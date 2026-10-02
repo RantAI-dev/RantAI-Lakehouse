@@ -173,7 +173,8 @@ assert both ways in `tests/route_auth.rs`.
 
 - `POST /api/gold/export/{mart}` accepts `?ifChanged=true`. When set, and
   both `lastChangedAt` and `lastExportedAt` are known, and
-  `lastChangedAt <= lastExportedAt`: do not export; return
+  `lastChangedAt < lastExportedAt` (strictly; see the slice B review,
+  finding B1 — the plan first said `<=`, which was wrong): do not export; return
   `{ "skipped": true, "reason": "unchanged since <rfc3339>" }` with `200`.
 - If either timestamp is `null`, export (fail toward publishing, since a
   stale open copy is the worse outcome).
@@ -234,7 +235,8 @@ assert both ways in `tests/route_auth.rs`.
   - When on: last published time, snapshot ID (`getLastExport`), the last
     five runs (`listExportRuns`), and a "Publish now" action
     (`triggerExport`).
-  - State line: "Up to date" when `lastChangedAt <= lastExportedAt`; "Out
+  - State line: "Up to date" when `lastChangedAt < lastExportedAt`
+    (strictly; slice B review finding B1); "Out
     of date" when newer; "Not measured" when `lastChangedAt` is `null`;
     "Never published" when `lastExportedAt` is `null`.
   - Errors from the toggle are shown in place; no optimistic flip that
@@ -568,3 +570,104 @@ changed to match (backlog `SEC-8`).
 
 **Slice B starts from `main` at or after `2cdbf1b`**, on a fresh branch
 `feat/gold-publish-per-mart-b`. The old branch was deleted on merge.
+
+### PR slice B — T2–T5 (reviewer, 2026-10-02)
+
+Reviewed `b74c7e5`, `44bdfb3`, `2623f07`, `21a787d`, `aa2a60a`. `origin/main`
+(`ac8099b`) was merged into the branch first; it merged cleanly.
+
+**One `BLOCKER`, one `SHOULD-FIX`. Not opening the PR until B1 is fixed.**
+
+#### B1 — `BLOCKER` — an equal timestamp must not skip (the plan's error)
+
+`if_changed_skip_reason` skips when `changed_ms <= exported_ms`. Both sides
+are whole seconds: `system.parts.modification_time` is a `DateTime`, and
+the history row stores `started_at.unix_timestamp() * 1000`
+(`routes/gold.rs`, `record_export_history`). So a write that lands in the
+same second an export started, after that export read the mart, compares
+equal and is skipped on every later run until the mart is written again.
+The open copy is then stale while the console says "Up to date" — a silent
+wrong answer, the class this repo treats as most serious.
+
+The developer implemented what the plan said: T4 specified `<=`. The plan
+was wrong and has been corrected above (T4 and T7 now say strictly `<`).
+The handoff's statement that the error direction is "never a missed one" is
+true for background merges but not for this case.
+
+Fix:
+
+- Skip only when `changed_ms < exported_ms`. Equal exports. The cost is one
+  extra export when a mart was written in the same second its last export
+  began, which is the safe direction.
+- Update `unchanged_mart_since_the_last_export_is_skipped_with_a_reason`:
+  its "equal timestamps" case and comment ("the mart's last write is the
+  export itself") are wrong — an export does not write the mart. Add a unit
+  test that equal timestamps export.
+- Update the doc comments on `if_changed_skip_reason` and `export`'s "Skip"
+  section, and the T4 paragraph in `gold_export.py`'s module docstring, to
+  say "strictly before".
+- Cite `PR slice B review B1` at the fix site and in the commit body.
+
+#### S1 — `SHOULD-FIX` — no Postgres should be `503`, through one helper
+
+`publications`, `publication` and `set_publication` each repeat
+`let Some(pool) = state.pg.as_deref() else { return Err(ApiError::Internal(...)) }`.
+The repo's convention for an unconfigured Postgres is `503`
+(`ApiError::Unavailable`; `routes::pipelines::pool`, and `README.md`:
+"dependent routes return `503`"). Use one helper returning
+`ApiError::Unavailable` with fixed text, and change the three sites and
+their `# Errors` sections. Rule 4: check for an existing shared helper
+before adding one to `routes/gold.rs`.
+
+#### Checked and correct
+
+- T2: migration `0054` has a why-header, matches the specified columns, and
+  no other branch on `origin` has a `0054`–`0059` migration. Store functions
+  bind every value and carry `# Errors`.
+- T3: the three routes match the plan's table. The `PUT` is floored at
+  `gold:export` in `POLICY_TABLE`; `tests/route_auth.rs` loops the table, so
+  both directions are covered without a new test. Unknown mart is `404`,
+  measured against `system.tables`. Switching off calls nothing in Iceberg.
+  The toggle is audited through the existing `store_audit::insert`.
+- T4: the skip returns before the single-flight lock, writes no history row,
+  and unknown facts export. The freshness reads happen only when
+  `ifChanged=true`.
+- T5: the scheduler unions the API list with the env override, de-duplicates
+  by name, raises on a failed fetch, and records a skip without a
+  materialization. The env default is empty in code, compose and
+  `.env.example`.
+- The new dev-dependencies add no package to `Cargo.lock`; only feature
+  edges on packages already present.
+
+#### Verification re-run by the reviewer on `aa2a60a`
+
+Foreground, shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 78 suites, **2831 passed, 0 failed, 8
+  ignored**. The handoff says 2 ignored; the count is 8, as in slice A. The
+  JWKS flake the handoff mentions did not occur in this run.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375 passed,
+  30 subtests passed**.
+- `docker compose --profile '*' config --quiet` — pass.
+
+Not re-run by the reviewer: the clean-project `docker compose up` proof for
+the compose edit. The handoff describes it; the edit is one default value.
+
+#### Observations, not findings against this slice
+
+- **Background merges cause extra copies.** A `MergeTree` merge writes a new
+  part with a new `modification_time`, so a mart that is merged after its
+  export looks changed and is exported again on the next run, with no data
+  change. Each such export appends a full copy. This is the safe direction
+  but it weakens "skip when unchanged". A merge-proof signal needs its own
+  measurement; tracked as backlog `DATA-10`.
+- **This PR touches `Cargo.toml` and `Cargo.lock`.** Under the merge rule, a
+  PR that touches dependencies may not merge while a dependency check is
+  red, and `cargo audit` / `cargo deny` are red on `main`. Backlog `SEC-8`
+  must land first (plan: `2026-10-02-sec-8-dependency-checks.md`), or the
+  product owner grants an exception.

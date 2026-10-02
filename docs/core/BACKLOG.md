@@ -38,6 +38,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `GOV-1` | Audit trail covers every console change | Governance | PRODUCT §3 |
 | `OPS-1` | Trim old versions of raw tables | Monitoring | `README.md` |
 | `DATA-2` | Trim old copies in published Gold tables | Build | `features/gold-publish-per-mart.md` |
+| `DATA-10` | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | Slice B review, gold-publish plan |
 | `DATA-6` | A "latest copy only" view for outside readers of published tables | Build | `features/gold-publish-per-mart.md` |
 | `SEC-4` | Human security review | Security | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decide a support commitment | Business | PRODUCT §4 blocker 5 |
