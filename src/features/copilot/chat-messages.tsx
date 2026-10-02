@@ -13,7 +13,6 @@ import {
   Copy,
   Pencil,
   RefreshCw,
-  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
@@ -30,31 +29,19 @@ import type { ChatProgress, Msg } from "./use-copilot";
 
 /*
  * Copilot's message list, laid out like the RantAI-Agents chat
- * (`features/conversations/components/chat/chat-workspace.tsx`): an avatar
- * and name beside each answer, the user's message in a tinted bubble,
- * tool calls as compact rows above the text, a collapsible "Thinking" box
- * for the model's reasoning, and a footer with the time and hover actions.
+ * (`features/conversations/components/chat/chat-workspace.tsx`): the
+ * user's message in a tinted bubble on the right, answers as plain text on
+ * the left, tool calls as compact rows above the text, a collapsible
+ * "Thinking" box for the model's reasoning, and a footer with the time and
+ * hover actions.
+ *
+ * There is no avatar or "Copilot" name beside an answer. With one
+ * assistant in the conversation, the bubble on the right already says who
+ * is speaking, and a gradient badge plus a bold name on every answer was
+ * decoration repeated per message (QA feedback).
  * From the ParaGPT answer-rendering proposal: the live status pill with
  * seconds, the table copy bar (`MiniMarkdown`) and "answered in".
  */
-
-/** Copilot's avatar — the Agents round mark, in the console's brand blues. */
-function CopilotAvatar({ live, small }: { live?: boolean; small?: boolean }) {
-  return (
-    <span
-      aria-hidden
-      className={cn(
-        "relative flex shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-[var(--brand-canvas-light)] to-[var(--brand-canvas-dark)] text-white shadow-sm",
-        small ? "size-6" : "size-8",
-      )}
-    >
-      {live ? (
-        <span className="absolute -inset-1.5 rounded-full bg-[radial-gradient(circle,color-mix(in_oklch,var(--brand-1),transparent_55%),transparent_70%)] motion-safe:animate-pulse" />
-      ) : null}
-      <Sparkles className={cn("relative", small ? "size-3" : "size-3.5")} />
-    </span>
-  );
-}
 
 /** The Agents typing dots plus the proposal's live label and seconds. */
 function StatusPill({ progress }: { progress: ChatProgress | null }) {
@@ -226,7 +213,7 @@ function MessageFooter({
 /** The Copilot message list — rich rendering (tool rows, build tree, markdown). */
 export function ChatMessages({
   messages, busy, progress, error, className, onRetry,
-  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, avatars, draft, liveReasoning,
+  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, draft, liveReasoning,
   onEdit, onDelete, onDismissError,
 }: {
   messages: Msg[];
@@ -244,8 +231,6 @@ export function ChatMessages({
   onCompleteTool?: (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => void;
   /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
   confirmingKey?: string | null;
-  /** Avatars and names beside answers — the wide /copilot page only. */
-  avatars?: boolean;
   /** Answer text streamed so far (`useCopilot().draft`). */
   draft?: string;
   /** Reasoning streamed so far (`useCopilot().liveReasoning`). */
@@ -281,13 +266,7 @@ export function ChatMessages({
         return (
           <motion.div key={key} {...enter} className="py-3">
             <div className={cn("group flex gap-3", isUser && "justify-end")}>
-              {!isUser && avatars ? <CopilotAvatar /> : null}
-              <div className={cn("min-w-0 flex-1", isUser ? (avatars ? "ml-12" : "ml-6") : avatars && "mr-8")}>
-                {!isUser && avatars ? (
-                  <div className="mb-1 flex items-center gap-2">
-                    <span className="text-sm font-semibold text-foreground">Copilot</span>
-                  </div>
-                ) : null}
+              <div className={cn("min-w-0 flex-1", isUser && "ml-6")}>
 
                 {isEditing ? (
                   <div className="space-y-2">
@@ -315,7 +294,7 @@ export function ChatMessages({
                     </div>
                   </div>
                 ) : isUser ? (
-                  <div className="ml-auto w-fit max-w-full rounded-2xl border border-[color-mix(in_oklch,var(--brand-1),transparent_75%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-4 py-2.5 text-sm whitespace-pre-wrap text-foreground">
+                  <div className="ml-auto w-fit max-w-full rounded-2xl bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-4 py-2.5 text-sm whitespace-pre-wrap text-foreground">
                     {m.content}
                   </div>
                 ) : (
@@ -380,13 +359,7 @@ export function ChatMessages({
       {busy ? (
         <div className="py-3">
           <div className="flex gap-3">
-            {avatars ? <CopilotAvatar live /> : null}
-            <div className={cn("min-w-0 flex-1", avatars && "mr-8")}>
-              {avatars ? (
-                <div className="mb-1 flex items-center gap-2">
-                  <span className="text-sm font-semibold text-foreground">Copilot</span>
-                </div>
-              ) : null}
+            <div className="min-w-0 flex-1">
               {liveReasoning ? <ReasoningBox text={liveReasoning} live={!draft} /> : null}
               {steps.length ? (
                 <div className="mb-1 space-y-0.5">

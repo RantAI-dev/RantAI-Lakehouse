@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
-import { GlowFrame } from "@/components/ui/brand-glow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -88,7 +87,9 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
           onClick={() => setMode(m)}
           className={cn(
             "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-            mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
+            // Neutral, not `text-primary`: primary is too dark to read on the
+            // dark theme, where the selected mode all but disappeared.
+            mode === m ? "bg-background text-foreground shadow-xs" : "text-muted-foreground hover:text-foreground",
           )}
         >
           {m === "ask" ? "Ask" : "Build"}
@@ -105,7 +106,7 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
  */
 export function ChatComposer({
   mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, glow,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -123,8 +124,12 @@ export function ChatComposer({
   glass?: boolean;
   /** Compact single-line pill (collapsed dock, Google-style). */
   compact?: boolean;
-  /** Brand focus ring (`GlowFrame`) — the full /copilot page. */
-  glow?: boolean;
+  /**
+   * Opaque surface with a plain border — the full /copilot page, where the
+   * composer sits straight on the tinted page background and the default
+   * translucent fill would not stand out from it.
+   */
+  solid?: boolean;
 }) {
   const [input, setInput] = React.useState("");
   const submit = () => {
@@ -225,13 +230,12 @@ export function ChatComposer({
     </>
   );
 
-  // The /copilot page's composer: Home's spinning brand ring on focus.
-  if (glow) return <GlowFrame innerClassName="p-1.5">{body}</GlowFrame>;
-
   return (
     <div className={cn(
       "rounded-2xl border p-1.5 transition-all",
-      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
+      solid
+        ? "border-border bg-background shadow-xs focus-within:border-foreground/25"
+        : glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
     )}>
       {body}
     </div>

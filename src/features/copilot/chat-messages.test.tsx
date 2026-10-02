@@ -25,10 +25,12 @@ const conversation: Msg[] = [
 ]
 
 describe("ChatMessages (RantAI-Agents layout)", () => {
-  it("shows the answer with Copilot's name, a closed reasoning box, one row per tool and the answer time", () => {
-    const { container } = render(<ChatMessages messages={conversation} busy={false} avatars />)
+  it("shows the answer with a closed reasoning box, one row per tool and the answer time, and no name or avatar", () => {
+    const { container } = render(<ChatMessages messages={conversation} busy={false} />)
     const view = within(container)
-    expect(view.getByText("Copilot")).toBeDefined()
+    // The avatar and the "Copilot" name beside each answer were removed on
+    // purpose (QA feedback); the user's bubble already says who speaks.
+    expect(view.queryByText("Copilot")).toBeNull()
     expect(view.getByText("Thought for 2s")).toBeDefined()
     expect(view.queryByText("Use list_datasets.")).toBeNull()
     expect(view.getByText("Search")).toBeDefined()
@@ -40,7 +42,7 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
     const onEdit = mock(() => {})
     const onRetry = mock(() => {})
     const { container } = render(
-      <ChatMessages messages={conversation} busy={false} avatars onEdit={onEdit} onRetry={onRetry} />,
+      <ChatMessages messages={conversation} busy={false} onEdit={onEdit} onRetry={onRetry} />,
     )
     const view = within(container)
     fireEvent.click(view.getByLabelText("Regenerate response"))
@@ -59,7 +61,6 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
       <ChatMessages
         messages={conversation.slice(0, 1)}
         busy
-        avatars
         liveReasoning="Checking the catalog"
         progress={{ phase: "tool", tool: "list_datasets", startedAt: Date.now(), steps: ["list_datasets"] }}
       />,
