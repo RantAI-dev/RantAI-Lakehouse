@@ -70,37 +70,17 @@ export type LineageEdge = {
   id: string
   from: string
   to: string
-  /**
-   * `ingest`: a connector loads a source object into Bronze. `read`/`write`:
-   * a pipeline reads its source and rebuilds its target.
-   */
-  kind: "ingest" | "read" | "write" | "pipeline" | "query" | "agent" | "transform"
-}
-
-export type LineageNode = {
-  id: string
-  label: string
-  /** `source | bronze | silver | serving | pipeline`, or `dataset` for another zone. */
-  kind: string
-  sublabel?: string | null
-  /** What the node opens: a connector id, a pipeline id, or a catalog asset id. */
-  ref?: string
-  /** Column in a left-to-right layout: 0 has nothing upstream. */
-  depth?: number
+  kind: "pipeline" | "query" | "agent" | "transform"
 }
 
 export type LineageGraph = {
   focus: string
-  /** The nodes `focus` resolved to; empty when nothing is recorded for it. */
-  focusIds?: string[]
-  nodes: LineageNode[]
+  nodes: { id: string; label: string; kind: string }[]
   edges: LineageEdge[]
   columnMappings: { source: string; target: string; transform: string }[]
   /** False when the build has no lineage capture; `reason` says why. */
   supported: boolean
   reason?: string
-  /** What the graph covers, and what it does not trace. */
-  note?: string
 }
 
 export type AuditEvent = {

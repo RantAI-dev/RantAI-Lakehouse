@@ -1,23 +1,21 @@
 "use client"
 
 import * as React from "react"
-import { useSearchParams } from "next/navigation"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Input } from "@/components/ui/input"
 import { useDataTable } from "@/hooks/use-data-table"
-import { useDebounce } from "@/hooks/use-debounce"
 import { useService } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { governanceService } from "@/services"
 import type { LineageGraph } from "@/services/contracts/governance"
 import { getLineageColumns } from "./lineage-columns"
-import { LineageColumns } from "./lineage-graph"
 
 function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
   const tableUrlState = useTableUrlState()
@@ -75,34 +73,20 @@ function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
 }
 
 export function LineagePage() {
-  // Links from an asset or a pipeline run name what to focus on
-  // (`/lineage?focus=<id>`); it used to be ignored for a fixed demo id.
-  const searchParams = useSearchParams()
-  const urlFocus = searchParams.get("focus") ?? ""
-  const [focus, setFocus] = React.useState(urlFocus)
-  // Following a link to this page from this page (the sidebar entry,
-  // another `?focus=`) changes only the URL: the page stays mounted, so
-  // the URL's focus is taken over here, during render.
-  const [seenUrlFocus, setSeenUrlFocus] = React.useState(urlFocus)
-  if (urlFocus !== seenUrlFocus) {
-    setSeenUrlFocus(urlFocus)
-    setFocus(urlFocus)
-  }
-  // Not one request per keystroke.
-  const query = useDebounce(focus.trim(), 300)
-  const state = useService((s) => governanceService.getLineage(query, s), [query])
+  const [focus, setFocus] = React.useState("event-pariwisata")
+  const state = useService((s) => governanceService.getLineage(focus, s), [focus])
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Lineage"
-        description="Where data comes from and where it goes: connector ingests and pipelines, with column mappings. Leave the focus empty to see everything."
+        description="Dataset, pipeline, query, and agent-action lineage with column mappings."
       />
       <Input
         value={focus}
         onChange={(e) => setFocus(e.target.value)}
         className="max-w-sm"
         aria-label="Focus asset id"
-        placeholder="Pipeline, table (silver.orders), catalog asset or connector id"
+        placeholder="Focus asset id"
       />
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
@@ -113,16 +97,16 @@ export function LineagePage() {
         // capture is not implemented".
         <EmptyState title="Lineage not available" description={state.data.reason} />
       ) : null}
-      {state.status === "success" && state.data.supported && state.data.nodes.length === 0 ? (
-        <EmptyState
-          title={query ? `No lineage recorded for ${query}` : "No lineage recorded yet"}
-          description={state.data.note}
-        />
-      ) : null}
-      {state.status === "success" && state.data.supported && state.data.nodes.length > 0 ? (
+      {state.status === "success" && state.data.supported ? (
         <>
-          <SectionCard title="Graph" description={state.data.note}>
-            <LineageColumns graph={state.data} onTrace={setFocus} />
+          <SectionCard title="Graph">
+            <FlowCanvas
+              nodes={state.data.nodes.map((n) => ({
+                id: n.id,
+                label: n.label,
+                kind: n.kind,
+              }))}
+            />
           </SectionCard>
           <SectionCard
             title="Connections"
@@ -131,9 +115,6 @@ export function LineagePage() {
             <ConnectionsTable graph={state.data} />
           </SectionCard>
           <SectionCard title="Column mappings">
-            {state.data.columnMappings.length === 0 ? (
-              <p className="text-xs text-muted-foreground">No pipeline in this graph maps columns.</p>
-            ) : null}
             <ul className="space-y-2 text-sm">
               {state.data.columnMappings.map((m) => (
                 <li key={`${m.source}-${m.target}`} className="font-mono text-xs">

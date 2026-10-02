@@ -7,12 +7,10 @@
 //! `{kind}` dispatch, matching Next.js's separate `lineage/route.ts` file —
 //! it is never reached by [`Kind::parse`].
 
-use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
@@ -573,42 +571,44 @@ async fn replication(ch: &ChClient) -> Result<Value, GovError> {
 /// Query parameters accepted by `GET /api/governance/lineage`.
 #[derive(Debug, Deserialize)]
 pub struct LineageQuery {
-    /// What to trace: a pipeline id, a `<zone>.<table>` dataset, a Bronze
-    /// table's catalog slug, a connector id, or a connector's
-    /// `<connector id>:<object>`. Absent/empty returns every recorded flow
-    /// in the caller's tenant.
+    /// The dataset slug to trace. Absent/empty (`?focus=` unset) returns
+    /// the empty lineage graph — HTTP 200, not an error — matching
+    /// `gov-lineage-empty.json` in the parity corpus.
     #[serde(default)]
     focus: String,
 }
 
-/// `GET /api/governance/lineage?focus=<id>` — the recorded lineage around
-/// `focus` in the caller's tenant: connector ingest specs and authored
-/// pipeline definitions, the definitions jobs execute (see
-/// [`crate::lineage`]). It used to report lineage as not implemented, after
-/// `WS1` removed a graph that was guessed from table names.
+/// The lineage response for a build with no lineage capture.
 ///
-/// A caller in no tenant gets an empty graph, never every tenant's flows.
+/// `WS1` task 1.5: this route used to derive a three-node
+/// `source → Bronze → Silver` chain from the catalog's naming conventions and
+/// return it as lineage, with per-column transform text chosen by a three-way
+/// match on the column's declared type. Nothing captured any of it, so the
+/// arrows and the transforms were guesses that read as fact — and a lineage
+/// graph is precisely the surface a reader assumes is authoritative. `WS4`
+/// builds real lineage from `Dagster` op dependencies; until then this route
+/// reports the capability as absent and names the reason.
+fn lineage_unsupported(focus: &str) -> Value {
+    json!({
+        "focus": focus,
+        "nodes": [{ "id": focus, "label": focus, "kind": "focus" }],
+        "edges": [],
+        "columnMappings": [],
+        "supported": false,
+        "reason": "lineage capture not implemented",
+    })
+}
+
+/// `GET /api/governance/lineage?focus=<slug>`.
 ///
-/// # Errors
-///
-/// 404 for an `X-Tenant` the caller does not belong to; 503 when no
-/// Postgres pool is configured; 500 on a database failure.
-pub async fn lineage(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    headers: HeaderMap,
-    Query(q): Query<LineageQuery>,
-) -> ApiResult<ApiJson<Value>> {
-    let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
-        return Ok(ApiJson(crate::lineage::graph_around(&[], &[], &q.focus)));
-    };
-    let (connectors, pipelines) =
-        lakehouse_store::lineage::lineage_sources(pool(&state)?, tenant_id).await?;
-    Ok(ApiJson(crate::lineage::graph_around(
-        &connectors,
-        &pipelines,
-        &q.focus,
-    )))
+/// `state` is unused: lineage capture is not implemented (see
+/// [`lineage_unsupported`]), so this handler no longer queries `ClickHouse`.
+/// It is kept as a parameter (rather than dropped from the signature) only
+/// because dropping it would be signature churn unrelated to this fix and
+/// axum's `Handler` blanket impl still requires an `async fn`; `WS4` makes
+/// this parameter live again when it builds real lineage.
+pub async fn lineage(State(_state): State<AppState>, Query(q): Query<LineageQuery>) -> Response {
+    (StatusCode::OK, ApiJson(lineage_unsupported(&q.focus))).into_response()
 }
 
 // ── `GET /api/governance/ingest-runs?connectorId=` (WS3 item 17) ───────
@@ -1577,6 +1577,23 @@ mod tests {
         let sql = maintenance_run_query(Some("o'rders"));
 
         assert!(sql.contains("WHERE table_name = 'o''rders'"));
+    }
+
+    #[test]
+    fn lineage_reports_unsupported_not_a_template() {
+        let v = lineage_unsupported("serving.mart_revenue");
+
+        assert_eq!(v["supported"], json!(false));
+        assert!(
+            v["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "an unsupported capability must say why"
+        );
+        // The focus node is the only honest node: it is the table the caller
+        // asked about. Anything else would be invented.
+        assert_eq!(v["nodes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["edges"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["columnMappings"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["focus"], json!("serving.mart_revenue"));
     }
 
     /// Real precedent, cited in this task's plan: `lakehouse-clickhouse/
