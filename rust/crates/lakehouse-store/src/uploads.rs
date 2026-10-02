@@ -3,7 +3,7 @@
 //!
 //! The file's BYTES are not here: they live in the warehouse bucket under
 //! an `uploads/` prefix, and [`Upload::storage_key`] points at them. See
-//! `migrations/0049_upload.sql`'s header for why, and for why
+//! `migrations/0054_upload.sql`'s header for why, and for why
 //! `storage_key` is always a server-generated name rather than the user's
 //! own filename.
 //!
