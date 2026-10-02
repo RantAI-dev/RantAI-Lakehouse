@@ -39,6 +39,7 @@ use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
+use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -2620,6 +2621,47 @@ async fn check_dial_ssrf(
         .map_err(ApiError::BadRequest)
 }
 
+/// Refuse a spec whose `sourceObjects` land in a raw table an uploaded file
+/// was loaded into (plan task T8, ADR 0014, decision 5).
+///
+/// "Loaded" is [`lakehouse_store::uploads::table_loaded_by_upload`]: an upload
+/// of ANY tenant (raw table names are shared) is `ingested` into that table,
+/// and deleting the upload does not take that back. A table an upload has only
+/// claimed, because its load is running or failed, is not refused: nothing
+/// says yet that an upload loaded it.
+///
+/// `target` is stored unvalidated server-side (the console checks it), so a
+/// value that is not text is skipped here and left to whatever reads it
+/// later; every distinct text target is asked about once. The pool is only
+/// needed, and only required, when there is a target to ask about.
+///
+/// # Errors
+///
+/// 409 naming the first target an upload loaded; 503 if no pool is
+/// configured; the store's fixed `database error` when the question cannot
+/// be asked.
+async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Result<(), ApiError> {
+    let targets: std::collections::BTreeSet<&str> = source_objects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("target").and_then(Value::as_str))
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let pool = pool(state)?;
+    for target in targets {
+        if uploads::table_loaded_by_upload(pool, target).await? {
+            return Err(ApiError::Conflict(format!(
+                "The table {target} was loaded from an uploaded file, so a connector cannot \
+                 load into it. Choose another target."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `PUT /api/connectors/{id}/ingest-spec` — set a connector's ingest
 /// configuration.
 ///
@@ -2644,13 +2686,21 @@ async fn check_dial_ssrf(
 /// pastes an obviously-internal host and finds out immediately, at save
 /// time, rather than on the next scheduled run (WS3 plan judge review Z1).
 ///
+/// # A connector may not take a table an upload loaded
+///
+/// A `sourceObjects[].target` that is a raw table an uploaded file was loaded
+/// into is refused with a 409 ([`refuse_uploaded_targets`], ADR 0014,
+/// decision 5): an upload may never load into a connector's table, and the
+/// other direction would let a scheduled connector replace or append to what
+/// a person uploaded.
+///
 /// # Errors
 ///
 /// 404 if `id` is unknown; 400 if `dial` fails
 /// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
 /// refuses `dial`'s host (`StoreError::Validation` maps to
 /// `ApiError::BadRequest`, never `Internal` — both messages are safe to
-/// surface); 503/500 as above.
+/// surface); 409 if a target is a table an upload loaded; 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2670,6 +2720,7 @@ pub async fn ingest_spec_put(
     // than surfacing as a rejected run later.
     lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for
