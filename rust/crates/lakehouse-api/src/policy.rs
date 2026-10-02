@@ -322,11 +322,32 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
+    ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
+    ("DELETE", "/api/pipelines/{id}",                  Policy::RequiresPermission("pipeline:write")),
+    ("GET",  "/api/pipelines/{id}/schedule-ticks",     Policy::RequiresPermission("pipeline:read")),
+    // Every tenant's authored definitions, for the orchestrator's job
+    // factory. `pipeline:read` is the floor; the handler also refuses
+    // anyone but a service identity (routes::authored_pipelines).
+    ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
+    // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
+    // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
+    // matrix is "runs for this pipeline" + "steps for each run"
+    // composed into one round trip. The static path MUST be
+    // registered BEFORE `/runs/{runId}/steps` in
+    // `routes::pipelines_router` so axum does not match `{runId} =
+    // "steps"` and route the request to the wrong handler.
+    ("GET",  "/api/pipelines/{id}/runs/steps",        Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/logs",  Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/trigger",           Policy::RequiresPermission("pipeline:write")),
+    // R4 plan 2c: read-side companion to trigger. The handler refuses
+    // unknown ids and returns `{ defaultConfig: null, defaultConfigYaml:
+    // <yaml>, hasConfig: true }` for any job in Dagster — `pipeline:read`
+    // matches `list_pipelines`/`list_pipeline_runs`, the only other
+    // places a model can read pipeline state.
+    ("GET",  "/api/pipelines/{id}/config-schema",      Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/status",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/pause",             Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/resume",            Policy::RequiresPermission("pipeline:write")),
@@ -336,6 +357,30 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `identity:write`, not `pipeline:write`: this is a governance
     // decision about who may see the row, not a pipeline-operation grant.
     ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
+    // Dagster `run_failure_sensor` posts to this; the handler then
+    // refuses non-service `pipeline:write` holders, mirroring
+    // `authored_pipelines::runnable` (a `pipeline:write` user is still
+    // not the orchestrator).
+    ("POST", "/api/pipelines/events/run-failed",     Policy::RequiresPermission("pipeline:write")),
+    // Same posture as the run-failed route above: the
+    // `run_status_sensor(SUCCESS)` posts here, and the handler
+    // refuses a non-service `pipeline:write` holder. Plan 1f.
+    ("POST", "/api/pipelines/events/run-finished",   Policy::RequiresPermission("pipeline:write")),
+    // Plan 1f: per-pipeline SLA. `pipeline:write` is the floor — a
+    // `pipeline:read` holder can see the row's existence via the runs
+    // route but cannot list or set the SLA thresholds themselves.
+    ("GET",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
+    ("PUT",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
+    // Plan R4 2b: definition version history. List/get take the same
+    // floor as the runs and source routes (`pipeline:read`); restore
+    // takes `pipeline:write` because it mutates the row.
+    ("GET",  "/api/pipelines/{id}/versions",         Policy::RequiresPermission("pipeline:read")),
+    ("GET",  "/api/pipelines/{id}/versions/{version}", Policy::RequiresPermission("pipeline:read")),
+    ("POST", "/api/pipelines/{id}/versions/{version}/restore", Policy::RequiresPermission("pipeline:write")),
+    // Volume history: the same authorization posture as `/runs` (which
+    // is `pipeline:read`); a pipeline-write holder can already set the
+    // SLA, so reading the resulting row counts is `pipeline:read`.
+    ("GET",  "/api/pipelines/{id}/volume",            Policy::RequiresPermission("pipeline:read")),
 
     // ── Dashboard: seeded Dashboard Viewer permission `dashboard:read`.
     //    `dashboard:write` is the natural write counterpart — see module
@@ -351,6 +396,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
+    // Dashboard folders (plan §4): filing dashboards is editing them.
+    ("GET",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    // Dashboard SQL sources: listing is a read; authoring and previewing
+    // arbitrary SQL is its own permission, separate from dashboard:write
+    // (plan §1, the Metabase "native query" split).
+    ("GET",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("PUT",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("DELETE", "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("POST",   "/api/dashboard/sources/preview", Policy::RequiresPermission("dashboard:sql")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),

@@ -72,7 +72,23 @@ export type PipelineRun = {
   auditEventId?: string
   /** Output dataset produced by this run when known. */
   outputAssetId?: string
+  /** When the orchestrator created (queued) the run; the gap to `startedAt` is queue and launch time. Absent on a mutation response. */
+  queuedAt?: string | null
+  /** The run this one re-executes, when it is a retry. */
+  parentRunId?: string | null
+  /** The first run of this retry chain. */
+  rootRunId?: string | null
+  /** What launched the run, read from the orchestrator's own run tags (`routes::pipelines::run_trigger`). `"manual"` means no schedule, sensor or backfill launched it. */
+  trigger?: PipelineRunTrigger
 }
+
+export type PipelineRunTrigger = {
+  kind: "schedule" | "sensor" | "backfill" | "retry" | "manual" | string
+  name: string | null
+}
+
+/** How a retry picks the steps it runs again: every step, or only the failed ones (failed runs only). */
+export type RetryStrategy = "allSteps" | "fromFailure"
 
 /** One op node in a job's dependency graph (`GET /api/pipelines/{id}`'s `graph.ops`). */
 export type PipelineOpNode = {
@@ -81,6 +97,10 @@ export type PipelineOpNode = {
   sourceRef: string | null
   commit: string | null
   sql: string | null
+  /** What the op's own code reads, one short phrase each, as the op declares it (`op_metadata.source_metadata`). Not observed from a run. */
+  reads: string[]
+  /** What the op's own code writes; see `reads`. */
+  writes: string[]
 }
 
 /** One dependency edge: `from` runs before `to`. */
@@ -122,6 +142,12 @@ export type PipelineDetail = Omit<Pipeline, "description"> & {
   config: { key: string; value: string }[]
   /** Non-null only for an authored (`pl-`) pipeline. */
   definition: AuthoredDefinition | null
+  /**
+   * Authored pipelines only: the orchestrator job built for it
+   * (`authored__<id>`), or null while it has none (a draft, or one the
+   * orchestrator has not loaded). Absent for a Dagster job.
+   */
+  orchestratorJob?: string | null
   /**
    * NOT part of `GET /api/pipelines/{id}`. `routes::pipelines::detail`
    * (WS4 item C1) returns no `runs` field -- runs have their own route,
@@ -183,6 +209,43 @@ export type GeneratePipelineInput = {
   database: string
 }
 
+/** `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields. The name is fixed at creation (the id, and the job name, derive from it). */
+export type UpdatePipelineInput = {
+  kind: PipelineKind | string
+  sourceZone: string
+  sourceTable: string
+  incrementalColumn?: string
+  transforms: string[]
+  fbicEnabled?: boolean
+  targetZone: string
+  targetTable: string
+  schedule: string
+  owner?: string
+  description?: string
+}
+
+/** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */
+export type ScheduleTick = {
+  tickId: string
+  /** `SUCCESS` (launched runs), `SKIPPED`, `FAILURE` or `STARTED`. */
+  status: string
+  /** Unix seconds. */
+  timestamp: number
+  runIds: string[]
+  /** The schedule's own reason for not launching. */
+  skipReason: string | null
+  /** The orchestrator's error text is not sent (AGENTS.md principle 4); only that it failed. */
+  failed: boolean
+}
+
+export type ScheduleTicks = {
+  /** The schedule's name, or null when the pipeline has none. */
+  schedule: string | null
+  ticks: ScheduleTick[]
+  /** Set when the orchestrator could not be asked. */
+  unavailable: string | null
+}
+
 export interface PipelineService {
   listPipelines(signal?: AbortSignal): Promise<PipelineList>
   getPipeline(id: string, signal?: AbortSignal): Promise<PipelineDetail>
@@ -190,7 +253,8 @@ export interface PipelineService {
   createPipeline(input: CreatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
   triggerRun(id: string, signal?: AbortSignal): Promise<PipelineRun>
   cancelRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
-  retryRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
+  /** `POST /api/pipelines/runs/{runId}/retry`; `strategy` defaults to every step. */
+  retryRun(runId: string, signal?: AbortSignal, strategy?: RetryStrategy): Promise<PipelineRun>
   pausePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
   resumePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
   /** `GET /api/pipelines/{id}/source?op=` — one op's read-only source text (WS4 item F1). */
@@ -212,4 +276,10 @@ export interface PipelineService {
   /** `POST /api/pipelines/generate` — the Agentic Builder's real (non-mock)
    * draft-from-instruction call. */
   generatePipeline(input: GeneratePipelineInput, signal?: AbortSignal): Promise<Pipeline>
+  /** `PUT /api/pipelines/{id}` — replace an authored pipeline's definition. */
+  updatePipeline(id: string, input: UpdatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
+  /** `DELETE /api/pipelines/{id}` — delete an authored pipeline. */
+  deletePipeline(id: string, signal?: AbortSignal): Promise<void>
+  /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
+  getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
 }

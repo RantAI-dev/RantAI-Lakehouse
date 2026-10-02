@@ -46,6 +46,16 @@ pub enum ChartKind {
     Waterfall,
     /// Geographic choropleth map.
     Geomap,
+    /// Flow between two dimensions (`x` → `series`), width = value.
+    /// Needs a breakdown.
+    Sankey,
+    /// Two-level hierarchy (`x` → `series`) as rings. Needs a breakdown.
+    Sunburst,
+    /// Distribution of one measure per category: min, quartiles, max
+    /// (`quantilesExact`). No aggregate applies.
+    Boxplot,
+    /// Daily values on a calendar grid; `x` is a date column.
+    Calendar,
     /// Single-number KPI tile.
     Kpi,
     /// Single-number gauge tile.

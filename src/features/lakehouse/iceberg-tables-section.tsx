@@ -3,7 +3,6 @@
 import { useState } from "react"
 import Link from "next/link"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
-import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
@@ -55,14 +54,30 @@ const tableColumns: ColumnDef<LakehouseTableSummary>[] = [
 ]
 
 /**
- * The Lakehouse tables surface: the single configured warehouse, its
- * namespaces (with table counts where the fan-out finished in budget), and
- * the tables grid for a selected namespace (WS2 §4).
+ * The Iceberg tables Lakekeeper serves for the caller's tenant warehouse:
+ * its namespaces (with table counts where the fan-out finished in budget)
+ * and the tables grid for a selected namespace (WS2 §4). Each table links
+ * to its detail page, where the per-table maintenance policy is set.
+ *
+ * Rendered inside Table Maintenance rather than as its own page: a list of
+ * tables sitting next to Data Explorer read as a duplicate, and the policy
+ * form was the only thing here no other page did. It lists every table in
+ * the warehouse, including ones the catalog registry never recorded (Gold
+ * export tables, for example).
+ *
+ * `bronze` is selected by default when it exists, because that is the
+ * namespace the maintenance job runs over.
  */
-export function LakehouseTablesPage() {
+export function IcebergTablesSection() {
   const warehousesState = useService((s) => lakehouseService.listWarehouses(s), [])
   const namespacesState = useService((s) => lakehouseService.listNamespaces(undefined, s), [])
-  const [selectedNamespace, setSelectedNamespace] = useState<string | null>(null)
+  const [pickedNamespace, setPickedNamespace] = useState<string | null>(null)
+  const defaultNamespace =
+    namespacesState.status === "success" &&
+    namespacesState.data.some((ns) => ns.name === "bronze")
+      ? "bronze"
+      : null
+  const selectedNamespace = pickedNamespace ?? defaultNamespace
   const tablesState = useService(
     (s) =>
       selectedNamespace === null
@@ -74,11 +89,6 @@ export function LakehouseTablesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader
-        title="Lakehouse tables"
-        description="The Iceberg warehouse, namespaces, and tables served by Lakekeeper."
-      />
-
       <SectionCard size="sm" title="Warehouse">
         {warehousesState.status === "loading" ? <LoadingSkeleton rows={1} /> : null}
         {warehousesState.status === "error" ? (
@@ -86,7 +96,11 @@ export function LakehouseTablesPage() {
         ) : null}
         {warehousesState.status === "success" ? (
           warehouse === undefined ? (
-            <EmptyState title="No warehouse configured" className="py-4" />
+            <EmptyState
+              title="No warehouse for this tenant"
+              description="The warehouse list is scoped to your active tenant. A tenant whose provisioning has not created a Lakekeeper warehouse has none to show."
+              className="py-4"
+            />
           ) : (
             <div className="flex items-center gap-2 text-sm">
               <span className="font-mono">{warehouse.name}</span>
@@ -101,7 +115,7 @@ export function LakehouseTablesPage() {
       <SectionCard
         size="sm"
         title="Namespaces"
-        description="Select a namespace to list its tables."
+        description="Select a namespace to list its tables. Open a table to see its schema, partition spec and snapshots, and to set its maintenance policy."
       >
         {namespacesState.status === "loading" ? <LoadingSkeleton rows={2} /> : null}
         {namespacesState.status === "error" ? (
@@ -118,7 +132,7 @@ export function LakehouseTablesPage() {
                   type="button"
                   size="sm"
                   variant={selectedNamespace === ns.name ? "default" : "outline"}
-                  onClick={() => setSelectedNamespace(ns.name)}
+                  onClick={() => setPickedNamespace(ns.name)}
                 >
                   {ns.name} · {fmtMeasured(ns.tableCount)}
                 </Button>

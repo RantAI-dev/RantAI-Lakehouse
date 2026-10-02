@@ -170,7 +170,7 @@ pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
             "Table function tidak diizinkan pada query yang diatur kebijakan."
         }
         sql_rewrite::RewriteError::SensitiveSystemTable { .. } => {
-            "Membaca tabel sistem ini memerlukan izin audit:read."
+            "Tabel sistem ini tidak bisa dibaca dari sini; gunakan halaman Audit."
         }
         sql_rewrite::RewriteError::DictOrJoinFunctionDenied { .. } => {
             "Fungsi dictGet/joinGet tidak diizinkan untuk principal dengan kebijakan aktif — \

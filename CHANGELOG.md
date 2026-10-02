@@ -10,6 +10,41 @@ once a first release is tagged.
 
 ### Added
 
+- Run-config schema and validated trigger (plan R4 2c): `GET /api/pipelines/{id}/config-schema` returns the job's default config YAML (`pipeline:read`), `defaultConfig: null` alongside `defaultConfigYaml` since the workspace has no YAML parser dep and Dagster emits the default as a string; `pl-…` ids return `hasConfig: false` without contacting Dagster. `POST /api/pipelines/{id}/trigger` now accepts an optional `{"runConfig": <object>}` body — when supplied, the route validates against the job's schema (`isPipelineConfigValid`) and, on `RunConfigValidationInvalid`, returns a structured 400 `{ errors: [{ path: string[], reason: <EvaluationErrorReason> }] }` built only from `path` and `reason` (Dagster's free-form `message` is never forwarded, AGENTS.md principle 4); on success the config goes through `launchRun(runConfigData:)`. The audit row for `pipeline.trigger` now carries `args.configKeys` — the TOP-LEVEL keys of the supplied config, never the values. The copilot's `trigger_pipeline` tool gained the same optional `runConfig`.
+- Definition version history for authored pipelines (plan R4 2b): a new `pipeline_definition_version` row per `create`/`update`/`delete` (migration `0053`), written inside the same transaction so a failed write leaves no orphan row. The list endpoint (`GET /api/pipelines/{id}/versions`) returns metadata only, newest-first, so the list scales to many versions without shipping every prior snapshot; the get endpoint (`GET /api/pipelines/{id}/versions/{version}`) returns the editable state captured at that version; restore (`POST /api/pipelines/{id}/versions/{version}/restore`) replays a snapshot back into the live row through the existing update path, leaving `name` and `status` alone. Reads are `pipeline:read`; restore is `pipeline:write`. 404 for non-`pl-` ids and for unknown `(id, version)` pairs.
+- Pipeline duration SLA: a new `pipeline_sla` row per pipeline (`maxDurationSeconds`, `lateAfterSeconds`) edited through `GET`/`PUT /api/pipelines/{id}/sla` (plan 1f, migration `0050`). When the SLA exists, the pipeline row's payload gains `slaOk` (true while the latest run's `durationSeconds` is at or under `maxDurationSeconds`, `null` while a run is in flight or no SLA is set) and each run gains `overDuration` (true when the run finished and was over `maxDurationSeconds`).
+- Late pipeline alerts: `late` on the pipeline row is `true` when no run has succeeded in `lateAfterSeconds` and a threshold is configured, and a `pipeline_late` kind of `alert_rule` fires for matching pipelines via the `/api/alerts/run` op. With no threshold, both stay `null`/`unsupported` rather than zero-firing.
+- Volume drop alerts: each `authored__<id>` job reports its row count to the API through Dagster's new `run_status_sensor(SUCCESS)` (mirrors the existing `run_failure_sensor`), and a `pipeline_volume_drop` kind of `alert_rule` fires when the latest run wrote under half the median of the previous 5+ completed runs. The same hook computes `pipeline_slow` (using `overDuration`). With fewer than 5 prior samples, the rule is recorded as `skipped` rather than firing or staying silent.
+- Dagster `pipeline_run_finished_sensor` (plan 1f) — mirror of the existing failure sensor, posting one `POST /api/pipelines/events/run-finished` per `SUCCESS` run in this code location. Same posture: degraded-honest when `PIPELINE_RUN_TOKEN` is unset, `default_status=RUNNING`, retries at the sensor level, deduped on the API side by `(run_id, kind)`.
+- Pipeline-failure alerts: a new `pipeline_failure` kind of `alert_rule`, scoped to one pipeline or `*`, that fires when a Dagster run ends in `FAILURE`. Dagster's `run_failure_sensor` (in `dagster/dispar_orchestrate/pipeline_events.py`) posts each failure to a new service-only `POST /api/pipelines/events/run-failed`; the API dedupes by `(run_id, kind)` (new `pipeline_run_event` table, migration `0049`) so a sensor retry never double-alerts, and the alert body names the pipeline, the run id, and a relative `/pipelines/<id>?run=<runId>` link — never the orchestrator's error text.
+- Console-authored pipelines now run: `authored_factory.py` builds one `authored__<id>` job, and a cron schedule when the pipeline has one, per `ready` or `paused` pipeline from the new service-only `GET /api/pipelines/runnable`. The API asks the orchestrator to reload after every change, which is why the code location now runs `dagster code-server start`.
+- Edit (`PUT /api/pipelines/{id}`, `/pipelines/{id}/edit`) and delete (`DELETE /api/pipelines/{id}`) for authored pipelines, with audit events.
+- `GET /api/pipelines/{id}/schedule-ticks` and a Schedule history on the pipeline page: each time a schedule was due and whether it launched, skipped or failed. The orchestrator's error text is not sent.
+- Authored pipelines now declare upstream wiring (`dependsOn` / `depends_on`, max 10): migration `0052_pipeline_depends_on.sql` adds the column, `POST`/`PUT /api/pipelines` validate ids and cycles against the existing authored graph + the live Dagster job list, and `authored_factory.py` builds one `run_status_sensor(SUCCESS)` per downstream — `authored__<safe_id>_after`, default `RUNNING`, run_key = upstream run id, ALL semantics ("every upstream has a SUCCESS run that finished after the downstream's most-recent start"). Dagster unreachable on a write degrades to "no Dagster upstreams accepted" rather than refusing the write. The detail payload gains `upstream` (with each upstream's `lastSuccessAt`) and `downstream`. The schedule-ticks endpoint now also merges in the dependency sensor's ticks, tagged `kind:"sensor"` so the UI can render the upstream-staleness skip reason alongside the schedule's outcomes.
+- Rows per run: gold export and ingest report the rows they wrote, shown as "Rows written" in the run inspector.
+- `scripts/compose.sh`: `docker compose` with `GIT_SHA` set from the checkout, which the pipeline page's source view needs.
+- Dashboard SQL sources: a saved read-only `SELECT` (e.g. a join across
+  several `serving` marts) that a chart can use instead of one mart.
+  Authored from Query Studio ("Save as SQL source") with the new
+  `dashboard:sql` permission (only `*:*` holds it today); restricted to
+  one `SELECT`/`WITH` over `serving.*` tables, run through the policy
+  rewrite, capped at 2,000 rows and 30 s. Charts on a source follow its
+  current SQL, dashboard filters apply, and the Copilot can list sources
+  and build charts on them (`list_sql_sources`, `sqlSource`).
+- Dashboard folders (stage 1): nested up to four levels, holding
+  dashboards and SQL sources; only empty folders can be deleted. Managed
+  from the dashboard title menu; "Move to folder…" in the ⋯ menu.
+- Page-aware Copilot: the dashboard's tiles with their first rows and the
+  active filters, or Query Studio's SQL and last result, are sent as page
+  context (bounded; the API cap is now 6,000 characters).
+- Chart builder: chart types in a sidebar next to the form and live
+  preview, replacing the separate gallery step.
+- Four chart kinds: sankey and sunburst (flow / two-level hierarchy over
+  a dimension and a required breakdown), box plot (min, quartiles, max per
+  category via `quantilesExact`), and calendar heatmap (daily values, up
+  to the last year of data). Available in the builder, to the Copilot, and
+  on SQL sources.
+
 - Gold Exports console page: per-mart last export (`snapshotId`/
   `exportedAt`, read straight off the Iceberg table's own snapshot), an
   "Export now" action, export history from a new `console.gold_export_run`
@@ -32,9 +67,57 @@ once a first release is tagged.
 - Per-tenant built-in "Main" dashboard tile catalog loaded from a JSON
   file via `BUILTIN_DASHBOARD_SPEC`, replacing the removed
   `BUILTIN_DASHBOARD_ENABLED` boolean flag (WS6).
+- Dashboard list page at `/dashboards/browse`, as a gallery of cards or a
+  table with search, filters and sorting. Each dashboard shows its tile
+  count, owner, last-updated time and whether it is shared publicly or
+  embeddable; rows offer rename, duplicate and delete. Reachable from the
+  board switcher ("Browse all dashboards"), the command palette, and the
+  navbar. Dashboards can now carry a one-line description, set when they
+  are created or renamed and shown in the list.
+- `GET /api/dashboard/boards` now returns `chartCount`, `builtin`,
+  `description`, `createdBy` and `updatedAt` per board. `chartCount` is
+  derived from `console.bi_chart` on each request rather than stored, so it
+  cannot go stale when a chart moves between boards. `updatedAt` exposes the
+  same column as the existing `createdAt` under an honest name: the table is
+  a `ReplacingMergeTree(created_at)`, so that column is the version column
+  and every save rewrites it.
+- `POST /api/dashboard/boards` accepts `description`, and records the
+  signed-in caller's display name in `created_by`.
+  `PUT /api/dashboard/boards` accepts `description`.
+- Pipeline recovery API (R2): `POST /api/pipelines/{id}/runs/{runId}/retry`
+  now accepts `{"strategy":"selected","stepKeys":[...]}` to re-run a chosen
+  subset of steps, with the step keys validated against the parent run's
+  step history and the first unknown key named in the 400 response; the
+  Copilot `retry_pipeline_run` tool gained a matching `stepKeys` array
+  argument. Steps now report their attempt count (`attempts`), and a new
+  `GET /api/pipelines/{id}/runs/steps` route returns every recent run of a
+  pipeline alongside per-step status, attempt count and duration (the
+  route is registered before the `/runs/{runId}/steps` catch-all so the
+  `runs/steps` path reaches it). On a Dagster transport failure the matrix
+  route reports `available: false` with the standard `unavailable` reason,
+  never a 5xx. (R2)
+- `max_retries` per authored pipeline: `POST /api/pipelines` and
+  `PUT /api/pipelines/{id}` accept `maxRetries` (0–5, rejected with a 400
+  outside the band; defaults to 2) and persist it in `lakehouse-store` via
+  the new migration `0051_pipeline_max_retries.sql`. The Dagster
+  `authored__<id>` job reads `definition["maxRetries"]` and overrides only
+  the attempt count on the shared `DEFAULT_RETRY_POLICY`; delay, backoff
+  and jitter come from the shared policy. (R2)
 
 ### Changed
 
+- `gold_export_job` is rebuilt as `list_gold_marts` (fan-out, one `DynamicOutput` per configured mart) -> `export_gold_mart[<key>]` (mapped, one step per Gold mart) -> `summarize_gold_export` (collect), per PART A of `parts/1b-dagster-one-op-per-unit-and-retries.md`. One mart's HTTP error fails only that mapped step (the others still record their `maintenance_run` success rows); the failure row for the failed mart is written before the bare re-raise, so the governance surface sees the failure immediately, not only after the retry policy's attempts have all come up empty. The console's pipeline detail log parsing is unchanged: the log shape (`Execution of step "<key>" failed.`) is unchanged, and the console fixture now references the mapped-step names (`export_gold_mart[<key>]`) instead of the old single `run_gold_export`.
+- `ingest_job` is rebuilt as `run_ingest` (fan-out, batch connectors only — `cdc` and `kafka`/stream connectors yield no mapped steps) -> `ingest_source_object[<key>]` (mapped per `sourceObjects` entry) -> collect, per PART B of `parts/1b-dagster-one-op-per-unit-and-retries.md`. The mapped step's input carries the connector with its `secretRef` STRING REFERENCES only — the secrets are resolved INSIDE the mapped op, never on the `DynamicOutput` payload, because Dagster's IO manager persists op outputs and a resolved secret on one would leak. `SecretRefRejected`, `UnknownAdapter`, `ssrf_guard.SsrfBlocked`, and `UnsupportedColumnType` are wrapped as `Failure(allow_retries=False)` at the mapped op's boundary so a config-shaped failure is never retried.
+- `bronze_maintenance_job` is rebuilt as `list_bronze_tables` (fan-out, runs catalog-database creation and the policy-list fetch once per run, not once per table) -> `maintain_bronze_table[<key>]` (mapped, per-table body) -> `summarize_bronze_maintenance` (collect), per PART C of `parts/1b-dagster-one-op-per-unit-and-retries.md`. A failed table's mapped step fails without taking the others down, and a fresh catalog with zero tables yields a still-successful run (`summarize_bronze_maintenance` collects an empty list). Mapping-key collisions (two tables whose names sanitize to the same Dagster step key) raise `Failure(allow_retries=False)` naming both.
+- A shared `DEFAULT_RETRY_POLICY` (max_retries=2, delay=30s, exponential backoff with ±jitter) is wired on every op in the Dagster code location, and every `Failure` raised on a config, auth, SSRF, secret-ref, or column-type problem sets `allow_retries=False`, per PART D of `parts/1b-dagster-one-op-per-unit-and-retries.md`. Gold export HTTP errors are NOT wrapped in `Failure(allow_retries=False)` — they are bare re-raised so the default policy retries a transient 5xx (busy ClickHouse on the `lakehouse-api` side, the canonical case the plan names), and a persistent 4xx/5xx fails after the policy's two attempts. The sanitize helpers (`gold_export._sanitize_mapping_key`, `ingest_factory._sanitize_target`, `maintenance._sanitize_mapping_key`) now use the exact ASCII `[A-Za-z0-9_]` rule via a precompiled `re`, replacing the previous `str.isalnum()`-based rule that would silently accept non-ASCII letters as Dagster mapping keys.
+- `/dashboards` no longer renders a page. It resolves: to the dashboard you
+  last had open, or — when you have not created one yet — to the built-in
+  "Main" board, and only otherwise to the list at `/dashboards/browse`.
+  Returning to Dashboards from another section therefore reopens the
+  dashboard you were working on instead of making you pick it again. The
+  single-dashboard canvas moved to `/dashboards/[id]`. The last-opened
+  dashboard is remembered per browser and validated against the server on
+  every resolve, so a deleted board never leaves you on an empty canvas.
 - **Relicensed the project from Apache-2.0 to AGPL-3.0-or-later.**
   `v0.1.0` was released and remains distributed under Apache-2.0 — that
   historical release is unaffected. All source as of this change is
@@ -77,6 +160,36 @@ once a first release is tagged.
 - The alerts table now distinguishes an API failure from having no alerts,
   instead of showing an empty state for both.
 
+### Fixed
+
+- A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list. A Platform Admin (`*:*`) with no tenant now sees every tenant's authored pipelines there, the rule that already showed them the Dagster jobs; before, they saw none. An authored pipeline's `authored__<id>` Dagster job is not listed a second time.
+- `PIPELINE_RUN_TOKEN` is now passed to `lakehouse-api` and `dagster-code-location`; it was passed to neither, so no authored pipeline could become a job.
+- The authored-pipeline schedule field offers cron presets and a validated custom cron; its old free-text default ("Every hour") never fired.
+- The Pipelines list shows "Never run" instead of an empty badge for a job that has never run, and schedules in words.
+- Dashboard drill-down, filter values (`/api/dashboard/values`), alert
+  values and digests now go through the policy rewrite like dashboard
+  tiles, so masking and row filters apply there too (alerts and digests as
+  the least-privileged "Dashboard Viewer" role, like embeds).
+- LLM failures no longer show the provider's raw response text in the
+  Copilot or the text-to-SQL agent.
+- `enforce` passes no permissions to the statement classifier (it passed
+  role names); sensitive `system.*` tables stay unreadable from governed
+  SQL surfaces, now stated explicitly.
+- A new dashboard no longer shows the previous board's charts (a stale
+  load response won the race); closed selects in the chart builder show
+  labels instead of raw ids; Copilot chart drafts on a SQL source preview
+  correctly.
+- Tests: `lakehouse-test-support` reuses one labelled Postgres container
+  instead of leaking one per test binary; the connector secret allowlist
+  test no longer depends on a developer `.env` (loaded by `sqlx::test`).
+- `debezium-server` re-pinned to `:1.1.1.Final@sha256:2ad14b1…` so the
+  `Rust · G4 Debezium CDC into Bronze` job pulls again — the prior
+  digest-only pin (`…5281e2bd…`, what `:latest` resolved to on 2026-09-24)
+  now 404s (`manifest unknown`, CI run 36680491360), and a bare digest
+  pin dies silently whenever upstream overwrites the untagged image.
+- The Dagster dependency sensor (`authored__<id>_after`) is now actually built. The Rust `RunnablePipeline` serializes `depends_on` as `dependsOn` (`#[serde(rename_all = "camelCase")]` in `lakehouse-store/src/pipelines.rs`), but the factory read `pipeline.get("depends_on")` which always returned `None`, so every chain was silently dead. The factory now reads `dependsOn`, matching the wire format, and the test fixture mirrors the live JSON. The existing pre-fix tests for `schedule`/`status`/`definition`/`sourceZone`/... already proved the rest of the factory's reads were on the camelCase wire.
+- `DELETE /api/pipelines/{id}` refuses to delete an authored pipeline that is still listed as an upstream by another authored pipeline's `depends_on`, naming every downstream id verbatim in a 400. Without this, deleting the upstream left a dangling reference the validator refuses the next time the downstream is edited, AND a sensor that watched a job that no longer existed. Pure helper `referencing_downstreams(pairs, target_id)` extracted from the route so the reverse walk is unit-tested directly (the route handler cannot be tested at this seam without a real pool).
+
 ### Removed
 
 - Pages and dialogs with no backend behind them: storage tiering (including
@@ -93,6 +206,16 @@ once a first release is tagged.
   "completed" before they had run.
 - Seeded pipeline and alert rows that were indistinguishable from real
   activity are pruned by migration.
+
+### Fixed
+
+- Sorting a table column now actually reorders the rows. `useDataTable`
+  built its column whitelist from `column.id`, but TanStack derives that id
+  from `accessorKey` inside the table rather than on the definition object,
+  so almost every column was missing from the whitelist and the URL parser
+  discarded the sort it had just written. Restoring a filter from table
+  memory failed the same way. Affects every table page, not only the
+  dashboard list.
 
 ## [0.1.0] - 2026-08-30
 

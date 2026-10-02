@@ -3,10 +3,21 @@
 import * as React from "react";
 import { usePathname } from "next/navigation";
 import { Sparkles, Plus, ChevronDown, PanelRight } from "lucide-react";
+import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryButton } from "./history-menu";
+
+/**
+ * Pages that never show the floating dock: Home's own prompt is the entry
+ * point there, and /copilot is the full conversation, so a second input
+ * would be two boxes doing the same thing. `AppFrame` reads this too, to
+ * drop the bottom padding it keeps free for the dock.
+ */
+export function dockHiddenOn(pathname: string | null): boolean {
+  return pathname === "/" || Boolean(pathname?.startsWith("/copilot"));
+}
 
 /**
  * The GLOBAL chat dock — a bar at the BOTTOM-CENTER of every page (Google
@@ -22,7 +33,7 @@ export function CopilotDock() {
   const pathname = usePathname();
   const c = useCopilot();
 
-  if (pathname?.startsWith("/copilot") || c.dockPosition === "right") {
+  if (dockHiddenOn(pathname) || c.dockPosition === "right") {
     return null;
   }
 
@@ -87,20 +98,13 @@ export function CopilotDock() {
                 </div>
                 <div className="grid gap-1.5 sm:grid-cols-2">
                   {c.pageContext.suggest[c.mode].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => c.send(s)}
-                      disabled={c.busy}
-                      className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-left text-xs text-foreground transition-colors hover:bg-muted hover:border-primary/40 disabled:opacity-50"
-                    >
-                      {s}
-                    </button>
+                    <SuggestionButton key={s} text={s} onClick={() => c.send(s)} disabled={c.busy} />
                   ))}
                 </div>
               </div>
             ) : (
               <ChatMessages
-                messages={c.messages}
+                messages={c.messages} draft={c.draft} liveReasoning={c.liveReasoning} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError}
                 busy={c.busy}
                 error={c.error} progress={c.progress} onRetry={c.retry}
                 onConfirmTool={c.confirmTool}

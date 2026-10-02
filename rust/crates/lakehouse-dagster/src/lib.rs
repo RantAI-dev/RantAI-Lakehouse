@@ -25,6 +25,74 @@ pub struct DgRun {
     /// Unix seconds the run ended, or `None` if it hasn't finished yet.
     #[serde(default)]
     pub end_time: Option<f64>,
+    /// Unix seconds the run was created (queued). The gap to `start_time`
+    /// is time spent queued and launching. Only the per-job query asks for
+    /// it; `None` elsewhere.
+    #[serde(default)]
+    pub creation_time: Option<f64>,
+    /// The run this one re-executes, when it is a retry.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    /// The first run of a retry chain, when this is a retry.
+    #[serde(default)]
+    pub root_run_id: Option<String>,
+    /// The run's tags. `Dagster` records what launched a run here
+    /// (`dagster/schedule_name`, `dagster/sensor_name`, `dagster/backfill`).
+    #[serde(default)]
+    pub tags: Vec<DgTag>,
+}
+
+/// One `key`/`value` tag on a [`DgRun`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct DgTag {
+    /// The tag's key, e.g. `dagster/schedule_name`.
+    pub key: String,
+    /// The tag's value.
+    pub value: String,
+}
+
+/// A [`DgRun`] together with its summed materialization row count, for the
+/// volume route (`GET /api/pipelines/{id}/volume`) and the
+/// `pipeline_volume_drop` alert (plan 1f).
+///
+/// `rows` is `None` when no step of the run reported any `IntMetadataEntry`
+/// labelled `"rows"` — a run that did real work whose every asset
+/// materialization happens not to count rows (or whose steps failed before
+/// materialization) is not a row count of `0`; it is a measurement gap.
+#[derive(Debug, Clone)]
+pub struct DgRunWithRows {
+    /// The underlying run record (same shape [`list_runs_for_job`] returns).
+    pub run: DgRun,
+    /// Sum of every `"rows"`-labelled `IntMetadataEntry` across every
+    /// step's materializations; `None` when no step reported rows.
+    pub rows: Option<i64>,
+}
+
+/// How a re-execution picks the steps it runs again.
+///
+/// `Selected` is deliberately NOT a variant here: a re-execution of a
+/// chosen subset carries step keys and Dagster expresses it through
+/// `launchRunReexecution(executionParams { stepKeys })`, not through a
+/// `ReexecutionStrategy` value. Parsing that request belongs to the
+/// route layer, so this enum stays closed and the strategy mapping can
+/// never report a strategy the caller did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReexecutionStrategy {
+    /// Every step of the parent run.
+    AllSteps,
+    /// Only the steps that failed or did not run, reusing the outputs of
+    /// the steps that succeeded. `Dagster` refuses it for a run that did
+    /// not fail.
+    FromFailure,
+}
+
+impl ReexecutionStrategy {
+    const fn graphql(self) -> &'static str {
+        match self {
+            Self::AllSteps => "ALL_STEPS",
+            Self::FromFailure => "FROM_FAILURE",
+        }
+    }
 }
 
 /// A `Dagster` run together with the run config it was launched with, as
@@ -229,6 +297,195 @@ struct LaunchRunError {
 }
 
 #[derive(Debug, Deserialize)]
+struct IsPipelineConfigValidData {
+    #[serde(rename = "isPipelineConfigValid")]
+    is_pipeline_config_valid: ConfigValidationResult,
+}
+
+/// Wire shape for `isPipelineConfigValid` — a `PipelineConfigValidationResult`
+/// union (`dagster_graphql/schema/pipelines/config_result.py`). The
+/// `Unknown` variant catches new typenames Dagster might add in a future
+/// version; the route layer treats it as `NotFound` so an unknown
+/// union member never claims success.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum ConfigValidationResult {
+    #[serde(rename = "RunConfigValidationInvalid")]
+    Invalid {
+        errors: Vec<ConfigValidationErrorWire>,
+    },
+    #[serde(rename = "PipelineConfigValidationValid")]
+    Valid {
+        #[serde(rename = "pipelineName")]
+        _pipeline_name: String,
+    },
+    #[serde(rename = "PipelineNotFoundError")]
+    NotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "InvalidSubsetError")]
+    InvalidSubset {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Wire shape for ONE `ConfigValidationError` — note this struct only
+/// reads the `path` and `reason` fields (see [`DgClient::validate_run_config`]
+/// for the rationale; `serde(other)` would silently drop free-form text
+/// fields, but the route-layer mutation check depends on the fact that
+/// those fields are NEVER deserialized here, so even an accidental
+/// `serde_json::Value::to_string` downstream cannot echo them back).
+#[derive(Debug, Deserialize)]
+struct ConfigValidationErrorWire {
+    path: Vec<String>,
+    reason: String,
+}
+
+/// Convert the wire union into the public [`ConfigValidationOutcome`].
+/// Dagster's `InvalidSubsetError` is collapsed to `NotFound` with no
+/// errors: a subset-mismatch never includes structured `path`/`reason`
+/// entries (the union uses a different shape on the `InvalidSubsetError`
+/// branch), and the route layer renders an empty `errors` array the same
+/// way it renders a non-empty one. `Unknown` is treated as `NotFound` —
+/// the safer of the two "refused" outcomes, never a false `Valid`.
+fn config_validation_outcome_from(wire: ConfigValidationResult) -> ConfigValidationOutcome {
+    match wire {
+        ConfigValidationResult::Invalid { errors } => ConfigValidationOutcome::Invalid {
+            errors: errors
+                .into_iter()
+                .map(|e| ConfigValidationError {
+                    path: e.path,
+                    reason: e.reason,
+                })
+                .collect(),
+        },
+        ConfigValidationResult::Valid { .. } => ConfigValidationOutcome::Valid,
+        ConfigValidationResult::NotFound { .. }
+        | ConfigValidationResult::InvalidSubset { .. }
+        | ConfigValidationResult::Unknown => ConfigValidationOutcome::NotFound,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RunConfigSchemaData {
+    #[serde(rename = "runConfigSchemaOrError")]
+    run_config_schema_or_error: RunConfigSchemaOrError,
+}
+
+/// Union wire shape for `runConfigSchemaOrError`. Only `Schema` and
+/// `PipelineNotFoundError` map to special-cased variants here;
+/// `InvalidSubsetError`, `ModeNotFoundError`, and `PythonError` each
+/// capture a `message` but are flattened to `Other(..)` in
+/// [`DgClient::run_config_schema`], which surfaces them as a 503 (the
+/// route layer does NOT see `message` — the field is `#[allow(dead_code)]`
+/// on purpose so it cannot accidentally be read or rendered).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum RunConfigSchemaOrError {
+    #[serde(rename = "RunConfigSchema")]
+    Schema {
+        #[serde(rename = "rootDefaultYaml")]
+        root_default_yaml: String,
+    },
+    #[serde(rename = "PipelineNotFoundError")]
+    NotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "InvalidSubsetError")]
+    InvalidSubset {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "ModeNotFoundError")]
+    ModeNotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "PythonError")]
+    PythonError {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+}
+
+impl RunConfigSchemaOrError {
+    /// The wire-level `message` for any variant that carries one (the
+    /// `message` is `None` for `Schema`, which is why this returns
+    /// `None` for it). Used by [`DgClient::run_config_schema`] to
+    /// surface a useful 503 for `InvalidSubsetError` / `ModeNotFoundError`
+    /// / `PythonError`. The function is `pub(crate)` only — never
+    /// `pub` — so the public surface of this crate does not expose
+    /// upstream text. `message` is deliberately dead-coded at every
+    /// call site (see the `#[allow(dead_code)]` attributes on the
+    /// variants above) to make it impossible for a future contributor
+    /// to render it into a response without first adding the
+    /// `pub(crate) -> pub` boundary and getting the diff into review.
+    #[allow(dead_code, reason = "see `DgClient::run_config_schema`'s refusal arm")]
+    fn dagster_message(&self) -> Option<&str> {
+        match self {
+            RunConfigSchemaOrError::Schema { .. } | RunConfigSchemaOrError::NotFound { .. } => None,
+            RunConfigSchemaOrError::InvalidSubset { message }
+            | RunConfigSchemaOrError::ModeNotFound { message }
+            | RunConfigSchemaOrError::PythonError { message } => message.as_deref(),
+        }
+    }
+
+    /// The `__typename` of the deserialized variant, used in lieu of
+    /// `message` for the 503 path when Dagster omits a message string.
+    fn typename(&self) -> &'static str {
+        match self {
+            RunConfigSchemaOrError::Schema { .. } => "RunConfigSchema",
+            RunConfigSchemaOrError::NotFound { .. } => "PipelineNotFoundError",
+            RunConfigSchemaOrError::InvalidSubset { .. } => "InvalidSubsetError",
+            RunConfigSchemaOrError::ModeNotFound { .. } => "ModeNotFoundError",
+            RunConfigSchemaOrError::PythonError { .. } => "PythonError",
+        }
+    }
+}
+
+/// `runConfigSchemaOrError`'s successful payload — what the route
+/// layer returns as `defaultConfigYaml`. Kept separate from
+/// [`RunConfigSchemaOrError`] (the wire union) so the public API does
+/// not carry an enum with a 503-only arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunConfigSchema {
+    /// The default config for the pipeline, as a YAML string from
+    /// `Dagster`'s `RunConfigSchema.rootDefaultYaml`. Kept as YAML
+    /// (not parsed to JSON) — see [`DgClient::run_config_schema`] for
+    /// the rationale.
+    pub root_default_yaml: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TerminateRunData {
     #[serde(rename = "terminateRun")]
     terminate_run: TerminateRunResultBody,
@@ -292,6 +549,47 @@ pub struct RunStatusInfo {
     /// recorded one yet (WS4 item G1 — the value the API layer reports as
     /// `startedAt` when it can, rather than fabricating `now()`).
     pub start_time: Option<f64>,
+    /// Unix seconds the run ended, or `None` if `Dagster` hasn't
+    /// recorded an end yet (still running). Plan 1f: the run-finished
+    /// event route needs this to compute `durationSeconds` and decide
+    /// whether the run was over its `pipeline_sla.max_duration_seconds`.
+    pub end_time: Option<f64>,
+}
+
+/// One step in a runs × steps matrix row — the matrix's per-cell shape,
+/// `stepKey`/`status`/`durationMs`, sized to what the route layer renders
+/// (no `startMs`/`endMs`/materializations, since the matrix view is a
+/// grid, not a step detail view).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStepMatrixEntry {
+    /// The step's key (e.g. `"run_bronze_maintenance"`).
+    pub step_key: String,
+    /// The step's raw `Dagster` status string (the route maps it through
+    /// [`map_run_status`] for the response, the same way every other
+    /// step status the API returns is mapped — see [`RunStep::status`]).
+    pub status: String,
+    /// `endTime - startTime` in milliseconds — `None` when either side is
+    /// missing (a step that never started, or one whose timestamps Dagster
+    /// hasn't recorded yet), never a fabricated `0`.
+    pub duration_ms: Option<i64>,
+}
+
+/// One row in a runs × steps matrix — a run plus its per-step statuses,
+/// returned by [`DgClient::list_runs_with_steps_for_job`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWithSteps {
+    /// The run's id.
+    pub run_id: String,
+    /// The run's `Dagster` status string (raw, like [`DgRun::status`]).
+    pub status: String,
+    /// Unix seconds the run started, or `None` if `Dagster` hasn't
+    /// recorded one — the route layer turns this into `startedAt` and
+    /// leaves it `null` rather than fabricating `now()`.
+    pub start_time: Option<f64>,
+    /// Each step's key + status + duration, in `Dagster`'s reported order.
+    pub steps: Vec<RunStepMatrixEntry>,
 }
 
 /// One asset materialization reported by a step, matching
@@ -333,6 +631,11 @@ pub struct RunStep {
     pub end_ms: Option<i64>,
     /// Assets this step materialized, in `Dagster`'s reported order.
     pub materializations: Vec<StepMaterialization>,
+    /// How many attempts `Dagster` recorded for this step
+    /// (`stepStats.attempts`, a list of `RunMarker { startTime endTime }`).
+    /// `1` for a step that ran once, `0` for one that never started
+    /// (empty/absent list), `2+` for one that was retried.
+    pub attempts: usize,
 }
 
 /// One log line, from a `MessageEvent`-implementing event in a run's log
@@ -376,6 +679,57 @@ pub struct LaunchOutcome {
     pub run_id: Option<String>,
     /// A human-readable failure reason, present on failure.
     pub error: Option<String>,
+}
+
+/// One structured validation error from
+/// [`DgClient::validate_run_config`]. The fields are the ONLY two this
+/// crate reads from Dagster's `ConfigValidationError`: the structured
+/// `path` (where in the config) and the enum `reason` (why). Dagster's
+/// own `message` text — free-form, sometimes a long English sentence —
+/// is intentionally NOT carried here; AGENTS.md principle 4 forbids
+/// forwarding upstream error text in a response, and this crate never
+/// builds a `String` from `message` so the caller cannot accidentally
+/// do so either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValidationError {
+    /// Path within the run config the error refers to (e.g.
+    /// `["ops", "run_ingest", "config", "connector_id"]`). `Vec<String>`
+    /// because `ConfigValidationError.path` is `[String!]` on the
+    /// Dagster side (`dagster_graphql/schema/pipelines/config.py:136`).
+    pub path: Vec<String>,
+    /// `EvaluationErrorReason` enum value as a string (one of
+    /// `RUNTIME_TYPE_MISMATCH`, `MISSING_REQUIRED_FIELD`,
+    /// `MISSING_REQUIRED_FIELDS`, `FIELD_NOT_DEFINED`,
+    /// `FIELDS_NOT_DEFINED`, `SELECTOR_FIELD_ERROR`).
+    pub reason: String,
+}
+
+/// Outcome of [`DgClient::validate_run_config`]. The three variants
+/// mirror `PipelineConfigValidationResult`'s four-typename union, minus
+/// `PipelineConfigValidationValid` (collapsed into `Valid` since a
+/// valid result carries no further data the caller needs).
+///
+/// This is deliberately NOT a [`crate::DgError`]: a typed refusal is
+/// a normal outcome of validation, the same shape `launch_run`'s
+/// `LaunchOutcome.error` already uses, never an `Err`. `Err` is
+/// reserved for transport failures and malformed GraphQL responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigValidationOutcome {
+    /// `RunConfigValidationInvalid` / `InvalidSubsetError` — the
+    /// caller-supplied config (or selector subset) is rejected by
+    /// Dagster; the structured errors are returned as-is.
+    Invalid {
+        /// Every error Dagster reported, in its reported order.
+        errors: Vec<ConfigValidationError>,
+    },
+    /// `PipelineConfigValidationValid` — the config is valid; the
+    /// caller may launch.
+    Valid,
+    /// `PipelineNotFoundError` — `job_name` does not name a known
+    /// pipeline in this repository/location. Callers map this to a
+    /// 404 — `routes::pipelines::config_schema` already returns 404
+    /// for an unknown id, and this variant carries the same answer.
+    NotFound,
 }
 
 /// Shared decode/branch tail for [`DgClient::launch_run`],
@@ -513,7 +867,8 @@ impl DgClient {
         // against known job names by the caller.
         let query = format!(
             "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId jobName status startTime endTime }} }} \
+             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
+             creationTime parentRunId rootRunId tags {{ key value }} }} }} \
              }} }}"
         );
         let data: RunsOrErrorData = self.execute(&query, None).await?;
@@ -540,6 +895,95 @@ impl DgClient {
         );
         let data: ConfiguredRunsOrErrorData = self.execute(&query, None).await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
+    }
+
+    /// The runs × steps matrix for `job_name` (Plan 1c, R2): up to `limit`
+    /// most-recent runs, each with its `stepStats { stepKey status
+    /// startTime endTime }`. ONE GraphQL call — the route layer MUST NOT
+    /// fan out per run (`with_materializations` would be a tempting extra
+    /// field but is read out separately by [`DgClient::run_steps`] per
+    /// single run when needed; the matrix deliberately excludes it to
+    /// keep the one-call contract). Modeled on
+    /// [`DgClient::list_runs_for_job`]'s `pipelineName` filter.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_with_steps_for_job(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<RunWithSteps>, DgError> {
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId status startTime \
+             stepStats {{ stepKey status startTime endTime }} }} }} }} }}"
+        );
+        let body = json!({ "query": query });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+        }
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        if let Some(errors) = parsed.get("errors") {
+            return Err(DgError::Server(truncate_300(&errors.to_string())));
+        }
+        let results = parsed
+            .pointer("/data/runsOrError/results")
+            .and_then(Value::as_array);
+        let Some(results) = results else {
+            return Ok(Vec::new());
+        };
+        Ok(results.iter().map(run_with_steps_from_value).collect())
+    }
+
+    /// Like [`list_runs_for_job`], but each run is paired with its summed
+    /// materialization row count (plan 1f). Backed by a single GraphQL
+    /// query that pulls `stepStats { materializations { metadataEntries } }`
+    /// alongside the run fields, so the volume route stays one round trip
+    /// rather than N+1 against `Dagster`. Rows are summed across every
+    /// step's materializations; a run with no `"rows"`-labelled metadata
+    /// reports `rows = None` (a measurement gap, never `0`).
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_for_job_with_materializations(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<DgRunWithRows>, DgError> {
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
+             creationTime parentRunId rootRunId tags {{ key value }} \
+             stepStats {{ stepKey status startTime endTime \
+             materializations {{ metadataEntries {{ __typename \
+             ... on IntMetadataEntry {{ label intValue }} }} }} \
+             }} }} }} }} }}"
+        );
+        // `metadataEntries` is a heterogeneous GraphQL union whose
+        // `serde` untag would silently drop real variants, so the run
+        // results are pulled as raw JSON and parsed with the same
+        // value-navigation approach `pipeline_run_status` already uses
+        // for `stepStats`.
+        let value: Value = self.execute(&query, None).await?;
+        let results = value
+            .pointer("/runsOrError/results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(results.len());
+        for run_value in results {
+            let run: DgRun = serde_json::from_value(run_value.clone())
+                .map_err(|e| DgError::Server(format!("Dagster run payload: {e}")))?;
+            let rows = rows_for_run(&run_value);
+            out.push(DgRunWithRows { run, rows });
+        }
+        Ok(out)
     }
 
     /// List jobs in the default repository together with each job's
@@ -623,6 +1067,8 @@ impl DgClient {
                 source_ref: metadata_value(&h.solid.definition.metadata, "source_ref"),
                 commit: metadata_value(&h.solid.definition.metadata, "commit"),
                 sql: metadata_value(&h.solid.definition.metadata, "sql"),
+                reads: metadata_lines(&h.solid.definition.metadata, "reads"),
+                writes: metadata_lines(&h.solid.definition.metadata, "writes"),
             })
             .collect();
         let edges = solid_handles
@@ -721,6 +1167,139 @@ impl DgClient {
         Ok(launch_outcome_from(data.launch_run))
     }
 
+    /// Validate `run_config` against `job_name`'s schema BEFORE launching
+    /// it. Mirrors `query isPipelineConfigValid(pipeline: $sel, mode:
+    /// "default", runConfigData: $cfg) { ... }` (R4 plan 2c).
+    ///
+    /// The query selects ONLY `path` and `reason` from `ConfigValidationError`,
+    /// never `message`/`stack`/`valueRep`/`field`/`fields`/... — those are
+    /// the strings and structured objects Dagster itself attaches to its
+    /// own error type, several of which carry free-form English text (a
+    /// "`MissingFieldConfigError.field.name`", a `RuntimeMismatchConfigError
+    /// .value_rep` like `"'123' of type 'String'"`). Carrying them into the
+    /// `ConfigValidationOutcome::Invalid.errors` would let the route layer
+    /// accidentally (or by reviewer pressure) echo upstream text back to
+    /// the caller; AGENTS.md principle 4 forbids that. The plan's mutation
+    /// check (`passing Dagster's free text through in the 400 must FAIL`)
+    /// is the regression test for this discipline.
+    ///
+    /// `mode` is `"default"` for every job this client targets (the same
+    /// literal `launch_run` already passes — `lakehouse-dagster` was never
+    /// multi-mode). `runConfigData` is sent as a JSON OBJECT (NOT a string),
+    /// matching [`DgClient::launch_run_with_config`]'s shape and Dagster
+    /// 1.13's `RunConfigData` scalar definition.
+    ///
+    /// A typed refusal (`RunConfigValidationInvalid`,
+    /// `PipelineNotFoundError`, `InvalidSubsetError`) is reported as
+    /// `Ok(ConfigValidationOutcome::{Invalid, NotFound})`, not `Err` —
+    /// `Err` is reserved for transport failures and malformed GraphQL
+    /// responses, mirroring [`DgClient::launch_run`]'s posture for the
+    /// same shape.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn validate_run_config(
+        &self,
+        job_name: &str,
+        run_config: &Value,
+    ) -> Result<ConfigValidationOutcome, DgError> {
+        let query = "query($sel: PipelineSelector!, $cfg: RunConfigData!) { \
+                      isPipelineConfigValid(pipeline: $sel, mode: \"default\", \
+                      runConfigData: $cfg) { \
+                      __typename \
+                      ... on RunConfigValidationInvalid { errors { path reason } } \
+                      ... on InvalidSubsetError { message } \
+                      ... on PipelineConfigValidationValid { pipelineName } \
+                      ... on PipelineNotFoundError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": job_name,
+            },
+            "cfg": run_config,
+        });
+        // `execute<T>` unwraps `data` into `T`; see `GqlResponse`. A raw
+        // `Value` parse is NOT used here (unlike `pipeline_run_status`) —
+        // the union is closed (`Invalid | Valid | NotFound | PythonError`),
+        // so a typed `Deserialize` keeps the failure-to-`__typename`
+        // mapping compile-checked.
+        let data: IsPipelineConfigValidData = self.execute(query, Some(variables)).await?;
+        Ok(config_validation_outcome_from(
+            data.is_pipeline_config_valid,
+        ))
+    }
+
+    /// Fetch `job_name`'s run-config schema (its default config in YAML),
+    /// used by `GET /api/pipelines/{id}/config-schema` (R4 plan 2c).
+    /// Mirrors `query runConfigSchemaOrError(selector: $sel, mode: "default")
+    /// { ... on RunConfigSchema { rootDefaultYaml } ... on
+    /// PipelineNotFoundError { message } }`.
+    ///
+    /// `rootDefaultYaml` is a YAML string on Dagster's side (`run_config
+    /// .py:51`, `resolve_rootDefaultYaml`). Parsing YAML into JSON would
+    /// require a `serde_yaml`-family dep this workspace does not yet
+    /// depend on (and `serde_yaml` is deprecated upstream); the route
+    /// layer surfaces the raw YAML alongside `defaultConfig: null`
+    /// rather than carrying a YAML parser for one field. Dagster
+    /// emits at most a few dozen lines of plain YAML for a job's
+    /// default config, and a console form built from JSON Schema /
+    /// per-field editors does not need to pre-fill it anyway.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`]. A `PipelineNotFoundError` is
+    /// collapsed to `Ok(None)` — the same posture
+    /// [`DgClient::pipeline_run_status`] already takes for its own
+    /// `RunNotFoundError` — and the route maps that to a 404.
+    pub async fn run_config_schema(
+        &self,
+        job_name: &str,
+    ) -> Result<Option<RunConfigSchema>, DgError> {
+        let query = "query($sel: PipelineSelector!) { \
+                      runConfigSchemaOrError(selector: $sel, mode: \"default\") { \
+                      __typename \
+                      ... on RunConfigSchema { rootDefaultYaml } \
+                      ... on InvalidSubsetError { message } \
+                      ... on PipelineNotFoundError { message } \
+                      ... on ModeNotFoundError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": job_name,
+            }
+        });
+        let data: RunConfigSchemaData = self.execute(query, Some(variables)).await?;
+        match data.run_config_schema_or_error {
+            RunConfigSchemaOrError::Schema { root_default_yaml } => {
+                Ok(Some(RunConfigSchema { root_default_yaml }))
+            }
+            // `PipelineNotFoundError` is the only non-Schema typename
+            // this client surfaces as `None`; the route maps that to a
+            // 404. Other refusal typenames (`ModeNotFoundError`,
+            // `InvalidSubsetError`, `PythonError`) ARE reported as
+            // `Err(DgError::Server(...))` so they surface as a 503 like
+            // every other `Dagster`-side error in this crate — the
+            // "no such job" answer is the only one that collapses to a
+            // "not found" answer without surfacing the orchestrator's
+            // own message.
+            RunConfigSchemaOrError::NotFound { .. } => Ok(None),
+            RunConfigSchemaOrError::InvalidSubset { .. }
+            | RunConfigSchemaOrError::ModeNotFound { .. }
+            | RunConfigSchemaOrError::PythonError { .. } => {
+                let wire = &data.run_config_schema_or_error;
+                let msg = wire.dagster_message().unwrap_or_else(|| wire.typename());
+                Err(DgError::Server(msg.to_owned()))
+            }
+        }
+    }
+
     /// Terminate a running run, matching `mutation { terminateRun(runId:
     /// ...) }`. Used by `cancelRun` (Phase 2, Task 2.5). Uses
     /// `SAFE_TERMINATE` (the default `terminatePolicy`) rather than
@@ -762,28 +1341,149 @@ impl DgClient {
         })
     }
 
-    /// Re-execute a finished (failed/cancelled) run from the start, matching
+    /// Re-execute a finished (failed/cancelled) run, matching
     /// `mutation { launchRunReexecution(reexecutionParams: { parentRunId,
-    /// strategy: ALL_STEPS }) }`. Used by `retryRun` (Phase 2, Task 2.5).
-    /// `ALL_STEPS`, not `FROM_FAILURE`: the mock's `retryRun` restarts the
-    /// whole run (`processed`/`accepted`/... reset to 0), which
-    /// `ALL_STEPS` is the closer match for.
+    /// strategy }) }`. Used by `retryRun` (Phase 2, Task 2.5), which
+    /// defaults to [`ReexecutionStrategy::AllSteps`] and offers
+    /// [`ReexecutionStrategy::FromFailure`] for a failed run.
     ///
     /// # Errors
     ///
     /// See [`DgClient::launch_run`].
-    pub async fn launch_reexecution(&self, parent_run_id: &str) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($parentRunId: String!) { \
-                      launchRunReexecution(reexecutionParams: { parentRunId: $parentRunId, \
-                      strategy: ALL_STEPS }) { \
-                      __typename \
-                      ... on LaunchRunSuccess { run { runId } } \
-                      ... on PythonError { message } \
-                      ... on RunConfigValidationInvalid { errors { message } } \
-                      } }";
+    pub async fn launch_reexecution(
+        &self,
+        parent_run_id: &str,
+        strategy: ReexecutionStrategy,
+    ) -> Result<LaunchOutcome, DgError> {
+        // `strategy` is an enum literal from a closed Rust enum, never
+        // caller text, so it is safe to place in the query string.
+        let query = format!(
+            "mutation($parentRunId: String!) {{ \
+             launchRunReexecution(reexecutionParams: {{ parentRunId: $parentRunId, \
+             strategy: {} }}) {{ \
+             __typename \
+             ... on LaunchRunSuccess {{ run {{ runId }} }} \
+             ... on PythonError {{ message }} \
+             ... on RunConfigValidationInvalid {{ errors {{ message }} }} \
+             }} }}",
+            strategy.graphql()
+        );
         let data: LaunchReexecutionData = self
-            .execute(query, Some(json!({ "parentRunId": parent_run_id })))
+            .execute(&query, Some(json!({ "parentRunId": parent_run_id })))
             .await?;
+        Ok(launch_outcome_from(data.launch_run_reexecution))
+    }
+
+    /// Re-execute a finished run, but only the named `step_keys`. Two
+    /// round trips: the parent run's `pipelineName`, `rootRunId`, and
+    /// `runConfig` are looked up first; the mutation then calls
+    /// `launchRunReexecution(executionParams: { selector, runConfigData,
+    /// stepKeys, executionMetadata: { parentRunId, rootRunId } })`.
+    ///
+    /// Why the lookup-then-mutate shape: Dagster's
+    /// `launchRunReexecution(executionParams)` requires the parent run's
+    /// config to be passed back as `runConfigData` (`dagster_graphql/
+    /// schema/inputs.py:322`, `RunConfigData` accepts the OBJECT form —
+    /// see [`DgClient::launch_run_with_config`] for the same declared
+    /// type), and the same mutation enforces EXACTLY ONE of
+    /// `executionParams` / `reexecutionParams`, so a `strategy`-based
+    /// `reexecutionParams` would lose `stepKeys`. The single source of
+    /// `runConfig` Dagster exposes is `Run.runConfig`
+    /// (`schema/pipelines/pipeline.py:646`, resolver `:811`), a generic
+    /// `RunConfigData` scalar; its JSON shape round-trips straight back
+    /// to `runConfigData` without any YAML parsing here — no
+    /// `serde_yaml` / `dump_run_config_yaml` dependency introduced.
+    ///
+    /// A parent that does not resolve to a `Run` (`RunNotFoundError`,
+    /// `__typename` other than `"Run"`) is returned as
+    /// `Ok(LaunchOutcome { error: Some(_), run_id: None })` — matching
+    /// [`DgClient::launch_reexecution`]'s posture. The route layer maps
+    /// that to a `404`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`]. A transport-level failure on
+    /// either the lookup or the mutation becomes [`DgError::Transport`]
+    /// / [`DgError::Server`]; a Dagster-side typed refusal becomes
+    /// `Ok(LaunchOutcome { error: Some(msg), .. })`.
+    pub async fn launch_reexecution_of_steps(
+        &self,
+        parent_run_id: &str,
+        step_keys: &[&str],
+    ) -> Result<LaunchOutcome, DgError> {
+        // ── Lookup: parent run's pipelineName, rootRunId, runConfig.
+        // `runConfig` is a `RunConfigData` (`GenericScalar`) — Dagster
+        // serialises the underlying Python dict as a JSON object. We
+        // forward that object as `runConfigData` on the mutation, the
+        // same OBJECT form `launch_run_with_config` already validates
+        // (`$cfg: RunConfigData!`, body asserted in its own wiremock
+        // test). No YAML parsing is needed: re-serialising this `Value`
+        // straight through GraphQL JSON gives Dagster the exact same
+        // shape it returned.
+        let lookup_query = "query($rid: ID!) { pipelineRunOrError(runId: $rid) { \
+                            __typename \
+                            ... on Run { pipelineName rootRunId runConfig } } }";
+        // `execute<T>` unwraps `data` into `T` (see `GqlResponse`), so
+        // `lookup` is already the `{pipelineRunOrError: ...}` object
+        // — not the whole response. Same posture as
+        // [`DgClient::pipeline_run_status`], which reads
+        // `parsed.pointer("/data/...")` only because it uses a raw
+        // `Value` parse to tolerate a `Run` vs `RunNotFoundError` split.
+        let lookup: Value = self
+            .execute(lookup_query, Some(json!({ "rid": parent_run_id })))
+            .await?;
+        let parent = &lookup["pipelineRunOrError"];
+        if parent.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(LaunchOutcome {
+                run_id: None,
+                error: Some("RunNotFoundError".to_owned()),
+            });
+        }
+        let pipeline_name = parent
+            .get("pipelineName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DgError::Server("parent run missing pipelineName".to_owned()))?
+            .to_owned();
+        let root_run_id = parent
+            .get("rootRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // `runConfig` is `RunConfigData!` on `Run` (schema/pipelines/
+        // pipeline.py:646) — Dagster always returns it for a Run. We
+        // still tolerate its absence as an empty object rather than
+        // crashing, so a future schema change never makes this method
+        // panic on `as_object().unwrap()`.
+        let run_config = parent
+            .get("runConfig")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+
+        // ── Mutation: launchRunReexecution with executionParams.
+        // `ExecutionParams.stepKeys` is `[String!]` (inputs.py:331-336).
+        let mutation = "mutation($sel: JobOrPipelineSelector!, \
+                         $cfg: RunConfigData!, $keys: [String!]!, \
+                         $parentRunId: String!, $rootRunId: String) { \
+                         launchRunReexecution(executionParams: { \
+                         selector: $sel, runConfigData: $cfg, stepKeys: $keys, \
+                         executionMetadata: { parentRunId: $parentRunId, \
+                         rootRunId: $rootRunId } }) { \
+                         __typename \
+                         ... on LaunchRunSuccess { run { runId } } \
+                         ... on PythonError { message } \
+                         ... on RunConfigValidationInvalid { errors { message } } \
+                         } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": pipeline_name,
+            },
+            "cfg": run_config,
+            "keys": step_keys,
+            "parentRunId": parent_run_id,
+            "rootRunId": root_run_id,
+        });
+        let data: LaunchReexecutionData = self.execute(mutation, Some(variables)).await?;
         Ok(launch_outcome_from(data.launch_run_reexecution))
     }
 
@@ -847,6 +1547,110 @@ impl DgClient {
         })
     }
 
+    /// Ask the webserver to reload this client's code location, so jobs
+    /// and schedules built at import time (authored pipelines,
+    /// `authored_factory.py`) are rebuilt from the API's current data.
+    /// Only a code server started with `dagster code-server start`
+    /// re-imports its module on reload; a plain `dagster api grpc` server
+    /// would reconnect and serve the same definitions.
+    ///
+    /// A GraphQL-level refusal (`RepositoryLocationNotFound`,
+    /// `ReloadNotSupported`, a `PythonError` while loading) is returned as
+    /// `Ok` with `error` set, like [`DgClient::launch_run`].
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn reload_location(&self) -> Result<ReloadOutcome, DgError> {
+        let query = "mutation($name: String!) { reloadRepositoryLocation(repositoryLocationName: $name) { \
+                      __typename \
+                      ... on WorkspaceLocationEntry { locationOrLoadError { __typename \
+                        ... on PythonError { message } } } \
+                      ... on RepositoryLocationNotFound { message } \
+                      ... on ReloadNotSupported { message } \
+                      ... on UnauthorizedError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let data: Value = self
+            .execute(query, Some(json!({ "name": self.location })))
+            .await?;
+        Ok(reload_outcome_from(&data["reloadRepositoryLocation"]))
+    }
+
+    /// The most recent ticks of one schedule, newest first: when it fired,
+    /// whether that launched a run, was skipped, or failed. A schedule that
+    /// does not exist reads as an empty list, so a job without one simply
+    /// has no ticks.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn schedule_ticks(
+        &self,
+        schedule_name: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleTick>, DgError> {
+        let query = "query($sel: ScheduleSelector!, $limit: Int!) { scheduleOrError(scheduleSelector: $sel) { \
+                      __typename \
+                      ... on Schedule { scheduleState { ticks(limit: $limit) { \
+                        tickId status timestamp runIds skipReason error { message } } } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "scheduleName": schedule_name,
+            },
+            "limit": limit,
+        });
+        let data: Value = self.execute(query, Some(variables)).await?;
+        Ok(schedule_ticks_from(&data["scheduleOrError"]))
+    }
+
+    /// The most recent ticks of one sensor, newest first: when it evaluated,
+    /// whether it launched a run, was skipped, or failed. A sensor that does
+    /// not exist reads as an empty list (R3 plan 2a — `authored__<id>_after`
+    /// sensors only exist once their pipeline has `depends_on`; before that,
+    /// the route merges in `[]` rather than failing).
+    ///
+    /// The query path is `sensorOrError(sensorSelector)` (note: the
+    /// singular `SensorSelector`, NOT `SensorOrError.sensors(...)`) —
+    /// `Dagster`'s `1.13.20` GraphQL schema names the selector type
+    /// `SensorSelector` and the matching field `sensorOrError`. Verified
+    /// live against this repository's Dagster stack; see the
+    /// `schedule_ticks_from`-style unit test in this file.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn sensor_ticks(
+        &self,
+        sensor_name: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleTick>, DgError> {
+        let query = "query($sel: SensorSelector!, $limit: Int!) { sensorOrError(sensorSelector: $sel) { \
+                      __typename \
+                      ... on Sensor { sensorState { ticks(limit: $limit) { \
+                        tickId status timestamp runIds skipReason error { message } } } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "sensorName": sensor_name,
+            },
+            "limit": limit,
+        });
+        let data: Value = self.execute(query, Some(variables)).await?;
+        // The schedule and sensor tick payloads share the same
+        // `{ tickId, status, timestamp, runIds, skipReason, error }`
+        // shape; a shared `ticks_from_state` helper parses both — only
+        // the parent key differs (`scheduleState` vs `sensorState`). A
+        // `SensorNotFoundError` typename has no `sensorState`, so the
+        // helper returns `[]`.
+        Ok(sensor_ticks_from(&data["sensorOrError"]))
+    }
+
     /// A single run's live status + per-step status, matching
     /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
     /// `Run`).
@@ -869,7 +1673,7 @@ impl DgClient {
         run_id: &str,
     ) -> Result<Option<RunStatusInfo>, DgError> {
         let query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename \
-                      ... on Run { status startTime stepStats { stepKey status } } } }";
+                      ... on Run { status startTime endTime stepStats { stepKey status } } } }";
         let body = json!({ "query": query, "variables": { "rid": run_id } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let text = resp.text().await?;
@@ -888,6 +1692,7 @@ impl DgClient {
             .unwrap_or("unknown")
             .to_owned();
         let start_time = run.get("startTime").and_then(Value::as_f64);
+        let end_time = run.get("endTime").and_then(Value::as_f64);
         let steps = run
             .get("stepStats")
             .and_then(Value::as_array)
@@ -912,6 +1717,7 @@ impl DgClient {
             status,
             steps,
             start_time,
+            end_time,
         }))
     }
 
@@ -940,7 +1746,8 @@ impl DgClient {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { stepStats { stepKey status startTime endTime \
                       materializations { assetKey { path } metadataEntries { __typename \
-                      ... on IntMetadataEntry { label intValue } } } } } } }";
+                      ... on IntMetadataEntry { label intValue } } } \
+                      attempts { startTime endTime } } } } }";
         let body = json!({ "query": query, "variables": { "rid": run_id } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let text = resp.text().await?;
@@ -1110,6 +1917,98 @@ pub struct GraphOp {
     /// `sql=` to `source_metadata` (`dagster/dispar_orchestrate/op_metadata.py`),
     /// which is every op in this code location today.
     pub sql: Option<String>,
+    /// What the op's own code reads, one short phrase each, from the
+    /// newline-joined `"reads"` entry `source_metadata` writes. Declared by
+    /// the op, not observed from a run. Empty when the op declares nothing.
+    pub reads: Vec<String>,
+    /// What the op's own code writes; see [`Self::reads`].
+    pub writes: Vec<String>,
+}
+
+/// What [`DgClient::reload_location`] reports: `error` is `None` when the
+/// location reloaded and loaded cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// Why the reload was refused or the location failed to load, as the
+    /// orchestrator said it. Server-side only: callers log it and never put
+    /// it in a response.
+    pub error: Option<String>,
+}
+
+fn reload_outcome_from(v: &Value) -> ReloadOutcome {
+    let typename = v["__typename"].as_str().unwrap_or("");
+    if typename == "WorkspaceLocationEntry" {
+        let load = &v["locationOrLoadError"];
+        if load["__typename"] == "PythonError" {
+            return ReloadOutcome {
+                error: Some(
+                    load["message"]
+                        .as_str()
+                        .unwrap_or("location failed to load")
+                        .to_owned(),
+                ),
+            };
+        }
+        return ReloadOutcome { error: None };
+    }
+    ReloadOutcome {
+        error: Some(
+            v["message"]
+                .as_str()
+                .map_or_else(|| format!("reload refused ({typename})"), str::to_owned),
+        ),
+    }
+}
+
+/// One schedule evaluation, from [`DgClient::schedule_ticks`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleTick {
+    /// The tick's id.
+    pub tick_id: String,
+    /// `SUCCESS` (launched runs), `SKIPPED`, `FAILURE` or `STARTED`.
+    pub status: String,
+    /// Unix seconds the tick was evaluated.
+    pub timestamp: f64,
+    /// Runs the tick launched.
+    pub run_ids: Vec<String>,
+    /// Why the schedule decided not to launch, in the schedule's own
+    /// words (`SkipReason` in the code location).
+    pub skip_reason: Option<String>,
+    /// Whether the tick failed with an error. The error text itself is the
+    /// orchestrator's and is not carried here (AGENTS.md principle 4).
+    pub failed: bool,
+}
+
+fn schedule_ticks_from(v: &Value) -> Vec<ScheduleTick> {
+    ticks_from_state(&v["scheduleState"])
+}
+
+fn sensor_ticks_from(v: &Value) -> Vec<ScheduleTick> {
+    ticks_from_state(&v["sensorState"])
+}
+
+fn ticks_from_state(state: &Value) -> Vec<ScheduleTick> {
+    state["ticks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| ScheduleTick {
+            tick_id: t["tickId"]
+                .as_str()
+                .map_or_else(|| t["tickId"].to_string(), str::to_owned),
+            status: t["status"].as_str().unwrap_or("").to_owned(),
+            timestamp: t["timestamp"].as_f64().unwrap_or(0.0),
+            run_ids: t["runIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().map(str::to_owned))
+                .collect(),
+            skip_reason: t["skipReason"].as_str().map(str::to_owned),
+            failed: !t["error"].is_null(),
+        })
+        .collect()
 }
 
 /// Look up `label` in `entries` (`definition.metadata`'s `{key, value}`
@@ -1118,6 +2017,21 @@ pub struct GraphOp {
 /// deviation note on why this client reads a flat key/value list instead of
 /// the plan sketch's `TextMetadataEntry` union). `None` when no entry with
 /// that key exists.
+/// A newline-joined `label` entry split back into its phrases (see
+/// `dagster/dispar_orchestrate/op_metadata.py::source_metadata`); blank
+/// lines are dropped, and an absent entry is an empty list.
+fn metadata_lines(entries: &[MetadataItem], label: &str) -> Vec<String> {
+    metadata_value(entries, label)
+        .map(|v| {
+            v.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn metadata_value(entries: &[MetadataItem], label: &str) -> Option<String> {
     entries
         .iter()
@@ -1214,6 +2128,61 @@ struct DependsOnSolid {
     name: String,
 }
 
+/// Convert one `runsOrError.results` element into a [`RunWithSteps`] —
+/// one row of the runs × steps matrix. The `stepStats` array is mapped
+/// through [`run_step_matrix_entry_from_value`] for the per-step parse;
+/// the function reads nothing else (no `creationTime`, no `tags`, no
+/// `parentRunId`, no `rootRunId`) because the matrix view does not
+/// surface them.
+fn run_with_steps_from_value(r: &Value) -> RunWithSteps {
+    let steps = r
+        .get("stepStats")
+        .and_then(Value::as_array)
+        .map(|stats| stats.iter().map(run_step_matrix_entry_from_value).collect())
+        .unwrap_or_default();
+    RunWithSteps {
+        run_id: r
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status: r
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        start_time: r.get("startTime").and_then(Value::as_f64),
+        steps,
+    }
+}
+
+/// Convert one `stepStats` element into a [`RunStepMatrixEntry`] — the
+/// matrix's per-cell shape (`stepKey`/`status`/`durationMs`), narrower
+/// than [`RunStep`] (no materializations, no startMs/endMs, no attempts).
+/// `durationMs` is `None` when either `startTime` or `endTime` is
+/// missing on the wire — never a fabricated `0`.
+fn run_step_matrix_entry_from_value(s: &Value) -> RunStepMatrixEntry {
+    let start_ms = seconds_to_ms(s.get("startTime"));
+    let end_ms = seconds_to_ms(s.get("endTime"));
+    let duration_ms = match (start_ms, end_ms) {
+        (Some(a), Some(b)) => Some(b - a),
+        _ => None,
+    };
+    RunStepMatrixEntry {
+        step_key: s
+            .get("stepKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status: s
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        duration_ms,
+    }
+}
+
 /// Convert one `stepStats` array element into a [`RunStep`] — split out
 /// from [`DgClient::run_steps`] so the per-step parse (itself several
 /// nested `Option` chains) reads as one function rather than a closure
@@ -1233,6 +2202,10 @@ fn run_step_from_value(s: &Value) -> RunStep {
                 .collect()
         })
         .unwrap_or_default();
+    let attempts = s
+        .get("attempts")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     RunStep {
         step_key: s
             .get("stepKey")
@@ -1247,6 +2220,7 @@ fn run_step_from_value(s: &Value) -> RunStep {
         start_ms: seconds_to_ms(s.get("startTime")),
         end_ms: seconds_to_ms(s.get("endTime")),
         materializations,
+        attempts,
     }
 }
 
@@ -1267,6 +2241,27 @@ fn rows_from_metadata_entries(entries: &Value) -> Option<i64> {
         }
         e.get("intValue").and_then(Value::as_i64)
     })
+}
+
+/// Sum `rows` across every materialization of every step in `run_value`,
+/// or `None` when no step reported any. A run with a mixture of
+/// materializations (some with rows, some without) gets the sum of those
+/// that did report — partial measurements are not failures, they just
+/// aren't `0`.
+fn rows_for_run(run_value: &Value) -> Option<i64> {
+    let steps = run_value.get("stepStats")?.as_array()?;
+    let mut total: Option<i64> = None;
+    for step in steps {
+        let Some(materializations) = step.get("materializations").and_then(Value::as_array) else {
+            continue;
+        };
+        for mat in materializations {
+            if let Some(rows) = rows_from_metadata_entries(mat.get("metadataEntries")?) {
+                total = Some(total.map_or(rows, |t| t + rows));
+            }
+        }
+    }
+    total
 }
 
 /// Join `assetKey.path` (`Dagster`'s asset key is a path segment list, e.g.
@@ -1600,6 +2595,226 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("bad field a; bad field b"));
     }
 
+    /// R4 plan 2c: `isPipelineConfigValid` returning
+    /// `RunConfigValidationInvalid` maps to `ConfigValidationOutcome::Invalid`,
+    /// and the wire-level `path` + `reason` come through as-is. The test
+    /// also asserts the request body shape (`PipelineSelector` with
+    /// `mode: "default"` + the user config as `RunConfigData`) and that
+    /// the query SELECTS only `path` + `reason` (never `message`) — the
+    /// latter is what AGENTS.md principle 4 + the plan's mutation check
+    /// depend on, so the assertion is part of the test (without it, a
+    /// regression that re-adds `message` to the wire selection would
+    /// still pass).
+    #[tokio::test]
+    async fn validate_run_config_invalid_returns_path_and_reason() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("isPipelineConfigValid"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": { "ops": { "run_x": { "config": { "k": 1 } } } },
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "RunConfigValidationInvalid",
+                    "errors": [
+                        { "path": ["ops", "run_x", "config", "k"],
+                          "reason": "RUNTIME_TYPE_MISMATCH",
+                          "message": "value '1' is not a String" },
+                        { "path": ["resources", "io"],
+                          "reason": "FIELD_NOT_DEFINED" }
+                    ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config(
+                "refresh_lakehouse",
+                &json!({ "ops": { "run_x": { "config": { "k": 1 } } } }),
+            )
+            .await
+            .unwrap();
+        let ConfigValidationOutcome::Invalid { errors } = outcome else {
+            panic!("expected Invalid, got {outcome:?}");
+        };
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors[0],
+            ConfigValidationError {
+                path: vec!["ops".into(), "run_x".into(), "config".into(), "k".into()],
+                reason: "RUNTIME_TYPE_MISMATCH".into(),
+            }
+        );
+        assert_eq!(errors[1].path, vec!["resources", "io"]);
+        assert_eq!(errors[1].reason, "FIELD_NOT_DEFINED");
+    }
+
+    /// R4 plan 2c: a `PipelineConfigValidationValid` response maps to
+    /// `ConfigValidationOutcome::Valid`. The test also confirms the
+    /// selector + variables shape so a future regression that changes
+    /// either is caught at the test boundary.
+    #[tokio::test]
+    async fn validate_run_config_valid_is_ok() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("isPipelineConfigValid"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": {},
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "PipelineConfigValidationValid",
+                    "pipelineName": "refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config("refresh_lakehouse", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConfigValidationOutcome::Valid);
+    }
+
+    /// R4 plan 2c: `PipelineNotFoundError` from `isPipelineConfigValid`
+    /// is reported as `ConfigValidationOutcome::NotFound` (NOT `Err`),
+    /// matching `LaunchOutcome.error`'s posture. The test asserts the
+    /// message is deserialized-but-not-forwarded (i.e. the field is
+    /// dropped at the wire union) — the route layer cannot echo Dagster's
+    /// own `message` if it is never read.
+    #[tokio::test]
+    async fn validate_run_config_not_found_is_ok_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "PipelineNotFoundError",
+                    "message": "Could not find pipeline named refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config("refresh_lakehouse", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConfigValidationOutcome::NotFound);
+    }
+
+    /// R4 plan 2c: `runConfigSchemaOrError` returning `RunConfigSchema`
+    /// carries `rootDefaultYaml` and is mapped to `Some(RunConfigSchema)`.
+    /// The query's variables must be `PipelineSelector` (with the same
+    /// `repositoryName` / `repositoryLocationName` / `pipelineName`
+    /// shape) so a future regression that switches to a different
+    /// selector type (e.g. `PipelineSelector.byName` accidentally) is
+    /// caught here.
+    #[tokio::test]
+    async fn run_config_schema_returns_root_default_yaml() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("runConfigSchemaOrError"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": {
+                        "repositoryName": "__repository__",
+                        "repositoryLocationName": "dispar_orchestrate.definitions",
+                        "pipelineName": "refresh_lakehouse"
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "runConfigSchemaOrError": {
+                        "__typename": "RunConfigSchema",
+                        "rootDefaultYaml": "ops:\n  run_x:\n    config:\n      k: v\n"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let schema = client
+            .run_config_schema("refresh_lakehouse")
+            .await
+            .unwrap()
+            .expect("expected Some, got None");
+        assert_eq!(
+            schema.root_default_yaml,
+            "ops:\n  run_x:\n    config:\n      k: v\n"
+        );
+    }
+
+    /// R4 plan 2c: `PipelineNotFoundError` from `runConfigSchemaOrError`
+    /// maps to `Ok(None)` (the route maps that to a 404), NOT to `Err`
+    /// — Dagster's `message` ("Could not find pipeline named ...") is
+    /// never read by this client, only the `__typename`.
+    #[tokio::test]
+    async fn run_config_schema_not_found_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runConfigSchemaOrError": { "__typename": "PipelineNotFoundError",
+                    "message": "Could not find pipeline named refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let schema = client.run_config_schema("refresh_lakehouse").await.unwrap();
+        assert!(schema.is_none());
+    }
+
+    /// R4 plan 2c: a non-`RunConfigSchema` refusal (here `PythonError`)
+    /// surfaces as `Err(DgError::Server(_))` — Dagster's own `message`
+    /// text IS used here, but only inside the crate's `DgError::Server`,
+    /// never forwarded to a response (the route layer translates
+    /// `DgError::Server` to a 503 via `js_error` (`"Error: {Display}"`)
+    /// — see `routes::pipelines`'s call sites).
+    /// The test is the contract for "this is the only path that uses the
+    /// message"; a regression that forwards it as a 200 would have to
+    /// either change this match arm or add a new variant.
+    #[tokio::test]
+    async fn run_config_schema_python_error_returns_server_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runConfigSchemaOrError": { "__typename": "PythonError",
+                    "message": "schema failure" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client
+            .run_config_schema("refresh_lakehouse")
+            .await
+            .expect_err("expected Err, got Ok");
+        assert!(matches!(err, DgError::Server(_)), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn list_runs_for_job_parses_end_time() {
         let server = MockServer::start().await;
@@ -1621,6 +2836,158 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].end_time, Some(3.0));
+    }
+
+    /// Plan 1c (R2): the runs × steps matrix comes from ONE GraphQL call
+    /// per pipeline, not one per run. This test proves the response shape
+    /// the route layer turns into `{ runs: [{ runId, status, startedAt,
+    /// steps: [{ stepKey, status, durationMs|null }] }], unavailable }`
+    /// — and that two runs in one `results[]` arrive in two `RunWithSteps`,
+    /// not one (the route never has to fan out per-run).
+    #[tokio::test]
+    async fn list_runs_with_steps_for_job_returns_step_stats_per_run_in_one_call() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("stepStats"))
+            .and(body_string_contains("refresh_lakehouse"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 3.0,
+                      "stepStats": [
+                          { "stepKey": "extract", "status": "SUCCESS",
+                            "startTime": 1.0, "endTime": 2.0 },
+                          { "stepKey": "load", "status": "SUCCESS",
+                            "startTime": 2.0, "endTime": 3.0 }
+                      ] },
+                    { "runId": "r2", "jobName": "refresh_lakehouse", "status": "FAILURE",
+                      "startTime": 4.0, "endTime": 7.0,
+                      "stepStats": [
+                          { "stepKey": "extract", "status": "SUCCESS",
+                            "startTime": 4.0, "endTime": 5.0 },
+                          { "stepKey": "load", "status": "FAILURE",
+                            "startTime": 5.0, "endTime": 7.0 }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let rows = client
+            .list_runs_with_steps_for_job("refresh_lakehouse", 30)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both runs are present in one response");
+        assert_eq!(rows[0].run_id, "r1");
+        assert_eq!(rows[0].steps.len(), 2);
+        assert_eq!(rows[0].steps[0].step_key, "extract");
+        assert_eq!(
+            rows[0].steps[0].duration_ms,
+            Some(1000),
+            "durationMs is the per-step end-start diff"
+        );
+        assert_eq!(rows[1].run_id, "r2");
+        assert_eq!(rows[1].steps.len(), 2);
+        assert_eq!(rows[1].steps[1].status, "FAILURE");
+    }
+
+    /// A step whose `startTime`/`endTime` are both `null` (it never ran)
+    /// reports `durationMs: None`, not a fabricated `0` — same honesty
+    /// posture as the API layer's own "never fabricate a measurement"
+    /// rule (AGENTS.md principle 5).
+    #[tokio::test]
+    async fn list_runs_with_steps_reports_null_duration_for_a_step_that_never_started() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "j", "status": "FAILURE",
+                      "startTime": 1.0, "endTime": 2.0,
+                      "stepStats": [
+                          { "stepKey": "ran", "status": "SUCCESS",
+                            "startTime": 1.0, "endTime": 2.0 },
+                          { "stepKey": "never_started", "status": "SKIPPED",
+                            "startTime": null, "endTime": null }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let rows = client.list_runs_with_steps_for_job("j", 30).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let step_duration = rows[0]
+            .steps
+            .iter()
+            .find(|s| s.step_key == "never_started")
+            .map(|s| s.duration_ms);
+        assert_eq!(step_duration, Some(None));
+    }
+
+    /// `list_runs_for_job_with_materializations` sums the `"rows"`
+    /// metadata entries across every step's materializations, returning
+    /// `None` for a run whose steps reported no row count.
+    #[tokio::test]
+    async fn list_runs_for_job_with_materializations_sums_rows_across_steps() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 3.0,
+                      "stepStats": [
+                          { "stepKey": "step_a", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "IntMetadataEntry",
+                                      "label": "rows", "intValue": 100 }
+                                ] }
+                            ] },
+                          { "stepKey": "step_b", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "IntMetadataEntry",
+                                      "label": "rows", "intValue": 250 }
+                                ] },
+                                { "metadataEntries": [
+                                    { "__typename": "TextMetadataEntry",
+                                      "label": "note", "text": "no count here" }
+                                ] }
+                            ] }
+                      ] },
+                    { "runId": "r2", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 4.0, "endTime": 5.0,
+                      "stepStats": [
+                          { "stepKey": "step_a", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "TextMetadataEntry",
+                                      "label": "note", "text": "rows aren't tracked" }
+                                ] }
+                            ] }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_materializations("refresh_lakehouse", 30)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        // r1: 100 + 250 = 350 (the TextMetadataEntry contributes nothing).
+        assert_eq!(runs[0].rows, Some(350));
+        // r2: nothing reported rows, so the run reports None — not 0.
+        assert_eq!(runs[1].rows, None);
     }
 
     #[tokio::test]
@@ -1834,8 +3201,106 @@ mod tests {
             .await;
 
         let client = DgClient::new(format!("{}/graphql", server.uri()));
-        let outcome = client.launch_reexecution("r1").await.unwrap();
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::AllSteps)
+            .await
+            .unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn a_reload_reports_a_clean_load_a_load_error_and_a_refusal_apart() {
+        let ok = json!({ "__typename": "WorkspaceLocationEntry",
+            "locationOrLoadError": { "__typename": "RepositoryLocation" } });
+        assert_eq!(reload_outcome_from(&ok).error, None);
+        let broken = json!({ "__typename": "WorkspaceLocationEntry",
+            "locationOrLoadError": { "__typename": "PythonError", "message": "boom" } });
+        assert_eq!(reload_outcome_from(&broken).error.as_deref(), Some("boom"));
+        let refused = json!({ "__typename": "ReloadNotSupported", "message": "no" });
+        assert_eq!(reload_outcome_from(&refused).error.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn schedule_ticks_keep_skip_reasons_but_not_error_text() {
+        let v = json!({ "__typename": "Schedule", "scheduleState": { "ticks": [
+            { "tickId": "1", "status": "SUCCESS", "timestamp": 10.0, "runIds": ["r1"],
+              "skipReason": null, "error": null },
+            { "tickId": "2", "status": "SKIPPED", "timestamp": 5.0, "runIds": [],
+              "skipReason": "nothing new", "error": null },
+            { "tickId": "3", "status": "FAILURE", "timestamp": 1.0, "runIds": [],
+              "skipReason": null, "error": { "message": "Traceback ... secret" } }
+        ] } });
+        let ticks = schedule_ticks_from(&v);
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[0].run_ids, vec!["r1".to_owned()]);
+        assert_eq!(ticks[1].skip_reason.as_deref(), Some("nothing new"));
+        assert!(ticks[2].failed);
+        let serialized = serde_json::to_string(&ticks).unwrap();
+        assert!(
+            !serialized.contains("Traceback"),
+            "error text must not be carried"
+        );
+        // A schedule that does not exist has no ticks, not an error.
+        assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
+    }
+
+    /// R3 plan 2a BLOCKER regression: `sensor_ticks` selects
+    /// `sensorState { ticks { ... } }`, but the parser used to read
+    /// `scheduleState`. A `Sensor` has no `scheduleState`, so the call
+    /// returned `[]` for every sensor regardless of data — the
+    /// `authored__<id>_after` dependency ticks the UI was supposed to
+    /// merge in were silently dropped. The fixture mirrors the shape the
+    /// `sensor_ticks` query actually selects, including the
+    /// `SensorNotFoundError` typename the route treats as "no ticks".
+    #[test]
+    fn sensor_ticks_extract_ticks_from_sensor_state_not_schedule_state() {
+        let v = json!({ "__typename": "Sensor", "sensorState": { "ticks": [
+            { "tickId": "s1", "status": "SUCCESS", "timestamp": 10.0, "runIds": ["r1"],
+              "skipReason": null, "error": null },
+            { "tickId": "s2", "status": "SKIPPED", "timestamp": 5.0, "runIds": [],
+              "skipReason": "upstream not ready", "error": null },
+            { "tickId": "s3", "status": "FAILURE", "timestamp": 1.0, "runIds": [],
+              "skipReason": null, "error": { "message": "Traceback ... secret" } }
+        ] } });
+        let ticks = sensor_ticks_from(&v);
+        assert_eq!(
+            ticks.len(),
+            3,
+            "sensor ticks must be parsed from sensorState.ticks"
+        );
+        assert_eq!(ticks[0].run_ids, vec!["r1".to_owned()]);
+        assert_eq!(ticks[1].skip_reason.as_deref(), Some("upstream not ready"));
+        assert!(ticks[2].failed);
+        let serialized = serde_json::to_string(&ticks).unwrap();
+        assert!(
+            !serialized.contains("Traceback"),
+            "Dagster error text must not be carried in the response"
+        );
+        // A sensor that does not exist has no ticks, not an error.
+        assert!(sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })).is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_reexecution_from_failure_sends_that_strategy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains(
+                "strategy: FROM_FAILURE",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "r3" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::FromFailure)
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r3"));
     }
 
     #[tokio::test]
@@ -1851,9 +3316,106 @@ mod tests {
             .await;
 
         let client = DgClient::new(format!("{}/graphql", server.uri()));
-        let outcome = client.launch_reexecution("r1").await.unwrap();
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::AllSteps)
+            .await
+            .unwrap();
         assert!(outcome.run_id.is_none());
         assert_eq!(outcome.error.as_deref(), Some("boom"));
+    }
+
+    /// Plan 1c (R2): the selected-steps re-execution first looks up the
+    /// parent run's `pipelineName`/`rootRunId`/`runConfig`, then calls
+    /// `launchRunReexecution(executionParams: { selector, runConfigData,
+    /// stepKeys, executionMetadata: { parentRunId, rootRunId } })`. The
+    /// wiremock must see ONE GraphQL body that carries the requested
+    /// `stepKeys` AND the parent config — otherwise Dagster would launch
+    /// without its required resources (see `dagster_graphql/schema/
+    /// inputs.py:314-340`).
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_sends_selector_step_keys_and_parent_config() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        // Register the mutation mock FIRST so it gets the higher priority
+        // (wiremock uses "most recently mounted first" — see the docs on
+        // `MockServer`). Then mount the lookup mock so it cannot shadow the
+        // mutation on a body that contains both `pipelineRunOrError` AND
+        // `launchRunReexecution` (none of our requests do, but the order
+        // makes the intent explicit).
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("launchRunReexecution"))
+            .and(body_string_contains("$cfg: RunConfigData!"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": { "ops": { "run_x": { "config": { "k": "v" } } } },
+                    "keys": ["run_x", "run_y"],
+                    "parentRunId": "parent-1",
+                    "rootRunId": "root-1",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "new-run" } } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineRunOrError"))
+            .and(body_partial_json(json!({
+                "variables": { "rid": "parent-1" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run",
+                    "pipelineName": "refresh_lakehouse",
+                    "rootRunId": "root-1",
+                    "runConfig": { "ops": { "run_x": { "config": { "k": "v" } } } }
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("parent-1", &["run_x", "run_y"])
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("new-run"));
+        assert!(outcome.error.is_none());
+    }
+
+    /// The lookup of a non-`Run` parent (`RunNotFoundError`) is propagated
+    /// as `Ok(LaunchOutcome { error, .. })`, not `Err` — matching
+    /// [`DgClient::launch_run`] / [`DgClient::terminate_run`]'s posture
+    /// (`DgClient::pipeline_run_status`'s sibling returns `Ok(None)` for
+    /// the same condition; the route layer above is what maps that into a
+    /// 404).
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_reports_parent_not_found_as_error_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains(
+                "pipelineRunOrError",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "RunNotFoundError" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("nope", &["any"])
+            .await
+            .unwrap();
+        assert!(outcome.run_id.is_none());
+        assert!(outcome.error.is_some());
     }
 
     #[tokio::test]
@@ -2040,6 +3602,44 @@ mod tests {
         assert_eq!(no_rows.materializations[0].rows, None);
     }
 
+    /// Plan 1c (R2): each `stepStats` row carries an `attempts` list
+    /// (`RunMarker { startTime endTime }` — `dagster_graphql/schema/logs/
+    /// events.py:717`). Three attempts → `attempts: 3`. A step that
+    /// never ran carries an empty `attempts` list → `attempts: 0` (never
+    /// a fabricated `1`).
+    #[tokio::test]
+    async fn run_steps_parses_attempts_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "Run", "stepStats": [
+                    { "stepKey": "retried_step", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 2.0,
+                      "attempts": [
+                          { "startTime": 1.0, "endTime": 1.5 },
+                          { "startTime": 1.6, "endTime": 1.8 },
+                          { "startTime": 1.9, "endTime": 2.0 }
+                      ] },
+                    { "stepKey": "never_started", "status": "SKIPPED",
+                      "startTime": null, "endTime": null, "attempts": [] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let steps = client.run_steps("r1").await.unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].step_key, "retried_step");
+        assert_eq!(steps[0].attempts, 3);
+        assert_eq!(steps[1].step_key, "never_started");
+        assert_eq!(
+            steps[1].attempts, 0,
+            "an empty attempts list means the step never started; never fabricate 1"
+        );
+    }
+
     /// A missing run is a normal "nothing to show" case here, matching the
     /// posture [`pipeline_run_status_none_when_run_not_found`] proves for
     /// the sibling call — real shape verified live (WS4 item A1) against a
@@ -2120,6 +3720,25 @@ mod tests {
         // the real fixture carries no `sql` metadata key — `None`, not a
         // fabricated empty string.
         assert_eq!(op.sql, None);
+        // The captured fixture predates `reads`/`writes`: absent entries
+        // read as empty lists, never as a fabricated phrase.
+        assert!(op.reads.is_empty() && op.writes.is_empty());
+    }
+
+    #[test]
+    fn metadata_lines_split_a_newline_joined_entry_and_drop_blank_lines() {
+        let entries = vec![MetadataItem {
+            key: "writes".to_owned(),
+            value: "Iceberg bronze.x\n\n ClickHouse lake.y ".to_owned(),
+        }];
+        assert_eq!(
+            metadata_lines(&entries, "writes"),
+            vec![
+                "Iceberg bronze.x".to_owned(),
+                "ClickHouse lake.y".to_owned()
+            ]
+        );
+        assert!(metadata_lines(&entries, "reads").is_empty());
     }
 
     /// An op reporting metadata with none of the three recognized labels

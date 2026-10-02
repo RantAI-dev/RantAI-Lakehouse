@@ -9,6 +9,8 @@ import type {
   PipelineRunLogsPage,
   CreatePipelineInput,
   GeneratePipelineInput,
+  ScheduleTicks,
+  UpdatePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -29,8 +31,12 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return sendJson<T>("POST", url, body, signal);
+}
+
+async function sendJson<T>(method: string, url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, {
-    method: "POST",
+    method,
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
@@ -60,9 +66,15 @@ export const dagsterPipelineService: PipelineService = {
     };
   },
   async listRuns(pipelineId, signal) {
-    return (
-      await getJson<{ runs: PipelineRun[] }>(`/api/pipelines/${encodeURIComponent(pipelineId)}/runs`, { signal })
-    ).runs;
+    const body = await getJson<{ runs: PipelineRun[]; unavailable?: string | null }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs`,
+      { signal }
+    );
+    // The route answers 200 with `unavailable` set when the orchestrator
+    // could not be asked (`routes::pipelines::runs`). Returning the empty
+    // list would read as "this job has never run".
+    if (body.unavailable) throw new ServiceError("unavailable", body.unavailable);
+    return body.runs;
   },
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
@@ -81,8 +93,12 @@ export const dagsterPipelineService: PipelineService = {
   cancelRun(runId, signal) {
     return postJson<PipelineRun>(`/api/pipelines/runs/${encodeURIComponent(runId)}/cancel`, undefined, signal);
   },
-  retryRun(runId, signal) {
-    return postJson<PipelineRun>(`/api/pipelines/runs/${encodeURIComponent(runId)}/retry`, undefined, signal);
+  retryRun(runId, signal, strategy) {
+    return postJson<PipelineRun>(
+      `/api/pipelines/runs/${encodeURIComponent(runId)}/retry`,
+      strategy ? { strategy } : undefined,
+      signal
+    );
   },
   pausePipeline(id, signal) {
     return postJson<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}/pause`, undefined, signal);
@@ -116,5 +132,18 @@ export const dagsterPipelineService: PipelineService = {
   },
   generatePipeline(input: GeneratePipelineInput, signal) {
     return postJson<Pipeline>("/api/pipelines/generate", input, signal);
+  },
+  async updatePipeline(id, input: UpdatePipelineInput, signal) {
+    return sendJson<Pipeline>("PUT", `/api/pipelines/${encodeURIComponent(id)}`, input, signal);
+  },
+  async deletePipeline(id, signal) {
+    await sendJson<unknown>("DELETE", `/api/pipelines/${encodeURIComponent(id)}`, undefined, signal);
+  },
+  async getScheduleTicks(id, signal) {
+    const body = await getJson<ScheduleTicks>(
+      `/api/pipelines/${encodeURIComponent(id)}/schedule-ticks`,
+      { signal }
+    );
+    return { schedule: body.schedule ?? null, ticks: body.ticks ?? [], unavailable: body.unavailable ?? null };
   },
 };

@@ -47,7 +47,7 @@ pub(super) async fn create_chart(
 pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib" });
+        return json!({ "error": "id is required" });
     }
     let input = match parse_chart_input(args) {
         Ok(i) => i,
@@ -69,7 +69,17 @@ pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
 }
 
 pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    match store::create_board(ch, &arg_str(args, "name")).await {
+    // `created_by` is left empty: the assistant is not a person, and naming
+    // it as the author would put a non-account into a column the UI shows
+    // as an owner.
+    match store::create_board(
+        ch,
+        &arg_str(args, "name"),
+        &arg_str(args, "description"),
+        "",
+    )
+    .await
+    {
         Ok(board) => json!({
             "created": true, "id": board.id, "name": board.name,
             "note": "Pakai id ini di create_chart.board.",
@@ -144,7 +154,8 @@ pub(super) async fn list_charts(ch: &ChClient) -> Value {
                 .map(|c| {
                     json!({
                         "id": c.spec.id, "title": c.spec.title, "kind": c.spec.kind,
-                        "mart": c.spec.mart, "source": c.source,
+                        "mart": c.spec.mart, "sqlSource": c.spec.sql_source,
+                        "source": c.source,
                     })
                 })
                 .collect();
@@ -154,10 +165,39 @@ pub(super) async fn list_charts(ch: &ChClient) -> Value {
     }
 }
 
+/// `list_sql_sources`: every dashboard SQL source with its columns split
+/// into dimensions and measures, the same split `describe_mart` uses. A
+/// `ClickHouse` failure is a fixed message, never its text.
+pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
+    match lakehouse_bi::sources::list_sources(ch).await {
+        Ok(sources) => {
+            let out: Vec<Value> = sources
+                .iter()
+                .map(|s| {
+                    let (measures, dimensions): (Vec<_>, Vec<_>) = s
+                        .columns
+                        .iter()
+                        .partition(|c| crate::routes::support::is_numeric_type(&c.ty));
+                    json!({
+                        "id": s.id, "title": s.title,
+                        "dimensions": dimensions.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                        "measures": measures.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            json!({ "total": out.len(), "sources": out })
+        }
+        Err(err) => {
+            tracing::warn!(%err, "list_sql_sources failed");
+            json!({ "error": "SQL sources tidak bisa dibaca saat ini." })
+        }
+    }
+}
+
 pub(super) async fn delete_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib" });
+        return json!({ "error": "id is required" });
     }
     match store::delete_chart(ch, &id).await {
         Ok(()) => json!({ "deleted": true, "id": id }),

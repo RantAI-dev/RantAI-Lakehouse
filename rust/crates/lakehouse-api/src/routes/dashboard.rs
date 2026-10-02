@@ -17,7 +17,6 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::builder::sql_with_filters;
 use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
 use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
@@ -29,7 +28,8 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
-    is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, strip_non_ident,
+    is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
+    strip_non_ident,
 };
 use crate::state::AppState;
 
@@ -181,8 +181,15 @@ async fn get_body(
             results.insert(id, val);
         }
     }
+    let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     for c in &stored_for_board {
-        let sql = sql_with_filters(c, &years, &filters, &cols);
+        let sql = match stored_chart_sql(c, &years, &filters, &cols, &sources) {
+            Ok(sql) => sql,
+            Err(msg) => {
+                results.insert(c.spec.id.clone(), json!({ "error": msg }));
+                continue;
+            }
+        };
         let (id, val) = run_spec_sql(ch, &c.spec.id, &sql, roles, placeholders, obligations).await;
         results.insert(id, val);
     }
@@ -201,7 +208,7 @@ async fn get_body(
 
     let mut boards_out = vec![json!({ "id": "default", "name": "Main" })];
     for b in &boards {
-        boards_out.push(json!({ "id": b.id, "name": b.name }));
+        boards_out.push(json!({ "id": b.id, "name": b.name, "folderId": b.folder_id }));
     }
 
     let kpis_out: Vec<Value> = if on_default {
@@ -414,32 +421,77 @@ pub async fn specs_delete(
 // ── /api/dashboard/boards ───────────────────────────────────────────────
 
 /// `GET /api/dashboard/boards` — every dashboard, `default` first.
+///
+/// Each board carries a `chartCount`. It is computed here rather than
+/// stored: the number of tiles on a board is derived from `console.bi_chart`
+/// and would go stale the moment a chart is added, moved between boards, or
+/// deleted. The built-in board's count comes from the compiled-in specs,
+/// which is where its tiles actually come from.
 pub async fn boards_list(State(state): State<AppState>) -> Response {
-    match store::list_boards(&state.clickhouse).await {
-        Ok(boards) => {
-            let mut out = vec![json!({ "id": "default", "name": "Main", "layout": {} })];
-            out.extend(
-                boards
-                    .iter()
-                    .map(|b| serde_json::to_value(b).unwrap_or_else(|_| json!({}))),
-            );
-            (StatusCode::OK, ApiJson(json!({ "boards": out }))).into_response()
-        }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+    let ch = &state.clickhouse;
+    let (boards, stored) =
+        match tokio::try_join!(store::list_boards(ch), store::list_stored_charts(ch)) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for c in &stored {
+        *counts.entry(c.board.as_str()).or_default() += 1;
     }
+    // Counted the same way the payload decides to serve them: an empty
+    // catalogue means this tenant's BUILTIN_DASHBOARD_SPEC never loaded, so
+    // the built-in board has no tiles to report.
+    let builtin_tiles = CHARTS.len() + KPIS.len();
+    let mut out = vec![json!({
+        "id": store::DEFAULT_BOARD_ID,
+        "name": "Main",
+        "layout": {},
+        "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
+        "builtin": true,
+    })];
+    out.extend(boards.iter().map(|b| {
+        let mut value = serde_json::to_value(b).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "chartCount".to_owned(),
+                json!(counts.get(b.id.as_str()).copied().unwrap_or(0)),
+            );
+            obj.insert("builtin".to_owned(), json!(false));
+        }
+        value
+    }));
+    (StatusCode::OK, ApiJson(json!({ "boards": out }))).into_response()
 }
 
-/// `{name?, duplicate?}` — the `POST /api/dashboard/boards` body shape.
+/// `{name?, description?, duplicate?}` — the `POST /api/dashboard/boards`
+/// body shape.
 #[derive(Debug, Deserialize, Default)]
 struct BoardCreateBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     duplicate: Option<String>,
+    /// Folder to create the board in (`""`/absent = root).
+    #[serde(default, rename = "folderId")]
+    folder_id: Option<String>,
+}
+
+/// The signed-in caller's display name, for the `created_by` column.
+///
+/// Empty when nobody is attached — the AI tool surface creates boards with
+/// no principal, and an empty author is the honest answer there. This is
+/// recorded for display only; it grants nothing and is never read back as
+/// an authorization input.
+fn author_name(principal: Option<&Extension<Principal>>) -> String {
+    principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
 }
 
 /// `POST /api/dashboard/boards` — create a board, or duplicate one.
@@ -449,6 +501,7 @@ struct BoardCreateBody {
 /// 400 on an unparseable body or a `ClickHouse`/validation failure.
 pub async fn boards_create(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: BoardCreateBody = if body.is_empty() {
@@ -457,12 +510,28 @@ pub async fn boards_create(
         serde_json::from_slice(&body)
             .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
-    let board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup).await
+    let author = author_name(principal.as_ref());
+    let folder_id = parsed.folder_id.unwrap_or_default().trim().to_owned();
+    // Checked first, so an unknown folder creates nothing.
+    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
+    let mut board = if let Some(dup) = parsed.duplicate {
+        store::duplicate_board(&state.clickhouse, &dup, &author).await
     } else {
-        store::create_board(&state.clickhouse, &parsed.name.unwrap_or_default()).await
+        store::create_board(
+            &state.clickhouse,
+            &parsed.name.unwrap_or_default(),
+            &parsed.description.unwrap_or_default(),
+            &author,
+        )
+        .await
     }
     .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    if !folder_id.is_empty() {
+        store::move_board(&state.clickhouse, &board.id, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        board.folder_id = Some(folder_id);
+    }
     Ok(ApiJson(json!({ "ok": true, "board": board })))
 }
 
@@ -474,6 +543,8 @@ struct BoardEditBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     layout: Option<LayoutMap>,
     #[serde(default)]
     filters: Option<Vec<FilterDef>>,
@@ -481,6 +552,9 @@ struct BoardEditBody {
     public: Option<bool>,
     #[serde(default)]
     embed: Option<bool>,
+    /// Move the board to this folder (`""` = root).
+    #[serde(default, rename = "folderId")]
+    folder_id: Option<String>,
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -490,9 +564,11 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
         None | Some("") => false,
         Some(store::DEFAULT_BOARD_ID) => {
             body.name.is_none()
+                && body.description.is_none()
                 && body.filters.is_none()
                 && body.public.is_none()
                 && body.embed.is_none()
+                && body.folder_id.is_none()
         }
         Some(_) => true,
     }
@@ -528,6 +604,11 @@ pub async fn boards_update(
             .await
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     }
+    if let Some(description) = &parsed.description {
+        store::describe_board(ch, &id, description)
+            .await
+            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    }
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
@@ -537,6 +618,13 @@ pub async fn boards_update(
         store::update_board_filters(ch, &id, filters)
             .await
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    }
+    if let Some(folder_id) = &parsed.folder_id {
+        let folder_id = folder_id.trim();
+        crate::routes::dashboard_folders::ensure_folder_exists(ch, folder_id).await?;
+        store::move_board(ch, &id, folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     if let Some(public) = parsed.public {
         let token = store::set_board_public(ch, &id, public)
@@ -563,7 +651,7 @@ pub async fn boards_delete(
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
-    if id.is_empty() || id == "default" {
+    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
     store::delete_board(&state.clickhouse, &id)
@@ -579,11 +667,21 @@ pub async fn boards_delete(
 pub struct FieldsQuery {
     #[serde(default)]
     mart: Option<String>,
+    /// A dashboard SQL source id; answers with its probed columns instead
+    /// of a mart's.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
 pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+    if let Some(id) = q.source.as_deref() {
+        return match source_fields_body(&state.clickhouse, id).await {
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+            Err(err) => crate::error::ApiRejection(err).into_response(),
+        };
+    }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
@@ -594,6 +692,37 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
     }
 }
 
+/// `?source=` branch of [`fields`]: the SQL source's columns, split the same
+/// way a mart's are. New shape (no parity corpus); errors are classified,
+/// never `ClickHouse` text.
+async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> {
+    let source = lakehouse_bi::sources::get_source(ch, id.trim())
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .ok_or_else(|| ApiError::NotFound(format!("SQL source '{}' not found.", id.trim())))?;
+    let mut dimensions = Vec::new();
+    let mut measures = Vec::new();
+    for c in &source.columns {
+        if is_numeric_type(&c.ty) {
+            measures.push(c.name.clone());
+        } else {
+            dimensions.push(c.name.clone());
+        }
+    }
+    Ok(json!({
+        "source": source.id,
+        "title": source.title,
+        "dimensions": dimensions,
+        "measures": measures,
+        "columns": source.columns,
+    }))
+}
+
+/// Schema metadata only — mart names, column names/types, row counts from
+/// `system.tables`/`system.columns`, never row values — so no policy
+/// rewrite: governance here masks and filters DATA, and the builder needs
+/// the column list to exist at all. (`/values`, which reads data, is
+/// rewritten.)
 async fn fields_body(
     ch: &ChClient,
     mart: Option<&str>,
@@ -655,6 +784,11 @@ async fn fields_body(
 pub struct RecordsQuery {
     #[serde(default)]
     mart: Option<String>,
+    /// Set by a tile built on a dashboard SQL source. Drill-down over a
+    /// source is not supported yet (plan §3.4); answered honestly instead of
+    /// being treated as a missing mart.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     column: Option<String>,
     #[serde(default)]
@@ -682,10 +816,74 @@ fn esc(s: &str) -> String {
 
 /// `GET /api/dashboard/records` — drill-down: raw Gold rows behind one
 /// category value.
+///
+/// Same posture as [`get`]: `Policy::RequiresPermission("dashboard:read")`
+/// guarantees a real `Extension<Principal>`, and the row query goes through
+/// `policy_engine::rewrite_sql_for_roles` before it reaches `ClickHouse`.
+/// Drill-down review fix: this route used to run
+/// `SELECT * FROM serving.<mart>` with plain `ch.query`, so a column masked
+/// (or rows filtered) on the tile came back unmasked one click later.
 pub async fn records(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<RecordsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    records_for_roles(
+        &state.clickhouse,
+        q,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await
+    .map(ApiJson)
+    .map_err(Into::into)
+}
+
+/// Classifies a `ClickHouse` failure on the dashboard's data routes
+/// (drill-down, filter values, SQL-source fields) without forwarding its
+/// text (AGENTS.md principle 4): a server-side error is a fixed 422,
+/// anything else a fixed 503; the real detail is only logged.
+fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+    match err {
+        lakehouse_clickhouse::ChError::Server(_) => {
+            tracing::warn!(%err, "dashboard query failed");
+            ApiError::Unprocessable("dashboard query failed".to_owned())
+        }
+        lakehouse_clickhouse::ChError::Transport(_) | lakehouse_clickhouse::ChError::Cancelled => {
+            tracing::warn!(%err, "clickhouse unreachable for a dashboard query");
+            ApiError::Unavailable("clickhouse unavailable".to_owned())
+        }
+    }
+}
+
+/// [`records`]' body, taking the principal's roles and placeholders
+/// explicitly so the enforcement path can be tested against a mock
+/// `ClickHouse` and a real policy row.
+async fn records_for_roles(
+    ch: &ChClient,
+    q: RecordsQuery,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &PolicyEngineObligations<'_>,
+) -> Result<Value, ApiError> {
+    if q.source.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(json!({
+            "supported": false,
+            "message": "Drill-down is not available yet for charts built on a SQL source.",
+            "columns": [],
+            "rows": [],
+        }));
+    }
     let mart_raw = q.mart.unwrap_or_default();
     let mart = mart_raw
         .strip_prefix("serving.")
@@ -702,10 +900,9 @@ pub async fn records(
         .clamp(1, 200);
 
     if !is_strict_ident(&mart) || !is_strict_ident(&column) {
-        return Err(ApiError::BadRequest("invalid mart/column".to_owned()).into());
+        return Err(ApiError::BadRequest("invalid mart/column".to_owned()));
     }
 
-    let ch = &state.clickhouse;
     let cols_sql = format!(
         "SELECT name FROM system.columns WHERE database='serving' AND table='{}'",
         esc(&mart)
@@ -713,33 +910,46 @@ pub async fn records(
     let cols = ch
         .rows(&cols_sql, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     if cols.is_empty() {
-        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")).into());
+        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")));
     }
     let has_column = cols
         .iter()
         .any(|c| c.get("name").and_then(Value::as_str) == Some(column.as_str()));
     if !has_column {
-        return Err(ApiError::BadRequest(format!("column '{column}' does not exist")).into());
+        return Err(ApiError::BadRequest(format!(
+            "column '{column}' does not exist"
+        )));
     }
 
     let sql = format!(
         "SELECT * FROM serving.{mart} WHERE {column} = '{}' LIMIT {limit}",
         esc(&value)
     );
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })?;
     let result = ch
-        .query(&sql, None)
+        .query(&rewritten, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
-    Ok(ApiJson(json!({
+    Ok(json!({
         "columns": columns,
         "rows": result.data,
         "mart": mart,
         "column": column,
         "value": value,
-    })))
+    }))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -751,17 +961,54 @@ pub struct ValuesQuery {
     column: Option<String>,
 }
 
-/// `GET /api/dashboard/values` — distinct values of one column, across
-/// every Gold mart that has it (for a dashboard filter dropdown).
+/// `GET /api/dashboard/values?column=` — the distinct values of `column`
+/// across every `serving` mart that has it (the dashboard filter picker).
+///
+/// Unlike `/fields` (schema metadata only), this reads DATA, so it goes
+/// through `policy_engine::rewrite_sql_for_roles` for the caller's roles
+/// like the tiles do: a masked column's values, or rows a row filter hides,
+/// used to be listed here in the clear (plan §8 item 3). `ClickHouse`
+/// errors are classified, never forwarded.
 pub async fn values(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<ValuesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    values_for_roles(
+        &state.clickhouse,
+        q,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await
+    .map(ApiJson)
+    .map_err(Into::into)
+}
+
+/// [`values`]' body, taking roles and placeholders explicitly so the
+/// enforcement path can be tested against a mock `ClickHouse` and a real
+/// policy row.
+async fn values_for_roles(
+    ch: &ChClient,
+    q: ValuesQuery,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &PolicyEngineObligations<'_>,
+) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
-        return Err(ApiError::BadRequest("column is required".to_owned()).into());
+        return Err(ApiError::BadRequest("column is required".to_owned()));
     }
-    let ch = &state.clickhouse;
     let marts_sql = format!(
         "SELECT table FROM system.columns WHERE database='serving' AND name='{column}' AND \
          table NOT LIKE '%\\_baru'"
@@ -769,11 +1016,9 @@ pub async fn values(
     let marts = ch
         .rows(&marts_sql, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     if marts.is_empty() {
-        return Ok(ApiJson(
-            json!({ "column": column, "values": Vec::<String>::new() }),
-        ));
+        return Ok(json!({ "column": column, "values": Vec::<String>::new() }));
     }
     let union = marts
         .iter()
@@ -784,15 +1029,26 @@ pub async fn values(
         .collect::<Vec<_>>()
         .join(" UNION DISTINCT ");
     let sql = format!("SELECT v FROM ({union}) WHERE v != '' ORDER BY v LIMIT 200");
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })?;
     let rows = ch
-        .rows(&sql, None)
+        .rows(&rewritten, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     let values: Vec<String> = rows
         .iter()
         .filter_map(|r| r.get("v").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
-    Ok(ApiJson(json!({ "column": column, "values": values })))
+    Ok(json!({ "column": column, "values": values }))
 }
 
 // ── /api/dashboard/export ───────────────────────────────────────────────
@@ -800,6 +1056,10 @@ pub async fn values(
 /// `GET /api/dashboard/export` — every board + stored chart, as a minimal
 /// hand-rolled `YAML` document. The only non-`JSON` response in this crate:
 /// returned directly as `text/yaml`, bypassing [`ApiJson`].
+///
+/// # Errors
+///
+/// 500 (`ApiError::Internal`) if either `ClickHouse` listing fails.
 pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
     let (charts, boards, default_row) = tokio::try_join!(
         store::list_stored_charts(&state.clickhouse),
@@ -1152,6 +1412,13 @@ mod tests {
             r#"{"id":"b_1","name":"x","public":true}"#
         )));
         assert!(!board_edit_allowed(&body(r#"{"layout":{}}"#)));
+        // The built-in board lives outside the folder tree.
+        assert!(!board_edit_allowed(&body(
+            r#"{"id":"default","folderId":"f_1"}"#
+        )));
+        assert!(board_edit_allowed(&body(
+            r#"{"id":"b_1","folderId":"f_1"}"#
+        )));
     }
 
     #[test]
@@ -1175,5 +1442,300 @@ mod tests {
         let out = yaml_board("b1", "Board 1", Some(&layout));
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+    }
+}
+
+#[cfg(test)]
+mod records_enforcement {
+    //! Drill-down review fix: `/api/dashboard/records` must go through the
+    //! same `policy_engine::rewrite_sql_for_roles` path as the tiles. Same
+    //! two-harness shape as `support::run_spec_sql_enforcement`: a real
+    //! (ephemeral) Postgres with a real policy row, and a wiremock
+    //! `ClickHouse`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_core::ApiError;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{RecordsQuery, records_for_roles};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    fn drill(mart: &str, column: &str, value: &str) -> RecordsQuery {
+        RecordsQuery {
+            mart: Some(mart.to_owned()),
+            column: Some(column.to_owned()),
+            value: Some(value.to_owned()),
+            limit: None,
+            source: None,
+        }
+    }
+
+    /// Answers both `system.columns` lookups the drill-down makes: the
+    /// route's own column check (reads `name`) and the policy engine's
+    /// column resolution (reads `name`/`default_*`).
+    async fn mount_mart_columns(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "id", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "region", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 3,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_rows_are_masked_like_the_tile_they_came_from(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "drill-down-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_mart_columns(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "id", "type": "UInt64"},
+                    {"name": "email", "type": "String"},
+                    {"name": "region", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***", "region": "north"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let body = records_for_roles(
+            &ch,
+            drill("mart_x", "region", "north"),
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect("a masked drill-down still answers");
+
+        assert_eq!(body["rows"][0]["email"], "***");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        let row_queries: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("north"))
+            .collect();
+        assert!(
+            !row_queries.is_empty(),
+            "the row query must reach ClickHouse"
+        );
+        assert!(
+            row_queries
+                .iter()
+                .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
+            "every drill-down row query must be the masked rewrite, never the raw SELECT *: {row_queries:?}"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_on_a_sql_source_tile_is_unsupported_and_never_queries(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // No mocks: any ClickHouse request would fail the call.
+        let server = MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let mut q = drill("", "material_group", "x");
+        q.source = Some("s_1234abcd".to_owned());
+
+        let body = records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations)
+            .await
+            .expect("an honest unsupported answer, not an error");
+
+        assert_eq!(body["supported"], false);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_clickhouse_error_text_never_reaches_the_response(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        mount_mart_columns(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("north"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("Code: 60. DB::Exception: upstream-secret-detail"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let err = records_for_roles(
+            &ch,
+            drill("mart_x", "region", "north"),
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect_err("a failing row query is an error");
+
+        let text = format!("{err:?}");
+        assert!(
+            !text.contains("upstream-secret-detail"),
+            "ClickHouse's own text leaked: {text}"
+        );
+        assert!(
+            matches!(err, ApiError::Unprocessable(ref m) if m == "dashboard query failed"),
+            "expected the fixed 422, got {err:?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod values_enforcement {
+    //! `/api/dashboard/values` reads data, so it is governed like the tiles
+    //! (plan §8 item 3). Same two-harness shape as `records_enforcement`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{ValuesQuery, values_for_roles};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn filter_values_of_a_masked_column_are_masked(pool: PgPool) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "values-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        // Which marts have the column.
+        Mock::given(method("POST"))
+            .and(body_string_contains("SELECT table FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "table", "type": "String"}],
+                "data": [{"table": "mart_x"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        // The policy engine's column resolution.
+        Mock::given(method("POST"))
+            .and(body_string_contains("default_kind"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "region", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "String"}],
+                "data": [{"v": "***"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("email".to_owned()),
+            },
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect("masked values still answer");
+
+        assert_eq!(body["values"], serde_json::json!(["***"]));
+        let distinct_queries: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("DISTINCT"))
+            .collect();
+        assert!(!distinct_queries.is_empty());
+        assert!(
+            distinct_queries
+                .iter()
+                .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
+            "every DISTINCT read must be the masked rewrite: {distinct_queries:?}"
+        );
+        Ok(())
     }
 }

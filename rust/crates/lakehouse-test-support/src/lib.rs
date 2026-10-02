@@ -2,8 +2,10 @@
 //!
 //! Any integration test crate that depends on this crate (see
 //! `lakehouse-store` and `lakehouse-auth`) gets a **`testcontainers`-managed
-//! Postgres** started automatically, once per test binary, before any test
-//! runs — no manual `docker compose up`, no shared external database.
+//! Postgres** before any test runs — no manual `docker compose up`, no
+//! shared external database. It is ONE labelled container reused by every
+//! test process (started on first use, restarted if stopped), not a new one
+//! per test binary: see `start_postgres_container`.
 //!
 //! # How it works
 //!
@@ -12,8 +14,7 @@
 //! worker threads and before any `#[sqlx::test]` reads `DATABASE_URL`. That
 //! sidesteps the usual "who initializes first" race between parallel test
 //! threads: by the time any test body executes, `DATABASE_URL` already
-//! points at a live, empty Postgres instance running in a container that
-//! stays up for the lifetime of the test process.
+//! points at a live Postgres instance running in that shared container.
 //!
 //! `#[sqlx::test(migrations = "../../migrations")]` then does the rest: for
 //! *each* test it opens a fresh, migrated, isolated database against that
@@ -32,8 +33,8 @@
 
 use std::sync::OnceLock;
 
-use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::postgres::Postgres;
 
 static DATABASE_URL: OnceLock<String> = OnceLock::new();
@@ -73,8 +74,19 @@ fn start_postgres_container() {
     ));
 
     let url = runtime.block_on(async {
+        // ONE container, reused by every test process: found by this label
+        // and started again if it was stopped. The handle below is leaked
+        // and nothing ever removed the container at exit, so the old
+        // one-container-per-test-binary setup left every one of them
+        // running — 245 on one shared dev VM (2026-09-22 → 26), about
+        // 14 GiB of memory. Removing it at exit instead is not safe: tokio
+        // cannot be driven after `main` has returned (it panics, and the
+        // test process aborts). Sharing one server is fine for isolation,
+        // since `#[sqlx::test]` gives every test its own database on it.
         let container = Postgres::default()
             .with_tag("16-alpine")
+            .with_label("org.rantai.lakehouse-test-support", "postgres-16")
+            .with_reuse(ReuseDirective::Always)
             .start()
             .await
             .unwrap_or_else(|e| {
@@ -91,8 +103,9 @@ fn start_postgres_container() {
                 panic!("lakehouse-test-support: failed to read the mapped Postgres port: {e}")
             });
 
-        // Leak the container handle itself so it is never dropped (which
-        // would stop and remove it) for the lifetime of the process.
+        // Leak the handle so it is never dropped for the lifetime of the
+        // process. (A reused container is not removed on drop either; the
+        // leak keeps its log-streaming task alive.)
         let container = Box::leak(Box::new(container));
         let _ = container;
 
@@ -111,7 +124,11 @@ fn start_postgres_container() {
     }
 }
 
-#[ctor::ctor]
+// `ctor` 1.0 requires an explicit acknowledgement that a pre-`main`
+// constructor may do something unsafe (here: `set_var` in
+// `start_postgres_container`, safe only because nothing else has started
+// yet); see the SAFETY comment above.
+#[ctor::ctor(unsafe)]
 fn init() {
     start_postgres_container();
 }

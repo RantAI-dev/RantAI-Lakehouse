@@ -74,13 +74,13 @@ from __future__ import annotations
 
 import re
 
-# Cited verbatim from `docker-compose.yml:2053` -- the static demo
+# Cited verbatim from `docker-compose.yml:2401` -- the static demo
 # connector's own pinned image reference. A module-level constant, not
 # re-typed by hand at render time, so a copy/paste drift between the two
 # services is impossible.
 DEBEZIUM_IMAGE_DIGEST = (
-    "ghcr.io/memiiso/debezium-server-iceberg@sha256:"
-    "c49ebdaae01762a5509804926710d6a831e45d56f70ce98cf69bac57cc6a6bf9"
+    "ghcr.io/memiiso/debezium-server-iceberg:1.1.1.Final@sha256:"
+    "2ad14b158914097985e98933e6f541e2f4e34fabd1c5d47d655067b9db0282b8"
 )
 
 # Mirrors `ConnectorSlug::new`'s validation

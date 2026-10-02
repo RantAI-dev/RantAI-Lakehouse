@@ -1,11 +1,10 @@
-import { Suspense } from "react"
-import { DashboardPage } from "@/features/dashboards/dashboard-page"
+import { DashboardResolver } from "@/features/dashboards/dashboard-resolver"
 
-/** Thin App Router page for Dashboards. Suspense for useSearchParams. */
+/**
+ * Not a page but a successor: it leads to the board you last had open, or to
+ * the only one you have. The list lives at `/dashboards/browse`, and a single
+ * dashboard's canvas at `/dashboards/[id]`.
+ */
 export default function Page() {
-  return (
-    <Suspense fallback={<div className="p-4 text-sm text-muted-foreground">Loading…</div>}>
-      <DashboardPage />
-    </Suspense>
-  )
+  return <DashboardResolver />
 }

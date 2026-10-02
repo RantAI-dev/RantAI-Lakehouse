@@ -162,6 +162,10 @@ services:
       LLM_URL: ${LLM_URL:-https://api.minimax.io/v1}
       LLM_MODEL: ${LLM_MODEL:-MiniMax-M3}
       LLM_KEY: ${LLM_KEY:-}
+      # Copilot chat request timeout in seconds (default 120, clamped
+      # 30..1800). Raise it only for a slow self-hosted model, e.g. a
+      # small model on CPU; see routes/mod.rs `AI_CHAT_TIMEOUT`.
+      AI_CHAT_TIMEOUT_SECS: ${AI_CHAT_TIMEOUT_SECS:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -227,6 +231,12 @@ services:
       # schedule factory's connector fetch fails visibly (401) rather than
       # silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
+      # `main::bootstrap_pipeline_run_service` seeds the
+      # "authored-pipeline-scheduler" service identity (`pipeline:read`,
+      # `pipeline:write`) from this value; `dagster-code-location` sends the
+      # same value to read `GET /api/pipelines/runnable`. Unset: nothing is
+      # seeded and authored pipelines get no job (said in both logs).
+      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — base URL for `routes::query::run`'s `engine: "trino"` path
       # (`lakehouse-trino`'s `/v1/statement` client). An internal service
       # address, not a credential, so a default is fine here — the `trino`
@@ -1603,6 +1613,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-db-init:
         condition: service_completed_successfully
@@ -1784,6 +1801,14 @@ services:
       # With this unset, the API seeds no identity and the ingest schedule
       # factory's connector fetch fails visibly (401), never silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
+      # `authored_factory.py`'s token for `GET /api/pipelines/runnable`,
+      # the list it builds one `authored__<id>` job per console-authored
+      # pipeline from. Must match `lakehouse-api`'s own `PIPELINE_RUN_TOKEN`
+      # (same single-`.env`-value reasoning as `AGENT_RUN_TOKEN` above).
+      # It was never passed to either container, so no authored pipeline
+      # ever became a job. Unset: no identity is seeded and the factory
+      # loads zero authored jobs, saying so in its log.
+      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
@@ -1793,7 +1818,13 @@ services:
       # under the `trino` profile; when it is unreachable the job records
       # a degraded skip in `skipped_verbs` rather than raising.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
-    command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    # `code-server start`, not `api grpc`: it serves the same gRPC API on
+    # the same port, and it re-imports the module when the webserver is
+    # asked to reload this location. The API asks for that after every
+    # authored-pipeline change (`routes::authored_pipelines`), since
+    # authored jobs are built at import time; `api grpc` kept serving the
+    # definitions it started with.
+    command: ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
   # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres
@@ -1856,6 +1887,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-code-location:
         condition: service_started
@@ -1887,6 +1925,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-code-location:
         condition: service_started
@@ -2388,13 +2433,19 @@ services:
     restart: "no"
 
   # P5 (G4) — Debezium Server + `debezium-server-iceberg` (memiiso), pinned
-  # by digest (R4: community-maintained, no versioned tag exists upstream —
-  # see `docs/plans/P5-RESULT.md`). Captures `p5_cdc.orders` via Postgres
-  # logical replication (`pgoutput`), upsert mode, initial snapshot then
-  # streaming, straight into Bronze through the SAME Lakekeeper/RustFS
-  # stack every other Bronze writer in this repo uses. This is a single,
-  # statically-configured demo connector (ADR 0007: "no dynamic
-  # per-connector provisioning" this phase) — it proves the config shape
+  # by tag + digest (R4: community-maintained). The tag names the release
+  # so a future failure is diagnosable, the digest keeps the image
+  # immutable. A bare digest pin dies silently when upstream overwrites
+  # the untagged image — this is the second time: `c49ebd…` on 2026-09-24,
+  # `5281e2bd…` on 2026-09-30. Upstream's 1.1.1.Final release notes say
+  # attestations are disabled so released images stay pullable (upstream
+  # PR #732). Captures
+  # `p5_cdc.orders` via Postgres logical replication (`pgoutput`), upsert
+  # mode, initial snapshot then streaming, straight into Bronze through
+  # the SAME Lakekeeper/RustFS stack every other Bronze writer in this
+  # repo uses. This is a single, statically-configured demo connector
+  # (ADR 0007: "no dynamic per-connector provisioning" this phase) — it
+  # proves the config shape
   # `lakehouse_store::cdc::render_debezium_properties` designs, not a
   # production connector-management control plane.
   #
@@ -2405,14 +2456,15 @@ services:
   # in `.env`, not a one-off prefix (same reasoning as `DAGSTER_URL`'s
   # existing warning elsewhere in this file).
   #
-  # Re-pinned 2026-09-24: upstream overwrote the untagged image, so the
-  # digest P5 measured (`sha256:c49ebd…`) returns `manifest unknown`. This
-  # is the digest `:latest` resolved to on that date (image built
-  # 2026-09-11, revision e16f5ef). P5-RESULT.md's measurements were taken
-  # on the old image; G4 is what re-proves them on this one.
+  # Re-pinned 2026-09-30: the prior pin was
+  # `ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bd…` (the
+  # digest `:latest` had resolved to on 2026-09-24). CI run 36680491360's
+  # `G4` job logs `manifest unknown` for that digest — the registry no
+  # longer has it. P5-RESULT.md's measurements were taken on the earlier
+  # `c49ebd…` image; G4 is what re-proves them on this one.
   debezium-server:
     profiles: ["dagster"]
-    image: ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bdd43b1906bf4502325411d49d66ecf75d992f3d07745ff378cc92cfe4
+    image: ghcr.io/memiiso/debezium-server-iceberg:1.1.1.Final@sha256:2ad14b158914097985e98933e6f541e2f4e34fabd1c5d47d655067b9db0282b8
     depends_on:
       g4-source-init:
         condition: service_completed_successfully

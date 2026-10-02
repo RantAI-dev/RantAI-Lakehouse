@@ -238,9 +238,18 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     [memoryKeySignature]
   );
 
+  // TanStack derives a column's id from `accessorKey` inside the table, not on
+  // the def object, so reading `column.id` alone leaves out every column that
+  // did not spell an id out — which is most of them. The whitelist then
+  // rejects its own columns and sorting silently never applies.
   const columnIds = React.useMemo(() => {
     return new Set(
-      columns.map((column) => column.id).filter(Boolean) as string[]
+      columns
+        .map(
+          (column) =>
+            column.id ?? (column as { accessorKey?: string }).accessorKey
+        )
+        .filter(Boolean) as string[]
     );
   }, [columns]);
 

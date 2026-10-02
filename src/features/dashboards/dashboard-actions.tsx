@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Copy, Download, FileDown, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Share2, Trash2,
+  Check, Copy, Download, FileDown, FolderInput, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,13 +13,14 @@ import {
   DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { REFRESH_INTERVALS } from "./auto-refresh";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
   isDefault, loading, fullscreen, autoSec,
-  onRefresh, onToggleFullscreen, onAutoSec, onRename, onShare, onExportPdf, onDuplicate, onDelete,
+  onRefresh, onToggleFullscreen, onAutoSec, onRename, onMove, onShare, onExportPdf, onDuplicate, onDelete,
 }: {
   readonly isDefault: boolean;
   readonly loading: boolean;
@@ -29,6 +30,8 @@ export function DashboardActionsMenu({
   readonly onToggleFullscreen: () => void;
   readonly onAutoSec: (value: string) => void;
   readonly onRename: () => void;
+  /** Absent when the viewer cannot file dashboards into folders. */
+  readonly onMove?: () => void;
   readonly onShare: () => void;
   readonly onExportPdf: () => void;
   readonly onDuplicate: () => void;
@@ -65,9 +68,31 @@ export function DashboardActionsMenu({
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
-            {!isDefault ? (
+            {/* Kept in place on the built-in dashboard rather than removed:
+                a name that cannot be changed is worth saying once, whereas a
+                menu that quietly grows an entry on every other board leaves
+                the reader wondering what else is missing here. The wrapping
+                span carries the hover — the disabled item itself has
+                `pointer-events-none`. */}
+            {isDefault ? (
+              <Tooltip>
+                <TooltipTrigger render={<span className="block" />}>
+                  <DropdownMenuItem disabled>
+                    <Pencil className="size-4" /> Rename
+                  </DropdownMenuItem>
+                </TooltipTrigger>
+                <TooltipContent side="left" className="max-w-56">
+                  The built-in dashboard keeps its name. Duplicate it for a copy you can rename.
+                </TooltipContent>
+              </Tooltip>
+            ) : (
               <DropdownMenuItem onClick={onRename}>
                 <Pencil className="size-4" /> Rename
+              </DropdownMenuItem>
+            )}
+            {!isDefault && onMove ? (
+              <DropdownMenuItem onClick={onMove}>
+                <FolderInput className="size-4" /> Move to folder…
               </DropdownMenuItem>
             ) : null}
             {!isDefault ? (

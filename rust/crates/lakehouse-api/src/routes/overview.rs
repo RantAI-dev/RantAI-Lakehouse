@@ -610,6 +610,10 @@ mod tests {
             status: "SUCCESS".to_owned(),
             start_time: Some(start.unix_timestamp() as f64),
             end_time: None,
+            creation_time: None,
+            parent_run_id: None,
+            root_run_id: None,
+            tags: Vec::new(),
         }
     }
 

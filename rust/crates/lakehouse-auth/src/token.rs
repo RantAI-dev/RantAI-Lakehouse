@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use crate::secret::Secret;
@@ -14,9 +14,9 @@ use crate::secret::Secret;
 /// safe to treat as a password-equivalent secret.
 const TOKEN_BYTES: usize = 32;
 
-/// Generate a fresh opaque token: `TOKEN_BYTES` bytes from
-/// [`rand::rngs::OsRng`] (via [`rand::thread_rng`], which is seeded from the
-/// OS CSPRNG), lower-hex encoded. Collisions are not a practical concern —
+/// Generate a fresh opaque token: `TOKEN_BYTES` bytes from [`rand::rng`]
+/// (thread-local, seeded from the OS CSPRNG), lower-hex encoded. Collisions
+/// are not a practical concern —
 /// 256 bits of entropy hex-encoded gives a birthday bound far beyond any
 /// realistic number of concurrently issued sessions/service credentials —
 /// but callers still enforce uniqueness at the database level
@@ -24,7 +24,7 @@ const TOKEN_BYTES: usize = 32;
 #[must_use]
 pub fn generate_opaque_token() -> Secret {
     let mut bytes = [0_u8; TOKEN_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(TOKEN_BYTES * 2);
     for byte in bytes {
         let _ = write!(out, "{byte:02x}");

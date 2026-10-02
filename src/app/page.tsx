@@ -1,8 +1,8 @@
 "use client"
 
-import { OverviewPage } from "@/features/overview/overview-page"
+import { HomePage } from "@/features/home/home-page"
 
-/** Thin App Router page for OverviewPage. */
+/** Thin App Router page for HomePage. */
 export default function Page() {
-  return <OverviewPage />
+  return <HomePage />
 }

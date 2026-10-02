@@ -28,9 +28,9 @@
 //! authentication primitive.
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use async_trait::async_trait;
-use rand::rngs::OsRng;
 use uuid::Uuid;
 
 use crate::authenticator::Authenticator;
@@ -53,15 +53,20 @@ const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$ZHVtbXlkdW1teWR1bW15ZHU
 /// ([`Argon2::default`], which is the OWASP-recommended minimum: 19 MiB
 /// memory, 2 iterations, 1 degree of parallelism).
 ///
+/// `password-hash` 0.6 removed the explicit `SaltString`-from-`OsRng` call
+/// this used to make — `PasswordHasher::hash_password` now generates its
+/// own random salt internally via the `getrandom` feature (default-on for
+/// `argon2`), which is still OS-backed CSPRNG randomness, just no longer a
+/// caller-visible step.
+///
 /// # Errors
 ///
 /// Returns [`AuthError::Hash`] if hashing fails (in practice this only
 /// happens for pathological inputs `Argon2` itself rejects, e.g. an
 /// extremely long password).
 pub fn hash_password(password: &Secret) -> Result<Secret, AuthError> {
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(password.expose().as_bytes(), &salt)
+        .hash_password(password.expose().as_bytes())
         .map_err(|_| AuthError::Hash)?;
     Ok(Secret::new(hash.to_string()))
 }
@@ -285,6 +290,30 @@ mod tests {
         // returning `false` for both a bad hash and a bad password to hide
         // the difference.
         assert!(PasswordHash::new(DUMMY_HASH).is_ok());
+    }
+
+    /// A real `Argon2id` `PHC` hash of `PRE_BUMP_PASSWORD`, generated with
+    /// argon2 0.5.3 (the version this crate used before the #21 dependency
+    /// bump to 0.6). Pinned here so the bump is proven not to have changed
+    /// what a stored hash from before it verifies against — a password
+    /// hashing library bump that silently stops verifying pre-existing
+    /// rows would lock out every user who hasn't since changed their
+    /// password.
+    const PRE_BUMP_PASSWORD: &str = "pinned-regression-test-password-v0.5";
+    const PRE_BUMP_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$php75+C3qAii2F/vDtY4nw$64yTZpHPjDVICcfrr0H/AJh/D9e0Yw82Ch8AE3XRvYA";
+
+    #[test]
+    fn a_hash_from_before_the_argon2_0_6_bump_still_verifies() {
+        assert!(verify_password(
+            &Secret::new(PRE_BUMP_PASSWORD),
+            PRE_BUMP_ARGON2_HASH
+        ));
+        // And the non-enumeration guarantee still holds: a wrong password
+        // against that same pre-existing hash still fails.
+        assert!(!verify_password(
+            &Secret::new("wrong"),
+            PRE_BUMP_ARGON2_HASH
+        ));
     }
 
     #[test]

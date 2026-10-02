@@ -45,6 +45,7 @@ pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
 pub mod routes;
+pub mod sql_guard;
 pub mod sql_rewrite;
 pub mod state;
 pub mod tenant;

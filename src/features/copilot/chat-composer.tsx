@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
+import { GlowFrame } from "@/components/ui/brand-glow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -10,7 +11,7 @@ import type { Mode } from "./use-copilot";
 import { capsForMode } from "./capabilities";
 
 /** The "Tools" menu — pick the (menu-facing) CAPABILITIES the agent may use. */
-function ToolsMenu({
+export function ToolsMenu({
   mode, enabledCaps, toggleCap,
 }: {
   mode: Mode;
@@ -72,13 +73,39 @@ function ToolsMenu({
 }
 
 /**
+ * The Ask/Build switch. Shared by the composer and Home's prompt so both
+ * drive the same `useCopilot` mode.
+ */
+export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
+  return (
+    <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
+      {(["ask", "build"] as Mode[]).map((m) => (
+        <button
+          key={m}
+          type="button"
+          aria-pressed={mode === m}
+          title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
+          onClick={() => setMode(m)}
+          className={cn(
+            "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+            mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {m === "ask" ? "Ask" : "Build"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
  * The chat composer — input + Ask/Build toggle + Tools menu + send. A "bar"
  * style like Google Cloud Assist / RantAI-Agents. Used by the global chat
  * dock and /copilot.
  */
 export function ChatComposer({
   mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact,
+  enabledCaps, toggleCap, onFocus, glass, compact, glow,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -96,6 +123,8 @@ export function ChatComposer({
   glass?: boolean;
   /** Compact single-line pill (collapsed dock, Google-style). */
   compact?: boolean;
+  /** Brand focus ring (`GlowFrame`) — the full /copilot page. */
+  glow?: boolean;
 }) {
   const [input, setInput] = React.useState("");
   const submit = () => {
@@ -142,11 +171,8 @@ export function ChatComposer({
     );
   }
 
-  return (
-    <div className={cn(
-      "rounded-2xl border p-1.5 transition-all",
-      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
-    )}>
+  const body = (
+    <>
       <Textarea
         value={input}
         onChange={(e) => setInput(e.target.value)}
@@ -161,24 +187,7 @@ export function ChatComposer({
         className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
-        {/* Ask/Build toggle */}
-        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
-          {(["ask", "build"] as Mode[]).map((m) => (
-            <button
-              key={m}
-              type="button"
-              aria-pressed={mode === m}
-              title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
-              onClick={() => setMode(m)}
-              className={cn(
-                "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {m === "ask" ? "Ask" : "Build"}
-            </button>
-          ))}
-        </div>
+        <ModeToggle mode={mode} setMode={setMode} />
 
         {enabledCaps && toggleCap ? (
           <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
@@ -213,6 +222,18 @@ export function ChatComposer({
           </button>
         )}
       </div>
+    </>
+  );
+
+  // The /copilot page's composer: Home's spinning brand ring on focus.
+  if (glow) return <GlowFrame innerClassName="p-1.5">{body}</GlowFrame>;
+
+  return (
+    <div className={cn(
+      "rounded-2xl border p-1.5 transition-all",
+      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
+    )}>
+      {body}
     </div>
   );
 }

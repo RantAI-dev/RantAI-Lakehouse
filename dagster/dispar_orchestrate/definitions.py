@@ -12,7 +12,11 @@ from dagster import Definitions
 from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
 from dispar_orchestrate.alerts_run import alerts_run_job, alerts_run_schedule
 from dispar_orchestrate.assets import bronze_ingest_job
-from dispar_orchestrate.authored_factory import authored_jobs
+from dispar_orchestrate.authored_factory import (
+    authored_dependency_sensors,
+    authored_jobs,
+    authored_schedules,
+)
 from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
@@ -22,6 +26,10 @@ from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
     bronze_maintenance_schedule,
+)
+from dispar_orchestrate.pipeline_events import (
+    pipeline_run_failed_sensor,
+    pipeline_run_finished_sensor,
 )
 from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
@@ -52,15 +60,11 @@ from dispar_orchestrate.replication_metrics import (
 # schema-ownership split with `bronze_catalog.py`.
 #
 # WS4 items E1/E3/E4 add `authored_jobs`: one real `authored__<id>` job per
-# Postgres-authored, `ready`-status `pipeline_definition` row, built from
-# `GET /api/pipelines` at code-load time — see `authored_factory.py`'s
-# module doc for the full design, its degrade-honestly fetch, and two
-# verified gaps (no `definition` field on this branch's list response yet;
-# the pipeline-run service identity's `pipeline:write`-only scope) that
-# currently keep this list empty against a real running stack. Spread into
-# `jobs=`, not `schedules=`: an authored pipeline has no cron schedule of
-# its own in this plan's scope — it is triggered on demand via
-# `POST /api/pipelines/{id}/trigger`, same as `gold_export_job`.
+# console-authored pipeline in status `ready` or `paused`, built from
+# `GET /api/pipelines/runnable` at code-load time, and `authored_schedules`:
+# one schedule per such pipeline whose authored schedule is a cron — see
+# `authored_factory.py`'s module doc for the design, its degrade-honestly
+# fetch, and the reload that picks up console edits.
 #
 # WS6 restores `gold_export_schedule` (daily 04:00,
 # `default_status=RUNNING`, same convention as every schedule below — see
@@ -92,9 +96,23 @@ defs = Definitions(
         *agent_run_schedules,
         capacity_snapshot_schedule,
         gold_export_schedule,
+        *authored_schedules,
     ],
-    # `ingest_job`'s connector schedules: one sensor reading them from
-    # lakehouse-api, so a schedule saved in the console needs no reload --
-    # see `ingest_factory.py`'s "Schedules" section.
-    sensors=[ingest_schedule_sensor],
+    sensors=[
+        # `ingest_job`'s connector schedules: one sensor reading them from
+        # lakehouse-api, so a schedule saved in the console needs no reload --
+        # see `ingest_factory.py`'s "Schedules" section.
+        ingest_schedule_sensor,
+        pipeline_run_failed_sensor,
+        pipeline_run_finished_sensor,
+        # R3 plan 2a: one `run_status_sensor` per authored pipeline with
+        # non-empty `depends_on`, named `authored__<safe_id>_after` (the
+        # same name the API layer fetches ticks for via
+        # `GET /api/pipelines/{id}/schedule-ticks`). Pipelines without
+        # `depends_on` contribute no entry, so the sensor list is empty
+        # until an author wires a chain. See `authored_factory.py`'s
+        # module doc for the ALL-semantics and run_key = upstream run id
+        # design choices.
+        *authored_dependency_sensors,
+    ],
 )

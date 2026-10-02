@@ -3,7 +3,7 @@ import { topoSortOps } from "./topo-sort-ops"
 import type { PipelineOpNode } from "@/services/contracts/pipelines"
 
 function op(name: string): PipelineOpNode {
-  return { name, description: null, sourceRef: null, commit: null, sql: null }
+  return { name, description: null, sourceRef: null, commit: null, sql: null, reads: [], writes: [] }
 }
 
 describe("topoSortOps", () => {
@@ -37,7 +37,13 @@ describe("topoSortOps", () => {
   })
 
   it("renders a single op with no edges deliberately (Phase A found this is the common real case), not as a broken empty graph", () => {
-    const ops = [op("run_bronze_maintenance")]
+    // PART C of `parts/1b-dagster-one-op-per-unit-and-retries.md`:
+    // `run_bronze_maintenance` was split into `list_bronze_tables` ->
+    // `maintain_bronze_table[<key>]` -> `summarize_bronze_maintenance`.
+    // The test only cares that a single op with no edges is rendered
+    // as a single-node graph; using `list_bronze_tables` keeps it
+    // pinned to a current op name.
+    const ops = [op("list_bronze_tables")]
     const sorted = topoSortOps(ops, [])
     expect(sorted).toEqual([{ node: ops[0], upstream: [] }])
   })

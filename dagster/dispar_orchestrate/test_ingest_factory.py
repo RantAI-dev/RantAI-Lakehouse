@@ -999,3 +999,361 @@ def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkey
 
     assert [r["status"] for r in recorded] == ["succeeded"]
     assert "could not be registered in the catalog: clickhouse is down" in capsys.readouterr().out
+
+
+def test_run_ingest_reports_each_objects_measured_rows_as_a_materialization(monkeypatch) -> None:
+    # PART B of `parts/1b-dagster-one-op-per-unit-and-retries.md`: the
+    # materialization is now logged by the mapped `ingest_source_object`
+    # op, not by `run_ingest` (which is the fan-out). Driving the full
+    # `ingest_job` via `execute_in_process` -- the same path the other
+    # PART B fan-out tests use -- proves the per-object materialization
+    # is still emitted (only for `orders`, whose adapter returned an
+    # int; `sheet` returned `None` and so is not materialized). The
+    # materialization is read off the per-step
+    # `event_specific_data.materialization.metadata` -- the same path
+    # `test_gold_export.py::GoldExportFanOutTest` walks.
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    rows_by_object = {"orders": 42, "sheet": None}
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj: rows_by_object[obj["name"]])
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {},
+        "sourceObjects": [{"name": "orders", "target": "orders"}, {"name": "sheet", "target": "sheet"}],
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+    materials = [
+        (
+            e.event_specific_data.materialization.asset_key.to_user_string(),
+            e.event_specific_data.materialization.metadata["rows"].value,
+        )
+        for e in result.all_events
+        if e.event_type_value == "ASSET_MATERIALIZATION"
+    ]
+    assert materials == [("bronze/orders", 42)]
+
+
+def _stub_env(monkeypatch) -> None:
+    """Stub `IngestFactoryConfig.from_env` so a fan-out test does not
+    reach the real `LAKEHOUSE_API_URL` env. Used by every PART B fan-out
+    test below."""
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(
+        f.IngestFactoryConfig,
+        "from_env",
+        staticmethod(lambda: f.IngestFactoryConfig(api_url="http://x", service_token="t")),
+    )
+
+
+def _batch_connector(targets):
+    return {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {},
+        "sourceObjects": [{"name": t, "target": t} for t in targets],
+    }
+
+
+# PART B fan-out tests. `run_ingest` is now the fan-out:
+# cdc -> log + no DynamicOutputs; stream -> call _run_stream_connector +
+# no DynamicOutputs; batch -> one DynamicOutput per `sourceObjects` entry,
+# mapped to a per-object `ingest_source_object` step. A failed object's
+# step fails without taking the others down; secrets are resolved INSIDE
+# the mapped op (the DynamicOutput payload carries the connector with its
+# `secretRef` strings only).
+def test_three_objects_yield_three_mapped_steps_with_their_keys(monkeypatch) -> None:
+    """Three source objects -> three mapped steps
+    `ingest_source_object[<sanitized_target>]`. Each mapped step
+    calls `_run_one_object` once, in its own failure unit."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    monkeypatch.setattr(
+        f, "_run_one_object",
+        lambda connector, obj: {"orders": 7, "customers": 3, "invoices": 1}[obj["name"]],
+    )
+    connector = _batch_connector(["orders", "customers", "invoices"])
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+
+    # `run_ingest` is now a `DynamicOut` op; invoke it via
+    # `execute_in_process` on the real `ingest_job` so the
+    # fan-out->map->collect graph runs as a job.
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+    assert result.success
+    succeeded = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+    # The mapped op's mapping_key is the sanitized target -- three
+    # distinct targets -> three distinct step keys.
+    assert "ingest_source_object[orders]" in succeeded
+    assert "ingest_source_object[customers]" in succeeded
+    assert "ingest_source_object[invoices]" in succeeded
+
+
+def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monkeypatch) -> None:
+    """One object's adapter raises -> only that mapped step fails;
+    the others still record `ingest_run` success rows. Without the
+    fan-out, a single failure aborted the whole per-object loop
+    inside `run_ingest`, and the failing object's row was its only
+    observability.
+
+    The test drives the real `_run_one_object` (so its
+    `record_ingest_run` call -- in EVERY branch, including the
+    `except Exception` catch -- runs for real) by patching the
+    adapter's `build_source` to raise only for the `customers`
+    object, mirroring how the existing `_run_one_object` tests
+    inject fakes through the adapter seam (`test_adapters_sql.py`'s
+    pattern)."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+
+    class _FakeOutcome:
+        def __init__(self, rows: int) -> None:
+            self.rows = rows
+
+    class _FakeResult:
+        def __init__(self, rows: int) -> None:
+            self.source = object()  # identity-only; sink is monkeypatched
+            self.resolved = None
+            self.rows = rows
+
+    class _FakeAdapter:
+        def build_source(self, dial, secrets, objs):
+            if objs[0]["name"] == "customers":
+                raise f.UnknownAdapter("adapter=something-not-real")
+            return _FakeResult(rows={"orders": 11, "invoices": 5}[objs[0]["name"]])
+
+    # Patch the generic-sql adapter entry on the module's adapter
+    # table; mirror what `test_run_one_object_routes_*_through_*`
+    # already does.
+    monkeypatch.setitem(f._ADAPTERS, "sql", _FakeAdapter())
+    monkeypatch.setattr(f, "_host_of", lambda dial: None)
+
+    def fake_load(source, target, sink_config, plan):
+        return _FakeOutcome(rows=42)
+
+    # `load_via_sink` is referenced inside `_run_one_object` as
+    # `sink_adapter.load_via_sink` (where `sink_adapter` is the
+    # `adapters.sink` module), NOT `ingest_factory.load_via_sink`. So
+    # patching `f.load_via_sink` (the local re-export) does nothing --
+    # the real function would still run, drive dlt's pipeline, and
+    # try to reach `lakehouse-api`. Patch the canonical attribute on
+    # the sink module instead. The previous test that mocks
+    # `f.load_via_sink` works because it drives `_run_one_object`
+    # directly, where the same reference is used -- here we drive
+    # through the job graph, so the canonical patch is the one that
+    # matters.
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", fake_load)
+
+    # Resolve the connector's declared `secretRef` so the pre-adapter
+    # `_resolve_object_secrets` call inside `_run_one_object` does not
+    # itself raise `SecretRefRejected` (which would otherwise be the
+    # failure the test would observe, not the adapter-side
+    # `UnknownAdapter` it is meant to assert). The other PART B tests
+    # use a `secretRef: None` connector and skip this, because they do
+    # not exercise `_run_one_object` end-to-end.
+    monkeypatch.setattr(
+        f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret"
+    )
+
+    # Capture every `record_ingest_run` call so the test can assert
+    # the failing object's row exists alongside the two success rows.
+    record_calls = []
+    monkeypatch.setattr(
+        f, "record_ingest_run",
+        lambda **kwargs: record_calls.append(kwargs),
+    )
+    connector = _batch_connector(["orders", "customers", "invoices"])
+    connector["secretRef"] = "env:CONNECTOR_PG_PASSWORD"
+    connector["secretRefSecondary"] = None
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+    assert not result.success
+    failed = {e.step_key for e in result.all_events if e.event_type_value == "STEP_FAILURE"}
+    succeeded = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+    assert "ingest_source_object[customers]" in failed
+    assert "ingest_source_object[orders]" in succeeded
+    assert "ingest_source_object[invoices]" in succeeded
+    # At least one of the recorded `ingest_run` rows must be a
+    # failure row for `customers` -- the failing object's row must
+    # exist alongside the two success rows.
+    statuses_by_name = {
+        call["object_name"]: call["status"] for call in record_calls if "object_name" in call
+    }
+    assert statuses_by_name.get("customers") == "failed"
+    assert statuses_by_name.get("orders") == "succeeded"
+    assert statuses_by_name.get("invoices") == "succeeded"
+
+
+def test_oracle_tls_config_error_from_a_mapped_step_is_wrapped_in_a_non_retryable_failure(
+    monkeypatch,
+) -> None:
+    """PART D witness: `OracleTlsConfigError` (raised inside
+    `adapters.oracle.build_source` for a bad TLS config) is one of the
+    config-shaped types added to `ingest_source_object`'s except tuple
+    in this round. Drive the op directly with a real
+    `build_op_context`, mock `_run_one_object` to raise that type, and
+    assert the surfaced `Failure` carries `allow_retries=False` with
+    the original `OracleTlsConfigError` as `__cause__`. The mapped
+    step's `record_ingest_run` failure row is written first (in
+    `_run_one_object`'s own `except Exception` branch), so the
+    governance surface sees the failure immediately -- exactly like
+    the existing `UnknownAdapter` fan-out test."""
+    from dagster import Failure, build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    def fake_run_one_object(_connector, obj):
+        raise f.oracle_adapter.OracleTlsConfigError(
+            f"oracle tls config rejected for {obj.get('target')!r}"
+        )
+
+    monkeypatch.setattr(f, "_run_one_object", fake_run_one_object)
+    with pytest.raises(Failure) as ctx:
+        f.ingest_source_object(
+            build_op_context(),
+            {"connector": {"id": "c"}, "obj": {"name": "orders", "target": "orders"}},
+        )
+    assert ctx.value.allow_retries is False
+    assert isinstance(ctx.value.__cause__, f.oracle_adapter.OracleTlsConfigError)
+
+
+def test_cdc_connector_yields_no_mapped_steps(monkeypatch) -> None:
+    """A `cdc`-adapter connector has NO per-object batch body to
+    run (Debezium's own compose service owns its ingestion, see
+    `run_ingest`'s existing cdc branch). `run_ingest` therefore
+    yields no DynamicOutputs and the job runs only `run_ingest`
+    itself, succeeding -- a downstream step being absent must not
+    be treated as a failure."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: {
+        "id": "conn-cdc",
+        "adapter": "cdc",
+        "dial": {},
+        "sourceObjects": [],
+    })
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-cdc"}}}},
+    )
+    assert result.success
+    succeeded = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+    # Only `run_ingest` itself runs -- no mapped `ingest_source_object`.
+    assert "run_ingest" in succeeded
+    for key in succeeded:
+        assert not key.startswith("ingest_source_object["), key
+
+
+def test_stream_connector_yields_no_mapped_steps(monkeypatch) -> None:
+    """A `stream` ingestMode routes to `_run_stream_connector`
+    (Kafka), not the per-object loop. `run_ingest` yields no
+    DynamicOutputs and the stream connector runs as a single
+    non-mapped body inside `run_ingest` itself."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: {
+        "id": "conn-kafka",
+        "adapter": "kafka",
+        "ingestMode": "stream",
+        "dial": {},
+        "sourceObjects": [],
+    })
+    called = []
+    monkeypatch.setattr(
+        f, "_run_stream_connector",
+        lambda connector: called.append(connector["id"]),
+    )
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-kafka"}}}},
+    )
+    assert result.success
+    assert called == ["conn-kafka"]
+
+
+def test_a_non_ascii_letter_is_replaced_with_an_underscore_for_dagsters_charset() -> None:
+    """Dagster's `check_valid_chars` requires `^[A-Za-z0-9_]+$`.
+    `str.isalnum()` is True for non-ASCII letters (`"é".isalnum()`,
+    `"²".isalnum()`), so the helper must use the exact ASCII rule
+    -- not `c.isalnum()`. This pins that contract: the helper turns
+    a non-ASCII letter into `_`, not into itself."""
+    import dispar_orchestrate.ingest_factory as f
+
+    assert f._sanitize_target("schéma") == "sch_ma"
+    # Both the `.` and the `é` are outside `[A-Za-z0-9_]` and become
+    # `_` independently -- two consecutive underscores, no special
+    # merging behaviour. The contract is "every non-ASCII char -> `_`",
+    # not "non-ASCII runs collapse".
+    assert f._sanitize_target("café.orders") == "caf__orders"
+    assert f._sanitize_target("plain_ok") == "plain_ok"
+
+
+def test_no_dynamic_output_value_contains_a_resolved_secret(monkeypatch) -> None:
+    """The `DynamicOutput` payload `run_ingest` hands to each mapped
+    step is the connector dict as `_fetch_one_connector` returned
+    it -- which carries only `secretRef` STRING REFERENCES, never
+    a resolved secret value. Dagster's IO manager persists op
+    outputs, so a resolved secret becoming one would leak it. This
+    test asserts the invariant by snapshotting every yielded
+    DynamicOutput's value and confirming no key looks like a
+    resolved secret."""
+    from dagster import build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {"host": "db.example.com", "driver": "postgres"},
+        "secretRef": "env:CONNECTOR_PG_PASSWORD",
+        "secretRefSecondary": None,
+        "sourceObjects": [
+            {"name": "orders", "target": "orders"},
+            {"name": "customers", "target": "customers"},
+        ],
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+
+    # `run_ingest` is a DynamicOut op; invoke directly with a real
+    # context and consume the generator.
+    gen = f.run_ingest(build_op_context(op_config={"connector_id": "conn-pg"}))
+    payloads = []
+    try:
+        for dyn in gen:
+            payloads.append(dyn.value)
+    except StopIteration:
+        pass
+
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["connector"]["id"] == "conn-pg"
+        # `secretRef` is the unresolved reference (string), not a
+        # resolved value. The same holds for `secretRefSecondary`.
+        assert payload["connector"]["secretRef"] == "env:CONNECTOR_PG_PASSWORD"
+        assert payload["connector"]["secretRefSecondary"] is None
+        # No field on the connector dict should hold a non-empty
+        # value that looks like an actual secret -- env vars go via
+        # `secret_resolver.resolve_secret_ref`, never via the
+        # connector dict itself, so any non-empty `password`/
+        # `token`/`key` on the connector dict would be the leak this
+        # invariant is closing.
+        for field in ("password", "token", "api_key", "secret"):
+            assert field not in payload["connector"], f"{field!r} leaked into DynamicOutput payload"

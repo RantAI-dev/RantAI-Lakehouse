@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::builder::{QueryBuilder, build_kpi_sql};
+use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
@@ -63,18 +63,37 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Radar,
     ChartKind::Waterfall,
     ChartKind::Geomap,
+    ChartKind::Sankey,
+    ChartKind::Sunburst,
+    ChartKind::Boxplot,
+    ChartKind::Calendar,
     ChartKind::Kpi,
     ChartKind::Gauge,
     ChartKind::Table,
     ChartKind::Text,
 ];
 
-/// Kinds allowed to carry a breakdown (2nd dimension). `heatmap` REQUIRES one.
-/// Mirrors the TS `BREAKDOWN_KINDS` set.
+/// Kinds allowed to carry a breakdown (2nd dimension). `heatmap`, `sankey`
+/// and `sunburst` REQUIRE one ([`breakdown_required`]). Mirrors the TS
+/// `BREAKDOWN_KINDS` set.
 fn breakdown_allowed(kind: ChartKind) -> bool {
     matches!(
         kind,
-        ChartKind::Bar | ChartKind::Hbar | ChartKind::Line | ChartKind::Area | ChartKind::Heatmap
+        ChartKind::Bar
+            | ChartKind::Hbar
+            | ChartKind::Line
+            | ChartKind::Area
+            | ChartKind::Heatmap
+            | ChartKind::Sankey
+            | ChartKind::Sunburst
+    )
+}
+
+/// Kinds that only make sense with a 2nd dimension.
+fn breakdown_required(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Heatmap | ChartKind::Sankey | ChartKind::Sunburst
     )
 }
 
@@ -97,8 +116,14 @@ pub struct ChartSpec {
     pub subtitle: Option<String>,
     /// How to render the data.
     pub kind: ChartKind,
-    /// Source mart (unqualified, e.g. `mart_wisman`), empty for `text`.
+    /// Source mart (unqualified, e.g. `mart_wisman`), empty for `text` and
+    /// for a chart built on a SQL source.
     pub mart: String,
+    /// Dashboard SQL source id (`s_…`) when the chart reads a SQL source
+    /// instead of a mart. `None` for every chart stored before SQL sources
+    /// existed, which is why it defaults.
+    #[serde(rename = "sqlSource", skip_serializing_if = "Option::is_none", default)]
+    pub sql_source: Option<String>,
     /// `ClickHouse` SQL that returns the chart's rows, empty for `text`.
     pub sql: String,
     /// Column name for the X axis / category.
@@ -192,6 +217,11 @@ pub struct ChartInput {
     /// of failing at deserialization with "missing field `mart`".
     #[serde(default)]
     pub mart: String,
+    /// Dashboard SQL source id, the alternative to `mart` (exactly one of
+    /// the two for every kind but `text`). `camelCase` on the wire like the
+    /// rest of the console's JSON.
+    #[serde(rename = "sqlSource", skip_serializing_if = "Option::is_none", default)]
+    pub sql_source: Option<String>,
     /// How to render the data.
     pub kind: ChartKind,
     /// X-axis / category column.
@@ -248,6 +278,14 @@ pub struct Board {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// One-line purpose, shown wherever a dashboard is listed rather than
+    /// opened. Empty when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub description: Option<String>,
+    /// Display name of whoever created this board (`""` for boards made
+    /// before the column existed, or by an unauthenticated caller).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_by: Option<String>,
     /// Tile layout, by chart id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub layout: Option<LayoutMap>,
@@ -257,12 +295,28 @@ pub struct Board {
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
+    /// When this board was last written, `ClickHouse`-formatted.
+    ///
+    /// Same underlying column as [`Self::created_at`], deliberately: the
+    /// table is a `ReplacingMergeTree(created_at)`, so `created_at` is the
+    /// VERSION column and every upsert (rename, layout save, filter
+    /// change) rewrites it with `now()`. It has therefore always been a
+    /// last-modified value wearing a "created" name. Exposing it under
+    /// both names lets a list view label it truthfully as "Updated"
+    /// without breaking the existing `createdAt` field that the share
+    /// dialog and the parity corpus already read.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub updated_at: Option<String>,
     /// Public read-only share token, when enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub public_token: Option<String>,
     /// Whether signed (JWT) embedding is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embed_enabled: Option<bool>,
+    /// Dashboard folder id (`crate::folders`); empty = root. `None` only on
+    /// a board value built in code before it is saved.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub folder_id: Option<String>,
 }
 
 /// A tile's position on the 12-column grid canvas.
@@ -302,12 +356,12 @@ pub struct FilterDef {
 // first group, which carries no version/variant bits and is therefore
 // uniformly random) / `randomUUID().replace(/-/g, "")` (32 hex chars).
 
-fn random_hex(n_bytes: usize) -> String {
+pub(crate) fn random_hex(n_bytes: usize) -> String {
     use std::fmt::Write as _;
 
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = vec![0_u8; n_bytes];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(n_bytes * 2);
     for b in bytes {
         let _ = write!(out, "{b:02x}");
@@ -413,6 +467,48 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // Both `String DEFAULT ''`, not `DateTime DEFAULT now()`: a default is
+    // evaluated at READ time for rows written before the column existed, so
+    // a `now()` default would hand back a different value on every SELECT.
+    // A constant empty string is stable for old rows.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS description String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // Dashboard folders (`crate::folders`): boards and SQL sources carry a
+    // `folder_id`, `''` meaning the root.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS folder_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS created_by String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_folder (\n\
+           id String, name String, parent_id String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // Dashboard SQL sources (`crate::sources`). Same versioned-insert shape
+    // as the two tables above: every save is an INSERT, `created_at` is the
+    // version, a delete is an `is_deleted = 1` tombstone.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_source (\n\
+           id String, title String, sql String, columns_json String DEFAULT '[]',\n\
+           folder_id String DEFAULT '', created_by String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -426,7 +522,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -456,14 +552,19 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| row.get("embed_enabled").and_then(Value::as_i64))
         .unwrap_or(0);
+    let stamp = row_str(row, "created_at").to_owned();
     Board {
         id: row_str(row, "id").to_owned(),
         name: row_str(row, "name").to_owned(),
+        description: Some(row_str(row, "description").to_owned()),
+        created_by: Some(row_str(row, "created_by").to_owned()),
         layout: Some(parse_layout(layout_json)),
         filters: Some(parse_filters(filters_json)),
-        created_at: Some(row_str(row, "created_at").to_owned()),
+        created_at: Some(stamp.clone()),
+        updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
+        folder_id: Some(row_str(row, "folder_id").to_owned()),
     }
 }
 
@@ -510,7 +611,12 @@ pub async fn get_board(ch: &ChClient, id: &str) -> Result<Option<Board>, ChError
 ///
 /// Returns [`BiError::Validation`] when `name` is blank after trimming, or
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
+pub async fn create_board(
+    ch: &ChClient,
+    name: &str,
+    description: &str,
+    created_by: &str,
+) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
@@ -518,45 +624,60 @@ pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
             "dashboard name is required.".to_owned(),
         ));
     }
+    let desc = description.trim();
+    let author = created_by.trim();
     let id = new_board_id();
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name) VALUES ({}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by) VALUES ({}, {}, {}, {})",
         SqlLiteral::from(id.as_str()),
-        SqlLiteral::from(clean)
+        SqlLiteral::from(clean),
+        SqlLiteral::from(desc),
+        SqlLiteral::from(author)
     );
     ch.exec(&sql, None).await?;
     Ok(Board {
         id,
         name: clean.to_owned(),
+        description: Some(desc.to_owned()),
+        created_by: Some(author.to_owned()),
         layout: Some(LayoutMap::new()),
         filters: Some(Vec::new()),
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     })
 }
 
 /// INSERT (not `ALTER ... UPDATE`) — `ReplacingMergeTree`, instant & consistent.
+#[allow(clippy::too_many_arguments)]
 async fn upsert_board(
     ch: &ChClient,
     id: &str,
     name: &str,
+    description: &str,
+    created_by: &str,
     layout: &LayoutMap,
     filters: &[FilterDef],
     public_token: &str,
     embed_enabled: bool,
+    folder_id: &str,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token, embed_enabled) VALUES \
-         ({}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
+        SqlLiteral::from(description),
+        SqlLiteral::from(created_by),
         SqlLiteral::from(layout_json),
         SqlLiteral::from(filters_json),
         SqlLiteral::from(public_token),
         i32::from(embed_enabled),
+        SqlLiteral::from(folder_id),
     );
     ch.exec(&sql, None).await
 }
@@ -568,6 +689,18 @@ async fn save_board_patch(
 ) -> Result<(), ChError> {
     let name = patch.name.unwrap_or(board.name.as_str());
     let name = if name.is_empty() { "Dashboard" } else { name };
+    // `created_by` is never patched: it records who made the board, which
+    // does not change when somebody else edits it. It must still be
+    // re-written on every upsert, or the ReplacingMergeTree row that wins
+    // would carry an empty author.
+    let description = patch
+        .description
+        .or(board.description.as_deref())
+        .unwrap_or("");
+    let created_by = patch
+        .created_by
+        .or(board.created_by.as_deref())
+        .unwrap_or("");
     let empty_layout = LayoutMap::new();
     let layout = patch
         .layout
@@ -585,14 +718,21 @@ async fn save_board_patch(
     let embed_enabled = patch
         .embed_enabled
         .unwrap_or_else(|| board.embed_enabled.unwrap_or(false));
+    // Every save is a full-row INSERT, so a patch that does not touch the
+    // folder must carry the current one forward or the board would fall
+    // back to the root.
+    let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
     upsert_board(
         ch,
         &board.id,
         name,
+        description,
+        created_by,
         layout,
         filters,
         public_token,
         embed_enabled,
+        folder_id,
     )
     .await
 }
@@ -602,10 +742,13 @@ async fn save_board_patch(
 #[derive(Default)]
 struct BoardPatch<'a> {
     name: Option<&'a str>,
+    description: Option<&'a str>,
+    created_by: Option<&'a str>,
     layout: Option<&'a LayoutMap>,
     filters: Option<&'a [FilterDef]>,
     public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
+    folder_id: Option<&'a str>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -635,6 +778,53 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     Ok(())
 }
 
+/// Set a board's one-line description. Blank clears it. No-op if the board
+/// does not exist, matching [`rename_board`].
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let clean = description.trim();
+    if let Some(board) = get_board(ch, id).await? {
+        save_board_patch(
+            ch,
+            &board,
+            BoardPatch {
+                description: Some(clean),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Move a board into folder `folder_id` (`""` = root). The caller has
+/// already checked that the folder exists.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] if the board does not exist, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id)
+        .await?
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            folder_id: Some(folder_id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Update a board's tile layout, creating a bare `Board { id, name:
 /// "Dashboard" }` shell if it does not exist yet. Ports `updateBoardLayout`.
 ///
@@ -650,11 +840,15 @@ pub async fn update_board_layout(
     let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
         id: id.to_owned(),
         name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
         layout: None,
         filters: None,
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     });
     save_board_patch(
         ch,
@@ -682,11 +876,15 @@ pub async fn update_board_filters(
     let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
         id: id.to_owned(),
         name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
         layout: None,
         filters: None,
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     });
     save_board_patch(
         ch,
@@ -806,14 +1004,23 @@ pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
 ///
 /// Returns [`BiError::Validation`] if the source board does not exist, or
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> {
+pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let src = get_board(ch, id)
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let charts = list_stored_charts(ch).await?;
     let charts: Vec<_> = charts.into_iter().filter(|c| c.board == id).collect();
-    let new_board = create_board(ch, &format!("{} (salinan)", src.name)).await?;
+    // The copy carries the original's description — it describes the same
+    // thing — but is authored by whoever pressed Duplicate, not by the
+    // person who made the original.
+    let new_board = create_board(
+        ch,
+        &format!("{} (salinan)", src.name),
+        src.description.as_deref().unwrap_or(""),
+        created_by,
+    )
+    .await?;
     let mut id_map: HashMap<String, String> = HashMap::new();
     for c in &charts {
         let new_id = new_chart_id();
@@ -832,8 +1039,14 @@ pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> 
         }
     }
     update_board_layout(ch, &new_board.id, &new_layout).await?;
+    // The copy lands next to the original, not at the root.
+    let folder_id = src.folder_id.clone().unwrap_or_default();
+    if !folder_id.is_empty() {
+        move_board(ch, &new_board.id, &folder_id).await?;
+    }
     Ok(Board {
         layout: Some(new_layout),
+        folder_id: Some(folder_id),
         ..new_board
     })
 }
@@ -959,6 +1172,7 @@ fn empty_chart_input() -> ChartInput {
         title: String::new(),
         subtitle: None,
         mart: String::new(),
+        sql_source: None,
         kind: ChartKind::Table,
         dimension: String::new(),
         measures: Vec::new(),
@@ -1023,6 +1237,8 @@ struct KpiCtx<'a> {
     subtitle: Option<String>,
     kind: ChartKind,
     mart: String,
+    sql_source: Option<String>,
+    from: Relation,
     agg: String,
     measures: Vec<String>,
     span: u8,
@@ -1041,6 +1257,8 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         subtitle,
         kind,
         mart,
+        sql_source,
+        from,
         agg,
         measures,
         span,
@@ -1066,6 +1284,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         title: title.clone(),
         subtitle: None,
         mart: mart.clone(),
+        sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
         measures: vec![m.clone()],
@@ -1081,22 +1300,16 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
-    let mart_ident = Ident::new(mart.as_str())
-        .map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     // `agg` was already checked against `aggregate_allowed` above, so this
     // conversion is exact (never hits the `Sum` fallback).
-    let sql = build_kpi_sql(
-        &mart_ident,
-        &measure_ident,
-        Aggregate::from_str_lossy(&agg),
-        &[],
-    );
+    let sql = build_kpi_sql(&from, &measure_ident, Aggregate::from_str_lossy(&agg), &[]);
     let spec = ChartSpec {
         id: new_id,
         title,
         subtitle,
         kind,
         mart,
+        sql_source,
         sql,
         x: String::new(),
         y: ChartY::Single("v".to_owned()),
@@ -1153,6 +1366,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         title: title.clone(),
         subtitle: None,
         mart: String::new(),
+        sql_source: None,
         kind,
         dimension: String::new(),
         measures: Vec::new(),
@@ -1172,6 +1386,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         subtitle,
         kind,
         mart: String::new(),
+        sql_source: None,
         sql: String::new(),
         x: String::new(),
         y: ChartY::Single(String::new()),
@@ -1201,6 +1416,8 @@ struct ChartCtx<'a> {
     subtitle: Option<String>,
     kind: ChartKind,
     mart: String,
+    sql_source: Option<String>,
+    from: Relation,
     agg: String,
     measures: Vec<String>,
     span: u8,
@@ -1260,7 +1477,7 @@ fn validate_chart_shape(
         }
         if !breakdown_allowed(kind) {
             return Err(BiError::Validation(
-                "breakdown is only for bar/hbar/line/area/heatmap.".to_owned(),
+                "breakdown is only for bar/hbar/line/area/heatmap/sankey/sunburst.".to_owned(),
             ));
         }
         if measures.len() > 1 {
@@ -1269,9 +1486,18 @@ fn validate_chart_shape(
             ));
         }
     }
-    if kind == ChartKind::Heatmap && breakdown.is_empty() {
+    if breakdown_required(kind) && breakdown.is_empty() {
+        let label = serde_json::to_value(kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        return Err(BiError::Validation(format!(
+            "{label} needs a breakdown (2nd dimension)."
+        )));
+    }
+    if kind == ChartKind::Boxplot && measures.len() != 1 {
         return Err(BiError::Validation(
-            "heatmap needs a breakdown (2nd dimension).".to_owned(),
+            "a 'boxplot' chart needs exactly one measure.".to_owned(),
         ));
     }
     Ok(())
@@ -1283,7 +1509,8 @@ fn validate_chart_shape(
 /// [`QueryBuilder`]. Split out of `spec_from_chart_input` to keep it under
 /// clippy's line-count limit.
 fn build_chart_sql(
-    mart: &str,
+    kind: ChartKind,
+    from: &Relation,
     dimension: &str,
     measures: &[String],
     agg: &str,
@@ -1291,8 +1518,6 @@ fn build_chart_sql(
     limit: u32,
     breakdown: Option<&str>,
 ) -> Result<String, BiError> {
-    let mart_ident =
-        Ident::new(mart).map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     let dimension_ident = Ident::new(dimension).map_err(|_| {
         BiError::Validation(format!(
             "invalid or missing dimension column '{dimension}'."
@@ -1312,9 +1537,22 @@ fn build_chart_sql(
         })?),
         None => None,
     };
+    if kind == ChartKind::Boxplot {
+        // One measure, checked by `validate_chart_shape`; no aggregate.
+        let measure = measure_idents
+            .first()
+            .ok_or_else(|| BiError::Validation("invalid or missing measure column.".to_owned()))?;
+        return Ok(crate::builder::build_boxplot_sql(
+            from,
+            &dimension_ident,
+            measure,
+            &[],
+            limit,
+        ));
+    }
     // `agg` was already checked against `aggregate_allowed` by the caller
     // (`spec_from_chart_input`), so this conversion is exact.
-    Ok(QueryBuilder::new(mart_ident)
+    Ok(QueryBuilder::over(from.clone())
         .dimension(dimension_ident)
         .aggregate(Aggregate::from_str_lossy(agg))
         .order(order)
@@ -1336,6 +1574,8 @@ fn spec_from_chart_input(
         subtitle,
         kind,
         mart,
+        sql_source,
+        from,
         agg,
         measures,
         span,
@@ -1348,9 +1588,18 @@ fn spec_from_chart_input(
     } = ctx;
 
     let dimension = input.dimension.clone();
-    let limit = input.limit.unwrap_or(20).clamp(1, 100);
+    // A calendar shows one cell per day, so up to a year of rows; every
+    // other kind keeps the Top-N range the builder offers (1–100).
+    let limit = if kind == ChartKind::Calendar {
+        input.limit.unwrap_or(366).clamp(1, 366)
+    } else {
+        input.limit.unwrap_or(20).clamp(1, 100)
+    };
     let order = input.order.clone().unwrap_or_else(|| {
-        if matches!(kind, ChartKind::Line | ChartKind::Area) {
+        if matches!(
+            kind,
+            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
+        ) {
             "none".to_owned()
         } else {
             "desc".to_owned()
@@ -1368,6 +1617,7 @@ fn spec_from_chart_input(
         title: title.clone(),
         subtitle: subtitle.clone(),
         mart: mart.clone(),
+        sql_source: sql_source.clone(),
         kind,
         dimension: dimension.clone(),
         measures: measures.clone(),
@@ -1383,7 +1633,8 @@ fn spec_from_chart_input(
     };
 
     let sql = build_chart_sql(
-        &mart,
+        kind,
+        &from,
         &dimension,
         &measures,
         &agg,
@@ -1403,6 +1654,7 @@ fn spec_from_chart_input(
         subtitle,
         kind,
         mart,
+        sql_source,
         sql,
         x: dimension,
         y,
@@ -1478,6 +1730,57 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
     })
 }
 
+/// Where a chart's rows come from, resolved and validated against the real
+/// schema: a `serving` mart's columns from `system.columns`, or a SQL
+/// source's columns as probed when it was saved.
+struct Resolved {
+    mart: String,
+    sql_source: Option<String>,
+    from: Relation,
+    cols: std::collections::HashSet<String>,
+}
+
+/// Resolve `input.mart` / `input.sql_source` (exactly one) into a
+/// [`Resolved`] relation.
+async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved, BiError> {
+    let source_id = input
+        .sql_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = source_id {
+        if !input.mart.trim().is_empty() {
+            return Err(BiError::Validation(
+                "choose either a mart or a SQL source, not both.".to_owned(),
+            ));
+        }
+        let source = crate::sources::get_source(ch, id)
+            .await?
+            .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
+        let cols = source.column_names();
+        return Ok(Resolved {
+            mart: String::new(),
+            sql_source: Some(source.id),
+            from: Relation::Sql(source.sql),
+            cols,
+        });
+    }
+    let mart = input
+        .mart
+        .strip_prefix("serving.")
+        .unwrap_or(&input.mart)
+        .to_owned();
+    let mart_ident = Ident::new(mart.as_str())
+        .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
+    let cols = validated_mart_columns(ch, &mart).await?;
+    Ok(Resolved {
+        mart,
+        sql_source: None,
+        from: Relation::Mart(mart_ident),
+        cols,
+    })
+}
+
 /// Validate `input` against the REAL `ClickHouse` schema, then assemble a
 /// [`StoredChartSpec`]. Throws a friendly error when the mart/columns are
 /// invalid. `id` is optional — supplied for EDIT. Branches per kind: `text`
@@ -1521,19 +1824,13 @@ pub async fn spec_from_input(
         );
     }
 
-    // ── kpi/table/chart need a mart ──────────────────────────────────
-    let mart = input
-        .mart
-        .strip_prefix("serving.")
-        .unwrap_or(&input.mart)
-        .to_owned();
-    if !IDENT_ALLOWED(&mart) {
-        return Err(BiError::Validation(format!(
-            "invalid mart name: {}",
-            input.mart
-        )));
-    }
-    let cols = validated_mart_columns(ch, &mart).await?;
+    // ── kpi/table/chart need a mart OR a SQL source ─────────────────
+    let Resolved {
+        mart,
+        sql_source,
+        from,
+        cols,
+    } = resolve_relation(ch, input).await?;
     let has_year = cols.contains("tahun");
     let agg = input
         .aggregate
@@ -1567,6 +1864,8 @@ pub async fn spec_from_input(
                 subtitle,
                 kind,
                 mart,
+                sql_source,
+                from,
                 agg,
                 measures,
                 span,
@@ -1587,6 +1886,8 @@ pub async fn spec_from_input(
             subtitle,
             kind,
             mart,
+            sql_source,
+            from,
             agg,
             measures,
             span,
@@ -1679,6 +1980,7 @@ impl StoredChartSpec {
                 subtitle: None,
                 kind,
                 mart: mart.to_owned(),
+                sql_source: None,
                 sql,
                 x: dimension.to_owned(),
                 y,
@@ -1695,6 +1997,7 @@ impl StoredChartSpec {
                 title: "Test".to_owned(),
                 subtitle: None,
                 mart: mart.to_owned(),
+                sql_source: None,
                 kind,
                 dimension: dimension.to_owned(),
                 measures,
@@ -1728,7 +2031,7 @@ mod tests {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
     }
 
-    /// Regression test for H1 (`ensure_bi_table` re-issuing all 8 DDL
+    /// Regression test for H1 (`ensure_bi_table` re-issuing all 13 DDL
     /// statements on every call): the first call to any public function
     /// must run the DDL bootstrap, but every call after that — across the
     /// whole process, matching the TS's module-level `ensured` flag — must
@@ -1748,9 +2051,14 @@ mod tests {
         let ch = client(&server.uri());
         ensure_bi_table(&ch).await.unwrap();
         let first_call_requests = server.received_requests().await.unwrap().len();
+        // 13 = the original 8, plus `description` and `created_by`
+        // `ADD COLUMN` statements added for the dashboard list page, plus
+        // dashboard SQL sources (`bi_source`) and folders (`bi_folder` +
+        // `bi_board.folder_id`) joining the bootstrap; the property under
+        // test — every later call is free — is unchanged.
         assert_eq!(
-            first_call_requests, 8,
-            "first call should issue all 8 DDL statements"
+            first_call_requests, 13,
+            "first call should issue all 13 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -1758,6 +2066,26 @@ mod tests {
         assert_eq!(
             after_second_call, first_call_requests,
             "second call must be a no-op (cached), matching the TS's once-per-process guard"
+        );
+    }
+
+    #[test]
+    fn sankey_and_sunburst_need_a_breakdown_and_a_boxplot_one_measure() {
+        let cols: std::collections::HashSet<String> = ["region", "channel", "amount", "qty"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let m1 = vec!["amount".to_owned()];
+        let m2 = vec!["amount".to_owned(), "qty".to_owned()];
+        for kind in [ChartKind::Sankey, ChartKind::Sunburst] {
+            assert!(validate_chart_shape(kind, "region", &m1, "", &cols).is_err());
+            assert!(validate_chart_shape(kind, "region", &m1, "channel", &cols).is_ok());
+        }
+        assert!(validate_chart_shape(ChartKind::Boxplot, "region", &m1, "", &cols).is_ok());
+        assert!(validate_chart_shape(ChartKind::Boxplot, "region", &m2, "", &cols).is_err());
+        assert!(
+            validate_chart_shape(ChartKind::Calendar, "region", &m1, "channel", &cols).is_err(),
+            "a calendar takes no breakdown"
         );
     }
 
@@ -1868,17 +2196,27 @@ mod tests {
         let board = Board {
             id: "b_1".to_owned(),
             name: "Dash".to_owned(),
+            description: Some("Ringkasan kunjungan".to_owned()),
+            created_by: Some("Bootstrap Admin".to_owned()),
             layout: None,
             filters: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
+            updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
+            folder_id: Some("f_1".to_owned()),
         };
         let json = serde_json::to_value(&board).unwrap();
         assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
+        assert_eq!(json.get("updatedAt").unwrap(), "2026-01-02 00:00:00");
+        assert_eq!(json.get("createdBy").unwrap(), "Bootstrap Admin");
+        assert_eq!(json.get("description").unwrap(), "Ringkasan kunjungan");
         assert_eq!(json.get("publicToken").unwrap(), "p_abc");
         assert_eq!(json.get("embedEnabled").unwrap(), true);
+        assert_eq!(json.get("folderId").unwrap(), "f_1");
         assert!(json.get("created_at").is_none());
+        assert!(json.get("updated_at").is_none());
+        assert!(json.get("created_by").is_none());
         assert!(json.get("public_token").is_none());
         assert!(json.get("embed_enabled").is_none());
     }

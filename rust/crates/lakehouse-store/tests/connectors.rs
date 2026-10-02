@@ -178,9 +178,12 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             schedule: "manual".to_owned(),
             owner: None,
             description: None,
+            max_retries: None,
             tenant_id: None,
+            depends_on: Vec::new(),
             connector_id: Some(connector.id.clone()),
         },
+        None,
     )
     .await
     .unwrap();

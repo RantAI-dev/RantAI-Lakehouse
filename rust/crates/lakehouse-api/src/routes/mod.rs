@@ -10,6 +10,7 @@ mod agents;
 mod ai;
 mod alerts;
 pub mod auth;
+mod authored_pipelines;
 mod catalog;
 mod catalog_governance;
 mod catalog_profile;
@@ -17,12 +18,15 @@ mod catalog_query;
 mod catalog_source;
 mod connectors;
 mod dashboard;
+mod dashboard_folders;
+mod dashboard_sources;
 mod embed;
 mod gold;
 mod governance;
 mod identity;
 mod knowledge;
 mod lakehouse;
+mod lineage;
 mod notifications;
 mod ops;
 mod overview;
@@ -115,10 +119,33 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// non-default `maxDuration` today.
 fn route_timeout(path: &str) -> Duration {
     match path {
-        "/api/ai/chat" => Duration::from_secs(120),
+        "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/agent/query" => Duration::from_secs(90),
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// `/api/ai/chat`'s timeout: `AI_CHAT_TIMEOUT_SECS` when set, else 120s.
+///
+/// 120s fits a hosted model. A small model served on CPU (an on-prem
+/// deployment without a GPU) needs several minutes for one multi-round
+/// tool loop: measured on a 8-core CPU, `qwen3:4b` under Ollama took 37s
+/// to answer "say ok" alone, so every copilot turn with that model timed
+/// out at 120s. An operator who chooses such a model can raise the bound;
+/// nothing else changes. Read once, like `tenant.rs`'s deployment labels.
+static AI_CHAT_TIMEOUT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    chat_timeout_from(std::env::var("AI_CHAT_TIMEOUT_SECS").ok().as_deref())
+});
+
+/// Parses `AI_CHAT_TIMEOUT_SECS`: whole seconds, clamped to 30..=1800 so a
+/// typo can neither make every chat time out nor hold a connection for
+/// hours. Unset, empty or unparseable -> the 120s default.
+fn chat_timeout_from(raw: Option<&str>) -> Duration {
+    raw.map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::from_secs(120), |secs| {
+            Duration::from_secs(secs.clamp(30, 1800))
+        })
 }
 
 /// Build the application router with `state` threaded through every
@@ -148,9 +175,46 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
-        .route("/api/pipelines/{id}", get(pipelines::detail))
+        // Static, so it is matched ahead of `/api/pipelines/{id}`.
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .route(
+            "/api/pipelines/{id}",
+            get(pipelines::detail)
+                .put(authored_pipelines::update)
+                .delete(authored_pipelines::delete),
+        )
+        .route(
+            "/api/pipelines/{id}/schedule-ticks",
+            get(authored_pipelines::schedule_ticks),
+        )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
+        // Plan R4 2b: definition version history. Static under
+        // `{id}/versions`, so it is registered BEFORE
+        // `{id}/versions/{version}/restore` (which would otherwise
+        // match `{version}/restore` as `{version}`).
+        .route(
+            "/api/pipelines/{id}/versions",
+            get(pipelines::list_versions),
+        )
+        .route(
+            "/api/pipelines/{id}/versions/{version}",
+            get(pipelines::get_version),
+        )
+        .route(
+            "/api/pipelines/{id}/versions/{version}/restore",
+            axum::routing::post(authored_pipelines::restore_version),
+        )
+        // Plan 1c (R2, day-1): the runs × steps matrix endpoint is
+        // STATIC under `{id}/runs/steps`, so it is registered BEFORE the
+        // `{runId}/steps` route below — otherwise axum would match the
+        // literal path with `{runId} = "steps"` and route the matrix
+        // request to `run_steps` (which would then 503 trying to
+        // interpret "steps" as a Dagster run id). The order matters.
+        .route(
+            "/api/pipelines/{id}/runs/steps",
+            get(pipelines::runs_step_matrix),
+        )
         .route(
             "/api/pipelines/{id}/runs/{runId}/steps",
             get(pipelines::run_steps),
@@ -162,6 +226,15 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/trigger",
             axum::routing::post(pipelines::trigger),
+        )
+        // R4 plan 2c: read-side companion to `/trigger`. Registered
+        // BEFORE `/api/pipelines/{id}` only matters for static sub-paths
+        // (already covered above) — `{id}/config-schema` is registered
+        // here next to `/trigger` since they share the `id` namespace
+        // and route handlers share `path = {id}`.
+        .route(
+            "/api/pipelines/{id}/config-schema",
+            get(pipelines::config_schema),
         )
         .route(
             "/api/pipelines/{id}/status",
@@ -188,6 +261,40 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
+        )
+        // Dagster `run_failure_sensor` posts here once per failed run;
+        // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
+        // enforces service-identity (the route is gated by `pipeline:write`
+        // first, then the handler refuses a non-service `pipeline:write`
+        // holder, mirroring `authored_pipelines::runnable`).
+        .route(
+            "/api/pipelines/events/run-failed",
+            axum::routing::post(pipelines::run_failed_event),
+        )
+        // Plan 1f: Dagster `run_status_sensor(SUCCESS)` posts here once
+        // per successful run. Same posture as the run-failed route — the
+        // handler enforces a service identity on top of the `pipeline:write`
+        // gate. Computes the run's `slow`/`volume_drop` outcomes and hands
+        // each to its per-kind evaluator: `evaluate_pipeline_slow` /
+        // `evaluate_pipeline_volume_drop`.
+        .route(
+            "/api/pipelines/events/run-finished",
+            axum::routing::post(pipelines::run_finished_event),
+        )
+        // Plan 1f: per-pipeline SLA. `GET` returns 404 when no SLA is
+        // configured (so the UI can distinguish "no SLA yet" from a
+        // degraded backend); `PUT` upserts and writes a `pipeline.sla_set`
+        // audit event. The route validates the body (positive thresholds
+        // only) — the database CHECK is defense in depth.
+        .route(
+            "/api/pipelines/{id}/sla",
+            get(pipelines::get_sla).put(pipelines::put_sla),
+        )
+        // Plan 1f: volume history (last 30 runs + their row counts and the
+        // `drop` decision per run). Same 30-run window as `/runs`.
+        .route(
+            "/api/pipelines/{id}/volume",
+            axum::routing::get(pipelines::volume),
         )
 }
 
@@ -597,6 +704,24 @@ pub fn router(state: AppState) -> Router {
                 .put(dashboard::boards_update)
                 .delete(dashboard::boards_delete),
         )
+        .route(
+            "/api/dashboard/folders",
+            get(dashboard_folders::list)
+                .post(dashboard_folders::create)
+                .put(dashboard_folders::update)
+                .delete(dashboard_folders::delete),
+        )
+        .route(
+            "/api/dashboard/sources",
+            get(dashboard_sources::list)
+                .post(dashboard_sources::create)
+                .put(dashboard_sources::update)
+                .delete(dashboard_sources::delete),
+        )
+        .route(
+            "/api/dashboard/sources/preview",
+            axum::routing::post(dashboard_sources::preview),
+        )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
@@ -698,6 +823,16 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) and `agent/query` (90s) — a
     /// blanket 60s bound 408'd a legitimate in-flight request. Pins the
     /// per-route table to the TS `export const maxDuration` grep.
+    #[test]
+    fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
+        assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("")), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
+        assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+    }
+
     #[test]
     fn route_timeout_matches_typescript_max_duration() {
         assert_eq!(route_timeout("/api/ai/chat"), Duration::from_secs(120));

@@ -380,9 +380,9 @@ struct ConnectorSecretResolver {
 }
 
 impl ConnectorSecretResolver {
-    fn new(dir: &std::path::Path) -> Self {
+    fn new(env: EnvSecretResolver, dir: &std::path::Path) -> Self {
         Self {
-            env: EnvSecretResolver::new(),
+            env,
             // A fixed base directory, never caller-supplied — see
             // `FileSecretResolver`'s doc comment for why that matters.
             file: FileSecretResolver::new(dir),
@@ -422,6 +422,28 @@ impl SecretResolver for ConnectorSecretResolver {
             })
         }
     }
+}
+
+/// The allowlisted connector secret resolver [`AppState::new`] installs,
+/// over `env` (the real process environment in production) and the
+/// connector secrets directory `dir`.
+///
+/// A function of its own so the allowlist test can pass an explicit, empty
+/// environment: `sqlx::test`'s harness calls `dotenvy::var`, which loads
+/// the nearest `.env` into the process environment, so on a developer
+/// machine whose `.env` sets `CONNECTOR_*` the real environment made that
+/// test fail whenever a database test had run first in the same process.
+fn connector_secret_resolver(
+    env: EnvSecretResolver,
+    dir: &std::path::Path,
+) -> Arc<dyn DynSecretResolver> {
+    Arc::new(AllowlistedSecretResolver::new(
+        ConnectorSecretResolver::new(env, dir),
+        CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+            .iter()
+            .map(|s| (*s).to_owned()),
+        "connector-allowlist",
+    ))
 }
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
@@ -549,13 +571,10 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
-            connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
-                ConnectorSecretResolver::new(&secrets_dir),
-                CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-                    .iter()
-                    .map(|s| (*s).to_owned()),
-                "connector-allowlist",
-            )),
+            connector_secret_resolver: connector_secret_resolver(
+                EnvSecretResolver::new(),
+                &secrets_dir,
+            ),
             connector_secret_store: Arc::new(ConnectorSecretStore::new(secrets_dir)),
             auth,
             gold_export_locks: MartLocks::default(),
@@ -586,7 +605,7 @@ mod tests {
     async fn connector_secrets_are_read_from_the_configured_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("connector_managed_conn_x_password"), "pw\n").unwrap();
-        let resolver = ConnectorSecretResolver::new(dir.path());
+        let resolver = ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path());
         let value = resolver
             .resolve("file:/run/secrets/connector_managed_conn_x_password")
             .await
@@ -597,7 +616,10 @@ mod tests {
     /// The default directory leaves every ref exactly as written.
     #[test]
     fn the_default_secrets_directory_leaves_refs_unchanged() {
-        let resolver = ConnectorSecretResolver::new(std::path::Path::new(CONNECTOR_SECRETS_DIR));
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            std::path::Path::new(CONNECTOR_SECRETS_DIR),
+        );
         let secret_ref = "file:/run/secrets/connector_managed_conn_x_password";
         assert_eq!(resolver.located(secret_ref), secret_ref);
     }
@@ -679,8 +701,14 @@ mod tests {
     #[tokio::test]
     async fn connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag()
      {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        let state = AppState::new(cfg);
+        // An explicit empty environment, not the process one: see
+        // `connector_secret_resolver`'s doc comment (a `.env` loaded by
+        // `sqlx::test` made this order-dependent). Same allowlist and
+        // resolver chain `AppState::new` installs.
+        let resolver = super::connector_secret_resolver(
+            lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::new()),
+            std::path::Path::new(CONNECTOR_SECRETS_DIR),
+        );
 
         for admitted in [
             "env:CONNECTOR_PG_PASSWORD",
@@ -688,15 +716,11 @@ mod tests {
             "env:CONNECTOR_S3_SECRET_KEY",
             "env:CONNECTOR_MYSQL_PASSWORD",
         ] {
-            let err = state
-                .connector_secret_resolver
-                .resolve_dyn(admitted)
-                .await
-                .unwrap_err();
+            let err = resolver.resolve_dyn(admitted).await.unwrap_err();
             assert!(
                 matches!(err, lakehouse_core::secret::SecretError::NotFound { .. }),
                 "{admitted} must be allowed by the pattern allowlist (NotFound, not \
-                 NotAllowed, since the env var is unset in this test process); got {err:?}"
+                 NotAllowed, since the explicit test environment is empty); got {err:?}"
             );
         }
 
@@ -706,11 +730,7 @@ mod tests {
             "env:CH_PASSWORD",
             "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
         ] {
-            let err = state
-                .connector_secret_resolver
-                .resolve_dyn(forbidden)
-                .await
-                .unwrap_err();
+            let err = resolver.resolve_dyn(forbidden).await.unwrap_err();
             assert!(
                 matches!(err, lakehouse_core::secret::SecretError::NotAllowed { .. }),
                 "{forbidden} must be refused by the allowlist; got {err:?}"

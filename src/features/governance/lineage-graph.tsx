@@ -3,46 +3,102 @@
 import * as React from "react"
 import Link from "next/link"
 import { ChevronRight, ExternalLink } from "lucide-react"
-import { StatusBadge } from "@/components/patterns/status-badge"
-import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
-import type { LineageGraph, LineageNode } from "@/services/contracts/governance"
+import type { LineageGraph } from "@/services/contracts/governance"
+
+export type LineageNode = LineageGraph["nodes"][number]
 
 /** What a node is, as its small caption. */
 export const KIND_LABEL: Record<string, string> = {
-  source: "Source",
+  connector: "Connector",
+  source: "Publisher",
+  dataset: "Dataset",
   bronze: "Bronze",
   silver: "Silver",
-  serving: "Serving (gold)",
+  gold: "Gold",
+  iceberg: "Iceberg",
   pipeline: "Pipeline",
 }
 
-/** The page a node opens, when it has one. */
+/** An id's kind prefix and the rest: `table:silver.orders` is `["table", "silver.orders"]`. */
+function idParts(id: string): [string, string] {
+  const at = id.indexOf(":")
+  return at < 0 ? [id, ""] : [id.slice(0, at), id.slice(at + 1)]
+}
+
+/** The nodes the graph was asked about: the API marks them `kind: "focus"`. */
+export function focusIds(graph: LineageGraph): Set<string> {
+  return new Set(graph.nodes.filter((n) => n.kind === "focus").map((n) => n.id))
+}
+
+/**
+ * What a node is. A focus node's own kind is replaced by `"focus"`, so it
+ * is read back from the id, whose prefix the API sets per kind
+ * (`routes/lineage.rs`): `connector:`, `bronze:`, `dataset:`, `source:`,
+ * `iceberg:`, and `table:<database>.<table>`.
+ */
+export function nodeKind(node: LineageNode): string {
+  if (node.kind !== "focus") return node.kind
+  const [prefix, rest] = idParts(node.id)
+  if (prefix !== "table") return prefix
+  if (rest.startsWith("silver.")) return "silver"
+  if (rest.startsWith("serving.")) return "gold"
+  return "table"
+}
+
+/**
+ * The page a node opens, when its id names one. A Bronze table has none
+ * here: its catalog page is addressed by a registry slug the graph does
+ * not carry.
+ */
 export function nodeHref(node: LineageNode): string | null {
-  if (!node.ref) return null
-  const ref = encodeURIComponent(node.ref)
-  switch (node.kind) {
-    case "pipeline":
-      return `/pipelines/${ref}`
-    case "source":
+  const [prefix, rest] = idParts(node.id)
+  if (!rest) return null
+  const ref = encodeURIComponent(rest)
+  switch (prefix) {
+    case "connector":
       return `/connectors/${ref}/edit`
-    case "bronze":
-    case "silver":
-    case "serving":
+    case "dataset":
       return `/data/assets/${ref}`
+    case "table":
+      return rest.startsWith("silver.") || rest.startsWith("serving.") ? `/data/assets/${ref}` : null
     default:
       return null
   }
 }
 
-function isEntityStatus(value: string): value is EntityStatus {
-  return value in ENTITY_STATUS_LABEL
+/**
+ * Each node's column: its longest path from a node with nothing upstream,
+ * so every arrow points right. A node on a cycle goes one column past the
+ * rest.
+ */
+export function nodeDepths(graph: LineageGraph): Map<string, number> {
+  const ids = new Set(graph.nodes.map((n) => n.id))
+  const edges = graph.edges.filter((e) => ids.has(e.from) && ids.has(e.to))
+  const waiting = new Map<string, number>([...ids].map((id) => [id, 0]))
+  for (const e of edges) waiting.set(e.to, (waiting.get(e.to) ?? 0) + 1)
+  const depth = new Map<string, number>()
+  const queue = [...ids].filter((id) => waiting.get(id) === 0)
+  for (const id of queue) depth.set(id, 0)
+  while (queue.length > 0) {
+    const id = queue.shift()!
+    const here = depth.get(id) ?? 0
+    for (const e of edges) {
+      if (e.from !== id) continue
+      depth.set(e.to, Math.max(depth.get(e.to) ?? 0, here + 1))
+      const left = (waiting.get(e.to) ?? 1) - 1
+      waiting.set(e.to, left)
+      if (left === 0) queue.push(e.to)
+    }
+  }
+  const past = depth.size === 0 ? 0 : Math.max(...depth.values()) + 1
+  for (const id of ids) if (!depth.has(id)) depth.set(id, past)
+  return depth
 }
 
 /**
- * The graph as columns, left to right: a node's column is its longest path
- * from something with nothing upstream (`depth`, from the API), so every
- * arrow points right. Branches stack within a column.
+ * The graph as columns, left to right ([`nodeDepths`]). Branches stack
+ * within a column.
  *
  * With `onTrace` (the Lineage page), a node's name re-focuses the graph on
  * it and a corner icon opens its page. Without (an asset's Lineage tab),
@@ -55,10 +111,11 @@ export function LineageColumns({
   readonly graph: LineageGraph
   readonly onTrace?: (id: string) => void
 }) {
-  const focusIds = new Set(graph.focusIds ?? [])
+  const focus = focusIds(graph)
+  const depths = nodeDepths(graph)
   const columns: LineageNode[][] = []
   for (const node of graph.nodes) {
-    const depth = node.depth ?? 0
+    const depth = depths.get(node.id) ?? 0
     const column = columns[depth] ?? []
     column.push(node)
     columns[depth] = column
@@ -75,18 +132,19 @@ export function LineageColumns({
           <div className="flex shrink-0 flex-col justify-center gap-2">
             {column.map((node) => {
               const href = nodeHref(node)
+              const kind = nodeKind(node)
               return (
                 <div
                   key={node.id}
                   role="listitem"
                   className={cn(
                     "flex w-52 flex-col gap-1 rounded-lg border border-border bg-card px-3 py-2.5 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]",
-                    focusIds.has(node.id) && "border-primary ring-1 ring-primary/30"
+                    focus.has(node.id) && "border-primary ring-1 ring-primary/30"
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      {KIND_LABEL[node.kind] ?? node.kind}
+                      {KIND_LABEL[kind] ?? kind}
                     </span>
                     {href && onTrace ? (
                       <Link
@@ -107,7 +165,7 @@ export function LineageColumns({
                     >
                       {node.label}
                     </button>
-                  ) : href && !focusIds.has(node.id) ? (
+                  ) : href && !focus.has(node.id) ? (
                     <Link
                       href={href}
                       className="truncate text-sm font-medium leading-5 text-foreground hover:text-primary"
@@ -120,11 +178,6 @@ export function LineageColumns({
                       {node.label}
                     </span>
                   )}
-                  {node.kind === "pipeline" && node.sublabel && isEntityStatus(node.sublabel) ? (
-                    <StatusBadge status={node.sublabel} className="self-start" />
-                  ) : node.sublabel ? (
-                    <span className="truncate text-xs text-muted-foreground">{node.sublabel}</span>
-                  ) : null}
                 </div>
               )
             })}

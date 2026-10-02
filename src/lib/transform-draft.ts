@@ -77,3 +77,71 @@ export function transformErrorRowIndex(message: string): number | null {
   if (!match) return null
   return Number(match[1])
 }
+
+/**
+ * A stored transform string read back for display: its verb and a short
+ * phrase of its arguments ("on nama_event", "tahun, nama_event"). Returns
+ * `null` for a string outside the five verbs, and the page shows it raw.
+ * This only splits the text for reading; `parse_transform` on the server
+ * is still the only validator.
+ */
+export function describeTransform(
+  raw: string
+): { verb: TransformDraft["verb"]; detail: string } | null {
+  const match = /^\s*(dedupe|filter|rename|cast|select)\((.*)\)\s*$/.exec(raw)
+  if (!match) return null
+  const verb = match[1] as TransformDraft["verb"]
+  const args = match[2].trim()
+  switch (verb) {
+    case "dedupe":
+      return { verb, detail: `one row per ${args}` }
+    case "rename": {
+      const [from, to] = args.split(",").map((s) => s.trim())
+      return { verb, detail: to ? `${from} → ${to}` : args }
+    }
+    case "cast": {
+      const [column, type] = args.split(",").map((s) => s.trim())
+      return { verb, detail: type ? `${column} as ${type}` : args }
+    }
+    case "select":
+      return { verb, detail: args.split(",").map((s) => s.trim()).join(", ") }
+    case "filter":
+      return { verb, detail: args }
+  }
+}
+
+/**
+ * The inverse of `renderTransformDraft`: a stored transform string back to
+ * the draft the editor shows, so an existing pipeline can be edited in the
+ * same form it was created in. `null` for a string outside the five shapes
+ * `renderTransformDraft` produces; the server's grammar is the same set,
+ * so a stored transform always parses.
+ */
+export function parseTransformDraft(raw: string): TransformDraft | null {
+  const match = /^\s*(dedupe|filter|rename|cast|select)\((.*)\)\s*$/.exec(raw)
+  if (!match) return null
+  const args = match[2].trim()
+  switch (match[1]) {
+    case "dedupe":
+      return args ? { verb: "dedupe", key: args } : null
+    case "select":
+      return args ? { verb: "select", columns: args } : null
+    case "rename": {
+      const [from, to, extra] = args.split(",").map((s) => s.trim())
+      return from && to && extra === undefined ? { verb: "rename", from, to } : null
+    }
+    case "cast": {
+      const [column, type, extra] = args.split(",").map((s) => s.trim())
+      const castType = CAST_TYPES.find((t) => t === type)
+      return column && castType && extra === undefined ? { verb: "cast", column, type: castType } : null
+    }
+    case "filter": {
+      // Longest operators first, so `>=` is not read as `>`.
+      const f = /^(\w+)\s*(!=|<=|>=|=|<|>)\s*'(.*)'$/.exec(args)
+      const operator = FILTER_OPERATORS.find((op) => op === f?.[2])
+      return f && operator ? { verb: "filter", column: f[1], operator, value: f[3] } : null
+    }
+    default:
+      return null
+  }
+}

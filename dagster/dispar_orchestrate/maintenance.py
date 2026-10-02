@@ -184,13 +184,23 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
-from dagster import DefaultScheduleStatus, Definitions, Failure, ScheduleDefinition, job, op
+from dagster import (
+    DefaultScheduleStatus,
+    Definitions,
+    DynamicOut,
+    DynamicOutput,
+    Failure,
+    ScheduleDefinition,
+    job,
+    op,
+)
 
 from dispar_orchestrate.bronze_catalog import (
     ClickHouseTarget,
@@ -198,7 +208,7 @@ from dispar_orchestrate.bronze_catalog import (
     record_maintenance_run,
     record_maintenance_verb_run,
 )
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 CATALOG_DB = "icecat_maintenance"
 
@@ -494,6 +504,116 @@ def _table_namespace_and_name(table_name: str) -> tuple[str, str]:
     return namespace, name
 
 
+# Dagster's `DynamicOutput.mapping_key` must match `^[A-Za-z0-9_]+$`
+# (`dagster._core.definitions.utils.check_valid_chars`). The exact ASCII
+# rule from `parts/1b-dagster-one-op-per-unit-and-retries.md`: every
+# character outside `[A-Za-z0-9_]` becomes `_`. Precompiled once at
+# module load; the same rule `gold_export._sanitize_mapping_key` and
+# `ingest_factory._sanitize_target` enforce so a table name can serve
+# as a schedule name, an op name, or a mapping key consistently. Note:
+# `str.isalnum()` would be wrong here -- it is True for non-ASCII
+# letters (`"é".isalnum()`, `"²".isalnum()`), which would silently
+# produce a non-ASCII mapping key that Dagster then rejects.
+_SANITIZE_NON_ASCII = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _sanitize_mapping_key(name: str) -> str:
+    """Dagster-legal `DynamicOutput.mapping_key` derived from a
+    catalog table name -- the exact ASCII `[A-Za-z0-9_]+` rule
+    `gold_export._sanitize_mapping_key` and
+    `ingest_factory._sanitize_target` already enforce. Bronze tables
+    happen to be `<namespace>.<name>` and both segments are already
+    `[A-Za-z0-9_]+`, so this is in practice a no-op for today's catalog;
+    kept consistent with the other fan-out modules for the
+    collision-detection rule (and so a future table name that violates
+    the rule does not silently break graph-build at runtime)."""
+    return _SANITIZE_NON_ASCII.sub("_", name)
+
+
+def _run_maintenance_for_table(
+    cfg: MaintenanceConfig,
+    table_name: str,
+    policy: dict[str, Any] | None,
+    policy_fetch_error: str | None,
+) -> dict[str, Any]:
+    """The per-table body of the maintenance chain, extracted from
+    `run_bronze_maintenance` so PART C's `maintain_bronze_table` mapped
+    op and the existing `test_maintenance.py` Trino-integration tests
+    can both drive it. Behaviour is unchanged from the previous
+    in-line loop body: probe, dry-run + applied orphan removal,
+    growth measurement, policy-driven `expire_snapshots`/`optimize`,
+    `record_maintenance_run` + `record_maintenance_verb_run`."""
+    expire_skip_reason = probe_expire_snapshots_skip(cfg, table_name)
+    dry = run_remove_orphan_files(cfg, table_name, dry_run=True)
+    real = run_remove_orphan_files(cfg, table_name, dry_run=False)
+    growth = measure_snapshot_growth(cfg, table_name)
+    namespace, name = _table_namespace_and_name(table_name)
+    now = datetime.now(timezone.utc)
+
+    skipped_verbs: list[str] = []
+    verb_runs: list[dict[str, str]] = []
+
+    if policy_fetch_error is not None:
+        skipped_verbs.append(f"policy fetch failed: {policy_fetch_error}")
+
+    last_run_at: datetime | None = None
+    if policy is not None:
+        if policy.get("orphanAgeHours") is not None:
+            detail = (
+                "orphan_age_hours not applied: remove_orphan_files is "
+                "called without an age argument on this ClickHouse"
+            )
+            skipped_verbs.append(detail)
+            verb_runs.append(
+                {
+                    "verb": "orphan_age_hours",
+                    "engine": "clickhouse",
+                    "outcome": "skipped",
+                    "detail": detail,
+                }
+            )
+        last_run_at = _parse_run_at(latest_maintenance_run_at(cfg.ch, table_name))
+
+    expire_skip, expire_verb_run = _expire_snapshots_result(
+        cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
+    )
+    if expire_skip is not None and expire_skip not in skipped_verbs:
+        skipped_verbs.append(expire_skip)
+    if expire_verb_run is not None:
+        verb_runs.append(expire_verb_run)
+
+    optimize_skip, optimize_verb_run = _optimize_result(
+        cfg, namespace, name, policy, now, last_run_at
+    )
+    if optimize_skip is not None and optimize_skip not in skipped_verbs:
+        skipped_verbs.append(optimize_skip)
+    if optimize_verb_run is not None:
+        verb_runs.append(optimize_verb_run)
+
+    record_maintenance_run(
+        table_name=table_name,
+        dry_run_metrics=dry,
+        applied_metrics=real,
+        skipped_verbs=skipped_verbs,
+        snapshot_growth=growth,
+        target=cfg.ch,
+    )
+    if verb_runs:
+        record_maintenance_verb_run(
+            table_name=table_name,
+            run_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            verb_runs=verb_runs,
+            target=cfg.ch,
+        )
+    return {
+        "table_name": table_name,
+        "dry_run": dry,
+        "applied": real,
+        "skipped_verbs": skipped_verbs,
+        "snapshot_growth": growth,
+    }
+
+
 def _fetch_policy_index(
     cfg: MaintenanceConfig,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], str | None]:
@@ -530,9 +650,17 @@ def _fetch_policy_index(
         return {}, f"{type(exc).__name__}"
 
     if resp.status_code in (401, 403):
+        # PART D: a 401/403 from the maintenance-policy API is a
+        # configuration / authentication problem (the token is wrong,
+        # or the Lakekeeper role no longer grants the policy endpoint)
+        # — retrying won't help. `allow_retries=False` is the
+        # canonical non-retryable pattern; otherwise the default retry
+        # policy burns its 60s budget on a problem the operator has to
+        # fix out-of-band.
         raise Failure(
             f"maintenance policy fetch failed with HTTP {resp.status_code} "
-            f"from {url} — check LAKEHOUSE_MAINTENANCE_TOKEN"
+            f"from {url} — check LAKEHOUSE_MAINTENANCE_TOKEN",
+            allow_retries=False,
         )
 
     try:
@@ -836,30 +964,40 @@ def _optimize_result(
 
 
 @op(
+    out=DynamicOut(),
+    retry_policy=DEFAULT_RETRY_POLICY,
     # sql=None: this op runs one REMOVE/EXPIRE statement per discovered
     # table, not one fixed template.
-    tags=source_metadata("dispar_orchestrate/maintenance.py::run_bronze_maintenance", sql=None)
+    tags=source_metadata(
+        "dispar_orchestrate/maintenance.py::list_bronze_tables",
+        sql=None,
+        reads=["Iceberg bronze.* (every table)", "GET /api/lakehouse/maintenance-policies"],
+        # `writes` is the side-effect of this op: a `DynamicOutput` per
+        # Bronze table, which becomes a mapped
+        # `maintain_bronze_table[<sanitized_table>]` step. Declared
+        # here so the every-op walk test that requires non-empty
+        # `writes` does not flag this fan-out as having no writes.
+        writes=["DynamicOutput per discovered Bronze table"],
+    ),
 )
-def run_bronze_maintenance(context) -> list[dict[str, Any]]:
-    """The P4 maintenance chain, per Bronze table: `remove_orphan_files`
-    dry-run (metrics only, matching the task brief's "dry_run metrics
-    surfaced in console" requirement) then the real run — the working verb
-    on ClickHouse 26.8. Also measures (never reclaims —
-    `measure_snapshot_growth`) per-table snapshot/metadata-log counts, so
-    the unbounded growth `expire_snapshots`'s removal leaves behind is
-    tracked every run instead of silent (see module doc's "Lakekeeper-side
-    snapshot expiry" section).
+def list_bronze_tables(context) -> Any:
+    """PART C of `parts/1b-dagster-one-op-per-unit-and-retries.md`:
+    fan-out op. Runs the per-run SETUP work that must not repeat per
+    table (catalog database creation, policy list fetch) and yields
+    one `DynamicOutput` per Bronze table, carrying that table's
+    policy (already looked up) and the run-wide `policy_fetch_error`
+    flag, so the mapped `maintain_bronze_table` op needs no
+    per-call re-fetch.
 
-    The table's configured policy (module doc, "Per-table policy + Trino
-    verbs") then decides `expire_snapshots`/`optimize`: with no policy at
-    all, this keeps today's exact behavior — the real, freshly-observed
-    ClickHouse probe failure recorded for `expire_snapshots`, and
-    `OPTIMIZE`'s fixed design-skip message, both unconditional. The
-    policy list itself is fetched ONCE per run (not once per table); a
-    401/403 is a configuration/auth problem and raises `dagster.Failure`,
-    while an unreachable API, a 5xx, or a malformed body is recorded as a
-    per-table skip and the run continues with unconditional orphan
-    removal (never silently treated as "no policy")."""
+    Two tables that sanitize to the same mapping_key raise
+    `Failure(allow_retries=False)` -- they would otherwise collapse
+    into one mapped step doing two tables' work, which Dagster's
+    graph would refuse at build time and which this fan-out catches
+    first with both names in the message.
+
+    The 401/403 policy-fetch `Failure` raise from `_fetch_policy_index`
+    is the same as before -- it raises BEFORE any table loop runs,
+    so it remains a whole-run failure (not a per-table skip)."""
     cfg = MaintenanceConfig.from_env()
     _ensure_catalog_database(cfg)
     tables = discover_bronze_tables(cfg)
@@ -873,101 +1011,76 @@ def run_bronze_maintenance(context) -> list[dict[str, Any]]:
             "orphan-file removal still runs"
         )
 
-    results: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
     for table_name in tables:
-        expire_skip_reason = probe_expire_snapshots_skip(cfg, table_name)
-        context.log.warning(f"[{table_name}] skipping expire_snapshots: {expire_skip_reason}")
-
-        dry = run_remove_orphan_files(cfg, table_name, dry_run=True)
-        context.log.info(f"[dry-run] {table_name}: {dry}")
-        real = run_remove_orphan_files(cfg, table_name, dry_run=False)
-        context.log.info(f"[applied] {table_name}: {real}")
-
-        growth = measure_snapshot_growth(cfg, table_name)
-        if growth["measured"]:
-            context.log.info(
-                f"[{table_name}] snapshot growth: "
-                f"{growth['snapshot_count']} snapshot(s), "
-                f"{growth['metadata_log_count']} metadata-log entr(y/ies) — "
-                "nothing in this stack reclaims these yet, see module doc"
-            )
-        else:
-            context.log.warning(
-                f"[{table_name}] snapshot growth NOT measured this run "
-                "(no CH_OAUTH_CLIENT_ID — pre-R1/authz-disabled stack)"
-            )
-
         namespace, name = _table_namespace_and_name(table_name)
         policy = None if policy_fetch_error is not None else policy_index.get((namespace, name))
-        now = datetime.now(timezone.utc)
-
-        skipped_verbs: list[str] = []
-        verb_runs: list[dict[str, str]] = []
-
-        if policy_fetch_error is not None:
-            skipped_verbs.append(f"policy fetch failed: {policy_fetch_error}")
-
-        last_run_at: datetime | None = None
-        if policy is not None:
-            if policy.get("orphanAgeHours") is not None:
-                detail = (
-                    "orphan_age_hours not applied: remove_orphan_files is "
-                    "called without an age argument on this ClickHouse"
-                )
-                skipped_verbs.append(detail)
-                verb_runs.append(
-                    {
-                        "verb": "orphan_age_hours",
-                        "engine": "clickhouse",
-                        "outcome": "skipped",
-                        "detail": detail,
-                    }
-                )
-            last_run_at = _parse_run_at(latest_maintenance_run_at(cfg.ch, table_name))
-
-        expire_skip, expire_verb_run = _expire_snapshots_result(
-            cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
-        )
-        if expire_skip is not None and expire_skip not in skipped_verbs:
-            skipped_verbs.append(expire_skip)
-        if expire_verb_run is not None:
-            verb_runs.append(expire_verb_run)
-
-        optimize_skip, optimize_verb_run = _optimize_result(
-            cfg, namespace, name, policy, now, last_run_at
-        )
-        if optimize_skip is not None and optimize_skip not in skipped_verbs:
-            skipped_verbs.append(optimize_skip)
-        if optimize_verb_run is not None:
-            verb_runs.append(optimize_verb_run)
-
-        context.log.info(f"[{table_name}] skipped_verbs: {skipped_verbs}")
-
-        record_maintenance_run(
-            table_name=table_name,
-            dry_run_metrics=dry,
-            applied_metrics=real,
-            skipped_verbs=skipped_verbs,
-            snapshot_growth=growth,
-            target=cfg.ch,
-        )
-        if verb_runs:
-            record_maintenance_verb_run(
-                table_name=table_name,
-                run_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                verb_runs=verb_runs,
-                target=cfg.ch,
+        key = _sanitize_mapping_key(table_name)
+        if key in seen:
+            raise Failure(
+                f"discovered two Bronze tables whose names sanitize to the same "
+                f"Dagster step key {key!r}: {seen[key]!r} and {table_name!r} -- "
+                "rename one so each table maps to a unique mapped step",
+                allow_retries=False,
             )
-        results.append(
-            {
+        seen[key] = table_name
+        yield DynamicOutput(
+            value={
                 "table_name": table_name,
-                "dry_run": dry,
-                "applied": real,
-                "skipped_verbs": skipped_verbs,
-                "snapshot_growth": growth,
-            }
+                "policy": policy,
+                "policy_fetch_error": policy_fetch_error,
+            },
+            mapping_key=key,
         )
 
+
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/maintenance.py::maintain_bronze_table",
+        sql=None,
+        reads=["Iceberg bronze.{table_name}", "maintenance policy for {table_name}"],
+        writes=[
+            "Iceberg bronze.{table_name} (orphan files, snapshots, compaction)",
+            "ClickHouse lake.bronze_meta.maintenance_run",
+            "ClickHouse lake.bronze_meta.maintenance_verb_run",
+        ],
+    ),
+)
+def maintain_bronze_table(context, payload: dict[str, Any]) -> dict[str, Any]:
+    """The per-table maintenance chain. Carries the table's already-
+    resolved policy in `payload["policy"]` (looked up once by the
+    fan-out op, not once per table). The body delegates to
+    `_run_maintenance_for_table`, the same helper
+    `test_maintenance.py`'s `RunBronzeMaintenanceTrinoIntegrationTest`
+    drives to assert the per-table behaviour end-to-end -- the tests
+    and this op are the same code path."""
+    cfg = MaintenanceConfig.from_env()
+    return _run_maintenance_for_table(
+        cfg,
+        payload["table_name"],
+        payload["policy"],
+        payload["policy_fetch_error"],
+    )
+
+
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/maintenance.py::summarize_bronze_maintenance",
+        sql=None,
+        reads=["per-table result list from maintain_bronze_table[*]"],
+        writes=["output metadata tables_maintained"],
+    ),
+)
+def summarize_bronze_maintenance(
+    context, results: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Collects every mapped `maintain_bronze_table` step's result and
+    logs the per-run count (the only number this whole job owes to
+    the rest of the code location -- per-table dry-run/applied
+    counts live on each `maintain_bronze_table` step's
+    `record_maintenance_run` row, not aggregated here)."""
     context.add_output_metadata({"tables_maintained": len(results)})
     return results
 
@@ -975,9 +1088,16 @@ def run_bronze_maintenance(context) -> list[dict[str, Any]]:
 @job
 def bronze_maintenance_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `bronze_maintenance_job`.
-    Launched the same way `bronze_ingest_job` (P3) is — no Rust-side
-    special-casing needed."""
-    run_bronze_maintenance()
+    PART C: `list_bronze_tables` is the fan-out (one DynamicOutput per
+    Bronze table) -> `maintain_bronze_table` (mapped per-table body)
+    -> `summarize_bronze_maintenance` (collects). The `.map(...)`
+    form is mandatory here -- `maintain_bronze_table(list_bronze_tables())`
+    would emit an "uninvoked op" warning then a graph-build error,
+    because the output of `list_bronze_tables()` is a DynamicOutput,
+    not a value the mapped op can consume directly."""
+    summarize_bronze_maintenance(
+        list_bronze_tables().map(lambda payload: maintain_bronze_table(payload)).collect()
+    )
 
 
 # Daily at 03:00 — arbitrary but conservative cadence for a Bronze table

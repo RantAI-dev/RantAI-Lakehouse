@@ -7,13 +7,18 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
-import { KIND_LABEL, LineageColumns, nodeHref } from "@/features/governance/lineage-graph"
+import {
+  KIND_LABEL,
+  LineageColumns,
+  focusIds,
+  type LineageNode,
+} from "@/features/governance/lineage-graph"
 import { useService, type ServiceState } from "@/hooks/use-service"
 import { assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type { LineageGraph, LineageNode } from "@/services/contracts/governance"
+import type { LineageGraph } from "@/services/contracts/governance"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -55,7 +60,7 @@ export function lineageSides(graph: LineageGraph | null): {
   downstream: LineageNode[]
 } {
   if (!graph) return { upstream: [], downstream: [] }
-  const focus = new Set(graph.focusIds ?? [])
+  const focus = focusIds(graph)
   const byId = new Map(graph.nodes.map((n) => [n.id, n]))
   const walk = (forward: boolean) => {
     const seen = new Set(focus)
@@ -78,16 +83,33 @@ export function lineageSides(graph: LineageGraph | null): {
 }
 
 /**
+ * The authored pipeline a `pipeline` edge was recorded from. The graph
+ * draws a pipeline as an edge from its source to its target, and names it
+ * only in the edge's `evidence` (`routes/lineage.rs`: "authored pipeline
+ * <name> (<id>)").
+ */
+function edgePipeline(evidence: string | undefined): { id: string; name: string } | null {
+  const match = /^authored pipeline (.+) \((pl-[^()]+)\)$/.exec(evidence ?? "")
+  return match ? { id: match[2], name: match[1] } : null
+}
+
+/**
  * What reads this asset: the pipelines the graph records reading it, then
  * whatever the catalog itself lists (`dependents`), without repeats.
  */
 export function assetDependents(a: AssetDetail, graph: LineageGraph | null): Related[] {
-  const focus = new Set(graph?.focusIds ?? [])
-  const byId = new Map((graph?.nodes ?? []).map((n) => [n.id, n]))
+  const focus = graph ? focusIds(graph) : new Set<string>()
   const out = new Map<string, Related>()
   for (const edge of graph?.edges ?? []) {
-    const node = edge.kind === "read" && focus.has(edge.from) ? byId.get(edge.to) : undefined
-    if (node) out.set(node.id, { id: node.id, name: node.label, kind: "pipeline", href: nodeHref(node) })
+    const pipeline = edge.kind === "pipeline" && focus.has(edge.from) ? edgePipeline(edge.evidence) : null
+    if (pipeline) {
+      out.set(pipeline.id, {
+        id: pipeline.id,
+        name: pipeline.name,
+        kind: "pipeline",
+        href: `/pipelines/${encodeURIComponent(pipeline.id)}`,
+      })
+    }
   }
   for (const d of a.dependents) {
     if (!out.has(d.id)) {

@@ -138,7 +138,13 @@ def step_wait_for_services() -> None:
     # The webserver answering is not the code location having loaded:
     # compose can recreate `dagster-code-location` when this runner starts,
     # and an `ingest/run` in that window fails with PipelineNotFoundError
-    # (seen in CI). Wait until Dagster itself lists `ingest_job`.
+    # (seen in CI). The recreate can ALSO land AFTER this wait -- compose
+    # recreates the container when THIS runner starts, so the first launch
+    # POST races the recovered gRPC server by milliseconds (seen twice in
+    # CI: PR #57 and the R3 merge to main). The launch sites guard against
+    # that race directly via `_post_ingest_run`, which waits again on a
+    # 422 `PipelineNotFoundError` and retries once. Wait here only until
+    # Dagster itself lists `ingest_job`.
     _wait_for("Dagster code location (ingest_job loaded)", _ingest_job_is_loaded, 120)
 
 
@@ -337,6 +343,44 @@ def _create_connector(*, name: str, kind: str, host: str, credential: dict) -> d
     return created.json()
 
 
+def _post_ingest_run(connector_id: str) -> requests.Response:
+    """POST /api/connectors/{id}/ingest/run with a one-shot retry that
+    closes compose's dagster-code-location reload window. The reload
+    can land AFTER step_wait_for_services() already observed a loaded
+    location -- compose recreates the container when THIS runner
+    starts, so the first launch POST races the recovered gRPC server
+    by milliseconds and the API returns 422 `PipelineNotFoundError`
+    (seen twice in CI: PR #57 and the R3 merge to main). On a 422
+    whose body names `PipelineNotFoundError`, wait up to 120 s for
+    `_ingest_job_is_loaded` and POST once more. Any other failure
+    raises immediately. The retry's own failure raises with an
+    explicit `post-reload retry` note so the gate's failure log names
+    which side of the race it lost.
+    """
+    url = f"{API_URL}/api/connectors/{connector_id}/ingest/run"
+    resp = API.post(url, timeout=10)
+    if resp.ok:
+        return resp
+    if resp.status_code != 422 or "PipelineNotFoundError" not in resp.text:
+        raise G6Failure(f"ingest/run for {connector_id!r} failed: {resp.status_code} {resp.text}")
+    print(
+        f"[g6] ingest/run for {connector_id!r} hit the dagster-code-location "
+        "reload window; waiting for ingest_job to reload"
+    )
+    _wait_for(
+        "Dagster code location (ingest_job loaded) post-reload",
+        _ingest_job_is_loaded,
+        120,
+    )
+    retry = API.post(url, timeout=10)
+    if retry.ok:
+        return retry
+    raise G6Failure(
+        f"ingest/run for {connector_id!r} failed (post-reload retry): "
+        f"{retry.status_code} {retry.text}"
+    )
+
+
 def _register_and_run(
     *,
     name: str,
@@ -370,9 +414,7 @@ def _register_and_run(
     if not spec_resp.ok:
         raise G6Failure(f"set ingest-spec for {name!r} failed: {spec_resp.status_code} {spec_resp.text}")
 
-    run_resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
-    if not run_resp.ok:
-        raise G6Failure(f"ingest/run for {name!r} failed: {run_resp.status_code} {run_resp.text}")
+    run_resp = _post_ingest_run(connector_id)
     result = run_resp.json()
     if result.get("supported") is False:
         print(f"[g6] {name!r}: supported=false ({result.get('reason')})")
@@ -506,9 +548,7 @@ def step_ingest_matrix() -> None:
 
     # Postgres batch: the existing seeded conn-pg-lakehouse (0033),
     # already adapter=sql -- run it directly, no new connector needed.
-    pg_run = API.post(f"{API_URL}/api/connectors/conn-pg-lakehouse/ingest/run", timeout=10)
-    if not pg_run.ok:
-        raise G6Failure(f"ingest/run for conn-pg-lakehouse failed: {pg_run.status_code} {pg_run.text}")
+    pg_run = _post_ingest_run("conn-pg-lakehouse")
     run_ids["conn-pg-lakehouse"] = pg_run.json()["runId"]
 
     # files: the fixture ops/g6/seed_files_fixture.py wrote to
@@ -642,7 +682,7 @@ def step_cdc_reports_unsupported_not_a_launch() -> None:
         },
         timeout=10,
     )
-    run_resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
+    run_resp = _post_ingest_run(connector_id)
     run_body = run_resp.json()
     if run_body.get("supported") is not False or "runId" in run_body:
         raise G6Failure(f"expected a supported:false, no-runId response for a cdc connector, got: {run_body}")
@@ -746,7 +786,7 @@ def step_sheets_reports_unsupported() -> None:
               "sourceObjects": [{"name": "A1:B2", "target": "g6_sheets_placeholder"}]},
         timeout=10,
     )
-    run_resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
+    run_resp = _post_ingest_run(connector_id)
     run_body = run_resp.json()
     run_id = run_body.get("runId")
     if not run_id:

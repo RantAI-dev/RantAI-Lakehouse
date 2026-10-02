@@ -12,17 +12,40 @@ final shape of `dispar_orchestrate`, only the first one.
 from __future__ import annotations
 
 import psycopg2
-from dagster import job, op
+from dagster import Failure, job, op
 
 from dispar_orchestrate.bronze_catalog import register_bronze_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig, run_bronze_ingest
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
-@op(tags=source_metadata("dispar_orchestrate/assets.py::ingest_bronze_table"))
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/assets.py::ingest_bronze_table",
+        reads=["Postgres BRONZE_SOURCE_SCHEMA.TABLE (via dlt)"],
+        writes=["Iceberg bronze.{BRONZE_TABLE_NAME}"],
+    ),
+)
 def ingest_bronze_table(context) -> dict:
-    """Run the dlt pipeline: Postgres -> Bronze Iceberg through Lakekeeper."""
-    summary = run_bronze_ingest()
+    """Run the dlt pipeline: Postgres -> Bronze Iceberg through Lakekeeper.
+
+    PART D wrap: `dlt_pipeline.BronzeIngestConfig.from_dial`
+    (`dlt_pipeline.py:198,200`) raises `ValueError` when the dial's
+    `driver` is not `postgres`/`postgresql` or when the connector's
+    `source_objects` list is empty -- a config problem. Wrap it at this
+    op's boundary so the `DEFAULT_RETRY_POLICY` doesn't burn 60s on a
+    config that will not change between attempts. `RuntimeError` from
+    `dlt_pipeline.run_bronze_ingest` (`dlt_pipeline.py:300`, failed dlt
+    load jobs) is left retryable -- that is a transient / load-side
+    failure, not a config rejection."""
+    try:
+        summary = run_bronze_ingest()
+    except ValueError as exc:
+        raise Failure(
+            description=f"bronze ingest config rejected: {exc}",
+            allow_retries=False,
+        ) from exc
     context.log.info(f"dlt load complete: {summary}")
     context.add_output_metadata(
         {
@@ -33,7 +56,14 @@ def ingest_bronze_table(context) -> dict:
     return summary
 
 
-@op(tags=source_metadata("dispar_orchestrate/assets.py::register_in_catalog"))
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/assets.py::register_in_catalog",
+        reads=["Postgres source table (row count)", "ClickHouse system.tables, system.columns"],
+        writes=["ClickHouse lake.bronze_meta.dataset_catalog", "ClickHouse lake.bronze_meta.dataset_sync"],
+    ),
+)
 def register_in_catalog(context, summary: dict) -> None:
     """Make the ingested table show up on `GET /api/catalog` and the
     `governance/lineage`/`governance/classification` surfaces, by writing

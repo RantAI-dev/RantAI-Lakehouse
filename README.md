@@ -111,7 +111,9 @@ $EDITOR .env
 # 4. Bring up Postgres, ClickHouse, and the Rust API (built from
 #    rust/Dockerfile). Dagster and a real LLM are NOT part of this stack —
 #    see docs/OPERATIONS.md for what that means and how to add them.
-docker compose up --build
+#    scripts/compose.sh is `docker compose` with GIT_SHA set from this
+#    checkout, which the pipeline page's source view needs (see the script).
+scripts/compose.sh up --build
 # lakehouse-api listens on :8080 once postgres and clickhouse report
 # healthy. Check with: curl -sf localhost:8080/health
 

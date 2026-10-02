@@ -32,6 +32,13 @@ cargo build
 See [README.md](README.md) for environment variables and how to bring up
 the full stack (Postgres, ClickHouse, Dagster) with Docker.
 
+## Code standard
+
+How the code itself is written — documentation, error handling, secrets,
+routes, tests, per-language rules, and the agent-specific constraints — is
+in [docs/CODE-STANDARD.md](docs/CODE-STANDARD.md); the short form every
+contributor (human or AI agent) should keep in view is [AGENTS.md](AGENTS.md).
+
 ## Running tests
 
 Frontend:

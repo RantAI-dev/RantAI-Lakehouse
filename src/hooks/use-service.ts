@@ -17,7 +17,8 @@ export type ServiceState<T> =
  */
 export function useService<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
-  deps: React.DependencyList = []
+  deps: React.DependencyList = [],
+  options: { keepDataOnReload?: boolean } = {}
 ): ServiceState<T> & { reload: () => void } {
   const [state, setState] = React.useState<ServiceState<T>>({
     status: "loading",
@@ -28,10 +29,25 @@ export function useService<T>(
   const fetcherRef = React.useRef(fetcher)
   fetcherRef.current = fetcher
 
+  const keepRef = React.useRef(options.keepDataOnReload ?? false)
+  keepRef.current = options.keepDataOnReload ?? false
+  const depsKeyRef = React.useRef<React.DependencyList | null>(null)
+
   React.useEffect(() => {
     const controller = new AbortController()
     let active = true
-    setState({ status: "loading", data: null, error: null })
+    // A polled page reloads on a timer: with `keepDataOnReload`, a reload
+    // for the SAME deps keeps the last data on screen instead of flashing
+    // a skeleton every tick. New deps still show loading, since the old
+    // data belongs to something else.
+    const sameDeps =
+      depsKeyRef.current !== null &&
+      depsKeyRef.current.length === deps.length &&
+      depsKeyRef.current.every((d, i) => Object.is(d, deps[i]))
+    depsKeyRef.current = deps
+    if (!(keepRef.current && sameDeps)) {
+      setState({ status: "loading", data: null, error: null })
+    }
     fetcherRef
       .current(controller.signal)
       .then((data) => {

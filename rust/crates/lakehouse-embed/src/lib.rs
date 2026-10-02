@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lakehouse_clickhouse::{ChClient, ChError};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -84,7 +84,7 @@ pub fn sign_embed(claims: &EmbedClaims, secret: &str) -> String {
         .unwrap_or_else(|_| "e30".to_owned());
     let payload = b64url_json(claims).unwrap_or_else(|_| "e30".to_owned());
     let data = format!("{header}.{payload}");
-    let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes()) else {
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
         return String::new();
     };
     mac.update(data.as_bytes());
@@ -110,7 +110,7 @@ pub fn verify_embed(token: &str, secret: &str) -> Option<EmbedClaims> {
     };
     let data = format!("{header}.{payload}");
     let given = from_b64url(sig).ok()?;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes()).ok()?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(data.as_bytes());
     // Constant-time comparison, matching `crypto.timingSafeEqual`. A
     // length mismatch is also rejected by `verify_slice` (constant-time
@@ -150,7 +150,7 @@ fn generate_hex_secret() -> String {
     use std::fmt::Write as _;
 
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
         acc

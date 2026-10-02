@@ -121,29 +121,39 @@ const TABLE = {
   },
 }
 
-/** conn → bronze.demo_orders → pipeline → silver.orders_clean */
+/**
+ * connector → bronze.demo_orders → silver.orders_clean, in the shape
+ * `routes/lineage.rs` answers: the asked-about node is `kind: "focus"`, and
+ * an authored pipeline is an edge named in its `evidence`.
+ */
 const GRAPH = {
   focus: "bronze.demo_orders",
-  focusIds: ["bronze.demo_orders"],
   nodes: [
-    { id: "conn-pg:public.orders", label: "public.orders", kind: "source", sublabel: "Postgres", ref: "conn-pg", depth: 0 },
-    { id: "bronze.demo_orders", label: "bronze.demo_orders", kind: "bronze", sublabel: null, ref: "demo-orders", depth: 1 },
-    { id: "pl-clean", label: "orders_clean", kind: "pipeline", sublabel: "ready", ref: "pl-clean", depth: 2 },
-    { id: "silver.orders_clean", label: "silver.orders_clean", kind: "silver", sublabel: null, ref: "silver.orders_clean", depth: 3 },
+    { id: "connector:conn-pg", label: "Postgres", kind: "connector" },
+    { id: "bronze:demo_orders", label: "bronze.demo_orders", kind: "focus" },
+    { id: "table:silver.orders_clean", label: "silver.orders_clean", kind: "silver" },
   ],
   edges: [
-    { id: "a", from: "conn-pg:public.orders", to: "bronze.demo_orders", kind: "ingest" },
-    { id: "b", from: "bronze.demo_orders", to: "pl-clean", kind: "read" },
-    { id: "c", from: "pl-clean", to: "silver.orders_clean", kind: "write" },
+    { id: "e0", from: "connector:conn-pg", to: "bronze:demo_orders", kind: "ingest", evidence: "ingest spec (sql adapter)" },
+    {
+      id: "e1",
+      from: "bronze:demo_orders",
+      to: "table:silver.orders_clean",
+      kind: "pipeline",
+      evidence: "authored pipeline orders_clean (pl-clean)",
+    },
   ],
-  columnMappings: [
-    { source: "bronze.demo_orders.amount", target: "silver.orders_clean.amount_usd", transform: "renamed" },
-  ],
+  columnMappings: [],
   supported: true,
-  note: "Traced from connector ingest specs and pipelines built in the console.",
+  coverage: ["only edges the platform recorded are drawn"],
 }
 
-const NO_LINEAGE = { ...GRAPH, focusIds: [], nodes: [], edges: [], columnMappings: [] }
+const NO_LINEAGE = {
+  ...GRAPH,
+  nodes: [],
+  edges: [],
+  note: "no recorded lineage mentions bronze.demo_orders",
+}
 
 const PROFILE = {
   supported: true,
@@ -224,7 +234,8 @@ describe("AssetDetailTabs", () => {
     stubApi()
     renderTabs()
 
-    // Source upstream; the pipeline and its Silver table downstream.
+    // The connector upstream, the Silver table downstream, and the
+    // pipeline that reads it as a dependent.
     await waitFor(() =>
       expect(tabNames()).toEqual([
         "Overview",
@@ -272,23 +283,26 @@ describe("Lineage tab", () => {
 
     const graph = await screen.findByRole("list", { name: "Lineage graph" })
     expect(within(graph).getAllByRole("listitem").map((n) => n.textContent)).toEqual([
-      "Sourcepublic.ordersPostgres",
+      "ConnectorPostgres",
       "Bronzebronze.demo_orders",
-      "Pipelineorders_cleanReady",
       "Silversilver.orders_clean",
     ])
     // Its neighbours open their own pages; the asset itself is not a link to itself.
-    expect(within(graph).getByText("orders_clean").closest("a")?.getAttribute("href")).toBe("/pipelines/pl-clean")
+    expect(within(graph).getByText("Postgres").closest("a")?.getAttribute("href")).toBe("/connectors/conn-pg/edit")
+    expect(within(graph).getByText("silver.orders_clean").closest("a")?.getAttribute("href")).toBe(
+      "/data/assets/silver.orders_clean"
+    )
     expect(within(graph).getByText("bronze.demo_orders").closest("a")).toBeNull()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("?focus=bronze.demo_orders"))).toBe(true)
 
     expect(screen.getByText("Open lineage graph").closest("a")?.getAttribute("href")).toBe(
       "/lineage?focus=bronze.demo_orders"
     )
-    expect(screen.getByText("bronze.demo_orders.amount")).toBeTruthy()
-    // The pipeline that reads it is a dependent.
+    // The pipeline that reads it is a dependent, named by the edge's evidence.
     const dependents = screen.getByText("Dependents").closest("[data-slot=card]") as HTMLElement
-    expect(within(dependents).getByText("orders_clean")).toBeTruthy()
+    expect(within(dependents).getByText("orders_clean").closest("a")?.getAttribute("href")).toBe(
+      "/pipelines/pl-clean"
+    )
   })
 
   it("says nothing is recorded, and why, instead of drawing an empty graph", async () => {
@@ -297,7 +311,7 @@ describe("Lineage tab", () => {
     renderTabs()
 
     expect(await screen.findByText("No lineage recorded for bronze.demo_orders")).toBeTruthy()
-    expect(screen.getByText(GRAPH.note)).toBeTruthy()
+    expect(screen.getByText(NO_LINEAGE.note)).toBeTruthy()
     expect(screen.getByRole("tab", { name: /Lineage/ }).textContent).toBe("Lineage0")
   })
 

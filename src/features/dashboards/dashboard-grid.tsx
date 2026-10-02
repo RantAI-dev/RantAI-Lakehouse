@@ -27,6 +27,8 @@ export type TileMenuItem = {
 
 export type GridItem = {
   id: string;
+  /** Chart width chosen in the builder; `2` = full width. Only sizes a tile with no stored box yet. */
+  span?: 1 | 2;
   title: string;
   subtitle?: string;
   badge?: React.ReactNode;
@@ -44,8 +46,9 @@ const ROW_H = 44;
 const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
 /**
- * Ensure every item has a box; items without one get placed 2-per-row
- * below. A stored layout that already overlaps gets tidied up too.
+ * Ensure every item has a box; items without one get placed below, half
+ * width (2 per row) or full width for `span: 2`. A stored layout that
+ * already overlaps gets tidied up too.
  */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   const out: LayoutMap = {};
@@ -56,8 +59,10 @@ function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   let col = 0;
   for (const it of items) {
     if (out[it.id]) continue;
-    out[it.id] = { x: col, y: maxY, w: DEFAULT.w, h: DEFAULT.h };
-    col += DEFAULT.w;
+    const w = it.span === 2 ? COLS : DEFAULT.w;
+    if (col + w > COLS) { col = 0; maxY += DEFAULT.h; }
+    out[it.id] = { x: col, y: maxY, w, h: DEFAULT.h };
+    col += w;
     if (col >= COLS) { col = 0; maxY += DEFAULT.h; }
   }
   return settleLayout(out);
