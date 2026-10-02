@@ -263,7 +263,10 @@ fn unsupported(reason: &str) -> Response {
 
 /// The table behind `id` (see `catalog_source`), or `Ok(None)` when the
 /// asset is real but nothing readable backs it.
-async fn resolve_source(state: &AppState, id: &str) -> Result<Option<ReadSource>, ApiError> {
+pub(crate) async fn resolve_source(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<ReadSource>, ApiError> {
     if id.starts_with("silver.") || id.starts_with("serving.") {
         let (db, table) = split_db_table(id);
         return Ok(catalog_source::clickhouse_source(&state.clickhouse, &db, &table).await?);

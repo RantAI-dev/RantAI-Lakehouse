@@ -174,6 +174,18 @@ function stubApi({
     const path = String(input)
     const method = init?.method ?? "GET"
     if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
+    if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
+    if (method === "DELETE" && path.includes("/api/governance/quality/")) return json({ ok: true })
+    if (method === "PUT" && path.includes("/api/governance/quality/")) {
+      return json({ id: "q3", name: "email_complete", ...JSON.parse(String(init?.body)), dimension: "completeness", lastStatus: null, lastRunAt: null, evaluable: true, hint: null })
+    }
+    if (method === "POST" && path.endsWith("/api/governance/policies")) return json({ id: "p-new" }, 201)
+    if (method === "PUT" && path.includes("/api/governance/policies/")) return json({ id: "p1", status: JSON.parse(String(init?.body)).status })
+    if (method === "DELETE" && path.includes("/api/governance/policies/")) return json({ ok: true })
+    if (path.includes("/sample?limit=")) {
+      const limit = Number(path.split("limit=")[1])
+      return json({ rows: Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })), limit })
+    }
     if (method === "POST" && path.endsWith("/run")) return json({ id: "q2", status: "passed", value: "0 repeated values in 50 rows" })
     if (method === "POST" && path.endsWith("/api/governance/quality")) return json({ id: "new" }, 201)
     if (method === "POST" && path.endsWith("/api/governance/classification")) return json({ id: "c1" }, 201)
@@ -425,6 +437,8 @@ describe("Quality tab", () => {
     fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
     expect(screen.getByText("id unique")).toBeTruthy()
+    // Bronze is append-only: what "unique" means there is said up front.
+    expect(screen.getByText(/only when it repeats within\s+one load/)).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -629,5 +643,269 @@ describe("Health and classification", () => {
     expect(writes(fetchSpy)).toEqual([
       ["POST", "/api/governance/classification", { asset: "bronze.demo_orders", column: "amount", classification: "confidential" }],
     ])
+  })
+})
+
+describe("Quality tab: deleting a rule", () => {
+  const checks: AssetDetail["qualityChecks"] = [
+    { id: "q1", name: "row_count", dimension: "completeness", status: "passed", lastRun: "2026-09-30T00:00:00Z", origin: "observed" },
+    { id: "q3", name: "email_complete", dimension: "completeness", status: null, lastRun: null, threshold: ">= 95%", origin: "rule", evaluable: false, hint: "Write the threshold as one of: …" },
+  ]
+
+  it("deletes an authored rule after a confirmation, then reloads the asset", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks }, reloaded)
+
+    // The observed check is the quality job's own: nothing to delete.
+    expect(screen.queryByLabelText("Delete rule row_count")).toBeNull()
+    fireEvent.click(await screen.findByLabelText("Delete rule email_complete"))
+    expect(writes(fetchSpy)).toEqual([])
+    fireEvent.click(screen.getByRole("button", { name: "Delete rule" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/quality/q3", undefined]])
+  })
+
+  it("offers no delete without governance:write", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read", "governance:read"] })
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks })
+
+    await screen.findByText("email_complete")
+    await waitFor(() => expect(screen.queryByLabelText("Delete rule email_complete")).toBeNull())
+  })
+})
+
+describe("Activity tab: freshness target", () => {
+  it("says no target is set, and sets one as an SLA on the table key", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=activity"
+    renderTabs(BRONZE, reloaded)
+
+    expect(screen.getByText(/No target is set/)).toBeTruthy()
+    fireEvent.click(await screen.findByText("Set target"))
+    fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "0" } })
+    expect((screen.getByRole("button", { name: "Save target" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "6" } })
+    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "hours" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save target" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      ["PUT", "/api/governance/sla", { tableName: "bronze.demo_orders", expectedIntervalMinutes: 360 }],
+    ])
+  })
+
+  it("says where the target comes from, and opens on the one already set", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, freshnessTargetSeconds: 172800, freshnessTargetSource: "sla" })
+
+    expect(screen.getByText(/by its freshness SLA/)).toBeTruthy()
+    fireEvent.click(await screen.findByText("Change target"))
+    expect((screen.getByLabelText("New data at least every") as HTMLInputElement).value).toBe("2")
+    expect((screen.getByLabelText("Unit") as HTMLSelectElement).value).toBe("days")
+  })
+})
+
+describe("Sample tab", () => {
+  it("shows the rows the asset carries, and asks for more only when asked", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=sample"
+    renderTabs()
+
+    const sizes = screen.getByRole("group", { name: "Rows to show" })
+    expect(within(sizes).getByText("5").getAttribute("aria-pressed")).toBe("true")
+    expect(screen.getAllByRole("row")).toHaveLength(2)
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/sample"))).toBe(false)
+
+    fireEvent.click(within(sizes).getByText("25"))
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=25"))).toBe(true)
+  })
+
+  it("offers no row count to a reader who may not read rows", () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs({ ...BRONZE, sample: [], sampleRestricted: true })
+
+    expect(screen.getByText("Sample rows need query access")).toBeTruthy()
+    expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+  })
+})
+
+describe("Access tab: adding a policy", () => {
+  it("adds a masking policy bound to the table its rows are read from", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(BRONZE, reloaded)
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // Nothing to enforce yet: no role, no column, no filter.
+    const save = () => screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement
+    expect(save().disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Roles it applies to"), { target: { value: "Analyst, Dashboard Viewer" } })
+    expect(save().disabled).toBe(true)
+    fireEvent.click(screen.getByLabelText("amount"))
+    fireEvent.click(save())
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "POST",
+        "/api/governance/policies",
+        {
+          name: "govern_bronze_demo_orders",
+          kind: "Column mask",
+          subjects: "Analyst, Dashboard Viewer",
+          resources: "bronze.demo_orders",
+          effect: "Permit with obligation",
+          conditions: JSON.stringify({ roles: ["Analyst", "Dashboard Viewer"], table: "bronze.demo_orders", mask: ["amount"] }),
+          activate: false,
+        },
+      ],
+    ])
+  })
+
+  it("offers no policy form without policy:write", async () => {
+    stubApi({ permissions: ["catalog:read", "policy:read"] })
+    url.search = "tab=access"
+    renderTabs()
+
+    await screen.findByText("Open policies")
+    expect(screen.queryByText("Add policy")).toBeNull()
+  })
+})
+
+describe("Quality tab: rewriting a rule", () => {
+  const checks: AssetDetail["qualityChecks"] = [
+    { id: "q3", name: "email_complete", asset: "bronze.demo_orders", dimension: "completeness", status: null, lastRun: null, threshold: ">= 95%", severity: "high", origin: "rule", evaluable: false, hint: "Write the threshold as one of: …" },
+  ]
+
+  it("rewrites the threshold of a rule that cannot be run, then reloads the asset", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks }, reloaded)
+
+    fireEvent.click(await screen.findByLabelText("Edit rule email_complete"))
+    // The form opens on the rule as it is; saving it unchanged is nothing to save.
+    expect((screen.getByLabelText("Table") as HTMLInputElement).value).toBe("bronze.demo_orders")
+    expect((screen.getByLabelText("Severity") as HTMLSelectElement).value).toBe("high")
+    const save = screen.getByRole("button", { name: "Save rule" }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Threshold"), { target: { value: " amount not null >= 95% " } })
+    expect(screen.getByText(/results recorded for this rule are cleared/)).toBeTruthy()
+    fireEvent.click(save)
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      ["PUT", "/api/governance/quality/q3", { asset: "bronze.demo_orders", threshold: "amount not null >= 95%", severity: "high" }],
+    ])
+  })
+
+  it("offers no edit without governance:write", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read", "governance:read"] })
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks })
+
+    await screen.findByText("email_complete")
+    await waitFor(() => expect(screen.queryByLabelText("Edit rule email_complete")).toBeNull())
+  })
+})
+
+describe("Activity tab: one history of changes", () => {
+  it("places the table's schema versions among what people changed, newest first", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      changeHistory: [
+        { id: "audit-2", at: "2026-09-30T09:00:00Z", actor: "Rina", summary: "Edited description" },
+        { id: "audit-1", at: "2026-09-21T09:00:00Z", actor: "Budi", summary: "Added quality rule orders_id_unique" },
+      ],
+    })
+
+    const history = screen.getByText("Change history").closest("[data-slot=card]") as HTMLElement
+    await waitFor(() => expect(within(history).getAllByRole("listitem")).toHaveLength(4))
+    expect(within(history).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringContaining("RinaEdited description"),
+      expect.stringContaining("Schema v1Added amount (decimal(12, 2))"),
+      expect.stringContaining("BudiAdded quality rule orders_id_unique"),
+      expect.stringContaining("Schema v0Created with 2 columns"),
+    ])
+  })
+})
+
+describe("Access tab: enforcing and deleting a policy", () => {
+  const policy = (status: string): AssetDetail["policySummary"][number] => ({
+    id: "p1",
+    name: "mask-amount",
+    effect: "Permit with obligation",
+    kind: "Column mask",
+    status,
+    table: "bronze.demo_orders",
+    appliesToYou: false,
+    roles: ["Analyst"],
+    mask: ["amount"],
+  })
+
+  it("enforces a draft after saying what that changes, then reloads the asset", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs({ ...BRONZE, policySummary: [policy("draft")] }, reloaded)
+
+    const item = screen.getByText("mask-amount").closest("li") as HTMLElement
+    expect(within(item).getByText("draft · not enforced")).toBeTruthy()
+    fireEvent.click(await within(item).findByRole("button", { name: "Enforce" }))
+    expect(screen.getByText(/read its masked columns as \*\*\*/)).toBeTruthy()
+    expect(writes(fetchSpy)).toEqual([])
+    fireEvent.click(screen.getByRole("button", { name: "Enforce" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["PUT", "/api/governance/policies/p1/status", { status: "ready" }]])
+  })
+
+  it("stops enforcing a policy back to a draft", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs({ ...BRONZE, policySummary: [policy("ready")] }, reloaded)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stop enforcing" }))
+    expect(screen.getByText(/read unmasked and unfiltered\. The policy is kept as a draft/)).toBeTruthy()
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Stop enforcing" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["PUT", "/api/governance/policies/p1/status", { status: "draft" }]])
+  })
+
+  it("deletes a policy, warning when it is the one being enforced", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs({ ...BRONZE, policySummary: [policy("ready")] }, reloaded)
+
+    fireEvent.click(await screen.findByLabelText("Delete policy mask-amount"))
+    expect(screen.getByText(/It is being enforced/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Delete policy" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/policies/p1", undefined]])
+  })
+
+  it("offers neither without policy:write", async () => {
+    stubApi({ permissions: ["catalog:read", "policy:read"] })
+    url.search = "tab=access"
+    renderTabs({ ...BRONZE, policySummary: [policy("draft")] })
+
+    await screen.findByText("Open policies")
+    expect(screen.queryByRole("button", { name: "Enforce" })).toBeNull()
+    expect(screen.queryByLabelText("Delete policy mask-amount")).toBeNull()
   })
 })

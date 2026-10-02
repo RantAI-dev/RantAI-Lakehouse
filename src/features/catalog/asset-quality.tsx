@@ -2,7 +2,8 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Play, Plus } from "lucide-react"
+import { Pencil, Play, Plus, Trash2 } from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
@@ -27,6 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useAuth } from "@/features/auth/auth-provider"
+import { EditRuleDialog } from "@/features/governance/quality-rule-edit-dialog"
 import { useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { notifyError, notifySuccess } from "@/lib/notify"
@@ -188,6 +190,13 @@ function AddRuleDialog({
               </select>
             </div>
           ) : null}
+          {form.kind === "unique" && key.startsWith("bronze.") ? (
+            <p className="text-xs text-muted-foreground">
+              Bronze keeps every load, so a source loaded twice holds each row twice. Where the
+              table records its loads, a value counts as repeated only when it repeats within
+              one load.
+            </p>
+          ) : null}
           {form.kind === "rows" ? (
             <div className="grid gap-1.5">
               <Label htmlFor="rule-rows">Minimum rows</Label>
@@ -307,7 +316,15 @@ function Result({ q }: { q: Check }) {
   )
 }
 
-function CheckRow({ q }: { q: Check }) {
+function CheckRow({
+  q,
+  onEdit,
+  onDelete,
+}: {
+  q: Check
+  onEdit?: (q: Check) => void
+  onDelete?: (q: Check) => void
+}) {
   return (
     <TableRow>
       <TableCell className="py-1.5 align-top">
@@ -332,6 +349,30 @@ function CheckRow({ q }: { q: Check }) {
       <TableCell className="py-1.5 align-top text-xs text-muted-foreground">
         {q.lastRun === null ? "Never" : formatRelativeTime(q.lastRun)}
       </TableCell>
+      <TableCell className="py-1 text-right align-top whitespace-nowrap">
+        {/* Only an authored rule is this page's to change or delete; a
+            recorded verdict belongs to the job that wrote it. */}
+        {onEdit && q.origin === "rule" ? (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Edit rule ${q.name}`}
+            onClick={() => onEdit(q)}
+          >
+            <Pencil />
+          </Button>
+        ) : null}
+        {onDelete && q.origin === "rule" ? (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Delete rule ${q.name}`}
+            onClick={() => onDelete(q)}
+          >
+            <Trash2 />
+          </Button>
+        ) : null}
+      </TableCell>
     </TableRow>
   )
 }
@@ -352,6 +393,24 @@ export function AssetQuality({
   const { hasPermission } = useAuth()
   const [adding, setAdding] = React.useState(false)
   const [running, setRunning] = React.useState(false)
+  const [deleting, setDeleting] = React.useState<Check | null>(null)
+  const [editing, setEditing] = React.useState<Check | null>(null)
+  const remove = useServiceAction((signal, id: string) =>
+    governanceService.deleteQualityRule(id, signal)
+  )
+  const canWrite = hasPermission("governance:write")
+
+  async function confirmDelete() {
+    if (!deleting) return
+    const ok = await remove.run(deleting.id)
+    if (ok === null) {
+      notifyError("The rule could not be deleted", remove.error)
+      return
+    }
+    notifySuccess(`Deleted rule ${deleting.name}`)
+    setDeleting(null)
+    onChanged()
+  }
   const summary = qualitySummary(a.qualityChecks)
   const runnable = a.qualityChecks.filter((q) => q.origin === "rule" && q.evaluable !== false)
   const parts = [
@@ -423,16 +482,50 @@ export function AssetQuality({
                 <TableHead className="text-xs">Severity</TableHead>
                 <TableHead className="text-xs">Result</TableHead>
                 <TableHead className="text-xs">Last run</TableHead>
+                <TableHead className="text-xs" aria-label="Actions" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {a.qualityChecks.map((q) => (
-                <CheckRow key={q.id} q={q} />
+                <CheckRow
+                  key={q.id}
+                  q={q}
+                  onEdit={canWrite ? setEditing : undefined}
+                  onDelete={canWrite ? setDeleting : undefined}
+                />
               ))}
             </TableBody>
           </Table>
         </div>
       )}
+      <ConfirmActionDialog
+        open={deleting !== null}
+        onOpenChange={(open) => (open ? undefined : setDeleting(null))}
+        title="Delete quality rule"
+        description={`Delete ${deleting?.name ?? "this rule"}?`}
+        impact="The rule and the results recorded for it are removed. It will no longer count toward this asset's health."
+        confirmLabel="Delete rule"
+        confirming={remove.status === "pending"}
+        destructive
+        onConfirm={() => void confirmDelete()}
+      />
+      {editing ? (
+        <EditRuleDialog
+          rule={{
+            id: editing.id,
+            name: editing.name,
+            // An API build older than `asset` on a check: the asset's own table.
+            asset: editing.asset ?? lineageKey(a),
+            threshold: editing.threshold ?? "",
+            severity: editing.severity ?? "medium",
+          }}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null)
+            onChanged()
+          }}
+        />
+      ) : null}
       {adding ? (
         <AddRuleDialog
           asset={a}

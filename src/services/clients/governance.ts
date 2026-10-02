@@ -10,6 +10,7 @@ import type {
   ReplicationSlot,
   CreatePolicyInput,
   CreateQualityRuleInput,
+  UpdateQualityRuleInput,
   CreateClassificationRuleInput,
   DatasetSla,
 } from "../contracts/governance";
@@ -106,8 +107,30 @@ export const clickhouseGovernanceService: GovernanceService = {
   createPolicy(input: CreatePolicyInput, signal) {
     return post<Policy>("/api/governance/policies", input, signal);
   },
+  setPolicyStatus(id, status, signal) {
+    return put<Policy>(`/api/governance/policies/${encodeURIComponent(id)}/status`, { status }, signal);
+  },
+  async deletePolicy(id, signal) {
+    const res = await apiFetch(`/api/governance/policies/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the policy");
+  },
   createQualityRule(input: CreateQualityRuleInput, signal) {
     return post<QualityRule>("/api/governance/quality", input, signal);
+  },
+  updateQualityRule(id, input: UpdateQualityRuleInput, signal) {
+    return put<QualityRule>(`/api/governance/quality/${encodeURIComponent(id)}`, input, signal);
+  },
+  async deleteQualityRule(id, signal) {
+    const res = await apiFetch(`/api/governance/quality/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the rule");
   },
   runQualityRule(id, signal) {
     return post<QualityRunResult>(

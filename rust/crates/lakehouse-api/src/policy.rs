@@ -183,6 +183,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // so it needs the same `query:read` as running that SELECT yourself —
     // and goes through the same policy rewrite (`routes::catalog_profile`).
     ("GET", "/api/catalog/{id}/profile", Policy::RequiresPermission("query:read")),
+    // More sample rows than the detail body carries: rows are data.
+    ("GET", "/api/catalog/{id}/sample", Policy::RequiresPermission("query:read")),
 
     // ── Catalog annotations (WS2 §13): console-only owner/steward/tags/
     //    description. PUT reuses the already-seeded `catalog:write`
@@ -246,6 +248,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // WS7 item A5: only someone who could actually save the policy may
     // preview its effect.
     ("POST", "/api/governance/policies/preview", Policy::RequiresPermission("policy:write")),
+    // Enforcing, stopping or removing a policy is as much authoring it as
+    // creating it is.
+    ("PUT", "/api/governance/policies/{id}/status", Policy::RequiresPermission("policy:write")),
+    ("DELETE", "/api/governance/policies/{id}", Policy::RequiresPermission("policy:write")),
     // WS5 item E1 (Y6): per-table freshness SLA. `governance:write` is the
     // existing grant `0030_table_maintenance_policy.sql` already gives the
     // `Governance Admin` role (not re-granted here) — same permission the
@@ -255,6 +261,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
+    // Rewriting or removing a rule is a governance decision, like setting an SLA.
+    ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
     ("POST", "/api/governance/{kind}",    Policy::RequiresAuth),
 

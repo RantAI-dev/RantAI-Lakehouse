@@ -1,10 +1,24 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
+import { Timer } from "lucide-react"
+import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import {
   Table,
   TableBody,
@@ -13,8 +27,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { useAuth } from "@/features/auth/auth-provider"
+import { useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
-import { formatCompactNumber, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format"
+import {
+  formatCompactNumber,
+  formatDateTime,
+  formatLagSeconds,
+  formatNumber,
+  formatRelativeTime,
+} from "@/lib/format"
 import {
   isIcebergCandidate,
   msToIso,
@@ -22,7 +44,13 @@ import {
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured, type Measured } from "@/lib/measured"
+import { notifySuccess } from "@/lib/notify"
+import { schemaHistory } from "@/lib/schema-history"
+import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
+import type { DatasetSla } from "@/services/contracts/governance"
+import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
+import { lineageKey } from "./asset-lineage"
 import type { IcebergTableState } from "./asset-storage"
 
 function QuietEmpty({ title, description }: { title: string; description?: string }) {
@@ -111,13 +139,212 @@ function IcebergSnapshots({ asset: a, state }: { asset: AssetDetail; state: Iceb
   )
 }
 
+const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
+
+const UNIT_MINUTES = { minutes: 1, hours: 60, days: 1440 } as const
+type Unit = keyof typeof UNIT_MINUTES
+
 /**
- * The Activity tab: what happened to the asset over time — its loads
- * (snapshots), the changes people made to it, and who queries it.
+ * How often the table is expected to refresh, as the whole number of
+ * minutes the SLA stores — or `null` while the form does not say one.
  */
-export function AssetActivity({ asset: a, iceberg }: { asset: AssetDetail; iceberg: IcebergTableState }) {
+export function slaMinutes(amount: string, unit: Unit): number | null {
+  const n = Number(amount)
+  if (amount.trim() === "" || !Number.isInteger(n) || n <= 0) return null
+  return n * UNIT_MINUTES[unit]
+}
+
+/** The largest unit a number of minutes is a whole count of. */
+function inLargestUnit(minutes: number): { amount: string; unit: Unit } {
+  for (const unit of ["days", "hours"] as const) {
+    if (minutes % UNIT_MINUTES[unit] === 0) return { amount: String(minutes / UNIT_MINUTES[unit]), unit }
+  }
+  return { amount: String(minutes), unit: "minutes" }
+}
+
+function SetTargetDialog({
+  asset: a,
+  onClose,
+  onSaved,
+}: {
+  asset: AssetDetail
+  onClose: () => void
+  onSaved: () => void
+}) {
+  // Start from the SLA in force; a target taken from the registry's
+  // frequency is not an SLA, so the form then starts from a day.
+  const current =
+    a.freshnessTargetSource === "sla" && a.freshnessTargetSeconds
+      ? inLargestUnit(Math.round(a.freshnessTargetSeconds / 60))
+      : { amount: "1", unit: "days" as Unit }
+  const [amount, setAmount] = React.useState(current.amount)
+  const [unit, setUnit] = React.useState<Unit>(current.unit)
+  const save = useServiceAction((signal, input: DatasetSla) =>
+    governanceService.putDatasetSla(input, signal)
+  )
+  const minutes = slaMinutes(amount, unit)
+
+  async function submit() {
+    if (minutes === null) return
+    const saved = await save.run({ tableName: lineageKey(a), expectedIntervalMinutes: minutes })
+    if (saved === null) return
+    notifySuccess("Freshness target saved")
+    onSaved()
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Set freshness target</DialogTitle>
+          <DialogDescription>
+            How often {a.name} must receive new data. Past that, it reads as late and its
+            health as degraded.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-1.5">
+          <Label htmlFor="sla-amount">New data at least every</Label>
+          <div className="flex gap-2">
+            <Input
+              id="sla-amount"
+              inputMode="numeric"
+              className="w-24"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              aria-invalid={minutes === null}
+            />
+            <select
+              aria-label="Unit"
+              className={selectClassName}
+              value={unit}
+              onChange={(e) => setUnit(e.target.value as Unit)}
+            >
+              {(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => (
+                <option key={u} value={u}>
+                  {u}
+                </option>
+              ))}
+            </select>
+          </div>
+          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
+          <Button
+            size="sm"
+            onClick={() => void submit()}
+            disabled={minutes === null || save.status === "pending"}
+          >
+            {save.status === "pending" ? "Saving…" : "Save target"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/**
+ * How fresh the asset is against how fresh it is meant to be, and the way
+ * to say how fresh that is. Without a target an age is only an age — which
+ * is every Silver and serving table until someone sets one here.
+ */
+function FreshnessCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged: () => void }) {
+  const { hasPermission } = useAuth()
+  const [setting, setSetting] = React.useState(false)
+  const target = a.freshnessTargetSeconds ?? null
+  // An SLA names a table as `<namespace>.<table>`.
+  const canTarget = lineageKey(a).includes(".")
+
+  return (
+    <SectionCard
+      size="sm"
+      title="Freshness"
+      description={
+        target === null
+          ? "No target is set, so the age is shown without calling it on time or late."
+          : `Expected within ${formatLagSeconds(target)}, ${
+              a.freshnessTargetSource === "sla"
+                ? "by its freshness SLA"
+                : "from the refresh frequency its registry states"
+            }.`
+      }
+      action={
+        hasPermission("governance:write") && canTarget ? (
+          <Button size="sm" variant="outline" onClick={() => setSetting(true)}>
+            <Timer />
+            {a.freshnessTargetSource === "sla" ? "Change target" : "Set target"}
+          </Button>
+        ) : undefined
+      }
+    >
+      <FreshnessIndicator
+        lagSeconds={a.freshnessLagSeconds}
+        targetSeconds={target}
+        targetSource={a.freshnessTargetSource}
+        className="text-sm"
+      />
+      {setting ? (
+        <SetTargetDialog
+          asset={a}
+          onClose={() => setSetting(false)}
+          onSaved={() => {
+            setSetting(false)
+            onChanged()
+          }}
+        />
+      ) : null}
+    </SectionCard>
+  )
+}
+
+type Change = AssetDetail["changeHistory"][number]
+
+/**
+ * One history of what changed about the asset, newest first: what people
+ * did to it (the audit trail) and what its table's schema became (the
+ * Iceberg table's own schema versions). A schema version has no author on
+ * record, so it is named by its version; one with no time on record
+ * cannot be placed among the others and is left to the Schema tab.
+ */
+export function changeTimeline(history: Change[], versions: LakehouseSchemaVersion[]): Change[] {
+  const schema = schemaHistory(versions).flatMap((v) =>
+    v.sinceMs === null
+      ? []
+      : [
+          {
+            id: `schema-${v.schemaId}`,
+            at: msToIso(v.sinceMs),
+            actor: `Schema v${v.schemaId}`,
+            summary: v.changes.join(" · "),
+          },
+        ]
+  )
+  return [...history, ...schema].sort((a, b) => b.at.localeCompare(a.at))
+}
+
+/**
+ * The Activity tab: what happened to the asset over time — how fresh it
+ * is, its loads (snapshots), the changes to it and its schema, and who
+ * queries it.
+ */
+export function AssetActivity({
+  asset: a,
+  iceberg,
+  onChanged,
+}: {
+  asset: AssetDetail
+  iceberg: IcebergTableState
+  /** Reloads the asset after its freshness target was set. */
+  onChanged: () => void
+}) {
+  const changes = changeTimeline(
+    a.changeHistory,
+    iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : []
+  )
+
   return (
     <div className="flex flex-col gap-2">
+      <FreshnessCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
         title="Snapshots"
@@ -147,13 +374,13 @@ export function AssetActivity({ asset: a, iceberg }: { asset: AssetDetail; icebe
         <SectionCard
           size="sm"
           title="Change history"
-          description="Edits to this asset's description, owner, tags and policies."
+          description="Edits to its details, changes to its schema, and the rules, classifications, policies and targets added for it."
         >
-          {a.changeHistory.length === 0 ? (
+          {changes.length === 0 ? (
             <QuietEmpty title="No changes recorded" />
           ) : (
             <ul className="divide-y divide-border text-sm">
-              {a.changeHistory.map((c) => (
+              {changes.map((c) => (
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>

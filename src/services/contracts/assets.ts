@@ -108,6 +108,8 @@ export type AssetDetail = Asset & {
   qualityChecks: {
     id: string
     name: string
+    /** Authored rules: the table the rule names (`bronze.orders`). */
+    asset?: string
     dimension: string
     status: CheckStatus | null
     lastRun: string | null
@@ -217,7 +219,12 @@ export type AssetDetail = Asset & {
    * `icecat_api.\`bronze.orders\`` on ClickHouse. Absent when nothing
    * readable backs the asset, or from an older API build.
    */
-  queryTarget?: { engine: "clickhouse" | "trino"; table: string }
+  queryTarget?: {
+    engine: "clickhouse" | "trino"
+    table: string
+    /** The table name a policy binds to to govern reads of `table`. */
+    policyTable?: string
+  }
   /**
    * Registry facts the detail route passes through from
    * `bronze_meta.dataset_sync` (`catalog.rs`): how often the dataset is
@@ -345,6 +352,16 @@ export interface AssetService {
    * dead-fixture reason as `requestAccess` below.
    */
   getAssetProfile?(id: string, signal?: AbortSignal): Promise<AssetProfile>
+  /**
+   * `GET /api/catalog/{id}/sample?limit=N` — more sample rows than the
+   * detail body's five (the API caps the limit), masked and row-filtered
+   * like any query the caller runs. Needs `query:read`.
+   */
+  getAssetSample?(
+    id: string,
+    limit: number,
+    signal?: AbortSignal
+  ): Promise<Record<string, string>[]>
   /**
    * `PUT /api/catalog/{id}/annotation` — replace the asset's annotation
    * (needs `catalog:write`). Optional for the same dead-fixture reason.

@@ -25,10 +25,11 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::governance::{
     CreateClassificationRuleInput, CreatePolicyInput, CreateQualityRuleInput,
-    CreateResidencyRuleInput, DatasetSla, create_classification_rule, create_policy,
-    create_quality_rule, create_residency_rule, expected_interval_minutes_for,
-    list_classification_rules, list_dataset_sla, list_policies, list_quality_rules,
-    list_residency_rules, upsert_dataset_sla,
+    CreateResidencyRuleInput, DatasetSla, UpdateQualityRuleInput, create_classification_rule,
+    create_policy, create_quality_rule, create_residency_rule, delete_policy, delete_quality_rule,
+    expected_interval_minutes_for, list_classification_rules, list_dataset_sla, list_policies,
+    list_quality_rules, list_residency_rules, set_policy_status, update_quality_rule,
+    upsert_dataset_sla,
 };
 use sqlx::PgPool;
 
@@ -367,5 +368,174 @@ async fn upsert_dataset_sla_rejects_a_non_positive_interval_at_the_database(
     .await
     .expect_err("the CHECK constraint must reject a zero interval");
     assert!(matches!(err, StoreError::Database(_)), "{err:?}");
+    Ok(())
+}
+
+/// Deleting a rule returns what was deleted, once; an unknown id — or one
+/// that is not a UUID at all — deletes nothing and is not an error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_quality_rule_returns_the_rule_and_only_once(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_quality_rule(
+        &pool,
+        &CreateQualityRuleInput {
+            name: "orders_id_unique".to_owned(),
+            asset: "silver.orders".to_owned(),
+            dimension: "uniqueness".to_owned(),
+            threshold: "id unique".to_owned(),
+            severity: "high".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let before = list_quality_rules(&pool).await.unwrap().len();
+
+    let deleted = delete_quality_rule(&pool, &created.id).await.unwrap();
+    assert_eq!(deleted.map(|r| r.name), Some("orders_id_unique".to_owned()));
+    assert_eq!(list_quality_rules(&pool).await.unwrap().len(), before - 1);
+
+    assert!(
+        delete_quality_rule(&pool, &created.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        delete_quality_rule(&pool, "not-a-uuid")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Rewriting a rule changes what it checks and keeps its name and id; a
+/// dimension left out stays as it was; an unknown id rewrites nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_quality_rule_rewrites_it_in_place(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_quality_rule(
+        &pool,
+        &CreateQualityRuleInput {
+            name: "email_complete".to_owned(),
+            asset: "serving.mart_customer_segment".to_owned(),
+            dimension: "completeness".to_owned(),
+            threshold: ">= 95%".to_owned(),
+            severity: "high".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let rewrite = UpdateQualityRuleInput {
+        asset: "silver.customers".to_owned(),
+        threshold: "email not null >= 95%".to_owned(),
+        severity: "medium".to_owned(),
+        dimension: None,
+    };
+
+    let updated = update_quality_rule(&pool, &created.id, &rewrite)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.name, "email_complete");
+    assert_eq!(updated.asset, "silver.customers");
+    assert_eq!(updated.threshold, "email not null >= 95%");
+    assert_eq!(updated.severity, "medium");
+    assert_eq!(updated.dimension, "completeness");
+    let listed = list_quality_rules(&pool).await.unwrap();
+    assert!(listed.contains(&updated));
+
+    let with_dimension = UpdateQualityRuleInput {
+        dimension: Some("validity".to_owned()),
+        ..rewrite.clone()
+    };
+    let updated = update_quality_rule(&pool, &created.id, &with_dimension)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.dimension, "validity");
+
+    for unknown in ["00000000-0000-4000-8000-000000000000", "not-a-uuid"] {
+        assert!(
+            update_quality_rule(&pool, unknown, &rewrite)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+fn masking_policy(name: &str, activate: bool) -> CreatePolicyInput {
+    CreatePolicyInput {
+        name: name.to_owned(),
+        kind: "Column mask".to_owned(),
+        subjects: "Analyst".to_owned(),
+        resources: "bronze.customers".to_owned(),
+        effect: "Permit with obligation".to_owned(),
+        conditions: Some(
+            r#"{"roles":["Analyst"],"table":"bronze.customers","mask":["email"]}"#.to_owned(),
+        ),
+        activate,
+        owner: None,
+    }
+}
+
+/// A draft can be enforced and an enforced policy stopped; each change of
+/// status is a new version, and asking for the status it already has is
+/// not one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_policy_status_enforces_and_stops_a_policy(pool: PgPool) -> sqlx::Result<()> {
+    let draft = create_policy(&pool, &masking_policy("mask_email", false))
+        .await
+        .unwrap();
+    assert_eq!((draft.status.as_str(), draft.version), ("draft", 1));
+
+    let enforced = set_policy_status(&pool, &draft.id, "ready")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((enforced.status.as_str(), enforced.version), ("ready", 2));
+    assert_eq!(enforced.conditions, draft.conditions);
+
+    let again = set_policy_status(&pool, &draft.id, "ready")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((again.status.as_str(), again.version), ("ready", 2));
+    assert_eq!(again.updated_at, enforced.updated_at);
+
+    let stopped = set_policy_status(&pool, &draft.id, "draft")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((stopped.status.as_str(), stopped.version), ("draft", 3));
+
+    for unknown in ["00000000-0000-4000-8000-000000000000", "not-a-uuid"] {
+        assert!(
+            set_policy_status(&pool, unknown, "ready")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+/// Deleting a policy returns what was deleted — with the status it had —
+/// once; an unknown id deletes nothing and is not an error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_policy_returns_the_policy_and_only_once(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_policy(&pool, &masking_policy("mask_email", true))
+        .await
+        .unwrap();
+    let before = list_policies(&pool).await.unwrap().len();
+
+    let deleted = delete_policy(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(deleted.name, "mask_email");
+    assert_eq!(deleted.status, "ready");
+    assert_eq!(list_policies(&pool).await.unwrap().len(), before - 1);
+
+    assert!(delete_policy(&pool, &created.id).await.unwrap().is_none());
+    assert!(delete_policy(&pool, "not-a-uuid").await.unwrap().is_none());
     Ok(())
 }

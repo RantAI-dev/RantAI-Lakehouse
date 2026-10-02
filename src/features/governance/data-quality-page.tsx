@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
@@ -19,6 +20,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import type { Severity } from "@/lib/status"
@@ -28,6 +30,7 @@ import {
   SEVERITY_OPTIONS,
   getDataQualityColumns,
 } from "./data-quality-columns"
+import { EditRuleDialog } from "./quality-rule-edit-dialog"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -60,6 +63,15 @@ export function DataQualityPage() {
     withNotify(
       { success: "Check ran", error: "The check could not be run" },
       (signal, id: string) => governanceService.runQualityRule(id, signal)
+    )
+  )
+  const { hasPermission } = useAuth()
+  const [deleting, setDeleting] = React.useState<QualityRule | null>(null)
+  const [editing, setEditing] = React.useState<QualityRule | null>(null)
+  const removeRule = useServiceAction(
+    withNotify(
+      { success: "Quality rule deleted", error: "The rule could not be deleted" },
+      (signal, id: string) => governanceService.deleteQualityRule(id, signal)
     )
   )
   const columns = React.useMemo(
@@ -122,6 +134,16 @@ export function DataQualityPage() {
       lastValue: result.value,
       lastRunAt: new Date().toISOString(),
     })
+    state.reload()
+  }
+
+  async function handleDelete() {
+    if (!deleting) return
+    // `run` resolves to `null` only on failure, which `withNotify` reports.
+    const ok = await removeRule.run(deleting.id)
+    if (ok === null) return
+    setDeleting(null)
+    setSelected(null)
     state.reload()
   }
 
@@ -223,11 +245,46 @@ export function DataQualityPage() {
               >
                 Inspect in Data Explorer
               </Button>
+              {/* `evaluable` is only on an authored rule; a verdict a job
+                  recorded is not a rule this page can change or delete. */}
+              {selected.evaluable !== undefined && hasPermission("governance:write") ? (
+                <>
+                  <Button variant="outline" size="sm" onClick={() => setEditing(selected)}>
+                    Edit rule
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => setDeleting(selected)}>
+                    Delete rule
+                  </Button>
+                </>
+              ) : null}
             </div>
           </>
         ) : null}
       </DetailDrawer>
 
+      {editing ? (
+        <EditRuleDialog
+          rule={editing}
+          onClose={() => setEditing(null)}
+          onSaved={(saved) => {
+            setEditing(null)
+            // The drawer shows the rule as it now reads; the list catches up.
+            setSelected(saved)
+            state.reload()
+          }}
+        />
+      ) : null}
+      <ConfirmActionDialog
+        open={deleting !== null}
+        onOpenChange={(open) => (open ? undefined : setDeleting(null))}
+        title="Delete quality rule"
+        description={`Delete ${deleting?.name ?? "this rule"}?`}
+        impact="The rule and the results recorded for it are removed."
+        confirmLabel="Delete rule"
+        confirming={removeRule.status === "pending"}
+        destructive
+        onConfirm={() => void handleDelete()}
+      />
       <CreateSheet
         open={createOpen}
         onOpenChange={(open) => {

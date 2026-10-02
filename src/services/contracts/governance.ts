@@ -140,6 +140,13 @@ export type CreateQualityRuleInput = {
   severity: Severity
 }
 
+/** What rewriting a rule may change; its name stays. */
+export type UpdateQualityRuleInput = {
+  asset: string
+  threshold: string
+  severity: Severity
+}
+
 export type CreateClassificationRuleInput = {
   asset: string
   column?: string
@@ -206,12 +213,30 @@ export interface GovernanceService {
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
   listReplicationSlots(signal?: AbortSignal): Promise<ReplicationSlot[]>
   createPolicy(input: CreatePolicyInput, signal?: AbortSignal): Promise<Policy>
+  /**
+   * Enforce a policy (`"ready"`) or stop enforcing it (`"draft"`); needs
+   * `policy:write`. It applies from the next query on.
+   */
+  setPolicyStatus(id: string, status: "ready" | "draft", signal?: AbortSignal): Promise<Policy>
+  /** Remove a policy, enforced or not; needs `policy:write`. */
+  deletePolicy(id: string, signal?: AbortSignal): Promise<void>
   createQualityRule(
     input: CreateQualityRuleInput,
     signal?: AbortSignal
   ): Promise<QualityRule>
   /** Evaluate one authored rule now; needs `query:read`. */
   runQualityRule(id: string, signal?: AbortSignal): Promise<QualityRunResult>
+  /**
+   * Rewrite an authored rule; needs `governance:write`. Changing its table
+   * or threshold clears the results recorded for it.
+   */
+  updateQualityRule(
+    id: string,
+    input: UpdateQualityRuleInput,
+    signal?: AbortSignal
+  ): Promise<QualityRule>
+  /** Remove an authored rule and its recorded runs; needs `governance:write`. */
+  deleteQualityRule(id: string, signal?: AbortSignal): Promise<void>
   createClassificationRule(
     input: CreateClassificationRuleInput,
     signal?: AbortSignal

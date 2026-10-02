@@ -98,6 +98,15 @@ export const clickhouseAssetService: AssetService = {
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to profile asset");
     return json as AssetProfile;
   },
+  async getAssetSample(id, limit, signal) {
+    const res = await apiFetch(
+      `/api/catalog/${encodeURIComponent(id)}/sample?limit=${encodeURIComponent(limit)}`,
+      { signal }
+    );
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load sample rows");
+    return (json?.rows ?? []) as Record<string, string>[];
+  },
   async updateAnnotation(id, input, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/annotation`, {
       method: "PUT",

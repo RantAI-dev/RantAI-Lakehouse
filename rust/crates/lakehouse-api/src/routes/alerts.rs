@@ -427,7 +427,19 @@ pub async fn run(
         persist_fired_results(pg, &state.clickhouse, &results).await;
     }
 
-    Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
+    // The same tick keeps quality verdicts current: every runnable rule
+    // whose verdict is over an hour old is run again, in the background —
+    // a table scan must not hold up this response (the scheduler waits 30
+    // seconds for it). Not on a single-rule run (`?id=`), which is someone
+    // testing one alert, not the tick.
+    let quality_started =
+        query.id.is_none() && crate::routes::quality::spawn_scheduled_pass(&state);
+
+    Ok(ApiJson(json!({
+        "ran": results.len(),
+        "results": results,
+        "qualityPassStarted": quality_started,
+    })))
 }
 
 #[cfg(test)]

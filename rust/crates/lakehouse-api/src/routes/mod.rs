@@ -247,6 +247,10 @@ fn governance_static_router() -> Router<AppState> {
             axum::routing::post(quality::run_rule),
         )
         .route(
+            "/api/governance/quality/{id}",
+            axum::routing::put(quality::update_rule).delete(quality::delete_rule),
+        )
+        .route(
             // A dedicated route (WS3 item 17), mounted alongside `lineage`
             // immediately above — never a seventh `{kind}` dispatch value
             // (see `governance.rs`'s module doc comment).
@@ -255,13 +259,21 @@ fn governance_static_router() -> Router<AppState> {
         )
         .route(
             "/api/governance/policies",
-            get(governance::list_policies).post(governance::create_policy),
+            get(governance::list_policies).post(governance::create_policy_route),
         )
         // WS7 item A5: real policy impact preview (closes WS1 task 12's
         // deferred half).
         .route(
             "/api/governance/policies/preview",
             axum::routing::post(governance::preview_policy),
+        )
+        .route(
+            "/api/governance/policies/{id}",
+            axum::routing::delete(governance::delete_policy),
+        )
+        .route(
+            "/api/governance/policies/{id}/status",
+            axum::routing::put(governance::set_policy_status),
         )
         // WS5 item E1 (Y6): dataset freshness SLA.
         .route(
@@ -520,6 +532,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/catalog/query", get(catalog::query))
         .route("/api/catalog/{id}", get(catalog::detail))
         .route("/api/catalog/{id}/profile", get(catalog_profile::profile))
+        .route("/api/catalog/{id}/sample", get(catalog::sample))
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),

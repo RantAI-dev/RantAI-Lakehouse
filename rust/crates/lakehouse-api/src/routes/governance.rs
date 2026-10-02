@@ -761,6 +761,44 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
+/// Records that something about a catalog table changed — a rule, a
+/// classification, a policy or a freshness target was added for it — so
+/// the table's asset page can show it in its Change history
+/// (`catalog_governance::change_history`). Keyed by the table as the rule
+/// names it, lower-cased; an asset is looked up under every key it goes
+/// by. Best-effort, like every audit write: it never fails the change it
+/// records.
+pub(crate) async fn audit_table_change(
+    state: &AppState,
+    actor: Option<&Principal>,
+    table: &str,
+    action: &str,
+    args: Value,
+) {
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    let table = table.trim().to_lowercase();
+    if table.is_empty() {
+        return;
+    }
+    let _ = lakehouse_store::audit::insert(
+        pg,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: actor.map(|p| p.id.uuid().to_string()),
+            principal_kind: actor.map(|_| "user".to_owned()),
+            actor_label: actor.map(|p| p.display_name.clone()),
+            action: action.to_owned(),
+            resource_kind: Some("catalog".to_owned()),
+            resource_id: Some(table),
+            args: Some(args),
+            outcome: "executed".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 /// `POST /api/governance/{kind}` — author a new rule for `kind` (`quality`,
 /// `classification`, or `residency`; `audit` has no writer, and anything
 /// else is unrecognized).
@@ -775,17 +813,43 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
 pub async fn create_rule(
     State(state): State<AppState>,
     Path(kind): Path<String>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> Response {
+    let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state), body).await {
-            Ok(resp) => resp.into_response(),
+        Kind::Quality => match create_quality_rule(State(state.clone()), body).await {
+            Ok(resp) => {
+                let rule = &resp.1.0;
+                audit_table_change(
+                    &state,
+                    actor,
+                    &rule.asset,
+                    "quality.rule_create",
+                    json!({ "name": rule.name, "threshold": rule.threshold }),
+                )
+                .await;
+                resp.into_response()
+            }
             Err(err) => err.into_response(),
         },
-        Kind::Classification => match create_classification_rule(State(state), body).await {
-            Ok(resp) => resp.into_response(),
-            Err(err) => err.into_response(),
-        },
+        Kind::Classification => {
+            match create_classification_rule(State(state.clone()), body).await {
+                Ok(resp) => {
+                    let rule = &resp.1.0;
+                    audit_table_change(
+                        &state,
+                        actor,
+                        &rule.asset,
+                        "catalog.classify",
+                        json!({ "column": rule.column, "classification": rule.classification }),
+                    )
+                    .await;
+                    resp.into_response()
+                }
+                Err(err) => err.into_response(),
+            }
+        }
         Kind::Residency => match create_residency_rule(State(state), body).await {
             Ok(resp) => resp.into_response(),
             Err(err) => err.into_response(),
@@ -880,6 +944,154 @@ pub async fn create_policy(
     let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// `POST /api/governance/policies` as the router mounts it:
+/// [`create_policy`], plus a Change-history entry on the table the new
+/// policy binds, when its condition names one.
+///
+/// # Errors
+///
+/// Exactly [`create_policy`]'s.
+pub async fn create_policy_route(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+    let created = create_policy(State(state.clone()), body).await?;
+    let policy = &created.1.0;
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+    {
+        audit_table_change(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &cond.table,
+            "policy.create",
+            json!({ "name": policy.name }),
+        )
+        .await;
+    }
+    Ok(created)
+}
+
+/// Records a change to a policy in the audit trail: on the table its
+/// condition binds, where that table's asset page shows it in its Change
+/// history ([`audit_table_change`]) — or, for a policy that binds no
+/// table, on the policy itself. One event either way.
+async fn audit_policy_change(
+    state: &AppState,
+    actor: Option<&Principal>,
+    policy: &Policy,
+    action: &str,
+    args: Value,
+) {
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+    {
+        audit_table_change(state, actor, &cond.table, action, args).await;
+        return;
+    }
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    let _ = lakehouse_store::audit::insert(
+        pg,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: actor.map(|p| p.id.uuid().to_string()),
+            principal_kind: actor.map(|_| "user".to_owned()),
+            actor_label: actor.map(|p| p.display_name.clone()),
+            action: action.to_owned(),
+            resource_kind: Some("policy".to_owned()),
+            resource_id: Some(policy.id.clone()),
+            args: Some(args),
+            outcome: "executed".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+/// The `PUT /api/governance/policies/{id}/status` body.
+#[derive(Debug, Deserialize)]
+pub struct PolicyStatusBody {
+    status: String,
+}
+
+/// `PUT /api/governance/policies/{id}/status` — enforce a policy
+/// (`"ready"`) or stop enforcing it (`"draft"`). Until this route a policy
+/// kept the status it was created with for life: a draft could never be
+/// enforced, and an enforced one could never be stopped. It takes effect
+/// on the next query — obligations are read from the store each time.
+///
+/// # Errors
+///
+/// `400` for a malformed body or any other status; `404` when no policy
+/// has that id; 503/500 as above.
+pub async fn set_policy_status(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Policy>> {
+    let body: PolicyStatusBody = parse_body(&body)?;
+    if !matches!(body.status.as_str(), "ready" | "draft") {
+        return Err(ApiError::BadRequest(
+            "status must be \"ready\" (enforced) or \"draft\" (not enforced)".to_owned(),
+        )
+        .into());
+    }
+    let pool = pool(&state)?;
+    let before = governance::list_policies(pool)
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    let policy = governance::set_policy_status(pool, &id, &body.status)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    if before.status != policy.status {
+        let action = if policy.status == "ready" {
+            "policy.enforce"
+        } else {
+            "policy.suspend"
+        };
+        audit_policy_change(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &policy,
+            action,
+            json!({ "name": policy.name }),
+        )
+        .await;
+    }
+    Ok(ApiJson(policy))
+}
+
+/// `DELETE /api/governance/policies/{id}` — remove a policy. An enforced
+/// one stops masking and filtering from the next query on, which is why
+/// the audit event says whether it was (`enforced`).
+///
+/// # Errors
+///
+/// `404` when no policy has that id; 503/500 as above.
+pub async fn delete_policy(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let policy = governance::delete_policy(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    audit_policy_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &policy,
+        "policy.delete",
+        json!({ "name": policy.name, "enforced": policy.status == "ready" }),
+    )
+    .await;
+    Ok(ApiJson(json!({ "ok": true, "id": policy.id })))
 }
 
 /// The `POST /api/governance/policies/preview` body — a `table`/`mask`/
@@ -1204,6 +1416,7 @@ pub struct PutDatasetSlaBody {
 /// guarantee this mirrors, not the other way around. 503/500 as above.
 pub async fn put_sla(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<governance::DatasetSla>> {
     let body: PutDatasetSlaBody = parse_body(&body)?;
@@ -1220,6 +1433,14 @@ pub async fn put_sla(
         owner: body.owner,
     };
     let saved = governance::upsert_dataset_sla(pool(&state)?, &input).await?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &saved.table_name,
+        "catalog.sla_set",
+        json!({ "minutes": saved.expected_interval_minutes }),
+    )
+    .await;
     Ok(ApiJson(saved))
 }
 

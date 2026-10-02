@@ -160,11 +160,24 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
     };
     // Board id → how many of its charts read the asset, in first-seen order.
     let mut boards: Vec<(String, usize)> = Vec::new();
+    let mut count = |board: &str| match boards.iter_mut().find(|(id, _)| id == board) {
+        Some((_, n)) => *n += 1,
+        None => boards.push((board.to_owned(), 1)),
+    };
     for chart in charts.iter().filter(|c| reads_any(&c.spec.sql, tables)) {
-        match boards.iter_mut().find(|(id, _)| *id == chart.board) {
-            Some((_, n)) => *n += 1,
-            None => boards.push((chart.board.clone(), 1)),
-        }
+        count(&chart.board);
+    }
+    // The default dashboard also shows the charts and KPI tiles this
+    // deployment ships with (`lakehouse_bi::specs`), which are stored
+    // nowhere: they read the asset as much as a saved chart does.
+    let builtin = lakehouse_bi::specs::charts()
+        .iter()
+        .map(|c| c.sql.as_str())
+        .chain(lakehouse_bi::specs::kpis().iter().map(|k| k.sql.as_str()))
+        .filter(|sql| reads_any(sql, tables))
+        .count();
+    for _ in 0..builtin {
+        count(DEFAULT_BOARD);
     }
     if boards.is_empty() {
         return Vec::new();
@@ -188,6 +201,9 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
         })
         .collect()
 }
+
+/// The board every deployment has, with no row in `console.bi_board`.
+const DEFAULT_BOARD: &str = "default";
 
 /// The window [`usage`] looks back over.
 const USAGE_DAYS: i32 = 7;
@@ -278,6 +294,7 @@ const CHANGE_HISTORY_LIMIT: i64 = 50;
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
+    let arg = |key: &str| event.args.get(key).and_then(Value::as_str);
     let summary = match event.action.as_str() {
         "catalog.annotate" => {
             let fields: Vec<&str> = event
@@ -292,14 +309,70 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
                 format!("Edited {}", fields.join(", "))
             }
         }
-        "catalog.access_request" => event
+        "catalog.access_request" => arg("permission").map_or_else(
+            || "Requested access".to_owned(),
+            |permission| format!("Requested {permission}"),
+        ),
+        "catalog.classify" => format!(
+            "Classified {} as {}",
+            arg("column").map_or_else(|| "the asset".to_owned(), |c| format!("column {c}")),
+            arg("classification").unwrap_or("unspecified"),
+        ),
+        "catalog.sla_set" => event
             .args
-            .get("permission")
-            .and_then(Value::as_str)
+            .get("minutes")
+            .and_then(Value::as_i64)
             .map_or_else(
-                || "Requested access".to_owned(),
-                |permission| format!("Requested {permission}"),
+                || "Set a freshness target".to_owned(),
+                |minutes| format!("Set the freshness target to {}", span(minutes * 60)),
             ),
+        "quality.rule_create" => format!("Added quality rule {}", arg("name").unwrap_or("")),
+        "quality.rule_update" => {
+            // Only the parts the rewrite changed (`changed`), each with
+            // what it became.
+            let changed = |part: &str| {
+                event
+                    .args
+                    .get("changed")
+                    .and_then(Value::as_array)
+                    .is_some_and(|c| c.iter().any(|p| p.as_str() == Some(part)))
+            };
+            let parts: Vec<String> = [
+                ("threshold", "threshold to \""),
+                ("asset", "table to "),
+                ("severity", "severity to "),
+            ]
+            .into_iter()
+            .filter(|(part, _)| changed(part))
+            .filter_map(|(part, words)| {
+                let value = arg(part)?;
+                let quote = if part == "threshold" { "\"" } else { "" };
+                Some(format!("{words}{value}{quote}"))
+            })
+            .collect();
+            let name = arg("name").unwrap_or("");
+            if parts.is_empty() {
+                format!("Changed quality rule {name}")
+            } else {
+                format!("Changed quality rule {name}: {}", parts.join(", "))
+            }
+        }
+        "quality.rule_delete" => format!("Deleted quality rule {}", arg("name").unwrap_or("")),
+        "policy.create" => format!("Added policy {}", arg("name").unwrap_or("")),
+        "policy.enforce" => format!("Enforced policy {}", arg("name").unwrap_or("")),
+        "policy.suspend" => format!("Stopped enforcing policy {}", arg("name").unwrap_or("")),
+        "policy.delete" => {
+            let was_enforced = event.args.get("enforced").and_then(Value::as_bool) == Some(true);
+            format!(
+                "Deleted policy {}{}",
+                arg("name").unwrap_or(""),
+                if was_enforced {
+                    " (it was enforced)"
+                } else {
+                    ""
+                }
+            )
+        }
         other => other.to_owned(),
     };
     json!({
@@ -310,24 +383,33 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
             .clone()
             .or_else(|| event.principal_id.clone())
             .unwrap_or_else(|| "Unknown".to_owned()),
-        "summary": summary,
+        "summary": summary.trim_end(),
     })
 }
 
-/// What people did to the catalog asset `id`, newest first, from the audit
-/// trail (`resource_kind = "catalog"`): edits to its details and access
-/// requests. Loads are the Snapshots list's story, not this one's.
-pub(crate) async fn change_history(state: &AppState, id: &str) -> Vec<Value> {
+/// What people did to a catalog asset, newest first, from the audit trail
+/// (`resource_kind = "catalog"`): edits to its details, access requests,
+/// and the rules, classifications, policies and freshness targets added
+/// for it. `keys` is every id the asset is recorded under — its catalog
+/// id, and its table keys, which is what a rule names. Loads are the
+/// Snapshots list's story, not this one's.
+pub(crate) async fn change_history(state: &AppState, keys: &[String]) -> Vec<Value> {
     let Some(pg) = state.pg.as_deref() else {
         return Vec::new();
     };
-    let filter = lakehouse_store::audit::AuditFilter {
-        limit: CHANGE_HISTORY_LIMIT,
-        resource_kind: Some("catalog".to_owned()),
-        resource_id: Some(id.to_owned()),
-        ..Default::default()
-    };
-    match lakehouse_store::audit::list(pg, filter).await {
+    // A catalog id is recorded as written; a table key lower-cased
+    // (`routes::governance::audit_table_change`). Ask for both spellings.
+    let mut ids: Vec<String> = Vec::new();
+    for key in keys {
+        for id in [key.clone(), key.to_lowercase()] {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    match lakehouse_store::audit::list_for_resources(pg, "catalog", &ids, CHANGE_HISTORY_LIMIT)
+        .await
+    {
         Ok(events) => events.iter().map(change_entry).collect(),
         Err(err) => {
             tracing::warn!(?err, "catalog detail: change history unavailable");
@@ -412,6 +494,7 @@ fn rule_check(rule: &QualityRule, run: Option<&LatestRun>) -> Value {
     json!({
         "id": rule.id,
         "name": rule.name,
+        "asset": rule.asset,
         "dimension": rule.dimension,
         "threshold": rule.threshold,
         "severity": rule.severity,
@@ -968,6 +1051,93 @@ mod tests {
         // An older event recorded no permission.
         let bare = change_entry(&audit_event("catalog.access_request", json!({})));
         assert_eq!(bare["summary"], "Requested access");
+
+        // What was added for the asset's table, in the same list.
+        for (action, args, summary) in [
+            (
+                "catalog.classify",
+                json!({ "column": "email", "classification": "restricted" }),
+                "Classified column email as restricted",
+            ),
+            (
+                "catalog.classify",
+                json!({ "column": null, "classification": "public" }),
+                "Classified the asset as public",
+            ),
+            (
+                "catalog.sla_set",
+                json!({ "minutes": 2160 }),
+                "Set the freshness target to 36h 00m",
+            ),
+            (
+                "quality.rule_create",
+                json!({ "name": "orders_id_unique" }),
+                "Added quality rule orders_id_unique",
+            ),
+            (
+                "quality.rule_update",
+                json!({
+                    "name": "orders_id_unique",
+                    "changed": ["threshold", "severity"],
+                    "threshold": "order_id unique",
+                    "asset": "silver.orders",
+                    "severity": "high",
+                }),
+                "Changed quality rule orders_id_unique: threshold to \"order_id unique\", severity to high",
+            ),
+            (
+                "quality.rule_update",
+                json!({
+                    "name": "orders_id_unique",
+                    "changed": ["asset"],
+                    "threshold": "order_id unique",
+                    "asset": "silver.orders_clean",
+                    "severity": "high",
+                }),
+                "Changed quality rule orders_id_unique: table to silver.orders_clean",
+            ),
+            (
+                "quality.rule_update",
+                json!({ "name": "orders_id_unique", "threshold": "order_id unique" }),
+                "Changed quality rule orders_id_unique",
+            ),
+            (
+                "quality.rule_delete",
+                json!({ "name": "orders_id_unique" }),
+                "Deleted quality rule orders_id_unique",
+            ),
+            (
+                "policy.create",
+                json!({ "name": "mask-email" }),
+                "Added policy mask-email",
+            ),
+            (
+                "policy.enforce",
+                json!({ "name": "mask-email" }),
+                "Enforced policy mask-email",
+            ),
+            (
+                "policy.suspend",
+                json!({ "name": "mask-email" }),
+                "Stopped enforcing policy mask-email",
+            ),
+            (
+                "policy.delete",
+                json!({ "name": "mask-email", "enforced": true }),
+                "Deleted policy mask-email (it was enforced)",
+            ),
+            (
+                "policy.delete",
+                json!({ "name": "mask-email", "enforced": false }),
+                "Deleted policy mask-email",
+            ),
+        ] {
+            assert_eq!(
+                change_entry(&audit_event(action, args))["summary"],
+                summary,
+                "{action}"
+            );
+        }
     }
 
     fn rule(asset: &str, column: Option<&str>, level: &str) -> ClassificationRule {

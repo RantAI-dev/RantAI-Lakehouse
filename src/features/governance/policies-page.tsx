@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { useSearchParams } from "next/navigation"
 import { PlusIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
@@ -23,12 +24,23 @@ import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { governanceService } from "@/services"
 import type { Policy } from "@/services/contracts/governance"
+import { PolicyActions } from "./policy-actions"
 import { getPolicyColumns } from "./policy-columns"
 
 export function PoliciesPage() {
   const state = useService((s) => governanceService.listPolicies(s), [])
   const [selected, setSelected] = React.useState<Policy | null>(null)
   const tableUrlState = useTableUrlState()
+  // `?id=` is how an asset's Access tab links to one policy: open it once
+  // the list has it.
+  const linkedId = useSearchParams().get("id")
+  const opened = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    if (!linkedId || opened.current === linkedId || state.status !== "success") return
+    opened.current = linkedId
+    const linked = state.data?.find((p) => p.id === linkedId)
+    if (linked) setSelected(linked)
+  }, [linkedId, state.status, state.data])
 
   const columns = React.useMemo(
     () => getPolicyColumns({ onSelect: setSelected }),
@@ -139,6 +151,21 @@ export function PoliciesPage() {
                 },
               ]}
             />
+            <div className="flex flex-wrap gap-2">
+              <PolicyActions
+                policy={selected}
+                onChanged={(change) => {
+                  // The drawer shows the policy as it now stands; the list
+                  // catches up behind it.
+                  setSelected(
+                    change === "deleted"
+                      ? null
+                      : { ...selected, status: change === "enforced" ? "ready" : "draft" }
+                  )
+                  state.reload()
+                }}
+              />
+            </div>
           </>
         ) : null}
       </DetailDrawer>

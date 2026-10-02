@@ -262,6 +262,54 @@ pub async fn create_policy(pool: &PgPool, input: &CreatePolicyInput) -> Result<P
     Ok(row.into())
 }
 
+/// Set whether the policy `id` is enforced: `"ready"` enforces it,
+/// `"draft"` stops enforcing it. Returns the policy as it now reads — one
+/// version on when its status changed — or `None` when no policy has that
+/// id (including an id that is not a UUID at all).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the update fails — including a
+/// `status` the table's check constraint refuses.
+pub async fn set_policy_status(
+    pool: &PgPool,
+    id: &str,
+    status: &str,
+) -> Result<Option<Policy>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "UPDATE policy SET \
+           version = version + (status <> $2)::int, \
+           updated_at = CASE WHEN status <> $2 THEN now() ELSE updated_at END, \
+           status = $2 \
+         WHERE id = $1 RETURNING {POLICY_COLUMNS}"
+    );
+    let row: Option<PolicyRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(status)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(Policy::from))
+}
+
+/// Delete the policy `id`, returning it — so the caller can say what was
+/// removed, and whether it was being enforced — or `None` when no policy
+/// has that id (including an id that is not a UUID at all).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the delete fails.
+pub async fn delete_policy(pool: &PgPool, id: &str) -> Result<Option<Policy>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let sql = format!("DELETE FROM policy WHERE id = $1 RETURNING {POLICY_COLUMNS}");
+    let row: Option<PolicyRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    Ok(row.map(Policy::from))
+}
+
 // ── Quality rule (create only — see module doc comment) ────────────────
 
 /// An authored quality rule. Mirrors `QualityRule` in
@@ -363,6 +411,74 @@ pub async fn create_quality_rule(
     .fetch_one(pool)
     .await?;
     Ok(row.into())
+}
+
+/// What [`update_quality_rule`] changes of a rule. Its name stays: it is
+/// the rule's natural key, and what its changes are recorded under.
+#[derive(Debug, Clone)]
+pub struct UpdateQualityRuleInput {
+    /// The asset (table) the rule checks.
+    pub asset: String,
+    /// The threshold expression.
+    pub threshold: String,
+    /// Severity if the rule fails.
+    pub severity: String,
+    /// The quality dimension; `None` keeps the one it has.
+    pub dimension: Option<String>,
+}
+
+/// Rewrite the quality rule `id`, returning it as it now reads — or `None`
+/// when no rule has that id (including an id that is not a UUID at all).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the update fails.
+pub async fn update_quality_rule(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdateQualityRuleInput,
+) -> Result<Option<QualityRule>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let row: Option<QualityRuleRow> = sqlx::query_as(
+        "UPDATE quality_rule \
+         SET asset = $2, threshold = $3, severity = $4, dimension = COALESCE($5, dimension) \
+         WHERE id = $1 \
+         RETURNING id, name, asset, dimension, threshold, severity",
+    )
+    .bind(id)
+    .bind(&input.asset)
+    .bind(&input.threshold)
+    .bind(&input.severity)
+    .bind(input.dimension.as_deref())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(QualityRule::from))
+}
+
+/// Delete the quality rule `id`, returning it — so the caller can say what
+/// was removed — or `None` when no rule has that id (including an id that
+/// is not a UUID at all).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the delete fails.
+pub async fn delete_quality_rule(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<QualityRule>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let row: Option<QualityRuleRow> = sqlx::query_as(
+        "DELETE FROM quality_rule WHERE id = $1 \
+         RETURNING id, name, asset, dimension, threshold, severity",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(QualityRule::from))
 }
 
 // ── Classification rule (create only — see module doc comment) ─────────

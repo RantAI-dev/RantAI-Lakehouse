@@ -1288,7 +1288,12 @@ async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<Annotation
 /// annotation (`annotation`, what the edit form holds) and what the
 /// registry itself says (`registry`, what clearing a field falls back to),
 /// and the asset's `changeHistory` from the audit trail.
-async fn mark_annotation_and_history(state: &AppState, body: &mut Value, id: &str) {
+async fn mark_annotation_and_history(
+    state: &AppState,
+    body: &mut Value,
+    id: &str,
+    tables: &[String],
+) {
     let registry = json!({
         "owner": body.get("owner").cloned().unwrap_or(Value::Null),
         "description": body.get("description").cloned().unwrap_or(Value::Null),
@@ -1305,7 +1310,9 @@ async fn mark_annotation_and_history(state: &AppState, body: &mut Value, id: &st
     if let Some(annotation) = &annotation {
         apply_annotation(body, annotation);
     }
-    let history = catalog_governance::change_history(state, id).await;
+    let mut keys = vec![id.to_owned()];
+    keys.extend(tables.iter().cloned());
+    let history = catalog_governance::change_history(state, &keys).await;
     if let Some(o) = body.as_object_mut() {
         o.insert("registry".to_owned(), registry);
         o.insert(
@@ -1453,14 +1460,63 @@ async fn mark_governance(
 /// Tells the console what to put after `FROM` to query this asset in
 /// Query Studio (always `ClickHouse`, including an Iceberg table read
 /// through `Config::iceberg_query_db`). Absent when no readable table was
-/// found; the console then falls back to its own guess.
+/// found; the console then falls back to its own guess. `policyTable` is
+/// the name a policy must bind to for it to govern those reads.
 fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
     if let (Some(o), Some(source)) = (body.as_object_mut(), source) {
         o.insert(
             "queryTarget".to_owned(),
-            json!({ "engine": "clickhouse", "table": source.from }),
+            json!({
+                "engine": "clickhouse",
+                "table": source.from,
+                "policyTable": source.policy_key,
+            }),
         );
     }
+}
+
+/// How many sample rows the detail body itself carries.
+const DETAIL_SAMPLE_ROWS: u32 = 5;
+/// The most `GET /api/catalog/{id}/sample` returns: a look at the data,
+/// not an export — Query Studio is one click away for more.
+const SAMPLE_MAX_ROWS: u32 = 100;
+
+/// Query parameters accepted by `GET /api/catalog/{id}/sample`.
+#[derive(Debug, Deserialize)]
+pub struct SampleQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /api/catalog/{id}/sample?limit=N` — up to [`SAMPLE_MAX_ROWS`]
+/// sample rows of an asset, for a reader who wants more than the five the
+/// detail body carries. The same rows that reader could select in Query
+/// Studio: masked and row-filtered by [`governed_sample`], and gated by
+/// the same `query:read`.
+///
+/// # Errors
+///
+/// `404` when no asset has that id; `503` when the registry cannot be
+/// read.
+pub async fn sample(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<SampleQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Ok(ApiJson(
+            json!({ "rows": [], "supported": false, "reason": reason }),
+        ));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(DETAIL_SAMPLE_ROWS)
+        .clamp(1, SAMPLE_MAX_ROWS);
+    let source = super::catalog_profile::resolve_source(&state, &id).await?;
+    let (rows, _) = governed_sample(&state, &principal, source.as_ref(), limit).await;
+    Ok(ApiJson(json!({ "rows": rows, "limit": limit })))
 }
 
 /// Sample rows of `source` exactly as `principal` could read them in
@@ -1478,6 +1534,7 @@ async fn governed_sample(
     state: &AppState,
     principal: &Principal,
     source: Option<&ReadSource>,
+    limit: u32,
 ) -> (Vec<Value>, HashSet<String>) {
     let Some(source) = source else {
         return (Vec::new(), HashSet::new());
@@ -1498,7 +1555,7 @@ async fn governed_sample(
     if !principal.has(SAMPLE_PERMISSION) {
         return (Vec::new(), masked);
     }
-    let raw_sql = format!("SELECT * FROM {} LIMIT 5", source.from);
+    let raw_sql = format!("SELECT * FROM {} LIMIT {limit}", source.from);
     let sql = match crate::routes::query::rewrite_sql_for_principal(
         state,
         &raw_sql,
@@ -1570,7 +1627,8 @@ async fn clickhouse_asset_detail(
     let Ok(Some(source)) = catalog_source::clickhouse_source(ch, &db, &table).await else {
         return Err(not_found());
     };
-    let (sample, masked) = governed_sample(state, principal, Some(&source)).await;
+    let (sample, masked) =
+        governed_sample(state, principal, Some(&source), DETAIL_SAMPLE_ROWS).await;
     let schema: Vec<Value> = source
         .columns
         .iter()
@@ -1626,8 +1684,13 @@ async fn clickhouse_asset_detail(
         &[key.clone(), table.clone()],
     )
     .await;
-    mark_badges(state, &mut body, &[id.to_owned(), key, table.clone()]).await;
-    mark_annotation_and_history(state, &mut body, id).await;
+    mark_badges(
+        state,
+        &mut body,
+        &[id.to_owned(), key.clone(), table.clone()],
+    )
+    .await;
+    mark_annotation_and_history(state, &mut body, id, &[key]).await;
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
@@ -1696,7 +1759,8 @@ async fn bronze_asset_detail_body(
     let source = catalog_source::bronze_source(state, table)
         .await
         .unwrap_or_default();
-    let (sample, masked) = governed_sample(state, principal, source.as_ref()).await;
+    let (sample, masked) =
+        governed_sample(state, principal, source.as_ref(), DETAIL_SAMPLE_ROWS).await;
     // Declared types from whichever table was found; the registry's own
     // `tipe` otherwise (see the `data_type` fallback below).
     let type_of: HashMap<String, String> = source
@@ -1815,7 +1879,7 @@ async fn bronze_asset_detail_body(
     }
     mark_governance(state, principal, &mut body, &tables, &names).await;
     mark_badges(state, &mut body, &names).await;
-    mark_annotation_and_history(state, &mut body, slug).await;
+    mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
 }
 
@@ -3601,6 +3665,50 @@ mod tests {
             .await
             .expect("detail answers");
             response_json(resp).await
+        }
+
+        /// The larger sample goes through the same rewrite as the five rows
+        /// on the detail body, and never asks for more than the cap.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn sample_route_masks_rows_and_caps_the_limit(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Seeds the policy and mounts the mocks.
+            detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let ApiJson(body) = sample(
+                State(state),
+                Extension(analyst("catalog:read, query:read")),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+                Query(SampleQuery { limit: Some(5000) }),
+            )
+            .await
+            .expect("sample answers");
+
+            assert_eq!(body["limit"], json!(100));
+            assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
+            let requests = server.received_requests().await.expect("recorded");
+            let reads: Vec<String> = requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| b.contains("LIMIT 100"))
+                .collect();
+            assert!(
+                !reads.is_empty(),
+                "the sample must be read at the capped limit"
+            );
+            assert!(
+                reads.iter().all(|b| b.contains("replaceRegexpOne")),
+                "the sample must never reach ClickHouse unmasked"
+            );
+            Ok(())
         }
 
         /// The requests that read the asset's own rows: the sample's

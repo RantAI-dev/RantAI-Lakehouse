@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Tag } from "lucide-react"
+import { Check, Minus, Plus, Tag } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
@@ -16,14 +16,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
+import { PolicyActions } from "@/features/governance/policy-actions"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type { CreateClassificationRuleInput } from "@/services/contracts/governance"
+import type {
+  CreateClassificationRuleInput,
+  CreatePolicyInput,
+} from "@/services/contracts/governance"
 import { classificationTitle } from "./asset-badges"
 import { lineageKey } from "./asset-lineage"
 
@@ -231,7 +236,164 @@ function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onCha
   )
 }
 
-function PolicyItem({ p, canOpen }: { p: PolicySummary; canOpen: boolean }) {
+/**
+ * The table a policy must bind to govern this asset's rows: the one its
+ * reads actually go to (`queryTarget` — a Bronze dataset with a Silver
+ * model is read from Silver), named the way policies name tables.
+ */
+export function policyTable(a: AssetDetail): string {
+  if (a.queryTarget?.policyTable) return a.queryTarget.policyTable
+  const target = a.queryTarget?.table
+  if (!target) return lineageKey(a)
+  // An API build older than `policyTable`: icecat_api.`bronze.orders` and
+  // silver.`orders` both end in zone.table.
+  return target.replace(/`/g, "").split(".").slice(-2).join(".")
+}
+
+type PolicyForm = { roles: string; mask: string[]; rowFilter: string }
+
+/**
+ * The enforceable condition (`policy_engine::PolicyCondition`) the form
+ * describes, or `null` while it describes none: a policy needs a role,
+ * and at least one thing to do — a column to mask or a row filter.
+ */
+export function policyCondition(table: string, f: PolicyForm) {
+  const roles = f.roles
+    .split(",")
+    .map((r) => r.trim())
+    .filter((r) => r.length > 0)
+  const rowFilter = f.rowFilter.trim()
+  if (roles.length === 0 || (f.mask.length === 0 && rowFilter === "")) return null
+  return { roles, table, mask: f.mask, ...(rowFilter ? { rowFilter } : {}) }
+}
+
+/**
+ * Adds a masking / row-filter policy for this asset's table without
+ * leaving the page: the roles it applies to, the columns they see as
+ * `***`, and the rows they are limited to.
+ */
+function AddPolicyDialog({
+  asset: a,
+  onClose,
+  onSaved,
+}: {
+  asset: AssetDetail
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const table = policyTable(a)
+  const [form, setForm] = React.useState<PolicyForm>({ roles: "", mask: [], rowFilter: "" })
+  const [name, setName] = React.useState(`govern_${table.replace(".", "_")}`)
+  const [activate, setActivate] = React.useState(false)
+  const save = useServiceAction((signal, input: CreatePolicyInput) =>
+    governanceService.createPolicy(input, signal)
+  )
+  const condition = policyCondition(table, form)
+
+  function toggle(column: string) {
+    setForm((f) => ({
+      ...f,
+      mask: f.mask.includes(column) ? f.mask.filter((c) => c !== column) : [...f.mask, column],
+    }))
+  }
+
+  async function submit() {
+    if (!condition || !name.trim()) return
+    const saved = await save.run({
+      name: name.trim(),
+      kind: condition.mask.length > 0 ? "Column mask" : "Row filter",
+      subjects: condition.roles.join(", "),
+      resources: table,
+      effect: "Permit with obligation",
+      conditions: JSON.stringify(condition),
+      activate,
+    })
+    if (saved === null) return
+    notifySuccess(activate ? "Policy added and enforced" : "Policy saved as a draft")
+    onSaved()
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Add policy</DialogTitle>
+          <DialogDescription>
+            What the roles below may see of <span className="font-mono">{table}</span>.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-roles">Roles it applies to</Label>
+            <Input
+              id="policy-roles"
+              value={form.roles}
+              onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
+              placeholder="Analyst, Dashboard Viewer"
+            />
+          </div>
+          <fieldset className="grid gap-1.5">
+            <legend className="mb-1.5 text-sm font-medium">Columns to mask</legend>
+            <div className="flex max-h-40 flex-wrap gap-x-4 gap-y-1 overflow-y-auto">
+              {a.schema.map((c) => (
+                <label key={c.name} className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={form.mask.includes(c.name)}
+                    onChange={() => toggle(c.name)}
+                  />
+                  <span className="font-mono text-xs">{c.name}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-filter">Row filter (optional)</Label>
+            <Input
+              id="policy-filter"
+              value={form.rowFilter}
+              onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
+              placeholder="region = 'ID'"
+              className="font-mono"
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-name">Name</Label>
+            <Input id="policy-name" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={activate} onChange={(e) => setActivate(e.target.checked)} />
+            Enforce it now
+            <span className="text-xs text-muted-foreground">
+              — otherwise it is saved as a draft that changes nothing yet
+            </span>
+          </label>
+          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
+          <Button
+            size="sm"
+            onClick={() => void submit()}
+            disabled={!condition || !name.trim() || save.status === "pending"}
+          >
+            {save.status === "pending" ? "Saving…" : activate ? "Add and enforce" : "Save draft"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function PolicyItem({
+  p,
+  canOpen,
+  onChanged,
+}: {
+  p: PolicySummary
+  canOpen: boolean
+  onChanged: () => void
+}) {
   return (
     <li className="flex flex-col gap-1.5 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
@@ -251,6 +413,10 @@ function PolicyItem({ p, canOpen }: { p: PolicySummary; canOpen: boolean }) {
         ) : null}
         {p.appliesToYou ? <Pill tone="info">Applies to you</Pill> : null}
         <span className="ml-auto text-xs text-muted-foreground">{p.effect}</span>
+        <PolicyActions
+          policy={{ id: p.id, name: p.name, status: p.status ?? "draft" }}
+          onChanged={onChanged}
+        />
       </div>
       <dl className="grid gap-x-3 gap-y-1 text-xs sm:grid-cols-[max-content_1fr]">
         {p.table ? (
@@ -303,6 +469,7 @@ export function AssetAccess({
 }) {
   const { hasPermission } = useAuth()
   const canOpen = hasPermission("policy:read")
+  const [addingPolicy, setAddingPolicy] = React.useState(false)
 
   return (
     <div className="flex flex-col gap-2">
@@ -313,11 +480,19 @@ export function AssetAccess({
         title="Policies"
         description="Masking and row filters bound to this asset's tables."
         action={
-          canOpen ? (
-            <Button size="sm" variant="outline" render={<Link href="/governance/policies" />}>
-              Open policies
-            </Button>
-          ) : undefined
+          <div className="flex flex-wrap justify-end gap-1.5">
+            {hasPermission("policy:write") ? (
+              <Button size="sm" variant="outline" onClick={() => setAddingPolicy(true)}>
+                <Plus />
+                Add policy
+              </Button>
+            ) : null}
+            {canOpen ? (
+              <Button size="sm" variant="ghost" render={<Link href="/governance/policies" />}>
+                Open policies
+              </Button>
+            ) : null}
+          </div>
         }
       >
         {a.policySummary.length === 0 ? (
@@ -329,10 +504,20 @@ export function AssetAccess({
         ) : (
           <ul className="divide-y divide-border text-sm">
             {a.policySummary.map((p) => (
-              <PolicyItem key={p.id} p={p} canOpen={canOpen} />
+              <PolicyItem key={p.id} p={p} canOpen={canOpen} onChanged={onChanged} />
             ))}
           </ul>
         )}
+        {addingPolicy ? (
+          <AddPolicyDialog
+            asset={a}
+            onClose={() => setAddingPolicy(false)}
+            onSaved={() => {
+              setAddingPolicy(false)
+              onChanged()
+            }}
+          />
+        ) : null}
       </SectionCard>
     </div>
   )

@@ -1,7 +1,6 @@
 "use client"
 
 import * as React from "react"
-import Link from "next/link"
 import { usePathname, useSearchParams } from "next/navigation"
 import {
   Activity,
@@ -13,19 +12,7 @@ import {
   ShieldCheck,
   type LucideIcon,
 } from "lucide-react"
-import { EmptyState } from "@/components/patterns/page-states"
-import { SectionCard } from "@/components/patterns/section-card"
-import { Button } from "@/components/ui/button"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { assetQueryStudioHref } from "@/lib/asset-query"
 import { cn } from "@/lib/utils"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetAccess } from "./asset-access"
@@ -38,6 +25,7 @@ import {
 } from "./asset-lineage"
 import { AssetOverview, type AssetTab } from "./asset-overview"
 import { AssetQuality } from "./asset-quality"
+import { AssetSample } from "./asset-sample"
 import { AssetSchema } from "./asset-schema"
 import { useIcebergTable } from "./asset-storage"
 
@@ -158,7 +146,6 @@ export function AssetDetailTabs({
     if (t.left < s.left) strip.scrollLeft += t.left - s.left - 16
     else if (t.right > s.right) strip.scrollLeft += t.right - s.right + 16
   }, [tab])
-  const sampleColumns = Object.keys(a.sample[0] ?? {})
 
   const selectTab = React.useCallback(
     (next: AssetTab) => {
@@ -233,55 +220,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="sample">
-          <SectionCard
-            size="sm"
-            title="Sample rows"
-            description={
-              a.sample.length > 0
-                ? `The first ${a.sample.length} row${a.sample.length === 1 ? "" : "s"}, as you would read them: masking and row filters applied.`
-                : "Masking and row filters applied."
-            }
-            action={
-              <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a)} />}>
-                Open in Query Studio
-              </Button>
-            }
-          >
-            {a.sampleRestricted ? (
-              <EmptyState
-                title="Sample rows need query access"
-                description="Rows are data, so they require the query:read permission. Use Request access above to ask for it."
-                className="py-4"
-              />
-            ) : a.sample.length === 0 ? (
-              <EmptyState title="No sample rows available" className="py-4" />
-            ) : (
-              <div className="overflow-hidden rounded-lg border border-border">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="hover:bg-transparent">
-                      {sampleColumns.map((col) => (
-                        <TableHead key={col} className="font-mono text-xs font-medium">
-                          {col}
-                        </TableHead>
-                      ))}
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {a.sample.map((row, i) => (
-                      <TableRow key={i}>
-                        {sampleColumns.map((col) => (
-                          <TableCell key={col} className="py-1.5 font-mono text-xs">
-                            {row[col] ?? "—"}
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            )}
-          </SectionCard>
+          <AssetSample asset={a} />
         </TabsContent>
 
         <TabsContent value="quality">
@@ -297,7 +236,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="activity">
-          <AssetActivity asset={a} iceberg={iceberg} />
+          <AssetActivity asset={a} iceberg={iceberg} onChanged={onAssetChanged} />
         </TabsContent>
       </Tabs>
     </div>
