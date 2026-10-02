@@ -1467,6 +1467,308 @@ diff 0e0d24f HEAD -- rust`).
   good (T8 on a claim, not on an `ingested` row). That is the reviewer's rule;
   the feature page already says a name an upload asked for stays reserved.
 
+### Slice C — T7, T9 (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `e17d3ee`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited (scratch scripts and their output went to
+the session scratchpad). No `docker compose` and no cargo command was run, and no
+container of the running stack was touched: Docker was used only for throwaway
+`docker run --rm` containers of the existing `lakehouse-dagster-code-location`
+image, the worktree mounted read-only. No Rust, TypeScript or compose file is
+touched, and `adapters/sink.py` is unchanged (the plan's section 6 check: below).
+
+**Commits**
+
+- `6cb3351` feat(uploads): T7 the load job, one registration helper, and the
+  closed set of reasons (6 files, +1721/-417)
+- `c0fc23e` test(uploads): T9 acceptance gate for the upload path (1 file, +386)
+
+**What the job does**
+
+- *Run config.* The seven fields of slice B's handoff, all required. Declared as
+  an op `config_schema`, not as a `dagster.Config` class: with `from __future__
+  import annotations` Dagster cannot resolve a `Config` subclass from the op's
+  annotation (the sketch had no such import). `ingest_factory.py` and
+  `agent_runs.py` use the same form.
+- *Settings re-checked before anything is read.* Mode `replace` or `append`;
+  encoding `utf-8` or `utf-16`; delimiter one of `,` `;` tab `|`; header row 0
+  or more; upload id not empty; table name `^[a-z_][a-z0-9_]*$`, at most 128
+  characters, and a name dlt keeps (mismatch 3). Anything else fails with "The
+  load into the table failed.", the problem in the run log.
+- *Reading.* Decode as the preview does (`upload_parse::decode`): UTF-8 with a
+  byte order mark dropped; UTF-16 following its mark, little endian without one
+  (explicitly, not the platform's order), and a trailing odd byte dropped (the
+  README is silent on that one, the Rust is not); bad bytes become U+FFFD. Then
+  `csv.reader(io.StringIO(text, newline=""), delimiter=d)` with
+  `csv.field_size_limit` raised to `sys.maxsize` for the read and the write and
+  put back afterwards. `read_table` returns the header and the non-blank records
+  raw, and the tests assert it equals every one of the ten `.expected.json`.
+- *Whitespace.* Cells are stored exactly as parsed: nothing is trimmed. The
+  sketch stripped every value; that is gone. The README says cells are not
+  trimmed, the preview shows them untrimmed (what the person saw is what is
+  loaded), and ADR 0014 decision 4 says Bronze keeps what the source said. I
+  found no reason to trim that I can state: nothing the load does needs it, since
+  a record is blank by `str.isspace()` without the value being changed.
+  Whitespace decides two things only: whether a record is blank (skipped below
+  the header, never counted) and how a column is named (a header cell is trimmed
+  before its name is derived, as before).
+- *Short and long rows.* A row shorter than the header is padded with empty
+  strings; a longer one is cut to the header's length, which drops its extra
+  cells. The header index counts records, blank ones included (the SAP fixture's
+  is 4).
+- *Column names.* The sketch's rule, kept: ASCII letters and digits lower-cased,
+  every other character a separator, `__` collapsed, `_` trimmed, a blank cell
+  `col_<index>`, a leading digit gets `col_` in front, a repeat gets `_2`, `_3`.
+  Two defects fixed (mismatch 2); the old rule's names are unchanged for every
+  ASCII header it named without a collision (a test compares the two on 4000
+  random headers, more than 1000 of them collision-free).
+- *Row cap.* 2,000,000 data rows, counted in a first pass over the text before
+  anything is written, and a failure past it, never a truncation. The second
+  pass is a lazy generator over the same text, the only producer of rows, so a
+  file at the cap is never in memory as rows.
+- *Write.* Only `load_via_sink(resource, table, sink_config,
+  LoadPlan(mode=load_mode))`. The resource is a dlt resource over the lazy rows
+  with every column declared `text` (mismatch 1). A load with `has_failed_jobs`
+  is a failure, not a success with no count.
+- *Registration.* `connector_catalog.register_loaded_table`, the one helper both
+  callers use: total counted under `WHERE 1`, columns from `DESCRIBE` minus
+  `_dlt_*`, author `upload`. The description names the upload id and nothing
+  else: the catalog is shared across tenants, so not the tenant (it is in the
+  storage key) and not the file name.
+- *Outcome.* `record_ingest_run` once per run, after the outcome is known and
+  never retried (a second attempt after a failed insert could leave two rows):
+  `connector_id = upload:<id>`, `job = file_ingest_job`, `object = <table>`,
+  RFC 3339 UTC `started_at` and `ended_at`. Success: `succeeded`, the sink's
+  `rows` (NULL when it measured nothing, never the file's row count), empty
+  `error`. Failure: `failed`, `rows` NULL (or the sink's count when the data was
+  written and only the catalog entry failed), and an `error` from the closed set:
+
+  | Where it fails | Recorded |
+  | --- | --- |
+  | a key outside `uploads/` or with `..`; the read raises; decode or parse raises anything else | The stored file could not be read. |
+  | no record at the header row, or a header record with no cells | The header row is past the end of the file. |
+  | nothing below the header that is not blank | The file has no rows below the header row. |
+  | more than 2,000,000 data rows | The file has more than 2,000,000 rows. |
+  | a setting the API would not send; the sink config cannot be built; the sink raises or reports failed jobs; a bug in the module | The load into the table failed. |
+  | registration raises | The table was loaded but could not be registered in the catalog. |
+
+  If `record_ingest_run` itself raises, the run fails with `OutcomeNotRecorded`
+  and the API settles the upload as "The load stopped before it recorded a
+  result."
+
+  `LoadFailure` refuses any other sentence in its constructor, so no other text
+  can reach `ingest_run.error`; the six equal `ops/fixtures/
+  upload_load_failure_reasons.json` (a test reads the file) and the exception
+  text goes to the run log only (a test asserts the marker is in the log and
+  not in the row). The failure is re-raised after the row is written.
+- *No automatic retry.* `test_op_source_metadata` requires `DEFAULT_RETRY_POLICY`
+  on every op, so the op carries it; every failure leaves as `Failure(
+  allow_retries=False)`. Left to fire, the policy would record a row per attempt
+  (the plan says one per run) and an `append` that failed after it wrote would
+  add its rows again. "Try again" in the console is the retry.
+- *A1 and A2.* `ch_target`, `ensure_catalog_database` and `ch_exec` moved into
+  `connector_catalog.py` beside `register_loaded_table`; `ch_models.py` is
+  deleted (git history keeps it); `register_connector_table` keeps its
+  signature and is now the wrapper. The module docstring no longer says Bronze
+  is append-only.
+
+**Commands run, with counts**
+
+Per commit, scoped:
+
+- T7: `pytest dispar_orchestrate/test_file_ingest.py
+  dispar_orchestrate/test_connector_catalog.py`, in the image: 144 passed (125
+  new tests in the first file; 19 in the second, 14 of them new). The first run
+  had one failure, a test of mine that was wrong (it took a fourth record of a
+  four-record file for "past the end"); I fixed the test, not the code. The
+  whole orchestrator suite: before T7 `402 passed, 30 subtests passed in
+  11.18s`; after, `541 passed, 31 subtests passed in 12.81s`. The 31st subtest is
+  the new op in `test_every_op_carries_the_default_retry_policy`'s walk of every
+  registered op: `test_op_source_metadata.py` alone goes from 14 to 15 subtests
+  (measured on a `git archive` of `e17d3ee` and on the worktree), and the same
+  file checks the new op's `source_ref`, `commit` and `writes`.
+- T7 lints: `check_intra_package_imports.py` exit 0 (it was red on
+  `file_ingest.py:48` through slices A and B), `check_bare_iceberg_count.py` exit
+  0, `check_compose_init_readiness.py` exit 0. I also checked that
+  `check_bare_iceberg_count.py` still does not see the `count()` in
+  `connector_catalog.py` (the comment at the statement says so): with its `WHERE
+  1` removed in a scratch copy the lint stays green, so the rule is still kept
+  by hand there.
+- T7 import check: `docker run --rm --network none ... python -c "from
+  dispar_orchestrate.definitions import defs; print(sorted(j.name for j in
+  defs.resolve_all_job_defs()))"`: nine jobs, `file_ingest_job` among them (the
+  authored jobs are absent, as in slice A's check: the run tokens are unset in
+  that container).
+- T7 single-fault mutations, on a scratch copy of the tree, never the worktree:
+  30 (values trimmed; an unmeasured count replaced by the file's rows; no text
+  hints; the key guard without `..`; the csv limit not raised; the recorded
+  error is the exception text; the dlt table-name check gone; a trailing newline
+  accepted in a table name; the mode always replace; the failure retryable;
+  non-ASCII letters kept; suffix collisions allowed; the odd UTF-16 byte kept;
+  failed jobs ignored; the cap off by one; the storage key in the description; a
+  failed `record` swallowed; the sink's rows dropped on a registration failure;
+  rows held as a list; whitespace-only cells not blank; the failure constructor
+  accepting any text; a reason that differs from the shared file; the count
+  without `WHERE`; an unknown mode accepted; `ended_at` = `started_at`; blank
+  records not counted in the header index; a header with no cells accepted; the
+  UTF-8 mark kept; UTF-16 without a mark read big endian; registration skipped).
+  Each was run against `test_file_ingest.py`, `test_connector_catalog.py` and
+  `test_op_source_metadata.py`: **30 of 30 caught**. The retry one took 106 s,
+  Dagster waiting out its 30 s retry delay twice, which also shows the policy
+  does fire when `allow_retries=False` goes. The script is not committed.
+- T9: `python3 -m py_compile ops/g9/upload_test.py` and `python3
+  ops/g9/upload_test.py --help`: exit 0 (the `__pycache__` the first creates was
+  removed; `.gitignore` covers it). Run without `AUTH_BOOTSTRAP_*` it prints
+  `[g9] FAILED: set AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD...` and exits
+  1 before any request.
+
+Checks that are not in the repository (scripts in the scratchpad), all offline,
+on dlt 1.30.0 in the code-location image with `--network none`:
+
+- *The sink with plain generated rows (section 6).* `load_via_sink` over a
+  generator of dicts, the destination pointed at a local directory and dlt's
+  in-memory SQLite catalog (dlt's fallback when no catalog is configured):
+  `replace`, `replace`, `append` of 5, 3 and 4 rows gave a table of 7 rows, the
+  sink's `rows` 5, 3 and 4, snapshots `append`, `delete`, `append`, `append`. So
+  the sink needs no change for plain rows with `replace` or `append`.
+- *Types.* Same setup, plain rows: `2025-02-07T10:00:00Z` made the column
+  `timestamptz`, and the other values of that column went to a new `when__v_text`
+  column with NULLs left in `when`. With every column declared `text`: all values
+  back as written, `2025-02-07T10:00:00+07:00` included.
+- *Names.* `größe` was written as `gr_e`; `名前` and `値` both became `x` and dlt
+  logged "got normalized into x which collides with other column. Both columns
+  got merged into one".
+- *Table names.* 25 names the API's rule admits, written through the sink: 11 kept
+  (`plain`, `a__b`, `_x`, `a___b`, ...), 14 not (`x_` as `xx`, `__x` as `x`,
+  `s__1` as `s___1`, `__` failed); the sink's `rows` was NULL for each of the 13
+  that were renamed. `dlt.Schema(...).naming.normalize_tables_path(name) == name`
+  predicted all 25.
+- *The job end to end, offline.* `run_file_load` with its real code: the SAP
+  fixture (UTF-16, tab, header 4) `replace`, `replace`, `append`: 2, 2 and 4 rows,
+  four string columns, `0000100` kept; a hazard file (ISO timestamps mixed with
+  other text, leading zeros, non-ASCII, duplicate and blank headers, a quoted
+  line break, a short row, a long row, a 200,000-character cell) into one table,
+  every column `string`, every value as written, `rows` 5 measured; six runs, six
+  `ingest_run` calls. Only the object read, the catalog registration and the
+  `ingest_run` write were fakes.
+- *A replace with a different header* (`a,b` then `a,c`): the table has `a, b, c`,
+  and `b` reads NULL. dlt does not drop a column.
+- *Two single measurements, not budgets:* 300,000 rows of 8 text columns through
+  the real writer, offline: 30.3 s and a peak resident size of 449 MB. At the same
+  rate 2,000,000 rows would take about 200 s, which I did not run. The first pass
+  over 2,000,000 one-cell rows: 2.55 s.
+- *The gate against a stub.* A local stub of the routes, written from slice B's
+  handoff (not the API), on localhost: the gate passes, and five single faults (an
+  append that adds nothing, a failed load, a non-text column, lost leading zeros,
+  a missing `ingest_run` row) each end in `[g9] FAILED: ...` and exit 1. This
+  proves the script's own logic and nothing about the product.
+
+Final verification, once, in the foreground, on the final product commit
+`c0fc23e` (the handoff commit changes only this file):
+
+- The image command from the brief: `541 passed, 31 subtests passed in 13.01s`.
+- `python3 ops/lint/check_intra_package_imports.py` exit 0 ("all intra-package
+  dispar_orchestrate imports resolve"); `check_bare_iceberg_count.py` exit 0;
+  `check_compose_init_readiness.py` exit 0.
+- The import check above: exit 0, `file_ingest_job` registered.
+- `python3 -m py_compile ops/g9/upload_test.py && python3 ops/g9/upload_test.py
+  --help`: exit 0. `git status`: clean.
+
+**Not verified, or not run**
+
+- **A real load.** Nothing here touched RustFS, Lakekeeper's REST catalog,
+  ClickHouse or the running stack: the object read (`s3fs`) was run only against a
+  fake filesystem (the same construction `capacity_snapshot.py` and `adapters/
+  files.py` use against RustFS), the write only against a local directory, and
+  `register_loaded_table` and `record_ingest_run` only against fakes. Whether
+  ClickHouse's `DataLakeCatalog` shows a table dlt wrote through the REST catalog
+  under the names this job allows, and what `DESCRIBE` says for it, is what the
+  trial shows.
+- **The gate.** Never run against a deployed stack. In particular its SQL
+  (`count()` and `toTypeName(...)` under `WHERE 1`) has not been through the
+  query route's policy rewrite, and the ClickHouse type it expects (a name that
+  contains "String") is taken from `test_connector_catalog.py`'s sample `DESCRIBE`
+  output, not observed for an upload's table.
+- **Python 3.11**, which CI uses: no interpreter or image of it here. Everything
+  ran on 3.12.15 (the image). The code uses nothing newer than 3.9 that I know of.
+- **A launch through Dagster.** Only `execute_in_process` ran, with the run config
+  the API sends; not `launchRun` through the GraphQL API and the run launcher.
+- **The API's reading of the job's timestamps.** The job writes `ended_at` as
+  `datetime.now(timezone.utc).isoformat()`, for example
+  `2026-10-02T10:00:05.123456+00:00`, as slice B's handoff says the API accepts.
+  Its route tests write `Z` timestamps; I ran no Rust, so the `+00:00` form was not
+  put through `ended_after`.
+- **A file at the caps**: 2,000,000 rows or 50 MB through the job, on the stack.
+  No load of that size has been timed, so `UNKNOWN_RUN_BOUND` (one hour) is still
+  only a bound.
+- `gitleaks` is not installed here. I read the diff: no secret, host, port or
+  client name; the gate's defaults are the compose service hostname and the compose
+  default `icecat_api`, and it has no default credential.
+- Decoding invalid UTF-8 or UTF-16 beyond the fixtures was not compared with the
+  Rust `decode`: only the documented behaviours (marks, odd byte, replacement
+  character) are matched and tested.
+
+**Where the plan was wrong or silent against the code**
+
+1. **Plain rows are not all text.** T7 says "write through `load_via_sink(rows,
+   ...)`" and the feature page says every column is text. dlt 1.30.0 types
+   ISO-timestamp strings as `timestamptz` and splits a mixed column into
+   `<column>__v_text`. The sink takes an already configured resource, so the job
+   passes one with every column declared `text`: no sink change, and the decision
+   holds. A plan that wanted plain rows would have broken decision 6 for any file
+   with an ISO date-time column.
+2. **`_column_names` had two defects.** It kept non-ASCII letters, which dlt
+   rewrites and merges (silent loss of a column), and `a, a, a_2` became `a, a_2,
+   a_2`. The plan said to keep it; I kept its rule and fixed both. Non-ASCII
+   letters are separators now, so `Größe` is `gr_e`, the name dlt would have
+   written anyway.
+3. **The API's table-name rule admits names dlt writes under another name.**
+   `^[a-z_][a-z0-9_]*$` and 128 characters let `x_`, `__x`, `a__` and `s__1`
+   through; the load lands in `xx`, `x`, `a`, `s___1`, the sink reports no count
+   and registration of the requested name fails. The job refuses them before
+   reading, with dlt's own naming as the test. The user sees "The load into the
+   table failed." for a name the console accepted. The rule belongs in the
+   console's and the API's validation (T6, T10): see below.
+4. **One row per run against a retry policy every op must carry.** See "No
+   automatic retry" above; the plan did not mention the policy.
+5. **A reason the closed set lacks.** Two cases have no sentence of their own: a
+   header record with no cells (an empty line chosen as the header; the preview
+   returns an empty `columns` for it and for "past the end" alike, so it maps to
+   the header sentence), and a launch whose settings the API would not have sent
+   (maps to the generic load sentence). Both are in the table above.
+6. **`ch_models.py` goes entirely.** The plan's decision table and ADR 0014
+   ("`ch_models.py` stays: `connector_catalog.py` uses it") are stale after A1; I
+   did not edit the ADR.
+7. **`is_plain_table_name` uses `fullmatch`.** The shared regex was matched with
+   `$`, which also matches in front of a trailing newline, so `"orders\n"` passed
+   for a connector's target as well. One token, tested for both callers.
+8. **Noticed, not changed:** `ingest_factory._run_one_object` records `succeeded`
+   with `rows` NULL when `load_via_sink` returns `has_failed_jobs`, except on the
+   Postgres path, which raises. With dlt's default of raising on failed jobs this
+   may never happen: not measured. The upload job treats it as a failure.
+
+**For the planner to decide** (not mismatches)
+
+- The table-name rule: tightening it where the name is validated (the API's
+  `TABLE_NAME_RULE`, the console's `tableNameProblem`) to what dlt keeps would
+  turn mismatch 3 from a late generic failure into a message at the form. The
+  exact predicate is `dlt.Schema("x").naming.normalize_tables_path(name) ==
+  name`; a pattern that matches it needs thought, because `a__b` and `_x` are kept
+  and `__x`, `x_`, `a__` and `s__1` are not.
+- Whether the two missing reasons deserve sentences (a header with no cells; a
+  setting refused), which means the JSON file, the API's constants and its test.
+- `replace` keeps the columns of earlier loads: loading a file with other column
+  names into a table leaves the old ones, all NULL. dlt does not drop a column.
+  The feature page's "Limits to tell a customer" does not say so.
+- After "The table was loaded but could not be registered in the catalog.", the
+  data is in the table. "Try again" with `append` would add the rows a second
+  time; T11's Failed state should not offer a blind `append` retry for that reason.
+- `file_ingest_job` now shows in Dagster and in the Pipelines list as a job that
+  has never run and has no schedule.
+- The gate calls `GET /api/governance/ingest-runs`, which has no tenant filter
+  (section 5 of the plan says that is for its own change) and needs
+  `connector:manage`.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
