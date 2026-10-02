@@ -1807,6 +1807,230 @@ Final verification, once, in the foreground, on the final product commit
   (section 5 of the plan says that is for its own change) and needs
   `connector:manage`.
 
+### Slice C, fixes — T7a (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `fe2335c`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited (scratch scripts and their output went to
+the session scratchpad). No `docker compose` was run and no container of the
+running stack was touched. Docker was used for throwaway `docker run --rm`
+containers of the existing `lakehouse-dagster-code-location` image, the
+worktree mounted read-only, and, to find out why one test run failed (below),
+for read-only `docker ps`, `docker inspect` and `docker exec` calls (`df -h
+/dev/shm`, and `select` statements on `pg_database`). The `exec` calls went to
+every `postgres:16-alpine` container `docker ps` listed, to find the shared test
+one: six testcontainers ones (the shared test one is one of them) and
+`pos-postgres`, which belongs to another project. Nothing in any of them was
+written, restarted, dropped or pruned. `adapters/sink.py`,
+`connector_catalog.py` and `ops/g9/upload_test.py` are unchanged.
+
+**Commit**
+
+- `51221cb` fix(uploads): T7a a table-name rule the writer keeps, a seventh
+  reason, and the timestamp form (5 files, +396/-61: `routes/uploads.rs`,
+  `tests/upload_routes.rs`, `file_ingest.py`, `test_file_ingest.py`,
+  `ops/fixtures/upload_load_failure_reasons.json`)
+
+**The sentences, as built**
+
+- The table-name sentence (the API's `TABLE_NAME_RULE`, pinned in a unit test
+  and in the route test):
+  `Table names start with a lower-case letter and use lower-case letters and
+  digits joined by single underscores, with at most 128 characters.`
+- The seven reasons, in the order of the JSON file, the API's
+  `JOB_FAILURE_REASONS` and the job's `FAILURE_REASONS`. The new one is third:
+  the brief put it after "past the end", so it is the seventh by count and the
+  third by place, and both sides compare the list with the file in order.
+
+  1. The stored file could not be read.
+  2. The header row is past the end of the file.
+  3. The header row has no columns.
+  4. The file has no rows below the header row.
+  5. The file has more than 2,000,000 rows.
+  6. The load into the table failed.
+  7. The table was loaded but could not be registered in the catalog.
+
+**What was done, per finding**
+
+- **C1.** The rule is `^[a-z][a-z0-9]*(_[a-z0-9]+)*$` and at most 128
+  characters.
+  - *API.* `table_name_problem` reads the name a character at a time, left to
+    right (the crate has no regex dependency, and I added none). The shared
+    `Ident` check and its import are gone: every name the rule admits already
+    is an `Ident` (ASCII letters, digits and `_`, no leading digit), so it
+    added no guarantee; the doc comment says so. I grepped for an existing
+    predicate first (`cdc.rs`, `connector_secret_store.rs`, `catalog.rs`,
+    `lakehouse.rs`): each has its own rule, none this one.
+  - *Job.* `TABLE_NAME = re.compile(...)` with `fullmatch`, then the length,
+    then `_dlt_keeps_table_name` as the `elif` behind it. The job no longer
+    imports `is_plain_table_name`; `register_loaded_table` still calls it on
+    the table it interpolates into SQL, and every name the new pattern admits
+    passes it. `connector_catalog.py` and the connector targets' rule are not
+    touched.
+  - *Tests.* API: the plan's names through `table_name_problem` and through
+    `parse_ingest_request` (refused: `x_`, `_x`, `a__b`, `1a`, `Orders`, 129
+    characters; accepted: `a`, `a1`, `a_1`, `sap_material_master`, 128
+    characters), `_staging` moved from accepted to refused, and the route test
+    `an_invalid_ingest_body_is_400_and_asks_nobody` carries the new sentence and
+    five more refusals. Job: the same names; 22 refused names, each of which
+    must fail with dlt not asked and the pattern named in the cause; the guard
+    behind the pattern driven by a dlt that renames; the guard's answers for
+    the names dlt keeps and the ones it renames; and an enumeration (below).
+- **C2.** `parse_file` raises `HEADER_NO_COLUMNS` for a record at the header
+  row with no cells; `read_table` still raises "past the end" for no record at
+  that index. The tests that count or list the reasons: Rust
+  `the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture` (7),
+  `no_message_names_a_host_a_path_or_a_driver`,
+  `the_messages_the_plan_words_are_the_plans_words` and the near-miss texts of
+  `a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows`; Python a new
+  count test, the header tests, the unloadable-file parameters and the
+  one-row-per-failure scenarios. The route test file only had the number in a
+  comment. The slice C entry above is history: its table of reasons and its
+  mismatch 5 put an empty header under "past the end"; that is no longer so.
+- **C3.** `a_timestamp_the_job_writes_is_read_to_the_microsecond` in
+  `routes/uploads.rs`. `ended_after` reads the form (below); it needed no fix.
+
+**Commands run, with counts**
+
+Measured for this task (scratch scripts in the session scratchpad, offline,
+dlt 1.30.0 in the code-location image; none is committed except as the tests
+named):
+
+- *dlt's naming over names the rule admits.* `normalize_tables_path(name) ==
+  name` over every string of a bounded length on a small alphabet: `a1_` up to
+  9 characters, 29,523 strings, 3,861 match the rule, dlt changed 0 of them
+  (the old rule's extra names: 15,821, of which dlt changed 10,663); `ab12_` up
+  to 7, 97,655 strings, 27,282 match, 0 changed (31,311 extra, 17,151 changed);
+  `az09_` up to 6, 19,530 strings, 5,650 match, 0 changed (6,068 extra, 3,308
+  changed). This agrees with the reviewer's 59,052 and is the test
+  `test_no_short_name_the_upload_rule_admits_is_renamed_by_dlt` (the first
+  alphabet, 3,861).
+- *The Rust predicate against the Python pattern.* The text of
+  `table_name_problem` was extracted from `uploads.rs` with `sed` and compiled
+  alone with `rustc` (1.98.1, the machine's default toolchain, not the
+  workspace's 1.96.1; no cargo), and run over 597,878 strings (every string up
+  to 6 characters over `a z Z 0 _ - space é newline`, and seven names around the
+  128/129 bound). The Python pattern with its length bound, imported from the
+  worktree's `file_ingest`, gave the identical set: 1,763 accepted by each.
+- *Python single-fault mutants,* on a scratch copy, never the worktree: 15
+  (leading `_` allowed; doubled or trailing `_` allowed; leading digit allowed;
+  upper-case first letter allowed; no length bound; bound off by one; the dlt
+  guard removed; dlt asked before the pattern; `match` for `fullmatch`; the job
+  back on the connector rule; an empty header back under "past the end"; the
+  new reason missing from `FAILURE_REASONS`, missing from the JSON, with other
+  text, or in another place in the tuple). Each was run against
+  `test_file_ingest.py` (159 passed unmutated): **15 of 15 caught.** The first
+  run of the script was invalid (no network in the container, so no pytest, and
+  my success test read that as a pass); I fixed the script to refuse any output
+  that is not a pytest result and ran it again. No Rust mutation was run: a
+  rebuild per mutant is what the brief rules out, and the function was compared
+  with the regex exhaustively instead.
+- *The timestamp form.* `datetime(2026, 10, 2, 10, 0, 0, 123456,
+  tzinfo=timezone.utc).isoformat()` is `2026-10-02T10:00:00.123456+00:00` and
+  with microsecond 0 `2026-10-02T10:00:05+00:00`, printed by Python 3.12.3 on
+  the host. `ended_at` is a `String` column in `_INGEST_RUN_SCHEMA` and the API
+  reads it with `str_col`, so these are the characters it receives.
+
+Per step, scoped: `cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api
+--all-targets -- -D warnings` exit 0; `cargo test -p lakehouse-api --bin
+lakehouse-api routes::uploads` 28 passed (26 before); `cargo test -p
+lakehouse-api --test upload_routes` 66 passed.
+
+Final verification, once, in the foreground, on the final commit `51221cb`:
+
+- `cd rust && cargo fmt --check && cargo clippy --workspace --all-targets
+  --all-features -- -D warnings && cargo test --workspace`: exit 0 (fmt, clippy
+  and test). 79 `test result:` lines (65 test binaries and 14 doc-test targets),
+  summed **3377 passed, 0 failed, 8 ignored** (3373 before; the four are my two
+  new unit tests, each built and run in both the lib and the bin target of
+  `lakehouse-api`). The 8 ignored are the same eight as before.
+- The image command from the brief: `575 passed, 31 subtests passed in 12.53s`
+  (541 before).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`
+  and `check_compose_init_readiness.py`: exit 0 each.
+  `python3 -m py_compile ops/g9/upload_test.py`: exit 0, and the `__pycache__` it
+  makes was removed. `git status`: clean.
+- The code location imports with nine jobs, `file_ingest_job` among them
+  (`--network none`, run tokens unset, so the authored jobs are absent, as in
+  slice C's check). That one ran on the first version of the commit, `7d91651`,
+  whose `file_ingest.py` is byte for byte the final one.
+
+**A failed run, and why it is not a failure of this change.** The first
+`cargo test --workspace`, on `7d91651` (the same Rust and `file_ingest.py`
+bytes as `51221cb`; the amend only added five names to a Python test), exited
+101 at `-p lakehouse-api --test lakehouse_maintenance`: 5 failed, each a 401
+where a 400, 403 or 200 was expected. Run alone straight after, the same
+binary failed on `connect to the fresh per-test database: ... could not resize
+shared memory segment ... to 33554432 bytes: No space left on device`, which is
+the shared testcontainers Postgres (label
+`org.rantai.lakehouse-test-support=postgres-16`, 64 MB of `/dev/shm`, 1,046
+databases when I looked). A few minutes later, with that container idle
+(`/dev/shm` 1.0M of 64M used) and nothing changed, the binary alone passed
+(5 passed), and the whole workspace run passed (the numbers above, and again
+on `51221cb`). The binary does not touch uploads. I did not observe the cause
+of the 401s. The shared-memory error is the likely one: `auth.rs`'s extractor
+answers the same 401 for any error from the session lookup, a database error
+included (`if let Ok(principal) = auth.session.authenticate(..)`, else
+`unauthenticated()`). That is a reading of the code, not a proof. I did not
+drop databases or restart the container, as the brief forbids. Every
+`spin_up()` in `tests/common/mod.rs` runs `CREATE DATABASE` and that file has no
+`DROP DATABASE`: the container held 1,046 databases when I first looked and
+1,499 after my own runs (1,423 named `lakehouse_api_test_*`, one `_sqlx_test*`),
+so each full workspace run adds a few hundred, mine included.
+
+**Not verified, or not run**
+
+- Everything the plan keeps for the trial: a real load, the gate on a deployed
+  stack, and Python 3.11 (CI's; everything here ran on 3.12).
+- That a live ClickHouse returns `ended_at` as the same characters the job
+  inserted. The test pins `ended_after` on the characters Python writes; that
+  the column is a `String` and that `str_col` copies it is read from the code.
+- The console. T10's `tableNameProblem` does not exist yet and must say the
+  same sentence (the doc comment on `TABLE_NAME_RULE` says so), and
+  `suggestTableName` must only suggest names that pass the rule.
+- Any Rust mutation (above).
+
+**Where the plan was wrong or silent against the code**
+
+1. **C3 says nothing pins the form; one test did.** The route tests do write
+   only `Z`, but `a_result_counts_only_when_it_ended_after_the_claim` in
+   `routes/uploads.rs` (since T6, `d05ef0f`) already gave `ended_after` the
+   `+00:00` form with and without microseconds, later and not later. What it
+   did not pin is the order within one second to the microsecond (a version
+   that cut the fraction off would pass it), and the exact strings Python
+   writes. The new test adds those. `ended_after` reads the form: there was no
+   defect and I changed nothing in it.
+2. **Section 7's test command no longer works for this module.** It mounts only
+   `dagster/`; `test_file_ingest.py` reads `ops/fixtures/` from two levels above
+   the package, so it stops at collection ("the fixture directory is missing").
+   Measured with that exact mount. The command in the brief, with the whole
+   worktree at `/work`, is the one that works, and the one I ran.
+3. **The slice C entry's list of reasons is out of date,** as said under C2.
+   Its other missing reason (a setting the API would not have sent) still has no
+   sentence of its own and is recorded as "The load into the table failed."; T7a
+   did not ask for one.
+4. **`_staging` was an accepted name in an existing test.** A consequence, not
+   an error: `_staging` and every other name that starts or ends with `_` or
+   has `__` in it now fails with the new sentence. Nothing is deployed, so no
+   upload table made under the earlier rule should exist; a development
+   database used for hand tests might hold one, and could not load into it
+   again by that name.
+
+**For the planner to decide**
+
+- The feature page states the rule without its bound ("starts with a
+  lower-case letter and uses lower-case letters and digits joined by single
+  underscores"); the API's sentence adds "with at most 128 characters". T12 may
+  want the page to say it too.
+- `_dlt_keeps_table_name` builds a `dlt.Schema` on every call, about 1.5 ms (a
+  loop of 3,861 calls took 5.7 s). That is nothing once per run; the
+  enumeration test builds the naming once instead. I left the function as it
+  is.
+- The shared test Postgres accumulates one database per `spin_up()` and the
+  harness never drops them (see the failed run; 1,499 now). It is not this
+  plan's, but the shared-memory failure may come back for anyone running the
+  workspace suite, and someone with the standing to do it may want to drop the
+  old `lakehouse_api_test_*` databases. I did not.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
