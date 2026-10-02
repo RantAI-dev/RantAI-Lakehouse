@@ -366,6 +366,146 @@ Environment notes for the reviewer:
   hunk staged from this file for the handoff commit is the one you are
   reading.
 
+### PR slice B — T2–T5 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-b` off `main` (slice A's `6e46c9f`
+merged as PR #60 before this branch was cut). Four commits, one per task:
+
+- `b74c7e5` — T2. Migration `0054_gold_publication.sql` (why-header; the
+  columns exactly as specced, missing row = off);
+  `lakehouse-store/src/gold_publication.rs` (`get`/`list_enabled`/`upsert`,
+  `StoreError` classification as in `pipelines.rs`, `# Errors` on every
+  `Result` fn, values bound); registered in `store`'s `lib.rs`; tests in
+  `lakehouse-store/tests/gold_publication.rs` via `sqlx::test` covering
+  unknown-mart `None`, insert-then-in-place-flip, and list-only-enabled
+  (insert, flip, list: the "unknown returns None" accept is covered).
+- `44bdfb3` — T3. The three routes exactly as the table specifies
+  (policies, shapes, `404` on unknown mart, `PUT` off only flips the flag
+  — no Iceberg call), reusing `mart_exists` for the existing-mart check
+  (rule 4: no second validator); `lastChangedAt` from
+  `max(modification_time)` over active parts (null when parts = 0),
+  `lastExportedAt` from the newest `success` row (new
+  `gold_export_history::last_success_started_at`; null if none), `canEdit`
+  from the caller's `gold:export`. Toggles recorded through the existing
+  `lakehouse-store` audit writer (`store_audit::insert`,
+  action `gold.publication_set`, resource kind `gold_mart`) — no new audit
+  mechanism. Routes in `POLICY_TABLE` (both-ways assertions come from
+  `tests/route_auth.rs`'s existing loops over the table). New dev-deps
+  `testcontainers` 0.27 / `testcontainers-modules` 0.15 (clickhouse
+  feature) on `lakehouse-api` only, for route tests against a real
+  ClickHouse 26.8 (the freshness query cannot be faked on a stub);
+  5 tests in `tests/gold_publication.rs`, one shared container per binary
+  because `gold_export_history`'s ensure-table `OnceCell` assumes one CH
+  per process.
+- `2623f07` — T4. `?ifChanged=true` per spec: skip only when both
+  timestamps are known and `lastChangedAt <= lastExportedAt`; either null
+  exports; a skip is `200 {"skipped": true, "reason": "unchanged since
+  <rfc3339>"}` and writes **no** `console.gold_export_run` row, commits no
+  snapshot, and never takes the single-flight lock; boolean parsed with
+  `== "true"`; the freshness reads run only when the parameter is set, so
+  the manual path gains no queries. Skip decision extracted as a pure fn
+  (3 unit tests); the export handler's history-write block moved into a
+  `record_export_history` helper to satisfy the function-length lint,
+  behavior unchanged. Route tests cover skip (history count unchanged),
+  export-when-newer, and export-when-unknown (both stop deterministically
+  at the unprovisioned Lakekeeper token — 503, past the skip gate,
+  nothing recorded).
+- `21a787d` — T5. `list_gold_marts` unions
+  `GET /api/gold/publications` (same two-header credential as the POST,
+  `timeout=`, `raise_for_status()`) with `GOLD_EXPORT_MARTS`, dedup by
+  exact mart name (a mart in both sources is one step); two distinct
+  marts sanitizing to one step key still `Failure(allow_retries=False)`
+  with both names and origins. Env default now empty in code, compose,
+  and `.env.example`; compose comment explains the console owns the list
+  and the env is an override. `export_one_mart` sends `ifChanged=true`; a
+  skipped answer records `skipped_verbs=["unchanged"]` and emits no
+  `AssetMaterialization`. A failed fetch raises bare (retryable); a
+  malformed body is non-retryable `Failure`. `source_metadata` `reads`
+  updated on the fan-out op. Gate runner checked, not edited:
+  `ops/gold_export/gold_export_test.py` POSTs its own `GOLD_MART_NAME`
+  directly and never reads `GOLD_EXPORT_MARTS` (section-6 item 4).
+
+Verification — every command run in the foreground on `21a787d`, fresh
+build, counts quoted from the run:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — pass, no warnings.
+- `cd rust && cargo test --workspace` — 78 suites, all `ok`: **2831
+  passed, 0 failed, 2 ignored**. Full log kept at
+  `/tmp/opencode/t5-workspace-test.log`. Caveat, said plainly: one
+  earlier workspace run had 5 `lakehouse-auth` JWKS unit tests fail
+  (port/time flake under parallel load, 39s binary); `lakehouse-auth
+  --lib` passed 51/51 immediately after, and two consecutive full
+  workspace runs on the final commit were fully green — the failure did
+  not reproduce and is not in this slice's code.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375
+  passed, 30 subtests passed, 0 failed** (218 warnings, all the known
+  `kafka-python` deprecations, none from touched files).
+- `docker compose --profile '*' config --quiet` — pass.
+- Rule 8, on the compose edit: `GIT_SHA=$(git rev-parse HEAD) docker
+  compose -p t5proof --profile dagster up -d --build dagster-code-location
+  dagster-webserver dagster-daemon` from a clean project — every init
+  container `Exited (0)`, the code server loaded
+  `dispar_orchestrate.definitions`, `GOLD_EXPORT_MARTS=""` in the
+  code-location container env, and the webserver's GraphQL listed
+  `gold_export_job_schedule` with status `RUNNING`; `down -v` removed the
+  project afterwards.
+
+Section-6 answers:
+
+- **`0054` free:** `rust/migrations` contained no `0054_*` before
+  `b74c7e5`; the only branches on this remote checkout are `main` and
+  this one. Other workspaces cutting from `origin/main` are out of this
+  machine's sight — the migration lands with its consumer in this same
+  PR, so exposure is one merge window.
+- **Empty fan-out finishes:** proven by
+  `test_nothing_enabled_and_no_override_runs_a_successful_zero_step_job`
+  (`execute_in_process`, Dagster **1.13.20** as installed in
+  `~/.cache/rantai-dagster-venv`): run succeeds, zero
+  `export_gold_mart[*]` steps, `export_one_mart` never called,
+  `summarize_gold_export` succeeds with `marts_exported: 0`.
+- **`modification_time` moves for this repo's writers:** measured, not
+  assumed, against the compose ClickHouse (`clickhouse-server:26.8`)
+  image, fresh container. This repo's pipelines append Gold marts with
+  plain `INSERT INTO {zone}.\`{table}\` {select_sql}`
+  (`authored_factory.py`'s writer), into schema-on-write
+  `MergeTree ORDER BY tuple() AS ... LIMIT 0`. Measured sequence:
+  create + insert → `max(modification_time)` = write time, 1 active
+  part; second insert → moves forward, 2 parts; **zero-row INSERT →
+  does not move** (ClickHouse creates no part for an empty insert) and
+  row count unchanged — so a rewrite that produces zero rows is
+  indistinguishable from no rewrite, which is fine: no data changed, so
+  "unchanged" is the true answer. Caveat for the reviewer: background
+  MergeTree merges also advance `max(modification_time)` (a merge writes
+  a new part stamped with the merge time) — the error direction is a
+  spurious "changed" → one extra export, never a missed one.
+- **Nothing else relied on the old default:** repo-wide grep for
+  `GOLD_EXPORT_MARTS` hits only `gold_export.py` (override), compose
+  (now `:-`), `.env.example` (now empty), and the new tests. The gate
+  runner uses `GOLD_MART_NAME`. Compose change proven by the `up` above,
+  not by `config` alone.
+
+Not run, with reason: `bun run typecheck/lint/test` — slice B touches no
+TypeScript (AGENTS.md: only the lines for the languages the PR touched;
+T7–T8 are slice D). Nothing else skipped; no claim above is *not
+verified*.
+
+Environment notes for the reviewer:
+
+- The ClickHouse testcontainer needs the compose env trio
+  (`CLICKHOUSE_USER=default`, `CLICKHOUSE_PASSWORD=` empty,
+  `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`, tag `26.8`): the 26.8
+  entrypoint disables network access for `default` when `CLICKHOUSE_USER`
+  is unset even with an empty password, and the container handle must be
+  held for the binary's lifetime or it stops mid-test.
+- Axum handler ordering: the `Json` body extractor must be the LAST
+  argument (PUT route); `ApiResult`'s error type is `ApiRejection`, so a
+  direct `Err(ApiError::x())` needs `.into()`.
+
+
 ## 8. Review (planner appends findings per PR)
 
 ### PR slice A — T1 (reviewer, 2026-10-02)
