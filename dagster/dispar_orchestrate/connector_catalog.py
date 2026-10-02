@@ -32,7 +32,9 @@ from dispar_orchestrate import ch_models
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, register_bronze_table
 
 # This job's own `DataLakeCatalog` database, separate from every other
-# job's for the reason `silver_transform.py` gives for its own.
+# job's (`maintenance.py` keeps `icecat_maintenance` the same way), so
+# registering a table never depends on another job having created a
+# database first.
 CATALOG_DB = "icecat_ingest"
 
 # `sourceObjects[].target` is stored unvalidated server-side (the console

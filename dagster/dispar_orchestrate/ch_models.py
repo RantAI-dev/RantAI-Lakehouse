@@ -8,8 +8,7 @@ scheduling, logging and run history, not a bespoke job each.
 So a transform here is **data, not code**: one [`Model`] entry names its
 target table, its engine, and the `SELECT` that fills it. One job runs a
 whole list of them in order. Adding a mart is adding an entry — not
-copying a 180-line module and changing twelve lines of it, which is what
-`silver_transform.py` would have you do a second time.
+copying a job module and changing a dozen lines of it.
 
 This is deliberately the same shape a model-definition TABLE would have
 (see the `pipeline_definition` gap discussed in the console's Pipelines
@@ -24,8 +23,8 @@ TABLE … AS SELECT`. For an aggregate mart over a few million Silver rows
 that costs seconds, and it is *correct by construction*: an incrementally
 maintained aggregate has to reason about late-arriving rows, restatements
 and the `ReplacingMergeTree` versions its source still carries
-un-collapsed. Incremental loading belongs one layer down, where
-`silver_transform.py` does it on a real `_ingested_at` watermark.
+un-collapsed. Incremental loading belongs one layer down, on a real
+`_ingested_at` watermark.
 
 `CREATE OR REPLACE` is atomic on ClickHouse's default `Atomic` database
 engine: readers see either the old table or the new one, never a
