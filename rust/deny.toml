@@ -122,6 +122,14 @@ name = "lakehouse-store"
 allow = ["AGPL-3.0-or-later"]
 name = "lakehouse-test-support"
 
+# `lakehouse-trino` (14th first-party crate, added after the 13 above
+# were enumerated — SEC-8 S3). Same reasoning as the others: AGPL is
+# our own outbound license (CHANGELOG D4/2025-04 relicensing), accepted
+# only for workspace crates, never for third-party dependencies.
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-trino"
+
 [bans]
 multiple-versions = "allow"
 wildcards = "allow"
