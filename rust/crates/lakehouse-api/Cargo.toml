@@ -109,7 +109,10 @@ object_store = { version = "0.14", features = ["aws"] }
 # happen in one place at a time.
 arrow-array = "58"
 arrow-schema = "58"
-tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
+# rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
+# the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
