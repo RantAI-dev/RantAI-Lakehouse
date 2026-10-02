@@ -213,12 +213,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setRecords({ ...rows, value, loading: false });
   }, []);
 
-  // Open /dashboards (demo) → jump straight to the newest user dashboard if one exists.
-  React.useEffect(() => {
-    if (data && isDefault && data.boards.length > 1) {
-      router.replace(`/dashboards?board=${data.boards[data.boards.length - 1].id}`);
-    }
-  }, [data, isDefault, router]);
+  // No "jump to the newest user dashboard" from the built-in board here.
+  // That effect dated from when `/dashboards` was this page; it now is the
+  // resolver (`dashboard-resolver.tsx`), which sends you to the board you
+  // last had open. Opening Main from the list remembered "default", this
+  // effect replaced the URL with `/dashboards?board=<newest>`, the resolver
+  // sent you back to Main, and the page reloaded forever. Where to land is
+  // the resolver's decision alone; Main is a board you can choose to open.
 
   // Save layout (debounced). The built-in board saves too: the backend
   // accepts a layout — and only a layout — for id "default".
