@@ -292,6 +292,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // /api/gold/export/{mart}.
     ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
 
+    // DATA-1 — per-mart publish-to-Iceberg switches. `publications` is
+    // what the scheduler reads (RequiresAuth floor PLUS
+    // `check_export_token` in the handler, same two-layer shape as the
+    // export routes above); the detail GET is read-only state for the
+    // asset page (RequiresAuth floor, `canEdit` reports — never implies —
+    // the permission); the PUT is the one WRITE, floored at the existing
+    // `gold:export` permission so whoever may trigger an export by hand
+    // is exactly who may switch automatic publishing on. Switching off
+    // flips a flag only; no route under /api/gold ever drops Iceberg
+    // data.
+    ("GET", "/api/gold/publications",              Policy::RequiresAuth),
+    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAuth),
+    ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
+
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),
     ("POST", "/api/query/estimate",       Policy::RequiresPermission("query:read")),

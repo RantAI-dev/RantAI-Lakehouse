@@ -173,7 +173,8 @@ assert both ways in `tests/route_auth.rs`.
 
 - `POST /api/gold/export/{mart}` accepts `?ifChanged=true`. When set, and
   both `lastChangedAt` and `lastExportedAt` are known, and
-  `lastChangedAt <= lastExportedAt`: do not export; return
+  `lastChangedAt < lastExportedAt` (strictly; see the slice B review,
+  finding B1 — the plan first said `<=`, which was wrong): do not export; return
   `{ "skipped": true, "reason": "unchanged since <rfc3339>" }` with `200`.
 - If either timestamp is `null`, export (fail toward publishing, since a
   stale open copy is the worse outcome).
@@ -234,7 +235,8 @@ assert both ways in `tests/route_auth.rs`.
   - When on: last published time, snapshot ID (`getLastExport`), the last
     five runs (`listExportRuns`), and a "Publish now" action
     (`triggerExport`).
-  - State line: "Up to date" when `lastChangedAt <= lastExportedAt`; "Out
+  - State line: "Up to date" when `lastChangedAt < lastExportedAt`
+    (strictly; slice B review finding B1); "Out
     of date" when newer; "Not measured" when `lastChangedAt` is `null`;
     "Never published" when `lastExportedAt` is `null`.
   - Errors from the toggle are shown in place; no optimistic flip that
@@ -366,6 +368,203 @@ Environment notes for the reviewer:
   hunk staged from this file for the handoff commit is the one you are
   reading.
 
+### PR slice B — T2–T5 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-b` off `main` (slice A's `6e46c9f`
+merged as PR #60 before this branch was cut). Four commits, one per task:
+
+- `b74c7e5` — T2. Migration `0054_gold_publication.sql` (why-header; the
+  columns exactly as specced, missing row = off);
+  `lakehouse-store/src/gold_publication.rs` (`get`/`list_enabled`/`upsert`,
+  `StoreError` classification as in `pipelines.rs`, `# Errors` on every
+  `Result` fn, values bound); registered in `store`'s `lib.rs`; tests in
+  `lakehouse-store/tests/gold_publication.rs` via `sqlx::test` covering
+  unknown-mart `None`, insert-then-in-place-flip, and list-only-enabled
+  (insert, flip, list: the "unknown returns None" accept is covered).
+- `44bdfb3` — T3. The three routes exactly as the table specifies
+  (policies, shapes, `404` on unknown mart, `PUT` off only flips the flag
+  — no Iceberg call), reusing `mart_exists` for the existing-mart check
+  (rule 4: no second validator); `lastChangedAt` from
+  `max(modification_time)` over active parts (null when parts = 0),
+  `lastExportedAt` from the newest `success` row (new
+  `gold_export_history::last_success_started_at`; null if none), `canEdit`
+  from the caller's `gold:export`. Toggles recorded through the existing
+  `lakehouse-store` audit writer (`store_audit::insert`,
+  action `gold.publication_set`, resource kind `gold_mart`) — no new audit
+  mechanism. Routes in `POLICY_TABLE` (both-ways assertions come from
+  `tests/route_auth.rs`'s existing loops over the table). New dev-deps
+  `testcontainers` 0.27 / `testcontainers-modules` 0.15 (clickhouse
+  feature) on `lakehouse-api` only, for route tests against a real
+  ClickHouse 26.8 (the freshness query cannot be faked on a stub);
+  5 tests in `tests/gold_publication.rs`, one shared container per binary
+  because `gold_export_history`'s ensure-table `OnceCell` assumes one CH
+  per process.
+- `2623f07` — T4. `?ifChanged=true` per spec: skip only when both
+  timestamps are known and `lastChangedAt <= lastExportedAt`; either null
+  exports; a skip is `200 {"skipped": true, "reason": "unchanged since
+  <rfc3339>"}` and writes **no** `console.gold_export_run` row, commits no
+  snapshot, and never takes the single-flight lock; boolean parsed with
+  `== "true"`; the freshness reads run only when the parameter is set, so
+  the manual path gains no queries. Skip decision extracted as a pure fn
+  (3 unit tests); the export handler's history-write block moved into a
+  `record_export_history` helper to satisfy the function-length lint,
+  behavior unchanged. Route tests cover skip (history count unchanged),
+  export-when-newer, and export-when-unknown (both stop deterministically
+  at the unprovisioned Lakekeeper token — 503, past the skip gate,
+  nothing recorded).
+- `21a787d` — T5. `list_gold_marts` unions
+  `GET /api/gold/publications` (same two-header credential as the POST,
+  `timeout=`, `raise_for_status()`) with `GOLD_EXPORT_MARTS`, dedup by
+  exact mart name (a mart in both sources is one step); two distinct
+  marts sanitizing to one step key still `Failure(allow_retries=False)`
+  with both names and origins. Env default now empty in code, compose,
+  and `.env.example`; compose comment explains the console owns the list
+  and the env is an override. `export_one_mart` sends `ifChanged=true`; a
+  skipped answer records `skipped_verbs=["unchanged"]` and emits no
+  `AssetMaterialization`. A failed fetch raises bare (retryable); a
+  malformed body is non-retryable `Failure`. `source_metadata` `reads`
+  updated on the fan-out op. Gate runner checked, not edited:
+  `ops/gold_export/gold_export_test.py` POSTs its own `GOLD_MART_NAME`
+  directly and never reads `GOLD_EXPORT_MARTS` (section-6 item 4).
+
+Verification — every command run in the foreground on `21a787d`, fresh
+build, counts quoted from the run:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — pass, no warnings.
+- `cd rust && cargo test --workspace` — 78 suites, all `ok`: **2831
+  passed, 0 failed, 2 ignored**. Full log kept at
+  `/tmp/opencode/t5-workspace-test.log`. Caveat, said plainly: one
+  earlier workspace run had 5 `lakehouse-auth` JWKS unit tests fail
+  (port/time flake under parallel load, 39s binary); `lakehouse-auth
+  --lib` passed 51/51 immediately after, and two consecutive full
+  workspace runs on the final commit were fully green — the failure did
+  not reproduce and is not in this slice's code.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375
+  passed, 30 subtests passed, 0 failed** (218 warnings, all the known
+  `kafka-python` deprecations, none from touched files).
+- `docker compose --profile '*' config --quiet` — pass.
+- Rule 8, on the compose edit: `GIT_SHA=$(git rev-parse HEAD) docker
+  compose -p t5proof --profile dagster up -d --build dagster-code-location
+  dagster-webserver dagster-daemon` from a clean project — every init
+  container `Exited (0)`, the code server loaded
+  `dispar_orchestrate.definitions`, `GOLD_EXPORT_MARTS=""` in the
+  code-location container env, and the webserver's GraphQL listed
+  `gold_export_job_schedule` with status `RUNNING`; `down -v` removed the
+  project afterwards.
+
+Section-6 answers:
+
+- **`0054` free:** `rust/migrations` contained no `0054_*` before
+  `b74c7e5`; the only branches on this remote checkout are `main` and
+  this one. Other workspaces cutting from `origin/main` are out of this
+  machine's sight — the migration lands with its consumer in this same
+  PR, so exposure is one merge window.
+- **Empty fan-out finishes:** proven by
+  `test_nothing_enabled_and_no_override_runs_a_successful_zero_step_job`
+  (`execute_in_process`, Dagster **1.13.20** as installed in
+  `~/.cache/rantai-dagster-venv`): run succeeds, zero
+  `export_gold_mart[*]` steps, `export_one_mart` never called,
+  `summarize_gold_export` succeeds with `marts_exported: 0`.
+- **`modification_time` moves for this repo's writers:** measured, not
+  assumed, against the compose ClickHouse (`clickhouse-server:26.8`)
+  image, fresh container. This repo's pipelines append Gold marts with
+  plain `INSERT INTO {zone}.\`{table}\` {select_sql}`
+  (`authored_factory.py`'s writer), into schema-on-write
+  `MergeTree ORDER BY tuple() AS ... LIMIT 0`. Measured sequence:
+  create + insert → `max(modification_time)` = write time, 1 active
+  part; second insert → moves forward, 2 parts; **zero-row INSERT →
+  does not move** (ClickHouse creates no part for an empty insert) and
+  row count unchanged — so a rewrite that produces zero rows is
+  indistinguishable from no rewrite, which is fine: no data changed, so
+  "unchanged" is the true answer. Caveat for the reviewer: background
+  MergeTree merges also advance `max(modification_time)` (a merge writes
+  a new part stamped with the merge time) — the error direction is a
+  spurious "changed" → one extra export, never a missed one.
+- **Nothing else relied on the old default:** repo-wide grep for
+  `GOLD_EXPORT_MARTS` hits only `gold_export.py` (override), compose
+  (now `:-`), `.env.example` (now empty), and the new tests. The gate
+  runner uses `GOLD_MART_NAME`. Compose change proven by the `up` above,
+  not by `config` alone.
+
+Not run, with reason: `bun run typecheck/lint/test` — slice B touches no
+TypeScript (AGENTS.md: only the lines for the languages the PR touched;
+T7–T8 are slice D). Nothing else skipped; no claim above is *not
+verified*.
+
+Environment notes for the reviewer:
+
+- The ClickHouse testcontainer needs the compose env trio
+  (`CLICKHOUSE_USER=default`, `CLICKHOUSE_PASSWORD=` empty,
+  `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`, tag `26.8`): the 26.8
+  entrypoint disables network access for `default` when `CLICKHOUSE_USER`
+  is unset even with an empty password, and the container handle must be
+  held for the binary's lifetime or it stops mid-test.
+- Axum handler ordering: the `Json` body extractor must be the LAST
+  argument (PUT route); `ApiResult`'s error type is `ApiRejection`, so a
+  direct `Err(ApiError::x())` needs `.into()`.
+
+### PR slice B — fixes (developer, 2026-10-02)
+
+Fixes the review findings B1 (BLOCKER) and S1 (SHOULD-FIX), on
+`feat/gold-publish-per-mart-b` after the reviewer's merge of
+`origin/main` (`48b94ae`) and review commit (`ef07018`).
+
+Commits:
+
+- `de8bc5f` — B1. `if_changed_skip_reason` skips only when
+  `changed_ms < exported_ms`, strictly: `>` became `>=` in the export
+  branch, so equal timestamps export. The unit test's wrong "equal
+  timestamps" case (and its "the mart's last write is the export
+  itself" comment) is replaced by the strictly-older skip case, and a
+  new `equal_timestamps_export_fail_toward_a_fresh_copy` pins that
+  equal exports. Doc comments updated to "strictly before" on
+  `if_changed_skip_reason`, `export`'s Skip section, and — for the same
+  claim made in Python — `gold_export.py`'s module docstring T4
+  paragraph, `export_one_mart`'s docstring, and the skip-record
+  comment. The three `gold_publication.rs` integration skip tests were
+  re-checked against the strict rule and needed no change (they seed
+  runs ±3600s, never equal).
+- `5070200` — S1. New `pool(state)` in `routes/gold.rs` returning
+  `ApiError::Unavailable` with the same fixed-text shape as
+  `routes::identity::pool`/`routes::pipelines::pool`/`routes::
+  governance::pool` (checked per rule 4: those helpers are
+  per-module, none shared, so gold gets its own); the three
+  `ApiError::Internal("gold publications require Postgres")` sites in
+  `publications`/`publication`/`set_publication` now go through it,
+  and their `# Errors` sections say 503. The best-effort audit
+  writer's `as_deref() else return` is untouched — not an error path.
+
+Verification — every command run in the foreground on the final commit
+`5070200`, shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — pass, no warnings.
+- `cd rust && cargo test --workspace` — 78 suites, all `ok`: **2833
+  passed, 0 failed, 8 ignored** (full log at
+  `/tmp/opencode/b1s1-workspace-test.log`; the count is 2 over the
+  reviewed 2831 because the branch also carries `main`'s post-merge
+  tests and the new equal-timestamps test; ignored is 8, matching the
+  review's count — the slice-B handoff's "2" was an under-count of the
+  same suites and is corrected here).
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375
+  passed, 30 subtests passed** (B1 edits docstrings only, run for
+  completeness).
+- Scoped runs made while iterating: `cargo test -p lakehouse-api --lib
+  routes::gold` — 11 passed; `--test gold_publication` — 8 passed;
+  `--test route_auth` — 25 passed; `--test gold_export_auth` — 1 passed.
+
+Not run, with reason: `bun run typecheck/lint/test` and compose checks —
+the fix commits touch Rust and Python docstrings only.
+
+
+
 ## 8. Review (planner appends findings per PR)
 
 ### PR slice A — T1 (reviewer, 2026-10-02)
@@ -428,3 +627,146 @@ changed to match (backlog `SEC-8`).
 
 **Slice B starts from `main` at or after `2cdbf1b`**, on a fresh branch
 `feat/gold-publish-per-mart-b`. The old branch was deleted on merge.
+
+### PR slice B — T2–T5 (reviewer, 2026-10-02)
+
+Reviewed `b74c7e5`, `44bdfb3`, `2623f07`, `21a787d`, `aa2a60a`. `origin/main`
+(`ac8099b`) was merged into the branch first; it merged cleanly.
+
+**One `BLOCKER`, one `SHOULD-FIX`. Not opening the PR until B1 is fixed.**
+
+#### B1 — `BLOCKER` — an equal timestamp must not skip (the plan's error)
+
+`if_changed_skip_reason` skips when `changed_ms <= exported_ms`. Both sides
+are whole seconds: `system.parts.modification_time` is a `DateTime`, and
+the history row stores `started_at.unix_timestamp() * 1000`
+(`routes/gold.rs`, `record_export_history`). So a write that lands in the
+same second an export started, after that export read the mart, compares
+equal and is skipped on every later run until the mart is written again.
+The open copy is then stale while the console says "Up to date" — a silent
+wrong answer, the class this repo treats as most serious.
+
+The developer implemented what the plan said: T4 specified `<=`. The plan
+was wrong and has been corrected above (T4 and T7 now say strictly `<`).
+The handoff's statement that the error direction is "never a missed one" is
+true for background merges but not for this case.
+
+Fix:
+
+- Skip only when `changed_ms < exported_ms`. Equal exports. The cost is one
+  extra export when a mart was written in the same second its last export
+  began, which is the safe direction.
+- Update `unchanged_mart_since_the_last_export_is_skipped_with_a_reason`:
+  its "equal timestamps" case and comment ("the mart's last write is the
+  export itself") are wrong — an export does not write the mart. Add a unit
+  test that equal timestamps export.
+- Update the doc comments on `if_changed_skip_reason` and `export`'s "Skip"
+  section, and the T4 paragraph in `gold_export.py`'s module docstring, to
+  say "strictly before".
+- Cite `PR slice B review B1` at the fix site and in the commit body.
+
+#### S1 — `SHOULD-FIX` — no Postgres should be `503`, through one helper
+
+`publications`, `publication` and `set_publication` each repeat
+`let Some(pool) = state.pg.as_deref() else { return Err(ApiError::Internal(...)) }`.
+The repo's convention for an unconfigured Postgres is `503`
+(`ApiError::Unavailable`; `routes::pipelines::pool`, and `README.md`:
+"dependent routes return `503`"). Use one helper returning
+`ApiError::Unavailable` with fixed text, and change the three sites and
+their `# Errors` sections. Rule 4: check for an existing shared helper
+before adding one to `routes/gold.rs`.
+
+#### Checked and correct
+
+- T2: migration `0054` has a why-header, matches the specified columns, and
+  no other branch on `origin` has a `0054`–`0059` migration. Store functions
+  bind every value and carry `# Errors`.
+- T3: the three routes match the plan's table. The `PUT` is floored at
+  `gold:export` in `POLICY_TABLE`; `tests/route_auth.rs` loops the table, so
+  both directions are covered without a new test. Unknown mart is `404`,
+  measured against `system.tables`. Switching off calls nothing in Iceberg.
+  The toggle is audited through the existing `store_audit::insert`.
+- T4: the skip returns before the single-flight lock, writes no history row,
+  and unknown facts export. The freshness reads happen only when
+  `ifChanged=true`.
+- T5: the scheduler unions the API list with the env override, de-duplicates
+  by name, raises on a failed fetch, and records a skip without a
+  materialization. The env default is empty in code, compose and
+  `.env.example`.
+- The new dev-dependencies add no package to `Cargo.lock`; only feature
+  edges on packages already present.
+
+#### Verification re-run by the reviewer on `aa2a60a`
+
+Foreground, shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 78 suites, **2831 passed, 0 failed, 8
+  ignored**. The handoff says 2 ignored; the count is 8, as in slice A. The
+  JWKS flake the handoff mentions did not occur in this run.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375 passed,
+  30 subtests passed**.
+- `docker compose --profile '*' config --quiet` — pass.
+
+Not re-run by the reviewer: the clean-project `docker compose up` proof for
+the compose edit. The handoff describes it; the edit is one default value.
+
+#### Observations, not findings against this slice
+
+- **Background merges cause extra copies.** A `MergeTree` merge writes a new
+  part with a new `modification_time`, so a mart that is merged after its
+  export looks changed and is exported again on the next run, with no data
+  change. Each such export appends a full copy. This is the safe direction
+  but it weakens "skip when unchanged". A merge-proof signal needs its own
+  measurement; tracked as backlog `DATA-10`.
+- **This PR touches `Cargo.toml` and `Cargo.lock`.** Under the merge rule, a
+  PR that touches dependencies may not merge while a dependency check is
+  red, and `cargo audit` / `cargo deny` are red on `main`. Backlog `SEC-8`
+  must land first (plan: `2026-10-02-sec-8-dependency-checks.md`), or the
+  product owner grants an exception.
+
+### PR slice B — re-review after fixes (reviewer, 2026-10-02)
+
+Reviewed `de8bc5f` (B1) and `5070200` (S1).
+
+- **B1 closed.** `if_changed_skip_reason` now exports when
+  `changed_ms >= exported_ms`; equal timestamps export. The wrong "equal"
+  test case is gone, `equal_timestamps_export_fail_toward_a_fresh_copy` is
+  added, and the doc comments and the scheduler docstring say "strictly
+  before". Cited at the fix site.
+- **S1 closed.** One `pool` helper in `routes/gold.rs` returns
+  `ApiError::Unavailable`, mirroring `routes::pipelines::pool`; the three
+  handlers use it and their `# Errors` sections say `503`.
+
+**No open `BLOCKER` or `SHOULD-FIX`.**
+
+`SEC-8` merged first as PR #62 (`572540c`), so the dependency checks are
+green on `main`. `origin/main` was then merged into this branch. Two
+conflicts, resolved hunk by hunk: the SEC-8 plan file (both sides added it;
+`main`'s copy is this branch's plus the handoff and review) and
+`rust/Cargo.lock` (taken from `main`, then re-resolved by cargo for this
+branch's two dev-dependencies: `main`'s lockfile plus seven edges on
+packages already present, no new package).
+
+Verification re-run by the reviewer on the merged branch, foreground,
+shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 78 suites, **2833 passed, 0 failed, 8
+  ignored**.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375 passed,
+  30 subtests passed**.
+- `docker compose --profile '*' config --quiet` — pass.
+
+Not verified by the reviewer: the clean-project `docker compose up` for the
+one-line compose default change (the developer's handoff describes it), and
+the scheduler exporting a switched-on mart on a running stack (the feature's
+acceptance checklist covers it after slice D).

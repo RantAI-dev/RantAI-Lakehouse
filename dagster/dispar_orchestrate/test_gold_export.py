@@ -78,7 +78,10 @@ class GoldExportHeaderTests(unittest.TestCase):
 
     def test_export_one_mart_posts_with_both_headers_and_timeout(self) -> None:
         """The header pair actually flows through `export_one_mart`'s
-        POST — not just through `_headers` in isolation."""
+        POST — not just through `_headers` in isolation — and the
+        scheduled request carries `ifChanged=true` (plan T4): only the
+        schedule measures before it writes; the manual console trigger
+        sends no such parameter."""
         response = mock.Mock(spec=requests.Response)
         response.raise_for_status.return_value = None
         response.json.return_value = {"rowsExported": 5}
@@ -90,6 +93,7 @@ class GoldExportHeaderTests(unittest.TestCase):
 
         mocked_post.assert_called_once_with(
             "http://lakehouse-api.invalid:8080/api/gold/export/mart_a",
+            params={"ifChanged": "true"},
             headers={
                 "x-run-token": "tok-xyz",
                 "Authorization": "Bearer tok-xyz",
@@ -97,6 +101,50 @@ class GoldExportHeaderTests(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(body, {"rowsExported": 5})
+
+    def test_enabled_publications_are_fetched_with_the_same_auth_headers(self) -> None:
+        """`list_gold_marts` reads the enabled mart list from
+        `GET /api/gold/publications` (plan T5), which is a
+        `RequiresAuth` route — the same two-header credential the POST
+        carries must go out on this read too."""
+        response = mock.Mock(spec=requests.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"publications": [{"mart": "mart_a"}]}
+
+        with mock.patch.object(
+            gold_export.requests, "get", return_value=response
+        ) as mocked_get:
+            marts = gold_export._enabled_publication_marts(
+                _cfg(run_token="tok-xyz")
+            )
+
+        mocked_get.assert_called_once_with(
+            "http://lakehouse-api.invalid:8080/api/gold/publications",
+            headers={
+                "x-run-token": "tok-xyz",
+                "Authorization": "Bearer tok-xyz",
+            },
+            timeout=30,
+        )
+        self.assertEqual(marts, ["mart_a"])
+
+    def test_a_publications_response_without_a_list_is_a_non_retryable_failure(
+        self,
+    ) -> None:
+        """A body without the `publications` list is a protocol error, not
+        a transient blip — a retry would read the same wrong shape, so it
+        is a `Failure(allow_retries=False)`. Crucially it raises at all:
+        a malformed answer must never degrade into "zero marts", which
+        would silently skip every export."""
+        response = mock.Mock(spec=requests.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"unexpected": True}
+
+        with mock.patch.object(gold_export.requests, "get", return_value=response):
+            with self.assertRaises(gold_export.Failure) as ctx:
+                gold_export._enabled_publication_marts(_cfg())
+
+        self.assertFalse(ctx.exception.allow_retries)
 
 
 class GoldExportScheduleTests(unittest.TestCase):
@@ -128,6 +176,7 @@ class GoldExportFanOutTest(unittest.TestCase):
         cfg = mock.Mock(marts=["mart_a", "mart_b"], ch=None)
         bodies = {"mart_a": {"rowsExported": 7}, "mart_b": {"rowsExported": 3}}
         with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=[]), \
                 mock.patch.object(gold_export, "export_one_mart", side_effect=lambda c, m: bodies[m]), \
                 mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
             result = gold_export_job.execute_in_process(raise_on_error=False)
@@ -224,6 +273,7 @@ class GoldExportFanOutTest(unittest.TestCase):
             return {"rowsExported": 11}
 
         with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=[]), \
                 mock.patch.object(gold_export, "export_one_mart", side_effect=fake_export), \
                 mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
             result = gold_export_job.execute_in_process(raise_on_error=False)
@@ -254,7 +304,8 @@ class GoldExportFanOutTest(unittest.TestCase):
         from dispar_orchestrate import gold_export
 
         cfg = mock.Mock(marts=["mart-a", "mart.a"], ch=None)  # both -> mart_a
-        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg):
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=[]):
             # `list_gold_marts` is a `DynamicOut` op, so invoking it
             # returns a generator -- the body (including the
             # collision-time `raise Failure`) only executes when the
@@ -265,6 +316,112 @@ class GoldExportFanOutTest(unittest.TestCase):
         self.assertIn("mart-a", str(ctx.exception))
         self.assertIn("mart.a", str(ctx.exception))
         self.assertFalse(ctx.exception.allow_retries)
+
+    def test_nothing_enabled_and_no_override_runs_a_successful_zero_step_job(
+        self,
+    ) -> None:
+        """The empty union is a real, honest outcome, not an error: a
+        fresh deployment with nothing switched on and no override must
+        produce a run that SUCCEEDS with zero mapped export steps (the
+        plan's "empty fan-out finishes" acceptance) — never a failed run,
+        which would page someone for a nothing (Dagster 1.13.20)."""
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=[], ch=None)
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=[]), \
+                mock.patch.object(gold_export, "export_one_mart") as mocked_export:
+            result = gold_export_job.execute_in_process(raise_on_error=False)
+
+        self.assertTrue(result.success)
+        export_steps = {
+            e.step_key
+            for e in result.all_events
+            if e.event_type_value == "STEP_SUCCESS" and e.step_key.startswith("export_gold_mart[")
+        }
+        self.assertEqual(export_steps, set())
+        mocked_export.assert_not_called()
+        self.assertIn("summarize_gold_export", {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
+        })
+
+    def test_enabled_publications_and_the_env_override_union_deduplicated(self) -> None:
+        """The scheduled mart list is the UNION of the publications the
+        console enabled and `GOLD_EXPORT_MARTS`, deduplicated by exact
+        mart name — a mart listed in both places is one step, not two."""
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=["mart_b", "mart_env_only"], ch=None)
+        exported: list[str] = []
+
+        def fake_export(_cfg, mart):
+            exported.append(mart)
+            return {"rowsExported": 1}
+
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(
+                    gold_export,
+                    "_enabled_publication_marts",
+                    return_value=["mart_a", "mart_b"],
+                ), \
+                mock.patch.object(gold_export, "export_one_mart", side_effect=fake_export), \
+                mock.patch.object(gold_export, "record_maintenance_run"):
+            result = gold_export_job.execute_in_process(raise_on_error=False)
+
+        self.assertTrue(result.success)
+        self.assertEqual(sorted(exported), ["mart_a", "mart_b", "mart_env_only"])
+
+    def test_a_skipped_mart_records_unchanged_and_emits_no_materialization(
+        self,
+    ) -> None:
+        """A `{skipped: true}` answer is the schedule's everyday success
+        path (plan T4): it gets its `maintenance_run` row with
+        `skipped_verbs=["unchanged"]` — the honest ledger of "looked,
+        nothing to do" — but no `AssetMaterialization`, because nothing
+        was written to Iceberg, and the run still succeeds."""
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=["mart_a"], ch=None)
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=[]), \
+                mock.patch.object(
+                    gold_export,
+                    "export_one_mart",
+                    return_value={"skipped": True, "reason": "unchanged since 2026-10-02"},
+                ), \
+                mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
+            result = gold_export_job.execute_in_process(raise_on_error=False)
+
+        self.assertTrue(result.success)
+        self.assertIn("export_gold_mart[mart_a]", {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
+        })
+        self.assertEqual(mocked_record.call_args.kwargs["skipped_verbs"], ["unchanged"])
+        self.assertEqual(
+            [e for e in result.all_events if e.event_type_value == "ASSET_MATERIALIZATION"],
+            [],
+        )
+
+    def test_a_failed_publications_fetch_fails_the_run_instead_of_exporting_nothing(
+        self,
+    ) -> None:
+        """`GET /api/gold/publications` going down must never look like
+        "nothing is enabled": the fetch raises bare (retryable by
+        `DEFAULT_RETRY_POLICY`), the run fails, and no export step runs —
+        the silent-degradation direction is the one outcome this op
+        refuses."""
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=[], ch=None)
+        err = requests.HTTPError("503 Server Error: api down")
+        err.response = mock.Mock(text="boom")
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", side_effect=err):
+            gen = gold_export.list_gold_marts(build_op_context())
+            with self.assertRaises(requests.HTTPError) as ctx:
+                list(gen)
+
+        self.assertIs(ctx.exception, err)
 
     def test_a_non_ascii_letter_is_replaced_with_an_underscore_for_dagsters_charset(self) -> None:
         """Dagster's `check_valid_chars` requires `^[A-Za-z0-9_]+$`.

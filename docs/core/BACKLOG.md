@@ -17,7 +17,6 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SEC-1` | Confirm the leaked key is rotated; decide on rewriting git history | Security | `SECURITY.md` |
 | `REL-1` | Protect the main branch | Delivery | `docs/CI.md` |
 | `DOC-1` | Archive or rewrite the old product documents that contradict the build | Docs | PRODUCT §6 |
-| `SEC-8` | Update the dependencies failing `cargo audit` and `cargo deny` on `main` (three advisories in TLS certificate handling, one unmaintained crate, a licence check). Red on `main` and on PRs #58–#60 | Security | CI on PR #60 |
 | `GOV-2` | Decide which role may publish a table in open format | Governance | PRODUCT §6 |
 
 ## Next
@@ -38,6 +37,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `GOV-1` | Audit trail covers every console change | Governance | PRODUCT §3 |
 | `OPS-1` | Trim old versions of raw tables | Monitoring | `README.md` |
 | `DATA-2` | Trim old copies in published Gold tables | Build | `features/gold-publish-per-mart.md` |
+| `DATA-10` | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | Slice B review, gold-publish plan |
 | `DATA-6` | A "latest copy only" view for outside readers of published tables | Build | `features/gold-publish-per-mart.md` |
 | `SEC-4` | Human security review | Security | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decide a support commitment | Business | PRODUCT §4 blocker 5 |
@@ -92,3 +92,4 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | ID | Item | Outcome | Date |
 | --- | --- | --- | --- |
 | `PM-1` | Customer-facing product name | Decided: RantAI Lakehouse | 2026-10-02 |
+| `SEC-8` | Dependency security checks green on `main` | Done: PR #62. Three TLS-library vulnerabilities cleared by updating the SQL Server client; licence check fixed | 2026-10-02 |

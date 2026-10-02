@@ -629,6 +629,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/gold/exports", get(gold::exports))
         .route("/api/gold/export/{mart}/consumers", get(gold::consumers))
+        // DATA-1: per-mart publish-to-Iceberg switches — the scheduler's
+        // list of enabled marts, and the per-mart switch the asset page
+        // flips. POLICY_TABLE mirrors both paths below.
+        .route("/api/gold/publications", get(gold::publications))
+        .route(
+            "/api/gold/export/{mart}/publication",
+            get(gold::publication).put(gold::set_publication),
+        )
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route(
