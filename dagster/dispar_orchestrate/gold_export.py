@@ -45,8 +45,11 @@ console's switches write — the database is the source of truth) and the
 env override (an operator's escape hatch, default empty), deduplicated
 by mart name; two DISTINCT marts that would collapse into one Dagster
 step key are still refused. Every scheduled POST sends `ifChanged=true`
-(T4), so a mart whose `max(modification_time)` has not moved past its
-last successful export comes back `{skipped: true}` — recorded as
+(T4), so a mart whose `max(modification_time)` last moved strictly
+before its last successful export comes back `{skipped: true}` —
+strictly before, not "not after" (PR slice B review B1: both sides are
+whole seconds, so equal timestamps export rather than risk a stale copy
+the console calls up to date) — recorded as
 `skipped_verbs=["unchanged"]` with no `AssetMaterialization`, since
 nothing was written — and the empty union runs a zero-step job that
 still succeeds, which is the honest shape of "nothing is published."
@@ -139,10 +142,10 @@ def _headers(cfg: GoldExportConfig) -> dict[str, str]:
 def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
     """`ifChanged=true` (gold-publish-per-mart plan T4): the API skips
     the export — 200 `{skipped: true, reason: ...}`, nothing written,
-    no history row — when the mart's `max(modification_time)` has not
-    moved past its last successful export. The manual console trigger
-    sends no such parameter; only the schedule measures before it
-    writes."""
+    no history row — when the mart's `max(modification_time)` last moved
+    strictly before its last successful export (equal timestamps export,
+    PR slice B review B1). The manual console trigger sends no such
+    parameter; only the schedule measures before it writes."""
     resp = requests.post(
         f"{cfg.api_url}/api/gold/export/{mart}",
         params={"ifChanged": "true"},
@@ -320,7 +323,8 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
         raise
     # A skip is a successful no-op, not an error: the API answered 200
     # with `{skipped: true}` because the mart's `max(modification_time)`
-    # has not moved past its last successful export (plan T4). It gets
+    # last moved strictly before its last successful export (plan T4,
+    # strict per PR slice B review B1). It gets
     # its `maintenance_run` row -- `skipped_verbs=["unchanged"]`, the
     # honest ledger of "looked, nothing to do" -- but no
     # `AssetMaterialization`, because nothing was written to Iceberg.

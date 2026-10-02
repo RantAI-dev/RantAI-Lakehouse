@@ -109,17 +109,24 @@ pub struct ExportQuery {
 /// function so the three outcomes are unit-tested without any server.
 ///
 /// Returns `Some(reason)` — skip — only when BOTH facts are measured and
-/// the mart's last write is not after its last successful export. Any
-/// unknown (`None` either side — no active parts yet, no successful
-/// export yet, or an unparseable timestamp) exports: a stale open-format
-/// copy is the worse outcome, so uncertainty fails toward publishing.
+/// the mart's last write is STRICTLY before its last successful export.
+/// Equal timestamps export (PR slice B review B1): both sides are whole
+/// seconds (`modification_time` is a `DateTime`, the history row stores
+/// `started_at` in unix ms), so a write landing in the same second an
+/// export started — after that export read the mart — compares equal;
+/// skipping it would leave the open copy stale while the console says
+/// "Up to date". The cost of the strict comparison is one extra export
+/// for that same-second case, which is the safe direction. Any unknown
+/// (`None` either side — no active parts yet, no successful export yet,
+/// or an unparseable timestamp) exports: a stale open-format copy is the
+/// worse outcome, so uncertainty fails toward publishing.
 fn if_changed_skip_reason(
     last_changed_ms: Option<i64>,
     last_exported_ms: Option<i64>,
 ) -> Option<String> {
     let changed_ms = last_changed_ms?;
     let exported_ms = last_exported_ms?;
-    if changed_ms > exported_ms {
+    if changed_ms >= exported_ms {
         return None;
     }
     // The exported timestamp is always a real epoch-millisecond from the
@@ -248,14 +255,17 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 /// # Skip: `?ifChanged=true` (DATA-1 task 4)
 ///
 /// With that parameter, a mart whose measured last write
-/// (`max(modification_time)` over active parts) is not after its last
-/// successful export is skipped: `200` with `{"skipped": true, "reason":
-/// "unchanged since <rfc3339>"}`, and NOTHING else happens — no export,
-/// no `console.gold_export_run` row, no Iceberg snapshot. This is what
-/// the scheduler (task 5/6) sends so a quiet mart costs two cheap
-/// `ClickHouse` reads. Unknown facts never skip (see
-/// [`if_changed_skip_reason`]); the console's manual trigger does not
-/// send the parameter at all.
+/// (`max(modification_time)` over active parts) is strictly before its
+/// last successful export is skipped: `200` with `{"skipped": true,
+/// "reason": "unchanged since <rfc3339>"}`, and NOTHING else happens —
+/// no export, no `console.gold_export_run` row, no Iceberg snapshot.
+/// Strictly before, not "not after" (PR slice B review B1): equal
+/// timestamps export, because both sides are whole seconds and a write
+/// in the same second its last export began may have landed after that
+/// export read the mart. This is what the scheduler (task 5/6) sends so
+/// a quiet mart costs two cheap `ClickHouse` reads. Unknown facts never
+/// skip (see [`if_changed_skip_reason`]); the console's manual trigger
+/// does not send the parameter at all.
 ///
 /// # Single-flight: only one export of a given mart runs at a time
 ///
@@ -1031,13 +1041,23 @@ mod tests {
 
     #[test]
     fn unchanged_mart_since_the_last_export_is_skipped_with_a_reason() {
-        // Equal timestamps: the mart's last write is the export itself.
-        let skip = if_changed_skip_reason(Some(1_700_000_000_000), Some(1_700_000_000_000))
+        // Strictly older mart than the export: the copy is fresh.
+        // An export does not write the mart, so the comparison must be
+        // strict — see the equal case in
+        // `equal_timestamps_export_fail_toward_a_fresh_copy`.
+        let skip = if_changed_skip_reason(Some(1_699_999_000_000), Some(1_700_000_000_000))
             .expect("unchanged must skip");
         assert!(skip.starts_with("unchanged since "), "{skip}");
+    }
 
-        // Strictly older mart: the copy is fresh.
-        assert!(if_changed_skip_reason(Some(1_699_999_000_000), Some(1_700_000_000_000)).is_some());
+    #[test]
+    fn equal_timestamps_export_fail_toward_a_fresh_copy() {
+        // PR slice B review B1: both sides are whole seconds, so a write
+        // landing in the same second its last export started — after
+        // that export read the mart — compares equal and must EXPORT;
+        // skipping it would leave the open copy stale while the console
+        // says "Up to date".
+        assert!(if_changed_skip_reason(Some(1_700_000_000_000), Some(1_700_000_000_000)).is_none());
     }
 
     #[test]
