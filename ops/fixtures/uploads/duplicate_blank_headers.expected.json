@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["Name", "Name", "", "Qty ", "", "A.scrap"],
+  "rows": [
+    ["bolt", " steel ", "x", "10", "y", "0.5"],
+    ["nut", "iron", "", "5", "", ""]
+  ]
+}

@@ -36,6 +36,7 @@ mod state;
 mod tenant;
 mod tenant_scope;
 mod transform_grammar;
+mod upload_parse;
 mod upload_store;
 
 use anyhow::Context;

@@ -466,128 +466,13 @@ pub async fn delete(
 }
 
 // ── detection ───────────────────────────────────────────────────────────
-
-/// `utf-16` when the bytes carry a UTF-16 BOM or look like UTF-16LE
-/// (ASCII text interleaved with NUL), `utf-8` otherwise.
-///
-/// The SAP export that motivated this feature is UTF-16LE with a BOM and
-/// a `.xls` name: neither its extension nor its declared content type
-/// says so.
-fn detect_encoding(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
-        return "utf-16";
-    }
-    let sample = &bytes[..bytes.len().min(512)];
-    // A plain count, not `bytecount`: this runs once per preview over at
-    // most 512 bytes, and adding a dependency for that would cost more
-    // than it saves.
-    #[allow(clippy::naive_bytecount, reason = "512-byte sample, once per preview")]
-    let nuls = sample.iter().filter(|b| **b == 0).count();
-    if sample.len() > 16 && nuls * 3 > sample.len() {
-        return "utf-16";
-    }
-    "utf-8"
-}
-
-fn decode(bytes: &[u8], encoding: &str) -> String {
-    if encoding.eq_ignore_ascii_case("utf-16") {
-        let (bytes, big_endian) = match bytes {
-            [0xFF, 0xFE, rest @ ..] => (rest, false),
-            [0xFE, 0xFF, rest @ ..] => (rest, true),
-            other => (other, false),
-        };
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| {
-                if big_endian {
-                    u16::from_be_bytes([pair[0], pair[1]])
-                } else {
-                    u16::from_le_bytes([pair[0], pair[1]])
-                }
-            })
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
-/// The delimiter that splits the sampled lines most consistently.
-///
-/// Consistency, not frequency: a description column full of commas makes
-/// `,` the most COMMON character in a tab-separated export, but only the
-/// real delimiter yields the same field count on line after line.
-fn detect_delimiter(lines: &[&str]) -> char {
-    const CANDIDATES: [char; 4] = ['\t', ',', ';', '|'];
-    let sample: Vec<&&str> = lines
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .take(50)
-        .collect();
-    let mut best = (',', 0usize);
-    for candidate in CANDIDATES {
-        let counts: Vec<usize> = sample
-            .iter()
-            .map(|line| line.matches(candidate).count())
-            .filter(|n| *n > 0)
-            .collect();
-        if counts.is_empty() {
-            continue;
-        }
-        let modal = counts
-            .iter()
-            .copied()
-            .max_by_key(|n| counts.iter().filter(|m| *m == n).count())
-            .unwrap_or(0);
-        let agreeing = counts.iter().filter(|n| **n == modal).count();
-        let score = agreeing * modal;
-        if score > best.1 {
-            best = (candidate, score);
-        }
-    }
-    best.0
-}
-
-/// Index of the line that most plausibly holds column names.
-///
-/// The first line with the file's modal field count and no empty leading
-/// cell. Report exports (SAP's "Dynamic List Display" among them) open
-/// with title and date lines that have one field or a handful of stray
-/// tabs; taking line 0 as the header there produces a table whose columns
-/// are a report title.
-fn detect_header_row(lines: &[&str], delimiter: char) -> usize {
-    let counts: Vec<(usize, usize)> = lines
-        .iter()
-        .enumerate()
-        .take(50)
-        .map(|(i, line)| (i, split_row(line, delimiter).len()))
-        .filter(|(_, n)| *n > 1)
-        .collect();
-    if counts.is_empty() {
-        return 0;
-    }
-    let modal = counts
-        .iter()
-        .map(|(_, n)| *n)
-        .max_by_key(|n| counts.iter().filter(|(_, m)| m == n).count())
-        .unwrap_or(0);
-    counts
-        .iter()
-        .find(|(i, n)| {
-            *n == modal
-                && lines
-                    .get(*i)
-                    .map(|line| split_row(line, delimiter))
-                    .is_some_and(|cells| cells.iter().filter(|c| !c.trim().is_empty()).count() > 1)
-        })
-        .map_or(0, |(i, _)| *i)
-}
-
-fn split_row(line: &str, delimiter: char) -> Vec<String> {
-    line.split(delimiter)
-        .map(|cell| cell.trim_matches('"').trim().to_owned())
-        .collect()
-}
+//
+// Moved to `crate::upload_parse` (T5 of
+// docs/superpowers/plans/2026-10-02-upload-file.md): `detect_encoding`,
+// `decode`, `detect_delimiter`, `detect_header_row`, and `split_row`, which
+// `split_records` replaces. The handlers above still call them under their
+// old names and this file is still not declared in `routes/mod.rs`, so
+// nothing here compiles; T6 rewrites the handlers on `upload_parse`.
 
 #[cfg(test)]
 mod tests {
@@ -618,45 +503,5 @@ mod tests {
         assert_eq!(extension_of("file.cs v"), "");
         assert_eq!(extension_of("noext"), "");
         assert_eq!(extension_of("data.CSV"), "csv");
-    }
-
-    #[test]
-    fn detects_utf16_from_a_bom() {
-        let mut bytes = vec![0xFF, 0xFE];
-        bytes.extend("a\tb".encode_utf16().flat_map(u16::to_le_bytes));
-        assert_eq!(detect_encoding(&bytes), "utf-16");
-        assert_eq!(decode(&bytes, "utf-16"), "a\tb");
-    }
-
-    #[test]
-    fn detects_utf8_for_plain_ascii() {
-        assert_eq!(detect_encoding(b"id,name\n1,two\n"), "utf-8");
-    }
-
-    #[test]
-    fn delimiter_is_the_consistent_one_not_the_common_one() {
-        // Every description holds commas; only the tab count is stable.
-        let lines = vec![
-            "id\tdescription\tqty",
-            "1\tBOLT, HEX, M6\t10",
-            "2\tTAPE, WHITE, 50MM\t4",
-            "3\tGLUE, FAST, 20G\t7",
-        ];
-        assert_eq!(detect_delimiter(&lines), '\t');
-    }
-
-    #[test]
-    fn header_row_skips_a_report_preamble() {
-        // The shape of the SAP export this feature was built for.
-        let lines = vec![
-            "24.09.2025",
-            "",
-            "Material master Interface for MES",
-            "",
-            "Plnt\tMaterial\tDescription",
-            "8250\t0250161\tADHESIVE",
-            "8250\t0483912\tPP BAND",
-        ];
-        assert_eq!(detect_header_row(&lines, '\t'), 4);
     }
 }

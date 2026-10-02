@@ -1,0 +1,11 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["id", "name", "qty"],
+  "rows": [
+    ["1", "short"],
+    ["2", "full", "5"],
+    ["3", "long", "6", "extra", "cells"]
+  ]
+}

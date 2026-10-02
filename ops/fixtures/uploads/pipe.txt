@@ -1,0 +1,3 @@
+code|name|qty
+X1|Gasket|4
+X2|O-ring, large|9

@@ -1,0 +1,6 @@
+# These files are test inputs whose exact bytes are the point: line endings,
+# a byte order mark, UTF-16. Git must neither convert their line endings nor
+# treat them as text, or the result beside each one stops matching.
+* -text
+README.md text
+*.expected.json text
