@@ -59,7 +59,11 @@ The loop, per feature:
    (rule 13). Steps 4–5 repeat until there is no open `BLOCKER`.
 6. **PR and merge.** The planner, as reviewer, opens the pull request from
    the developer's branch and merges it once there is no open `BLOCKER`
-   and CI is green. The developer never opens or merges a PR. Nobody
+   and the PR adds no failing check: every check that passes on `main`
+   passes on the PR. A check already red on `main` does not block a PR
+   that did not cause it, but the reviewer names it in the review and it
+   must have a backlog item (`docs/core/BACKLOG.md`). A PR that touches
+   dependencies must not merge with a dependency check red. The developer never opens or merges a PR. Nobody
    pushes to `main` directly or force-pushes it; `main` only moves through
    a merged PR.
 7. **Done.** Merged is not Done. The product owner runs the acceptance

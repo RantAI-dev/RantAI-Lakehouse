@@ -269,6 +269,10 @@ run without the product owner fixing things by hand.
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
 
+Also open: the dependency security checks in CI are red on the main
+branch (three known advisories in a TLS library). Small to fix, and it
+should not stay red.
+
 Not blockers, but will be found in a customer's evaluation: login rate
 limiting, full audit coverage, single sign-on, tested backup restore,
 cleanup of old table versions.
