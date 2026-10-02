@@ -703,6 +703,21 @@ async fn publication_body(
     }))
 }
 
+/// Borrow the Postgres pool, or fail with a 503. Mirrors
+/// `routes::identity::pool`/`routes::pipelines::pool`: an UNCONFIGURED
+/// Postgres is `Unavailable`, not `Internal` — the deployment is missing
+/// `DATABASE_URL`, which is a "this route cannot work here" state, the
+/// repo's documented 503 (PR slice B review S1).
+fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "gold publications unavailable: no Postgres pool is configured \
+             (DATABASE_URL is missing or not a valid Postgres connection string)"
+                .to_owned(),
+        )
+    })
+}
+
 /// `GET /api/gold/publications` — the enabled marts, and nothing else.
 /// This is the scheduler's source of truth (DATA-1 task 5): a fresh
 /// deployment publishes exactly this list, which is empty until a
@@ -718,8 +733,8 @@ async fn publication_body(
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 500 with fixed text when
-/// Postgres is not reachable (this feature is Postgres-backed, unlike the
+/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// configured ([`pool`]; this feature is Postgres-backed, unlike the
 /// export routes), or 500 for a store failure (classified, never raw
 /// upstream text).
 pub async fn publications(
@@ -736,9 +751,7 @@ pub async fn publications(
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
-    let Some(pool) = state.pg.as_deref() else {
-        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
-    };
+    let pool = pool(&state)?;
     let enabled = lakehouse_store::gold_publication::list_enabled(pool)
         .await
         .map_err(ApiError::from)?;
@@ -761,9 +774,9 @@ pub async fn publications(
 ///
 /// # Errors
 ///
-/// Returns 400 for a mart that is not a valid identifier, 500 with fixed
-/// text when Postgres is unreachable, or classified store/`ClickHouse`
-/// errors otherwise.
+/// Returns 400 for a mart that is not a valid identifier, 503 when
+/// Postgres is not configured ([`pool`]), or classified
+/// store/`ClickHouse` errors otherwise.
 pub async fn publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -771,9 +784,7 @@ pub async fn publication(
 ) -> ApiResult<ApiJson<Value>> {
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
-    let Some(pool) = state.pg.as_deref() else {
-        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
-    };
+    let pool = pool(&state)?;
     let stored = lakehouse_store::gold_publication::get(pool, mart_ident.as_str())
         .await
         .map_err(ApiError::from)?;
@@ -839,9 +850,9 @@ async fn record_publication_audit(
 /// # Errors
 ///
 /// Returns 400 for a mart that is not a valid identifier, 404 for an
-/// unknown mart, 401 if the gate somehow let a principal-less request
-/// through (never, through the router), or classified store/`ClickHouse`
-/// errors otherwise.
+/// unknown mart, 503 when Postgres is not configured ([`pool`]), 401 if
+/// the gate somehow let a principal-less request through (never, through
+/// the router), or classified store/`ClickHouse` errors otherwise.
 pub async fn set_publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -856,9 +867,7 @@ pub async fn set_publication(
     };
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
-    let Some(pool) = state.pg.as_deref() else {
-        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
-    };
+    let pool = pool(&state)?;
     let exists = mart_exists(
         &state.clickhouse,
         &state.config.gold_source_schema,
