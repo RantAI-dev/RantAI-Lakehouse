@@ -367,6 +367,71 @@ and the three amendments here win:
   409; delete while loading is 409; no response body contains the text of
   an injected storage or orchestrator error.
 
+### T6a — Table claims, a lost run, and the reasons a response may show
+
+Fixes for the review of slice B, part 2 (section 9: `B4` to `B7`). One
+commit. Cite each finding at its fix site.
+
+- **`BLOCKER B4`: who owns a table is its own record.** T5a read ownership
+  from the upload rows (`bronze_table`), and a row is mutable: it names the
+  table of its *last* load, and another tenant's row may name the same
+  table. Two failures follow, the first found by the developer:
+  tenant B's load into `t` fails before it writes; tenant A then creates
+  `t`; B's retry passes the claim check and replaces A's rows. And an
+  upload that loaded `x` and is then loaded into `y` no longer names `x`,
+  so nothing says an upload made `x`.
+  - `0055` (still applied nowhere that persists) gains table
+    `upload_table_claim`: `bronze_table TEXT PRIMARY KEY`, `tenant_id UUID
+    REFERENCES tenant(id) ON DELETE SET NULL`, `upload_id TEXT NOT NULL`,
+    `claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()`. The primary key is the
+    point: one table name, one owner, decided by the database. It loses
+    `deleted_at`: with ownership recorded here, a deleted upload's row has
+    no reason to stay, so deleting is a real delete again.
+  - Store: `claim_table(tenant_id, table, upload_id)`, one atomic
+    statement, true when the claim is this tenant's afterwards (made now or
+    held before), false when another tenant holds it or its tenant is gone.
+    `table_claim(tenant_id, table)` answering none / ours / theirs.
+    `table_claimed(table)` for T8. `delete(id)` is hard and still refuses
+    an `ingesting` row in SQL. Remove `soft_delete`,
+    `table_claimed_by_upload`, `table_loaded_by_upload` and every
+    `deleted_at` filter. A claim is never released: say so in the module
+    doc.
+  - Routes: the table is free when no connector targets it and the claim
+    is ours, or there is no claim and the table does not exist. A claim
+    held by another tenant and an existing table nobody claimed get the
+    same sentence, so the answer does not say which: "That table name is
+    in use and no upload of this tenant created it, so a file cannot be
+    loaded into it." `claim_table` runs just before `mark_ingesting`; false
+    is that same 409.
+  - T8 uses `table_claimed`: "The table <name> is reserved for uploaded
+    files, so a connector cannot load into it. Choose another target."
+  - Tests: B's failed claim keeps A out and lets B retry; an upload loaded
+    into `x`, then into `y`, leaves `x` claimed (another upload of the
+    tenant may load into it, a connector may not take it); two tenants
+    claiming one new name, one wins; after a delete the claim remains and a
+    new upload of the tenant loads into the table.
+- **`SHOULD-FIX B5`: a run the orchestrator no longer knows.** Today such
+  an upload stays loading for ever: it cannot be deleted or loaded again.
+  When `pipeline_run_status` answers `Ok(None)`, read the recorded result:
+  found, settle by it. Not found and the claim is older than one hour
+  (a bound past any load of a 50 MB file, not a measurement; say so at the
+  constant): `failed`, "The orchestrator no longer knows this load." Not
+  found and younger, or the results cannot be read: leave it.
+- **`SHOULD-FIX B6`: only reasons the API knows reach a response.** The
+  recorded `error` is shown as written today, so one `str(exc)` in the job
+  would put exception text in a response. `ops/fixtures/
+  upload_load_failure_reasons.json` holds the six reasons of T7 as a JSON
+  array. The API has the same six as constants; a test asserts they equal
+  the file; `outcome_of` shows a recorded reason only when it is one of
+  them, and "The load failed." otherwise. T7's tests assert the job's
+  constants against the same file.
+- **`SHOULD-FIX B7`:** the `storage_key` tests carry a tenant name taken
+  from this deployment's defaults. The key is built from a tenant id now;
+  use a UUID.
+- **Accept:** the tests above; `tests/upload_routes.rs`,
+  `tests/connector_upload_table.rs` and the store's `tests/uploads.rs`
+  pass; no `deleted_at` is left in the tree.
+
 ### T7 — The load job
 
 Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
@@ -506,7 +571,7 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
 | Slice | Tasks | Why separate |
 | --- | --- | --- |
 | A | T1–T2 | Hygiene of the base. Could merge on its own |
-| B | T3–T5, T5a, T6, T8 | The API. Rust is confined to this slice and T1 |
+| B | T3–T5, T5a, T6, T6a, T8 | The API. Rust is confined to this slice and T1 |
 | C | T7, T9 | The job and the gate. No Rust |
 | D | T10–T12 | Console and documents. No Rust, no Python |
 
@@ -1259,3 +1324,62 @@ Noted, not a finding against this change:
 for a refused connection in the developer's test, so its "connection
 refused" branch may be unreachable with this version of `object_store`.
 It is existing code, used by the probes as well.
+
+### Slice B, part 2 — T5a, T6, T8 (reviewer, 2026-10-02)
+
+Reviewed `27c2865`, `d05ef0f` and `ec6686a` against T5a, T6 and T8.
+
+**Findings: one `BLOCKER`, three `SHOULD-FIX`. They become T6a.**
+
+- `BLOCKER B4`: a table's owner is read from upload rows, which are
+  mutable and not exclusive. Another tenant's claim that failed before it
+  wrote lets that tenant later replace a table the first tenant created
+  (the developer reported this and, correctly, did not change a decision to
+  close it). Loading one upload into a second table also drops the record
+  that it made the first. T5a was the planner's design; it was the wrong
+  shape. Ownership becomes a table of its own with the name as primary key,
+  and deleting an upload is a real delete again.
+- `SHOULD-FIX B5`: `Settler` leaves an upload loading for ever when the
+  orchestrator no longer knows its run. The developer documented it at the
+  type. It needs an end.
+- `SHOULD-FIX B6`: the job's recorded reason is returned as written.
+  Nothing in the API stops exception text arriving by that road.
+- `SHOULD-FIX B7`: a tenant name from this deployment's defaults in two
+  new unit tests.
+
+What was checked against the plan:
+
+- Six routes, six `POLICY_TABLE` entries, all `connector:manage`; the
+  per-id routes share one `route_layer`; the body limit is on the POST
+  route alone; `route_timeout` has its test.
+- Every sentence a caller can read is a constant at the top of
+  `routes/uploads.rs`. Storage, orchestrator and ClickHouse errors are
+  logged and answered with those. The tests inject distinctive upstream
+  text and assert its absence.
+- The claim comes before the launch; a launch that does not happen settles
+  the claim. The test for two simultaneous ingests fails when the SQL guard
+  is removed (the developer made it deterministic to prove that).
+- The table check answers 503 on a doubt. The reviewer asked the
+  development engine (26.8.9.10) what it says for a raw table that does
+  not exist: `Code: 60 … (UNKNOWN_TABLE)`, which is the one answer
+  `iceberg_table_presence` reads as "absent". That item of the handoff's
+  "not verified" list is now verified.
+- T8's check runs before the spec is saved and skips a target that is not
+  text.
+- `Cargo.lock` gains `multer` 3.1.0 and nothing else.
+
+Verification re-run by the reviewer: deferred to the commit that closes
+T6a, since T6a changes the store, the routes and the migration again. The
+developer's counts on `ec6686a`: 79 `test result:` lines, 3,351 passed, 0
+failed, 8 ignored, run as two commands.
+
+Noted, not findings against this change:
+
+- The API test harness (`tests/common/mod.rs::build_state_and_pool`)
+  creates a database per test and never drops it. The shared test Postgres
+  held 1,397 of them (13 GB) and the root disk fell to 8 GB free during
+  this slice. The developer dropped the idle ones. The leak is on the base
+  and needs its own change.
+- `delete` removes the object before it marks the row. A load claimed in
+  between would fail with "The stored file could not be read." That is a
+  visible failure, not a wrong result.

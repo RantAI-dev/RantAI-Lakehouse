@@ -31,10 +31,8 @@ and because one bucket means one set of credentials and one thing to back
 up. Under its own prefix, so nothing an upload writes can sit next to an
 Iceberg table's files.
 
-The file is removed when the upload is deleted. Nothing else expires it.
-The upload's row is kept, hidden, when it is deleted: it is the only record
-that an upload of that tenant created the table, and decision 5 needs that
-record to let a later upload load into the same table.
+The file is removed when the upload is deleted, and so is its row. Nothing
+else expires it.
 
 ## Decision 2 — the upload passes through the API, with a cap
 
@@ -79,9 +77,14 @@ not write to Postgres: the job holds credentials for the source database of
 the demo ingest, not for the console's database, and the two are the same
 only on the compose stack.
 
-An upload may load into a table that does not exist, or into one an upload
-of the same tenant claimed: some row of that tenant, live or deleted,
-names it. It may never load into a table a connector
+An upload may load into a table that does not exist, or into one its
+tenant has claimed. A claim is a row of `upload_table_claim`, keyed by the
+table name, made when a load is first requested and never released: one
+name, one tenant, decided by the database. It is a record of its own
+because an upload's row cannot carry it: the row names only the table of
+its last load, it goes when the upload is deleted, and nothing stops two
+tenants' rows naming the same table. The cost is that a name a tenant's
+upload once asked for stays that tenant's, even if the load never wrote. It may never load into a table a connector
 loads or that anything else created. The API checks this before launching,
 and refuses when it cannot check.
 

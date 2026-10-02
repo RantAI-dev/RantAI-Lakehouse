@@ -87,6 +87,9 @@ table once it is loaded.
   grows with every upload.
 - Adding the same file to a table twice doubles its rows. The console warns
   about a repeated file; it does not stop it.
+- A table name an upload has asked for stays reserved for that tenant's
+  uploads. Another tenant cannot upload into it and a connector cannot load
+  into it, even if the first load never wrote anything.
 - An upload is not resumable. If the connection drops, it starts again.
 - In an install with several tenants, the table an upload creates appears in
   the shared catalog, which only the tenant that owns the catalog sees.
