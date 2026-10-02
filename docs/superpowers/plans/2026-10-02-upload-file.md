@@ -657,6 +657,217 @@ Full verification, once, in the foreground, on the final product commit
    (`2026-10-02-gold-publish-per-mart.md`) is not in this worktree, so this
    entry follows the list in section 8's own intro.
 
+### Slice B, part 1 — T3, T4, T5 (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `4bf7578`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited (build output went to the shared
+`CARGO_TARGET_DIR`, scratch files to the session scratchpad); no `docker
+compose` was run. Docker was used for two things: the existing
+`lakehouse-test-support` Postgres container, by the store tests, and
+`rustfs/rustfs:1.0.0-rc.4` containers of my own (own named volume, random
+localhost port, throwaway credentials), started and removed twice for the
+checks listed below, after two starts that failed on a data-directory
+permission. No `Cargo.lock` change: no dependency was added. T6
+is not started: no route is wired, and `routes/uploads.rs` is still
+undeclared and does not compile.
+
+**Commits**
+
+- `98ad9a2` feat(uploads): T3 store and schema for uploaded files
+  (6 files, +1412/-64)
+- `8afc59d` feat(uploads): T4 storage for the files, over one shared RustFS client
+  (5 files, +949/-171)
+- `5480489` feat(uploads): T5 sniffing and parsing as pure functions, with shared fixtures
+  (26 files, +1643/-162)
+
+**What T6 builds on** (signatures as committed)
+
+- `lakehouse_store::uploads`: `enum LoadMode { Replace, Append }` (`Default` is
+  `Replace`; `as_str`, `parse`); `Upload` (not serialized: `storage_key`,
+  `tenant_id`; `rows` is `Option<i64>`, absent means not measured);
+  `insert(pool, &NewUpload) -> Upload` (`NewUpload.tenant_id: Uuid`);
+  `list(pool, tenant_id: Uuid, limit)`; `get(pool, id)` (unscoped);
+  `upload_in_tenants(pool, id, &[Uuid]) -> bool`;
+  `find_by_sha256(pool, tenant_id, sha, exclude_id)`;
+  `mark_ingesting(pool, id, &Value, table, LoadMode, run_id: Option<&str>) ->
+  Option<Upload>`; `mark_finished(pool, id, run_id: Option<&str>, error:
+  Option<&str>, row_count: Option<i64>) -> Option<Upload>`; `delete(pool, id)
+  -> bool`; `table_created_by_upload(pool, tenant_id, table)`;
+  `table_being_loaded(pool, table, exclude_id)`.
+  `lakehouse_store::connectors::any_connector_targets(pool, table) -> bool`.
+- `lakehouse_api::upload_store`: `PREFIX`; `UploadStore::connect(&Config)`,
+  `put(key, Bytes)`, `head_bytes(key, max)`, `delete(key)`, all returning
+  `Result<_, UploadStoreError>`; `UploadStoreError` is
+  `NotConfigured | Unavailable(&'static str)`, its `Display` is the two fixed
+  sentences, and `impl From<UploadStoreError> for ApiError` makes both 503, so
+  a handler can use `?`.
+- `lakehouse_api::upload_parse`: `sniff(head) -> Kind`; `Encoding`
+  (`as_str`, `parse`); `parse_delimiter(&str)`; `DELIMITERS`;
+  `split_records(text, delimiter)`; `preview(head, head_is_truncated,
+  Overrides, max_rows) -> Preview` (serializes as `detected`, `using`,
+  `columns`, `rows`, `truncated`); `detect_*`, `decode`, `is_space`.
+  `PREVIEW_BYTES` and `PREVIEW_ROWS` stay in `routes/uploads.rs` for T6.
+- `rustfs_client`, `upload_store` and `upload_parse` are declared in `main.rs`
+  and in the `lib.rs` mirror.
+
+**Commands run, with counts**
+
+Per commit, scoped:
+
+- T3: `cargo fmt -p lakehouse-store` then `cargo fmt --check` (exit 0; the
+  only files changed were mine); `cargo clippy -p lakehouse-store
+  --all-targets -- -D warnings` (exit 0, after one fix in the new test file:
+  `redundant_closure_for_method_calls`); `cargo test -p lakehouse-store --test
+  uploads`: 23 passed (22 against Postgres, one pure); `--test connectors
+  any_connector_targets`: 2 passed. Checked that the tests bite: with the two
+  SQL guards (`status <> 'ingesting'`, the run-id match) removed, 3 of them
+  fail; the file was restored (`cmp` identical).
+- T4: `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings` (exit 0, after one fix: `items_after_statements`); `cargo test -p
+  lakehouse-api --lib -- rustfs_client:: upload_store:: health::`: 30 passed
+  (13 `health`, unchanged and in place; 5 `rustfs_client`; 12
+  `upload_store`), and the same 30 with `--bin lakehouse-api`. With the
+  not-found arm of `delete` and the error mapping broken, 4 fail; restored.
+- T5: the same fmt and clippy (exit 0); `cargo test -p lakehouse-api --lib --
+  upload_parse::`: 40 passed, and 40 with `--bin`. With four behaviours
+  removed (the truncated-head drop, the UTF-8 mark, the extra whitespace
+  code points, `saturating_add`), 8 fail; restored.
+- `python3 ops/lint/check_bare_iceberg_count.py`: exit 0 after each.
+
+Full verification, once, in the foreground, on the final product commit
+`5480489` (the handoff commit changes only this file):
+
+- `cd rust && cargo fmt --check`: exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  exit 0. It ran after the per-commit clippy runs on the same tree, so cargo
+  re-checked only the crates not already fresh.
+- `cargo test -p lakehouse-store`: exit 0. 19 `test result:` lines (the lib,
+  17 integration binaries, doc tests): **403 passed, 0 failed, 0 ignored**.
+- `cargo test -p lakehouse-api`: exit 0, 3 min 1 s. 25 `test result:` lines
+  (24 test binaries and the doc tests): **2377 passed, 0 failed, 4 ignored**.
+  The 4 ignored were already on the base (one each in the lib and bin targets,
+  from `routes/ai/registry.rs`; two in `tests/parity.rs`); none was added.
+- `python3 ops/lint/check_bare_iceberg_count.py`: exit 0.
+- `python3 ops/lint/check_intra_package_imports.py`: exit 1, as on the base:
+  `file_ingest.py:48`. T7 clears it; I did not touch the file.
+
+Beyond the commands, checks that are not in the repository (their scripts
+lived in the scratchpad):
+
+- `split_records` against Python 3.12's `csv.reader(io.StringIO(text,
+  newline=""), delimiter=d)`: 164,000 generated inputs (two runs, alphabets of
+  quotes, delimiters, CR, LF, space, letters and a non-ASCII letter, up to 120
+  characters): no difference.
+- The ten fixtures: the expected JSON was written by hand, then read by a
+  Python reference reader (`utf-8-sig` or `utf-16`, `newline=""`, blank rows
+  dropped): all ten equal. With `newline=None` `cr_only` and `crlf_utf8_bom`
+  differ, and with the default `cr_only` raises `_csv.Error`; the README says
+  so.
+- `RustFS` 1.0.0-rc.4, a throwaway container, the bucket made with a signed
+  `curl`: `UploadStore` put, a range read of 8 bytes and of the whole object,
+  delete, delete again, delete of a key that never existed (all `Ok`), a read
+  after the delete (`Unavailable("not found")`), an empty object. A 50 MiB
+  `put`: 1.31, 1.26 and 1.21 s (a debug build of the API, localhost); a 256
+  KiB range read 0.018 s; delete 0.016 s; the 256 KiB read back equal. A
+  refused connection (`127.0.0.1:1`): head 2.6 s, put 6.0 s, delete 2.6 s, all
+  `Unavailable("connection failed")`.
+- Real Parquet files, written by `pyarrow` in the code-location image with
+  three codecs, with and without dictionaries: all begin `PAR1` and a `0x15`.
+- Python's `str.isspace()` and Rust's `char::is_whitespace` over every code
+  point: they differ in exactly U+001C to U+001F.
+- On the test Postgres, `jsonb_array_elements` raises on an object and on a
+  scalar, and `@>` does not.
+- Every fixture is in git byte for byte (regenerated and compared with `git
+  show`), and `git check-attr` shows the directory's `.gitattributes` in force.
+
+**Not verified, or not run**
+
+- Nothing is reachable over HTTP yet: no route test, no `route_auth` change.
+- A load end to end (T7), the gate (T9), the console.
+- `0055` was never run against the development database (not mine to touch).
+  It was run on a throwaway Postgres over `0054`, with no row and with one
+  legacy row, and on a fresh one by every `sqlx::test`.
+- A blackholed storage endpoint (dropped packets) was not measured, only a
+  refused one. `object_store` defaults apply, and I did not tune them: 30 s
+  per request, 5 s to connect, up to 10 retries within 3 minutes. A single
+  50 MB `put` is bounded by the 30 s, not by the 300 s route budget.
+- Multi-object delete on a store other than `RustFS` rc.4 (`SeaweedFS`).
+- `.gitattributes` under Windows `autocrlf`: only `git check-attr` was read.
+- `gitleaks` is not installed here. I read the diff: no secret, host, port or
+  client name. The credentials of the throwaway container were in shell
+  commands only.
+- `cargo test --workspace`, as the brief says; it runs after T6 and T8.
+
+**Where the plan was wrong or silent against the code**
+
+1. The crate has a `lib.rs` that mirrors `main.rs`'s module tree, and
+   `health.rs` is compiled in both targets, so `rustfs_client` has to be
+   declared in both. I declared all three modules in both, not only in
+   `main.rs`. T6's `routes/uploads.rs` is compiled in both targets too.
+2. T3 says the serialized `Upload` drops `storageKey` and the tenant; T6's list
+   of response fields also leaves out `contentType` and `sha256`. I followed T3
+   and kept both serialized. T6 can hide them or leave them.
+3. Beyond T3's signatures, in SQL: `mark_ingesting` returns `None` for a row
+   that is already `ingesting`, and `mark_finished` takes the `run_id` it is
+   settling and touches only an `ingesting` row under it. T6 settles a load
+   when it reads the row, and without the run id a slow reader that learned an
+   earlier run's outcome would settle the load that replaced it.
+   `mark_ingesting` also clears the last attempt's `error` and row count, and
+   `mark_finished` stores a count only for a success. `LoadMode` is an enum in
+   the store, `list` takes a required `Uuid`, and `updated_at` is not
+   optional (the column is `NOT NULL`).
+4. The sketch's `delete` doc says a missing object comes back as `NotFound`.
+   `object_store` 0.14 sends S3's multi-object delete (`POST
+   /<bucket>?delete`), and `RustFS` answers `Deleted` for a key it never held.
+   The `NotFound` arm stays for stores that answer 404. A store without
+   multi-object delete needs `AmazonS3Builder::with_disable_bulk_delete`,
+   which belongs in `rustfs_client`.
+5. The sketch's `UploadStore::from_config` took a `&dyn DynSecretResolver`,
+   and the only one `AppState` holds is `connector_secret_resolver`, which
+   refuses these refs by design, so nothing could have made it connect. Its
+   `Debug` doc also claimed to print only the type name while deriving
+   `Debug`; it is written by hand now.
+6. T5 left open: cells are not trimmed (the sketch trimmed in the preview and
+   stripped values in the load); a UTF-8 byte order mark is dropped; "blank"
+   uses `str.isspace()`'s set; rows are returned as parsed, not padded or cut;
+   a header row counts records, not lines. The `Parquet` magic needs a control
+   byte after it, because `PAR1,PAR2` is a legitimate header. Each is stated in
+   `upload_parse.rs`'s module doc, and the README says what the load (T7) must
+   match. The sketch's doc for `detect_header_row` said "no empty leading
+   cell" while its code checked for more than one non-blank cell; the doc now
+   says what the code did.
+7. Signatures moved with the move: `detect_delimiter` takes the text,
+   `detect_header_row` takes records, `Encoding` is an enum. The four moved
+   tests are the same assertions on the new signatures. `detect_delimiter`'s
+   modal count now takes the larger value on a tie (it used to take whichever
+   came last).
+8. The fixture set is the plan's plus four: CRLF with a byte order mark, a lone
+   CR, Latin-1 bytes in a UTF-8 file, malformed quotes. `any_connector_targets`'
+   two tests are in `tests/connectors.rs` beside the helpers they need, not in
+   `tests/uploads.rs`.
+9. `docs/core/BACKLOG.md` is not on this branch, so the migration header
+   cites the plan for `DATA-1` and not the backlog.
+
+**For the planner to decide** (not mismatches)
+
+- `table_created_by_upload` counts only `ingested` rows, as T3 says. A first
+  load that fails after the Iceberg write (the registration failure T7 names,
+  or a partial write), and any table whose upload was deleted, then exists
+  with no `ingested` row, so a retry into that name gets 409 "not free" and
+  "Try again" cannot succeed. Counting a `failed` row that names the table
+  would fix the retry; deleting an upload would still leave its table
+  unloadable.
+- T6 launches the job and then marks the row. Two concurrent ingests both pass
+  the 409 checks and both launch; `mark_ingesting` stops the second from being
+  recorded, not from running. Marking first and recording the run id after
+  would close it.
+- `classify_object_store_error` reported "connection failed" for a refused
+  connection, not its "connection refused": with `object_store` 0.14 its
+  `reqwest::Error` lookup finds nothing. That is existing code, used by the
+  health and connector probes too.
+- A zip that is not a workbook is also `Kind::Workbook`; T6's "looks like an
+  Excel workbook" wording covers it.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
