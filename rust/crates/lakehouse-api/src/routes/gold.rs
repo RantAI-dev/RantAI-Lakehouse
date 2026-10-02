@@ -50,9 +50,11 @@
 //! duplicating every row). See [`export`]'s own doc comment for the
 //! design tradeoff (409, not queueing).
 
+use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::{Principal, PrincipalId};
+use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
 use lakehouse_core::secret::SecretValue;
@@ -64,6 +66,7 @@ use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
@@ -482,6 +485,301 @@ pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
                    against a mart's exported table, even though the lakehouse-trino client \
                    crate already exists and is wired into this build for other routes",
     })))
+}
+
+// ── Per-mart publication switches (DATA-1) ──────────────────────────────
+//
+// Whether `serving.{mart}` is being kept fresh in the `gold` Iceberg
+// namespace is a per-mart setting (`gold_publication`, migration 0054)
+// instead of the Build-menu button ADR 0010 shipped first: the scheduler
+// reads the enabled set every night, an authored pipeline run re-exports
+// its own mart, and switching a mart off only flips the flag — the
+// Iceberg copy is never dropped by this feature (DATA-1 decision table).
+
+/// Whether `{schema}.{mart}` exists in `system.tables` — the PUT route's
+/// 404 gate. Same `system.tables` read `routes::catalog` builds its Gold
+/// asset list from; the identifier is `Ident`-validated before it is
+/// ever interpolated.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the query fails (a dead `ClickHouse` surfaces
+/// as its classified [`ApiError`], never raw text).
+async fn mart_exists(ch: &ChClient, schema: &str, mart: &str) -> Result<bool, ChError> {
+    let sql = format!(
+        "SELECT toString(count()) AS n FROM system.tables \
+         WHERE database = {schema} AND name = {mart}",
+        schema = lakehouse_core::ident::SqlLiteral::from(schema),
+        mart = lakehouse_core::ident::SqlLiteral::from(mart),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("n"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| n != "0"))
+}
+
+/// Unix-millisecond `max(modification_time)` over the active parts of
+/// `{schema}.{mart}`, or `None` when it has no active parts (a view, or
+/// an engine without parts) — "not measured", never a guessed time.
+///
+/// Measured, not assumed, on the compose file's own `ClickHouse` 26.8
+/// (plan §6): every INSERT creates a part whose `modification_time` is
+/// the write time, and a zero-row INSERT creates no part — so this value
+/// moves exactly when a pipeline actually rewrote the mart, which is the
+/// semantics `?ifChanged=true`'s skip needs. The count guard is what
+/// makes a parts-less table `None` rather than the epoch.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the query fails.
+async fn mart_last_changed_at(
+    ch: &ChClient,
+    schema: &str,
+    mart: &str,
+) -> Result<Option<i64>, ChError> {
+    let sql = format!(
+        "SELECT toString(count()) AS parts, \
+                toString(toUnixTimestamp(max(modification_time))) AS changed_s \
+         FROM system.parts \
+         WHERE database = {schema} AND table = {mart} AND active",
+        schema = lakehouse_core::ident::SqlLiteral::from(schema),
+        mart = lakehouse_core::ident::SqlLiteral::from(mart),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let parts = row.get("parts").and_then(Value::as_str).unwrap_or("0");
+    if parts == "0" {
+        return Ok(None);
+    }
+    Ok(row
+        .get("changed_s")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s * 1000))
+}
+
+/// The response body shared by the publication detail `GET` and `PUT`:
+/// the stored switch plus the two measured freshness facts the console's
+/// "Up to date"/"Out of date" line compares.
+async fn publication_body(
+    state: &AppState,
+    mart: &str,
+    enabled: bool,
+    updated_at: Option<String>,
+    can_edit: bool,
+) -> Result<Value, ApiError> {
+    let last_changed_at =
+        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(ApiError::from)?;
+    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(json!({
+        "mart": mart,
+        "enabled": enabled,
+        "updatedAt": updated_at,
+        "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
+        "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
+        "canEdit": can_edit,
+    }))
+}
+
+/// `GET /api/gold/publications` — the enabled marts, and nothing else.
+/// This is the scheduler's source of truth (DATA-1 task 5): a fresh
+/// deployment publishes exactly this list, which is empty until a
+/// `gold:export` principal switches a mart on.
+///
+/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
+/// [`check_export_token`] in the handler, same two-layer shape as the
+/// export routes: the scheduler authenticates with its run token or
+/// service identity; a human session needs `gold:export`. A publication
+/// list is not secret the way row data is, but it does reveal what a
+/// deployment considers its "open format" copy — same posture as
+/// `GET /api/gold/exports`.
+///
+/// # Errors
+///
+/// Returns 401/503 from [`check_export_token`], 500 with fixed text when
+/// Postgres is not reachable (this feature is Postgres-backed, unlike the
+/// export routes), or 500 for a store failure (classified, never raw
+/// upstream text).
+pub async fn publications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
+    check_export_token(
+        state.config.gold_export_run_token.as_deref(),
+        header_token,
+        query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )?;
+
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
+    };
+    let enabled = lakehouse_store::gold_publication::list_enabled(pool)
+        .await
+        .map_err(ApiError::from)?;
+    let publications: Vec<Value> = enabled
+        .iter()
+        .map(|p| json!({ "mart": p.mart, "enabled": p.enabled, "updatedAt": p.updated_at }))
+        .collect();
+    Ok(ApiJson(json!({ "publications": publications })))
+}
+
+/// `GET /api/gold/export/{mart}/publication` — one mart's publication
+/// state: the stored switch plus the two measured freshness facts.
+///
+/// A mart with no `gold_publication` row is OFF (the default), reported
+/// as `enabled: false, updatedAt: null` — a missing row is a state, not
+/// an error. `lastChangedAt`/`lastExportedAt` are honest `null`s when
+/// they cannot be measured (no active parts; no successful export yet) —
+/// the console renders "Not measured"/"Never published" from exactly
+/// these nulls, never a guessed time.
+///
+/// # Errors
+///
+/// Returns 400 for a mart that is not a valid identifier, 500 with fixed
+/// text when Postgres is unreachable, or classified store/`ClickHouse`
+/// errors otherwise.
+pub async fn publication(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
+    };
+    let stored = lakehouse_store::gold_publication::get(pool, mart_ident.as_str())
+        .await
+        .map_err(ApiError::from)?;
+    let (enabled, updated_at) = stored.map_or((false, None), |p| (p.enabled, Some(p.updated_at)));
+    let can_edit = principal
+        .as_ref()
+        .is_some_and(|Extension(p)| p.has("gold:export"));
+    let body = publication_body(&state, mart_ident.as_str(), enabled, updated_at, can_edit).await?;
+    Ok(ApiJson(body))
+}
+
+/// Body of `PUT /api/gold/export/{mart}/publication`.
+#[derive(Debug, Deserialize)]
+pub struct PublicationBody {
+    /// Whether the scheduler should keep this mart's Iceberg copy fresh.
+    /// `false` only flips the flag — the existing Iceberg table is never
+    /// dropped by this feature (DATA-1 decision table).
+    enabled: bool,
+}
+
+/// Best-effort audit row for a successful toggle, following
+/// `routes::pipelines::record_pipeline_audit`'s posture: a failed audit
+/// write is logged, never propagated — it must not turn an already-
+/// succeeded configuration change into a 500.
+async fn record_publication_audit(
+    state: &AppState,
+    principal: &Principal,
+    mart: &str,
+    enabled: bool,
+) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "gold.publication_set".to_owned(),
+        resource_kind: Some("gold_mart".to_owned()),
+        resource_id: Some(mart.to_owned()),
+        args: Some(json!({ "enabled": enabled })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::error!(%err, mart, "failed to record gold publication audit");
+    }
+}
+
+/// `PUT /api/gold/export/{mart}/publication` — switch one mart's
+/// publishing on or off. `POLICY_TABLE` floors this route at
+/// `RequiresPermission("gold:export")`, so the handler never re-checks
+/// the permission (fail closed at the gate); it needs the principal only
+/// to record who flipped the switch.
+///
+/// Returns 404 when `serving.{mart}` does not exist — measured against
+/// `system.tables`, not assumed — so a typo cannot silently enable
+/// publishing for a mart nobody can build.
+///
+/// # Errors
+///
+/// Returns 400 for a mart that is not a valid identifier, 404 for an
+/// unknown mart, 401 if the gate somehow let a principal-less request
+/// through (never, through the router), or classified store/`ClickHouse`
+/// errors otherwise.
+pub async fn set_publication(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+    principal: Option<Extension<Principal>>,
+    // The body extractor is deliberately LAST: axum requires consuming
+    // extractors at the end of the argument list (every sibling handler
+    // here follows the same order).
+    Json(body): Json<PublicationBody>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Internal("gold publications require Postgres".to_owned()).into());
+    };
+    let exists = mart_exists(
+        &state.clickhouse,
+        &state.config.gold_source_schema,
+        mart_ident.as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !exists {
+        return Err(ApiError::NotFound(format!(
+            "mart {:?} does not exist in {}",
+            mart_ident.as_str(),
+            state.config.gold_source_schema
+        ))
+        .into());
+    }
+
+    let updated = lakehouse_store::gold_publication::upsert(
+        pool,
+        mart_ident.as_str(),
+        body.enabled,
+        principal.id.uuid(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    record_publication_audit(&state, &principal, mart_ident.as_str(), body.enabled).await;
+
+    let body = publication_body(
+        &state,
+        mart_ident.as_str(),
+        updated.enabled,
+        Some(updated.updated_at),
+        true,
+    )
+    .await?;
+    Ok(ApiJson(body))
 }
 
 #[cfg(test)]

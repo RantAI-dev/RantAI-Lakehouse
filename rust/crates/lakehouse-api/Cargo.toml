@@ -132,6 +132,15 @@ async-trait = { workspace = true }
 # deterministic budget/timeout tests (WS2 §4) — a real `sleep` would make
 # those tests slow and, at the margins, flaky.
 tokio = { workspace = true, features = ["test-util"] }
+# `tests/gold_publication.rs` (DATA-1) proves the per-mart publication
+# routes' ClickHouse-backed halves (404 for an unknown mart, skip-when-
+# unchanged for `?ifChanged=true`) against a REAL `ClickHouse` — the same
+# `testcontainers` arrangement `lakehouse-test-support` provides for
+# Postgres, pinned to the compose file's own `26.8` tag. Versions mirror
+# `lakehouse-test-support`'s own declarations so Cargo unifies on one
+# build.
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
+testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `pipeline_source.rs`'s tests (WS4 item C2) exercise the allowlist builder
 # against a real filesystem (a real `..`/absolute-path/symlink escape must
 # actually resolve to a file outside a real base directory to prove
