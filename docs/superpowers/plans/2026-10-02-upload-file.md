@@ -604,6 +604,48 @@ Section 9 has the findings (`C1` to `C3`). One commit. Rust and Python.
   Known limitations" with the limits of the feature page.
 - **Accept:** each file names only settings and routes that exist.
 
+### T13 — Compose gives the API its storage settings
+
+From the review of slice D (`BLOCKER D1`). One commit.
+
+The API's upload store and its RustFS health probe both read
+`RUSTFS_S3_ENDPOINT`, `RUSTFS_ACCESS_KEY_SECRET_REF` and
+`RUSTFS_SECRET_KEY_SECRET_REF` (`config.rs`), and the `lakehouse-api`
+service in `docker-compose.yml` passes none of them. On the compose stack
+every upload is therefore refused with "Upload storage is not configured.",
+and the feature cannot be tried at all.
+
+- `docker-compose.yml`, `lakehouse-api` `environment:`, with a comment block
+  in the file's style:
+  - `RUSTFS_S3_ENDPOINT: ${RUSTFS_S3_ENDPOINT:-http://rustfs:9000}` (not a
+    secret; the in-network name, as `TENANT_WAREHOUSE_S3_ENDPOINT` uses).
+  - `RUSTFS_ACCESS_KEY_SECRET_REF: ${RUSTFS_ACCESS_KEY_SECRET_REF:-env:UPLOAD_S3_ACCESS_KEY}`
+    and the same for the secret key with `env:UPLOAD_S3_SECRET_KEY`. A
+    reference is not a secret, so a default is safe.
+  - `UPLOAD_S3_ACCESS_KEY: ${UPLOAD_S3_ACCESS_KEY:-}` and
+    `UPLOAD_S3_SECRET_KEY: ${UPLOAD_S3_SECRET_KEY:-}`: dedicated names, never
+    `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` themselves (the rule ADR 0002
+    Addendum 2 states and `TENANT_WAREHOUSE_S3_*` follows), and no default
+    credential (`AGENTS.md` rule 5). The comment says a deployment should
+    give them a credential limited to the warehouse bucket, and to its
+    `uploads/` prefix where the store supports per-prefix policies.
+- `rust/crates/lakehouse-api/src/rustfs_client.rs`: a reference that
+  resolves to an empty or whitespace-only value is `NotConfigured`, like an
+  unset reference. Without this, the defaults above would make an
+  unconfigured stack build a client with empty keys: the health tile would
+  turn from "unknown" to a failure, and uploads would answer "unavailable
+  (authentication failed)" instead of "not configured". Tests for both.
+- `.env.example`: a comment block per new name. `README.md` settings table:
+  a row for each of the five names, if not already there.
+- `docs/OPERATIONS.md`: replace the paragraph T12 wrote about the missing
+  settings with what an operator now sets.
+- **Accept:** `docker compose --profile '*' config --quiet` passes and
+  shows the five names on `lakehouse-api`; `check_compose_init_readiness.py`
+  passes; the `rustfs_client`, `upload_store` and `health` tests pass. A
+  `docker compose up` from a clean project is *not verified* (rule 8); the
+  trial recreates `lakehouse-api` on the development stack, which is the
+  first real start with these settings.
+
 ## 4. Slices
 
 | Slice | Tasks | Why separate |
@@ -611,7 +653,7 @@ Section 9 has the findings (`C1` to `C3`). One commit. Rust and Python.
 | A | T1–T2 | Hygiene of the base. Could merge on its own |
 | B | T3–T5, T5a, T6, T6a, T8 | The API. Rust is confined to this slice and T1 |
 | C | T7, T7a, T9 | The job and the gate. T7a touches Rust again |
-| D | T10–T12 | Console and documents. No Rust, no Python |
+| D | T10–T13 | Console and documents; T13 touches compose and one Rust file |
 
 The developer appends a handoff per slice. The planner reviews each before
 the next starts.
@@ -2582,4 +2624,56 @@ that were idle and older than 30 minutes before its own run. The leak is
 on the base and needs its own change.
 
 **Slice D starts from `feat/upload-file` at this review's commit.**
+
+### Slice D — T10, T11, T12 (reviewer, 2026-10-03)
+
+Reviewed `f26c3c5`, `dff5173` and `4a7bbcb` against T10 to T12. The
+developer session that started the slice was cut off by a session end after
+`f26c3c5`; a second session did T11 and T12 from there. The first session
+left an experiment under `src/tmp-exp/`, untracked; the reviewer removed it.
+
+**Findings: one `BLOCKER`, which becomes T13.**
+
+- `BLOCKER D1`: `docker-compose.yml` gives `lakehouse-api` none of the
+  three settings the upload store reads. The developer found it while
+  writing T12 and, rightly, did not write "nothing new to configure". The
+  reviewer confirmed it on the running stack: the API container has no
+  `RUSTFS_*` variable. Not a defect of slice D; a gap in the plan, which
+  assumed the settings were already there.
+
+What was checked against the plan:
+
+- Layers: the contract mirrors the routes; the client goes through
+  `apiFetch` and keeps the API's sentence as the error message; the
+  components import `@/services` only, start with `"use client"`, and call
+  no `fetch` of their own. The route file is a thin default export.
+- The rules the screens share with the API live in `src/lib/uploads.ts`,
+  with `node:test` tests: the table-name rule says the API's sentence word
+  for word, and `suggestTableName` only suggests names that pass it.
+- The upload page: a real labelled file input with drop as an addition;
+  the size refusal before anything is sent; detected and chosen values in
+  Check, an empty preview keeping Next disabled; the mode choice only for a
+  table a loaded upload of the tenant created; the registration-failed case
+  steering a retry to "Replace its rows". "Not measured" for rows.
+- `FormStepLayout` gained one optional prop with the old text as its
+  default, so every other wizard is unchanged.
+- The existing Connectors tab moved unchanged into its own component; its
+  tests pass.
+
+Verification re-run by the reviewer on `a2887c2`:
+
+- `bun run typecheck` — pass.
+- `bun run lint` — 0 errors, the 5 warnings of the base.
+- `bun run test` — 501 passed in 72 files (428 in 67 before the slice).
+- `bun --bun next build` — pass; `/connectors/upload` is built.
+
+Not verified: any screen in a browser against a running API. That is the
+trial.
+
+Accepted as a limit, not a finding: the mode choice is offered by reading
+the tenant's upload list, because the API has no read for who holds a
+name. A table whose upload was deleted is still the tenant's and still
+loads, but replaces without asking. `isUploadedTable` says so.
+
+**T13, then the trial.**
 
