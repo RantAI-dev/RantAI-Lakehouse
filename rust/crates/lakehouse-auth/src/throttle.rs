@@ -88,6 +88,14 @@ pub async fn locked_until(pool: &PgPool, key: &str) -> Result<Option<OffsetDateT
 /// covers the expired lock; `NULL` (never locked) yields `NULL`, which a
 /// `CASE WHEN` treats as false.
 ///
+/// A reset must also CLEAR the stale lock time (`locked_until = NULL`,
+/// review blocker 5, 2026-10-03): an expired `locked_until` left on the
+/// row satisfies `locked_until < now` on every later failure, so the
+/// count would reset to 1 forever and the key could never lock again —
+/// one lockout, then unlimited guessing. With the clear, the expired-lock
+/// clause fires exactly once, and the fresh window alone governs until it
+/// lapses or the key reaches the limit again.
+///
 /// Returns `Some(locked_until)` if this call just set the lock,
 /// `None` otherwise.
 ///
@@ -132,6 +140,9 @@ pub async fn record_failure(
                ELSE login_throttle.failures + 1 \
              END) >= $4 \
                THEN $2 + $5::interval \
+             WHEN login_throttle.window_started_at < $2 - $3::interval \
+               OR login_throttle.locked_until < $2 \
+               THEN NULL \
              ELSE login_throttle.locked_until \
            END \
          RETURNING login_throttle.failures, login_throttle.locked_until",
