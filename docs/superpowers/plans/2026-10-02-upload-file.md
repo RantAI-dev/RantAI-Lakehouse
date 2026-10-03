@@ -2332,6 +2332,23 @@ Mismatches between plan and code:
   `uploads/` (the plan's advice) stores files but makes that tile fail.
   Written in `docs/OPERATIONS.md`.
 
+### T13a (developer, 2026-10-03)
+
+Commit `5780cf7` `fix(uploads): T13a the API takes the in-network storage
+endpoint`, for `D2` (T13's mismatch 1, confirmed by the reviewer).
+
+- `lakehouse-api` gets `RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}`;
+  in the worktree (no `.env`) `docker compose --profile '*' config` resolves
+  it to `http://rustfs:9000`.
+- The T13 warnings in `.env.example` and `docs/OPERATIONS.md` are replaced by
+  one line; the README row no longer says compose reads `.env`'s value. The
+  module doc in `rustfs_client.rs` is rewrapped, no code change.
+- Run: `cargo fmt --check` pass; `cargo clippy -p lakehouse-api --all-targets
+  -- -D warnings` pass; `cargo test -p lakehouse-api --bin lakehouse-api
+  rustfs_client` 6 passed, 0 failed; `docker compose --profile '*' config
+  --quiet` exit 0; `check_compose_init_readiness.py` exit 0.
+- Not verified: a `docker compose up` from a clean project (rule 8).
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
