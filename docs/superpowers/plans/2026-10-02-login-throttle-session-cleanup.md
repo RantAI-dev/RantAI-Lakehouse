@@ -401,6 +401,58 @@ Verification, run in the foreground on `2de51bf`:
 - Python and compose lines: not run — no Python or compose file
   touched.
 
+### `feat/login-throttle-session-cleanup` (developer, 2026-10-03, review 2 fix round — NOT a handoff)
+
+This is a stop, not a green handoff: the DB-backed suites were not run
+on this machine and this branch adds code they must verify. Per review
+2's instruction ("If Docker is not available, say so and stop; the
+reviewer runs them"), the reviewer runs them before merge.
+
+Fixes (reviewer's branch `claude/gracious-albattani-vw5wsb` merged in
+first, fast-forward to `38fce06`; one commit per finding as required):
+
+- **Blocker 5** (`52bb2e1`, `rust/crates/lakehouse-auth/src/throttle.rs`):
+  the `locked_until` CASE in `record_failure` now clears the lock to
+  `NULL` under the same reset predicate, before the ELSE that preserved
+  the stale expired lock. Exactly the reviewer's experiment. The
+  expired-lock clause fires once; a key can always lock again after its
+  window fills. Module doc updated with the why and the review
+  citation.
+- **Blocker 3** (`805641e`, `rust/crates/lakehouse-auth/src/cleanup.rs`):
+  `use lakehouse_test_support as _;` added to the inline test module,
+  with the why-comment. Exactly the reviewer's experiment.
+- **SHOULD-FIX 6 + nit** (`d37b9fa`): "5 minute(s)" → proper
+  pluralisation in `login-page.tsx` with the test asserting it;
+  README's missing known-limitations bullet (active service tokens
+  never expire); OPERATIONS.md drops the untrue "(with a logged
+  warning)" and cites `MissedTickBehavior::Skip` instead; the
+  "mirrors exactly" unlock-SQL nit softened to "matches ... for an
+  ordinary address" with the trim/lower caveats spelled out.
+
+Verification actually run, in the foreground, on `d37b9fa`:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — clean.
+- `cargo test -p lakehouse-core` — 46 passed, 0 failed.
+- `cargo test --workspace --no-run -j 1` — 0 errors.
+- `bun run typecheck` — clean. `bun run lint` — 0 errors, 6
+  pre-existing warnings (untouched files). `bun run test` — 303
+  passed, 0 failed (the pluralisation test asserts the new wording).
+- `cargo test -p lakehouse-auth` — **attempted, not runnable here**:
+  the harness `ctor` aborts every test binary at process start
+  (`lakehouse-test-support: failed to start the Postgres testcontainer
+  (is Docker running and reachable?)` → SIGABRT; docker.sock is
+  root:docker, this user is not in the docker group, no sudo, no local
+  Postgres). No pass counts are producible on this machine. The
+  reviewer's experiments (8/8 throttle with the blocker 5 line; 2/2
+  cleanup with the blocker 3 line) are the only executed verification
+  of these two fixes; the full suites
+  (`cargo test -p lakehouse-auth`, `cargo test -p lakehouse-api
+  --test login_throttle`) must run on the fixed branch before merge.
+
+Python/compose lines: not run — no Python or compose file touched.
+
 ## 8. Review (planner appends)
 
 ### Review 1 — planner, 2026-10-03, on `5754a1e`
