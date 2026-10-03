@@ -473,15 +473,14 @@ Iceberg table. What that asks of the operator:
   store and the RustFS health probe read. You set two: `UPLOAD_S3_ACCESS_KEY`
   and `UPLOAD_S3_SECRET_KEY`, dedicated names that are never RustFS's own
   `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (ADR 0002 Addendum 2) and have no
-  default. `RUSTFS_S3_ENDPOINT` (default `http://rustfs:9000`),
+  default. `CH_RUSTFS_S3_ENDPOINT` (default `http://rustfs:9000`),
   `RUSTFS_ACCESS_KEY_SECRET_REF` (default `env:UPLOAD_S3_ACCESS_KEY`) and
   `RUSTFS_SECRET_KEY_SECRET_REF` (default `env:UPLOAD_S3_SECRET_KEY`) only
   need setting to override those defaults. Left empty, `POST /api/uploads`
   answers 503 "Upload storage is not configured.", nothing is stored, and
-  the RustFS health tile reads "unknown". Do not leave
-  `RUSTFS_S3_ENDPOINT=http://localhost:9010` (the `.env.example` line for
-  host runs) in the `.env` that compose reads: it overrides the in-network
-  default, and inside the container `localhost` is the container.
+  the RustFS health tile reads "unknown". The API container takes its
+  endpoint from `CH_RUSTFS_S3_ENDPOINT`, not from the host-facing
+  `RUSTFS_S3_ENDPOINT` of `.env`.
   Least privilege: the credential needs read, write and delete on the
   warehouse bucket's `uploads/` prefix and nothing else of the API's; where
   your store supports per-prefix policies, restrict it to that prefix, and

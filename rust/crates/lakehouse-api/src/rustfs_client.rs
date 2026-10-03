@@ -30,11 +30,11 @@
 //!
 //! Either ref unset is [`RustfsClientError::NotConfigured`], returned before
 //! any resolver is built. A ref that resolves to an empty or whitespace-only
-//! value is `NotConfigured` too (finding `D1`, below). Building the client opens no connection, so a
-//! deployment without object storage fails here, not on the network. The
-//! endpoint is the deployment's own setting (`RUSTFS_S3_ENDPOINT`), never a
-//! request value, so no SSRF check applies, unlike connector dials
-//! (`connector_dial`).
+//! value is `NotConfigured` too (finding `D1`, below). Building the client
+//! opens no connection, so a deployment without object storage fails here,
+//! not on the network. The endpoint is the deployment's own setting
+//! (`RUSTFS_S3_ENDPOINT`), never a request value, so no SSRF check applies,
+//! unlike connector dials (`connector_dial`).
 
 use lakehouse_core::secret::{EnvSecretResolver, SecretError, SecretResolver, SecretValue};
 use object_store::aws::{AmazonS3, AmazonS3Builder};

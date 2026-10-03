@@ -389,9 +389,12 @@ services:
       #    read these three settings (`config.rs`, `rustfs_client.rs`) but
       #    this service passed none of them, so on this stack every upload
       #    answered "Upload storage is not configured." ──
-      # The endpoint is not a secret: the in-network name, as
-      # `TENANT_WAREHOUSE_S3_ENDPOINT` above uses.
-      RUSTFS_S3_ENDPOINT: ${RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # The endpoint is not a secret. The container gets the name `config.rs`
+      # reads, interpolated from the IN-NETWORK `CH_RUSTFS_S3_ENDPOINT` the
+      # Dagster services use, never from the host-facing `RUSTFS_S3_ENDPOINT`
+      # of `.env` (a localhost address, which inside a container is the
+      # container): the split `LAKEKEEPER_BASE_URI` above makes too (`D2`).
+      RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # The two refs are ADR 0002 `secretRef`s, not secrets, so a default is
       # safe. They name DEDICATED variables below, never
       # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (RustFS's own root key): the
