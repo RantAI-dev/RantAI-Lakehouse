@@ -246,7 +246,83 @@ bullets should disappear in the same merge that makes them untrue.
 
 ## 7. Handoff (developer appends)
 
-_Empty._
+### `feat/login-throttle-session-cleanup` (developer, 2026-10-03)
+
+Base: `origin/main` at `0277ebd`. One commit per task, in plan order:
+
+- `daa562a` — T1, `ApiError::TooManyRequests` + `Retry-After` rendering.
+- `df4b8f1` — T2, migration `0055`, `throttle.rs`, integration tests.
+- `98567a1` — T3, config fields, `ThrottlePolicy` in `AppState`, throttled
+  `login`. Carries the `auth_retention_days` field T4 consumes (one
+  struct-block edit; splitting it would have left a commit whose
+  `Debug`/`from_map` did not compile).
+- `260874f` — T4, `cleanup.rs` + hourly `spawn_auth_cleanup`.
+- `f1128ca` — T5, console: `too_many_requests` code, `Retry-After` read,
+  login-page wait message, notify hint for the new code.
+- `71d3198` — T6, README/SECURITY limitation rewrites, Configuration
+  table, `.env.example`, OPERATIONS.md section, CHANGELOG.
+- `130f4b6` — T3's acceptance tests (`tests/login_throttle.rs`), written
+  after the T6 docs commit when the handoff draft found them missing —
+  five tests, one per acceptance bullet in the plan's T3.
+
+Deviations from the plan, none of scope:
+
+- `ThrottlePolicy` gained `#[derive(Debug, Clone)]` (the concurrent test
+  moves a clone into each spawned task; the struct has no `Copy`).
+- `PurgeCounts` field names are `sessions`/`service_credentials`/
+  `throttle_entries` — clippy's `struct_field_names` rejects the uniform
+  `_rows` postfix; renaming beat an `#[allow]`.
+- `login_failure_window_secs`/`login_lockout_secs`/`auth_retention_days`
+  are `u32` (not `u64`): the `u64` version forced `as i64` casts
+  (`cast_possible_wrap`); `u32` converts losslessly via `i64::from`.
+
+§6 verifications:
+
+- `0055` free: enumerated every remote branch (`git ls-remote --heads`)
+  and grepped each tree's `rust/migrations/` — no `0055` anywhere.
+- Case sensitivity: account lookup is `WHERE u.email = $1`
+  (`password.rs::verify`) — case-sensitive; the throttle key lower-cases.
+  So `Alice@x.com` and `alice@x.com` are different accounts sharing one
+  throttle key: an attacker hammering either spelling locks both. That is
+  the safe direction; no change made.
+- `Retry-After` through the proxy: `next.config.ts` rewrites `/api/*` as
+  a same-origin pass-through proxy (no header filtering in Next.js
+  rewrites), and the client reads it from that same-origin response.
+  Verified by code read, not by a live 429 round trip — *not exercised
+  end to end* (below).
+- No existing response changed: the new enum variant only adds arms;
+  `lakehouse-core`'s 46 status/rendering tests pass.
+- Shutdown: the cleanup task is a bare `tokio::spawn` never joined by
+  `with_graceful_shutdown`; main returning drops it. A purge caught
+  mid-run at shutdown leaves its finished `DELETE`s applied and the rest
+  to the next hourly run — the deletes are idempotent.
+
+Verification actually run, on the final commit `71d3198`, foreground:
+
+- `cargo fmt --check` (rust/) — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (rust/) — pass, zero warnings.
+- `cargo test -p lakehouse-core` — **46 passed, 0 failed**.
+- `cargo test --workspace --no-run -j 1` — every test binary compiles,
+  0 errors (the `-j 1` matters: parallel linking OOM-kills rustc on this
+  7 GB machine).
+- `bun run typecheck` — pass. `bun run lint` — 0 errors, 6 warnings, all
+  pre-existing in files this PR does not touch (`data-table.tsx`,
+  `sidebar.tsx`, `alerts-page.tsx`, `open-format-card.test.tsx`,
+  `use-data-table.ts`, `dashboard-specs.ts`).
+- `bun run test` — **301 pass, 0 fail** (56 files).
+
+*Not verified, with reason:* every DB-backed test (`#[sqlx::test]` in
+`lakehouse-auth`/`lakehouse-api`, including `tests/throttle.rs` and
+`tests/login_throttle.rs`) — this environment has no reachable Docker
+daemon (docker.sock permission denied; no passwordless sudo), and
+`lakehouse-test-support` panics without one by design. The acceptance
+tests compile clean (`cargo test --workspace --no-run -j 1`, 0 errors)
+but have never executed. CI runs `cargo test --workspace --locked` on
+the PR with Docker; that run is the gate for these.
+
+Python/compose lines of the verification block: not run — this PR
+touches no Python and no compose file.
 
 ## 8. Review (planner appends)
 
