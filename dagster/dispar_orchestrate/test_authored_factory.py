@@ -199,9 +199,25 @@ class OpForPipelineTest(unittest.TestCase):
     `test_maintenance.py` monkeypatches `_ch_query`."""
 
     def test_ready_pipeline_reads_transforms_writes_and_reports_real_rows(self) -> None:
+        """F1.4 (#57): `_write_clickhouse_table` is now ATOMIC: the body
+        inserts the new rows into a `__staging_<run_id>` table under the
+        same `target_zone`, then `EXCHANGE TABLES` swaps staging and
+        target. The previous direct `INSERT INTO serving.`orders_clean``
+        left a window where a partial mid-run write was visible to a
+        parallel reader -- a non-atomic read against a consumer
+        dashboard (this plan's `dagster_pipeline_orchestrator` is the
+        unit, but the row schema here is the same `serving` zone used
+        downstream). The two new asserts pin the staging-EXCHANGE
+        sequence (an atomic INSERT on the staging table followed by
+        EXCHANGE TABLES swapping the staging and target tables).
+        """
         pipeline = _ready_pipeline()
         run_fn = authored_factory._op_for_pipeline(pipeline)
 
+        # _write_clickhouse_table now does 2 count() calls (before
+        # insert on staging, after exchange on target -- the staging
+        # table is dropped after EXCHANGE, so the post-count must
+        # read the swapped-in target).
         counts = iter([[{"n": "0"}], [{"n": "3"}]])  # before, after
         exec_calls: list[str] = []
         with mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
@@ -211,7 +227,81 @@ class OpForPipelineTest(unittest.TestCase):
 
         self.assertEqual(result["rows"], 3)
         self.assertEqual(result["skipped_verbs"], [])
-        self.assertTrue(any("INSERT INTO serving.`orders_clean`" in c for c in exec_calls))
+        # The INSERT must target a staging table, not the live target.
+        insert_calls = [c for c in exec_calls if "INSERT INTO" in c]
+        self.assertEqual(len(insert_calls), 1, "exactly one INSERT per run")
+        self.assertNotIn("INSERT INTO serving.`orders_clean`", insert_calls[0])
+        self.assertIn("INSERT INTO serving.`__staging_orders_clean", insert_calls[0])
+        # The atomic swap follows the staging INSERT.
+        exchange_calls = [c for c in exec_calls if "EXCHANGE TABLES" in c]
+        self.assertEqual(len(exchange_calls), 1, "exactly one EXCHANGE per run")
+        self.assertIn("serving.`__staging_orders_clean", exchange_calls[0])
+        self.assertIn("serving.`orders_clean`", exchange_calls[0])
+
+    def test_atomic_write_succeeds_on_first_attempt(self) -> None:
+        """F1.4 (#57): the staging-EXCHANGE sequence completes in one
+        op invocation and reports a real row delta. The `_run` op
+        body's `SELECT count()` AFTER sequence must see the row count
+        of the SWAPPED-IN target (which is what readers see)."""
+        pipeline = _ready_pipeline()
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+
+        # First count(): before-staging-insert (target is the empty one
+        # from `_ensure_target_table`, so 0). Second count(): after
+        # EXCHANGE, on the swapped-in target that started as staging
+        # and now holds the 3 rows -- 3.
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        with mock.patch.object(authored_factory, "_ch_exec"), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+            result = run_fn(build_op_context())
+
+        self.assertEqual(result["rows"], 3)
+
+    def test_atomic_write_is_idempotent_under_retry(self) -> None:
+        """F1.4 (#57): a retry of the same op invocation must produce
+        the SAME final state on `serving.orders_clean` as a single
+        successful run. The atomic staging path makes the operation
+        idempotent: on retry the staging table is dropped (if left
+        over from a failed prior attempt) and re-created before the
+        INSERT. The op-body then runs to completion on the second
+        attempt, and the row delta is 3 -- not 6, which would have
+        been the symptom of a direct INSERT under retry.
+
+        We invoke the op body twice in the same test process (mirroring
+        `test_op_source_metadata.py::test_default_retry_policy_retries_a_transient_network_error`
+        which calls its op body twice to simulate a retry) and assert
+        the second invocation sees a final row count equal to the
+        first invocation's row count -- i.e. the swap puts the target
+        back to its post-write shape, not to its pre-write + staging
+        shape."""
+        pipeline = _ready_pipeline()
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+
+        # Each invocation: before=0, after=3. We don't share state
+        # between calls because `_write_clickhouse_table` drops the
+        # staging table before the INSERT, so each run begins from
+        # the same starting point. One iter per invocation (not a
+        # factory), because the lambda closes over the iter -- if a
+        # fresh iter were returned on every call, the second
+        # `_ch_query_json` would also read `{"n":"0"}` and the row
+        # delta would be 0.
+        counts_1 = iter([[{"n": "0"}], [{"n": "3"}]])
+        # First invocation -- staging-write + EXCHANGE.
+        with mock.patch.object(authored_factory, "_ch_exec"), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_1)), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+            first = run_fn(build_op_context())
+        self.assertEqual(first["rows"], 3)
+
+        counts_2 = iter([[{"n": "0"}], [{"n": "3"}]])
+        # Second invocation -- same op body, must still report 3
+        # rows of delta (no double-count, no leftover staging rows).
+        with mock.patch.object(authored_factory, "_ch_exec"), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_2)), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+            second = run_fn(build_op_context())
+        self.assertEqual(second["rows"], 3)
 
     def test_fbic_enabled_pipeline_records_a_skipped_verb_not_a_call(self) -> None:
         pipeline = _ready_pipeline(fbicEnabled=True)
@@ -333,10 +423,23 @@ class AuthoredScheduleTest(unittest.TestCase):
         ]}
         resp.raise_for_status.return_value = None
         with mock.patch.object(authored_factory.requests, "get", return_value=resp) as mocked_get:
-            jobs, schedules = authored_factory.build_authored_definitions(_cfg())
+            jobs, schedules, deps = authored_factory.build_authored_definitions(_cfg())
         self.assertEqual(mocked_get.call_count, 1)
         self.assertEqual(len(jobs), 2)
         self.assertEqual([s.name for s in schedules], ["authored__pl_dedupe_select_abc123_schedule"])
+        # F1.1: the third element is the `(pipeline, job)` list the
+        # sensor builder now consumes — one entry per fetched pipeline,
+        # and the `job` is the SAME `JobDefinition` instance the
+        # `jobs` list holds. A second `build_authored_job` call here is
+        # what F1.1 (BLOCKER) was about: the same name on two distinct
+        # `JobDefinition` objects crashes `Definitions` with
+        # `DagsterInvalidDefinitionError: Duplicate job definition found`.
+        self.assertEqual(len(deps), 2)
+        jobs_set = {id(j) for j in jobs}
+        self.assertTrue(
+            all(id(dep_job) in jobs_set for _dep_pipeline, dep_job in deps),
+            "the sensor builder must reuse the jobs the jobs list holds",
+        )
 
 
 # ── R3 plan 2a: dependency-sensor tests (appended below) ──────────────
@@ -418,6 +521,13 @@ def _dep_pipeline(pid: str, depends_on: list[str]) -> dict[str, Any]:
     return {**_ready_pipeline(), "id": pid, "dependsOn": depends_on}
 
 
+def _dep_pipeline_status(pid: str, depends_on: list[str], status: str) -> dict[str, Any]:
+    """A pipeline dict with an explicit `status` field, so the F1.2
+    paused-skip test can exercise the `paused` branch without changing
+    the default `ready` shape every other test in this class relies on."""
+    return {**_dep_pipeline(pid, depends_on), "status": status}
+
+
 def _build_dep_sensor(pid: str, depends_on: list[str]):
     """Helper: build the pipeline dict, then build and return the
     sensor `RunStatusSensorDefinition`. The sensor body is a closure
@@ -448,6 +558,28 @@ class TestDependencySensor:
         is the factory's whole point for pipelines without upstream wiring.
         """
         assert build_authored_dependency_sensor(_dep_pipeline("pl-empty", []), None) is None
+
+    def test_returns_none_when_a_chained_pipeline_is_paused(self) -> None:
+        """F1.2 SHOULD-FIX (#57): a `paused` pipeline with a non-empty
+        `dependsOn` produces NO `run_status_sensor`. Dagster keeps the
+        sensor's RUNNING/STOPPED state across a code-location reload,
+        so a sensor shipped RUNNING continues to fire even after the
+        pipeline's source `dependsOn` disappears — pausing the
+        pipeline must therefore skip the sensor at code-load time, AND
+        the API's `authored_status` route must stop the stored sensor
+        next to the schedule. The first half is asserted here; the
+        API half is the Rust `routes::pipelines::authored_status` wire
+        in F1.2's second step."""
+        @job(name="authored__pl_paused_down")
+        def _placeholder_job() -> None:
+            return None
+        assert (
+            build_authored_dependency_sensor(
+                _dep_pipeline_status("pl-paused-down", ["pl-up-a"], "paused"),
+                _placeholder_job,
+            )
+            is None
+        )
 
     def test_returns_a_sensor_when_depends_on_is_set(self) -> None:
         """A non-empty `depends_on` produces a sensor with the
@@ -489,14 +621,23 @@ class TestDependencySensor:
             job_name="ingest_job",
         )
 
-    def test_yields_run_request_with_run_key_equal_to_upstream_run_id_when_all_fresh(self) -> None:
+    def test_yields_run_request_with_run_key_equal_to_sorted_upstream_run_ids_when_all_fresh(self) -> None:
         """Happy path: the downstream has one prior run (start_time=100);
         upstream has one SUCCESS run that ended at 200 (>100). Yield
-        `RunRequest(run_key=<upstream run id>)`. `run_key` MUST equal the
-        triggering upstream run id -- Dagster's own dedup keeps a re-firing
-        upstream from launching the downstream twice for the same upstream
-        run; using any other key (the downstream id, the upstream job name,
-        a fresh UUID) breaks that."""
+        `RunRequest(run_key=authored-deps:<sorted upstream run ids>)`.
+
+        F1.3 (#57): the OLD `run_key = upstream_run.run_id` would launch
+        one downstream per upstream in a multi-upstream chain (each
+        upstream's own tick yielded a key derived only from itself; the
+        daemon's dedup was per-key, not per-round). The new key is the
+        sorted tuple of every upstream's latest SUCCESS run id, prefixed
+        with `authored-deps:`, so two ticks that see the same set of
+        upstream successes ask for the same downstream launch once.
+
+        With one upstream the new value is the same as the old (modulo
+        the prefix); the multi-upstream "one run per round" property is
+        asserted in `test_yields_one_run_request_for_two_upstream_events`.
+        """
         upstream_run = _FakeDagsterRun(
             job_name="authored__pl_up_a",
             run_id="upstream-1",
@@ -524,7 +665,7 @@ class TestDependencySensor:
         assert len(out) == 1
         request = out[0]
         assert isinstance(request, RunRequest)
-        assert request.run_key == "upstream-1"
+        assert request.run_key == "authored-deps:upstream-1"
 
     def test_yields_skip_reason_naming_the_stale_upstream_when_one_is_behind(self) -> None:
         """One upstream's latest SUCCESS ends at 50 (< downstream start
@@ -609,7 +750,7 @@ class TestDependencySensor:
         out = list(body(_StubContext(upstream_run, instance)))
         assert len(out) == 1
         assert isinstance(out[0], RunRequest)
-        assert out[0].run_key == "upstream-1"
+        assert out[0].run_key == "authored-deps:upstream-1"
 
     def test_queries_only_success_runs_for_upstreams(self) -> None:
         """The freshness walk asks `context.instance.get_runs` with
@@ -716,7 +857,144 @@ class TestDependencySensor:
         out = list(body(_StubContext(upstream_run, instance)))
         assert len(out) == 1
         assert isinstance(out[0], RunRequest)
-        assert out[0].run_key == "ingest-1"
+        assert out[0].run_key == "authored-deps:ingest-1"
+
+    def test_first_downstream_run_does_not_fire_when_one_upstream_never_succeeded(self) -> None:
+        """F1.3 (#57): on the chain's first-ever tick (the downstream has
+        no runs yet), the sensor body MUST check that EVERY upstream has had
+        a SUCCESS run -- even when the downstream has never run before,
+        "first run" does not waive ALL-semantics, only the "must-be-newer-
+        than-downstream-start" comparison.
+
+        The buggy old code took `if downstream_start is None: yield
+        RunRequest(...)` and returned before the upstream walk. With one
+        upstream that has never run, that path launched the downstream on
+        the first success of any OTHER upstream and never waited for the
+        missing one -- silently dead-chains that the UI then had to
+        diagnose. The fix walks every upstream first and yields
+        `SkipReason` when one has never had a SUCCESS."""
+        triggering_upstream = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-a-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [],
+                # `pl-up-a` has one SUCCESS run; `pl-up-b` has never
+                # had a SUCCESS run. ALL semantics means the chain must
+                # NOT fire on `pl-up-a`'s tick.
+                "authored__pl_up_a": [triggering_upstream],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a", "pl-up-b"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(triggering_upstream, instance)))
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+        assert "pl-up-b" in out[0].skip_message
+        assert "never had a SUCCESS run" in out[0].skip_message
+
+    def test_yields_skip_reason_when_downstream_latest_run_is_queued(self) -> None:
+        """F1.3 (#57): a downstream whose latest run has not started yet
+        (status `QUEUED` / `NOT_STARTED` -- the `start_time` is None)
+        must NOT launch another downstream run. The old `get_runs`
+        comment said "filtered by status" but the call had NO status
+        filter, so `latest_downstream.start_time` was None for a queued
+        run and the body treated it as "no downstream run yet" -- a
+        false-green that double-fires the chain until the queued run
+        finishes. The fix short-circuits on `start_time is None`
+        before any upstream walk."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        queued_downstream = _FakeDagsterRun(
+            job_name="authored__pl_down_1",
+            run_id="downstream-queued-1",
+            # `start_time = None` is the queued / not-yet-started shape.
+            status=DagsterRunStatus.QUEUED,
+            start_time=None,
+            end_time=None,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [queued_downstream],
+                "authored__pl_up_a": [upstream_run],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+        assert "queued run" in out[0].skip_message
+        assert "downstream-queued-1" in out[0].skip_message
+
+    def test_yields_one_run_request_for_two_upstream_events_in_one_round(self) -> None:
+        """F1.3 (#57): the chain's `run_key` MUST be derived from the
+        SORTED set of the upstreams' latest SUCCESS run ids, so two
+        upstream ticks that both see the same ALL-fresh upstream set
+        ask the daemon for the same downstream launch exactly once.
+        The old code keyed each upstream on its own run id and the
+        daemon's dedup kept each upstream from launching the same
+        downstream twice FOR THAT UPCELLING -- but two ticks that both
+        asked to launch yielded ONE downstream per tick, regardless of
+        dedup, because the keys were different. The daemon therefore saw
+        two consecutive RunRequests for a downstream that should have
+        launched once.
+
+        This test simulates the per-tick body twice (one body per
+        upstream tick) and asserts both ticks yield the SAME
+        `run_key`, so the daemon's own dedup keeps the second tick
+        from launching a second downstream run.
+        """
+        upstream_a = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-a-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        upstream_b = _FakeDagsterRun(
+            job_name="authored__pl_up_b",
+            run_id="upstream-b-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                "authored__pl_up_a": [upstream_a],
+                "authored__pl_up_b": [upstream_b],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a", "pl-up-b"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        # Tick #1 fires on upstream_a's SUCCESS run.
+        out_a = list(body(_StubContext(upstream_a, instance)))
+        assert len(out_a) == 1 and isinstance(out_a[0], RunRequest)
+        # Tick #2 fires on upstream_b's SUCCESS run (after the daemon
+        # has had a chance to launch the first downstream).
+        out_b = list(body(_StubContext(upstream_b, instance)))
+        assert len(out_b) == 1 and isinstance(out_b[0], RunRequest)
+        # Same key for both ticks = one daemon-decided downstream run.
+        assert out_a[0].run_key == out_b[0].run_key
+        assert out_a[0].run_key == "authored-deps:upstream-a-1,upstream-b-1"
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):
@@ -760,3 +1038,80 @@ class PerPipelineRetryPolicyTest(unittest.TestCase):
         self.assertEqual(op.retry_policy.delay, base.delay)
         self.assertEqual(op.retry_policy.backoff, base.backoff)
         self.assertEqual(op.retry_policy.jitter, base.jitter)
+
+
+class CodeLocationLoadTest(unittest.TestCase):
+    """F1.1 BLOCKER: a pipeline with `dependsOn` MUST load under a real
+    `Definitions(jobs, schedules, sensors)` — Dagster 1.13.20 refuses two
+    `JobDefinition`s with the same name on a single location load, and
+    building the job twice (once for `jobs`, once inside the sensor
+    builder's `build_authored_job(pipeline)` call) used to do exactly
+    that, taking the WHOLE code location down with it.
+
+    The load call is the real-Dagster-load seam the plan requires: every
+    other test in this file monkeypatches the HTTP fetch and inspects the
+    factory's return values, which never crosses the `Definitions`
+    validation step that fails in production. `load_all_definitions()`
+    is what `dagster code-server start` runs at reload time — failing
+    here is what was failing there."""
+
+    def test_a_chain_pipeline_loads_the_code_location_without_a_duplicate_job(self) -> None:
+        from dagster import Definitions
+
+        upstream = {**_ready_pipeline(), "id": "pl-up-a", "dependsOn": []}
+        downstream = {**_ready_pipeline(), "id": "pl-down-1", "dependsOn": ["pl-up-a"]}
+
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"pipelines": [upstream, downstream]}
+        resp.raise_for_status.return_value = None
+        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
+            jobs, schedules, deps = authored_factory.build_authored_definitions(_cfg())
+
+        sensors = authored_factory.build_authored_dependency_sensors(deps)
+        defs = Definitions(jobs=jobs, schedules=schedules, sensors=sensors)
+        # `load_all_definitions` walks the whole graph (jobs, schedules,
+        # sensors, their dependencies) and is what raises
+        # `DagsterInvalidDefinitionError: Duplicate job definition found`
+        # when the sensor builder reuses a name that is already taken by
+        # `authored_jobs`. A second `build_authored_job(pipeline)` here
+        # is the mutation that re-introduces the BLOCKER (see the
+        # `CodeLocationLoadMutationTest` below).
+        repo = defs.get_repository_def()
+        repo.load_all_definitions()  # must NOT raise
+
+
+class CodeLocationLoadMutationTest(unittest.TestCase):
+    """F1.1 mutation evidence. Building the downstream's job a second
+    time inside the sensor builder is the exact regression the BLOCKER
+    fix removed — this test re-introduces it and asserts that
+    `load_all_definitions()` fails with the same `DagsterInvalidDefinitionError`
+    the production code path raised. The assertion checks for the
+    typename AND the offending job name so a future refactor that moves
+    the failure somewhere else still requires a real review."""
+
+    def test_building_the_job_twice_breaks_load_with_duplicate_definition_error(self) -> None:
+        from dagster import Definitions, DagsterInvalidDefinitionError
+
+        upstream = {**_ready_pipeline(), "id": "pl-up-a", "dependsOn": []}
+        downstream = {**_ready_pipeline(), "id": "pl-down-1", "dependsOn": ["pl-up-a"]}
+
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"pipelines": [upstream, downstream]}
+        resp.raise_for_status.return_value = None
+        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
+            jobs, _schedules, _deps = authored_factory.build_authored_definitions(_cfg())
+
+        # Mutation: build the downstream's job a SECOND time — the
+        # regression the fix removed. The two `JobDefinition` objects
+        # share the name `authored__pl_down_1`; `Definitions` refuses.
+        duplicate_job = authored_factory.build_authored_job(downstream)
+        sensors = authored_factory.build_authored_dependency_sensor(
+            downstream, duplicate_job,
+        )
+
+        defs = Definitions(jobs=jobs, schedules=[], sensors=[sensors] if sensors else [])
+        with self.assertRaises(DagsterInvalidDefinitionError) as ctx:
+            defs.get_repository_def().load_all_definitions()
+        message = str(ctx.exception)
+        self.assertIn("Duplicate", message)
+        self.assertIn("authored__pl_down_1", message)
