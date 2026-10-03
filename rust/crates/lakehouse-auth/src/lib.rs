@@ -37,6 +37,7 @@
 //! for what it required.
 
 pub mod authenticator;
+pub mod cleanup;
 pub mod credential;
 pub mod error;
 pub mod oidc;
