@@ -13,23 +13,28 @@
 //! [`login`] responds with the exact same status/shape whether the email
 //! doesn't exist or the password is wrong — that guarantee lives in
 //! [`lakehouse_auth::password::verify`] itself (see its module doc
-//! comment), not duplicated here. What this module adds on top is a
-//! single `tracing::warn!("login failed")` line with NO email and NO
-//! secret in it, so an operator can see failed-login volume (and alert on
-//! a spike) without this becoming a user-enumeration or credential-leak
-//! oracle in the logs. A fuller rate limiter (e.g. per-IP/per-account
-//! backoff) is future work, deliberately not built here: the load-bearing
-//! anti-brute-force mitigation that already exists is
-//! [`lakehouse_auth::password::verify`] paying the same `Argon2id` cost on
-//! every attempt regardless of outcome, which already makes high-volume
-//! guessing expensive; a counter on top would add complexity this task's
-//! scope does not call for.
+//! comment), not duplicated here. What this module adds on top:
+//!
+//! * A single `tracing::warn!("login failed")` line with NO email and NO
+//!   secret in it, so an operator can see failed-login volume (and alert on
+//!   a spike) without this becoming a user-enumeration or credential-leak
+//!   oracle in the logs.
+//! * Per-account throttle (SEC-2): `N` wrong passwords within a window lock
+//!   the key for the lockout duration. A locked key returns `429` with a
+//!   `Retry-After` header and never reaches password verification — the
+//!   lockout response is identical whether the account exists or not.
+//!   The defaults (5 failures / 900 s → 300 s lock) are env settings
+//!   (`LOGIN_MAX_FAILURES`, `LOGIN_FAILURE_WINDOW_SECS`, `LOGIN_LOCKOUT_SECS`).
+//!
+//! See `docs/core/features/login-protection-and-session-cleanup.md` for
+//! the full specification and acceptance checklist.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
+use lakehouse_auth::throttle;
 use lakehouse_auth::{
     Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
 };
@@ -108,11 +113,25 @@ struct LoginResponse {
 /// `POST /api/auth/login` — verify `{ email, password }`, and on success,
 /// create a server-side session and set its cookie.
 ///
+/// # Throttle (SEC-2)
+///
+/// Before any password verification, the email is hashed and checked
+/// against `login_throttle`. If the key is locked, the route returns `429`
+/// with a `Retry-After` header and the same fixed message for an existing
+/// and a non-existing account — the hash is computed identically regardless
+/// of whether an account with that email exists, and a locked key never
+/// reaches password verification.
+///
+/// On a failed login, `record_failure` is called. If that call sets a
+/// lock, one `auth.login_locked` audit row is written (best-effort: a
+/// failed audit write is logged, not propagated). On a successful login,
+/// `clear` resets the count.
+///
 /// # Errors
 ///
-/// Returns the caller's [`ApiError`] (400 on an unparseable body, 401 on
-/// bad credentials — see the module doc comment for why that one status is
-/// shared between "no such email" and "wrong password") via `?`.
+/// 400 on an unparseable body; 401 on bad credentials (same status for
+/// "no such email" and "wrong password" — see the module doc comment);
+/// 429 when the key is locked; 503 if no Postgres pool is configured.
 pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {
     let pool = pool(&state)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
@@ -124,50 +143,71 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     let LoginBody { email, password } = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON body: {err}")))?;
 
-    // Goes through `LocalPasswordAuthenticator` (not
-    // `lakehouse_auth::password::verify` directly) so this route exercises
-    // exactly the same `Authenticator` seam every other credential kind
-    // does — see `crate::auth`'s module doc comment.
+    let key = throttle::key_for(&email);
+
+    if let Some(locked_until) = throttle::locked_until(pool, &key).await? {
+        let now = time::OffsetDateTime::now_utc();
+        // `.max(1)` keeps the value in range, so the `try_from` fallback
+        // below is unreachable; it exists so no `as` cast can silently
+        // wrap a negative difference.
+        let secs = u64::try_from((locked_until - now).whole_seconds() + 1)
+            .unwrap_or(1)
+            .max(1);
+        return Err(ApiError::TooManyRequests {
+            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
+            retry_after_secs: secs,
+        }
+        .into());
+    }
+
     let credential = Credential::Password {
         identifier: email,
         password: Secret::new(password),
     };
-    let principal = auth
-        .local
-        .authenticate(&credential)
-        .await
-        .inspect_err(|_| tracing::warn!("login failed"))?;
-
-    let PrincipalId::User(user_id) = principal.id else {
-        // `password::verify` only ever resolves a `PrincipalId::User` (it
-        // loads through `app_user`) — this branch exists so the match is
-        // exhaustive, not because it can be reached in practice.
+    if let Ok(principal) = auth.local.authenticate(&credential).await {
+        throttle::clear(pool, &key).await?;
+        let PrincipalId::User(user_id) = principal.id else {
+            tracing::warn!("login failed");
+            return Err(ApiError::invalid_or_expired().into());
+        };
+        let must_change_password = password::must_change_password(pool, user_id)
+            .await
+            .unwrap_or(false);
+        let token =
+            session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None, &[])
+                .await?;
+        let body = LoginResponse {
+            id: user_id.to_string(),
+            name: principal.display_name,
+            must_change_password,
+        };
+        let mut response = (StatusCode::OK, ApiJson(body)).into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            session_cookie_header(
+                state.config.is_dev,
+                token.expose(),
+                session::DEFAULT_SESSION_TTL,
+            ),
+        );
+        Ok(response)
+    } else {
+        let lock_set = throttle::record_failure(pool, &key, &state.throttle_policy).await?;
+        if lock_set.is_some() {
+            let event = NewAuditEvent {
+                action: "auth.login_locked".to_owned(),
+                outcome: "refused".to_owned(),
+                resource_kind: Some("login_key".to_owned()),
+                resource_id: Some(key[..12].to_owned()),
+                ..Default::default()
+            };
+            if let Err(err) = store_audit::insert(pool, event).await {
+                tracing::warn!(%err, "failed to record auth.login_locked audit event");
+            }
+        }
         tracing::warn!("login failed");
-        return Err(ApiError::invalid_or_expired().into());
-    };
-
-    let must_change_password = password::must_change_password(pool, user_id)
-        .await
-        .unwrap_or(false);
-    let token =
-        session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None, &[])
-            .await?;
-
-    let body = LoginResponse {
-        id: user_id.to_string(),
-        name: principal.display_name,
-        must_change_password,
-    };
-    let mut response = (StatusCode::OK, ApiJson(body)).into_response();
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        session_cookie_header(
-            state.config.is_dev,
-            token.expose(),
-            session::DEFAULT_SESSION_TTL,
-        ),
-    );
-    Ok(response)
+        Err(ApiError::invalid_or_expired().into())
+    }
 }
 
 /// `POST /api/auth/logout` — revoke the caller's session server-side (so a
