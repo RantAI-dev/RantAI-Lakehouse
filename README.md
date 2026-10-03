@@ -487,6 +487,10 @@ issue about any of the following — they're known, not bugs:
   throttle rows hourly. It runs in-band and may skip a tick under load;
   nothing guarantees a session or credential is removed within a
   particular bound. See `AUTH_RETENTION_DAYS` in the Configuration table.
+- **Active service tokens never expire.** The cleanup job deletes only
+  what is already expired or revoked; a non-revoked service token is
+  valid indefinitely no matter how old, so rotation is a manual,
+  operator-driven act (see `docs/OPERATIONS.md`).
 - **A previously-internal API key and internal LAN hostnames are present
   in git history** (2 and ~10 commits reachable from `main`,
   respectively), predating this repo going public. The key must be, and

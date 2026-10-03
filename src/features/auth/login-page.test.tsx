@@ -92,9 +92,9 @@ describe("LoginPage lockout surface (plan T5)", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("Too many failed sign-in attempts. Try again later.")
-    // 300 s renders as the whole-minute wait, not a countdown and not a
-    // raw seconds value.
-    expect(alert.textContent).toContain("Try again in about 5 minute(s).")
+    // 300 s renders as the whole-minute wait, pluralised properly
+    // ("minutes", not "minute(s)" — review SHOULD-FIX 6, 2026-10-03).
+    expect(alert.textContent).toContain("Try again in about 5 minutes.")
   })
 
   it("still shows the credentials message on a 401", async () => {

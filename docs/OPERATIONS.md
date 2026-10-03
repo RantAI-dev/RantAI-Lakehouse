@@ -633,10 +633,12 @@ DELETE FROM public.login_throttle
 WHERE key_hash = encode(sha256(lower(trim(' ' from 'User@Example.Com'))::bytea), 'hex');
 ```
 
-`lower(trim(...))` mirrors exactly how the API derives the key
-(`throttle::key_for`), and `sha256()` is a built-in since Postgres 11 —
-no extension needed. Deleting the row clears both the count and the
-lock; there is no separate "unlock" flag.
+`lower(trim(...))` matches how the API derives the key for an ordinary
+address (`throttle::key_for` — exact for the common case, though Rust's
+`str::trim` strips all whitespace where SQL `trim(' ' …)` strips only
+spaces, and `lower()` follows the database collation), and `sha256()` is
+a built-in since Postgres 11 — no extension needed. Deleting the row
+clears both the count and the lock; there is no separate "unlock" flag.
 
 ### Session cleanup background job
 
@@ -650,8 +652,9 @@ A task spawned at API boot purges, roughly hourly:
   such a row can never lock again (the next failure starts a fresh
   window), so it goes as soon as its window lapses, not 30 days later.
 
-It logs purge counts at each run and skips a tick (with a logged warning)
-if the previous run has not finished. It is best-effort, not a guarantee:
+It logs purge counts at each run and skips a tick if the previous run
+has not finished (`MissedTickBehavior::Skip`). It is best-effort, not a
+guarantee:
 nothing promises a session is gone within any particular bound. The job
 only deletes — it does not rotate anything, and an ACTIVE (non-revoked)
 service token never expires or gets cleaned up no matter how old it is;

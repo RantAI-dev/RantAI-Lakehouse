@@ -145,7 +145,7 @@ export function LoginPage() {
         let msg = serviceError.message;
         if (serviceError.retryAfterSecs && serviceError.retryAfterSecs > 0) {
           const minutes = Math.ceil(serviceError.retryAfterSecs / 60);
-          const minutesText = minutes === 1 ? "1 minute" : `${minutes} minute(s)`;
+          const minutesText = minutes === 1 ? "1 minute" : `${minutes} minutes`;
           msg += ` Try again in about ${minutesText}.`;
         }
         setError(msg);
