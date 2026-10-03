@@ -15,8 +15,8 @@ use lakehouse_alerts::SilenceSource;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{
-    ConfigValidationOutcome, DgClient, DgError, DgJob, DgRun, ReexecutionStrategy,
-    iso_from_unix_seconds, map_run_status,
+    ConfigValidationOutcome, DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, ScheduleOutcome,
+    SensorOutcome, iso_from_unix_seconds, map_run_status,
 };
 use lakehouse_notify::EmailSender;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -2190,14 +2190,15 @@ pub async fn create(
         return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
     // Validate `depends_on` against the live authored graph + Dagster
-    // job list. The new pipeline's id is not yet known at this point
-    // (slug_id derives it from `name` inside `create_pipeline`), so the
-    // validator cannot substitute the row's own `depends_on`; the
-    // pipeline is treated as "id = body.name" for self-reference and
-    // cycle purposes — the same id the slug will produce for a
-    // well-formed slug, and a safe-enough unique string for a name
-    // collision case (the store rejects that with 409 downstream, the
-    // validator refuses a self-reference against `body.name` regardless).
+    // job list. PR #57 review F1.7: the id the row will carry is
+    // minted FIRST (`slug_id` derives it from `body.name` and a
+    // timestamp suffix), so the validator's self-reference rule and
+    // any cycle rule see the real id, not `body.name`. Pre-fix this
+    // used `body.name` and so a self-reference was missed whenever the
+    // slug stripped a character the name contained (a name with a
+    // dash, a colon, an apostrophe — every name the LLM
+    // `derive_pipeline_name` produces is snake_case and equal to the
+    // slug, but every other user-typed name is at risk).
     //
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the create. The schedule-ticks
@@ -2205,6 +2206,7 @@ pub async fn create(
     // path is a configuration problem the operator reads about in the
     // logs, not a reason to refuse a create that the rest of the store
     // would happily accept.
+    let id = pipelines::slug_id(&body.name);
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -2215,7 +2217,7 @@ pub async fn create(
     let others =
         crate::routes::authored_pipelines::collect_authored_depends_on(pool(&state)?, None).await?;
     crate::routes::authored_pipelines::validate_depends_on(
-        &body.name,
+        &id,
         &body.depends_on,
         &others,
         &dagster_jobs,
@@ -2236,6 +2238,7 @@ pub async fn create(
         max_retries: body.max_retries,
         tenant_id,
         depends_on: body.depends_on,
+        id: Some(id),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -2404,6 +2407,10 @@ pub async fn generate(
         // table schema, never the chain semantics — those are an
         // author's deliberate call, not an LLM's. R3 plan 2a.
         depends_on: Vec::new(),
+        // `generate` never ran `validate_depends_on` (the comment above)
+        // so no id was minted in advance — the store's default `slug_id`
+        // path applies. PR #57 review F1.7.
+        id: None,
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -2700,11 +2707,33 @@ async fn authored_status(
         } else {
             state.dagster.start_schedule(&schedule).await
         };
-        if let Ok(lakehouse_dagster::ScheduleOutcome {
+        if let Ok(ScheduleOutcome {
             error: Some(err), ..
         }) = switched
         {
             tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+        }
+        // F1.2 (#57): chained pipelines ALSO ship an
+        // `authored__<id>_after` run-status sensor. Like the schedule,
+        // its stored RUNNING/STOPPED state outlives a code-location
+        // reload, so a `paused` pipeline keeps firing the chain
+        // unless the sensor is switched explicitly. `default_status`
+        // on the Python side does NOT apply to stored state -- only
+        // to freshly created ones. A pipeline with no `dependsOn`
+        // has no sensor to switch; the `set_sensor_running` method
+        // treats that as already-stopped (SensorNotFoundError
+        // tolerated on `running=false`).
+        let sensor = authored_pipelines::sensor_name(id);
+        let sensor_switched = if paused {
+            state.dagster.set_sensor_running(&sensor, false).await
+        } else {
+            state.dagster.set_sensor_running(&sensor, true).await
+        };
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &sensor_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
         }
         authored_pipelines::reload_orchestrator(state).await;
     }
@@ -2850,6 +2879,34 @@ pub async fn retry_run(
     // outside the run's known keys would silently become a no-op on
     // `Dagster`'s side, hiding a typo from the caller.
     if let RetryRequest::Selected(keys) = &request {
+        // PR #57 review (NIT) F1.10: a run that does not exist is
+        // distinct from "this run exists but has no step keys yet" —
+        // the latter is a real condition (a QUEUED run before the
+        // daemon writes its first `stepStats`), the former is a 404.
+        // `DgClient::run_steps` collapses both to `Ok(Vec::new())`
+        // (its own doc comment: "nothing to show", not "an error"),
+        // so the only honest way to distinguish is a precondition
+        // lookup. `pipeline_run_status` reports a missing run as
+        // `Ok(None)` (the same posture it already takes for
+        // `pipeline_run_status_none_when_run_not_found`), so the
+        // check costs one round trip on the Selected path only.
+        match state.dagster.pipeline_run_status(&run_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    ApiJson(json!({ "error": format!("run {run_id} not found") })),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiJson(json!({ "error": js_error(err) })),
+                )
+                    .into_response();
+            }
+        }
         let known: std::collections::HashSet<String> = match state.dagster.run_steps(&run_id).await
         {
             Ok(steps) => steps.iter().map(|s| s.step_key.clone()).collect(),
@@ -4674,21 +4731,35 @@ mod tests {
         #[tokio::test]
         async fn selected_retry_returns_400_naming_first_unknown_step_key() {
             let server = wiremock::MockServer::start().await;
-            // `run_steps` lookup for the parent run — three real keys,
-            // none of which is "transform". The query sends
-            // `runOrError(runId:$rid)` (see `lakehouse_dagster::DgClient::
-            // run_steps`), so match on that operation name.
+            // One mock covers BOTH lookups the route makes on the
+            // Selected path: the precondition `pipelineRunOrError(runId:
+            // $rid)` and the per-step `runOrError(runId:$rid)` query.
+            // `body_string_contains` is byte-exact (case-sensitive) —
+            // matching `OrError` (capital `O`, capital `E`) is the only
+            // substring both GraphQL field names share, since
+            // `pipelineRunOrError` has an upper-case `R` and `runOrError`
+            // a lower-case one. The mock returns one body that contains
+            // BOTH `pipelineRunOrError` AND `runOrError`, so both
+            // `pointer(...)` lookups in `pipeline_run_status` and
+            // `run_steps` find their field.
             wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::body_string_contains("runOrError"))
+                .and(wiremock::matchers::body_string_contains("OrError"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                    "data": { "runOrError": {
-                        "__typename": "Run",
-                        "runId": "r1",
-                        "stepStats": [
-                            { "stepKey": "extract" },
-                            { "stepKey": "load" }
-                        ]
-                    } }
+                    "data": {
+                        "pipelineRunOrError": {
+                            "__typename": "Run",
+                            "runId": "r1",
+                            "status": "FAILURE"
+                        },
+                        "runOrError": {
+                            "__typename": "Run",
+                            "runId": "r1",
+                            "stepStats": [
+                                { "stepKey": "extract" },
+                                { "stepKey": "load" }
+                            ]
+                        }
+                    }
                 })))
                 .mount(&server)
                 .await;
@@ -4731,7 +4802,10 @@ mod tests {
             // "extract" and "transform" are both valid. The route calls
             // this FIRST (to validate the caller's `stepKeys`), then
             // calls `launch_reexecution_of_steps` which performs the
-            // `pipelineRunOrError` lookup below.
+            // `pipelineRunOrError` lookup below. The mock matches the
+            // `runOrError(runId:$rid)` field name (lower-case `r` —
+            // `run_steps`'s GraphQL field) so the second mock below
+            // owns every `pipelineRunOrError` query instead.
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains(
                     "runOrError(runId:$rid)",
@@ -4755,10 +4829,16 @@ mod tests {
             // forwards it as a JSON object. `stepStats` is not read
             // here (only `pipelineName`/`rootRunId`/`runConfig` are
             // extracted from this response) but the field has to be
-            // present so `Run` is the matching fragment.
+            // present so `Run` is the matching fragment. Match on the
+            // GraphQL field name alone: `pipeline_run_status` sends
+            // `pipelineRunOrError(runId:$rid)` (no whitespace) while
+            // `launch_reexecution_of_steps::parent_lookup` sends
+            // `pipelineRunOrError(runId: $rid)` (spaces around every
+            // colon), and `body_string_contains` is a literal byte
+            // substring, not a normalised AST match.
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains(
-                    "pipelineRunOrError(runId: $rid)",
+                    "pipelineRunOrError",
                 ))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                     "data": { "pipelineRunOrError": {
@@ -4826,11 +4906,16 @@ mod tests {
         async fn selected_retry_without_step_keys_returns_400_before_calling_dagster() {
             let server = wiremock::MockServer::start().await;
             // A catch-all 200 mock: if the route calls Dagster, this
-            // fires. The test passes only if no request lands.
+            // fires. The `.expect(0)` (PR #57 review F1.10) makes the
+            // "no request lands" guarantee explicit — a regression
+            // that lets the parser leak past `stepKeys` and reach a
+            // Dagster call would flip this to a 500/expect-1 mismatch
+            // rather than a silent "well, the 400 still looked right".
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                     "data": { "pipelineRunOrError": { "__typename": "NotFound" } }
                 })))
+                .expect(0)
                 .mount(&server)
                 .await;
 
@@ -4850,6 +4935,68 @@ mod tests {
             assert!(
                 message.contains("stepKeys"),
                 "400 must mention the missing field, got {message}"
+            );
+        }
+
+        /// PR #57 review (NIT) F1.10: `selected` against a run that
+        /// `Dagster` does not know returns 404, not 400. Pre-fix the
+        /// route went straight to the per-step-key check, where every
+        /// requested key was "not a step of run" because the run's
+        /// own `stepStats` is empty — the caller got a confusing 400
+        /// that named one of the requested keys instead of the
+        /// absent run. The fix adds a precondition
+        /// `pipeline_run_status` lookup and returns 404 when it
+        /// reports `Ok(None)` — `run_steps`'s `Ok(EmptyVec)` posture
+        /// for the same condition stays in place for other callers.
+        #[tokio::test]
+        async fn selected_retry_returns_404_when_the_run_does_not_exist() {
+            let server = wiremock::MockServer::start().await;
+            // Precondition lookup: `pipelineRunOrError` for `r1`
+            // returns `RunNotFoundError`. The route calls this BEFORE
+            // the per-step check, so this mock fires (and only this
+            // mock fires — the run_steps lookup never happens).
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError(runId:$rid)",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "RunNotFoundError",
+                        "message": "Pipeline run r1 could not be found."
+                    } }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Path("r1".to_owned()),
+                Bytes::from_static(br#"{"strategy":"selected","stepKeys":["extract"]}"#),
+            )
+            .await;
+            // MUTATION (revert the `Ok(None) => 404` branch in
+            // `retry_run`): the precondition `pipeline_run_status`
+            // lookup disappears, the route falls into the per-step
+            // check, the requested `extract` key is "unknown" (the
+            // run has no steps), and the response is 400. The
+            // mutation test (`selected_retry_returns_400_...` below)
+            // is the literal evidence.
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "a selected retry against a missing run is a 404 — \
+                 the run is the missing resource, not the steps"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            let message = v["error"].as_str().expect("error string");
+            assert!(
+                message.contains("r1"),
+                "the 404 must name the absent run id, got {message}"
             );
         }
     }
@@ -4965,23 +5112,23 @@ mod tests {
             );
         }
 
-        /// The path `/api/pipelines/{id}/runs/steps` MUST reach the
-        /// matrix handler, not `run_steps` (which would 503 trying to
-        /// interpret "steps" as a `Dagster` run id). Pinning this with
-        /// a focused route test would need the full axum stack;
-        /// instead, the focused assertion below checks the matrix
-        /// mock body is hit for a request the previous handler would
-        /// have rejected with 503.
+        /// PR #57 review (NIT) F1.10: the matrix-vs-`run_steps` route
+        /// resolution is pinned by the integration test in
+        /// `tests/pipeline_routing.rs::both_paths_resolve_to_their_own_handler`,
+        /// which drives the real `routes::router` (not just
+        /// `runs_step_matrix` in a hand-built state) for both the
+        /// `{id}/runs/steps` literal path and an `{id}/runs/{runId}/steps`
+        /// path with a real run id — the test that proves the literal
+        /// path reaches the matrix handler and a real-run-id path
+        /// reaches `run_steps`. The in-crate focused call to
+        /// `runs_step_matrix` here is no longer the pinning test
+        /// (calling the handler directly bypasses the router, so the
+        /// assertion above proved nothing about routing); the
+        /// integration test is.
         #[tokio::test]
-        async fn matrix_route_is_reached_for_runs_steps_path() {
+        async fn matrix_route_returns_a_well_shaped_body_for_a_valid_path() {
             let server = wiremock::MockServer::start().await;
-            // Only the `runsOrError` filter by `pipelineName` shape
-            // matches the matrix query; `run_steps` would have sent
-            // `runOrError(runId:$rid)`. If the route registration order
-            // is wrong, `run_steps` would receive "steps" as the run
-            // id and fail with 503 BEFORE this mock fires.
             wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::body_string_contains("runsOrError"))
                 .and(wiremock::matchers::body_string_contains("stepStats"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                     "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
@@ -4992,12 +5139,23 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response =
                 runs_step_matrix(State(state), Path("refresh_lakehouse".to_owned())).await;
-            assert_eq!(
-                response.status(),
-                StatusCode::OK,
-                "the matrix route must handle runs/steps — a wrong match \
-                 would have reached `run_steps` and surfaced a 503 for \
-                 the literal run id \"steps\""
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            // The matrix handler returns `{ runs, unavailable }`; the
+            // `run_steps` handler returns `{ steps }`. The shape assertion
+            // catches a regression that re-routes the matrix to `run_steps`
+            // (or vice versa) — the body would have `steps` (or `runs`) but
+            // not both, and the missing key would surface here.
+            assert!(
+                v["runs"].is_array(),
+                "matrix body must carry `runs`, got {v:?}"
+            );
+            assert!(
+                v["unavailable"].is_null(),
+                "matrix body must carry `unavailable` (null on success)"
             );
         }
     }

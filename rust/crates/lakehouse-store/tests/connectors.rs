@@ -180,6 +180,11 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             max_retries: None,
             tenant_id: None,
             depends_on: Vec::new(),
+            // PR #57 review F1.7: `None` lets the store derive the id
+            // itself via `slug_id` — this fixture is the "dependent
+            // pipeline" the connector's reverse-lookup assertion uses,
+            // not a write where the route mints an id in advance.
+            id: None,
         },
         None,
     )

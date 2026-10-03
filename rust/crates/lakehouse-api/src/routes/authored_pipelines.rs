@@ -102,6 +102,13 @@ pub const MAX_DEPENDS_ON: usize = 10;
 /// to write from the lookup (the validator substitutes the proposed
 /// `depends_on` for `exclude_id`); passing `None` includes every row,
 /// which is what the detail route uses to compute `downstream`.
+///
+/// # Errors
+///
+/// Returns `ApiRejection` (classified to 500/503 — never upstream text,
+/// AGENTS.md rule 4) on a database failure, via the same
+/// [`lakehouse_store::StoreError`] -> [`ApiError`] mapping every other
+/// store call uses.
 pub async fn collect_authored_depends_on(
     pool: &lakehouse_store::PgPool,
     exclude_id: Option<&str>,
@@ -144,6 +151,21 @@ pub async fn collect_authored_depends_on(
 ///    sequence like `A → B`, `B → C`, `C → A` is caught when the user
 ///    submits the third edit — not silently allowed by reading the
 ///    pre-update graph.
+/// 5. No entry starts with `authored__` — the orchestrator's reserved
+///    namespace for the jobs, schedules and sensors it builds for
+///    authored pipelines. `list_jobs()` strips leading-underscore names
+///    but not `authored__…`, so this rule catches what the engine-side
+///    filter cannot (PR #57 review F1.9).
+/// 6. No duplicate entry in the same submission (PR #57 review F1.9) —
+///    duplicates would inflate the cycle walk and the count cap, fire
+///    two sensors, and persist redundant graph data.
+///
+/// # Errors
+///
+/// Returns `ApiRejection` (the route maps to 400) for any rule
+/// violation above. Each message names the offending id verbatim so the
+/// UI can highlight the input that broke the rule; the caller-supplied
+/// list is never echoed back whole (AGENTS.md rule 4).
 pub fn validate_depends_on(
     this_id: &str,
     new_depends_on: &[String],
@@ -160,6 +182,36 @@ pub fn validate_depends_on(
             "depends_on must not include the pipeline's own id ({this_id:?})"
         ))
         .into());
+    }
+
+    // Rule 5 (PR #57 review F1.9): refuse `authored__…` names. The
+    // `__` prefix is reserved for the orchestrator's internal jobs
+    // (asset materialization, sensor ticks); an authored pipeline
+    // listing one as an upstream would create a dependency on a job
+    // the operator has no way to inspect, edit, or pause. The Dagster
+    // `list_jobs()` filter only strips leading-underscore names, not
+    // `authored__…`, so the validator has to refuse it explicitly.
+    for dep in new_depends_on {
+        if dep.starts_with("authored__") {
+            return Err(ApiError::BadRequest(format!(
+                "depends_on entry {dep:?} uses the reserved authored__ namespace \
+                 (these jobs are not addressable as upstreams)"
+            ))
+            .into());
+        }
+    }
+
+    // Rule 6 (PR #57 review F1.9): refuse duplicates in the same
+    // submission. The cycle walk and the count cap treat duplicates
+    // as separate entries, so a list like `[A, A]` could exceed the
+    // cap on the size of the row, two duplicate sensors fire, and a
+    // chain written to the column ends up redundant.
+    let mut sorted = new_depends_on.to_vec();
+    sorted.sort();
+    if let Some([a, _]) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(
+            ApiError::BadRequest(format!("depends_on contains {a:?} more than once")).into(),
+        );
     }
 
     // Rule 3: count cap. Checked before "is every id valid" so an over-cap
@@ -236,6 +288,16 @@ pub fn referencing_downstreams(pairs: &[(String, Vec<String>)], target_id: &str)
 /// including them here would either over-restrict or under-restrict
 /// depending on whether the walk treated their empty `depends_on` as
 /// "dead end" or "self".
+///
+/// PR #57 review (BLOCKER) F1.7: `update` excluded the row being edited
+/// from `others` (`collect_authored_depends_on(pool, Some(&id))`), so an
+/// edge back to the edited row would miss the "is this an authored
+/// pipeline?" filter and be silently skipped. The walk now checks
+/// `next == this_id` BEFORE the filter, so a cycle that closes through
+/// the edited row is reported exactly the same way as one that closes
+/// through any other authored pipeline. The `visited` set stops the walk
+/// from going exponential on a fan-in / layered graph: a node visited
+/// via one DFS start is not re-visited from the next.
 fn validate_no_cycle(
     this_id: &str,
     new_depends_on: &[String],
@@ -247,12 +309,13 @@ fn validate_no_cycle(
         new_depends_on: &[String],
         others: &[(String, Vec<String>)],
         on_stack: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<String>,
     ) -> Result<(), String> {
         if on_stack.iter().any(|n| n == current) {
             // `current` is being visited on the current DFS path.
-            // When `current == this_id`, the cycle closes back to the
-            // pipeline being edited — the exact condition we are
-            // guarding against.
+            // `current` is necessarily a different node from the one
+            // that pointed at it (the caller pushed a different id),
+            // so this is always a cycle, not a self-loop.
             return Err(current.to_owned());
         }
         on_stack.push(current.to_owned());
@@ -268,28 +331,48 @@ fn validate_no_cycle(
                 .unwrap_or_default()
         };
         for next in edges {
-            // Skip Dagster jobs — they cannot be part of a cycle (no
-            // `depends_on`), so walking them is wasted work that would
-            // also treat their empty edge list as a terminal node and
-            // never report a cycle that actually terminates in them.
+            // PR #57 review (BLOCKER) F1.7: the closing-edge check
+            // runs BEFORE the "not authored" skip. `update` excludes
+            // the row being edited from `others`
+            // (`collect_authored_depends_on(pool, Some(&id))`), so an
+            // edge back to `this_id` would otherwise pass through the
+            // skip as "unknown" and the cycle would never be reported.
+            // The 2-cycle and 3-cycle tests via the update path are
+            // the regression evidence; the ordering matters.
+            if next == this_id {
+                return Err(this_id.to_owned());
+            }
             if others.iter().all(|(id, _)| id != &next) {
                 continue;
             }
-            visit(&next, this_id, new_depends_on, others, on_stack)?;
+            // Already fully explored from a previous DFS start in this
+            // call — no cycle reachable from it, so re-visiting is
+            // wasted work that turns a fan-in graph exponential.
+            if !visited.insert(next.clone()) {
+                continue;
+            }
+            visit(&next, this_id, new_depends_on, others, on_stack, visited)?;
         }
         on_stack.pop();
         Ok(())
     }
     let mut on_stack = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for start in new_depends_on {
-        visit(start, this_id, new_depends_on, others, &mut on_stack).map_err(
-            |cycle_back_to| -> ApiRejection {
-                ApiError::BadRequest(format!(
-                    "depends_on would create a cycle back to pipeline {cycle_back_to:?}"
-                ))
-                .into()
-            },
-        )?;
+        visit(
+            start,
+            this_id,
+            new_depends_on,
+            others,
+            &mut on_stack,
+            &mut visited,
+        )
+        .map_err(|cycle_back_to| -> ApiRejection {
+            ApiError::BadRequest(format!(
+                "depends_on would create a cycle back to pipeline {cycle_back_to:?}"
+            ))
+            .into()
+        })?;
     }
     Ok(())
 }
@@ -380,13 +463,15 @@ pub struct UpdateBody {
     #[serde(default)]
     max_retries: Option<i16>,
     /// Upstream pipeline ids (authored `pl-…` or Dagster job names). R3
-    /// plan 2a, migration `0052`. Empty list when omitted, matching the
-    /// column's `DEFAULT '{}'`. The route validates every id and the
-    /// resulting graph BEFORE calling the store (see
-    /// [`validate_depends_on`]); an invalid list is refused with 400
-    /// and writes nothing.
+    /// plan 2a, migration `0052`. PR #57 review F1.8: `None` keeps the
+    /// stored chain (a console save that does not touch `dependsOn`
+    /// used to write `[]` and erase every author-wired upstream).
+    /// `Some(vec)` replaces it; an explicit empty `Some(vec![])` clears
+    /// it. The route validates every id and the resulting graph BEFORE
+    /// calling the store (see [`validate_depends_on`]); an invalid
+    /// list is refused with 400 and writes nothing.
     #[serde(default)]
-    depends_on: Vec<String>,
+    depends_on: Option<Vec<String>>,
 }
 
 fn authored_only(id: &str) -> Result<(), ApiRejection> {
@@ -445,6 +530,13 @@ pub async fn update(
     // committed; the update path runs against its current state). Both
     // paths refuse an invalid set with 400 BEFORE the store is touched.
     //
+    // PR #57 review F1.8: only validate when the body actually carries
+    // a `dependsOn` to set; a console save that did not touch the
+    // field leaves the stored chain alone (the COALESCE write below).
+    // When present, the body's `Some(vec)` is the same shape as
+    // `update`'s pre-fix `Vec<String>` — the validator runs against
+    // the proposed new list, not the stored chain.
+    //
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
     // `routes::pipelines::create`'s identical treatment. The rule
@@ -461,7 +553,9 @@ pub async fn update(
         }
     };
     let others = collect_authored_depends_on(pool, Some(&id)).await?;
-    validate_depends_on(&id, &body.depends_on, &others, &dagster_jobs)?;
+    if let Some(new_depends_on) = &body.depends_on {
+        validate_depends_on(&id, new_depends_on, &others, &dagster_jobs)?;
+    }
     let input = UpdatePipelineInput {
         kind: body.kind,
         source_zone: body.source_zone,
@@ -629,7 +723,12 @@ pub async fn restore_version(
         owner: Some(snapshot.owner),
         description: snapshot.description,
         max_retries: Some(snapshot.max_retries),
-        depends_on: snapshot.depends_on,
+        // Restore is an authoritative replay: the stored snapshot's
+        // chain always replaces the cleared one. `Some(vec)` is
+        // necessary so `COALESCE($N, depends_on)` writes the
+        // restored chain and not the stored chain (which is what
+        // `None` would do). PR #57 review F1.8.
+        depends_on: Some(snapshot.depends_on.clone()),
     };
     let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
@@ -799,6 +898,14 @@ mod tests {
     /// the edited row as having the proposed edges; this is the
     /// regression that proves the override is at the cycle walk, not at
     /// the input check.
+    ///
+    /// Pre-fix (#57 F1.7): the walk skipped `current == this_id` edges as
+    /// "not an authored pipeline", and `others` from
+    /// `collect_authored_depends_on(pool, Some(&id))` excludes the edited
+    /// row, so a 3-cycle where the edited row sits BETWEEN the entry and
+    /// the closing edge would close only on the edited row (excluded from
+    /// `others`), the walk skipped it, and the route returned 200. The
+    /// fix checks `next == this_id` BEFORE the "not authored" skip.
     #[test]
     fn validate_depends_on_detects_a_three_cycle_when_editing_the_closing_edge() {
         // Pre-edit authored state: A→B, B→C; C has no `depends_on` yet.
@@ -809,9 +916,10 @@ mod tests {
         ];
         let dagster = vec!["ingest_job".to_owned()];
         // The edit: C depends on A → A→B→C→A is a cycle. The walk
-        // returns the cycle's entry node (A, which the DFS first
-        // visited), not the edited pipeline (C, which is on the cycle
-        // path but not the node the walk re-enters through).
+        // detects the cycle when an edge (B→C, the stored edge) points
+        // back to the edited pipeline (`this_id` = "pl-c") and returns
+        // its id verbatim — the node the dependency graph closes into,
+        // which is also the node the user just submitted the edit on.
         let err = validate_depends_on("pl-c", &["pl-a".to_owned()], &others, &dagster).unwrap_err();
         let message = err.0.to_string();
         assert!(
@@ -819,8 +927,98 @@ mod tests {
             "error must name the rule that fired: {message:?}"
         );
         assert!(
-            message.contains("pl-a"),
-            "error must name the cycle's entry node (the first node visited twice): {message:?}"
+            message.contains("pl-c"),
+            "error must name the edited pipeline the cycle closes into: {message:?}"
+        );
+    }
+
+    /// PR #57 review (BLOCKER) F1.7: `update` calls
+    /// `collect_authored_depends_on(pool, Some(&id))`, which excludes the
+    /// row being edited. Pre-fix the walk's "not an authored pipeline"
+    /// skip treated the excluded row as missing and never closed a cycle
+    /// that returns to it, so `A → B; PUT B with dependsOn:[A]` returned
+    /// 200. The fix checks `next == this_id` BEFORE the skip. `others`
+    /// here mirrors the route's `collect_authored_depends_on(..., Some(&id))`
+    /// call shape EXACTLY (the pipeline being edited does NOT appear).
+    #[test]
+    fn validate_depends_on_refuses_a_two_cycle_via_update_path() {
+        // Pre-edit authored state: A→B; B has no `depends_on` yet.
+        // The PUT on B excludes B from `others` (this matches the
+        // route's `Some(&id)` exclusion; production never passes an
+        // `others` containing the row being edited).
+        let others = vec![("pl-a".to_owned(), vec!["pl-b".to_owned()])];
+        let dagster: Vec<String> = Vec::new();
+        // The edit: B depends on A → A→B→A. The walk visits A, follows
+        // its stored edge to B, sees `next == this_id`, and reports the
+        // cycle as "B" (the edited pipeline).
+        let err = validate_depends_on("pl-b", &["pl-a".to_owned()], &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("cycle"),
+            "a 2-cycle through the edited pipeline must be refused as a cycle, not silently allowed: {message:?}"
+        );
+        assert!(
+            message.contains("pl-b"),
+            "the error must name the pipeline the cycle closes into (the edited one): {message}"
+        );
+    }
+
+    /// PR #57 review (BLOCKER) F1.7: the same fix as the 2-cycle, for a
+    /// 3-cycle where the edited pipeline sits BETWEEN the walk's start
+    /// and the closing edge. Same `others` shape as the route's update
+    /// path — the edited row is excluded.
+    #[test]
+    fn validate_depends_on_refuses_a_three_cycle_via_update_path() {
+        // Pre-edit authored state: A→B, B→C; C has no `depends_on` yet.
+        // The PUT on C excludes C from `others`, matching the route's
+        // `Some(&id)` shape.
+        let others = vec![
+            ("pl-a".to_owned(), vec!["pl-b".to_owned()]),
+            ("pl-b".to_owned(), vec!["pl-c".to_owned()]),
+        ];
+        let dagster: Vec<String> = Vec::new();
+        // The edit: C depends on A → A→B→C→A. The walk visits A,
+        // follows A→C via B, sees `next == this_id` (C, the edited
+        // pipeline), and reports "C" verbatim.
+        let err = validate_depends_on("pl-c", &["pl-a".to_owned()], &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("cycle"),
+            "a 3-cycle through the edited pipeline must be refused as a cycle: {message:?}"
+        );
+        assert!(
+            message.contains("pl-c"),
+            "the error must name the pipeline the cycle closes into: {message}"
+        );
+    }
+
+    /// PR #57 review (BLOCKER) F1.7: a fan-in (diamond) shape — A → {B,
+    /// C} → D — is acyclic and must be accepted. The walk's `visited`
+    /// set prevents the layered graph from being walked exponentially:
+    /// once D is marked visited via the B→D leg, the C→D leg skips it.
+    /// `others` excludes A (the edited row) to mirror the route's update
+    /// shape.
+    #[test]
+    fn validate_depends_on_accepts_a_diamond_via_update_path() {
+        // Pre-edit authored state: B→D, C→D; D has no edges. A is the
+        // row being edited (excluded from `others`).
+        let others = vec![
+            ("pl-b".to_owned(), vec!["pl-d".to_owned()]),
+            ("pl-c".to_owned(), vec!["pl-d".to_owned()]),
+            ("pl-d".to_owned(), Vec::new()),
+        ];
+        let dagster: Vec<String> = Vec::new();
+        // The edit: A → {B, C}. B→D, C→D — D is reachable via two paths
+        // but the walk must terminate without flagging a cycle.
+        assert!(
+            validate_depends_on(
+                "pl-a",
+                &["pl-b".to_owned(), "pl-c".to_owned()],
+                &others,
+                &dagster,
+            )
+            .is_ok(),
+            "a fan-in graph is acyclic: A → B → D and A → C → D share D, but D has no outgoing edge"
         );
     }
 
@@ -837,6 +1035,54 @@ mod tests {
         assert!(
             message.contains("own id") && message.contains("pl-a"),
             "self-reference must be named plainly: {message:?}"
+        );
+    }
+
+    /// PR #57 review (SHOULD-FIX) F1.9: a `depends_on` entry starting
+    /// with the orchestrator's reserved `authored__` namespace is
+    /// refused with a 400 that names the offending entry. The
+    /// orchestrator's `list_jobs()` filter strips leading-underscore
+    /// names but not `authored__…`, so the validator rejects explicitly
+    /// (rule 5). `authored__<id>` is the job name the factory builds
+    /// for the pipeline that owns `<id>` — depending on your own job
+    /// would deadlock, and depending on someone else's is not an
+    /// addressable author intent.
+    #[test]
+    fn validate_depends_on_refuses_an_authored_underscore_entry() {
+        let others = vec![("pl-a".to_owned(), Vec::new())];
+        let dagster = vec!["ingest_job".to_owned()];
+        let err = validate_depends_on("pl-a", &["authored__pl_a".to_owned()], &others, &dagster)
+            .unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("authored__") && message.contains("authored__pl_a"),
+            "the 400 must name the reserved namespace AND the offending entry: {message:?}"
+        );
+    }
+
+    /// PR #57 review (SHOULD-FIX) F1.9: a list with a duplicate entry
+    /// is refused with a 400 that names the duplicated id (rule 6). A
+    /// list like `[A, A]` could exceed the count cap on a row with two
+    /// copies of A in it, fire the chain sensor twice for A, and persist
+    /// a redundant edge in the column.
+    #[test]
+    fn validate_depends_on_refuses_duplicate_entries() {
+        let others = vec![
+            ("pl-a".to_owned(), Vec::new()),
+            ("pl-b".to_owned(), Vec::new()),
+        ];
+        let dagster: Vec<String> = Vec::new();
+        let err = validate_depends_on(
+            "pl-c",
+            &["pl-a".to_owned(), "pl-b".to_owned(), "pl-a".to_owned()],
+            &others,
+            &dagster,
+        )
+        .unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("pl-a"),
+            "the 400 must name the duplicated id: {message:?}"
         );
     }
 
@@ -1152,6 +1398,11 @@ mod tests {
                 max_retries: None,
                 tenant_id: None,
                 depends_on,
+                // The route mints an id before the validator runs (PR
+                // #57 review F1.7). The store fixtures here want the
+                // slug-derived default; that is exactly what `id: None`
+                // triggers in `create_pipeline`.
+                id: None,
             }
         }
 
@@ -1218,6 +1469,291 @@ mod tests {
             assert!(
                 message.contains(&pl_b.id),
                 "the 400 must name the dangling id verbatim: {message:?}"
+            );
+        }
+    }
+
+    /// PR #57 review (BLOCKER) F1.7: `A → B; PUT B with dependsOn:[A]`
+    /// returned 200 — pre-fix the cycle walk's "not an authored
+    /// pipeline" skip treated the edited row (excluded from `others` by
+    /// `collect_authored_depends_on(..., Some(&id))`) as unknown and
+    /// never closed the cycle. The route-level test exercises the real
+    /// `update` handler against a real `sqlx::test` Postgres so the
+    /// "excluded from others" precondition is the one production
+    /// actually constructs.
+    mod update_put_refuses_a_two_cycle {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "src".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "tgt".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on,
+                // The route mints an id before the validator runs (PR
+                // #57 review F1.7). The store fixtures here want the
+                // slug-derived default; that is exactly what `id: None`
+                // triggers in `create_pipeline`.
+                id: None,
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_put_on_b_with_dependson_a_returns_400(pool: sqlx::PgPool) {
+            // 1. `pl-a` exists with `depends_on = ["pl-b"]` — the
+            //    pre-edit chain that A depends on B.
+            let pl_b = pipelines::create_pipeline(&pool, &create_input("pl-b", Vec::new()), None)
+                .await
+                .expect("create pl-b");
+            let pl_a = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-a", vec![pl_b.id.clone()]),
+                None,
+            )
+            .await
+            .expect("create pl-a");
+
+            // 2. PUT B with `dependsOn: [<A's real id>]` — the closing
+            //    edge of an A↔B cycle. The store slugifies names with
+            //    a timestamp suffix, so the JSON carries the id read
+            //    back from the create result, not a hand-rolled "pl-a".
+            //    The body carries the editable fields the route
+            //    requires (kind/zone/table/schedule) but omits any
+            //    `dependsOn`-related fields the validator does not
+            //    depend on.
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "src",
+                    "targetZone": "silver",
+                    "targetTable": "tgt",
+                    "schedule": "manual",
+                    "dependsOn": [pl_a.id],
+                }))
+                .expect("a fixed-shape JSON body serializes"),
+            );
+            let err = update(
+                State(state_for(&pool)),
+                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Path(pl_b.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("a 2-cycle through the edited pipeline must be refused at the validator");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "PUT that closes a cycle through the edited row must be a 400, not a successful write"
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&response_body);
+            assert!(
+                message.contains("cycle"),
+                "the 400 must name the rule that fired: {message:?}"
+            );
+            assert!(
+                message.contains(&pl_b.id),
+                "the 400 must name the edited pipeline the cycle closes into: {message:?}"
+            );
+
+            // 3. Belt-and-braces: A's stored chain is unchanged
+            //    (the validator refused before any write happened).
+            let pl_a_after = pipelines::get_pipeline(&pool, &pl_a.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert_eq!(
+                pl_a_after.depends_on,
+                vec![pl_b.id.clone()],
+                "A's stored chain must not have changed"
+            );
+        }
+    }
+
+    /// PR #57 review (BLOCKER) F1.7: the create route mints the id
+    /// via [`pipelines::slug_id`] BEFORE running `validate_depends_on`,
+    /// so the validator's self-reference rule and any cycle rule see
+    /// the real id (not `body.name`, which only equals the slug when
+    /// the name happens to be lowercase alnum — every other user-typed
+    /// name produces a slug the validator would otherwise miss). This
+    /// unit test pins that the validator catches a self-reference
+    /// when `this_id` is a slug-shaped id (the shape the route hands
+    /// over); the create route is the seam that builds this id, and a
+    /// matching route-level test would need to mock the time-dependent
+    /// `slug_id` to land on the same id the route mints internally.
+    #[test]
+    fn validate_depends_on_refuses_self_reference_for_a_slug_shaped_id() {
+        let slug = pipelines::slug_id("compliance-rpt");
+        let others: Vec<(String, Vec<String>)> = Vec::new();
+        let dagster: Vec<String> = Vec::new();
+        let err =
+            validate_depends_on(&slug, std::slice::from_ref(&slug), &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("own id") && message.contains(&slug),
+            "self-reference must name the slug-shaped id verbatim: {message:?}"
+        );
+    }
+
+    /// PR #57 review (SHOULD-FIX) F1.8: every save that did not carry
+    /// `dependsOn` wrote `[]`, because the field was unconditional
+    /// `Vec<String>` with `#[serde(default)]` and the COALESCE write
+    /// was not there. The route-level pair proves the new shape
+    /// (`Option<Vec<String>>` joined by `COALESCE` in the SQL):
+    ///   - a save without `dependsOn` keeps the stored chain,
+    ///   - an explicit `[]` clears the chain.
+    mod update_preserves_depends_on_when_omitted {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "src".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "tgt".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on,
+                id: None,
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_without_dependson_keeps_the_stored_chain(pool: sqlx::PgPool) {
+            // 1. Build a graph A→B and persist both rows through the
+            //    store. The route-level handler is the seam that runs the
+            //    validator and the COALESCE write; the store fixtures
+            //    here just give it a known starting chain.
+            let pl_b = pipelines::create_pipeline(&pool, &create_input("pl-b", Vec::new()), None)
+                .await
+                .expect("create pl-b");
+            let pl_a = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-a", vec![pl_b.id.clone()]),
+                None,
+            )
+            .await
+            .expect("create pl-a");
+            assert_eq!(pl_a.depends_on, vec![pl_b.id.clone()]);
+
+            // 2. PUT A's other editable fields and omit `dependsOn`.
+            //    The console sends `{"dependsOn": null}` on a save that
+            //    did not touch the chain — this body models that and
+            //    the result must be 200 with the stored chain intact.
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"bronze","sourceTable":"src","targetZone":"silver","targetTable":"tgt","schedule":"manual","dependsOn":null}"#,
+            );
+            let _response = update(
+                State(state_for(&pool)),
+                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Path(pl_a.id.clone()),
+                body,
+            )
+            .await
+            .expect("an update that omits dependsOn must keep the stored chain");
+
+            // 3. Read A: the chain is the one we stored, untouched.
+            let pl_a_after = pipelines::get_pipeline(&pool, &pl_a.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert_eq!(
+                pl_a_after.depends_on,
+                vec![pl_b.id.clone()],
+                "an update body without dependsOn must not erase the stored chain"
+            );
+
+            // 4. PUT A with an explicit empty `dependsOn`: the chain
+            //    is cleared. This is the contract `Some(vec![])`
+            //    documents for the writer — it carries the "clear it"
+            //    intent that `None` (and the pre-fix `Vec::new()`
+            //    default) cannot.
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"bronze","sourceTable":"src","targetZone":"silver","targetTable":"tgt","schedule":"manual","dependsOn":[]}"#,
+            );
+            let _ = update(
+                State(state_for(&pool)),
+                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Path(pl_a.id.clone()),
+                body,
+            )
+            .await
+            .expect("an update that explicitly clears dependsOn must succeed");
+            let pl_a_after = pipelines::get_pipeline(&pool, &pl_a.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert!(
+                pl_a_after.depends_on.is_empty(),
+                "an explicit empty dependsOn must clear the chain: {}",
+                pl_a_after.depends_on.len()
             );
         }
     }

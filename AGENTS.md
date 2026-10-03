@@ -13,7 +13,8 @@ are in `docs/adr/`, phases/gates/risks in
 `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`, measurements in
 `docs/plans/*-RESULT.md`. Product documents are in `docs/core/`: `PRODUCT.md`
 (what the product is, has, lacks, and what is next), `BACKLOG.md`, and one
-page per feature in `docs/core/features/`.
+page per feature in `docs/core/features/`. A planner or reviewer taking over
+reads `docs/core/HANDOFF.md` for the current state.
 
 ## Who plans, who writes, who reviews
 

@@ -437,11 +437,23 @@ they declare no `dependsOn`, so they cannot close one.
 Semantics are **ALL**, not any: the sensor fires after a `SUCCESS` run of
 one upstream, but the downstream is requested only when *every* upstream
 has a `SUCCESS` run that finished after the downstream's own most-recent
-run started. A downstream with no run history yet (its first-ever run)
-fires without waiting for one. Each downstream gets a run-status sensor
-named `authored__<id>_after`, `default_status=RUNNING` so a chain never
-ships silently stopped, and its `run_key` is the triggering upstream's run
-id, so a re-firing upstream cannot launch the same downstream twice.
+run started. A downstream whose latest run is `QUEUED` or `NOT_STARTED`
+is NOT the same as "no run yet" -- the queued run is the previous chain
+launch still in flight, so the sensor waits for it to actually start before
+firing again (no double-launch). A downstream with NO run history yet
+(first-ever chain tick) does fire on a fresh upstream success, but the
+ALL check STILL runs -- an upstream that has never succeeded is
+`SkipReason`-named, never silently bypassed. Each downstream gets a
+run-status sensor named `authored__<id>_after`, `default_status=RUNNING`
+so a chain never ships silently stopped, and its `run_key` is the SORTED
+tuple of every upstream's latest SUCCESS run id
+(`"authored-deps:run-a-1,run-b-1"`), so two ticks that see the same set
+of upstream successes ask the daemon for the same downstream launch
+exactly once (the daemon's own dedup keeps the second tick from
+launching a second downstream run). A `paused` pipeline contributes NO
+sensor; `routes::pipelines::authored_status` also stops the stored
+sensor next to the schedule when pausing a chained pipeline, so the
+chain truly goes quiet (Dagster keeps sensor state across a reload).
 
 **Where the skip reason shows.** `GET /api/pipelines/{id}/schedule-ticks`
 merges the pipeline's schedule ticks with the `authored__<id>_after`
@@ -454,6 +466,13 @@ downstream run."
 location reloads — the authored update asks the orchestrator to reload, and
 the factory rebuilds the sensors from `GET /api/pipelines/runnable`. A
 draft has no job and is not rebuilt; its chain arms when it goes `ready`.
+
+**Editing the chain (PR #57 review F1.8).** A save that does NOT include
+`dependsOn` keeps the stored chain (the write uses `COALESCE`); an
+explicit `dependsOn: []` clears it. Pre-fix every save wrote `[]`,
+erasing every author-wired upstream in one round trip. The route-level
+pair (`routes::authored_pipelines::update`) proves both directions
+against a real `sqlx::test` Postgres.
 
 ### What's deliberately NOT in the stack
 

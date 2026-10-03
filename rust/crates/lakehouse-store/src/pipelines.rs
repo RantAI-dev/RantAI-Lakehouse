@@ -574,7 +574,17 @@ fn split_zone_table(location: &str) -> (String, String) {
 /// (`"pl-<slug>-<base36 millis>"`), so ids created by this store don't
 /// collide with a Dagster job name (which is never prefixed `pl-`) or with
 /// each other.
-fn slug_id(name: &str) -> String {
+///
+/// Exposed (PR #57 review F1.7): the create route mints the id BEFORE
+/// running `depends_on` validation, so the validator's self-reference
+/// rule names the real id the row will carry (not `body.name`, which
+/// is only a safe-enough unique string and can differ from the slug —
+/// see `routes::pipelines::create`'s doc comment on the old behavior).
+/// `create_pipeline` itself still calls `slug_id` when the caller
+/// doesn't pass one, so callers that just want the default behavior
+/// are unaffected.
+#[must_use]
+pub fn slug_id(name: &str) -> String {
     let slug: String = name
         .to_lowercase()
         .chars()
@@ -660,6 +670,13 @@ pub struct CreatePipelineInput {
     /// Defaults to empty when the field is absent (route omits it, the
     /// migration's `DEFAULT '{}'` fills the column). Migration `0052`.
     pub depends_on: Vec<String>,
+    /// Optional id. PR #57 review F1.7: the create route mints the id
+    /// BEFORE running the `depends_on` validator, so the validator's
+    /// self-reference rule names the real id the row will carry.
+    /// `None` (the default) makes `create_pipeline` derive the id
+    /// itself via [`crate::pipelines::slug_id`], so existing callers
+    /// (tests, internal callers) keep working unchanged.
+    pub id: Option<String>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -682,7 +699,11 @@ pub async fn create_pipeline(
     input: &CreatePipelineInput,
     changed_by: Option<Uuid>,
 ) -> Result<Pipeline, StoreError> {
-    let id = slug_id(&input.name);
+    // PR #57 review F1.7: callers that need to know it before the row
+    // is committed (the create route, so it can pass the real id to
+    // `validate_depends_on`'s self-reference rule) pass `input.id =
+    // Some(...)`; everyone else keeps the same id via `slug_id`.
+    let id = input.id.clone().unwrap_or_else(|| slug_id(&input.name));
     let source = format!("{}.{}", input.source_zone, input.source_table);
     let target = format!("{}.{}", input.target_zone, input.target_table);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
@@ -768,10 +789,14 @@ pub struct UpdatePipelineInput {
     /// defense in depth, not the primary safety boundary).
     pub max_retries: Option<i16>,
     /// Upstream pipeline ids whose SUCCESS runs must precede this one's
-    /// (migration `0052`). Defaults to empty (the route passes `[]` when
-    /// the body omits the field, and the migration's `DEFAULT '{}'`
-    /// accepts the empty value).
-    pub depends_on: Vec<String>,
+    /// (migration `0052`). PR #57 review F1.8: `None` leaves the
+    /// stored value alone (the write uses `COALESCE`); `Some(vec)`
+    /// replaces it with `vec`, including an explicit empty `Some(vec![])`
+    /// that clears the chain. The route layer maps the JSON `null`
+    /// sentinel the console sends on unchanged to `None`; an absent
+    /// `dependsOn` in the body defaults to `None` via
+    /// `#[serde(default)]`.
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// Replace an authored pipeline's definition. Its status is left as it
@@ -840,11 +865,18 @@ async fn update_pipeline_with_event(
     // the route layer rejects out-of-range values with 400 first, so
     // the CHECK constraint here is defense in depth for whatever
     // happens to bind straight into the column.
+    //
+    // PR #57 review F1.8: `depends_on` joins the `COALESCE` family —
+    // `None` keeps the stored chain, `Some(vec)` replaces it (the
+    // empty `Some(vec![])` clears the chain explicitly). Before this
+    // the column was overwritten unconditionally and a console save
+    // that didn't carry `dependsOn` wrote `[]`, erases every author-
+    // wired upstream in one round trip.
     let sql = format!(
         "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
 owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
-         depends_on = $12 \
+         depends_on = COALESCE($12, depends_on) \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
@@ -860,6 +892,10 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         .bind(&transforms)
         .bind(&input.owner)
         .bind(input.max_retries)
+        // PR #57 review F1.8: `Option<Vec<String>>` becomes a typed
+        // SQL `NULL` when `None`, so `COALESCE($12, depends_on)`
+        // keeps the stored chain. `Some(vec![])` binds as the empty
+        // array and clears the chain explicitly.
         .bind(&input.depends_on)
         .fetch_optional(&mut *tx)
         .await?;

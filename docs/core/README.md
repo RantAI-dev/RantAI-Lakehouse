@@ -8,6 +8,7 @@ stays current.
 | [PRODUCT.md](PRODUCT.md) | The one product document: what it is, what is in it, what it lacks, what blocks production, what is next, open decisions | When a feature is accepted; before a release |
 | [BACKLOG.md](BACKLOG.md) | The one list of work | Weekly |
 | [features/](features/) | One page per feature: what the user can do, decisions, limits, acceptance checklist. Written only when a feature is built | Starting and finishing a feature |
+| [HANDOFF.md](HANDOFF.md) | Current state for a planner or reviewer taking over: what is merged, what is in flight, how to review, what to watch for | When the planner role changes hands |
 | [reference/](reference/) | Parked material: security overview, support model, release policy, competitive comparison, user guide, glossary | When a customer or contract needs it |
 
 ## How a feature moves
