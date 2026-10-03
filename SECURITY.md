@@ -97,10 +97,12 @@ This project has known, intentional limitations that are **not** considered
 vulnerabilities to report (they're already tracked as accepted risk — see
 the "Status / Known limitations" section of [README.md](README.md)):
 
-- No login rate limiting beyond logging.
+- Login throttling covers password login only. OIDC/SSO login has no
+  rate limiting beyond logging.
 - The service does not refuse to boot when Postgres is unreachable;
   dependent routes return `503` instead.
-- Sessions and service tokens have no automatic rotation/cleanup job.
+- Session/credential cleanup is best-effort (hourly background job, may
+  skip a tick under load); nothing guarantees rotation or timely deletion.
 
 If you find a way to escalate one of these into something more severe
 (e.g. an actual authentication bypass, not just "no rate limiting"), that

@@ -10,6 +10,27 @@ once a first release is tagged.
 
 ### Added
 
+- Login throttling and session cleanup (backlog `SEC-2`/`SEC-5`).
+  `POST /api/auth/login` now throttles failed password attempts per email
+  (SHA-256 of the trimmed lower-cased address, stored in a new
+  `login_throttle` table, migration `0055`): after `LOGIN_MAX_FAILURES`
+  (default 5) failures within `LOGIN_FAILURE_WINDOW_SECS` (default
+  900 s), the email is locked out for `LOGIN_LOCKOUT_SECS` (default
+  300 s) and every attempt gets an identical `429` with a `Retry-After`
+  header — same response whether or not the account exists. A successful
+  login clears the counter, and a failure after an expired lock starts
+  the count fresh. There is no off switch: `LOGIN_MAX_FAILURES=0`,
+  negative, and invalid values all fall back to the defaults instead of
+  disabling throttling or failing boot. The
+  console's login page surfaces the lockout with the wait time. A new
+  hourly background job purges expired/revoked sessions, revoked
+  credentials, and unlocked throttle rows whose failure window has
+  passed (throttle rows are not gated by `AUTH_RETENTION_DAYS`; sessions
+  and credentials are, default 30 days), logging purge counts; it is
+  best-effort and skips a tick if the previous run has not finished. This
+  replaces the previously-documented "no login rate limiting beyond
+  logging" and "no session cleanup job" limitations (README, SECURITY.md).
+
 - Gold publish as a per-mart option (backlog `DATA-1`). Publishing is off by
   default for every mart. A Platform Admin switches it on from the mart's
   asset detail page in Data; once on, the mart is published automatically

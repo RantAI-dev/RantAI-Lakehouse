@@ -60,6 +60,13 @@ export async function login(email: string, password: string): Promise<LoginResul
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
+  if (res.status === 429) {
+    const json = await res.json().catch(() => null);
+    const retryAfterRaw = res.headers.get("Retry-After");
+    const retryAfterSecs = retryAfterRaw ? parseInt(retryAfterRaw, 10) || undefined : undefined;
+    const message = json?.error ?? "Too many sign-in attempts.";
+    throw new ServiceError("too_many_requests", message, 429, retryAfterSecs);
+  }
   return parse<LoginResult>(res, "Login failed.");
 }
 

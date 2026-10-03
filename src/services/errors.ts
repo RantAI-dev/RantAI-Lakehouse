@@ -9,6 +9,7 @@ export type ServiceErrorCode =
   | "unavailable"
   | "invalid_request"
   | "aborted"
+  | "too_many_requests"
 
 export class ServiceError extends Error {
   readonly code: ServiceErrorCode
@@ -24,12 +25,21 @@ export class ServiceError extends Error {
    * parsing `message` text.
    */
   readonly status?: number
+  /** Seconds until the caller should retry, from a `Retry-After` header on
+   *  a 429 response; `undefined` for every other error. */
+  readonly retryAfterSecs?: number
 
-  constructor(code: ServiceErrorCode, message: string, status?: number) {
+  constructor(
+    code: ServiceErrorCode,
+    message: string,
+    status?: number,
+    retryAfterSecs?: number,
+  ) {
     super(message)
     this.name = "ServiceError"
     this.code = code
     this.status = status
+    this.retryAfterSecs = retryAfterSecs
   }
 }
 

@@ -8,6 +8,7 @@
 //! `src/app/api/embed/data/route.ts:43`.
 
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::openfga::OpenfgaError;
 use lakehouse_core::ApiError;
@@ -39,15 +40,29 @@ struct ErrorBody {
 impl IntoResponse for ApiRejection {
     fn into_response(self) -> Response {
         // `ApiError::status()` returns a `u16` known to be a valid HTTP
-        // status code (400/401/403/404/422/500); `StatusCode::from_u16`
-        // cannot fail for these constants, but `unwrap`/`expect` are denied
-        // outside tests, so fall back to 500 on the theoretical error path
-        // rather than panicking.
+        // status code (400/401/403/404/409/422/429/500/503);
+        // `StatusCode::from_u16` cannot fail for these constants, but
+        // `unwrap`/`expect` are denied outside tests, so fall back to 500
+        // on the theoretical error path rather than panicking.
         let status =
             StatusCode::from_u16(self.0.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = ErrorBody {
             error: self.0.to_string(),
         };
+        // login throttling (SEC-2): a 429 carries an integer Retry-After
+        // header so the browser and the console can show how long to wait.
+        if let lakehouse_core::ApiError::TooManyRequests {
+            retry_after_secs, ..
+        } = &self.0
+        {
+            let mut response = (status, ApiJson(body)).into_response();
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
+            );
+            return response;
+        }
         (status, ApiJson(body)).into_response()
     }
 }
@@ -215,6 +230,33 @@ mod tests {
         let resp = ApiRejection(ApiError::Internal("boom".to_owned())).into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await, json!({"error": "boom"}));
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_renders_429_with_retry_after_header() {
+        let resp = ApiRejection(ApiError::TooManyRequests {
+            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
+            retry_after_secs: 300,
+        })
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "Too many failed sign-in attempts. Try again later."})
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_carries_retry_after_header() {
+        let resp = ApiRejection(ApiError::TooManyRequests {
+            message: "slow down".to_owned(),
+            retry_after_secs: 120,
+        })
+        .into_response();
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "120"
+        );
     }
 
     /// End-to-end path every data route depends on: a `ClickHouse` failure

@@ -90,6 +90,17 @@ pub enum ApiError {
     /// An unexpected server-side failure. Maps to HTTP 500.
     #[error("{0}")]
     Internal(String),
+    /// The caller has been rate-limited (login throttling, SEC-2). Maps to
+    /// HTTP 429. Carries a fixed message and a retry-after duration in
+    /// seconds so the response can carry a `Retry-After` header.
+    #[error("{message}")]
+    TooManyRequests {
+        /// The fixed message shown to the caller — identical whether or
+        /// not the account exists.
+        message: String,
+        /// How many seconds until the caller should retry, as an integer.
+        retry_after_secs: u64,
+    },
 }
 
 impl ApiError {
@@ -119,6 +130,7 @@ impl ApiError {
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
             Self::Unavailable(_) => 503,
+            Self::TooManyRequests { .. } => 429,
         }
     }
 }
@@ -179,6 +191,18 @@ mod tests {
         assert_eq!(
             ApiError::Unavailable("database is not available".to_owned()).status(),
             503
+        );
+    }
+
+    #[test]
+    fn too_many_requests_maps_to_429() {
+        assert_eq!(
+            ApiError::TooManyRequests {
+                message: "slow down".to_owned(),
+                retry_after_secs: 60
+            }
+            .status(),
+            429
         );
     }
 }
