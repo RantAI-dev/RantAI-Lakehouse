@@ -567,6 +567,45 @@ check.
 | Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |
 
+## Login throttling and session cleanup
+
+`POST /api/auth/login` is throttled per email. After
+`LOGIN_MAX_FAILURES` failures (default 5) inside a
+`LOGIN_FAILURE_WINDOW_SECS` rolling window (default 900 s), that email is
+locked out for `LOGIN_LOCKOUT_SECS` (default 300 s); every further attempt
+gets `429` with a `Retry-After` header, regardless of whether the password
+is right, and regardless of whether the account exists. Setting
+`LOGIN_MAX_FAILURES=0` disables the throttle entirely. Invalid values for
+any of the three fall back to the defaults rather than failing boot.
+
+Notes an operator should know:
+
+- The throttle key is a SHA-256 of the trimmed, lower-cased email — the
+  API never stores raw addresses in `login_throttle`.
+- Successful login clears the failure count for that email.
+- The throttle is in-process per deployment; a horizontally-scaled
+  deployment that shares its Postgres shares the counter (rows are
+  upserted atomically), so the limit is per *deployment*, not per
+  *replica*.
+- The console surfaces `429` as a lockout message with the wait time from
+  `Retry-After`; nothing else on the login page changes.
+
+### Session cleanup background job
+
+A task spawned at API boot purges, roughly hourly:
+
+- expired and revoked auth sessions (TTL longer than
+  `AUTH_RETENTION_DAYS`, default 30),
+- revoked auth credentials older than the same retention window,
+- `login_throttle` rows whose lockout expired more than
+  `AUTH_RETENTION_DAYS` ago.
+
+It logs purge counts at each run and skips a tick (with a logged warning)
+if the previous run has not finished. It is best-effort, not a guarantee:
+nothing promises a session is gone within any particular bound, and the
+job does not rotate anything — it only deletes what is already expired or
+revoked.
+
 ## Proposal: `GET /api/auth/providers` (not built)
 
 **SSO is currently gated by a build-time flag, not a runtime one.** The
