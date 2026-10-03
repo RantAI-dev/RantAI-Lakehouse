@@ -2746,3 +2746,50 @@ loads, but replaces without asking. `isUploadedTable` says so.
 
 **T13, then the trial.**
 
+### T13, T13a (reviewer, 2026-10-03)
+
+Reviewed `bf1c65a` and `5780cf7` against T13.
+
+**Findings: `D1` is closed. One more, `D2`, was found by the developer and
+fixed in T13a. No open `BLOCKER`; the branch is ready for the trial.**
+
+- `D2` (fixed in `5780cf7`): the development `.env` sets
+  `RUSTFS_S3_ENDPOINT` to a localhost address for tools that run on the
+  host, as `.env.example` does. Interpolated into the container, it would
+  have made the API dial itself. The container now takes the in-network
+  `CH_RUSTFS_S3_ENDPOINT`, the variable the Dagster services already use
+  for the same store.
+
+What was checked:
+
+- With the development `.env`, the API service resolves to
+  `RUSTFS_S3_ENDPOINT: http://rustfs:9000`, references
+  `env:UPLOAD_S3_ACCESS_KEY` and `env:UPLOAD_S3_SECRET_KEY`, and both
+  credentials empty, since `.env` does not set them yet. The values were
+  not printed.
+- No default credential; the comment names ADR 0002 Addendum 2 and the
+  least-privilege advice. An empty credential reads as "not configured", so
+  an unconfigured stack keeps its health tile at "unknown".
+- The developer's note that a credential limited to `uploads/` would fail
+  the health probe, which lists the bucket root, is in `OPERATIONS.md`.
+  Accepted.
+
+Verification re-run by the reviewer on `5297478`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test -p lakehouse-api` — first run: 3 failed in
+  `tests/test_connection_route.rs`, each a 401 where 200 was expected, with
+  the shared test Postgres at 95% of its shared memory under 1,134 leaked
+  test databases (the leak noted in the review of slice B). The reviewer
+  dropped the 771 that were idle and older than ten minutes; the file then
+  passed alone, and the whole crate passed: 2,518 passed, 0 failed, 4
+  ignored, matching the handoff.
+- `docker compose --profile '*' config --quiet` — pass.
+- `python3 ops/lint/check_compose_init_readiness.py` — pass.
+
+Not verified: a `docker compose up` from a clean project (rule 8). The
+trial recreates `lakehouse-api` and `dagster-code-location` on the
+development stack, with the product owner's go-ahead.
+
