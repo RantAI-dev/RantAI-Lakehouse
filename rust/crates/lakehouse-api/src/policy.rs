@@ -318,10 +318,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
     // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
     // matrix is "runs for this pipeline" + "steps for each run"
-    // composed into one round trip. The static path MUST be
-    // registered BEFORE `/runs/{runId}/steps` in
-    // `routes::pipelines_router` so axum does not match `{runId} =
-    // "steps"` and route the request to the wrong handler.
+    // composed into one round trip. axum's `matchit` router
+    // resolves static segments ahead of path parameters regardless
+    // of registration order (PR #57 review F1.10), so the literal
+    // `runs/steps` path reaches the matrix handler and a path with
+    // a real `runId` reaches the per-run handler — the route
+    // registration order in `routes::pipelines_router` is a
+    // readability aid, not a correctness requirement, and the
+    // matrix-vs-`run_steps` resolution is pinned by
+    // `tests/pipeline_routing.rs::both_paths_resolve_to_their_own_handler`.
     ("GET",  "/api/pipelines/{id}/runs/steps",        Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/logs",  Policy::RequiresPermission("pipeline:read")),

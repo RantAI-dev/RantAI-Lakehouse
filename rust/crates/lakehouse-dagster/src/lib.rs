@@ -3122,6 +3122,13 @@ mod tests {
                       ] }
                 ] } }
             })))
+            // PR #57 review F1.10: `.expect(1)` is the "one call per
+            // request" guarantee the matrix's per-page shape and the
+            // brief's "matrix is single-round-trip" rule need. The route
+            // MUST NOT fan out per-run; a regression that adds a second
+            // round trip flips this to an expect-1 mismatch rather than
+            // a silent "well, the response looked right".
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3165,6 +3172,11 @@ mod tests {
                       ] }
                 ] } }
             })))
+            // PR #57 review F1.10: same `.expect(1)` as the primary
+            // "one call" test above — this test also goes through the
+            // matrix at limit 30, and a regression that fans out per
+            // step to look up the `null` duration would over-fire.
+            .expect(1)
             .mount(&server)
             .await;
 

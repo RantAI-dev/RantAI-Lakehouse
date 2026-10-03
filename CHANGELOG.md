@@ -84,18 +84,24 @@ once a first release is tagged.
 - `POST /api/dashboard/boards` accepts `description`, and records the
   signed-in caller's display name in `created_by`.
   `PUT /api/dashboard/boards` accepts `description`.
-- Pipeline recovery API (R2): `POST /api/pipelines/{id}/runs/{runId}/retry`
+- Pipeline recovery API (R2): `POST /api/pipelines/runs/{runId}/retry`
   now accepts `{"strategy":"selected","stepKeys":[...]}` to re-run a chosen
   subset of steps, with the step keys validated against the parent run's
   step history and the first unknown key named in the 400 response; the
   Copilot `retry_pipeline_run` tool gained a matching `stepKeys` array
-  argument. Steps now report their attempt count (`attempts`), and a new
-  `GET /api/pipelines/{id}/runs/steps` route returns every recent run of a
-  pipeline alongside per-step status, attempt count and duration (the
-  route is registered before the `/runs/{runId}/steps` catch-all so the
-  `runs/steps` path reaches it). On a Dagster transport failure the matrix
-  route reports `available: false` with the standard `unavailable` reason,
-  never a 5xx. (R2)
+  argument. A `selected` request against a run that `Dagster` does not
+  know returns 404 (the run is the missing resource). The per-run steps
+  view (`GET /api/pipelines/{id}/runs/{runId}/steps`) reports the
+  step's attempt count (`attempts`); the runs × steps matrix
+  (`GET /api/pipelines/{id}/runs/steps`) returns one row per recent
+  run and per-step `stepKey`, `status`, and `durationMs` (and no
+  attempt count — `attempts` is a per-step, per-run field, not a
+  matrix field). On a `Dagster` transport failure the matrix route
+  reports `unavailable: "<reason>"`, never a 5xx, and never an
+  `available` field. The matrix-vs-`run_steps` resolution is
+  handled by axum's `matchit` router (static segment ahead of
+  parameter), not by the registration order in
+  `routes::pipelines_router`. (R2)
 - `max_retries` per authored pipeline: `POST /api/pipelines` and
   `PUT /api/pipelines/{id}` accept `maxRetries` (0–5, rejected with a 400
   outside the band; defaults to 2) and persist it in `lakehouse-store` via
@@ -161,6 +167,14 @@ once a first release is tagged.
   instead of showing an empty state for both.
 
 ### Fixed
+
+- Cycle detection now fires on the row being edited (PR #57 review F1.7): the cycle walk's closing-edge check moved ahead of the "not an authored pipeline" skip, so a 2-cycle like `A → B; PUT B with dependsOn:[A]` (or any cycle that closes through the edited row) is refused with a 400 that names the edited pipeline — pre-fix the edited row was excluded from `others` by `collect_authored_depends_on(..., Some(&id))`, the skip treated it as unknown, and the cycle silently landed. The walk is also bounded by a visited set so a fan-in (diamond) graph doesn't blow up exponentially.
+- The create route mints the pipeline's id before running the `dependsOn` validator (PR #57 review F1.7): the validator's self-reference rule now compares against the real id (`pl-<slug>-<base36 millis>`), not `body.name`, which only equals the slug for snake_case names.
+- Editing an authored pipeline no longer wipes its `dependsOn` chain (PR #57 review F1.8): the field is `Option<Vec<String>>` joined by `COALESCE($N, depends_on)` in the write, so `None` keeps the stored chain (a console save that did not touch the field), `Some(vec)` replaces it, and an explicit `Some(vec![])` clears it.
+- `dependsOn` refuses entries in the orchestrator's reserved namespace (PR #57 review F1.9): a list starting with `authored__` is rejected with a 400 that names the offending entry, and duplicate entries in the same submission are rejected with a 400 that names the duplicated value.
+- `POST /api/pipelines/runs/{runId}/retry` with `selected` step keys returns 404 when the run does not exist (PR #57 review F1.10), not 400 — the precondition `pipeline_run_status` lookup distinguishes "this run exists but has no steps yet" (a 400 with the first unknown key) from "this run does not exist" (a 404).
+- The false "the matrix route is registered before `/runs/{runId}/steps`, order matters" comments in `routes/mod.rs` and `policy.rs` are removed (PR #57 review F1.10): axum's `matchit` router resolves static segments ahead of path parameters regardless of registration order, and the routing is pinned by an integration test in `tests/pipeline_routing.rs` that drives the real `routes::router` for both paths and asserts each reaches the correct handler.
+- Wiremock mocks in the runs × steps matrix tests (lakehouse-dagster, `list_runs_with_steps_for_job` at limit 30) and in the `selected_retry_without_step_keys_returns_400_before_calling_dagster` mock now carry `.expect(1)` / `.expect(0)` (PR #57 review F1.10), so a regression that adds a second round trip (or leaks the parser) surfaces as a mock-mismatch rather than a silent "well, the response looked right".
 
 - A pipeline with `dependsOn` no longer takes down the whole Dagster code location (PR #57 review F1.1): the dependency sensor re-fetched the runnable list and rebuilt the job, and Dagster refuses two job definitions with the same name at load time. One fetch now feeds both the jobs and the sensors.
 - Pausing a chained pipeline now also stops its dependency sensor, and resuming starts it again (PR #57 review F1.2): Dagster keeps a sensor's stored RUNNING state across code-location reloads, so removing the sensor alone left the chain firing; a paused pipeline also builds no sensor at all.

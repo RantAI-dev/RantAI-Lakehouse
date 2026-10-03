@@ -467,6 +467,13 @@ location reloads — the authored update asks the orchestrator to reload, and
 the factory rebuilds the sensors from `GET /api/pipelines/runnable`. A
 draft has no job and is not rebuilt; its chain arms when it goes `ready`.
 
+**Editing the chain (PR #57 review F1.8).** A save that does NOT include
+`dependsOn` keeps the stored chain (the write uses `COALESCE`); an
+explicit `dependsOn: []` clears it. Pre-fix every save wrote `[]`,
+erasing every author-wired upstream in one round trip. The route-level
+pair (`routes::authored_pipelines::update`) proves both directions
+against a real `sqlx::test` Postgres.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
