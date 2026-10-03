@@ -29,7 +29,8 @@
 //! # Fail closed, no I/O
 //!
 //! Either ref unset is [`RustfsClientError::NotConfigured`], returned before
-//! any resolver is built. Building the client opens no connection, so a
+//! any resolver is built. A ref that resolves to an empty or whitespace-only
+//! value is `NotConfigured` too (finding `D1`, below). Building the client opens no connection, so a
 //! deployment without object storage fails here, not on the network. The
 //! endpoint is the deployment's own setting (`RUSTFS_S3_ENDPOINT`), never a
 //! request value, so no SSRF check applies, unlike connector dials
@@ -46,9 +47,12 @@ use crate::config::Config;
 #[derive(Debug, thiserror::Error)]
 pub enum RustfsClientError {
     /// `RUSTFS_ACCESS_KEY_SECRET_REF` or `RUSTFS_SECRET_KEY_SECRET_REF` is
-    /// unset. An unconfigured credential is a configuration gap, not a
-    /// failure that was probed.
-    #[error("RUSTFS_ACCESS_KEY_SECRET_REF or RUSTFS_SECRET_KEY_SECRET_REF is not set")]
+    /// unset, or a ref resolves to an empty or whitespace-only value. An
+    /// unconfigured credential is a configuration gap, not a failure that
+    /// was probed.
+    #[error(
+        "RUSTFS_ACCESS_KEY_SECRET_REF or RUSTFS_SECRET_KEY_SECRET_REF is not set or resolves to nothing"
+    )]
     NotConfigured,
     /// A ref is set but does not resolve: the variable it names is unset,
     /// or the ref is not an `env:` reference. The error names the ref,
@@ -110,7 +114,8 @@ impl<R: SecretResolver> SecretResolver for ExactMatchSecretResolver<R> {
 /// # Errors
 ///
 /// [`RustfsClientError::NotConfigured`] when either ref is unset (nothing
-/// is resolved and nothing is dialled), [`RustfsClientError::CredentialUnavailable`]
+/// is resolved and nothing is dialled) or resolves to an empty or
+/// whitespace-only value, [`RustfsClientError::CredentialUnavailable`]
 /// when a ref does not resolve, [`RustfsClientError::Misconfigured`] when
 /// `object_store` rejects the endpoint or bucket.
 pub async fn build_client(config: &Config) -> Result<AmazonS3, RustfsClientError> {
@@ -149,6 +154,18 @@ pub(crate) async fn build_client_with<R: SecretResolver>(
         .resolve(secret_ref)
         .await
         .map_err(RustfsClientError::CredentialUnavailable)?;
+    // Finding `D1`: compose points the refs at `UPLOAD_S3_ACCESS_KEY` /
+    // `UPLOAD_S3_SECRET_KEY` by default, and those are passed through as
+    // empty strings when the operator sets nothing. An empty value is
+    // "not configured", the same as an unset ref; without this an
+    // unconfigured stack would build a client with empty keys, the health
+    // tile would turn from "unknown" to a failure, and uploads would answer
+    // "authentication failed" instead of "not configured". Checked after
+    // both resolve, so no value is ever put in an error.
+    if access_key.expose_secret().trim().is_empty() || secret_key.expose_secret().trim().is_empty()
+    {
+        return Err(RustfsClientError::NotConfigured);
+    }
     AmazonS3Builder::new()
         .with_endpoint(config.rustfs_s3_endpoint.clone())
         .with_region(config.rustfs_s3_region.clone())
@@ -225,6 +242,28 @@ mod tests {
             let err = build_client_with(&config(&env), inner).await.unwrap_err();
             assert!(matches!(err, RustfsClientError::NotConfigured), "{err:?}");
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{env:?}");
+        }
+    }
+
+    /// Finding `D1`: a ref that resolves, but to nothing, is the compose
+    /// default for a stack whose operator set no upload credential.
+    #[tokio::test]
+    async fn an_empty_or_whitespace_value_is_not_configured_and_nothing_is_dialled() {
+        for blank in ["", "   ", "\t\n"] {
+            for blank_key in ["TEST_RUSTFS_ACCESS", "TEST_RUSTFS_SECRET"] {
+                let mut map = HashMap::from([
+                    ("TEST_RUSTFS_ACCESS".to_owned(), "access-id".to_owned()),
+                    ("TEST_RUSTFS_SECRET".to_owned(), "secret-value".to_owned()),
+                ]);
+                map.insert(blank_key.to_owned(), blank.to_owned());
+                let err = build_client_with(&config(&BOTH_REFS), EnvSecretResolver::with_map(map))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, RustfsClientError::NotConfigured),
+                    "{blank_key} = {blank:?}: {err:?}"
+                );
+            }
         }
     }
 

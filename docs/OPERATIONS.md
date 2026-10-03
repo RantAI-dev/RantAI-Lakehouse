@@ -468,18 +468,31 @@ Iceberg table. What that asks of the operator:
   upload from "Uploaded files"; deleting an upload removes the file and its
   entry, never the table it became. Nothing else removes them: there is no
   expiry and no quota, so storage grows with every upload (up to 50 MB each).
-- **The API needs the object-storage settings.** `RUSTFS_S3_ENDPOINT`
-  (and `RUSTFS_S3_REGION`), `RUSTFS_ACCESS_KEY_SECRET_REF` and
-  `RUSTFS_SECRET_KEY_SECRET_REF` (the same refs the RustFS health probe
-  reads; `.env.example` lists them, the two refs commented out). With either
-  ref unset, `POST /api/uploads` answers 503 "Upload storage is not
-  configured." and nothing is stored. A ref resolves from the API process's
-  own environment, so the variable it names (for example `env:RUSTFS_ACCESS_KEY`)
-  has to be set there too. **`docker-compose.yml` does not pass any of
-  these to the `lakehouse-api` service today**, so on the compose stack
-  uploading answers that 503 until they are added to the service's
-  environment; this section adds no compose change, and an API container
-  with them set was not run for this document.
+- **The API needs a storage credential, and nothing else.** On the compose
+  stack the `lakehouse-api` service passes the three settings the upload
+  store and the RustFS health probe read. You set two: `UPLOAD_S3_ACCESS_KEY`
+  and `UPLOAD_S3_SECRET_KEY`, dedicated names that are never RustFS's own
+  `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (ADR 0002 Addendum 2) and have no
+  default. `RUSTFS_S3_ENDPOINT` (default `http://rustfs:9000`),
+  `RUSTFS_ACCESS_KEY_SECRET_REF` (default `env:UPLOAD_S3_ACCESS_KEY`) and
+  `RUSTFS_SECRET_KEY_SECRET_REF` (default `env:UPLOAD_S3_SECRET_KEY`) only
+  need setting to override those defaults. Left empty, `POST /api/uploads`
+  answers 503 "Upload storage is not configured.", nothing is stored, and
+  the RustFS health tile reads "unknown". Do not leave
+  `RUSTFS_S3_ENDPOINT=http://localhost:9010` (the `.env.example` line for
+  host runs) in the `.env` that compose reads: it overrides the in-network
+  default, and inside the container `localhost` is the container.
+  Least privilege: the credential needs read, write and delete on the
+  warehouse bucket's `uploads/` prefix and nothing else of the API's; where
+  your store supports per-prefix policies, restrict it to that prefix, and
+  otherwise to the warehouse bucket. The RustFS health probe lists the
+  bucket root (`client.list_with_delimiter(None)`), so a credential limited
+  to `uploads/` can store files but would show that tile as failing; that is
+  the cost of the narrower grant, not a fault. Whether the pinned RustFS can mint
+  such an identity is the open question the `CONNECTOR_S3_*` note in
+  `.env.example` records; for a throwaway local stack you may set the two
+  to the same value as `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`. A
+  `docker compose up` with these settings was not run for this document.
 - **`ICEBERG_QUERY_DB` must be set**, because a load into a table name that
   does not exist yet first asks ClickHouse whether the name is free. Compose
   defaults it to `icecat_api`. Unset, the load is refused with 503 "Uploads

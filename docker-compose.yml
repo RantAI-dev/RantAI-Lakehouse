@@ -384,6 +384,32 @@ services:
       TENANT_WAREHOUSE_STS_ROLE_ARN: ${TENANT_WAREHOUSE_STS_ROLE_ARN:-arn:aws:iam::000000000000:role/lakekeeper}
       TENANT_WAREHOUSE_S3_ACCESS_KEY: ${TENANT_WAREHOUSE_S3_ACCESS_KEY:-}
       TENANT_WAREHOUSE_S3_SECRET_KEY: ${TENANT_WAREHOUSE_S3_SECRET_KEY:-}
+      # ── Object storage for uploaded files and the RustFS health probe
+      #    (ADR 0014, decision 1; plan T13, finding `D1`). `lakehouse-api`
+      #    read these three settings (`config.rs`, `rustfs_client.rs`) but
+      #    this service passed none of them, so on this stack every upload
+      #    answered "Upload storage is not configured." ──
+      # The endpoint is not a secret: the in-network name, as
+      # `TENANT_WAREHOUSE_S3_ENDPOINT` above uses.
+      RUSTFS_S3_ENDPOINT: ${RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # The two refs are ADR 0002 `secretRef`s, not secrets, so a default is
+      # safe. They name DEDICATED variables below, never
+      # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (RustFS's own root key): the
+      # ADR 0002 Addendum 2 rule that a name the API's own process resolves
+      # must not alias a secret it depends on, which
+      # `TENANT_WAREHOUSE_S3_*` above and `CONNECTOR_S3_*` also follow.
+      RUSTFS_ACCESS_KEY_SECRET_REF: ${RUSTFS_ACCESS_KEY_SECRET_REF:-env:UPLOAD_S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY_SECRET_REF: ${RUSTFS_SECRET_KEY_SECRET_REF:-env:UPLOAD_S3_SECRET_KEY}
+      # No default credential (`AGENTS.md` rule 5). Left empty, the store
+      # reads them as "not configured" (`rustfs_client.rs`): uploads answer
+      # 503 "Upload storage is not configured." and the RustFS health tile
+      # stays "unknown", rather than dialling with empty keys. A deployment
+      # should give them a credential limited to the warehouse bucket, and
+      # to its `uploads/` prefix where the store supports per-prefix
+      # policies. Whether the pinned RustFS can mint such an identity is
+      # the open question the `CONNECTOR_S3_*` note in .env.example records.
+      UPLOAD_S3_ACCESS_KEY: ${UPLOAD_S3_ACCESS_KEY:-}
+      UPLOAD_S3_SECRET_KEY: ${UPLOAD_S3_SECRET_KEY:-}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
       # Passed through explicitly because otherwise a non-Dispar deployment
       # cannot override them at all. Each resolves to its historical Dispar
