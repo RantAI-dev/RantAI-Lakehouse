@@ -324,6 +324,80 @@ the PR with Docker; that run is the gate for these.
 Python/compose lines of the verification block: not run — this PR
 touches no Python and no compose file.
 
+### `feat/login-throttle-session-cleanup` (developer, 2026-10-03, review fix round)
+
+Fixes every BLOCKER and SHOULD-FIX from the planner's review of the
+first handoff, as commits `656d68c` (code) and `2de51bf` (docs) on the
+same branch.
+
+- **Blocker 1** (`rust/crates/lakehouse-api/src/routes/auth.rs`): the
+  login handler now records a failure only for
+  `AuthError::InvalidCredentials`; every other `AuthError` propagates
+  through `From<AuthError> for ApiError` (classified 500) and counts
+  nothing. New end-to-end test
+  `a_storage_failure_during_login_is_not_rendered_or_counted_as_a_wrong_password`
+  renames `auth_identity` mid-login: asserts 500 with the classified
+  message for both a wrong and a correct password, zero
+  `login_throttle` rows, then first-try success after the table is
+  restored.
+- **Blocker 2** (`rust/crates/lakehouse-auth/tests/throttle.rs`): added
+  the missing `use lakehouse_test_support as _;` — the whole file had
+  been compile-verified only; the reviewer has since run it green.
+- **Blocker 3** (`rust/crates/lakehouse-auth/src/cleanup.rs`): the test
+  module is rewritten as an exact-survivor matrix (`token_hash`, not
+  the non-existent `session_hash`; `#[sqlx::test(migrations =
+  "../../migrations")]`; FK-valid fixtures through seeded `app_user` /
+  `service_identity`), covering live/20-hour-expired/3-day-expired
+  sessions, revoked vs active credentials, and
+  in-window/past-window/still-locked throttle rows, asserting exact
+  surviving sets rather than counts.
+- **SHOULD-FIX 1**: `record_failure`'s upsert resets to `failures = 1`
+  with a fresh window once the window has lapsed or the lock has
+  expired; new test
+  `a_failure_after_the_lock_expires_starts_the_count_fresh`.
+- **SHOULD-FIX 2**: the concurrency test now asserts `failures == 10`
+  and `locked.is_some()` exactly.
+- **SHOULD-FIX 3**: new
+  `src/features/auth/login-page.test.tsx` (2 tests): 429 renders the
+  server message plus "Try again in about 5 minute(s)." for
+  `Retry-After: 300`; 401 renders exactly "Invalid email or password."
+  and never leaks `invalid_or_expired`.
+- **Blocker 4 / SHOULD-FIX 4** (`README.md`, `docs/OPERATIONS.md`,
+  `CHANGELOG.md`, `.env.example`): no document claims a
+  `LOGIN_MAX_FAILURES=0` off switch anymore; all four now state that
+  0/negative/unparseable fall back to the default. OPERATIONS.md no
+  longer claims throttle rows purge after `AUTH_RETENTION_DAYS` (now:
+  unlocked rows with a lapsed window, no retention gate — same fix in
+  `cleanup.rs`'s `purge` doc comment) and gains manual-unlock SQL (by
+  `key_hash`, mirroring `throttle::key_for`; tables unqualified in
+  `public` — verified no `search_path` override exists), the
+  first-admin-lockout caveat, and the active-service-tokens-never-
+  expire note.
+- **SHOULD-FIX 5**: `PurgeCounts` and `ThrottlePolicy` fields
+  documented; both `allow(missing_docs, reason = "self-documenting")`
+  exceptions removed.
+
+Verification, run in the foreground on `2de51bf`:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — clean (first run failed on an unused variable in the new
+  acceptance test; fixed by asserting the classified message also for
+  the correct-password attempt, then re-run clean).
+- `cargo test -p lakehouse-core` — 46 passed, 0 failed.
+- `cargo test --workspace --no-run -j 1` — 0 errors (all test
+  binaries compile).
+- `bun run typecheck` — clean. `bun run lint` — 0 errors, 6 warnings
+  (unchanged, pre-existing, untouched files). `bun run test` — 303
+  passed, 0 failed (301 before; +2 new login-page tests).
+- DB-backed suites (`throttle.rs`, `cleanup.rs`, `login_throttle.rs`,
+  route auth tests): **not run** — still no Docker daemon on this
+  machine (docker.sock permission denied, no passwordless sudo). Same
+  caveat as the first handoff; CI runs them on the PR. Everything else
+  in this round is compile- or execution-verified as quoted above.
+- Python and compose lines: not run — no Python or compose file
+  touched.
+
 ## 8. Review (planner appends)
 
 _Empty._
