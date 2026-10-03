@@ -1,7 +1,7 @@
 # Login throttling and session cleanup — Implementation Plan
 
-**Status:** not started. Written 2026-10-02 by the planner (Claude Opus) for
-a developer agent, under the role split in `AGENTS.md`.
+**Status:** built, in review — review 2 (2026-10-03) has two open BLOCKERs (3, 5), see §8.
+Written 2026-10-02 by the planner (Claude Opus) for a developer agent, under the role split in `AGENTS.md`.
 
 **Feature page (requirements and acceptance checklist):**
 `docs/core/features/login-protection-and-session-cleanup.md`. Backlog
@@ -111,6 +111,9 @@ neither runs cargo.
     `locked_until = now() + lockout` when the count reaches `max_failures`.
     Returns the lock time if this call set one. It must be atomic: two
     concurrent failures must both be counted.
+    *Corrected in review 1 (SHOULD-FIX 1):* a failure on a key whose lock
+    has expired also starts a new window at 1, exactly like a passed
+    window, and clears the expired `locked_until` (review 2, BLOCKER 5).
   - `clear(pool, key) -> Result<(), AuthError>`.
   - All values bound. `# Errors` on every `Result` fn.
 - **Accept:** `sqlx::test`s: below the limit no lock; the Nth failure
@@ -400,4 +403,280 @@ Verification, run in the foreground on `2de51bf`:
 
 ## 8. Review (planner appends)
 
-_Empty._
+### Review 1 — planner, 2026-10-03, on `5754a1e`
+
+Reality check first: `feat/login-throttle-session-cleanup` is on `origin`
+at `5754a1e`, nine commits over `0277ebd`, hashes match the handoff. No PR
+yet (correct — the planner opens it).
+
+#### BLOCKER 1 — every authentication error is now a "wrong password"
+
+`routes/auth.rs`, `login`: `if let Ok(principal) = auth.local.authenticate(..)
+… else { record_failure; 401 }`. The `else` catches **every** `AuthError`,
+not only `InvalidCredentials`. Before this change `?` turned
+`AuthError::Database` / `AuthError::Hash` into a classified `500
+"authentication error"` (`lakehouse-auth/src/error.rs` `From<AuthError>`).
+Now a database hiccup during verification, or a corrupt stored hash, is
+(a) reported to the user as a wrong password, and (b) counted as a throttle
+failure — five transient errors lock a real user out. This also falsifies
+the handoff's "no existing response changed".
+
+Fix: `match` the result. `Ok(p)` → success path. `Err(AuthError::InvalidCredentials)`
+→ `record_failure`, audit, `warn!("login failed")`, `401`. Any other `Err(e)`
+→ return `e.into()` without touching the throttle. Add an assertion that
+the old mapping holds (a unit test on the match helper, or a route test
+that a non-credential error does not create a `login_throttle` row).
+
+#### BLOCKER 2 — the throttle storage tests have never run anywhere, CI included
+
+`lakehouse-auth/tests/throttle.rs` does not link `lakehouse-test-support`
+(every other file in that directory has `use lakehouse_test_support as _;`,
+e.g. `tests/session.rs:19`). Without it nothing starts Postgres or sets
+`DATABASE_URL`, and all seven tests panic: `DATABASE_URL must be set:
+EnvVar(NotPresent)`. CI does not set `DATABASE_URL` either, so these would
+have been red on the PR. The concurrency acceptance test is among them.
+
+Reviewer experiment (local, not committed): with that one line added, all
+seven pass (`cargo test -p lakehouse-auth --test throttle` → 7 passed). So
+the SQL is right; the fix is the one line.
+
+#### BLOCKER 3 — the cleanup tests cannot pass, and miss the plan's cases
+
+`lakehouse-auth/src/cleanup.rs` `mod tests` — all seven fail when run
+(same `DATABASE_URL` panic; fixing that exposes the rest):
+
+- `INSERT INTO session (id, session_hash, …)` — the column is `token_hash`
+  (`0019_auth.sql:77`). There is no `session_hash` anywhere.
+- `app_user_id` and `service_identity_id` are fresh `Uuid::new_v4()` —
+  both are `NOT NULL REFERENCES … ` (`0019_auth.sql:76,98`), so every seed
+  fails on the foreign key.
+- `gen_random_bytes` is `pgcrypto`; no migration enables it.
+- `#[sqlx::test]` with no `migrations = "../../migrations"`, inside a crate
+  that has no `migrations/` directory: the tables do not exist. Compare
+  `tests/throttle.rs`, which gets this right.
+- Plan T4 asks for one test seeding each kind **on both sides** of the
+  cut-off and asserting **which rows remain**. Missing: a session expired
+  inside the retention (must survive), a revoked session (both sides), a
+  throttle row inside its window (must survive). The tests assert counts
+  only.
+
+Fix: move them to `lakehouse-auth/tests/cleanup.rs` with the migrations
+path, use a user the migrations seed (as `tests/session.rs` does) and a
+service identity created the way `tests/service_token.rs::seed_service_identity`
+does (rule 4: reuse, do not re-invent), use `token_hash` with a bound
+random hex value, and write the single table-driven test the plan
+describes, asserting the surviving IDs. Keep the empty-tables test.
+
+#### BLOCKER 4 — the docs advertise an off switch that does not exist
+
+`README.md` (configuration table), `docs/OPERATIONS.md`, `CHANGELOG.md` and
+`.env.example` all say `LOGIN_MAX_FAILURES=0` disables throttling. The code
+(correctly, per decision "No off switch") treats `0` as unset and uses `5`.
+An operator following the docs believes the throttle is off when it is on;
+worse, the docs contradict a signed-off security posture (principle 2:
+never fabricate). Fix the four docs: zero, negative or unparseable falls
+back to the default; the throttle cannot be turned off. Do **not** change
+the code.
+
+#### SHOULD-FIX 1 — one mistake after a lock expires re-locks at once
+
+`throttle::record_failure`: the lock is 300 s, the window 900 s. When the
+lock expires inside the window, `failures` is still ≥ 5, so the next single
+failure re-locks for another 5 minutes and writes another
+`auth.login_locked` row. A user who waits out the lock and mistypes once is
+locked again. This is a plan gap (the plan said "when the count reaches
+`max_failures`" without saying what happens after expiry), corrected here:
+**a failure on a key whose lock has expired starts a new window at 1.** In
+the SQL, treat `login_throttle.locked_until IS NOT NULL AND
+login_throttle.locked_until <= $2` the same as "window passed" in all three
+`CASE`s. Add a test: lock, let it expire (short lockout), one failure →
+not locked, `failures = 1`. The plan's T2 text is updated below.
+
+#### SHOULD-FIX 2 — the concurrency test does not test concurrency
+
+`tests/throttle.rs::ten_concurrent_record_failure_calls_all_count` asserts
+only "locked" and "≥ 1 call saw the lock". With `max_failures = 5`, a lost
+update that counted only 5 of 10 still passes. Fix: use a policy with
+`max_failures` above 10 (e.g. 100) and assert
+`SELECT failures FROM login_throttle WHERE key_hash = $1` is exactly 10.
+
+#### SHOULD-FIX 3 — T5 has no component test
+
+Plan T5 acceptance: a component test — a `429` shows the wait message, a
+`401` still shows the credentials message. None was added (`bun run test`
+is 301, the baseline). There is no login-page test yet; add `src/features/auth/login-page.test.tsx`. While
+there: the text is "Try again in about 5 minute(s)." — the plan's wording is
+"about 5 minutes"; pluralise properly.
+
+#### SHOULD-FIX 4 — `docs/OPERATIONS.md` misses what the plan asked for, and says untrue things
+
+Missing (plan T6): how an operator clears a lock by hand
+(`DELETE FROM login_throttle WHERE key_hash = …`, and a one-line way to
+compute the hash, e.g. `printf '%s' 'user@example.com' | sha256sum` after
+trimming and lower-casing), and that the first admin can be locked out too.
+
+Untrue, remove or correct:
+- "skips a tick (with a logged warning) if the previous run has not
+  finished" — the loop runs `purge` inline; there is no such warning. Same
+  sentence in `CHANGELOG.md`, and "may skip a tick under load" in `README.md`
+  and `SECURITY.md`.
+- "`login_throttle` rows whose lockout expired more than
+  `AUTH_RETENTION_DAYS` ago" — throttle rows go once unlocked and past the
+  failure window; retention does not apply to them. The same error is in
+  `cleanup.rs`'s `purge` doc comment ("at least `retention` old").
+- "The throttle is in-process per deployment" — it is in Postgres.
+
+`README.md`: the plan asked the cleanup bullet to be replaced with what
+stays true — **active service tokens do not expire**. Add that bullet.
+`CHANGELOG.md`: the plan asked for two or three plain sentences a customer
+can read first, then the detail.
+
+#### SHOULD-FIX 5 — `#[allow(missing_docs)]` with an uncheckable reason
+
+`ThrottlePolicy` and `PurgeCounts`: "field names are self-documenting" is
+not a checkable reason (`AGENTS.md`). Write a one-line doc on each field
+and drop the `allow`.
+
+#### Nits (fix if touching the file)
+
+- `0055_login_throttle.sql` has no trailing newline.
+- `docs/core/BACKLOG.md` is edited on this branch (the plan says not to);
+  the change is identical to what `main` already has from #65, so it
+  disappears when `main` is merged in.
+
+#### Checked and correct
+
+- `429` built only from fixed text and the lock time; nothing about the
+  account reaches it. `401` path still returns `ApiError::invalid_or_expired()`.
+- A locked key returns before `authenticate`: no Argon2 cost.
+- `record_failure` is one `INSERT … ON CONFLICT DO UPDATE`; all values
+  bound; the interval strings are built from integers and bound, not
+  spliced into SQL.
+- Throttle storage errors use `?` → `AuthError::Database` →
+  `"authentication error"`; no fall-through to an unthrottled login.
+- Audit row: `auth.login_locked`, `login_key`, 12 hex characters, no
+  principal, no email or password; best-effort write.
+- Cleanup `DELETE`s match the plan; none touches a live session or an
+  active credential (`revoked_at < cutoff` is false for `NULL`).
+- Config fallback rejects zero, negative and garbage; fields are in `Debug`.
+- `Retry-After` is set only for the new variant; no other response changes.
+- `tests/login_throttle.rs` covers all five T3 acceptance bullets.
+
+#### Verification by the reviewer
+
+Run on `5754a1e` in a fresh clone, Docker available, foreground:
+
+- `cargo test -p lakehouse-auth --no-fail-fast` — lib: **54 passed, 7
+  failed** (all of `cleanup::tests`); `tests/throttle.rs`: **0 passed, 7
+  failed** (`DATABASE_URL must be set`); the other six binaries: 21, 7, 5,
+  7, 8, 9 passed, 1 ignored.
+- `cargo test -p lakehouse-api --test login_throttle` — **5 passed, 0
+  failed**.
+- Experiment above: `tests/throttle.rs` plus the harness import — 7 passed.
+- Trial merge of `main` (`6e12254`) into the branch: one add/add conflict in
+  this plan file; `main`'s copy is identical to the branch's original, so
+  the branch's version is the resolution. No other conflict.
+
+*Not verified by the reviewer:* full workspace clippy and test, the
+TypeScript block (typecheck, lint, test), the compose line. These run once
+on the fixed branch before merge, not now: the branch has blockers.
+
+#### What the developer does next
+
+Fix BLOCKERs 1–4 and SHOULD-FIXes 1–5, one commit each, citing
+`PR review BLOCKER n` / `SHOULD-FIX n` at the fix site and in the commit
+body (rule 13). Merge `main` in first (or merge the reviewer's branch that
+carries this review). Then run the **DB-backed** tests, not only
+`--no-run`: if Docker is unavailable on your machine, say so and the
+reviewer runs them. End the report with the literal output of
+`git status --short`, `git log --oneline origin/main..HEAD` and
+`git ls-remote --heads origin feat/login-throttle-session-cleanup`.
+
+### Review 2 — planner, 2026-10-03, on `0456d5f` merged with `main` `b81b3a1`
+
+Review 1 above was written earlier the same day; the reviewer's push failed
+then, so it lands on the branch together with this one. Correction to
+review 1, SHOULD-FIX 4: "skips a tick if the previous run has not finished"
+**is true** — the loop uses `MissedTickBehavior::Skip`. Only "(with a
+logged warning)" is untrue.
+
+Reality check: `656d68c`, `2de51bf`, `0456d5f` are on `origin`. `main` gained
+#66 (pipelines; no auth files, no migration) — merged in, the plan file is
+the only conflict, resolved as in review 1. `0055` is still free.
+
+#### Closed
+
+- BLOCKER 1 — fixed. `Err(AuthError::InvalidCredentials)` alone counts and
+  renders `401`; any other error is the classified `500`, counted nowhere.
+  The new route test (rename `auth_identity` mid-login) passes.
+- BLOCKER 2 — fixed. `tests/throttle.rs` links the harness; its tests run.
+- BLOCKER 4 — fixed in all four files.
+- SHOULD-FIX 2, 5 — fixed. SHOULD-FIX 3 — test added (see below for the
+  wording).
+
+#### BLOCKER 5 — after the first lock expires, the key can never lock again
+
+Introduced by the SHOULD-FIX 1 change in `throttle::record_failure`. The
+reset predicate is `window passed OR locked_until < now`, but on a reset
+the `locked_until` assignment falls to `ELSE login_throttle.locked_until`,
+so the **expired** lock time stays on the row. Every later failure matches
+`locked_until < now` again and resets the count to 1; with
+`max_failures > 1` the key never reaches the limit. An attacker triggers
+one lock, waits it out, then guesses without limit. The developer's own new
+test `a_failure_after_the_lock_expires_starts_the_count_fresh` catches it
+and **fails** (`throttle.rs:194`, "the second failure after expiry must
+lock again") — it was never run.
+
+Fix: in the `locked_until` `CASE`, add a branch before the `ELSE`:
+`WHEN <the same reset predicate> THEN NULL`. Reviewer experiment (local,
+not committed): with exactly that branch, `cargo test -p lakehouse-auth
+--test throttle` → **8 passed**.
+
+#### BLOCKER 3 — still open: the cleanup tests still do not run
+
+`cleanup.rs` `mod tests` gained the migrations path and a correct survivor
+matrix, but still has no `use lakehouse_test_support as _;`. Both tests
+panic `DATABASE_URL must be set`, exactly as in review 1. Reviewer
+experiment: with that one line inside `mod tests`, `cargo test -p
+lakehouse-auth --lib cleanup` → **2 passed**. (Moving them to
+`tests/cleanup.rs`, as review 1 suggested, works too.)
+
+#### SHOULD-FIX 6 — leftovers from review 1
+
+- `docs/OPERATIONS.md:653` — drop "(with a logged warning)"; no warning is
+  logged.
+- `README.md` "Status / Known limitations" — the bullet the plan asked for:
+  active service tokens never expire (OPERATIONS.md says it; README does
+  not).
+- `login-page.tsx` — "about 5 minute(s)": write "minutes" (and "1 minute"),
+  and update `login-page.test.tsx`, which now asserts the wrong wording.
+
+#### Nit
+
+- `docs/OPERATIONS.md` unlock SQL: "mirrors exactly" overstates it.
+  `trim(' ' from …)` strips only spaces where `str::trim` strips all
+  whitespace, and `lower()` follows the database collation. Say "for an
+  ordinary address".
+- Review 1 asked for one commit per finding; this round came as three.
+  Keep to one per finding next round.
+
+#### Verification by the reviewer (Docker available, foreground)
+
+- `cargo test -p lakehouse-api --test login_throttle` — **6 passed, 0
+  failed**.
+- `cargo test -p lakehouse-auth --test throttle` — **7 passed, 1 failed**
+  (BLOCKER 5).
+- `cargo test -p lakehouse-auth --lib` — **54 passed, 2 failed** (BLOCKER 3).
+- The two experiments above — 8/8 and 2/2.
+
+*Not run:* full workspace clippy and test, the TypeScript block, compose.
+They run once on the next round, before the PR.
+
+#### Next round
+
+Two one-line BLOCKER fixes and SHOULD-FIX 6, one commit each, cited at the
+fix site. Then **run** `cargo test -p lakehouse-auth` and `cargo test -p
+lakehouse-api --test login_throttle` — every test file this branch adds
+must be reported with its pass count, not `--no-run`. If Docker is not
+available, say so and stop; the reviewer runs them.
+
