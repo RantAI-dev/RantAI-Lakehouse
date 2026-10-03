@@ -99,7 +99,12 @@ pub async fn purge(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    // `#[sqlx::test]` needs `DATABASE_URL` pointing at a Postgres and the
+    // migrations applied; `lakehouse-test-support` sets both up (review
+    // blocker 3, 2026-10-03 — without this link the tests panic
+    // `DATABASE_URL must be set` before a single assertion runs).
     use super::*;
+    use lakehouse_test_support as _;
     use sqlx::PgPool;
     use time::OffsetDateTime;
     use uuid::Uuid;
