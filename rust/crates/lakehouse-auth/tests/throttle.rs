@@ -6,6 +6,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered). Without
+// this line `sqlx::test` finds no `DATABASE_URL` and every test in the
+// file fails before its first statement — review blocker 2, 2026-10-03.
+use lakehouse_test_support as _;
+
 use lakehouse_auth::throttle::{self, ThrottlePolicy};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -131,14 +139,63 @@ async fn ten_concurrent_record_failure_calls_all_count(pool: PgPool) {
         let handle = tokio::spawn(async move { throttle::record_failure(&pool, &key, &p).await });
         handles.push(handle);
     }
-    let mut locked_count = 0;
     for handle in handles {
-        let result = handle.await.unwrap();
-        if result.unwrap().is_some() {
-            locked_count += 1;
-        }
+        handle.await.unwrap().unwrap();
     }
-    let locked = throttle::locked_until(&pool, &key).await.unwrap();
+    // Every call must have counted: the stored count is exactly 10, and
+    // exactly the calls from the 5th increment onward report a lock. A
+    // weaker `>= 1` check here would pass even if half the concurrent
+    // attempts went uncounted (review SHOULD-FIX 2, 2026-10-03).
+    let (failures, locked): (i32, Option<time::OffsetDateTime>) =
+        sqlx::query_as("SELECT failures, locked_until FROM login_throttle WHERE key_hash = $1")
+            .bind(&key)
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+    assert_eq!(failures, 10, "every concurrent failure must be counted");
     assert!(locked.is_some());
-    assert!(locked_count >= 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failure_after_the_lock_expires_starts_the_count_fresh(pool: PgPool) {
+    // After a lock expires, ONE further failure must only be failure #1:
+    // the plan (as corrected in review SHOULD-FIX 1, 2026-10-03) requires
+    // the count to restart, not carry the pre-lock failures into an
+    // immediate re-lock.
+    let key = throttle::key_for("expired-lock@test.com");
+    let short = ThrottlePolicy {
+        max_failures: 2,
+        window: Duration::seconds(900),
+        lockout: Duration::seconds(2),
+    };
+    throttle::record_failure(&pool, &key, &short).await.unwrap();
+    assert!(
+        throttle::record_failure(&pool, &key, &short)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let lock = throttle::record_failure(&pool, &key, &short).await.unwrap();
+    assert!(
+        lock.is_none(),
+        "one failure after an expired lock must not re-lock"
+    );
+    let (failures,): (i32,) =
+        sqlx::query_as("SELECT failures FROM login_throttle WHERE key_hash = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failures, 1, "the count restarts at 1 after a lock expires");
+
+    // And the key needs a full new set of failures to lock again.
+    assert!(
+        throttle::record_failure(&pool, &key, &short)
+            .await
+            .unwrap()
+            .is_some(),
+        "the second failure after expiry must lock again"
+    );
 }

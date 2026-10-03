@@ -219,6 +219,59 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
 }
 
 #[tokio::test]
+async fn a_storage_failure_during_login_is_not_rendered_or_counted_as_a_wrong_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    // Break the login lookup itself: `password::verify` SELECTs from
+    // `auth_identity`, so renaming the table turns every login into a
+    // storage error for the duration of the rename. A storage error must
+    // surface as its classified 500 — never as the non-enumerated 401 a
+    // wrong password gets, and never as a counted failure (review
+    // blocker 1, 2026-10-03: five database hiccups would otherwise lock
+    // a real user out).
+    sqlx::query("ALTER TABLE auth_identity RENAME TO auth_identity_renamed")
+        .execute(&pool)
+        .await
+        .expect("rename auth_identity to simulate a storage failure");
+    let mut resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let wrong_password_body = body_string(&mut resp).await;
+    let mut resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let correct_password_body = body_string(&mut resp).await;
+    sqlx::query("ALTER TABLE auth_identity_renamed RENAME TO auth_identity")
+        .execute(&pool)
+        .await
+        .expect("restore auth_identity");
+
+    assert!(
+        wrong_password_body.contains("authentication error"),
+        "a storage failure renders its classified message, got: {wrong_password_body}"
+    );
+    assert!(
+        correct_password_body.contains("authentication error"),
+        "the classified message must not depend on the password's correctness, got: {correct_password_body}"
+    );
+    assert!(
+        !wrong_password_body.contains("Too many failed sign-in"),
+        "a storage failure must not render as a lockout"
+    );
+
+    // Nothing was recorded against the key: no throttle row exists, and
+    // once the lookup works again the CORRECT password signs in on the
+    // first try (and a wrong one would still have two failures of
+    // headroom, not zero).
+    let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM login_throttle")
+        .fetch_one(&pool)
+        .await
+        .expect("query login_throttle");
+    assert_eq!(rows, 0, "a storage failure must not count toward the lock");
+    let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn an_expired_lock_lets_the_correct_password_through_again() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "1")).await;
     seed_password_identity(&pool).await;

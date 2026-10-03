@@ -20,11 +20,19 @@ use crate::{AuthError, PgPool};
 /// back to the default (enforced by [`crate::Config`] — this struct is
 /// constructed from already-validated values and carries no fallback
 /// logic of its own).
-#[allow(missing_docs, reason = "field names are self-documenting in context")]
+/// How many failed attempts are tolerated within [`Self::window`] before
+/// [`Self::lockout`] is applied to the key.
 #[derive(Debug, Clone)]
 pub struct ThrottlePolicy {
+    /// Failed attempts tolerated within [`Self::window`] before the key
+    /// locks.
     pub max_failures: u32,
+    /// How long a failure counts toward [`Self::max_failures`]; failures
+    /// older than this stop counting (the count restarts at 1 on the next
+    /// failure).
     pub window: Duration,
+    /// How long a key stays locked once [`Self::max_failures`] is
+    /// reached.
     pub lockout: Duration,
 }
 
@@ -73,6 +81,13 @@ pub async fn locked_until(pool: &PgPool, key: &str) -> Result<Option<OffsetDateT
 /// `INSERT … ON CONFLICT (key_hash) DO UPDATE` — two concurrent failures
 /// both increment the count.
 ///
+/// The count restarts at 1 in two cases: the row's window has passed, or
+/// the row was locked and that lock has expired (review SHOULD-FIX 1,
+/// 2026-10-03 — without this, one typo after a lock expires immediately
+/// re-locks the key for the full lockout again). `locked_until < now`
+/// covers the expired lock; `NULL` (never locked) yields `NULL`, which a
+/// `CASE WHEN` treats as false.
+///
 /// Returns `Some(locked_until)` if this call just set the lock,
 /// `None` otherwise.
 ///
@@ -87,26 +102,32 @@ pub async fn record_failure(
     let now = OffsetDateTime::now_utc();
     let window_interval = format!("{} seconds", policy.window.whole_seconds());
     let lockout_interval = format!("{} seconds", policy.lockout.whole_seconds());
-    // One SQL statement: if the old window has passed, start a new
-    // window at 1; otherwise increment. When count >= max_failures,
-    // set locked_until = now() + lockout.
+    // One SQL statement: if the old window has passed OR the previous
+    // lock has expired, start a new window at 1; otherwise increment.
+    // When the resulting count >= max_failures, set locked_until =
+    // now() + lockout. The reset predicate appears once per assignment
+    // because ON CONFLICT DO UPDATE assignments only see the pre-update
+    // row — they cannot reference each other.
     let row: Option<(i32, Option<OffsetDateTime>)> = sqlx::query_as(
         "INSERT INTO login_throttle (key_hash, failures, window_started_at, locked_until) \
          VALUES ($1, 1, $2, NULL) \
          ON CONFLICT (key_hash) DO UPDATE SET \
            failures = CASE \
              WHEN login_throttle.window_started_at < $2 - $3::interval \
+               OR login_throttle.locked_until < $2 \
                THEN 1 \
              ELSE login_throttle.failures + 1 \
            END, \
            window_started_at = CASE \
              WHEN login_throttle.window_started_at < $2 - $3::interval \
+               OR login_throttle.locked_until < $2 \
                THEN $2 \
              ELSE login_throttle.window_started_at \
            END, \
            locked_until = CASE \
              WHEN (CASE \
                WHEN login_throttle.window_started_at < $2 - $3::interval \
+                 OR login_throttle.locked_until < $2 \
                  THEN 1 \
                ELSE login_throttle.failures + 1 \
              END) >= $4 \

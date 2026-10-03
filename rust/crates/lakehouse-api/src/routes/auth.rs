@@ -36,7 +36,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use lakehouse_auth::throttle;
 use lakehouse_auth::{
-    Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
+    AuthError, Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
 };
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -164,49 +164,69 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         identifier: email,
         password: Secret::new(password),
     };
-    if let Ok(principal) = auth.local.authenticate(&credential).await {
-        throttle::clear(pool, &key).await?;
-        let PrincipalId::User(user_id) = principal.id else {
-            tracing::warn!("login failed");
-            return Err(ApiError::invalid_or_expired().into());
-        };
-        let must_change_password = password::must_change_password(pool, user_id)
-            .await
-            .unwrap_or(false);
-        let token =
-            session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None, &[])
-                .await?;
-        let body = LoginResponse {
-            id: user_id.to_string(),
-            name: principal.display_name,
-            must_change_password,
-        };
-        let mut response = (StatusCode::OK, ApiJson(body)).into_response();
-        response.headers_mut().append(
-            header::SET_COOKIE,
-            session_cookie_header(
-                state.config.is_dev,
-                token.expose(),
-                session::DEFAULT_SESSION_TTL,
-            ),
-        );
-        Ok(response)
-    } else {
-        let lock_set = throttle::record_failure(pool, &key, &state.throttle_policy).await?;
-        if lock_set.is_some() {
-            let event = NewAuditEvent {
-                action: "auth.login_locked".to_owned(),
-                outcome: "refused".to_owned(),
-                resource_kind: Some("login_key".to_owned()),
-                resource_id: Some(key[..12].to_owned()),
-                ..Default::default()
+    match auth.local.authenticate(&credential).await {
+        Ok(principal) => {
+            throttle::clear(pool, &key).await?;
+            let PrincipalId::User(user_id) = principal.id else {
+                tracing::warn!("login failed");
+                return Err(ApiError::invalid_or_expired().into());
             };
-            if let Err(err) = store_audit::insert(pool, event).await {
-                tracing::warn!(%err, "failed to record auth.login_locked audit event");
-            }
+            let must_change_password = password::must_change_password(pool, user_id)
+                .await
+                .unwrap_or(false);
+            let token = session::create_session(
+                pool,
+                user_id,
+                session::DEFAULT_SESSION_TTL,
+                None,
+                None,
+                &[],
+            )
+            .await?;
+            let body = LoginResponse {
+                id: user_id.to_string(),
+                name: principal.display_name,
+                must_change_password,
+            };
+            let mut response = (StatusCode::OK, ApiJson(body)).into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                session_cookie_header(
+                    state.config.is_dev,
+                    token.expose(),
+                    session::DEFAULT_SESSION_TTL,
+                ),
+            );
+            Ok(response)
         }
-        tracing::warn!("login failed");
-        Err(ApiError::invalid_or_expired().into())
+        // Only a rejected password counts toward the lock, and only it
+        // renders as the non-enumerated 401: a storage error mid-login
+        // must reach the caller as its classified error (see
+        // `From<AuthError> for ApiError` — a fixed "authentication error"
+        // 500), never as "wrong password", and must never walk a real
+        // user toward a lockout over a database hiccup (review blocker 1,
+        // 2026-10-03).
+        Err(AuthError::InvalidCredentials) => {
+            let lock_set = throttle::record_failure(pool, &key, &state.throttle_policy).await?;
+            if lock_set.is_some() {
+                let event = NewAuditEvent {
+                    action: "auth.login_locked".to_owned(),
+                    outcome: "refused".to_owned(),
+                    resource_kind: Some("login_key".to_owned()),
+                    resource_id: Some(key[..12].to_owned()),
+                    ..Default::default()
+                };
+                if let Err(err) = store_audit::insert(pool, event).await {
+                    tracing::warn!(%err, "failed to record auth.login_locked audit event");
+                }
+            }
+            tracing::warn!("login failed");
+            Err(ApiError::invalid_or_expired().into())
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "login failed with a non-credential error");
+            Err(ApiError::from(err).into())
+        }
     }
 }
 
