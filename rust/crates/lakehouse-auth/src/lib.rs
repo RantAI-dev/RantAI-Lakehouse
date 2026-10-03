@@ -48,6 +48,7 @@ pub mod repository;
 pub mod secret;
 pub mod service_token;
 pub mod session;
+pub mod throttle;
 mod token;
 
 pub use authenticator::Authenticator;
