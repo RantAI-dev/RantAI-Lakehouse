@@ -313,6 +313,13 @@ export function ConnectorCreatePage() {
       >
         {step === 0 ? (
           <div className="space-y-6">
+            {/* A file is not a registered source: it has its own page
+                (DATA-9, `docs/core/features/upload-file.md`). */}
+            <p className="text-sm text-muted-foreground">
+              <Link href="/connectors/upload" className="text-primary underline-offset-4 hover:underline">
+                Have a file instead? Upload a CSV or TSV
+              </Link>
+            </p>
             {types.status === "loading" ? (
               <LoadingSkeleton rows={4} />
             ) : types.status === "error" ? (

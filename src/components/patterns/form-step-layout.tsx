@@ -23,6 +23,7 @@ export function FormStepLayout({
   onSubmit,
   submitLabel = "Create",
   submitting = false,
+  submittingLabel = "Creating…",
   children,
   below,
   className,
@@ -34,6 +35,9 @@ export function FormStepLayout({
   onSubmit: () => void
   submitLabel?: string
   submitting?: boolean
+  /** The submit button's text while `submitting`; a wizard that does not
+   * create anything (a load, a send) says what it is doing instead. */
+  submittingLabel?: string
   children: React.ReactNode
   /** Shown under the step panel, in the same column (e.g. a page's delete
    * section), so it lines up with the form rather than the stepper. */
@@ -123,7 +127,7 @@ export function FormStepLayout({
               disabled={!canProceed || submitting}
               onClick={onSubmit}
             >
-              {submitting ? "Creating…" : submitLabel}
+              {submitting ? submittingLabel : submitLabel}
             </Button>
           ) : (
             <Button

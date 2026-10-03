@@ -12,9 +12,11 @@ import {
   UPLOAD_ENCODINGS,
   delimiterLabel,
   encodingLabel,
+  fileSizeProblem,
   headerRowDisplay,
   headerRowFromDisplay,
   isUploadedTable,
+  retryInput,
   statusLabel,
   suggestTableName,
   tableNameProblem,
@@ -255,4 +257,32 @@ test("REGISTRATION_FAILED_REASON is one of the reasons the load job records", ()
   assert.ok(Array.isArray(reasons))
   assert.ok(reasons.includes(REGISTRATION_FAILED_REASON))
   assert.equal(REGISTRATION_FAILED_REASON, "The table was loaded but could not be registered in the catalog.")
+})
+
+test("fileSizeProblem refuses only a file over 50 MB, names the limit and says what to do", () => {
+  assert.equal(fileSizeProblem("a.csv", 0), null)
+  assert.equal(fileSizeProblem("a.csv", MAX_UPLOAD_BYTES), null)
+  const problem = fileSizeProblem("big.csv", MAX_UPLOAD_BYTES + 1)
+  assert.ok(problem !== null)
+  assert.match(problem, /^big\.csv is /)
+  assert.match(problem, /50 MB limit/)
+  assert.match(problem, /Split it/)
+})
+
+test("retryInput repeats what the load was told, and replaces after a registration failure", () => {
+  const options = { encoding: "utf-8" as const, delimiter: ";", headerRow: 2 }
+  const failed = upload({
+    status: "failed",
+    parseOptions: options,
+    bronzeTable: "stock",
+    loadMode: "append",
+    error: "The load into the table failed.",
+  })
+  assert.deepEqual(retryInput(failed), { ...options, bronzeTable: "stock", mode: "append" })
+  assert.deepEqual(retryInput({ ...failed, loadMode: "replace" }), { ...options, bronzeTable: "stock", mode: "replace" })
+  // Rows are already in the table: adding them again would double them.
+  assert.equal(retryInput({ ...failed, error: REGISTRATION_FAILED_REASON })?.mode, "replace")
+  // A load nobody recorded the settings of is not guessed at.
+  assert.equal(retryInput(upload({ status: "failed" })), null)
+  assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
 })

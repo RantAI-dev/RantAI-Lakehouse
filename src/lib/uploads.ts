@@ -9,7 +9,13 @@
  * yes to something the API will refuse.
  */
 
-import type { Upload, UploadEncoding, UploadStatus } from "@/services/contracts/uploads"
+import { formatBytes } from "@/lib/format"
+import type {
+  IngestUploadInput,
+  Upload,
+  UploadEncoding,
+  UploadStatus,
+} from "@/services/contracts/uploads"
 
 /**
  * The largest file the API accepts (its `MAX_UPLOAD_BYTES`): 50 MiB, which
@@ -176,3 +182,38 @@ export function isUploadedTable(name: string, uploads: readonly Upload[]): boole
  * retry that adds rows would add them a second time.
  */
 export const REGISTRATION_FAILED_REASON = "The table was loaded but could not be registered in the catalog."
+
+/**
+ * Why a chosen file cannot be sent, or `null`. Only the size is judged here
+ * (it is what the browser knows before a byte leaves); an empty file, a
+ * workbook or a file that is not delimited text is the API's to refuse, in
+ * its own sentence, so a refusal the checklist expects (workbook: "save it as
+ * CSV") comes from one place. The sentence names the limit and says what to
+ * do next.
+ */
+export function fileSizeProblem(name: string, sizeBytes: number): string | null {
+  if (sizeBytes <= MAX_UPLOAD_BYTES) return null
+  return `${name} is ${formatBytes(sizeBytes)}, over the 50 MB limit. Split it into smaller files or leave out columns you do not need, then choose a file again.`
+}
+
+/**
+ * The body "Try again" sends: exactly what the failed load was told, which
+ * the API records on the upload (`parseOptions`, `bronzeTable`, `loadMode`),
+ * or `null` when the upload does not carry all of it (nothing is guessed).
+ *
+ * The one exception to "the same as before" is a load that failed only at
+ * the catalog (`REGISTRATION_FAILED_REASON`): its rows ARE in the table, so a
+ * retry with `append` would write them twice. That retry replaces, whatever
+ * the first load chose.
+ */
+export function retryInput(upload: Upload): IngestUploadInput | null {
+  const { parseOptions, bronzeTable } = upload
+  if (parseOptions === undefined || bronzeTable === undefined) return null
+  const mode =
+    upload.error === REGISTRATION_FAILED_REASON
+      ? "replace"
+      : upload.loadMode === "append"
+        ? "append"
+        : "replace"
+  return { ...parseOptions, bronzeTable, mode }
+}
