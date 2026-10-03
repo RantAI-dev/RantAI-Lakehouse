@@ -141,11 +141,21 @@ export function LoginPage() {
       // wrong", sending users to reset a credential that was fine all
       // along. `authClient.parse` already maps 401 → `permission_denied`.
       const serviceError = toServiceError(err);
-      setError(
-        serviceError.code === "permission_denied"
-          ? "Invalid email or password."
-          : serviceError.message || "Could not sign in. Try again."
-      );
+      if (serviceError.code === "too_many_requests") {
+        let msg = serviceError.message;
+        if (serviceError.retryAfterSecs && serviceError.retryAfterSecs > 0) {
+          const minutes = Math.ceil(serviceError.retryAfterSecs / 60);
+          const minutesText = minutes === 1 ? "1 minute" : `${minutes} minute(s)`;
+          msg += ` Try again in about ${minutesText}.`;
+        }
+        setError(msg);
+      } else {
+        setError(
+          serviceError.code === "permission_denied"
+            ? "Invalid email or password."
+            : serviceError.message || "Could not sign in. Try again."
+        );
+      }
     } finally {
       setSubmitting(false);
     }
