@@ -2032,6 +2032,212 @@ so each full workspace run adds a few hundred, mine included.
   workspace suite, and someone with the standing to do it may want to drop the
   old `lakehouse_api_test_*` databases. I did not.
 
+### Slice D — T10, T11, T12 (developer, 2026-10-03)
+
+Branch `feat/upload-file`, from `4e7ad65`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited; nothing was run in `/home/hv/lakehouse` or
+`/home/hv/lakehouse-uiux`; no `docker compose` was run and no container of the
+running stack was touched; no dev server was started. No Rust and no Python file
+is touched. T10 was written in an earlier session that was cut off; T11 and T12
+and this entry are from this one. Disk: 54 GB free before the build.
+
+**Commits**
+
+- `f26c3c5` feat(uploads): T10 console contract, client and the rules of the upload
+  screens. Its message describes it: the contract (`contracts/uploads.ts`), the
+  client over `apiFetch` (`clients/uploads.ts`, the `uploadService` binding) and the
+  pure rules (`src/lib/uploads.ts`) with their tests. Reviewed as passing typecheck,
+  lint and tests before this session.
+- `dff5173` feat(uploads): T11 console screens for uploading a file (15 files,
+  +2036/-15)
+- `4a7bbcb` docs(uploads): T12 documents that change with the upload feature
+  (5 files, +80)
+- this entry, `docs(uploads): handoff for slice D`
+
+**The screens as built** (all in `src/features/connectors/`, `"use client"` first,
+importing `@/services` and `@/lib` only)
+
+- *Sources*, `connectors-page.tsx`. The header has "Upload file" (outline, a link
+  to `/connectors/upload`) before "New Connector". Two tabs under it, "Connectors"
+  (the old body, moved unchanged into `ConnectorsTab`) and "Uploaded files", the open
+  one in `?tab=uploads` (the bare address is Connectors; switching writes the URL with
+  `history.replaceState`, as `asset-detail-tabs.tsx` does, and keeps other parameters).
+  `UploadsPanel` mounts only on its tab, so it polls only there.
+- *Uploaded files*, `uploads-panel.tsx`. Columns File, Size, Status, Table, Rows,
+  Uploaded by, Uploaded, and an unnamed actions column. Status is a pill (`Uploaded`,
+  `Loading`, `Loaded`, `Failed`, from `statusLabel`), and a failed row shows the API's
+  reason under it. Table is a link (the table's name, to `/data/assets/<assetId>`) when
+  `assetId` is present, else an em dash. Rows reads `Not measured` when `rows` is
+  absent. "Load" (a link to `/connectors/upload?id=<id>`) for `uploaded` and `failed`
+  only. "Delete" (aria-label `Delete <file>`) is disabled while `ingesting`, with the
+  title "This upload is being loaded, so it cannot be deleted yet."; it opens a
+  confirmation "Delete <file>?" / "The file is removed from storage and from this
+  list." / "The table <name> stays, with its rows." (without a table: "A table this
+  file was loaded into stays, with its rows."); a refusal of the API (409, 503) is
+  shown in the dialog in its own words and the row stays. Empty state: "No uploaded
+  files" / "Upload a CSV or TSV file to bring it in as a raw table." with an "Upload
+  file" button. An error with nothing on screen goes through `ErrorState` (a 403 is
+  "You don't have access"); a failed refresh with rows on screen keeps the rows and
+  says "The list could not be refreshed: <sentence>". Polls every 5 s only while a row
+  is `ingesting`; the interval is cleared when nothing is loading and on unmount.
+- *Upload page*, `upload-file-page.tsx` (route
+  `src/app/(data)/connectors/upload/page.tsx`), `FormStepLayout` with steps File,
+  Check, Table, Review; the submit button is "Load" ("Sending…" while the file is
+  sent, "Starting…" while the load starts: `FormStepLayout` got an optional
+  `submittingLabel`, because its fixed "Creating…" would be wrong here).
+  1. *File.* "Choose a file" (a real `<input type="file">`, no `accept`, so a
+     workbook can be chosen and refused by the API) inside a drop area ("Drop a CSV or
+     TSV file here, or choose one. Up to 50 MB; other kinds of file are refused with the
+     reason."). Shows name and size. Over 50 MiB: "<name> is <size>, over the 50 MB
+     limit. Split it into smaller files or leave out columns you do not need, then
+     choose a file again." (`fileSizeProblem`), Next disabled, nothing sent. "Next" sends
+     the file; a refusal is shown in place, word for word, in an alert (a 403 through
+     `ErrorState`). Dropping several files takes the first and says "One file at a time:
+     the first one was taken." Once stored the step reads "<name> (<size>) is stored.
+     Press Next to check how it is read." with "Choose a different file". The address
+     becomes `?id=<id>`, so a refresh resumes. With `?id=` (read once, at mount) the
+     page loads the upload first (`ErrorState` if that fails, so a 404 is "Not found"),
+     skips this step, and opens an upload that is loading on its status.
+  2. *Check*, `upload-check-step.tsx`. "Encoding" (UTF-8, UTF-16), "Delimiter" (Comma,
+     Semicolon, Tab, Pipe) and "Header row" (a text field from 1), each followed by
+     "Detected: <value>". The first read sends no parameter (the API detects); a change
+     reads again with that parameter only; a tab is sent as `%09`; the header row is typed
+     from 1 and sent from 0 only through `headerRowFromDisplay` / `headerRowDisplay`. A
+     typed value that is not a whole number of 1 or more says "Enter a whole number, 1 or
+     more.", sends nothing and disables Next. Below, the columns as the header cells and
+     the rows (first 20), then "Showing the first N rows. The file has more." (truncated),
+     "Showing all N rows.", or "There are no rows below the header row.". While a new
+     read is in flight the old preview stays, dimmed, with "Reading the file again with
+     these settings…". A refusal of the preview is shown in place with "Retry". A preview
+     with no columns says "The header row has no columns: it is past the part of the file
+     that was read, or it is an empty line. Choose another header row to go on." and Next
+     stays disabled.
+  3. *Table.* "Table name", suggested by `suggestTableName`; under it the rule
+     (`TABLE_NAME_RULE`), which turns red when the name breaks it (and Next is off). When
+     the name is a table a loaded upload of the tenant has (`isUploadedTable` over
+     `GET /api/uploads`): "<name> was created by an earlier upload. What should happen to
+     its rows?" with the radios "Replace its rows" (selected) and "Add to its rows"; the
+     choice is not offered for any other name, and the load then sends `replace`. "Every
+     column is stored as text. Numbers and dates have to be converted afterwards."
+  4. *Review.* A summary (File: name, size, uploaded; How it is read: encoding,
+     delimiter, header row from 1, columns; Table: name, the choice when offered, "Column
+     types: Text"); "Load" sends exactly the settings of the preview that was shown
+     (`preview.using`), the table and the mode. A refusal (409, 422, 503) is shown in
+     place, word for word.
+  - *Notices* above steps 2 to 4: the repeated-file notice ("This file was uploaded
+    before, as <name> on <date>. It was loaded into <table>. Loading it again with "Add
+    to its rows" would add its rows a second time."), and, for an upload that is failed,
+    "The last load of this file failed." with its reason.
+  - *After Load*, `upload-run-view.tsx`. A card with the file name, the status pill and
+    the table. Loading: "Loading <file> into <table>. This page updates by itself; you can
+    also leave it and come back from Uploaded files on Sources.", refreshed every 2 s only
+    while the status says `ingesting` (`useRefreshable` plus an interval, cleared on
+    unmount); a refresh that fails says "The status could not be refreshed: <sentence>
+    Trying again." Loaded: Table and Rows (`Not measured` when absent), the button "Open
+    in Data Explorer" (to `/data/assets/<assetId>`) and "Upload another file" (back to an
+    empty first step). Failed: the API's reason as it is ("No reason was recorded for this
+    failure." when there is none), "Change settings" (back to Check, with the earlier
+    reason as a notice) and "Try again" (a new load with what the load was told:
+    `retryInput`). When the reason is "The table was loaded but could not be registered in
+    the catalog.": "The rows are in the table <name>. Loading the file again with "Add to
+    its rows" would add them a second time. "Try again" loads with "Replace its rows", so
+    the table ends with this file's rows once.", and Try again sends `replace` whatever the
+    first load chose (tested). A refusal of "Try again" is shown in place.
+- *New Connector*, first step: above the type cards, the link "Have a file instead?
+  Upload a CSV or TSV" to `/connectors/upload`.
+- `src/lib/uploads.ts` gained `fileSizeProblem` and `retryInput` (pure, tested in
+  `uploads.test.ts`).
+
+**Commands run, with counts**
+
+- Per commit: `bun run typecheck` exit 0; `bun run lint` 0 errors and 5 warnings, all in
+  files this slice does not touch (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`,
+  `use-data-table.ts`, `dashboard-specs.ts`). For T11, `bun test src/features/connectors
+  src/lib/uploads.test.ts src/services`: 134 passed, 0 failed, 17 files. T12 touches
+  only documents.
+- Final, on the T12 commit (no source changed after T11): `bun run typecheck && bun run
+  lint && bun run test`: exit 0, 0 lint errors / 5 warnings, **501 passed, 0 failed, 72
+  files** (T10 left 461 in 69: +40 tests and three files: `uploads-panel.test.tsx`,
+  `upload-file-page.test.tsx`, `connectors-page.test.tsx`, plus a test each in
+  `connector-create-page.test.tsx` and `uploads.test.ts`).
+- `bun --bun next build`: exit 0; it compiles and lists `/connectors/upload` among the
+  routes.
+- Two single-fault mutations of the new code, to see the tests bite: Delete enabled for
+  a loading row (caught by "disables Delete while a row is loading"); the load sending
+  the raw mode instead of the effective one (first not caught, so a test was added for
+  "Add to its rows chosen, then the name changed to a new table", which now catches it).
+- `git status` showed nothing generated before either commit.
+
+**What each T11 accept item is tested by** (`bun:test` + `@testing-library/react`, the
+fetch stubbed, no network): the oversize refusal sends nothing (`upload-file-page.test`,
+asserts no POST); a server refusal is shown (create, preview, ingest, delete; word for
+word); the preview shows detected and chosen values and reads again on a change (the
+delimiter parameter, the header row from 1 as `headerRow=2`); the mode choice appears
+only for a loaded upload's table and not after the name changes; Loading, Loaded (rows,
+the link, polling stops), Failed (reason, Try again body), the registration case
+(wording and `replace`), Change settings; the list's "Not measured"; delete asks first,
+cancel sends nothing, a refusal stays in the dialog; polling starts and stops
+(`uploads-panel.test`); the tabs, the button order and `?tab=uploads`
+(`connectors-page.test`); the New Connector link.
+
+**Not verified, or not run**
+
+- **Any screen in a browser, against a running API.** Everything above was exercised in
+  happy-dom with a stubbed `fetch`; no layout, focus, keyboard or drag-and-drop behaviour
+  was seen, and drag-and-drop has no test at all (only the file control does). The
+  acceptance checklist of the feature page is still open.
+- `history.replaceState` for the tab and for `?id=` under Next and nuqs together:
+  tested only with `replaceState` stubbed (happy-dom starts on `about:blank`). Whether
+  the data table's own URL state (nuqs, table memory) leaves `?tab=` alone, or restores
+  a remembered table state over it, was not observed.
+- A 50 MB upload through the console's `/api` rewrite; a real load end to end; the
+  gate (`ops/g9`). They need a deployed stack, as the plan says.
+- The Analyst's view of Sources (checklist 19): the page shows the existing
+  "You don't have access" state for a 403 on the list; no browser check.
+
+**Where the plan was wrong, silent, or I chose**
+
+1. **T12 and the README: "nothing new to configure" is not what the compose file
+   does.** `git diff 98aaa64 -- docker-compose.yml .env.example
+   rust/crates/lakehouse-api/src/config.rs` is empty, so no setting was added, but the
+   `lakehouse-api` service in `docker-compose.yml` passes none of `RUSTFS_S3_ENDPOINT`,
+   `RUSTFS_ACCESS_KEY_SECRET_REF` or `RUSTFS_SECRET_KEY_SECRET_REF` (`.env.example` has
+   the endpoint, with a host-side default, and the two refs commented out; the service
+   has no `env_file`). On the compose stack, `POST /api/uploads` therefore answers 503
+   "Upload storage is not configured." until an operator adds them, and a ref also needs
+   the variable it names in the API's environment. `docs/OPERATIONS.md` says so; I did
+   not touch the compose file (this slice has none) and I did not run an API container
+   with them set. **The planner should decide whether a compose change (and which
+   secret the API may hold, given ADR 0002 Addendum 2) belongs before the trial deploy.**
+   The README line therefore does not say "nothing to configure"; it points at
+   OPERATIONS.
+2. **"Every sentence the API returns is shown as it is."** Refusals in place (create,
+   preview, ingest, delete, a failed poll) are shown exactly. A failure of a *read* that
+   goes through the existing `ErrorState` (the list, `?id=`) shows the sentence followed
+   by the app's hint for that error code (for example "Upload not found. It may already
+   have been deleted. Reload the list."), because `ErrorState` always adds one, and a
+   403 is the generic "You don't have access" without the sentence. The brief asked for
+   the existing state, so I used it.
+3. Beyond the plan, each for a reason: `?id=<id>` is written to the address once a file
+   is stored, so a refresh does not lose the upload; `fileSizeProblem` and `retryInput`
+   are in `src/lib/uploads.ts`; `FormStepLayout` has `submittingLabel`; a failed upload
+   opened for another load shows its earlier reason; one drop of several files takes the
+   first. "Choose a different file" after a file was stored leaves the earlier upload in
+   the list (nothing deletes it); that is a choice, not a defect I could close without a
+   delete call the person did not ask for.
+4. The first preview of an upload that already has `parseOptions` (a failed one opened
+   from the list) detects afresh and does not start from the settings that failed;
+   "Change settings" after a failure keeps what the person had chosen in this page.
+5. The table column shows the table's name as the link text and an em dash when there is
+   no `assetId`; the plan said only "a link when loaded". Rows reads `Not measured` also
+   for an upload never loaded, as the plan's rule ("when absent") says.
+6. `formatDateTime` is locale-dependent (en, "Oct 02, 2026, 10:00" in the test run), so
+   the duplicate notice's date is written in that form, not ISO.
+7. A 401 from any upload call goes through `apiFetch`'s existing redirect to the login
+   page; nothing here changed that.
+8. `FEATURE_COVERAGE.md`: the row is `[PARTIAL]`, not `[COMPLETE]`, because the status
+   tags are "verified repository facts" and no load has run end to end.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
