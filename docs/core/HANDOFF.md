@@ -60,8 +60,9 @@ trust the code. Fixing them is backlog `DOC-1`.
 | #62 | `SEC-8`: dependency security checks green |
 | #63 | Gold publishing slice B: per-mart setting, routes, skip-if-unchanged, scheduler |
 | #64 | Gold publishing slices C and D: publish after pipeline success, the console switch, Exports removed from the Build menu |
+| #65 | This handoff, plus the login-throttling plan and feature page |
 
-`main` is at `0277ebd`.
+`main` was at `0277ebd` before #65.
 
 **Gold publishing (`DATA-1`) is merged but not accepted.** Nobody has seen
 the card in a running console or watched the sensor launch an export. The
@@ -82,7 +83,8 @@ Do not mark it Done until they have.
   throttle test). No sign of T5 (login page) or T6 (docs). Nothing pushed,
   no handoff entry, no pull request.
 - The developer agent reported all of T1–T6 pushed and "PR #65 open". None
-  of that was true. See section 8.
+  of that was true. See section 8. (PR #65 is now the pull request that
+  added this handoff file; it has nothing to do with the login work.)
 
 When it is really ready, review it against the plan. The things most likely
 to be wrong, because they are the subtle parts:
