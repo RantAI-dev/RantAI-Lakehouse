@@ -2280,6 +2280,58 @@ cancel sends nothing, a refusal stays in the dialog; polling starts and stops
 8. `FEATURE_COVERAGE.md`: the row is `[PARTIAL]`, not `[COMPLETE]`, because the status
    tags are "verified repository facts" and no load has run end to end.
 
+### T13 (developer, 2026-10-03)
+
+Commit `bf1c65a` `fix(uploads): T13 compose gives the API its storage
+settings`. Cites `D1`, ADR 0014, ADR 0002 Addendum 2.
+
+The five settings on `lakehouse-api` (resolved by `docker compose --profile
+'*' config`):
+
+| Name | Default |
+| --- | --- |
+| `RUSTFS_S3_ENDPOINT` | `http://rustfs:9000` |
+| `RUSTFS_ACCESS_KEY_SECRET_REF` | `env:UPLOAD_S3_ACCESS_KEY` |
+| `RUSTFS_SECRET_KEY_SECRET_REF` | `env:UPLOAD_S3_SECRET_KEY` |
+| `UPLOAD_S3_ACCESS_KEY` | empty, no default |
+| `UPLOAD_S3_SECRET_KEY` | empty, no default |
+
+`rustfs_client.rs`: after both refs resolve, an empty or whitespace-only
+value for either is `NotConfigured` (new test
+`an_empty_or_whitespace_value_is_not_configured_and_nothing_is_dialled`,
+three blank values by two keys). `README.md` already had rows for the three
+`RUSTFS_*` names; they were updated and two `UPLOAD_S3_*` rows added.
+`docs/OPERATIONS.md`: T12's paragraph replaced.
+
+Commands (all run in the foreground, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target`, 53 GB free):
+
+- `cargo fmt --check`: pass (after `rustfmt` on `rustfs_client.rs` alone).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo test -p lakehouse-api --bin lakehouse-api rustfs_client`: 6 passed;
+  `upload_store`: 12 passed; `health`: 25 passed; 0 failed.
+- `cargo test -p lakehouse-api` (whole package, all targets summed): 2518
+  passed, 0 failed, 4 ignored.
+- `docker compose --profile '*' config --quiet`: exit 0; the five names
+  resolve on `lakehouse-api` (the two credentials empty, no `.env` here).
+- `python3 ops/lint/check_compose_init_readiness.py`: exit 0.
+
+Not verified: a `docker compose up` from a clean project (rule 8); the API
+container with a real credential; the bun and Python checks (no console or
+orchestrator file changed).
+
+Mismatches between plan and code:
+
+- `.env.example` sets `RUSTFS_S3_ENDPOINT=http://localhost:9010`
+  uncommented, and compose interpolates `.env`. A `.env` copied from it
+  therefore overrides the in-network default and the API container would
+  dial `localhost`. The plan's compose line is as written; the comment in
+  `.env.example` and a sentence in `docs/OPERATIONS.md` warn about it. A
+  decision is open: comment that line out in `.env.example`, or give the
+  compose service another name.
+- The RustFS health probe lists the bucket root, so a credential limited to
+  `uploads/` (the plan's advice) stores files but makes that tile fail.
+  Written in `docs/OPERATIONS.md`.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
