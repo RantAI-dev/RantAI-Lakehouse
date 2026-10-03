@@ -236,10 +236,10 @@ guessed.
 | `NODE_ENV` | Fallback for `APP_ENV` | — | No |
 | `AUTH_BOOTSTRAP_EMAIL` | Email for the idempotent bootstrap admin account created at startup | unset (no bootstrap admin) | No, but recommended for first run |
 | `AUTH_BOOTSTRAP_PASSWORD` | Password for the bootstrap admin account | unset | No, but required alongside `AUTH_BOOTSTRAP_EMAIL` to actually create one |
-| `LOGIN_MAX_FAILURES` | Failed password login attempts tolerated per email within `LOGIN_FAILURE_WINDOW_SECS` before lockout. Set to `0` to disable throttling entirely — every login gets a fresh chance | `5` | No |
+| `LOGIN_MAX_FAILURES` | Failed password login attempts tolerated per email within `LOGIN_FAILURE_WINDOW_SECS` before lockout. There is no off switch: `0`, negative, and unparseable values all fall back to the default, so an operator can never accidentally silence the throttle | `5` | No |
 | `LOGIN_FAILURE_WINDOW_SECS` | Rolling window (seconds) counted for login failures. Invalid values fall back to the default | `900` (15 min) | No |
 | `LOGIN_LOCKOUT_SECS` | Duration (seconds) a locked-out email stays locked. Invalid values fall back to the default | `300` (5 min) | No |
-| `AUTH_RETENTION_DAYS` | How many days to keep expired sessions, revoked credentials, and stale throttle rows before the background cleanup job purges them | `30` | No |
+| `AUTH_RETENTION_DAYS` | How many days to keep expired sessions and revoked credentials before the background cleanup job purges them. Throttle rows are not gated by this — an unlocked row with a lapsed window is purged as soon as its window lapses | `30` | No |
 | `OIDC_ISSUER` | OIDC provider issuer URL | unset | No — OIDC requires both this and `OIDC_CLIENT_ID` |
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above |
 | `OIDC_CLIENT_SECRET` | Reserved for a future authorization-code exchange; not currently read by `OidcAuthenticator` | unset | No |

@@ -574,37 +574,69 @@ check.
 `LOGIN_FAILURE_WINDOW_SECS` rolling window (default 900 s), that email is
 locked out for `LOGIN_LOCKOUT_SECS` (default 300 s); every further attempt
 gets `429` with a `Retry-After` header, regardless of whether the password
-is right, and regardless of whether the account exists. Setting
-`LOGIN_MAX_FAILURES=0` disables the throttle entirely. Invalid values for
-any of the three fall back to the defaults rather than failing boot.
+is right, and regardless of whether the account exists. A failed attempt
+only counts when the password was actually rejected — a database error
+mid-login renders as a 500 and does not count toward the lock.
+
+There is deliberately no off switch: `LOGIN_MAX_FAILURES=0`, negative,
+and unparseable values all fall back to the default (5), so an operator
+cannot silence the throttle by typo. The same fallback applies to the
+other two settings and to `AUTH_RETENTION_DAYS` — invalid values never
+fail boot and never disable the feature.
 
 Notes an operator should know:
 
 - The throttle key is a SHA-256 of the trimmed, lower-cased email — the
-  API never stores raw addresses in `login_throttle`.
-- Successful login clears the failure count for that email.
-- The throttle is in-process per deployment; a horizontally-scaled
-  deployment that shares its Postgres shares the counter (rows are
-  upserted atomically), so the limit is per *deployment*, not per
-  *replica*.
-- The console surfaces `429` as a lockout message with the wait time from
-  `Retry-After`; nothing else on the login page changes.
+  API never stores raw addresses in `login_throttle`. The account lookup
+  itself is case-sensitive (`WHERE u.email = $1`), so two spellings that
+  differ only by case are different accounts but one throttle key.
+- A successful login clears the failure count for that email, and a
+  failure after a lock has expired starts the count fresh — one typo
+  after a lockout ends does not immediately re-lock.
+- The first (bootstrap) admin can be locked out like anyone else; see
+  "Unlocking a lockout by hand" below.
+- The counter lives in Postgres, so a horizontally-scaled deployment
+  shares one limit per deployment, not per replica (rows are upserted
+  atomically, so concurrent attempts all count).
+- The console surfaces `429` as a lockout message with the wait time
+  from `Retry-After`; nothing else on the login page changes.
+
+### Unlocking a lockout by hand
+
+A lockout clears itself after `LOGIN_LOCKOUT_SECS`. To clear one early,
+delete the key's row (as the database owner, e.g. the `lakehouse` role):
+the API's tables live unqualified in the app database's `public` schema
+(migrations create them without a schema prefix and the pool sets no
+`search_path` override).
+
+```sql
+DELETE FROM public.login_throttle
+WHERE key_hash = encode(sha256(lower(trim(' ' from 'User@Example.Com'))::bytea), 'hex');
+```
+
+`lower(trim(...))` mirrors exactly how the API derives the key
+(`throttle::key_for`), and `sha256()` is a built-in since Postgres 11 —
+no extension needed. Deleting the row clears both the count and the
+lock; there is no separate "unlock" flag.
 
 ### Session cleanup background job
 
 A task spawned at API boot purges, roughly hourly:
 
-- expired and revoked auth sessions (TTL longer than
-  `AUTH_RETENTION_DAYS`, default 30),
-- revoked auth credentials older than the same retention window,
-- `login_throttle` rows whose lockout expired more than
-  `AUTH_RETENTION_DAYS` ago.
+- auth sessions whose `expires_at` or `revoked_at` is more than
+  `AUTH_RETENTION_DAYS` days old (default 30);
+- service credentials revoked more than `AUTH_RETENTION_DAYS` days ago;
+- `login_throttle` rows that are no longer locked AND whose failure
+  window has passed — this one is NOT gated by `AUTH_RETENTION_DAYS`:
+  such a row can never lock again (the next failure starts a fresh
+  window), so it goes as soon as its window lapses, not 30 days later.
 
 It logs purge counts at each run and skips a tick (with a logged warning)
 if the previous run has not finished. It is best-effort, not a guarantee:
-nothing promises a session is gone within any particular bound, and the
-job does not rotate anything — it only deletes what is already expired or
-revoked.
+nothing promises a session is gone within any particular bound. The job
+only deletes — it does not rotate anything, and an ACTIVE (non-revoked)
+service token never expires or gets cleaned up no matter how old it is;
+rotation is a manual, operator-driven act.
 
 ## Proposal: `GET /api/auth/providers` (not built)
 
