@@ -29,6 +29,7 @@ Update only with verified repository facts.
 | Data | Catalog namespaces (incl. Bronze Iceberg tables) | `/catalog` | [COMPLETE] | [REAL] |
 | Data | Storage lifecycle + restore (Hot/Warm real; Cold/AI always 0 — see README limitations) | `/storage` | [COMPLETE] | [REAL] |
 | Data | Connectors list / create / test / discover | `/connectors` | [COMPLETE] | [REAL] (CRUD is real Postgres; `testConnection` returns hardcoded latency — see `lakehouse-store/src/connectors.rs`, not a live socket check) |
+| Data | Upload a file into a raw table (File, Check, Table, Review; "Uploaded files" tab) | `/connectors/upload`, `/connectors?tab=uploads` | [PARTIAL] | [REAL] (screens, routes and the load job are built and tested piecewise; no load has been run end to end on a deployed stack, so the acceptance checklist in `docs/core/features/upload-file.md` is still open. Delimited text only, every column text; the load is a Dagster run, `file_ingest_job`) |
 | Build | Pipelines list / create / agentic draft | `/pipelines` | [COMPLETE] | [REAL] |
 | Build | Pipeline detail + graph + runs | `/pipelines/[pipelineId]` | [COMPLETE] | [REAL] |
 | Build | Pipeline run cancel / retry | (run drawer) | [COMPLETE] | [REAL] |

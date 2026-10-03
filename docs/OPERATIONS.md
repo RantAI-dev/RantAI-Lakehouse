@@ -455,6 +455,57 @@ location reloads — the authored update asks the orchestrator to reload, and
 the factory rebuilds the sensors from `GET /api/pipelines/runnable`. A
 draft has no job and is not rebuilt; its chain arms when it goes `ready`.
 
+### Uploaded files (DATA-9, ADR 0014)
+
+A person uploads a CSV or TSV file from the console (`/connectors/upload`);
+the API stores it, and a Dagster run (`file_ingest_job`) loads it into a raw
+Iceberg table. What that asks of the operator:
+
+- **The files are kept and they grow the bucket.** Each original file is
+  stored in the warehouse bucket (`LAKEHOUSE_WAREHOUSE_BUCKET`, default
+  `lakehouse-warehouse`) under `uploads/<tenant id>/<upload id>`, with a short
+  extension when the file name had one. It stays until someone deletes the
+  upload from "Uploaded files"; deleting an upload removes the file and its
+  entry, never the table it became. Nothing else removes them: there is no
+  expiry and no quota, so storage grows with every upload (up to 50 MB each).
+- **The API needs the object-storage settings.** `RUSTFS_S3_ENDPOINT`
+  (and `RUSTFS_S3_REGION`), `RUSTFS_ACCESS_KEY_SECRET_REF` and
+  `RUSTFS_SECRET_KEY_SECRET_REF` (the same refs the RustFS health probe
+  reads; `.env.example` lists them, the two refs commented out). With either
+  ref unset, `POST /api/uploads` answers 503 "Upload storage is not
+  configured." and nothing is stored. A ref resolves from the API process's
+  own environment, so the variable it names (for example `env:RUSTFS_ACCESS_KEY`)
+  has to be set there too. **`docker-compose.yml` does not pass any of
+  these to the `lakehouse-api` service today**, so on the compose stack
+  uploading answers that 503 until they are added to the service's
+  environment; this section adds no compose change, and an API container
+  with them set was not run for this document.
+- **`ICEBERG_QUERY_DB` must be set**, because a load into a table name that
+  does not exist yet first asks ClickHouse whether the name is free. Compose
+  defaults it to `icecat_api`. Unset, the load is refused with 503 "Uploads
+  need ICEBERG_QUERY_DB to be set, so the API can check that a table name is
+  free. Nothing was loaded."
+- **The load needs the orchestrator.** `file_ingest_job` is registered in
+  the code location (`dispar_orchestrate.definitions`), which runs under the
+  `dagster` compose profile (see "Dagster (opt-in, P3)"). With the orchestrator
+  down, "Load" answers 503 "The orchestrator could not be reached, so the load
+  was not started." The job reads the stored file and writes the table
+  with the settings the code location already has for Bronze ingest; uploads
+  add no setting to `docker-compose.yml`, `.env.example` or `config.rs`
+  (`git diff 98aaa64 -- docker-compose.yml .env.example
+  rust/crates/lakehouse-api/src/config.rs` is empty on this branch).
+- **A reverse proxy in front of the console must allow a request body of at
+  least 51 MB** (the 50 MB file plus the multipart form around it; the API
+  accepts 50 MiB + 1 MiB on this one route and keeps axum's 2 MB default on
+  every other). `POST /api/uploads` has a five-minute request deadline, a
+  bound for a slow link and not a measurement. A 50 MB upload through the
+  console's `/api` rewrite and through a proxy was **not verified**.
+- **Who can use it.** `connector:manage` on every upload route (Data Engineer,
+  Platform Admin). No role was added or changed. In an install with several
+  tenants, an upload and its table name belong to the uploader's tenant; the
+  table appears in the shared catalog, which only the tenant that owns the
+  catalog sees.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

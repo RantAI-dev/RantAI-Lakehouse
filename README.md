@@ -381,6 +381,15 @@ issue about any of the following — they're known, not bugs:
   streaming engine** and is not relabeled as one — it's a
   change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
   instead under Governance → "Ingestion (CDC)".
+- **Uploading a file is limited to delimited text, and every column is text.**
+  The console accepts a CSV or TSV (UTF-8 or UTF-16; comma, semicolon, tab or
+  pipe) of up to 50 MB and 2,000,000 data rows, and refuses a workbook, JSON or
+  Parquet file, or anything over a limit, with the reason, never cutting a file
+  short. The table it becomes stays in the raw layer: the pipeline builder
+  cannot read raw tables yet and a dashboard reads Gold tables only. The
+  original file is kept until someone deletes the upload, and uploading needs
+  the object-storage settings and the orchestrator (see `docs/OPERATIONS.md`,
+  "Uploaded files"). It has not been run end to end on a deployed stack.
 - **`knowledge.search` is mocked.** There is no vector store or embeddings
   API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
   Postgres (`lakehouse-store::knowledge`) — only the search-query path
