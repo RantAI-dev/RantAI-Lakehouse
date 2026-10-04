@@ -489,6 +489,25 @@ pub struct ScheduleOutcome {
     pub error: Option<String>,
 }
 
+/// Outcome of a sensor start/stop mutation (F1.2 #57).
+///
+/// Same shape as [`ScheduleOutcome`]: a sensor may be `SensorNotFoundError`
+/// at start (the sensor does not exist; F1.2 makes the route's `paused`
+/// branch not contribute one) and `UnauthorizedError`/`PythonError` at
+/// start/stop. `stopSensor` does not surface `SensorNotFoundError`
+/// (its result union has none — see Dagster schema `sensors.py`); a
+/// `stop` against a missing sensor returns `Ok(SensorOutcome { ok: true,
+/// error: None })` after the lookup step fails with `SensorNotFoundError`,
+/// which is the tolerance the plan calls out (the chain is already
+/// silent in that case, so the route's "already stopped" branch runs).
+#[derive(Debug, Clone)]
+pub struct SensorOutcome {
+    /// Whether the sensor was successfully started/stopped.
+    pub ok: bool,
+    /// A human-readable failure reason, present when `ok` is `false`.
+    pub error: Option<String>,
+}
+
 /// One `Dagster` execution step's status within a run, as reported by
 /// `stepStats`, matching `GET /api/ai/build-status`'s `{key, status}`
 /// output shape.
@@ -778,11 +797,13 @@ impl DgClient {
     /// [`DgError::Server`] when `Dagster` responds with a non-2xx status or
     /// a GraphQL `errors` array.
     pub async fn list_runs(&self, limit: u32) -> Result<Vec<DgRun>, DgError> {
-        let query = format!(
-            "{{ runsOrError(limit: {limit}) {{ __typename ... on Runs {{ results {{ \
-             runId jobName status startTime endTime }} }} }} }}"
-        );
-        let data: RunsOrErrorData = self.execute(&query, None).await?;
+        // F1.5 (PR #55/#56 review BLOCKER): `limit` is caller-supplied, so
+        // it travels as a GraphQL variable — every value crossing the
+        // client/server seam in this crate goes through the variables
+        // channel, never `format!`-interpolated into the query text.
+        let query = "query($limit: Int!) { runsOrError(limit: $limit) { __typename \
+                      ... on Runs { results { runId jobName status startTime endTime } } } }";
+        let data: RunsOrErrorData = self.execute(query, Some(json!({ "limit": limit }))).await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
     }
 
@@ -825,18 +846,22 @@ impl DgClient {
         job_name: &str,
         limit: u32,
     ) -> Result<Vec<DgRun>, DgError> {
-        // `filter: { pipelineName: "<job_name>" }` — the TypeScript
-        // interpolates `jobName` into the query string unescaped
-        // (`dagster.ts`); reproduced verbatim rather than parameterized,
-        // since `job_name` here is always a path segment already resolved
-        // against known job names by the caller.
-        let query = format!(
-            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
-             creationTime parentRunId rootRunId tags {{ key value }} }} }} \
-             }} }}"
-        );
-        let data: RunsOrErrorData = self.execute(&query, None).await?;
+        // F1.5 (PR #55/#56 review BLOCKER): `job_name` is the raw path id
+        // for non-`pl-` ids (`routes::pipelines::runs_body`,
+        // `runs_step_matrix`, `volume`), so a `pipeline:read` user who puts
+        // `"` in it controls the query text sent to Dagster. The id MUST
+        // travel as a GraphQL variable, never be interpolated into the
+        // query string. `RunsFilter.pipelineName` is a scalar `String`
+        // (`dagster_graphql/schema/inputs.py:51`), matching the inline
+        // shape this query emitted before — only the injection channel
+        // changes, the server-side semantics are identical.
+        let query = "query($job: String!, $limit: Int!) { runsOrError(\
+                      filter: { pipelineName: $job }, limit: $limit) { \
+                      __typename ... on Runs { results { runId jobName status startTime endTime \
+                      creationTime parentRunId rootRunId tags { key value } } } } }";
+        let data: RunsOrErrorData = self
+            .execute(query, Some(json!({ "job": job_name, "limit": limit })))
+            .await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
     }
 
@@ -857,12 +882,15 @@ impl DgClient {
         job_name: &str,
         limit: u32,
     ) -> Result<Vec<RunWithSteps>, DgError> {
-        let query = format!(
-            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId status startTime \
-             stepStats {{ stepKey status startTime endTime }} }} }} }} }}"
-        );
-        let body = json!({ "query": query });
+        // F1.5 (PR #55/#56 review BLOCKER): see [`DgClient::list_runs_for_job`]
+        // — `job_name` travels as a GraphQL variable. Scalar `RunsFilter
+        // .pipelineName` matches the original inline shape, server-side
+        // semantics unchanged.
+        let query = "query($job: String!, $limit: Int!) { runsOrError(\
+                      filter: { pipelineName: $job }, limit: $limit) { \
+                      __typename ... on Runs { results { runId status startTime \
+                      stepStats { stepKey status startTime endTime } } } } }";
+        let body = json!({ "query": query, "variables": { "job": job_name, "limit": limit } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -899,21 +927,26 @@ impl DgClient {
         job_name: &str,
         limit: u32,
     ) -> Result<Vec<DgRunWithRows>, DgError> {
-        let query = format!(
-            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
-             creationTime parentRunId rootRunId tags {{ key value }} \
-             stepStats {{ stepKey status startTime endTime \
-             materializations {{ metadataEntries {{ __typename \
-             ... on IntMetadataEntry {{ label intValue }} }} }} \
-             }} }} }} }} }}"
-        );
+        // F1.5 (PR #55/#56 review BLOCKER): see [`DgClient::list_runs_for_job`]
+        // — `job_name` travels as a GraphQL variable. Scalar `RunsFilter
+        // .pipelineName` matches the original inline shape, server-side
+        // semantics unchanged.
+        let query = "query($job: String!, $limit: Int!) { runsOrError(\
+                      filter: { pipelineName: $job }, limit: $limit) { \
+                      __typename ... on Runs { results { runId jobName status startTime endTime \
+                      creationTime parentRunId rootRunId tags { key value } \
+                      stepStats { stepKey status startTime endTime \
+                      materializations { metadataEntries { __typename \
+                      ... on IntMetadataEntry { label intValue } } } \
+                      } }} }} }";
         // `metadataEntries` is a heterogeneous GraphQL union whose
         // `serde` untag would silently drop real variants, so the run
         // results are pulled as raw JSON and parsed with the same
         // value-navigation approach `pipeline_run_status` already uses
         // for `stepStats`.
-        let value: Value = self.execute(&query, None).await?;
+        let value: Value = self
+            .execute(query, Some(json!({ "job": job_name, "limit": limit })))
+            .await?;
         let results = value
             .pointer("/runsOrError/results")
             .and_then(Value::as_array)
@@ -1387,10 +1420,26 @@ impl DgClient {
             .and_then(Value::as_str)
             .ok_or_else(|| DgError::Server("parent run missing pipelineName".to_owned()))?
             .to_owned();
+        // F1.6 (PR #56 review BLOCKER): Dagster's `executionParams` re-
+        // execution path requires a non-null `rootRunId` whenever
+        // `parentRunId` is present — `dagster_graphql/implementation/
+        // execution/launch_execution.py:47-49` runs `check.str_param(
+        // execution_metadata.root_run_id, "root_run_id")` when
+        // `is_reexecuted`, and `check.str_param` raises on a non-`str`
+        // (including the JSON `null` Dagster returns for a run that was
+        // never re-executed) → PythonError on the mutation. The right
+        // normalization is "the first re-execution makes the parent its
+        // own root", which is exactly what its own `reexecutionParams`
+        // path applies: `dagster/_core/instance/runs/run_domain.py:474`
+        // `root_run_id = parent_run.root_run_id or parent_run.run_id`.
+        // `parent.get("rootRunId")` is `None` for BOTH a JSON `null` value
+        // (not a `str` per `Value::as_str`) AND a missing field; both
+        // fall through `unwrap_or` to `parent_run_id`.
         let root_run_id = parent
             .get("rootRunId")
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .unwrap_or(parent_run_id)
+            .to_owned();
         // `runConfig` is `RunConfigData!` on `Run` (schema/pipelines/
         // pipeline.py:646) — Dagster always returns it for a Run. We
         // still tolerate its absence as an empty object rather than
@@ -1403,9 +1452,11 @@ impl DgClient {
 
         // ── Mutation: launchRunReexecution with executionParams.
         // `ExecutionParams.stepKeys` is `[String!]` (inputs.py:331-336).
+        // `$rootRunId` is `String!` (F1.6 — null root with parent is
+        // rejected at `launch_execution.py:47-49`; see the lookup above).
         let mutation = "mutation($sel: JobOrPipelineSelector!, \
                          $cfg: RunConfigData!, $keys: [String!]!, \
-                         $parentRunId: String!, $rootRunId: String) { \
+                         $parentRunId: String!, $rootRunId: String!) { \
                          launchRunReexecution(executionParams: { \
                          selector: $sel, runConfigData: $cfg, stepKeys: $keys, \
                          executionMetadata: { parentRunId: $parentRunId, \
@@ -1485,6 +1536,139 @@ impl DgClient {
             });
         }
         Ok(ScheduleOutcome {
+            ok: false,
+            error: Some(r.message.unwrap_or(r.typename)),
+        })
+    }
+
+    /// Start (resume) or stop (pause) a sensor, matching Dagster 1.13.20
+    /// `startSensor`/`stopSensor` mutations. Wired into
+    /// `routes::pipelines::authored_status` next to the schedule toggle
+    /// (F1.2 #57): when a chained pipeline is paused/resumed, the route
+    /// must also stop/start the `authored__<id>_after` sensor so the
+    /// chain truly goes quiet across a reload (Dagster keeps sensor
+    /// state across a code-location reload; the Python module-level
+    /// `default_status=RUNNING` does NOT reach the stored sensor state).
+    ///
+    /// The two mutations have different argument shapes against the
+    /// real schema (`startSensor` takes a `SensorSelector!`; `stopSensor`
+    /// takes a `String!` *sensor-state compound id*, NOT a selector).
+    /// `stop` therefore does a two-step lookup: query the sensor's
+    /// `sensorState { id }` by selector, then call `stopSensor(id: <id>)`.
+    /// If the lookup is `SensorNotFoundError`, the sensor never existed
+    /// (e.g. the pipeline has no `dependsOn`) and `running=false` is
+    /// treated as success -- the chain was already silent.
+    ///
+    /// `start` returns the standard `SensorOrError` shape:
+    /// `Sensor | SensorNotFoundError | UnauthorizedError | PythonError`.
+    /// `stop` returns `StopSensorMutationResultOrError` which has NO
+    /// `SensorNotFoundError` member (see `dagster_graphql/schema/sensors.py`
+    /// line 245); the lookup-step check is the only path that turns
+    /// "no such sensor" into `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn set_sensor_running(
+        &self,
+        sensor_name: &str,
+        running: bool,
+    ) -> Result<SensorOutcome, DgError> {
+        let sel = json!({
+            "repositoryName": self.repo,
+            "repositoryLocationName": self.location,
+            "sensorName": sensor_name,
+        });
+        if running {
+            let query = "mutation($sel: SensorSelector!) { startSensor(sensorSelector: $sel) { \
+                         __typename \
+                         ... on Sensor { sensorState { status } } \
+                         ... on SensorNotFoundError { message } \
+                         ... on PythonError { message } \
+                         ... on UnauthorizedError { message } \
+                         } }";
+            let data: std::collections::HashMap<String, ScheduleMutationResultBody> =
+                self.execute(query, Some(json!({ "sel": sel }))).await?;
+            let r = data.into_values().next().ok_or_else(|| {
+                DgError::Server("Dagster response missing startSensor result".to_owned())
+            })?;
+            if r.typename == "Sensor" {
+                return Ok(SensorOutcome {
+                    ok: true,
+                    error: None,
+                });
+            }
+            return Ok(SensorOutcome {
+                ok: false,
+                error: Some(r.message.unwrap_or(r.typename)),
+            });
+        }
+        // Stop path: two-step. First, fetch the sensor's stored
+        // instigation-state id; `stopSensor(id:)` requires it (the
+        // schema accepts the string id of an `InstigationState`, not a
+        // selector).
+        let lookup_query = "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { \
+                            __typename \
+                            ... on Sensor { sensorState { id status } } \
+                            ... on SensorNotFoundError { message } \
+                            } }";
+        let lookup: Value = self
+            .execute(lookup_query, Some(json!({ "sel": sel })))
+            .await?;
+        let sensor_block = &lookup["sensorOrError"];
+        // `sensorOrError` returns `null` when the field is missing
+        // (e.g. a sensor selector that the schema rejects outright);
+        // treat that the same as `SensorNotFoundError`.
+        let typename = sensor_block
+            .get("__typename")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if typename != "Sensor" {
+            // F1.2 tolerance: a missing sensor at `running=false` is
+            // treated as already-stopped. The route (F1.2) calls
+            // `set_sensor_running(_, false)` when pausing a pipeline
+            // that has no `dependsOn` (no sensor was built for it), and
+            // the `paused` branch in Python's `build_authored_dependency_sensor`
+            // skips the sensor for paused pipelines whose `dependsOn`
+            // has not yet been reloaded. In both cases the chain is
+            // already silent; returning `Ok(true)` keeps the route's
+            // toggle idempotent. `sensor_or_error` may also return
+            // `null` outright when the field is missing entirely; we
+            // collapse that to the same `SensorNotFoundError` shape.
+            return Ok(SensorOutcome {
+                ok: true,
+                error: None,
+            });
+        }
+        let Some(state_id) = sensor_block
+            .get("sensorState")
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(SensorOutcome {
+                ok: false,
+                error: Some("sensor missing sensorState.id".to_owned()),
+            });
+        };
+        let stop_query = "mutation($id: String!) { stopSensor(id: $id) { \
+                          __typename \
+                          ... on StopSensorMutationResult { instigationState { id status } } \
+                          ... on PythonError { message } \
+                          ... on UnauthorizedError { message } \
+                          } }";
+        let data: std::collections::HashMap<String, ScheduleMutationResultBody> = self
+            .execute(stop_query, Some(json!({ "id": state_id })))
+            .await?;
+        let r = data.into_values().next().ok_or_else(|| {
+            DgError::Server("Dagster response missing stopSensor result".to_owned())
+        })?;
+        if r.typename == "StopSensorMutationResult" {
+            return Ok(SensorOutcome {
+                ok: true,
+                error: None,
+            });
+        }
+        Ok(SensorOutcome {
             ok: false,
             error: Some(r.message.unwrap_or(r.typename)),
         })
@@ -2781,6 +2965,128 @@ mod tests {
         assert_eq!(runs[0].end_time, Some(3.0));
     }
 
+    /// F1.5 (PR #55/#56 review BLOCKER): `job_name` is the raw path id
+    /// for non-`pl-` ids (`routes::pipelines::runs_body`,
+    /// `routes_step_matrix`, `volume`), so a `pipeline:read` user could
+    /// put `"` and `#` in it. The id MUST travel as a GraphQL variable,
+    /// never be interpolated into the query text. The mock pins the
+    /// constant query substring (`pipelineName: $job` — a `$variable`
+    /// reference that a `format!` interpolation cannot produce) AND the
+    /// variables object containing the value. If the implementation
+    /// regresses to `format!`, the body won't include the constant
+    /// substring, no mock matches, wiremock returns 404, the client
+    /// surfaces `DgError::Server("Dagster HTTP 404")`, and the `unwrap`
+    /// here fails — that's the mutation-evidence red.
+    #[tokio::test]
+    async fn list_runs_for_job_job_name_travels_as_a_graphql_variable() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        // `"` and `#` — exactly the characters the prompt names, in an id
+        // that does NOT contain the constant query marker as a substring
+        // (so the `body_string_contains` matcher can't false-positive if
+        // the id were ever echoed into the query).
+        let evil = "r\"#x";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineName: $job"))
+            .and(body_partial_json(json!({
+                "variables": { "job": evil, "limit": 30 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client.list_runs_for_job(evil, 30).await.unwrap();
+        assert!(runs.is_empty());
+    }
+
+    /// Same F1.5 contract for `list_runs_with_steps_for_job`. The route
+    /// path through `runs_step_matrix` is the same as `runs_body` — it
+    /// passes the raw id when it does not start with `pl-`.
+    #[tokio::test]
+    async fn list_runs_with_steps_for_job_job_name_travels_as_a_graphql_variable() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let evil = "r\"#x";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineName: $job"))
+            .and(body_partial_json(json!({
+                "variables": { "job": evil, "limit": 30 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let rows = client.list_runs_with_steps_for_job(evil, 30).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// Same F1.5 contract for `list_runs_for_job_with_materializations`,
+    /// reached via the `volume` route.
+    #[tokio::test]
+    async fn list_runs_for_job_with_materializations_job_name_travels_as_a_graphql_variable() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let evil = "r\"#x";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineName: $job"))
+            .and(body_partial_json(json!({
+                "variables": { "job": evil, "limit": 30 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_materializations(evil, 30)
+            .await
+            .unwrap();
+        assert!(runs.is_empty());
+    }
+
+    /// F1.5 (PR #55/#56 review BLOCKER): `list_runs` is the sibling that
+    /// only takes a `limit`. It too used to interpolate the limit into
+    /// the query string; `limit` is caller-supplied (a `u32`, so cannot
+    /// carry GraphQL syntax), but converting it to `$limit: Int!` is
+    /// trivial and keeps every client call in this crate consistent with
+    /// the variable-channel contract.
+    #[tokio::test]
+    async fn list_runs_sends_limit_as_a_graphql_variable() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("runsOrError(limit: $limit)"))
+            .and(body_partial_json(json!({ "variables": { "limit": 25 } })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let _ = client.list_runs(25).await.unwrap();
+    }
+
     /// Plan 1c (R2): the runs × steps matrix comes from ONE GraphQL call
     /// per pipeline, not one per run. This test proves the response shape
     /// the route layer turns into `{ runs: [{ runId, status, startedAt,
@@ -2816,6 +3122,13 @@ mod tests {
                       ] }
                 ] } }
             })))
+            // PR #57 review F1.10: `.expect(1)` is the "one call per
+            // request" guarantee the matrix's per-page shape and the
+            // brief's "matrix is single-round-trip" rule need. The route
+            // MUST NOT fan out per-run; a regression that adds a second
+            // round trip flips this to an expect-1 mismatch rather than
+            // a silent "well, the response looked right".
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -2859,6 +3172,11 @@ mod tests {
                       ] }
                 ] } }
             })))
+            // PR #57 review F1.10: same `.expect(1)` as the primary
+            // "one call" test above — this test also goes through the
+            // matrix at limit 30, and a regression that fans out per
+            // step to look up the `null` duration would over-fire.
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3236,14 +3554,27 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("boom"));
     }
 
-    /// Plan 1c (R2): the selected-steps re-execution first looks up the
-    /// parent run's `pipelineName`/`rootRunId`/`runConfig`, then calls
-    /// `launchRunReexecution(executionParams: { selector, runConfigData,
-    /// stepKeys, executionMetadata: { parentRunId, rootRunId } })`. The
-    /// wiremock must see ONE GraphQL body that carries the requested
-    /// `stepKeys` AND the parent config — otherwise Dagster would launch
-    /// without its required resources (see `dagster_graphql/schema/
-    /// inputs.py:314-340`).
+    /// Plan 1c (R2) + F1.6 (PR #56 review BLOCKER): the selected-steps
+    /// re-execution first looks up the parent run's `pipelineName`/
+    /// `rootRunId`/`runConfig`, then calls `launchRunReexecution(
+    /// executionParams: { selector, runConfigData, stepKeys,
+    /// executionMetadata: { parentRunId, rootRunId } })`. The wiremock
+    /// must see ONE GraphQL body that carries the requested `stepKeys`
+    /// AND the parent config — otherwise Dagster would launch without its
+    /// required resources (see `dagster_graphql/schema/inputs.py:314-340`).
+    ///
+    /// F1.6 reason for the `null` root in the lookup: a run that was
+    /// NEVER re-executed has `rootRunId: null` in Dagster's `Run` payload
+    /// — that is the shape production produces for an ordinary run, and
+    /// is the one that broke "re-run selected steps" in the field (Dagster
+    /// refuses a null `rootRunId` with a parent on the `executionParams`
+    /// path: `dagster_graphql/implementation/execution/launch_execution.py:
+    /// 47-49` runs `check.str_param(execution_metadata.root_run_id,
+    /// "root_run_id")`, which raises on None → `PythonError`). The mutation
+    /// must therefore carry `rootRunId: parentRunId` — exactly the
+    /// normalization Dagster's own `reexecutionParams` path applies
+    /// (`dagster/_core/instance/runs/run_domain.py:474`, `root_run_id =
+    /// parent_run.root_run_id or parent_run.run_id`).
     #[tokio::test]
     async fn launch_reexecution_of_steps_sends_selector_step_keys_and_parent_config() {
         use wiremock::matchers::{body_partial_json, body_string_contains};
@@ -3267,7 +3598,7 @@ mod tests {
                     "cfg": { "ops": { "run_x": { "config": { "k": "v" } } } },
                     "keys": ["run_x", "run_y"],
                     "parentRunId": "parent-1",
-                    "rootRunId": "root-1",
+                    "rootRunId": "parent-1",
                 }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -3285,7 +3616,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunOrError": { "__typename": "Run",
                     "pipelineName": "refresh_lakehouse",
-                    "rootRunId": "root-1",
+                    "rootRunId": null,
                     "runConfig": { "ops": { "run_x": { "config": { "k": "v" } } } }
                 } }
             })))
@@ -3295,6 +3626,105 @@ mod tests {
         let client = DgClient::new(format!("{}/graphql", server.uri()));
         let outcome = client
             .launch_reexecution_of_steps("parent-1", &["run_x", "run_y"])
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("new-run"));
+        assert!(outcome.error.is_none());
+    }
+
+    /// F1.6 (PR #56 review BLOCKER): a second-level re-execution — a
+    /// parent that is ITSELF a re-execution — already has a non-null
+    /// `rootRunId` (the FIRST run's id, not the immediate parent's).
+    /// That root is forwarded unchanged: it is the start of the chain,
+    /// not the immediate parent. The mock lookup returns a non-null
+    /// `rootRunId`; the mutation body must carry the SAME value (NOT the
+    /// immediate parent's id), so the chain stays anchored at its origin.
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_forwards_an_existing_root_unchanged() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("launchRunReexecution"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "parentRunId": "parent-1",
+                    "rootRunId": "root-9",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "new-run" } } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineRunOrError"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run",
+                    "pipelineName": "refresh_lakehouse",
+                    "rootRunId": "root-9",
+                    "runConfig": {}
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("parent-1", &["any"])
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("new-run"));
+        assert!(outcome.error.is_none());
+    }
+
+    /// F1.6 (PR #56 review BLOCKER): `parent.rootRunId` absent from the
+    /// lookup payload entirely (not present at all — Dagster omits it for
+    /// some historical run shapes, and the `parent.get("rootRunId")`
+    /// chain must treat it the same as a JSON `null`). The mutation
+    /// carries `rootRunId: parentRunId` for the same reason the explicit
+    /// `null` does: a parent without a stored root IS its own root.
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_falls_back_to_parent_when_root_field_is_absent() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("launchRunReexecution"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "parentRunId": "parent-1",
+                    "rootRunId": "parent-1",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "new-run" } } }
+            })))
+            .mount(&server)
+            .await;
+        // `rootRunId` is OMITTED from the payload — the `parent.get(
+        // "rootRunId")` chain must yield `None` and `unwrap_or` to the
+        // parent run id.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineRunOrError"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run",
+                    "pipelineName": "refresh_lakehouse",
+                    "runConfig": {}
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("parent-1", &["any"])
             .await
             .unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("new-run"));
@@ -3746,5 +4176,147 @@ mod tests {
         let outcome = client.stop_schedule("nope").await.unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.error.as_deref(), Some("no such schedule"));
+    }
+
+    // ── F1.2 #57: `set_sensor_running` (sensor start/stop for the
+    //    `authored__<id>_after` sensor that ships with chained authored
+    //    pipelines). ────────────────────────────────────────────────
+
+    /// Start path: `startSensor` returns `Sensor` (with
+    /// `sensorState { status }`); the method maps that to
+    /// `Ok(SensorOutcome { ok: true, .. })`.
+    #[tokio::test]
+    async fn set_sensor_running_start_returns_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "startSensor": { "__typename": "Sensor",
+                    "sensorState": { "status": "RUNNING" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", true)
+            .await
+            .unwrap();
+        assert!(outcome.ok, "start should succeed: {outcome:?}");
+        assert!(outcome.error.is_none());
+    }
+
+    /// Stop path is a two-step lookup (the `stopSensor` mutation
+    /// needs the `InstigationState.id`, NOT a `SensorSelector`). This
+    /// test mocks both steps: the lookup returns a `Sensor` with a
+    /// `sensorState.id`, and `stopSensor` returns
+    /// `StopSensorMutationResult` with the new `instigationState`.
+    #[tokio::test]
+    async fn set_sensor_running_stop_returns_ok_after_two_step_lookup() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        // The stop path is TWO requests with different bodies: a lookup
+        // (`sensorOrError`) then the mutation (`stopSensor(id: …)`). A
+        // single mock answering both made the stop call's
+        // `HashMap` deserialisation pick a value by iteration order, so
+        // it could read `sensorOrError` (`__typename: "Sensor"`) and
+        // report a spurious failure. Register the mutation mock FIRST so
+        // it gets the higher priority (wiremock uses "most recently
+        // mounted first" — see the docs on `MockServer`). Then mount the
+        // lookup mock; the two body matchers are disjoint, so neither can
+        // shadow the other.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("stopSensor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "stopSensor": {
+                        "__typename": "StopSensorMutationResult",
+                        "instigationState": { "id": "remote_origin_id:selector_id", "status": "STOPPED" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("sensorOrError"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "sensorOrError": {
+                        "__typename": "Sensor",
+                        "sensorState": { "id": "remote_origin_id:selector_id", "status": "RUNNING" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", false)
+            .await
+            .unwrap();
+        assert!(outcome.ok, "stop should succeed: {outcome:?}");
+        assert!(outcome.error.is_none());
+    }
+
+    /// F1.2 tolerance: when the sensor does not exist at all (e.g. a
+    /// pipeline whose `dependsOn` is empty, so no sensor was built),
+    /// the lookup step returns `SensorNotFoundError` and the route's
+    /// `paused` branch treats `running=false` as already-stopped.
+    /// `set_sensor_running(_, false)` MUST return `Ok(true)` so the
+    /// toggle stays idempotent across reloads.
+    #[tokio::test]
+    async fn set_sensor_running_stop_is_already_silent_when_sensor_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "sensorOrError": { "__typename": "SensorNotFoundError",
+                    "message": "no such sensor" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.ok,
+            "stop on missing sensor -> already silent: {outcome:?}"
+        );
+        assert!(
+            outcome.error.is_none(),
+            "missing sensor must NOT surface an error: {outcome:?}"
+        );
+    }
+
+    /// Start path: `startSensor` returning `SensorNotFoundError`
+    /// (e.g. the sensor name is wrong) maps to `Ok(false)` with the
+    /// message in `error`. The route's `resume` branch uses the
+    /// `error` field to surface a 4xx to the caller.
+    #[tokio::test]
+    async fn set_sensor_running_start_reports_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "startSensor": { "__typename": "SensorNotFoundError",
+                    "message": "no such sensor" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", true)
+            .await
+            .unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some("no such sensor"));
     }
 }

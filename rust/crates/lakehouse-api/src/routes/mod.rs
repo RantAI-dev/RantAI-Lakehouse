@@ -202,11 +202,14 @@ fn pipelines_router() -> Router<AppState> {
             axum::routing::post(authored_pipelines::restore_version),
         )
         // Plan 1c (R2, day-1): the runs × steps matrix endpoint is
-        // STATIC under `{id}/runs/steps`, so it is registered BEFORE the
-        // `{runId}/steps` route below — otherwise axum would match the
-        // literal path with `{runId} = "steps"` and route the matrix
-        // request to `run_steps` (which would then 503 trying to
-        // interpret "steps" as a Dagster run id). The order matters.
+        // STATIC under `{id}/runs/steps`. axum's `matchit` router
+        // resolves static segments ahead of path parameters regardless
+        // of registration order — so the literal path here reaches
+        // `runs_step_matrix`, and a path with an actual `runId`
+        // reaches `run_steps` below. Registration order is a
+        // readability aid, not a correctness requirement
+        // (PR #57 review F1.10). The two paths' routing is pinned by
+        // `tests/pipeline_routing.rs::both_paths_resolve_to_their_own_handler`.
         .route(
             "/api/pipelines/{id}/runs/steps",
             get(pipelines::runs_step_matrix),
@@ -629,6 +632,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/gold/exports", get(gold::exports))
         .route("/api/gold/export/{mart}/consumers", get(gold::consumers))
+        // DATA-1: per-mart publish-to-Iceberg switches — the scheduler's
+        // list of enabled marts, and the per-mart switch the asset page
+        // flips. POLICY_TABLE mirrors both paths below.
+        .route("/api/gold/publications", get(gold::publications))
+        .route(
+            "/api/gold/export/{mart}/publication",
+            get(gold::publication).put(gold::set_publication),
+        )
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route(

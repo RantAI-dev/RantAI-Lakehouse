@@ -26,6 +26,7 @@ Update only with verified repository facts.
 | Overview | Alerts triage | `/alerts` | [COMPLETE] | [REAL] |
 | Data | Data Explorer (tier + layer) | `/data` | [COMPLETE] | [REAL] |
 | Data | Asset detail tabs | `/data/assets/[assetId]` | [COMPLETE] | [REAL] |
+| Data | Gold per-mart publish switch on asset page | `/data/assets/[assetId]` (Gold only) | [COMPLETE] | [REAL] |
 | Data | Catalog namespaces (incl. Bronze Iceberg tables) | `/catalog` | [COMPLETE] | [REAL] |
 | Data | Storage lifecycle + restore (Hot/Warm real; Cold/AI always 0 — see README limitations) | `/storage` | [COMPLETE] | [REAL] |
 | Data | Connectors list / create / test / discover | `/connectors` | [COMPLETE] | [REAL] (CRUD is real Postgres; `testConnection` returns hardcoded latency — see `lakehouse-store/src/connectors.rs`, not a live socket check) |

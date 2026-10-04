@@ -40,6 +40,7 @@ import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
+import { OpenFormatCard } from "./open-format-card"
 
 /**
  * Candidate permissions the "Request access" dialog offers. Not every
@@ -149,6 +150,7 @@ export function AssetDetailPage() {
           },
         ]}
       />
+      {a.layer === "gold" && <OpenFormatCard assetId={a.id} />}
       <AssetDetailTabs asset={a} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>

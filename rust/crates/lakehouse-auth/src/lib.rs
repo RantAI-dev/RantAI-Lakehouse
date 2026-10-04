@@ -37,6 +37,7 @@
 //! for what it required.
 
 pub mod authenticator;
+pub mod cleanup;
 pub mod credential;
 pub mod error;
 pub mod oidc;
@@ -48,6 +49,7 @@ pub mod repository;
 pub mod secret;
 pub mod service_token;
 pub mod session;
+pub mod throttle;
 mod token;
 
 pub use authenticator::Authenticator;

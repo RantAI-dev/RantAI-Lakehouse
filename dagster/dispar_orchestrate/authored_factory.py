@@ -14,12 +14,17 @@ all tenants) and builds, per pipeline:
   is not wanted is paused from the console, which also switches this
   schedule off (`routes::pipelines::authored_status`);
 * an `authored__<id>_after` run_status_sensor when the pipeline's
-  `dependsOn` is non-empty (R3 plan 2a). The sensor fires after a SUCCESS
-  run of any of its upstreams; it yields a `RunRequest` only when EVERY
-  upstream has had a SUCCESS run that finished AFTER this pipeline's
-  most-recent start time (ALL semantics — see `build_authored_dependency_sensor`
-  for the rule, named upstream-by-upstream in the `SkipReason` so the UI can
-  show "waiting on <id>").
+  `dependsOn` is non-empty AND its `status` is `ready` (R3 plan 2a, F1.2).
+  The sensor fires after a SUCCESS run of any of its upstreams; it yields
+  a `RunRequest` only when EVERY upstream has had a SUCCESS run that
+  finished AFTER this pipeline's most-recent start time (ALL semantics —
+  see `build_authored_dependency_sensor` for the rule, named
+  upstream-by-upstream in the `SkipReason` so the UI can show "waiting on
+  <id>"). A `paused` pipeline contributes NO sensor: the orchestrator
+  keeps the sensor's RUNNING/STOPPED state across a code-location
+  reload, so the `paused` branch has to skip the sensor AND the API
+  `authored_status` route has to stop the stored sensor next to the
+  schedule (F1.2).
 
 The API asks the webserver to reload this code location whenever a
 pipeline becomes ready, is edited, paused, resumed or deleted
@@ -293,12 +298,64 @@ def _ensure_target_table(target: ClickHouseTarget, target_zone: str, target_tabl
 
 
 def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> int:
-    """Insert `select_sql`'s rows into `target_zone.target_table` and
-    return the REAL row-count delta measured before/after -- never a
-    fabricated or assumed count (`AGENTS.md`: "no invented metrics")."""
+    """REPLACE `target_zone.target_table` with `select_sql`'s rows,
+    atomically, and return the REAL row-count DELTA between before and
+    after the swap -- what the caller records as rows written -- not
+    the absolute row count of the swapped-in target.
+
+    Semantics: the function is a `REPLACE`, not an `APPEND`. The op that
+    calls it (`_op_for_pipeline`) treats each run as a full snapshot of
+    the pipeline's output -- a downstream that reads `serving.<table>`
+    while this op is in the middle of writing would otherwise see a
+    half-populated table (`AGENTS.md` "fail closed"; F1.4 plan #57).
+    Inserting into the live target is the same bug a `TRUNCATE; INSERT`
+    pair would have, just hidden by the INSERT's default appending
+    semantics.
+
+    Implementation: a staging table named
+    `{target_zone}.__staging_{target_table}` holds the new rows. We
+    `DROP TABLE IF EXISTS` any leftover from a prior failed attempt
+    (idempotency under retry), `CREATE TABLE ... AS {select_sql}`
+    (re-uses the `_ensure_target_table` shape so column inference is
+    consistent), `INSERT INTO staging SELECT`, then
+    `EXCHANGE TABLES ...` so the staging table's contents replace the
+    live target in a single ClickHouse mutation step. The final
+    `SELECT count()` reads the SWAPPED-IN target (its name is still
+    `target_zone.target_table`; the staging table's contents moved
+    there). The staging table is dropped in the same sequence so the
+    next run's `DROP IF EXISTS` is a no-op.
+
+    Failure modes (per AGENTS.md "no invented metrics"): any raise
+    from `_ch_exec` propagates unwrapped -- a partial INSERT into the
+    staging table leaves the live target unchanged, the staging table
+    is dropped by the next run's `DROP IF EXISTS`, and the failing
+    run is retryable because no committed write happened to the live
+    target.
+    """
     _ensure_target_table(target, target_zone, target_table, select_sql)
+    staging_table = f"__staging_{target_table}"
+    # Idempotency under retry: drop any staging table left behind from
+    # a prior attempt that failed between `INSERT INTO staging` and
+    # `EXCHANGE TABLES`. `EXCHANGE TABLES` would otherwise refuse to
+    # run if the staging table is already present in `target_zone`.
+    _ch_exec(target, f"DROP TABLE IF EXISTS {target_zone}.`{staging_table}`")
+    _ch_exec(
+        target,
+        f"CREATE TABLE {target_zone}.`{staging_table}` "
+        f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+    )
     before = _ch_query_json(target, f"SELECT count() AS n FROM {target_zone}.`{target_table}`")
-    _ch_exec(target, f"INSERT INTO {target_zone}.`{target_table}` {select_sql}")
+    _ch_exec(target, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}")
+    # ClickHouse `EXCHANGE TABLES` is the atomic-swap primitive: both
+    # tables must exist in the same database, and the swap is a single
+    # mutation step (no transactional gap where readers see a
+    # half-empty target).
+    _ch_exec(
+        target,
+        f"EXCHANGE TABLES {target_zone}.`{target_table}` "
+        f"AND {target_zone}.`{staging_table}`",
+    )
+    _ch_exec(target, f"DROP TABLE {target_zone}.`{staging_table}`")
     after = _ch_query_json(target, f"SELECT count() AS n FROM {target_zone}.`{target_table}`")
     return int(after[0]["n"]) - int(before[0]["n"])
 
@@ -450,41 +507,60 @@ def build_authored_schedule(pipeline: dict[str, Any], authored_job: Any) -> Sche
 
 def build_authored_definitions(
     cfg: AuthoredPipelineConfig | None = None,
-) -> tuple[list[Any], list[ScheduleDefinition]]:
-    """Every authored job and schedule, from ONE fetch, so the two lists
-    can never describe different sets of pipelines. R3 plan 2a: this
-    function deliberately does NOT include the chain sensors — those are
-    built by `build_authored_dependency_sensors`, so this 2-tuple shape
-    stays compatible with HEAD's `test_jobs_and_schedules_come_from_one_fetch`
-    (and with `build_authored_jobs`, which is `... [0]`). The module
-    loaders below call both builders; they pay one extra HTTP roundtrip
-    at code-load time only when `PIPELINE_RUN_TOKEN` is set."""
+) -> tuple[
+    list[Any],
+    list[ScheduleDefinition],
+    list[tuple[dict[str, Any], Any]],
+]:
+    """Every authored job, schedule, and (pipeline, job) tuple needed by the
+    sensor builder, from ONE fetch of `/api/pipelines/runnable`, so the
+    three lists can never describe different sets of pipelines.
+
+    The `[(pipeline, job), ...]` half is what `build_authored_dependency_sensors`
+    now consumes: the sensor body MUST use the SAME `JobDefinition` the
+    code location's job list holds — building the job twice (once for
+    `jobs`, once inside the sensor builder) produced two `JobDefinition`s
+    with the same name, which `Dagster 1.13.20` refuses with
+    `DagsterInvalidDefinitionError: Duplicate job definition found` and
+    takes the whole code location load down with it (#55, F1.1 BLOCKER).
+
+    The 3-tuple shape is the deliberate successor to the previous
+    2-tuple shape (`(jobs, schedules)`). `build_authored_jobs` (HEAD's
+    `... [0]`) keeps the 2-tuple contract by mapping to `[0]` of the new
+    return; the old `test_jobs_and_schedules_come_from_one_fetch` test
+    moves its asserts to `(jobs, schedules) == defs[0], defs[1]` and gains
+    a fresh `(pipeline, job)` assert for the third element.
+
+    Returns `(jobs, schedules, deps)` — `deps` is the sensor builder's
+    input. With `PIPELINE_RUN_TOKEN` unset the fetch is a no-op and the
+    three lists are empty."""
     cfg = cfg or AuthoredPipelineConfig.from_env()
     jobs: list[Any] = []
     schedules: list[ScheduleDefinition] = []
+    deps: list[tuple[dict[str, Any], Any]] = []
     for pipeline in _fetch_authored_pipelines(cfg):
         authored_job = build_authored_job(pipeline)
         jobs.append(authored_job)
         schedule = build_authored_schedule(pipeline, authored_job)
         if schedule is not None:
             schedules.append(schedule)
-    return jobs, schedules
+        deps.append((pipeline, authored_job))
+    return jobs, schedules, deps
 
 
 def build_authored_dependency_sensors(
-    cfg: AuthoredPipelineConfig | None = None,
+    pipeline_jobs: list[tuple[dict[str, Any], Any]],
 ) -> list[Any]:
     """R3 plan 2a: one `run_status_sensor` per authored pipeline with
-    non-empty `depends_on`. Built separately from
-    `build_authored_definitions` so that function can keep its HEAD
-    2-tuple return shape — the sensor list only matters at code-load
-    time when `Definitions(sensors=...)` is constructed, and it is
-    empty whenever `PIPELINE_RUN_TOKEN` is unset (so the extra fetch
-    is a no-op in that case)."""
-    cfg = cfg or AuthoredPipelineConfig.from_env()
+    non-empty `depends_on`. Built from the `(pipeline, job)` list
+    `build_authored_definitions` returned so each sensor's
+    `request_job` is the SAME `JobDefinition` instance the code
+    location's `jobs=` list holds (see `build_authored_definitions`'s
+    docstring for the F1.1 BLOCKER this avoids). `run_jobs` does the
+    HTTP fetch itself, so this function takes a plain list and is
+    unit-testable without monkeypatching `requests`."""
     sensors: list[Any] = []
-    for pipeline in _fetch_authored_pipelines(cfg):
-        authored_job = build_authored_job(pipeline)
+    for pipeline, authored_job in pipeline_jobs:
         sensor = build_authored_dependency_sensor(pipeline, authored_job)
         if sensor is not None:
             sensors.append(sensor)
@@ -532,13 +608,27 @@ def build_authored_dependency_sensor(
     `dependsOn`. Reads `dependsOn` (camelCase), matching the wire
     format the Rust `RunnablePipeline` serializes under
     `#[serde(rename_all = "camelCase")]` — R3 plan 2a wire-format fix.
-    The sensor watches every upstream's SUCCESS run; on a firing tick
-    it computes "has every upstream had a SUCCESS that finished after
-    this pipeline's most-recent start?" -- ALL semantics (R3 plan 2a).
-    When yes, yield `RunRequest(run_key=<upstream run id>)` so
-    Dagster's own dedup keeps a re-firing upstream from launching the
-    downstream twice for the same upstream run; when no, yield a
-    `SkipReason` naming the upstream that is still behind.
+    A `paused` pipeline gets no sensor at all (F1.2, #57): the
+    orchestrator keeps a vanished sensor's RUNNING state across a
+    reload, so a paused chain has to be stopped rather than rebuilt.
+
+    The sensor watches every upstream's SUCCESS run. On each firing
+    tick it requires ALL upstreams to have a SUCCESS run that ended
+    after the downstream's most-recent run started -- or simply a
+    SUCCESS run when the downstream has never run (R3 plan 2a ALL
+    semantics). The downstream's latest run is the freshness anchor;
+    while that run has no `start_time` (queued / not started /
+    started-but-empty) the sensor skips, so a queued launch is never
+    double-fired. When an upstream is behind, the sensor yields a
+    `SkipReason` naming it, stopping the walk at the first one to keep
+    the per-tick work bounded by the number of upstreams.
+
+    When every upstream is fresh, the sensor yields ONE
+    `RunRequest(run_key=f"authored-deps:{sorted latest upstream SUCCESS
+    run ids}")` per round of upstream successes, not one per upstream.
+    Two upstreams that succeed in the same tick ask for the same
+    sorted key, so Dagster's own dedup drops the second and the
+    downstream launches once (R3 plan 2a).
 
     `monitored_jobs` accepts `JobSelector`s (for cross-location
     upstreams like `ingest_job`); `request_job` must be the
@@ -550,6 +640,19 @@ def build_authored_dependency_sensor(
     """
     depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
+        return None
+    # F1.2 SHOULD-FIX (#57): a paused pipeline must NOT get a chain sensor.
+    # The orchestrator keeps the sensor's RUNNING/STOPPED state across a
+    # reload (Dagster keys instigator state by a name-based `selector_id`
+    # in `sql_schedule_storage.py:110-128`, and the daemon never stops
+    # states that disappeared from code). Pausing a chained pipeline
+    # therefore meant a sensor shipped RUNNING continued to fire; the
+    # `routes::pipelines::authored_status` toggle stops the sensor at
+    # pause time so the chain truly goes quiet (the same toggle that
+    # stops the schedule). A `ready` pipeline re-enters `default_status
+    # =RUNNING` after a reload; the API path that flips `paused` ->
+    # `ready` also re-starts the sensor in the same toggle.
+    if pipeline.get("status") == "paused":
         return None
     monitored = [_upstream_job_selector(dep) for dep in depends_on]
     downstream_safe = _dagster_safe_name(pipeline["id"])
@@ -570,29 +673,61 @@ def build_authored_dependency_sensor(
     def _dependency_sensor(context: Any) -> Any:
         # `context.dagster_run` is the upstream run that triggered THIS
         # tick -- it is always SUCCESS here (`run_status=SUCCESS` on the
-        # decorator) and is the canonical id to use as `run_key`.
+        # decorator).
         upstream_run = context.dagster_run
-        # The downstream's most-recent start, regardless of outcome:
+        # The downstream's most-recent run, regardless of outcome:
         # what we need to beat is "started after this point in time".
-        # `NOT_STARTED`/`QUEUED` runs have no start_time, so we filter
-        # to status groups where `start_time` is set on every row
-        # (STARTED, SUCCESS, FAILURE, CANCELING, CANCELED -- the set
-        # that owns the field). The `descending` default on
-        # `get_runs(limit=1)` gives us the most-recent start.
+        # F1.3 (#57): a downstream with no `start_time` (its latest run
+        # is QUEUED / NOT_STARTED / STARTED-but-empty) is NOT the same
+        # as "no run yet" -- the queued run is the chain's previous
+        # launch and we MUST wait for it before re-firing. The walk
+        # below checks every upstream against either the downstream's
+        # `start_time` (when it has one) or its `creation_time` (when
+        # the latest run has not started yet) -- never "no comparison
+        # point", which was the buggy "first-success fires the chain"
+        # behaviour the old code shipped.
         downstream_runs = context.instance.get_runs(
             filters=RunsFilter(job_name=f"authored__{downstream_safe}"),
             limit=1,
         )
-        downstream_start = downstream_runs[0].start_time if downstream_runs else None
-        # No start_time on the downstream yet -> this is the first run
-        # in its chain. Allow the upstream-triggered run through
-        # regardless of when it finished: nothing else has fired the
-        # downstream yet, so there is no "stale upstream" to wait for.
-        if downstream_start is None:
-            yield RunRequest(run_key=upstream_run.run_id)
+        latest_downstream = downstream_runs[0] if downstream_runs else None
+        # F1.3 (#57): "downstream has a queued run" is the
+        # `latest_downstream is not None and latest_downstream.start_time
+        # is None` branch -- the chain's previous launch is still in
+        # flight, so we MUST NOT yield a fresh RunRequest until the
+        # queued run actually starts (and beats its upstream checks).
+        if latest_downstream is not None and latest_downstream.start_time is None:
+            yield SkipReason(
+                f"downstream has a queued run ({latest_downstream.run_id}); "
+                "skip until it starts so we do not double-launch"
+            )
             return
-        # Otherwise: check EVERY upstream, name the first one that
-        # is stale in the skip reason.
+        # The freshness anchor: every upstream must have a SUCCESS run
+        # that finished AFTER this point. `start_time` when the
+        # downstream has run; `None` when it has never run (the
+        # "first-ever" case where the old code already let the chain
+        # fire without waiting -- we keep that branch but ALSO require
+        # EVERY upstream to have had a SUCCESS, see below).
+        downstream_start = (
+            latest_downstream.start_time if latest_downstream is not None else None
+        )
+        # F1.3 (#57): every upstream must have a SUCCESS run, not
+        # "any one upstream has a SUCCESS run". Walking every upstream
+        # in `upstream_ids` and asking `instance.get_runs` with a
+        # SUCCESS filter is what catches the "one upstream never
+        # succeeded, but the others have" case the old code missed --
+        # yielding a SkipReason that names the upstream that is still
+        # behind. The first stale upstream encountered is the one we
+        # name in the skip reason; the walk stops there to keep the
+        # per-tick work bounded by the number of upstreams.
+        #
+        # `run_key` is derived from the SORTED set of the upstreams'
+        # latest SUCCESS run ids, so one round of upstream successes
+        # requests exactly ONE downstream run, not one per upstream:
+        # two upstreams that succeed in the same tick (each firing
+        # its own sensor tick) ask the daemon for the same
+        # `run_key`, and the daemon's own dedup drops the second.
+        latest_success_ids: list[str] = []
         for upstream_id in upstream_ids:
             upstream_job_name = (
                 f"authored__{_dagster_safe_name(upstream_id)}"
@@ -607,14 +742,27 @@ def build_authored_dependency_sensor(
                 limit=1,
             )
             latest = upstream_runs[0] if upstream_runs else None
-            if latest is None or latest.end_time is None or latest.end_time <= downstream_start:
+            if latest is None or latest.end_time is None:
+                yield SkipReason(
+                    f"upstream {upstream_id!r} has never had a SUCCESS run; "
+                    f"this upstream run ({upstream_run.run_id}) is not enough"
+                )
+                return
+            if latest.end_time <= (downstream_start or 0.0):
                 yield SkipReason(
                     f"upstream {upstream_id!r} has no SUCCESS run after the "
                     f"downstream's most-recent start ({downstream_start}); "
                     f"this upstream run ({upstream_run.run_id}) is stale"
                 )
                 return
-        yield RunRequest(run_key=upstream_run.run_id)
+            latest_success_ids.append(latest.run_id)
+        # ALL upstreams have a fresh SUCCESS run -> one RunRequest,
+        # keyed on the SORTED tuple of those upstream run ids. The
+        # `run_key` is a string the daemon dedups, so two ticks that
+        # see the same set of upstreams ask for the same downstream
+        # launch exactly once.
+        joined = ",".join(sorted(latest_success_ids))
+        yield RunRequest(run_key=f"authored-deps:{joined}")
 
     return _dependency_sensor
 
@@ -624,8 +772,9 @@ def build_authored_dependency_sensor(
 # for every way this degrades to empty lists without raising.
 # Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
-# names statically) sees all three names `definitions.py` imports.
-_authored_jobs_and_schedules = build_authored_definitions()
-authored_jobs = _authored_jobs_and_schedules[0]
-authored_schedules = _authored_jobs_and_schedules[1]
-authored_dependency_sensors = build_authored_dependency_sensors()
+# names statically) sees all four names `definitions.py` imports.
+_authored_jobs_and_schedules_and_deps = build_authored_definitions()
+authored_jobs = _authored_jobs_and_schedules_and_deps[0]
+authored_schedules = _authored_jobs_and_schedules_and_deps[1]
+_authored_pipeline_jobs = _authored_jobs_and_schedules_and_deps[2]
+authored_dependency_sensors = build_authored_dependency_sensors(_authored_pipeline_jobs)

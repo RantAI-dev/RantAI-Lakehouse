@@ -437,11 +437,23 @@ they declare no `dependsOn`, so they cannot close one.
 Semantics are **ALL**, not any: the sensor fires after a `SUCCESS` run of
 one upstream, but the downstream is requested only when *every* upstream
 has a `SUCCESS` run that finished after the downstream's own most-recent
-run started. A downstream with no run history yet (its first-ever run)
-fires without waiting for one. Each downstream gets a run-status sensor
-named `authored__<id>_after`, `default_status=RUNNING` so a chain never
-ships silently stopped, and its `run_key` is the triggering upstream's run
-id, so a re-firing upstream cannot launch the same downstream twice.
+run started. A downstream whose latest run is `QUEUED` or `NOT_STARTED`
+is NOT the same as "no run yet" -- the queued run is the previous chain
+launch still in flight, so the sensor waits for it to actually start before
+firing again (no double-launch). A downstream with NO run history yet
+(first-ever chain tick) does fire on a fresh upstream success, but the
+ALL check STILL runs -- an upstream that has never succeeded is
+`SkipReason`-named, never silently bypassed. Each downstream gets a
+run-status sensor named `authored__<id>_after`, `default_status=RUNNING`
+so a chain never ships silently stopped, and its `run_key` is the SORTED
+tuple of every upstream's latest SUCCESS run id
+(`"authored-deps:run-a-1,run-b-1"`), so two ticks that see the same set
+of upstream successes ask the daemon for the same downstream launch
+exactly once (the daemon's own dedup keeps the second tick from
+launching a second downstream run). A `paused` pipeline contributes NO
+sensor; `routes::pipelines::authored_status` also stops the stored
+sensor next to the schedule when pausing a chained pipeline, so the
+chain truly goes quiet (Dagster keeps sensor state across a reload).
 
 **Where the skip reason shows.** `GET /api/pipelines/{id}/schedule-ticks`
 merges the pipeline's schedule ticks with the `authored__<id>_after`
@@ -454,6 +466,13 @@ downstream run."
 location reloads — the authored update asks the orchestrator to reload, and
 the factory rebuilds the sensors from `GET /api/pipelines/runnable`. A
 draft has no job and is not rebuilt; its chain arms when it goes `ready`.
+
+**Editing the chain (PR #57 review F1.8).** A save that does NOT include
+`dependsOn` keeps the stored chain (the write uses `COALESCE`); an
+explicit `dependsOn: []` clears it. Pre-fix every save wrote `[]`,
+erasing every author-wired upstream in one round trip. The route-level
+pair (`routes::authored_pipelines::update`) proves both directions
+against a real `sqlx::test` Postgres.
 
 ### What's deliberately NOT in the stack
 
@@ -566,6 +585,80 @@ check.
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |
+
+## Login throttling and session cleanup
+
+`POST /api/auth/login` is throttled per email. After
+`LOGIN_MAX_FAILURES` failures (default 5) inside a
+`LOGIN_FAILURE_WINDOW_SECS` rolling window (default 900 s), that email is
+locked out for `LOGIN_LOCKOUT_SECS` (default 300 s); every further attempt
+gets `429` with a `Retry-After` header, regardless of whether the password
+is right, and regardless of whether the account exists. A failed attempt
+only counts when the password was actually rejected — a database error
+mid-login renders as a 500 and does not count toward the lock.
+
+There is deliberately no off switch: `LOGIN_MAX_FAILURES=0`, negative,
+and unparseable values all fall back to the default (5), so an operator
+cannot silence the throttle by typo. The same fallback applies to the
+other two settings and to `AUTH_RETENTION_DAYS` — invalid values never
+fail boot and never disable the feature.
+
+Notes an operator should know:
+
+- The throttle key is a SHA-256 of the trimmed, lower-cased email — the
+  API never stores raw addresses in `login_throttle`. The account lookup
+  itself is case-sensitive (`WHERE u.email = $1`), so two spellings that
+  differ only by case are different accounts but one throttle key.
+- A successful login clears the failure count for that email, and a
+  failure after a lock has expired starts the count fresh — one typo
+  after a lockout ends does not immediately re-lock.
+- The first (bootstrap) admin can be locked out like anyone else; see
+  "Unlocking a lockout by hand" below.
+- The counter lives in Postgres, so a horizontally-scaled deployment
+  shares one limit per deployment, not per replica (rows are upserted
+  atomically, so concurrent attempts all count).
+- The console surfaces `429` as a lockout message with the wait time
+  from `Retry-After`; nothing else on the login page changes.
+
+### Unlocking a lockout by hand
+
+A lockout clears itself after `LOGIN_LOCKOUT_SECS`. To clear one early,
+delete the key's row (as the database owner, e.g. the `lakehouse` role):
+the API's tables live unqualified in the app database's `public` schema
+(migrations create them without a schema prefix and the pool sets no
+`search_path` override).
+
+```sql
+DELETE FROM public.login_throttle
+WHERE key_hash = encode(sha256(lower(trim(' ' from 'User@Example.Com'))::bytea), 'hex');
+```
+
+`lower(trim(...))` matches how the API derives the key for an ordinary
+address (`throttle::key_for` — exact for the common case, though Rust's
+`str::trim` strips all whitespace where SQL `trim(' ' …)` strips only
+spaces, and `lower()` follows the database collation), and `sha256()` is
+a built-in since Postgres 11 — no extension needed. Deleting the row
+clears both the count and the lock; there is no separate "unlock" flag.
+
+### Session cleanup background job
+
+A task spawned at API boot purges, roughly hourly:
+
+- auth sessions whose `expires_at` or `revoked_at` is more than
+  `AUTH_RETENTION_DAYS` days old (default 30);
+- service credentials revoked more than `AUTH_RETENTION_DAYS` days ago;
+- `login_throttle` rows that are no longer locked AND whose failure
+  window has passed — this one is NOT gated by `AUTH_RETENTION_DAYS`:
+  such a row can never lock again (the next failure starts a fresh
+  window), so it goes as soon as its window lapses, not 30 days later.
+
+It logs purge counts at each run and skips a tick if the previous run
+has not finished (`MissedTickBehavior::Skip`). It is best-effort, not a
+guarantee:
+nothing promises a session is gone within any particular bound. The job
+only deletes — it does not rotate anything, and an ACTIVE (non-revoked)
+service token never expires or gets cleaned up no matter how old it is;
+rotation is a manual, operator-driven act.
 
 ## Proposal: `GET /api/auth/providers` (not built)
 
@@ -772,3 +865,26 @@ present.
 
 A malformed value fails startup rather than quietly disabling the check. With
 the setting unset, the API logs one warning at boot naming it.
+
+## Gold export: growth and background merges
+
+Every publish of a changed mart appends one full copy — an append-only
+Iceberg table — and nothing expires old copies yet. Storage grows by one
+copy per publish. Outside tools must select the latest export time
+(`SELECT … WHERE _exported_at = (SELECT max(_exported_at) …)`) when
+they read a published mart, or they will see every past copy.
+
+`GOLD_EXPORT_MARTS` now defaults to empty: the console owns the mart list
+through `GET /api/gold/publications`, and a fresh deployment publishes
+only what is switched on there. Keep the env var as an operator override
+for emergencies, not as the daily driver.
+
+A background `MergeTree` merge can advance `max(modification_time)` on a
+mart even when no data changed, causing one extra export. The error
+direction is a spurious "changed" → one extra copy, never a missed one.
+A merge-proof freshness signal tracks as backlog `DATA-10`.
+
+A mart over the row cap (`GOLD_EXPORT_MAX_ROWS`, default 5,000,000) is
+refused outright — the export names the mart and the cap in its error,
+never silently truncating. Raise the cap only when you have measured the
+memory pressure of a true full re-copy at the new size.

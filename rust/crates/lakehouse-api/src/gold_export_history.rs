@@ -158,9 +158,19 @@ pub async fn record_export_run(ch: &ChClient, row: &NewGoldExportRun<'_>) -> Res
 fn list_sql(mart: &str, limit: u32) -> String {
     format!(
         "SELECT id, status, rows_exported, format_version, snapshot_id, error, triggered_by, \
-         toString(started_at) AS started_at, toString(finished_at) AS finished_at \
-         FROM console.gold_export_run WHERE mart = {mart} \
-         ORDER BY started_at DESC LIMIT {limit} FORMAT JSON",
+          toString(started_at) AS started_at, toString(finished_at) AS finished_at \
+          FROM console.gold_export_run WHERE mart = {mart} \
+          ORDER BY started_at DESC LIMIT {limit} FORMAT JSON",
+        mart = SqlLiteral::from(mart),
+    )
+}
+
+fn last_success_sql(mart: &str) -> String {
+    format!(
+        "SELECT toString(toUnixTimestamp64Milli(started_at)) AS started_ms \
+          FROM console.gold_export_run \
+          WHERE mart = {mart} AND status = 'success' \
+          ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
     )
 }
@@ -236,6 +246,27 @@ pub async fn list_export_runs(
     Ok(result.data.iter().map(row_to_export_run).collect())
 }
 
+/// Unix-millisecond `started_at` of `mart`'s newest `status = 'success'`
+/// run, or `None` when it has never exported successfully. DATA-1's
+/// publication detail route and `?ifChanged=true` both need "when was
+/// this mart's Iceberg copy last refreshed" — the history table is that
+/// fact's owner (every export attempt, both triggers, writes one row).
+/// A stored timestamp that cannot be parsed also reads as `None`:
+/// "unknown", never a guessed time.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_success_started_at(ch: &ChClient, mart: &str) -> Result<Option<i64>, ChError> {
+    ensure_gold_export_run_table(ch).await?;
+    let rows = ch.rows(&last_success_sql(mart), None).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("started_ms"))
+        .and_then(Value::as_str)
+        .and_then(|ms| ms.parse::<i64>().ok()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -293,6 +324,15 @@ mod tests {
         let sql = list_sql("sales", 50);
         assert!(sql.contains("ORDER BY started_at DESC"), "{sql}");
         assert!(sql.contains("LIMIT 50"), "{sql}");
+        assert!(sql.contains("'sales'"), "{sql}");
+    }
+
+    #[test]
+    fn last_success_sql_filters_to_success_and_takes_only_the_newest_row() {
+        let sql = last_success_sql("sales");
+        assert!(sql.contains("status = 'success'"), "{sql}");
+        assert!(sql.contains("ORDER BY started_at DESC LIMIT 1"), "{sql}");
+        assert!(sql.contains("toUnixTimestamp64Milli"), "{sql}");
         assert!(sql.contains("'sales'"), "{sql}");
     }
 
