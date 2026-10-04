@@ -42,6 +42,7 @@ pub mod connectors;
 pub mod error;
 pub mod gold_publication;
 pub mod governance;
+pub mod home_layout;
 pub mod identity;
 pub mod ingest_spec;
 pub mod knowledge;
