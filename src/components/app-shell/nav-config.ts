@@ -14,6 +14,7 @@ import {
   GitBranch,
   HeartPulse,
   History,
+  LayoutGrid,
   Home,
   KeyRound,
   Library,
@@ -36,6 +37,13 @@ export type NavItem = {
   title: string
   href: string
   icon: LucideIcon
+  /**
+   * A second destination for this entry, shown as an icon button at the
+   * right end of its row (where a section's chevron sits). The row itself
+   * still goes to `href`. Only rendered for a single-page entry in the
+   * expanded sidebar.
+   */
+  action?: { title: string; href: string; icon: LucideIcon }
   /**
    * `true` when the page still runs on mock data (not wired to a real
    * service yet). Hidden from the sidebar unless
@@ -114,7 +122,17 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Dashboards",
     icon: BarChart3,
-    items: [{ title: "Dashboards", href: "/dashboards", icon: BarChart3 }],
+    items: [
+      {
+        title: "Dashboards",
+        href: "/dashboards",
+        icon: BarChart3,
+        // The row opens the dashboard you last had open (`/dashboards` is
+        // the resolver); the icon opens the list, where dashboards and
+        // their folders are managed.
+        action: { title: "Browse all dashboards", href: "/dashboards/browse", icon: LayoutGrid },
+      },
+    ],
   },
   {
     label: "Data",
