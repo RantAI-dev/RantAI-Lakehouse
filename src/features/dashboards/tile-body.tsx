@@ -14,7 +14,7 @@ function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<st
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, year, onDataClick,
+  spec, cell, dark, loading, year, onDataClick, hideLegend,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
@@ -23,6 +23,12 @@ export function TileBody({
   year: string;
   /** Click a data point (bar/slice/point) → drill/cross-filter. */
   onDataClick?: (name: string, pos: { x: number; y: number }) => void;
+  /**
+   * Draw the chart without its legend: for a small preview, where a legend
+   * of many entries takes the room and cannot be read. The tooltip still
+   * names each series.
+   */
+  hideLegend?: boolean;
 }) {
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
@@ -58,7 +64,10 @@ export function TileBody({
   }
 
   // chart
-  if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" onDataClick={onDataClick} />;
+  if (hasRows(cell) && cell.rows.length) {
+    const option = buildOption(spec, cell.rows, dark);
+    return <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={onDataClick} />;
+  }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
 }
 

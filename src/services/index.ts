@@ -17,6 +17,7 @@ import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
+import { homeService as homeClientService } from "./clients/home"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -76,6 +77,10 @@ export const goldService = goldClientService
 // Postgres, honest `supported: false` when no pool is configured. No mock
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
+// Home's per-user layout (cards and shortcuts, in order) over
+// `/api/home/layout`; honest `supported: false` when no Postgres pool is
+// configured. No mock ever existed for this domain.
+export const homeService = homeClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

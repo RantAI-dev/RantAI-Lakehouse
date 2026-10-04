@@ -29,9 +29,12 @@ type Payload = {
  * filters and the board's saved filters all apply exactly as on the
  * canvas. Nothing is cached or recomputed here.
  *
- * Tiles are taken in canvas order (top to bottom, left to right). Text
- * notes are skipped: a note without its neighbours says little. No drill
- * or edit: the title links to the canvas for that.
+ * Tiles are taken in canvas order (top to bottom, left to right), charts
+ * first: text notes are never shown (a note without its neighbours says
+ * little), and tables only when the board has no chart to show, since a
+ * table of a row or two is mostly empty space at this size. Legends are
+ * hidden: one with many entries fills the tile and cannot be read here.
+ * No drill or edit: the title links to the canvas for that.
  */
 export function DashboardPreview({
   boardId,
@@ -59,10 +62,11 @@ export function DashboardPreview({
       const box = layout[id];
       return box ? box.y * 100 + box.x : Number.MAX_SAFE_INTEGER;
     };
-    return [...(state.data?.charts ?? [])]
+    const candidates = [...(state.data?.charts ?? [])]
       .filter((c) => c.kind !== "text")
-      .sort((a, b) => order(a.id) - order(b.id))
-      .slice(0, limit);
+      .sort((a, b) => order(a.id) - order(b.id));
+    const visual = candidates.filter((c) => c.kind !== "table");
+    return (visual.length > 0 ? visual : candidates).slice(0, limit);
   }, [state.data, limit]);
 
   if (state.status === "success" && tiles.length === 0) return null;
@@ -96,7 +100,7 @@ export function DashboardPreview({
                     {spec.title}
                   </Link>
                   <div className="min-h-0 flex-1">
-                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} year="all" />
+                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} year="all" hideLegend />
                   </div>
                 </div>
               ))}
