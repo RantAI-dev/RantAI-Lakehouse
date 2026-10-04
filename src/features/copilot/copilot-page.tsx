@@ -2,14 +2,9 @@
 
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { motion, useReducedMotion, type Variants } from "motion/react";
-import { History, MessageSquare, Plus, Sparkles } from "lucide-react";
+import { History, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { SuggestionButton } from "@/features/copilot/suggestion-button";
-import { useService } from "@/hooks/use-service";
-import { cn } from "@/lib/utils";
-import { pipelineService } from "@/services";
-import { useCopilot, type Mode } from "./use-copilot";
+import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryMenu } from "./history-menu";
@@ -31,7 +26,8 @@ import { ConversationPanel } from "./conversation-panel";
 function SessionUrlSync() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { sessionId: activeId, loadSession } = useCopilot();
+  const { sessionId: activeId, loadSession, messages, busy } = useCopilot();
+  const messageCount = messages.length;
   const urlId = searchParams.get("id") ?? searchParams.get("session");
   const lastUrl = React.useRef<string | null | undefined>(undefined);
   const lastActive = React.useRef<string | null>(activeId);
@@ -52,32 +48,47 @@ function SessionUrlSync() {
     }
   }, [urlId, activeId, loadSession, router]);
 
+  // No conversation to show (no `?id=`, nothing open, nothing being
+  // asked): this page has no empty state of its own, so go to Home, where
+  // conversations start. A question sent from Home already has its first
+  // message and `busy` set before this page mounts (`send` sets both
+  // before its first await), so it is never bounced back.
+  const nothingOpen = !urlId && !activeId && messageCount === 0 && !busy;
+  React.useEffect(() => {
+    if (nothingOpen) router.replace("/");
+  }, [nothingOpen, router]);
+
   return null;
 }
 
 /**
- * The AI Copilot page — a chat view: a centered welcome with the two
- * modes and starters, the conversation, a composer on the bottom edge.
+ * One conversation with Copilot: the messages, and a composer on the
+ * bottom edge to continue it.
+ *
+ * It is not where a conversation starts. Home (`/`) has the composer for
+ * that, and this page has no empty state: it used to carry its own
+ * welcome, starters and composer, which made it a second Home (QA
+ * feedback, twice). With nothing to show it sends you to Home
+ * (`SessionUrlSync`), and "New chat" goes there too. Old conversations are
+ * found on History (`/copilot/history`), the sidebar entry.
  *
  * Plain, like Home and like chat products: the chat sits straight on the
- * page, with no card around it (a bordered frame holding the page's only
- * content read as a window inside the window) and no brand gradient, grid
- * backdrop or glow ring (QA feedback each time). It does a different job
- * from Home: Home shows what needs attention and asks one question; this
- * page is where conversations are held and resumed.
+ * page, with no card around it and no brand gradient, grid backdrop or
+ * glow ring.
  *
- * A thin bar on top carries the open conversation's title, New chat and
+ * A thin bar on top carries the conversation's title, New chat and
  * History. History opens `ConversationPanel` on the right, closed by
- * default (see that component for why right and why not tabs). On narrow
- * screens the bar is the `CopilotHistoryMenu` switcher instead. The brain
- * & history are still shared with the global chat dock via useCopilot.
+ * default, for switching without leaving the page (see that component for
+ * why right and why not tabs). On narrow screens the bar is the
+ * `CopilotHistoryMenu` switcher instead. The brain & history are still
+ * shared with the global chat dock via useCopilot.
  */
 /** Whether the history panel is open, kept per browser. */
 const HISTORY_KEY = "copilot:history-open";
 
 export function CopilotPage() {
   const c = useCopilot();
-  const reduce = useReducedMotion() ?? false;
+  const router = useRouter();
   // A per-viewer convenience: storage may be unavailable (private mode,
   // blocked site data), so every access is guarded and closed is the default.
   const [historyOpen, setHistoryOpen] = React.useState(false);
@@ -96,7 +107,15 @@ export function CopilotPage() {
       // not remembered; the toggle still works for this visit
     }
   };
-  const activeTitle = c.sessions.find((s) => s.id === c.sessionId)?.title || "New conversation";
+  const activeTitle = c.sessions.find((s) => s.id === c.sessionId)?.title || "Conversation";
+  const startNew = () => {
+    c.newChat();
+    router.push("/");
+  };
+  // A conversation opened by link has no id here until its messages have
+  // arrived (`loadSession` sets both together). One that is open but has
+  // had every message deleted is just empty, not loading.
+  const loading = c.messages.length === 0 && !c.busy && !c.error && !c.sessionId;
 
   // Viewport minus the 4rem navbar and `AppFrame`'s vertical padding, so the
   // message list scrolls on its own and the composer stays on the bottom edge.
@@ -113,7 +132,7 @@ export function CopilotPage() {
             sessions={c.sessions}
             activeId={c.sessionId}
             onSelect={(id) => void c.loadSession(id)}
-            onNew={() => c.newChat()}
+            onNew={startNew}
           />
         </div>
         <div className="hidden shrink-0 items-center justify-between gap-3 pb-2 lg:flex">
@@ -121,7 +140,7 @@ export function CopilotPage() {
             {activeTitle}
           </h1>
           <div className="flex shrink-0 items-center gap-1.5">
-            <Button variant="outline" size="sm" onClick={() => c.newChat()} className="gap-1.5 bg-background">
+            <Button variant="outline" size="sm" onClick={startNew} className="gap-1.5 bg-background">
               <Plus className="size-4" />
               New chat
             </Button>
@@ -140,16 +159,10 @@ export function CopilotPage() {
 
         <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-y-auto py-6 pr-0.5">
-            {c.messages.length === 0 ? (
-              <EmptyChat
-                reduce={reduce}
-                mode={c.mode}
-                setMode={c.setMode}
-                title={c.pageContext.title}
-                suggestions={c.pageContext.suggest[c.mode]}
-                onPick={(q) => c.send(q)}
-                busy={c.busy}
-              />
+            {loading ? (
+              <p role="status" className="py-10 text-center text-sm text-muted-foreground">
+                Loading conversation…
+              </p>
             ) : (
               <ChatMessages
                 messages={c.messages} draft={c.draft} liveReasoning={c.liveReasoning} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
@@ -183,110 +196,3 @@ export function CopilotPage() {
     </div>
   );
 }
-
-const MODES: { mode: Mode; label: string; icon: typeof MessageSquare; what: string; safety: string }[] = [
-  {
-    mode: "ask",
-    label: "Ask",
-    icon: MessageSquare,
-    what: "Answers questions about your data, pipelines and catalog, and explains what it finds.",
-    safety: "Only reads. Nothing is changed.",
-  },
-  {
-    mode: "build",
-    label: "Build",
-    icon: Sparkles,
-    what: "Creates charts and dashboards, sets up alerts and sources, runs pipelines.",
-    safety: "Asks you before anything is changed.",
-  },
-];
-
-/**
- * The empty conversation: what the two modes do (picking one switches the
- * composer's mode), then starters for the chosen mode. A failed pipeline,
- * when there is one, leads the Ask starters: it is read from the
- * pipelines service, so it names something that exists here.
- */
-function EmptyChat({
-  reduce,
-  mode,
-  setMode,
-  title,
-  suggestions,
-  onPick,
-  busy,
-}: {
-  readonly reduce: boolean;
-  readonly mode: Mode;
-  readonly setMode: (m: Mode) => void;
-  readonly title: string;
-  readonly suggestions: string[];
-  readonly onPick: (q: string) => void;
-  readonly busy: boolean;
-}) {
-  const pipelines = useService((signal) => pipelineService.listPipelines(signal), []);
-  const failed = (pipelines.data?.pipelines ?? []).find((p) => p.status === "failed");
-  const starters = mode === "ask" && failed ? [`Why did ${failed.name} fail?`, ...suggestions.slice(0, 2)] : suggestions;
-
-  return (
-    <motion.div
-      variants={reduce ? undefined : STAGGER}
-      initial="hidden"
-      animate="show"
-      className="flex min-h-full flex-col items-center justify-center px-2 py-8 text-center"
-    >
-      <motion.h2
-        variants={reduce ? undefined : RISE}
-        className="text-2xl font-semibold tracking-tight text-balance text-foreground sm:text-3xl"
-      >
-        {title}
-      </motion.h2>
-      <motion.div variants={reduce ? undefined : RISE} className="mt-6 grid w-full max-w-xl gap-3 sm:grid-cols-2">
-        {MODES.map((m) => {
-          const active = m.mode === mode;
-          const Icon = m.icon;
-          return (
-            <button
-              key={m.mode}
-              type="button"
-              aria-pressed={active}
-              onClick={() => setMode(m.mode)}
-              className={cn(
-                "flex flex-col gap-1.5 rounded-xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-                active ? "border-foreground/30 bg-background" : "border-border bg-background/50 hover:bg-background",
-              )}
-            >
-              <span className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                <Icon className="size-4 text-muted-foreground" />
-                {m.label}
-                {active ? <span className="ml-auto text-[10px] font-medium text-muted-foreground">Selected</span> : null}
-              </span>
-              <span className="text-xs leading-relaxed text-muted-foreground">{m.what}</span>
-              <span className="text-[11px] text-muted-foreground/80">{m.safety}</span>
-            </button>
-          );
-        })}
-      </motion.div>
-      <motion.p variants={reduce ? undefined : RISE} className="mt-6 text-xs text-muted-foreground">
-        Try one:
-      </motion.p>
-      <div className="mt-2 flex flex-wrap justify-center gap-2">
-        {starters.map((s) => (
-          <motion.div key={`${mode}-${s}`} variants={reduce ? undefined : RISE}>
-            <SuggestionButton text={s} variant="pill" onClick={() => onPick(s)} disabled={busy} />
-          </motion.div>
-        ))}
-      </div>
-    </motion.div>
-  );
-}
-
-const STAGGER: Variants = {
-  hidden: {},
-  show: { transition: { staggerChildren: 0.07, delayChildren: 0.05 } },
-};
-
-const RISE: Variants = {
-  hidden: { opacity: 0, y: 12 },
-  show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 170, damping: 26 } },
-};

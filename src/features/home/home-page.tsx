@@ -6,9 +6,9 @@ import { useRouter } from "next/navigation"
 import { motion, useReducedMotion, type Variants } from "motion/react"
 import {
   AlertTriangle,
-  ArrowUp,
   BarChart3,
   CheckCircle2,
+  ChevronDown,
   CircleHelp,
   FileCode2,
   GitBranch,
@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
+import { ChatComposer } from "@/features/copilot/chat-composer"
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
 import { DashboardPreview } from "@/features/dashboards/dashboard-preview"
 import { readLastBoard } from "@/features/dashboards/last-board"
@@ -47,45 +48,48 @@ import {
 } from "@/services"
 
 /**
- * Home: "is anything wrong, and where did I leave off".
+ * Home: where a conversation with Copilot starts, with what needs you and
+ * where you left off underneath.
  *
- * Three blocks, and that number is the design:
+ * The console is AI-driven, so the first thing on the page is the Copilot
+ * composer (Ask/Build, Tools). It is the only place a conversation is
+ * started: sending opens it at `/copilot?id=…`, and old conversations are
+ * on History. There used to be a second, near-identical composer on an
+ * "Ask AI" page; an earlier fix made Home's small to tell the two apart,
+ * which treated the symptom. Now there is one.
  *
- * 1. **Status** — one line, the page's focal point: what needs attention
- *    across pipelines, alerts, sources and datasets, with the items
- *    themselves underneath when there are any (`lib/home-status`). It
- *    carries counts of problems only. Totals, throughput and trends are
+ * Top to bottom:
+ *
+ * 1. **Composer** — the focal point, with one line on what the two modes
+ *    do. Deliberately a box of a few rows, not a half-screen hero: the
+ *    hero this page once had pushed everything else below the fold.
+ * 2. **Status** — one thin line directly under the composer, so a failure
+ *    is on screen without scrolling: what needs attention across
+ *    pipelines, alerts, sources and datasets (`lib/home-status`), with
+ *    "Details" opening the items and an "Ask AI" for each. It carries
+ *    counts of problems only. Totals, throughput and trends are
  *    Monitoring → Health (`/health`); Home was a wall of platform metrics
  *    once and that moved there on purpose, so nothing here should grow
  *    back into one.
- * 2. **From <dashboard>** — the wide column: the first tiles of the
+ * 3. **From <dashboard>** — the wide column: the first tiles of the
  *    dashboard last opened (`DashboardPreview`), from the same governed
- *    API as the canvas. Charts get the wide column because they need it.
- * 3. **Recent** — the narrow column: dashboards, conversations and saved
- *    queries as one list by time (`lib/home-recent`).
+ *    API as the canvas.
+ * 4. **Recent** — the narrow column: dashboards, conversations and saved
+ *    queries as one list by time (`lib/home-recent`), with the "+ New"
+ *    menu for starting something by hand.
  *
- * Starting something new is the "+ New" menu in the header. It is
- * onboarding content, so it only becomes large cards on the page while
- * the workspace is still empty (no pipeline, no source, no dashboard of
- * your own).
+ * Starting something by hand is onboarding content, so it only becomes
+ * large cards on the page while the workspace is still empty (no
+ * pipeline, no source, no dashboard of your own).
  *
- * How it got here, so it is not undone by accident (QA feedback each
- * time): five equal-weight blocks had no focal point; one narrow column
- * left half the screen empty; then eleven bordered cards with two-line
- * rows, an audit-log feed and a start section were too much. The feed
- * (raw audit text, and `/activity` exists), the three per-kind cards, the
- * second line under every row and the start section were removed. A
- * "Pipeline runs" list went last: beside Recent it looked like a fourth
- * kind that had been left out of it for no visible reason, a failed
- * pipeline is already in the status card, and a healthy one is a green
- * "9m ago" that asks nothing of anyone (schedules and run history are on
- * `/pipelines`). It was not merged into Recent because jobs on a
- * 15-minute schedule would always be the newest rows and push the
- * person's own work down. Add a block only if it replaces one.
- *
- * Home and Ask AI (`/copilot`) do different jobs: Home asks one question
- * through a small box that opens the answer in Ask AI; the full composer
- * (Ask/Build, Tools), starters and the conversation list live there.
+ * Removed on the way, so they are not re-added by accident (QA feedback
+ * each time): an audit-log activity feed (raw audit text, and `/activity`
+ * exists), a card per kind with two-line rows, a start section on the
+ * page, and a "Pipeline runs" list (a failed pipeline is already in the
+ * status line, a healthy one is a green "9m ago" that asks nothing of
+ * anyone; merged into Recent, jobs on a 15-minute schedule would always
+ * be the newest rows and bury the person's own work). Add a block only if
+ * it replaces one.
  *
  * AI is a copilot here, not the default path for changes: a "+ New" item
  * opens the manual flow, and handing the task to Copilot is a separate,
@@ -97,8 +101,8 @@ import {
  * and a list that cannot load says that instead of looking empty.
  *
  * Whether an LLM is configured is not known up front (no endpoint reports
- * it); when it is not, `POST /api/ai/chat` answers 503 and the Copilot
- * page shows that error.
+ * it); when it is not, `POST /api/ai/chat` answers 503 and the
+ * conversation page shows that error.
  *
  * The look is deliberately plain: page background, bordered cards, hover
  * as a light background change, one short fade-in that is dropped under
@@ -121,7 +125,11 @@ export function HomePage() {
     if (!pending || mode !== pending.mode) return
     setPending(null)
     void send(pending.text, [])
-  }, [pending, mode, send])
+    // Navigate only now. `send` has put the question and `busy` in place
+    // (both before its first await), and the conversation page sends an
+    // empty conversation straight back here.
+    router.push("/copilot")
+  }, [pending, mode, send, router])
 
   const ask = React.useCallback(
     (text: string, wanted: Mode = "ask") => {
@@ -130,9 +138,8 @@ export function HomePage() {
       copilot.newChat()
       copilot.setMode(wanted)
       setPending({ text: q, mode: wanted })
-      router.push("/copilot")
     },
-    [copilot, router],
+    [copilot],
   )
 
   const pipelines = useService(
@@ -266,8 +273,10 @@ export function HomePage() {
     onAi: () => ask(s.aiPrompt, "build"),
   }))
 
+
   const recentList = (
     <RecentList
+      action={<NewMenu items={starts} />}
       loading={boards.status === "loading" || saved.status === "loading"}
       failed={[
         boards.status === "error" ? "dashboards" : null,
@@ -284,22 +293,40 @@ export function HomePage() {
       animate="show"
       className="mx-auto flex w-full max-w-6xl flex-col gap-6 py-2 sm:py-6"
     >
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
-        <h1 className="min-w-0 text-xl font-semibold tracking-tight text-foreground sm:text-2xl">
+      {/* The hero: where a conversation starts. Greeting, the Copilot
+          composer, and the status line directly under it so a failure is
+          seen without scrolling. */}
+      <section className="mx-auto flex w-full max-w-3xl flex-col gap-3 sm:pt-6">
+        <h1 className="pb-1 text-center text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
           {greeting()}
           {displayName ? `, ${displayName}` : ""}
         </h1>
-        <div className="flex min-w-0 items-center gap-2">
-          <AskBar onAsk={(q) => ask(q, "ask")} />
-          <NewMenu items={starts} />
-        </div>
-      </header>
-
-      <StatusCard
-        status={status}
-        items={attention}
-        onAsk={(prompt) => ask(prompt)}
-      />
+        <ChatComposer
+          solid
+          autoFocus
+          rows={3}
+          mode={copilot.mode}
+          setMode={copilot.setMode}
+          onSend={(text) => ask(text, copilot.mode)}
+          busy={false}
+          enabledCaps={copilot.enabledCaps}
+          toggleCap={copilot.toggleCap}
+          placeholder={
+            copilot.mode === "build"
+              ? "Tell Copilot what to build or change…"
+              : "Ask anything about your lakehouse data…"
+          }
+        />
+        <p className="text-center text-xs text-muted-foreground">
+          Ask only reads. Build can create and change things, and always asks
+          you first.
+        </p>
+        <StatusStrip
+          status={status}
+          items={attention}
+          onAsk={(prompt) => ask(prompt)}
+        />
+      </section>
 
       {emptyWorkspace ? (
         <section className="flex flex-col gap-3">
@@ -391,27 +418,29 @@ const TONE: Record<
 > = {
   attention: {
     icon: AlertTriangle,
-    iconCls: "bg-destructive/10 text-destructive",
+    iconCls: "text-destructive",
     cardCls: "border-destructive/30",
   },
   unknown: {
     icon: CircleHelp,
-    iconCls: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    iconCls: "text-amber-600 dark:text-amber-400",
     cardCls: "border-amber-500/30",
   },
   clear: {
     icon: CheckCircle2,
-    iconCls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    iconCls: "text-emerald-600 dark:text-emerald-400",
     cardCls: "border-border",
   },
-  loading: { icon: CircleHelp, iconCls: "bg-muted text-muted-foreground", cardCls: "border-border" },
+  loading: { icon: CircleHelp, iconCls: "text-muted-foreground", cardCls: "border-border" },
 }
 
 /**
- * The status line and, when something needs attention, the items behind
- * it. One card, so the verdict and its evidence are read together.
+ * The status as one thin line under the composer: the verdict and what it
+ * is made of. When something needs attention, "Details" opens the items
+ * behind it, each with its own "Ask AI". It is a line, not a card, so the
+ * composer stays the page's focus while a failure is still on screen.
  */
-function StatusCard({
+function StatusStrip({
   status,
   items,
   onAsk,
@@ -420,17 +449,15 @@ function StatusCard({
   items: AttentionItem[]
   onAsk: (prompt: string) => void
 }) {
+  const [open, setOpen] = React.useState(false)
   if (status.tone === "loading") {
     return (
       <section
         aria-label="Lakehouse status"
-        className="flex items-center gap-3 rounded-xl border border-border bg-card p-4"
+        className="flex h-10 items-center gap-2.5 rounded-lg border border-border bg-card px-3"
       >
-        <Skeleton className="size-9 rounded-full" />
-        <div className="grid flex-1 gap-2">
-          <Skeleton className="h-4 w-52" />
-          <Skeleton className="h-3 w-80 max-w-full" />
-        </div>
+        <Skeleton className="size-4 rounded-full" />
+        <Skeleton className="h-3 w-64 max-w-full" />
       </section>
     )
   }
@@ -440,38 +467,42 @@ function StatusCard({
   return (
     <section
       aria-label="Lakehouse status"
-      className={cn("rounded-xl border bg-card", tone.cardCls)}
+      className={cn("rounded-lg border bg-card", tone.cardCls)}
     >
-      <div className="flex items-center gap-3 p-4">
-        <span
-          className={cn(
-            "grid size-9 shrink-0 place-items-center rounded-full",
-            tone.iconCls,
-          )}
-        >
-          <Icon className="size-5" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="text-base font-semibold text-foreground">
-            {status.headline}
-          </p>
-          <p className="text-sm text-muted-foreground">
-            {status.parts.join(" · ")}
-          </p>
-        </div>
+      <div className="flex min-h-10 items-center gap-2.5 px-3 py-1.5 text-sm">
+        <Icon className={cn("size-4 shrink-0", tone.iconCls)} />
+        <p className="min-w-0 flex-1">
+          <span className="font-medium text-foreground">{status.headline}</span>
+          <span className="text-muted-foreground">
+            {status.parts.length ? ` · ${status.parts.join(" · ")}` : ""}
+          </span>
+        </p>
+        {shown.length > 0 ? (
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() => setOpen((o) => !o)}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            Details
+            <ChevronDown
+              className={cn("size-3.5 transition-transform", open && "rotate-180")}
+            />
+          </button>
+        ) : null}
         <Link
           href="/health"
           className="hidden shrink-0 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline sm:inline"
         >
-          Health details
+          Health
         </Link>
       </div>
-      {shown.length > 0 ? (
-        <ul className="flex flex-col border-t border-border p-2">
+      {open && shown.length > 0 ? (
+        <ul className="flex flex-col border-t border-border p-1.5">
           {shown.map((it) => (
             <li
               key={it.key}
-              className="flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-muted/60"
+              className="flex items-center gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-muted/60"
             >
               <span className="size-2 shrink-0 rounded-full bg-destructive" />
               <Link
@@ -507,17 +538,23 @@ const RECENT_ICON: Record<
 
 /** Dashboards, conversations and saved queries as one list (`recentItems`). */
 function RecentList({
+  action,
   loading,
   failed,
   items,
 }: {
+  /** Shown beside the heading: the "+ New" menu. */
+  action?: React.ReactNode
   loading: boolean
   failed: string[]
   items: RecentItem[]
 }) {
   return (
     <section className="flex min-w-0 flex-col gap-3">
-      <SectionTitle>Recent</SectionTitle>
+      <div className="flex items-center justify-between gap-3">
+        <SectionTitle>Recent</SectionTitle>
+        {action}
+      </div>
       <div className="rounded-xl border border-border bg-card p-2">
         {loading ? (
           <div className="flex flex-col gap-2 p-2">
@@ -568,7 +605,7 @@ function RecentList({
             Dashboards
           </Link>
           <Link href="/copilot/history" className="underline-offset-4 hover:text-foreground hover:underline">
-            Conversations
+            History
           </Link>
           <Link href="/query-studio/saved" className="underline-offset-4 hover:text-foreground hover:underline">
             Saved queries
@@ -590,11 +627,11 @@ function NewMenu({ items }: { items: StartProps[] }) {
         render={
           <button
             type="button"
-            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "h-9 shrink-0 gap-1.5")}
+            className={cn(buttonVariants({ variant: "ghost", size: "sm" }), "-my-1 h-7 shrink-0 gap-1 px-2 text-xs text-muted-foreground")}
           />
         }
       >
-        <Plus className="size-4" />
+        <Plus className="size-3.5" />
         New
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-60">
@@ -618,41 +655,6 @@ function NewMenu({ items }: { items: StartProps[] }) {
         </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
-  )
-}
-
-/**
- * Home's question box: one small line, Ask mode, sent into Ask AI. Build
- * mode and the Tools menu are on Ask AI's own composer, not here.
- */
-function AskBar({ onAsk }: { onAsk: (q: string) => void }) {
-  const [draft, setDraft] = React.useState("")
-
-  return (
-    <form
-      className="relative min-w-0 flex-1 sm:w-72 sm:flex-none"
-      onSubmit={(e) => {
-        e.preventDefault()
-        if (draft.trim()) onAsk(draft)
-      }}
-    >
-      <input
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        placeholder="Ask AI about your data…"
-        aria-label="Ask AI"
-        title="Opens the answer in Ask AI"
-        className="block h-9 w-full rounded-lg border border-border bg-background pr-10 pl-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-foreground/30"
-      />
-      <button
-        type="submit"
-        aria-label="Ask AI"
-        disabled={!draft.trim()}
-        className="absolute top-1/2 right-1 grid size-7 -translate-y-1/2 place-items-center rounded-md bg-primary text-primary-foreground transition-colors hover:bg-primary/85 disabled:bg-transparent disabled:text-muted-foreground"
-      >
-        <ArrowUp className="size-4" />
-      </button>
-    </form>
   )
 }
 
