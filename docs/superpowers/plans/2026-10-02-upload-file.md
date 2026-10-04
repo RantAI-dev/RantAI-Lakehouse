@@ -2793,3 +2793,31 @@ Not verified: a `docker compose up` from a clean project (rule 8). The
 trial recreates `lakehouse-api` and `dagster-code-location` on the
 development stack, with the product owner's go-ahead.
 
+
+### The trial (reviewer, 2026-10-04)
+
+With the product owner's go-ahead. Built `lakehouse-api` and
+`dagster-code-location` from `630f345` and recreated both on the
+development stack; the other sessions on the machine were told first.
+
+- Migration `0055` applied at boot; `/health` answers 200; the API
+  container has the five storage settings.
+- `ops/g9/upload_test.py`: **PASS**. Upload of the UTF-16 fixture, preview,
+  `replace` (2 rows), `append` (4 rows), every column `Nullable(String)`,
+  one `ingest_run` row per load, delete keeps the table. It left the raw
+  table `g9_upload_8221faa6` and its claim.
+- A console from this worktree serves `/connectors/upload` on a spare port
+  for the acceptance checklist.
+
+Rollback, if needed: the images tagged `pre-upload-2026-10-04`, and the
+application database dump taken before the deploy; the older API image
+refuses to boot while migration 55 is recorded, so the image tag alone is
+not a rollback.
+
+Open before this branch meets `main`: `main` now has its own `0054` and
+`0055` migrations, so both upload migrations are renumbered (the next free
+number is 0057 or later) and the development database's migration record
+corrected by hand, as was done for `0049`.
+
+Not verified: the acceptance checklist of the feature page. That is the
+product owner's.
