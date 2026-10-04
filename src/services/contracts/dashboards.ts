@@ -34,7 +34,16 @@ export type DashboardService = {
     signal?: AbortSignal
   ): Promise<SqlSource>
   deleteSqlSource(id: string, signal?: AbortSignal): Promise<void>
-  previewSqlSource(sql: string, signal?: AbortSignal): Promise<SqlSourcePreview>
+  /**
+   * Run `sql` without saving it. With `chart` (the chart input the builder
+   * sends to `/api/dashboard/specs/preview`, minus any mart or source id) the
+   * answer also carries that chart drawn over this SQL.
+   */
+  previewSqlSource(
+    sql: string,
+    chart?: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<SqlSourcePreview>
   listFolders(signal?: AbortSignal): Promise<DashboardFolder[]>
   createFolder(input: { name: string; parentId?: string }, signal?: AbortSignal): Promise<DashboardFolder>
   updateFolder(
@@ -94,6 +103,12 @@ export type SaveSqlSourceInput = {
 export type SqlSourcePreview = {
   columns: SqlSourceColumn[]
   rows: Record<string, unknown>[]
+  /**
+   * Only when the request carried a `chart`: the render spec and rows, in
+   * the shape `POST /api/dashboard/specs/preview` answers with (`result`
+   * is `{ error }` when the chart's own query was refused).
+   */
+  chart?: { spec: Record<string, unknown>; result: Record<string, unknown> }
 }
 
 /**

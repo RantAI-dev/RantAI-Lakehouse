@@ -142,10 +142,10 @@ export const clickhouseDashboardService: DashboardService = {
       "SQL source could not be deleted"
     )
   },
-  async previewSqlSource(sql, signal): Promise<SqlSourcePreview> {
+  async previewSqlSource(sql, chart, signal): Promise<SqlSourcePreview> {
     return request<SqlSourcePreview>(
       "/api/dashboard/sources/preview",
-      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ sql }), signal },
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(chart ? { sql, chart } : { sql }), signal },
       "SQL source preview failed"
     )
   },

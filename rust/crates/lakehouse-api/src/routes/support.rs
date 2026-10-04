@@ -205,10 +205,42 @@ pub(crate) async fn run_spec_sql(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
 ) -> (String, Value) {
+    let result = match try_run_spec_sql(ch, sql, roles, placeholders, obligations).await {
+        Ok(result) => result,
+        Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
+        Err(SpecRunFailure::Clickhouse(err)) => json!({ "error": err.to_string() }),
+    };
+    (id.to_owned(), result)
+}
+
+/// Why [`try_run_spec_sql`] produced no rows. Kept apart so a caller whose
+/// responses must not carry `ClickHouse` text can classify the second kind
+/// itself; [`run_spec_sql`] keeps the tile behaviour of showing both.
+pub(crate) enum SpecRunFailure {
+    /// Refused by the policy rewrite before any query ran; the text is fixed.
+    Refused(&'static str),
+    /// `ClickHouse` failed on the rewritten SQL.
+    Clickhouse(ChError),
+}
+
+/// The body of [`run_spec_sql`]: the rewrite for `roles`, then the query, as
+/// `{"columns", "rows"}`. An empty `sql` (text tiles) needs no query.
+///
+/// # Errors
+///
+/// [`SpecRunFailure::Refused`] when the rewrite refuses (nothing was sent to
+/// `ClickHouse`), [`SpecRunFailure::Clickhouse`] when the query fails.
+pub(crate) async fn try_run_spec_sql(
+    ch: &ChClient,
+    sql: &str,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
+) -> Result<Value, SpecRunFailure> {
     if sql.is_empty() {
-        return (id.to_owned(), json!({ "columns": [], "rows": [] }));
+        return Ok(json!({ "columns": [], "rows": [] }));
     }
-    let rewritten = match crate::policy_engine::rewrite_sql_for_roles(
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         sql,
         &sqlparser::dialect::ClickHouseDialect {},
         roles,
@@ -216,22 +248,15 @@ pub(crate) async fn run_spec_sql(
         obligations,
     )
     .await
-    {
-        Ok(rewritten) => rewritten,
-        Err(err) => {
-            return (
-                id.to_owned(),
-                json!({ "error": crate::policy_engine::enforcement_error_message(&err) }),
-            );
-        }
-    };
-    match ch.query(&rewritten, None).await {
-        Ok(r) => {
-            let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
-            (id.to_owned(), json!({ "columns": columns, "rows": r.data }))
-        }
-        Err(err) => (id.to_owned(), json!({ "error": err.to_string() })),
-    }
+    .map_err(|err| {
+        SpecRunFailure::Refused(crate::policy_engine::enforcement_error_message(&err))
+    })?;
+    let r = ch
+        .query(&rewritten, None)
+        .await
+        .map_err(SpecRunFailure::Clickhouse)?;
+    let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
+    Ok(json!({ "columns": columns, "rows": r.data }))
 }
 
 /// The dashboard SQL sources the given charts read, by id — one

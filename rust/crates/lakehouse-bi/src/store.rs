@@ -1970,6 +1970,60 @@ struct Resolved {
     cols: std::collections::HashSet<String>,
 }
 
+/// The `sqlSource` id a spec built over [`InlineSql`] carries. It marks the
+/// spec as drawn from SQL, so everything keyed on "is a SQL source" (the
+/// point-map row cap, the console's source badge) behaves as for a stored
+/// source. No such id exists in `console.bi_source`, and only the preview
+/// path builds these specs, so a chart can never be stored with it.
+pub const UNSAVED_SOURCE_ID: &str = "unsaved";
+
+/// SQL that is not (yet) a stored source, with the columns the caller probed
+/// from it: what the chart builder previews a chart over before the source
+/// is saved. The caller owns the guard — `check_sql_source` and the role
+/// rewrite — exactly as it does before it stores a source; this crate only
+/// wraps the text as a derived table.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineSql<'a> {
+    /// The statement, already accepted by the guard.
+    pub sql: &'a str,
+    /// Its columns, from the caller's probe.
+    pub columns: &'a [crate::sources::SourceColumn],
+}
+
+/// A stored SQL source as a relation: its CURRENT text and the columns probed
+/// when it was saved.
+fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
+    let cols = source.column_names();
+    Resolved {
+        mart: String::new(),
+        sql_source: Some(source.id),
+        from: Relation::Sql(source.sql),
+        cols,
+    }
+}
+
+/// Unsaved SQL as a relation, the same shape [`resolved_from_stored`] gives a
+/// stored one. The chart names its columns only: a mart or a source id next
+/// to inline SQL would say two things about where the rows come from.
+fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Resolved, BiError> {
+    if !input.mart.trim().is_empty()
+        || input
+            .sql_source
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Err(BiError::Validation(
+            "a chart over unsaved SQL cannot also name a mart or a SQL source.".to_owned(),
+        ));
+    }
+    Ok(Resolved {
+        mart: String::new(),
+        sql_source: Some(UNSAVED_SOURCE_ID.to_owned()),
+        from: Relation::Sql(inline.sql.to_owned()),
+        cols: inline.columns.iter().map(|c| c.name.clone()).collect(),
+    })
+}
+
 /// Resolve `input.mart` / `input.sql_source` (exactly one) into a
 /// [`Resolved`] relation.
 async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved, BiError> {
@@ -1987,13 +2041,7 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         let source = crate::sources::get_source(ch, id)
             .await?
             .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
-        let cols = source.column_names();
-        return Ok(Resolved {
-            mart: String::new(),
-            sql_source: Some(source.id),
-            from: Relation::Sql(source.sql),
-            cols,
-        });
+        return Ok(resolved_from_stored(source));
     }
     let mart = input
         .mart
@@ -2009,6 +2057,52 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         from: Relation::Mart(mart_ident),
         cols,
     })
+}
+
+/// What [`spec_before_relation`] leaves to do.
+enum Stage {
+    /// A `text` chart: complete, it has no relation.
+    Done(Box<StoredChartSpec>),
+    /// Every other kind: the relation still has to be resolved.
+    NeedsRelation(CommonFields, GeoFields),
+}
+
+/// The checks that need neither a mart nor a source: common fields, the
+/// shape of `map`/`lat`/`lon`, and the whole `text` kind.
+fn spec_before_relation(
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    id: Option<String>,
+) -> Result<Stage, BiError> {
+    let common = derive_common_fields(input, id)?;
+    let geo = geo_fields(common.kind, input)?;
+    // ── TEXT — no SQL/mart ────────────────────────────────────────────
+    if common.kind == ChartKind::Text {
+        let CommonFields {
+            title,
+            kind,
+            new_id,
+            board,
+            span,
+            subtitle,
+        } = common;
+        return spec_from_text_input(
+            input,
+            TextCtx {
+                title,
+                subtitle,
+                kind,
+                new_id,
+                span,
+                board,
+                source,
+                created_by,
+            },
+        )
+        .map(|spec| Stage::Done(Box::new(spec)));
+    }
+    Ok(Stage::NeedsRelation(common, geo))
 }
 
 /// Validate `input` against the REAL `ClickHouse` schema, then assemble a
@@ -2028,6 +2122,49 @@ pub async fn spec_from_input(
     created_by: &str,
     id: Option<String>,
 ) -> Result<StoredChartSpec, BiError> {
+    let (common, geo) = match spec_before_relation(input, source, created_by, id)? {
+        Stage::Done(spec) => return Ok(*spec),
+        Stage::NeedsRelation(common, geo) => (common, geo),
+    };
+    // ── kpi/table/chart need a mart OR a SQL source ─────────────────
+    let resolved = resolve_relation(ch, input).await?;
+    spec_from_resolved(input, source, created_by, common, geo, resolved)
+}
+
+/// [`spec_from_input`] over SQL that is not a stored source (see
+/// [`InlineSql`]): the same validation and the same SQL building, with the
+/// relation and its columns taken from `inline` instead of read from
+/// `console.bi_source`. Never touches `ClickHouse`.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] for any input/schema validation failure,
+/// including a column the SQL does not return.
+pub fn spec_from_inline_sql(
+    input: &ChartInput,
+    inline: InlineSql<'_>,
+    source: ChartSource,
+    created_by: &str,
+) -> Result<StoredChartSpec, BiError> {
+    let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
+        Stage::Done(spec) => return Ok(*spec),
+        Stage::NeedsRelation(common, geo) => (common, geo),
+    };
+    let resolved = resolved_from_inline(input, inline)?;
+    spec_from_resolved(input, source, created_by, common, geo, resolved)
+}
+
+/// The part of [`spec_from_input`] that follows relation resolution, shared
+/// by the stored and the inline path so a chart is validated and its SQL
+/// built by one piece of code whichever way its rows are named.
+fn spec_from_resolved(
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    common: CommonFields,
+    geo: GeoFields,
+    resolved: Resolved,
+) -> Result<StoredChartSpec, BiError> {
     let CommonFields {
         title,
         kind,
@@ -2035,33 +2172,13 @@ pub async fn spec_from_input(
         board,
         span,
         subtitle,
-    } = derive_common_fields(input, id)?;
-    let geo = geo_fields(kind, input)?;
-
-    // ── TEXT — no SQL/mart ────────────────────────────────────────────
-    if kind == ChartKind::Text {
-        return spec_from_text_input(
-            input,
-            TextCtx {
-                title,
-                subtitle,
-                kind,
-                new_id,
-                span,
-                board,
-                source,
-                created_by,
-            },
-        );
-    }
-
-    // ── kpi/table/chart need a mart OR a SQL source ─────────────────
+    } = common;
     let Resolved {
         mart,
         sql_source,
         from,
         cols,
-    } = resolve_relation(ch, input).await?;
+    } = resolved;
     let has_year = cols.contains("tahun");
     let agg = input
         .aggregate
@@ -2692,5 +2809,177 @@ mod tests {
         assert_eq!(input.mart, "mart_wisman");
         assert_eq!(input.dimension, "");
         assert_eq!(input.measures, vec!["total".to_owned()]);
+    }
+
+    // ── charts over SQL that is not stored (`spec_from_inline_sql`) ──────
+
+    fn source_columns(pairs: &[(&str, &str)]) -> Vec<crate::sources::SourceColumn> {
+        pairs
+            .iter()
+            .map(|(name, ty)| crate::sources::SourceColumn {
+                name: (*name).to_owned(),
+                ty: (*ty).to_owned(),
+            })
+            .collect()
+    }
+
+    fn inline_chart(extra: &serde_json::Value) -> ChartInput {
+        let mut base = serde_json::json!({
+            "title": "Visitors", "kind": "hbar", "dimension": "place", "measures": ["visitors"],
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    const INLINE_SQL: &str = "SELECT place, lat, lon, visitors FROM serving.mart_x";
+
+    fn inline_cols() -> Vec<crate::sources::SourceColumn> {
+        source_columns(&[
+            ("place", "String"),
+            ("lat", "Float64"),
+            ("lon", "Float64"),
+            ("visitors", "UInt64"),
+        ])
+    }
+
+    /// The reason the inline path exists: a chart over unsaved SQL must be
+    /// the chart the same input yields once the SQL is saved, so the preview
+    /// shows what will be stored. Both go through `spec_from_resolved`; this
+    /// pins that the two relations feeding it agree.
+    #[test]
+    fn a_chart_over_inline_sql_is_built_exactly_like_one_over_the_same_stored_source() {
+        let cols = inline_cols();
+        let input = inline_chart(&serde_json::json!({}));
+        let inline = spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+        .unwrap();
+
+        let stored_source = crate::sources::SqlSource {
+            id: "s_1234abcd".to_owned(),
+            title: "t".to_owned(),
+            sql: INLINE_SQL.to_owned(),
+            columns: cols,
+            folder_id: String::new(),
+            created_by: String::new(),
+            updated_at: None,
+        };
+        let mut stored_input = input;
+        stored_input.sql_source = Some("s_1234abcd".to_owned());
+        let stored = spec_from_resolved(
+            &stored_input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&stored_input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &stored_input).unwrap(),
+            resolved_from_stored(stored_source),
+        )
+        .unwrap();
+
+        assert_eq!(inline.spec.sql, stored.spec.sql);
+        assert!(inline.spec.sql.contains("FROM (\n"), "{}", inline.spec.sql);
+        assert!(inline.spec.sql.contains("SETTINGS"), "{}", inline.spec.sql);
+        assert_eq!(inline.spec.x, stored.spec.x);
+        assert_eq!(inline.spec.y, stored.spec.y);
+        assert_eq!(inline.spec.mart, stored.spec.mart);
+        assert_eq!(inline.spec.sql_source.as_deref(), Some(UNSAVED_SOURCE_ID));
+    }
+
+    #[test]
+    fn a_chart_over_inline_sql_naming_a_column_the_sql_does_not_return_is_refused() {
+        let cols = inline_cols();
+        for extra in [
+            serde_json::json!({ "measures": ["not_returned"] }),
+            serde_json::json!({ "dimension": "not_returned" }),
+        ] {
+            let err = spec_from_inline_sql(
+                &inline_chart(&extra),
+                InlineSql {
+                    sql: INLINE_SQL,
+                    columns: &cols,
+                },
+                ChartSource::Ui,
+                "ui",
+            )
+            .unwrap_err();
+            assert!(matches!(err, BiError::Validation(_)), "{err:?}");
+        }
+        let err = spec_from_inline_sql(
+            &inline_chart(&serde_json::json!({ "measures": ["not_returned"] })),
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "invalid or missing measure column.");
+    }
+
+    #[test]
+    fn a_point_map_over_inline_sql_is_capped_like_a_stored_source() {
+        let cols = inline_cols();
+        let input = inline_chart(&serde_json::json!({
+            "kind": "pointmap", "dimension": "place", "lat": "lat", "lon": "lon",
+        }));
+        let spec = spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+        .unwrap();
+        assert!(spec.spec.sql.contains("LIMIT 2000"), "{}", spec.spec.sql);
+        assert_eq!(spec.spec.lat.as_deref(), Some("lat"));
+        assert_eq!(spec.spec.sql_source.as_deref(), Some(UNSAVED_SOURCE_ID));
+
+        let missing_lon = inline_chart(&serde_json::json!({
+            "kind": "pointmap", "dimension": "place", "lat": "lat", "lon": "nope",
+        }));
+        assert!(
+            spec_from_inline_sql(
+                &missing_lon,
+                InlineSql {
+                    sql: INLINE_SQL,
+                    columns: &cols
+                },
+                ChartSource::Ui,
+                "ui",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_chart_over_inline_sql_cannot_also_name_a_mart_or_a_source() {
+        let cols = inline_cols();
+        for extra in [
+            serde_json::json!({ "mart": "mart_x" }),
+            serde_json::json!({ "sqlSource": "s_1234abcd" }),
+        ] {
+            let err = spec_from_inline_sql(
+                &inline_chart(&extra),
+                InlineSql {
+                    sql: INLINE_SQL,
+                    columns: &cols,
+                },
+                ChartSource::Ui,
+                "ui",
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("unsaved SQL"), "{err}");
+        }
     }
 }

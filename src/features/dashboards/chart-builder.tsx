@@ -3,8 +3,8 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
-  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Flame, Gauge, Workflow,
-  Map, MapPin, Plus, ScatterChart, Search, Table2, Type, type LucideIcon,
+  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Code, Flame, Gauge, Workflow,
+  Map, MapPin, Pencil, Plus, ScatterChart, Search, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -22,16 +22,23 @@ import {
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import {
   decodeSourceChoice, encodeSourceChoice, fieldsQuery, sourcePayload, sourceValueFromDef,
+  type ChartSourceChoice,
 } from "@/lib/chart-source";
+import { useAuth } from "@/features/auth/auth-provider";
+import {
+  NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
+} from "@/lib/sql-source-draft";
 import { dashboardService } from "@/services";
-import type { SqlSource } from "@/services/contracts/dashboards";
+import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
+import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { TileBody } from "./tile-body";
+import { useSqlSourceDraft } from "./use-sql-source-draft";
 
 type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
@@ -293,12 +300,38 @@ export function ChartBuilder({
     measures: needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure],
     breakdown: canBreakdown ? breakdown : undefined,
   });
+  const canWriteSql = useAuth().hasPermission("dashboard:sql");
+  const isNewSql = source === NEW_SQL_CHOICE;
+  // Fields and picks follow the columns of the latest successful Run, and a
+  // column a re-run no longer returns is dropped rather than kept dangling.
+  function applyRunColumns(columns: SqlSourceColumn[]) {
+    const f = fieldsFromColumns(columns);
+    const any = [...f.measures, ...f.dimensions];
+    setFields(f);
+    setDimension((v) => keepIfOffered(v, f.dimensions));
+    setMeasure((v) => keepIfOffered(v, f.measures));
+    setMeasure2((v) => keepIfOffered(v, f.measures));
+    setMeasure3((v) => keepIfOffered(v, f.measures));
+    setBreakdown((v) => keepIfOffered(v, f.dimensions));
+    setLat((v) => keepIfOffered(v, any));
+    setLon((v) => keepIfOffered(v, any));
+  }
+  const draft = useSqlSourceDraft({ chartTitle: title.trim() || suggestedTitle, editChartId: editId, onColumns: applyRunColumns });
+  // A text note has no data source, so a SQL draft left behind is ignored.
+  const sqlActive = !isText && draft.mode !== "none";
+  const heldPreview = !isText && draft.holdsChartPreview;
+  // The SQL a chart preview may be drawn over: only text that was run
+  // successfully and not edited since, so the chart never reads columns the
+  // SQL may no longer return.
+  const previewSql = heldPreview && draft.phase === "fresh" ? draft.sql : null;
+  const [paneTab, setPaneTab] = React.useState<"chart" | "rows">("chart");
+  const noFieldsHint = isNewSql ? "run the SQL first" : "pick a source first";
   // Required fields still empty: listed in the preview before the user
   // hits Create, and the same list is the save-time error.
   const missing: string[] = isText
     ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
     : [
-        ...(choice ? [] : ["Data source"]),
+        ...(choice || isNewSql ? [] : ["Data source"]),
         ...(!isSingle && !isPoints && !dimension ? [dimensionLabel] : []),
         ...(isPoints && !lat ? ["Latitude"] : []),
         ...(isPoints && !lon ? ["Longitude"] : []),
@@ -308,12 +341,23 @@ export function ChartBuilder({
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
       ];
   const isEdit = !!editId;
+  // Why no chart can be drawn yet while the SQL is new or edited (null = it
+  // can). The rows of the Run fill the pane meanwhile.
+  const chartHold: string | null = !heldPreview ? null
+    : draft.phase === "stale" ? "The SQL changed since it was run. Run it again to preview the chart; until then, these are the rows of the earlier run."
+    : draft.phase === "failed" ? "The SQL did not run, so there is no chart to preview."
+    : draft.phase === "running" ? "Running the SQL…"
+    : draft.phase !== "fresh" ? "Write the SQL and run it to preview a chart over it."
+    : missing.length ? `Fill in ${missing.join(", ")} to preview the chart. Until then, these are the rows your SQL returns.`
+    : null;
+  const showRows = heldPreview && (chartHold !== null || paneTab === "rows");
   const boardOptions = boards.length ? boards : [{ id: "default", name: "Main" }];
   const boardLabels: Record<string, string> = Object.fromEntries(boardOptions.map((b) => [b.id, b.name]));
   // The data-source value is encoded (lib/chart-source); label it by name.
   const sourceLabels: Record<string, string> = Object.fromEntries([
     ...marts.map((m) => [encodeSourceChoice({ kind: "mart", name: m.name }), m.name]),
     ...sqlSources.map((s) => [encodeSourceChoice({ kind: "sql", id: s.id }), `SQL · ${s.title}`]),
+    [NEW_SQL_CHOICE, "Custom SQL · new source"],
   ]);
   const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
 
@@ -330,6 +374,7 @@ export function ChartBuilder({
   // (e.g. from Copilot) whose kind is already chosen.
   React.useEffect(() => {
     if (!open) return;
+    draft.cancel();
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
@@ -370,16 +415,32 @@ export function ChartBuilder({
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
     setTargetBoard(board); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    draft.cancel();
   }
 
   // User changes the data source → reset the column selections and reload.
   function onSourceChange(value: string) {
+    draft.cancel();
     setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
     setLat(""); setLon("");
+    if (value === NEW_SQL_CHOICE) { setFields(null); draft.startNew(); return; }
     if (value) void loadFields(value); else setFields(null);
   }
 
-  function buildPayload(forPreview = false): Record<string, unknown> {
+  /** Back to the saved source: the pickers list its stored columns again. */
+  function cancelSqlEdit() {
+    draft.cancel();
+    if (!source) return;
+    void loadFields(source).then((f) => {
+      setDimension((v) => keepIfOffered(v, f.dimensions));
+      setMeasure((v) => keepIfOffered(v, f.measures));
+      setMeasure2((v) => keepIfOffered(v, f.measures));
+      setMeasure3((v) => keepIfOffered(v, f.measures));
+      setBreakdown((v) => keepIfOffered(v, f.dimensions));
+    });
+  }
+
+  function buildPayload(forPreview = false, withSource: ChartSourceChoice | null = choice): Record<string, unknown> {
     if (missing.length) throw new Error(`Still needed: ${missing.join(", ")}.`);
     const payloadTitle = title.trim() || suggestedTitle || (forPreview ? "Chart preview" : "");
     if (!payloadTitle) throw new Error("Title is required.");
@@ -388,14 +449,14 @@ export function ChartBuilder({
       payload = { title: payloadTitle, kind, text, span, board: targetBoard };
     } else if (isSingle) {
       payload = {
-        title: payloadTitle, kind, ...sourcePayload(choice), measures: [measure], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure], aggregate, span, board: targetBoard,
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
       };
     } else {
       const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
       payload = {
-        title: payloadTitle, ...sourcePayload(choice), kind, dimension, measures, aggregate, span, board: targetBoard,
+        title: payloadTitle, ...sourcePayload(withSource), kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
         map: isMap ? effectiveMap : undefined,
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
@@ -417,18 +478,32 @@ export function ChartBuilder({
       setPreviewError(null);
       return;
     }
+    // `/specs/preview` reads the SAVED source by id, so while the SQL is new
+    // or edited it would draw the old rows (or none). The chart is drawn by
+    // the SQL-source preview instead, over the SQL as written, once that SQL
+    // has been run unchanged; before then the pane shows the Run's rows.
+    if (heldPreview && previewSql === null) { setPreview(null); setPreviewError(null); setPreviewBusy(false); return; }
     let payload: Record<string, unknown>;
-    try { payload = buildPayload(true); } catch { setPreview(null); setPreviewError(null); return; }
+    // No source in the chart input: the SQL travels beside it.
+    try { payload = buildPayload(true, heldPreview ? null : choice); } catch { setPreview(null); setPreviewError(null); return; }
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setPreviewBusy(true); setPreviewError(null);
-      void apiFetch("/api/dashboard/specs/preview", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload), signal: controller.signal,
-      }).then(async (res) => {
-        const json = await res.json();
-        if (!res.ok) throw new Error(json?.error ?? "Preview failed");
-        setPreview(json as Preview);
+      const request: Promise<Preview> = previewSql !== null
+        ? dashboardService.previewSqlSource(previewSql, payload, controller.signal).then((res) => {
+            if (!res.chart) throw new Error("Preview failed");
+            return res.chart as unknown as Preview;
+          })
+        : apiFetch("/api/dashboard/specs/preview", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload), signal: controller.signal,
+          }).then(async (res) => {
+            const json = await res.json();
+            if (!res.ok) throw new Error(json?.error ?? "Preview failed");
+            return json as Preview;
+          });
+      void request.then((next) => {
+        if (!controller.signal.aborted) setPreview(next);
       }).catch((e: unknown) => {
         if (!controller.signal.aborted) { setPreview(null); setPreviewError(e instanceof Error ? e.message : String(e)); }
       }).finally(() => { if (!controller.signal.aborted) setPreviewBusy(false); });
@@ -436,21 +511,63 @@ export function ChartBuilder({
     return () => { window.clearTimeout(timer); controller.abort(); };
     // Every field below affects the generated SQL or render spec.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon, aggregate, span, caption, target, text, order, limit, targetBoard]);
+  }, [open, title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon, aggregate, span, caption, target, text, order, limit, targetBoard, heldPreview, previewSql]);
 
   async function save() {
     setError(null);
+    if (sqlActive && draft.blocker) { draft.markSaveAttempted(); setError(draft.blocker); return; }
     let payload: Record<string, unknown>;
-    try { payload = buildPayload(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); return; }
+    // A new source has no id yet; a placeholder lets the same checks run
+    // before anything is written, and the real id replaces it below.
+    try { payload = buildPayload(false, draft.mode === "new" && sqlActive ? { kind: "sql", id: "pending" } : choice); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); return; }
     setBusy(true);
+    let savedSource: SqlSource | null = null;
+    let sourceVerb = "created";
     try {
-      const res = await apiFetch("/api/dashboard/specs", {
-        method: isEdit ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "Failed to save chart");
+      if (sqlActive) {
+        const name = draft.name.trim();
+        const original = draft.original;
+        try {
+          if (draft.mode === "new") {
+            savedSource = await dashboardService.createSqlSource({ title: name, sql: draft.sql });
+          } else if (original && (draft.changed || name !== original.title)) {
+            // `folderId` is sent back: the API replaces the folder with what
+            // the body says, and an absent one would move the source to the root.
+            sourceVerb = "updated";
+            savedSource = await dashboardService.updateSqlSource({ id: original.id, title: name, sql: draft.sql, folderId: original.folderId });
+          }
+        } catch (e) {
+          // The API's own message (guard, probe or name error), shown as it is.
+          setError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+        if (savedSource) {
+          const saved = savedSource;
+          setSqlSources((prev) => prev.some((s) => s.id === saved.id) ? prev.map((s) => (s.id === saved.id ? saved : s)) : [...prev, saved]);
+          payload = buildPayload(false, { kind: "sql", id: saved.id });
+        }
+      }
+      try {
+        const res = await apiFetch("/api/dashboard/specs", {
+          method: isEdit ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json?.error ?? "Failed to save chart");
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        if (!savedSource) { setError(message); return; }
+        // The source exists now. Move the builder onto it so that retrying
+        // saves only the chart instead of creating a second source.
+        const value = encodeSourceChoice({ kind: "sql", id: savedSource.id });
+        draft.cancel();
+        setSource(value);
+        void loadFields(value);
+        setError(`The SQL source “${savedSource.title}” was ${sourceVerb}, but the chart was not saved: ${message}. The builder now uses that source, so saving again will not create it twice.`);
+        return;
+      }
       setOpen(false);
       if (!isEdit) reset();
       onSaved(payload as ChartDef);
@@ -508,7 +625,7 @@ export function ChartBuilder({
           <div className="grid gap-1.5">
             <Label>Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
-              <SelectTrigger className="w-full"><SelectValue placeholder="pick a mart or SQL source" /></SelectTrigger>
+              <SelectTrigger className="w-full"><SelectValue placeholder={canWriteSql ? "pick a mart or SQL source, or write SQL" : "pick a mart or SQL source"} /></SelectTrigger>
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
@@ -528,13 +645,37 @@ export function ChartBuilder({
                     ))}
                   </SelectGroup>
                 ) : null}
+                {canWriteSql ? (
+                  <SelectGroup>
+                    <SelectLabel>New</SelectLabel>
+                    <SelectItem value={NEW_SQL_CHOICE}>
+                      <Code className="size-4" aria-hidden /> Write custom SQL…
+                    </SelectItem>
+                  </SelectGroup>
+                ) : null}
               </SelectContent>
             </Select>
-            {choice?.kind === "sql" ? (
-              <p className="text-xs text-muted-foreground">
-                Custom SQL, edited in Query Studio. Drill-down to records is not available for SQL sources yet.
-              </p>
+            {choice?.kind === "sql" && draft.mode !== "edit" ? (
+              canWriteSql ? (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <p className="text-xs text-muted-foreground">
+                    Custom SQL source. Drill-down to records is not available for SQL sources yet.
+                  </p>
+                  <Button
+                    type="button" size="sm" variant="outline"
+                    disabled={!sqlSources.some((s) => s.id === choice.id)}
+                    onClick={() => { const src = sqlSources.find((s) => s.id === choice.id); if (src) draft.startEdit(src); }}
+                  >
+                    <Pencil className="size-3.5" aria-hidden /> Edit SQL
+                  </Button>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Custom SQL source. You need the dashboard:sql permission to edit it. Drill-down to records is not available for SQL sources yet.
+                </p>
+              )
             ) : null}
+            {sqlActive ? <SqlSourcePanel draft={draft} onCancelEdit={cancelSqlEdit} /> : null}
           </div>
 
           {isMap ? (
@@ -558,7 +699,7 @@ export function ChartBuilder({
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
                 {isPoints ? (
                   <Select value={dimension || NO_BREAKDOWN} items={NO_LABEL_ITEMS} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : "pick a source first"} /></SelectTrigger>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
@@ -566,7 +707,7 @@ export function ChartBuilder({
                   </Select>
                 ) : (
                   <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
@@ -590,14 +731,14 @@ export function ChartBuilder({
               <div className="grid gap-1.5">
                 <Label>Latitude <Req /></Label>
                 <Select value={lat} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
-                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5">
                 <Label>Longitude <Req /></Label>
                 <Select value={lon} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
-                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
@@ -611,7 +752,7 @@ export function ChartBuilder({
             <div className="grid gap-1.5">
               <Label>{mLabels[0]} <Req /></Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                 <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
               </Select>
             </div>
@@ -699,13 +840,35 @@ export function ChartBuilder({
   );
   const previewPane = (
     <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
-      <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3">
         <p className="text-sm font-medium">Preview</p>
-        <p className="text-xs text-muted-foreground">Live data, updates as you edit</p>
+        {heldPreview && chartHold === null && draft.result ? (
+          <div role="group" aria-label="Preview content" className="flex gap-1">
+            {(["chart", "rows"] as const).map((tab) => (
+              <Button
+                key={tab} type="button" size="xs" variant={paneTab === tab ? "secondary" : "ghost"}
+                aria-pressed={paneTab === tab} onClick={() => setPaneTab(tab)}
+              >
+                {tab === "chart" ? "Chart" : "Rows"}
+              </Button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">{showRows ? "Rows from your SQL" : "Live data, updates as you edit"}</p>
+        )}
       </div>
       <div className="relative min-h-72 flex-1">
         <div className="absolute inset-0">
-          {preview ? (
+          {showRows ? (
+            <div className="flex h-full flex-col gap-3 overflow-auto">
+              {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
+              {draft.result && draft.phase !== "empty" ? (
+                <SqlRowsTable result={draft.result} stale={draft.phase === "stale"} className="min-h-0 flex-1" />
+              ) : (
+                <EmptyState className="py-6" title="Run the SQL" description="Its first rows appear here." />
+              )}
+            </div>
+          ) : preview ? (
             <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} year="all" />
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
@@ -822,8 +985,9 @@ export function ChartBuilder({
             {/* Error sits beside the button that caused it, not at the end of a long form. */}
             <DialogFooter className="items-center border-t border-border px-5 py-3">
               {error ? <p role="alert" className="text-sm text-destructive sm:mr-auto">{error}</p> : null}
+              {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground sm:mr-auto">{draft.blocker}</p> : null}
               <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-              <Button size="sm" onClick={() => void save()} disabled={busy}>
+              <Button size="sm" onClick={() => void save()} disabled={busy || (sqlActive && !!draft.runBlocker)}>
                 {busy ? "Saving…" : isEdit ? "Save changes" : "Create chart"}
               </Button>
             </DialogFooter>
