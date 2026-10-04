@@ -153,6 +153,17 @@ pub(crate) fn render_stored_spec(spec: &store::ChartSpec, source: ChartSource) -
     if let Some(v) = &spec.series {
         map.insert("series".to_owned(), json!(v));
     }
+    // The map kinds' view of the rows: without these the console cannot tell
+    // which bundled map to draw or which columns hold the coordinates.
+    if let Some(v) = &spec.map {
+        map.insert("map".to_owned(), json!(v));
+    }
+    if let Some(v) = &spec.lat {
+        map.insert("lat".to_owned(), json!(v));
+    }
+    if let Some(v) = &spec.lon {
+        map.insert("lon".to_owned(), json!(v));
+    }
     if let Some(v) = spec.format {
         map.insert("format".to_owned(), json!(v));
     }
@@ -305,6 +316,42 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn point_spec(map: Option<&str>) -> store::ChartSpec {
+        store::ChartSpec {
+            id: "u_1".to_owned(),
+            title: "T".to_owned(),
+            subtitle: None,
+            kind: lakehouse_bi::specs::ChartKind::Pointmap,
+            mart: "mart_x".to_owned(),
+            sql_source: None,
+            sql: "SELECT 1".to_owned(),
+            x: String::new(),
+            y: lakehouse_bi::specs::ChartY::Single("visitors".to_owned()),
+            series: None,
+            map: map.map(str::to_owned),
+            lat: Some("lat".to_owned()),
+            lon: Some("lon".to_owned()),
+            format: None,
+            span: None,
+            text: None,
+            caption: None,
+            target: None,
+        }
+    }
+
+    /// The console draws a map chart from these three fields alone, so a
+    /// hand-copied render that forgot one would show "map not available" for
+    /// a chart that is stored correctly.
+    #[test]
+    fn a_rendered_map_chart_carries_its_map_and_coordinate_columns() {
+        let rendered = render_stored_spec(&point_spec(Some("id-provinces")), ChartSource::Ui);
+        assert_eq!(rendered["map"], "id-provinces");
+        assert_eq!(rendered["lat"], "lat");
+        assert_eq!(rendered["lon"], "lon");
+        let no_map = render_stored_spec(&point_spec(None), ChartSource::Ui);
+        assert!(no_map.get("map").is_none());
+    }
 
     #[test]
     fn prettify_replaces_underscores_and_titlecases() {

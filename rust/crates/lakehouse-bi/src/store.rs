@@ -63,6 +63,8 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Radar,
     ChartKind::Waterfall,
     ChartKind::Geomap,
+    ChartKind::Pointmap,
+    ChartKind::Geoheat,
     ChartKind::Sankey,
     ChartKind::Sunburst,
     ChartKind::Boxplot,
@@ -95,6 +97,36 @@ fn breakdown_required(kind: ChartKind) -> bool {
         kind,
         ChartKind::Heatmap | ChartKind::Sankey | ChartKind::Sunburst
     )
+}
+
+/// Kinds drawn from one (`lat`, `lon`) pair per row instead of a category
+/// column. The category (`dimension`) is then only an optional label.
+fn is_point_kind(kind: ChartKind) -> bool {
+    matches!(kind, ChartKind::Pointmap | ChartKind::Geoheat)
+}
+
+/// Kinds drawn over a bundled map outline, so they may carry a `map` id.
+fn is_map_kind(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Geomap | ChartKind::Pointmap | ChartKind::Geoheat
+    )
+}
+
+/// Longest map id the server accepts. The console owns the catalogue of
+/// maps; the server only checks the shape, so a new bundled map needs no
+/// API change.
+const MAP_ID_MAX_LEN: usize = 40;
+
+/// Shape of a map id: lowercase letters, digits and `-`, 1 to
+/// [`MAP_ID_MAX_LEN`] bytes. Whether such an id is a map the console can draw
+/// is the console's call (it shows "map not available" for an unknown one).
+fn map_id_is_well_formed(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAP_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Mirrors the TS `AGGS` set.
@@ -133,6 +165,17 @@ pub struct ChartSpec {
     /// Optional 2nd-dimension breakdown column.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub series: Option<String>,
+    /// Map id for the map kinds (`geomap`, `pointmap`, `geoheat`). Absent
+    /// on a `geomap` stored before maps were selectable, which the console
+    /// draws as `dki-jakarta`; that is why it defaults.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub map: Option<String>,
+    /// Latitude column of a `pointmap`/`geoheat` (a column of the rows).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lat: Option<String>,
+    /// Longitude column of a `pointmap`/`geoheat`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lon: Option<String>,
     /// Numeric display format.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub format: Option<NumFmt>,
@@ -233,6 +276,17 @@ pub struct ChartInput {
     /// Optional 2nd dimension: splits into multiple series.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub breakdown: Option<String>,
+    /// Map id (`geomap`, `pointmap`, `geoheat`); shape-checked only, the
+    /// console owns the catalogue.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub map: Option<String>,
+    /// Latitude column (`pointmap`, `geoheat`; required for those, refused
+    /// for every other kind).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lat: Option<String>,
+    /// Longitude column; see [`Self::lat`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lon: Option<String>,
     /// Aggregate function.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub aggregate: Option<String>,
@@ -1177,6 +1231,9 @@ fn empty_chart_input() -> ChartInput {
         dimension: String::new(),
         measures: Vec::new(),
         breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
         aggregate: None,
         limit: None,
         order: None,
@@ -1289,6 +1346,9 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         dimension: String::new(),
         measures: vec![m.clone()],
         breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
         aggregate: Some(agg.clone()),
         limit: None,
         order: None,
@@ -1314,6 +1374,9 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         x: String::new(),
         y: ChartY::Single("v".to_owned()),
         series: None,
+        map: None,
+        lat: None,
+        lon: None,
         format: Some(NumFmt::Int),
         span: Some(span),
         text: None,
@@ -1371,6 +1434,9 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         dimension: String::new(),
         measures: Vec::new(),
         breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
         aggregate: None,
         limit: None,
         order: None,
@@ -1391,6 +1457,9 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         x: String::new(),
         y: ChartY::Single(String::new()),
         series: None,
+        map: None,
+        lat: None,
+        lon: None,
         format: Some(NumFmt::Int),
         span: Some(span),
         text: Some(text),
@@ -1427,6 +1496,111 @@ struct ChartCtx<'a> {
     has_year: bool,
     created_by: &'a str,
     cols: std::collections::HashSet<String>,
+    geo: GeoFields,
+}
+
+/// `map`/`lat`/`lon` of a chart input once their shape is checked: trimmed,
+/// blank = absent, and present only on the kinds that use them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GeoFields {
+    map: Option<String>,
+    lat: Option<String>,
+    lon: Option<String>,
+}
+
+/// A trimmed copy of `value`, `None` when it is absent or blank.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
+/// The JSON name of `kind` (`"pointmap"`), for error messages.
+fn kind_name(kind: ChartKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Check the shape of `map`/`lat`/`lon` against `kind`, before any schema
+/// lookup, so a stray field is refused on every kind (`text` and `kpi`
+/// included) instead of being stored and ignored. Column EXISTENCE is checked
+/// later, against the relation's columns ([`validate_point_columns`]).
+fn geo_fields(kind: ChartKind, input: &ChartInput) -> Result<GeoFields, BiError> {
+    let geo = GeoFields {
+        map: non_blank(input.map.as_deref()),
+        lat: non_blank(input.lat.as_deref()),
+        lon: non_blank(input.lon.as_deref()),
+    };
+    if let Some(map) = &geo.map {
+        if !is_map_kind(kind) {
+            return Err(BiError::Validation(
+                "map is only for geomap/pointmap/geoheat.".to_owned(),
+            ));
+        }
+        if !map_id_is_well_formed(map) {
+            return Err(BiError::Validation(format!(
+                "invalid map id: use 1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-'."
+            )));
+        }
+    }
+    if is_point_kind(kind) {
+        let (Some(lat), Some(lon)) = (&geo.lat, &geo.lon) else {
+            return Err(BiError::Validation(format!(
+                "a '{}' chart needs a latitude and a longitude column.",
+                kind_name(kind)
+            )));
+        };
+        if lat == lon {
+            return Err(BiError::Validation(
+                "latitude and longitude must be different columns.".to_owned(),
+            ));
+        }
+    } else if geo.lat.is_some() || geo.lon.is_some() {
+        return Err(BiError::Validation(
+            "latitude/longitude columns are only for pointmap/geoheat.".to_owned(),
+        ));
+    }
+    Ok(geo)
+}
+
+/// The column rules of a point map: `lat`/`lon` are real, valid columns,
+/// there is exactly one measure, and no two roles share a column (the SQL
+/// would select the same name twice). The label (`dimension`) is optional and
+/// already checked for existence by [`validate_chart_shape`].
+fn validate_point_columns(
+    geo: &GeoFields,
+    dimension: &str,
+    measures: &[String],
+    cols: &std::collections::HashSet<String>,
+) -> Result<(), BiError> {
+    let (Some(lat), Some(lon)) = (&geo.lat, &geo.lon) else {
+        return Ok(());
+    };
+    for (what, col) in [("latitude", lat), ("longitude", lon)] {
+        if !IDENT_ALLOWED(col) || !cols.contains(col) {
+            return Err(BiError::Validation(format!(
+                "invalid or missing {what} column '{col}'."
+            )));
+        }
+    }
+    let [measure] = measures else {
+        return Err(BiError::Validation(
+            "a map of points needs exactly one measure.".to_owned(),
+        ));
+    };
+    let label_clashes = !dimension.is_empty()
+        && [lat, lon, measure]
+            .iter()
+            .any(|col| col.as_str() == dimension);
+    if measure == lat || measure == lon || label_clashes {
+        return Err(BiError::Validation(
+            "the label, measure, latitude and longitude must be different columns.".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a `table`/chart shape (dimension existence, per-kind measure
@@ -1440,7 +1614,9 @@ fn validate_chart_shape(
     breakdown: &str,
     cols: &std::collections::HashSet<String>,
 ) -> Result<(), BiError> {
-    if !IDENT_ALLOWED(dimension) || !cols.contains(dimension) {
+    // A point map's dimension is only an optional tooltip label.
+    let optional_label = is_point_kind(kind) && dimension.is_empty();
+    if !optional_label && (!IDENT_ALLOWED(dimension) || !cols.contains(dimension)) {
         return Err(BiError::Validation(format!(
             "invalid or missing dimension column '{dimension}'."
         )));
@@ -1562,6 +1738,64 @@ fn build_chart_sql(
         .build())
 }
 
+/// Re-validate the columns of a point map as [`Ident`]s and build its SQL
+/// ([`crate::builder::build_points_sql`]). Split out of `build_chart_sql`,
+/// which already takes as many arguments as clippy allows.
+fn build_point_chart_sql(
+    from: &Relation,
+    geo: &GeoFields,
+    dimension: &str,
+    measures: &[String],
+    agg: &str,
+) -> Result<String, BiError> {
+    let ident = |name: Option<&str>, what: &str| {
+        name.and_then(|n| Ident::new(n).ok())
+            .ok_or_else(|| BiError::Validation(format!("invalid or missing {what} column.")))
+    };
+    let lat = ident(geo.lat.as_deref(), "latitude")?;
+    let lon = ident(geo.lon.as_deref(), "longitude")?;
+    let measure = ident(measures.first().map(String::as_str), "measure")?;
+    let label = if dimension.is_empty() {
+        None
+    } else {
+        Some(ident(Some(dimension), "label")?)
+    };
+    // `agg` was already checked against `aggregate_allowed` by the caller.
+    Ok(crate::builder::build_points_sql(
+        from,
+        (&lat, &lon),
+        label.as_ref(),
+        &measure,
+        Aggregate::from_str_lossy(agg),
+        &[],
+    ))
+}
+
+/// The row limit and sort order a chart is built with. A calendar shows one
+/// cell per day, so up to a year of rows; a point map has its own fixed cap
+/// ([`crate::builder::point_limit`]); every other kind keeps the Top-N range
+/// the builder offers (1-100).
+fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32, String) {
+    let limit = if kind == ChartKind::Calendar {
+        input.limit.unwrap_or(366).clamp(1, 366)
+    } else if is_point_kind(kind) {
+        crate::builder::point_limit(from)
+    } else {
+        input.limit.unwrap_or(20).clamp(1, 100)
+    };
+    let order = input.order.clone().unwrap_or_else(|| {
+        if matches!(
+            kind,
+            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
+        ) {
+            "none".to_owned()
+        } else {
+            "desc".to_owned()
+        }
+    });
+    (limit, order)
+}
+
 /// Assemble the `table`/chart branch of `specFromInput` (grouped, needs a
 /// dimension; validates `stacked`/`scatter`/`combo`/`bubble` measure-count
 /// rules and the optional breakdown column).
@@ -1585,28 +1819,14 @@ fn spec_from_chart_input(
         has_year,
         created_by,
         cols,
+        geo,
     } = ctx;
 
     let dimension = input.dimension.clone();
-    // A calendar shows one cell per day, so up to a year of rows; every
-    // other kind keeps the Top-N range the builder offers (1–100).
-    let limit = if kind == ChartKind::Calendar {
-        input.limit.unwrap_or(366).clamp(1, 366)
-    } else {
-        input.limit.unwrap_or(20).clamp(1, 100)
-    };
-    let order = input.order.clone().unwrap_or_else(|| {
-        if matches!(
-            kind,
-            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
-        ) {
-            "none".to_owned()
-        } else {
-            "desc".to_owned()
-        }
-    });
+    let (limit, order) = limit_and_order(kind, input, &from);
     let breakdown = input.breakdown.clone().unwrap_or_default();
     validate_chart_shape(kind, &dimension, &measures, &breakdown, &cols)?;
+    validate_point_columns(&geo, &dimension, &measures, &cols)?;
 
     let breakdown_opt = if breakdown.is_empty() {
         None
@@ -1622,6 +1842,9 @@ fn spec_from_chart_input(
         dimension: dimension.clone(),
         measures: measures.clone(),
         breakdown: breakdown_opt.clone(),
+        map: geo.map.clone(),
+        lat: geo.lat.clone(),
+        lon: geo.lon.clone(),
         aggregate: Some(agg.clone()),
         limit: Some(limit),
         order: Some(order.clone()),
@@ -1632,16 +1855,20 @@ fn spec_from_chart_input(
         target: None,
     };
 
-    let sql = build_chart_sql(
-        kind,
-        &from,
-        &dimension,
-        &measures,
-        &agg,
-        &order,
-        limit,
-        breakdown_opt.as_deref(),
-    )?;
+    let sql = if is_point_kind(kind) {
+        build_point_chart_sql(&from, &geo, &dimension, &measures, &agg)?
+    } else {
+        build_chart_sql(
+            kind,
+            &from,
+            &dimension,
+            &measures,
+            &agg,
+            &order,
+            limit,
+            breakdown_opt.as_deref(),
+        )?
+    };
 
     let y = if measures.len() == 1 {
         ChartY::Single(measures.into_iter().next().unwrap_or_default())
@@ -1659,6 +1886,9 @@ fn spec_from_chart_input(
         x: dimension,
         y,
         series: breakdown_opt,
+        map: geo.map,
+        lat: geo.lat,
+        lon: geo.lon,
         format: Some(NumFmt::Int),
         span: Some(span),
         text: None,
@@ -1806,6 +2036,7 @@ pub async fn spec_from_input(
         span,
         subtitle,
     } = derive_common_fields(input, id)?;
+    let geo = geo_fields(kind, input)?;
 
     // ── TEXT — no SQL/mart ────────────────────────────────────────────
     if kind == ChartKind::Text {
@@ -1897,6 +2128,7 @@ pub async fn spec_from_input(
             has_year,
             created_by,
             cols,
+            geo,
         },
     )
 }
@@ -1985,6 +2217,9 @@ impl StoredChartSpec {
                 x: dimension.to_owned(),
                 y,
                 series: None,
+                map: None,
+                lat: None,
+                lon: None,
                 format: Some(NumFmt::Int),
                 span: Some(1),
                 text: None,
@@ -2002,6 +2237,9 @@ impl StoredChartSpec {
                 dimension: dimension.to_owned(),
                 measures,
                 breakdown: None,
+                map: None,
+                lat: None,
+                lon: None,
                 aggregate: Some("sum".to_owned()),
                 limit: Some(20),
                 order: Some("none".to_owned()),
@@ -2087,6 +2325,203 @@ mod tests {
             validate_chart_shape(ChartKind::Calendar, "region", &m1, "channel", &cols).is_err(),
             "a calendar takes no breakdown"
         );
+    }
+
+    fn geo_input(kind: ChartKind) -> ChartInput {
+        let mut input = empty_chart_input();
+        input.title = "Map".to_owned();
+        input.kind = kind;
+        input
+    }
+
+    fn column_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|c| (*c).to_owned()).collect()
+    }
+
+    /// A `geomap` stored before maps were selectable carries none of the new
+    /// fields; it must read back unchanged (no migration) and write back
+    /// without them, so an old chart's stored JSON does not grow keys.
+    #[test]
+    fn an_old_geomap_row_without_map_lat_lon_reads_and_writes_back_unchanged() {
+        let old_row = r#"{"spec":{"id":"u_e491bf76","title":"Culinary by region (map)","kind":"geomap","mart":"mart_kuliner","sql":"SELECT wilayah, round(sum(jumlah_usaha)) AS jumlah_usaha FROM serving.mart_kuliner GROUP BY wilayah ORDER BY jumlah_usaha DESC LIMIT 20","x":"wilayah","y":"jumlah_usaha","format":"int","span":2},"def":{"title":"Culinary by region (map)","mart":"mart_kuliner","kind":"geomap","dimension":"wilayah","measures":["jumlah_usaha"],"aggregate":"sum","limit":20,"order":"desc","span":2,"board":"b_5cbfb279"},"hasYear":false}"#;
+        let parsed: StoredEnvelope = serde_json::from_str(old_row).unwrap();
+        assert_eq!(parsed.spec.kind, ChartKind::Geomap);
+        assert_eq!(
+            (&parsed.spec.map, &parsed.spec.lat, &parsed.spec.lon),
+            (&None, &None, &None)
+        );
+        let def = parsed.def.expect("def is in the envelope");
+        assert_eq!((&def.map, &def.lat, &def.lon), (&None, &None, &None));
+        let spec_json = serde_json::to_value(&parsed.spec).unwrap();
+        let def_json = serde_json::to_value(&def).unwrap();
+        for key in ["map", "lat", "lon"] {
+            assert!(spec_json.get(key).is_none(), "spec grew `{key}`");
+            assert!(def_json.get(key).is_none(), "def grew `{key}`");
+        }
+    }
+
+    #[test]
+    fn a_point_map_row_keeps_its_map_and_coordinate_columns() {
+        let row = r#"{"spec":{"id":"u_1","title":"T","kind":"pointmap","mart":"mart_x","sql":"SELECT 1","x":"place","y":"visitors","map":"id-provinces","lat":"lat","lon":"lon"},"def":{"title":"T","mart":"mart_x","kind":"pointmap","dimension":"place","measures":["visitors"],"map":"id-provinces","lat":"lat","lon":"lon"}}"#;
+        let parsed: StoredEnvelope = serde_json::from_str(row).unwrap();
+        assert_eq!(parsed.spec.kind, ChartKind::Pointmap);
+        assert_eq!(parsed.spec.map.as_deref(), Some("id-provinces"));
+        assert_eq!(parsed.spec.lat.as_deref(), Some("lat"));
+        let def = parsed.def.unwrap();
+        assert_eq!(def.lon.as_deref(), Some("lon"));
+    }
+
+    #[test]
+    fn a_map_id_is_checked_for_shape_only() {
+        for ok in ["dki-jakarta", "id-regencies", "a", "kab-2024"] {
+            assert!(map_id_is_well_formed(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "Dki-Jakarta",
+            "id_regencies",
+            "id regencies",
+            "../etc",
+            "peta/ok",
+            "é",
+        ] {
+            assert!(!map_id_is_well_formed(bad), "{bad}");
+        }
+        assert!(map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN)));
+        assert!(!map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN + 1)));
+    }
+
+    #[test]
+    fn map_lat_and_lon_are_accepted_only_on_the_kinds_that_use_them() {
+        // geomap: a map id, no coordinates.
+        let mut geomap = geo_input(ChartKind::Geomap);
+        geomap.map = Some("id-provinces".to_owned());
+        assert_eq!(
+            geo_fields(ChartKind::Geomap, &geomap)
+                .unwrap()
+                .map
+                .as_deref(),
+            Some("id-provinces")
+        );
+        geomap.lat = Some("lat".to_owned());
+        assert!(geo_fields(ChartKind::Geomap, &geomap).is_err());
+
+        // A blank map id is the same as none (an old geomap).
+        let mut blank = geo_input(ChartKind::Geomap);
+        blank.map = Some("  ".to_owned());
+        assert_eq!(
+            geo_fields(ChartKind::Geomap, &blank).unwrap(),
+            GeoFields::default()
+        );
+
+        // pointmap / geoheat: both coordinates, different columns.
+        for kind in [ChartKind::Pointmap, ChartKind::Geoheat] {
+            let mut input = geo_input(kind);
+            assert!(geo_fields(kind, &input).is_err(), "no coordinates");
+            input.lat = Some("lat".to_owned());
+            assert!(geo_fields(kind, &input).is_err(), "no longitude");
+            input.lon = Some("lat".to_owned());
+            assert!(geo_fields(kind, &input).is_err(), "same column twice");
+            input.lon = Some("lon".to_owned());
+            let geo = geo_fields(kind, &input).unwrap();
+            assert_eq!(
+                (geo.lat.as_deref(), geo.lon.as_deref()),
+                (Some("lat"), Some("lon"))
+            );
+            input.map = Some("Not A Map".to_owned());
+            assert!(geo_fields(kind, &input).is_err(), "malformed map id");
+        }
+
+        // Every other kind refuses all three.
+        for kind in [ChartKind::Bar, ChartKind::Kpi, ChartKind::Text] {
+            let mut with_map = geo_input(kind);
+            with_map.map = Some("id-provinces".to_owned());
+            assert!(geo_fields(kind, &with_map).is_err(), "{kind:?} map");
+            let mut with_lon = geo_input(kind);
+            with_lon.lon = Some("lon".to_owned());
+            assert!(geo_fields(kind, &with_lon).is_err(), "{kind:?} lon");
+            assert!(geo_fields(kind, &geo_input(kind)).is_ok());
+        }
+    }
+
+    #[test]
+    fn point_columns_must_exist_be_distinct_and_have_one_measure() {
+        let cols = column_set(&["lat", "lon", "visitors", "place", "bad col"]);
+        let geo = GeoFields {
+            map: None,
+            lat: Some("lat".to_owned()),
+            lon: Some("lon".to_owned()),
+        };
+        let one = vec!["visitors".to_owned()];
+        assert!(validate_point_columns(&geo, "place", &one, &cols).is_ok());
+        assert!(
+            validate_point_columns(&geo, "", &one, &cols).is_ok(),
+            "the label is optional"
+        );
+
+        let missing = GeoFields {
+            lat: Some("latitude".to_owned()),
+            ..geo.clone()
+        };
+        assert!(validate_point_columns(&missing, "", &one, &cols).is_err());
+        let not_an_ident = GeoFields {
+            lon: Some("bad col".to_owned()),
+            ..geo.clone()
+        };
+        assert!(validate_point_columns(&not_an_ident, "", &one, &cols).is_err());
+        let two = vec!["visitors".to_owned(), "lat".to_owned()];
+        assert!(
+            validate_point_columns(&geo, "", &two, &cols).is_err(),
+            "one measure only"
+        );
+        assert!(
+            validate_point_columns(&geo, "", &["lat".to_owned()], &cols).is_err(),
+            "measure is a coordinate"
+        );
+        assert!(
+            validate_point_columns(&geo, "lon", &one, &cols).is_err(),
+            "label is a coordinate"
+        );
+        assert!(
+            validate_point_columns(&geo, "visitors", &one, &cols).is_err(),
+            "label is the measure"
+        );
+    }
+
+    #[test]
+    fn a_point_map_needs_no_dimension_but_other_charts_still_do() {
+        let cols = column_set(&["lat", "lon", "visitors", "place"]);
+        let m1 = vec!["visitors".to_owned()];
+        for kind in [ChartKind::Pointmap, ChartKind::Geoheat] {
+            assert!(validate_chart_shape(kind, "", &m1, "", &cols).is_ok());
+            assert!(validate_chart_shape(kind, "place", &m1, "", &cols).is_ok());
+            assert!(validate_chart_shape(kind, "nope", &m1, "", &cols).is_err());
+            assert!(
+                validate_chart_shape(kind, "place", &m1, "lat", &cols).is_err(),
+                "a point map takes no breakdown"
+            );
+        }
+        assert!(validate_chart_shape(ChartKind::Geomap, "", &m1, "", &cols).is_err());
+    }
+
+    #[test]
+    fn a_point_map_has_a_fixed_limit_and_its_input_limit_is_ignored() {
+        let mart = Relation::Mart(Ident::new("mart_x").unwrap());
+        assert_eq!(crate::builder::point_limit(&mart), 5000);
+        let sql = build_point_chart_sql(
+            &mart,
+            &GeoFields {
+                map: None,
+                lat: Some("lat".to_owned()),
+                lon: Some("lon".to_owned()),
+            },
+            "",
+            &["visitors".to_owned()],
+            "avg",
+        )
+        .unwrap();
+        assert!(sql.contains("round(avg(visitors)) AS visitors"), "{sql}");
+        assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
     #[test]

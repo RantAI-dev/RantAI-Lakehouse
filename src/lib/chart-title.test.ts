@@ -28,3 +28,11 @@ test("sankey, calendar, scatter and combo read the way the chart is drawn", () =
   assert.equal(suggestChartTitle({ kind: "scatter", dimension: "city", measures: ["price", "area"] }), "price vs area by city")
   assert.equal(suggestChartTitle({ kind: "combo", dimension: "month", measures: ["sales", "margin"] }), "sales and margin by month")
 })
+
+test("map kinds are named after what they show, whether or not a label column is picked", () => {
+  assert.equal(suggestChartTitle({ kind: "geomap", dimension: "kab_kota", measures: ["visitors"] }), "visitors by kab_kota")
+  assert.equal(suggestChartTitle({ kind: "pointmap", measures: ["visitors"] }), "visitors by location")
+  assert.equal(suggestChartTitle({ kind: "pointmap", dimension: "place", measures: ["visitors"] }), "visitors by place")
+  assert.equal(suggestChartTitle({ kind: "geoheat", dimension: "place", measures: ["visitors"] }), "visitors density")
+  assert.equal(suggestChartTitle({ kind: "geoheat", measures: [] }), "")
+})

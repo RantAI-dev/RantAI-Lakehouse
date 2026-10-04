@@ -320,6 +320,64 @@ pub fn build_boxplot_sql(
     )
 }
 
+/// Most points a `pointmap`/`geoheat` draws. Past a few thousand symbols a
+/// map stops being readable and the tile slows down, so the query keeps the
+/// top rows by value and the console says when the cap was reached.
+pub const POINT_LIMIT: u32 = 5000;
+
+/// Rows `ClickHouse` returns for a statement over a [`Relation::Sql`]; the
+/// number in [`SQL_SOURCE_SETTINGS`].
+const SQL_SOURCE_MAX_ROWS: u32 = 2000;
+
+/// The row limit of a point map over `from`: [`POINT_LIMIT`] for a mart,
+/// but never above what a SQL source may return. A `LIMIT` the cap would
+/// undercut would let `ClickHouse` cut the result off by itself at an
+/// unpredictable block boundary, and the console could not tell "the map
+/// shows the top N" from "the result was cut".
+#[must_use]
+pub fn point_limit(from: &Relation) -> u32 {
+    match from {
+        Relation::Mart(_) => POINT_LIMIT,
+        Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
+    }
+}
+
+/// Point-map SQL: one row per distinct (`lat`, `lon`[, `label`]) with the
+/// aggregate of `measure`, the largest first, capped at [`point_limit`].
+/// Rows with a NULL coordinate are dropped in SQL (they cannot be placed);
+/// out-of-range coordinates are the console's to count and report.
+#[must_use]
+pub fn build_points_sql(
+    from: &Relation,
+    coords: (&Ident, &Ident),
+    label: Option<&Ident>,
+    measure: &Ident,
+    agg: Aggregate,
+    where_clauses: &[String],
+) -> String {
+    let (lat, lon) = coords;
+    let mut predicates: Vec<String> = where_clauses.to_vec();
+    predicates.push(format!("{lat} IS NOT NULL"));
+    predicates.push(format!("{lon} IS NOT NULL"));
+    let value = if agg == Aggregate::Count {
+        format!("count() AS {measure}")
+    } else {
+        format!("round({agg}({measure})) AS {measure}")
+    };
+    let (label_select, label_group) = label.map_or_else(
+        || (String::new(), String::new()),
+        |l| (format!("{l}, "), format!(", {l}")),
+    );
+    format!(
+        "SELECT {lat}, {lon}, {label_select}{value} FROM {} WHERE {} \
+         GROUP BY {lat}, {lon}{label_group} ORDER BY {measure} DESC, {lat}, {lon} LIMIT {}{}",
+        from.render(),
+        predicates.join(" AND "),
+        point_limit(from),
+        from.settings()
+    )
+}
+
 /// SQL for a stored spec with runtime filters applied (year filter + the
 /// dashboard's dimension filters). `mart_cols` maps mart name to its column
 /// set, so we know which filters actually apply. Ports `sqlWithFilters` in
@@ -466,6 +524,30 @@ fn rebuild(spec: &StoredChartSpec, from: &Relation, where_clauses: Vec<String>) 
     ) {
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
         return Some(build_kpi_sql(from, &measure, agg, &where_clauses));
+    }
+
+    if matches!(
+        spec.spec.kind,
+        crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat
+    ) {
+        // The dimension is only an optional label here, so it must not go
+        // through the `Ident::new(&def.dimension)` below (empty is valid).
+        let lat = Ident::new(def.lat.clone()?).ok()?;
+        let lon = Ident::new(def.lon.clone()?).ok()?;
+        let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        let label = if def.dimension.is_empty() {
+            None
+        } else {
+            Some(Ident::new(def.dimension.clone()).ok()?)
+        };
+        return Some(build_points_sql(
+            from,
+            (&lat, &lon),
+            label.as_ref(),
+            &measure,
+            agg,
+            &where_clauses,
+        ));
     }
 
     let dimension = Ident::new(def.dimension.clone()).ok()?;
@@ -1008,5 +1090,95 @@ mod tests {
             "{sql}"
         );
         assert!(sql.ends_with(SQL_SOURCE_SETTINGS), "{sql}");
+    }
+
+    fn point_spec(kind: ChartKind, label: &str) -> StoredChartSpec {
+        let mut spec = stored_spec(kind, "mart_x", label, &["visitors"]);
+        spec.def.lat = Some("lat".to_owned());
+        spec.def.lon = Some("lon".to_owned());
+        spec.spec.lat = Some("lat".to_owned());
+        spec.spec.lon = Some("lon".to_owned());
+        spec
+    }
+
+    #[test]
+    fn a_point_map_selects_coordinates_label_and_value_largest_first() {
+        let sql = build_points_sql(
+            &Relation::Mart(Ident::new("mart_x").unwrap()),
+            (&Ident::new("lat").unwrap(), &Ident::new("lon").unwrap()),
+            Some(&Ident::new("place").unwrap()),
+            &Ident::new("visitors").unwrap(),
+            Aggregate::Sum,
+            &["tahun IN (2024)".to_owned()],
+        );
+        assert_eq!(
+            sql,
+            "SELECT lat, lon, place, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE tahun IN (2024) AND lat IS NOT NULL AND lon IS NOT NULL \
+             GROUP BY lat, lon, place ORDER BY visitors DESC, lat, lon LIMIT 5000"
+        );
+    }
+
+    #[test]
+    fn a_point_map_without_a_label_groups_by_the_coordinates_alone_and_counts_rows() {
+        let sql = build_points_sql(
+            &Relation::Mart(Ident::new("mart_x").unwrap()),
+            (&Ident::new("lat").unwrap(), &Ident::new("lon").unwrap()),
+            None,
+            &Ident::new("visitors").unwrap(),
+            Aggregate::Count,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            "SELECT lat, lon, count() AS visitors FROM serving.mart_x \
+             WHERE lat IS NOT NULL AND lon IS NOT NULL \
+             GROUP BY lat, lon ORDER BY visitors DESC, lat, lon LIMIT 5000"
+        );
+    }
+
+    #[test]
+    fn a_stored_point_map_is_rebuilt_with_the_year_filter_and_its_coordinates() {
+        let spec = point_spec(ChartKind::Geoheat, "");
+        let cols = mart_cols(&[("mart_x", &["tahun", "lat", "lon", "visitors"])]);
+        let sql = sql_with_filters(&spec, &[2024], &[], &cols);
+        assert!(
+            sql.starts_with("SELECT lat, lon, round(sum(visitors)) AS visitors FROM serving.mart_x WHERE tahun IN (2024) AND lat IS NOT NULL"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_point_map_on_a_sql_source_is_limited_to_what_the_source_may_return() {
+        // `LIMIT 5000` over a 2000-row cap would be cut off by ClickHouse
+        // itself; the limit is the cap so "exactly the limit" is meaningful.
+        assert_eq!(SQL_SOURCE_MAX_ROWS, 2000);
+        assert!(
+            SQL_SOURCE_SETTINGS.contains(&format!("max_result_rows = {SQL_SOURCE_MAX_ROWS}")),
+            "SQL_SOURCE_MAX_ROWS must stay the number in SQL_SOURCE_SETTINGS"
+        );
+        let mut spec = point_spec(ChartKind::Pointmap, "materials");
+        spec.def.sql_source = Some("s_1234abcd".to_owned());
+        let cols: HashSet<String> = ["lat", "lon", "visitors", "materials"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let sql = sql_for_sql_source(&spec, SOURCE_SQL, &cols, &[], &[]).unwrap();
+        assert!(sql.contains(" LIMIT 2000 SETTINGS"), "{sql}");
+        assert!(sql.ends_with(SQL_SOURCE_SETTINGS), "{sql}");
+    }
+
+    #[test]
+    fn a_point_map_missing_its_coordinates_yields_none_not_other_sql() {
+        let mut spec = point_spec(ChartKind::Pointmap, "");
+        spec.def.lon = None;
+        let cols = mart_cols(&[("mart_x", &["tahun"])]);
+        assert_eq!(
+            sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[], &[]),
+            None
+        );
+        // With a mart and a filter the stored SQL stands in, as for any
+        // chart whose definition no longer validates.
+        assert_eq!(sql_with_filters(&spec, &[2024], &[], &cols), "SELECT 1");
     }
 }

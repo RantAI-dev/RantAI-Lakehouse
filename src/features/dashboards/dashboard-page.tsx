@@ -56,8 +56,10 @@ const NO_RESULTS: Record<string, Cell> = {};
  * real mart column — except on time series, whose axis is a derived period.
  */
 function drillColumn(spec: ChartCard): string | undefined {
-  // Nodes, rings, distributions and days are not one category value to drill into.
-  if (["geomap", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
+  // Nodes, rings, distributions and days are not one category value to drill
+  // into, and neither is a map (points have no category, and a region click
+  // would drill into a name that was matched, not stored).
+  if (["geomap", "pointmap", "geoheat", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
   if (spec.source !== "builtin") return spec.def?.dimension || undefined;
   return ["line", "area"].includes(spec.kind) ? undefined : spec.x || undefined;
 }

@@ -28,6 +28,9 @@ export type ChartInput = {
   dimension: string; // x-axis / category column
   measures: string[]; // value columns; >1 for "stacked"
   breakdown?: string; // optional 2nd dimension → splits into multiple series
+  map?: string; // bundled map id (kind="geomap" | "pointmap" | "geoheat")
+  lat?: string; // latitude column (kind="pointmap" | "geoheat")
+  lon?: string; // longitude column (kind="pointmap" | "geoheat")
   aggregate?: "sum" | "avg" | "max" | "min" | "count";
   limit?: number;
   order?: "desc" | "asc" | "none";
