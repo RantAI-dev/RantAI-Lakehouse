@@ -51,6 +51,8 @@ export type Board = {
   description?: string;
   /** Nama tampilan pembuat board. Kosong untuk board lama / tanpa login. */
   createdBy?: string;
+  /** Folder this board is filed in; empty or null = no folder. */
+  folderId?: string | null;
   layout?: LayoutMap;
   filters?: FilterDef[];
   createdAt?: string;

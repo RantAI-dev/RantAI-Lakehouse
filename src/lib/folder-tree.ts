@@ -78,3 +78,45 @@ export function folderPath(folders: FolderLike[], id: string): string {
   }
   return names.join(" / ")
 }
+
+export type FolderSection<B extends BoardLike> = {
+  /** "" for boards in no folder. */
+  folderId: string
+  /** "Sales / Q1"; "" for the no-folder section. */
+  path: string
+  boards: B[]
+}
+
+/**
+ * Boards as sections for the dashboard list: the no-folder section first,
+ * then every folder in tree order under its full path.
+ *
+ * Unlike `buildFolderTree`, boards keep the order they arrive in: the list
+ * has its own sort control, and sorting again here would turn that control
+ * into a dead button inside each section. A board whose folder no longer
+ * exists goes to the no-folder section rather than disappearing.
+ *
+ * `includeEmpty` keeps folders with nothing in them, so a folder just
+ * created is visible; turn it off while searching, where an empty section
+ * is noise. A folder that holds no board itself but has subfolders is
+ * never a section of its own: it would read "Sales 0" above "Sales / Q1 3",
+ * as if it were empty, while its name is already in the subfolder's path.
+ */
+export function groupBoardsByFolder<B extends BoardLike>(
+  folders: FolderLike[],
+  boards: B[],
+  includeEmpty = true
+): FolderSection<B>[] {
+  const known = new Set(folders.map((f) => f.id))
+  const sections: FolderSection<B>[] = []
+  const root = boards.filter((b) => !b.folderId || !known.has(b.folderId))
+  if (root.length > 0) sections.push({ folderId: "", path: "", boards: root })
+  for (const { folder } of flattenFolders(buildFolderTree(folders, []).folders)) {
+    const inFolder = boards.filter((b) => b.folderId === folder.id)
+    const hasSubfolders = folders.some((f) => f.parentId === folder.id)
+    if (inFolder.length > 0 || (includeEmpty && !hasSubfolders)) {
+      sections.push({ folderId: folder.id, path: folderPath(folders, folder.id), boards: inFolder })
+    }
+  }
+  return sections
+}
