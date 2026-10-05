@@ -1,8 +1,8 @@
 "use client";
 
 import * as React from "react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
-import { GlowFrame } from "@/components/ui/brand-glow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -88,7 +88,9 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
           onClick={() => setMode(m)}
           className={cn(
             "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-            mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
+            // Neutral, not `text-primary`: primary is too dark to read on the
+            // dark theme, where the selected mode all but disappeared.
+            mode === m ? "bg-background text-foreground shadow-xs" : "text-muted-foreground hover:text-foreground",
           )}
         >
           {m === "ask" ? "Ask" : "Build"}
@@ -105,7 +107,7 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
  */
 export function ChatComposer({
   mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, glow,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -123,10 +125,30 @@ export function ChatComposer({
   glass?: boolean;
   /** Compact single-line pill (collapsed dock, Google-style). */
   compact?: boolean;
-  /** Brand focus ring (`GlowFrame`) — the full /copilot page. */
-  glow?: boolean;
+  /**
+   * Opaque surface with a plain border — the full /copilot page, where the
+   * composer sits straight on the tinted page background and the default
+   * translucent fill would not stand out from it.
+   */
+  solid?: boolean;
+  /**
+   * Example prompts shown in place of the static placeholder, one at a
+   * time, cross-fading every few seconds while the box is empty. Tab
+   * takes the one on screen into the box. Under `prefers-reduced-motion`
+   * the first one stays put.
+   */
+  examples?: string[];
 }) {
   const [input, setInput] = React.useState("");
+  const reduce = useReducedMotion() ?? false;
+  const [exampleIndex, setExampleIndex] = React.useState(0);
+  const cycling = Boolean(examples?.length) && !input;
+  React.useEffect(() => {
+    if (!cycling || reduce || (examples?.length ?? 0) < 2) return;
+    const t = window.setInterval(() => setExampleIndex((i) => i + 1), 3500);
+    return () => window.clearInterval(t);
+  }, [cycling, reduce, examples?.length]);
+  const example = examples?.length ? examples[exampleIndex % examples.length] : undefined;
   const submit = () => {
     const t = input.trim();
     if (!t || busy) return;
@@ -173,19 +195,42 @@ export function ChatComposer({
 
   const body = (
     <>
-      <Textarea
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-        onFocus={onFocus}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
-        }}
-        rows={rows}
-        autoFocus={autoFocus}
-        placeholder={placeholder ?? "Ask anything about your lakehouse data…"}
-        aria-label="Message AI Copilot"
-        className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
-      />
+      <div className="relative">
+        <Textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onFocus={onFocus}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+            // Tab takes the example on screen, so it can be sent or edited.
+            if (e.key === "Tab" && !e.shiftKey && cycling && example) { e.preventDefault(); setInput(example); }
+          }}
+          rows={rows}
+          autoFocus={autoFocus}
+          // With examples the placeholder is the animated overlay below: a
+          // native placeholder cannot cross-fade.
+          placeholder={example ? "" : placeholder ?? "Ask anything about your lakehouse data…"}
+          aria-label="Message AI Copilot"
+          className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
+        />
+        {cycling && example ? (
+          <div aria-hidden className="pointer-events-none absolute inset-x-2 top-1.5 flex items-baseline gap-2 text-base text-muted-foreground md:text-sm">
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.span
+                key={example}
+                initial={reduce ? false : { opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={reduce ? undefined : { opacity: 0, y: -6 }}
+                transition={{ duration: 0.25 }}
+                className="min-w-0 truncate"
+              >
+                {example}
+              </motion.span>
+            </AnimatePresence>
+            <kbd className="hidden shrink-0 rounded border border-border px-1 font-mono text-[10px] sm:inline">Tab</kbd>
+          </div>
+        ) : null}
+      </div>
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
         <ModeToggle mode={mode} setMode={setMode} />
 
@@ -225,13 +270,12 @@ export function ChatComposer({
     </>
   );
 
-  // The /copilot page's composer: Home's spinning brand ring on focus.
-  if (glow) return <GlowFrame innerClassName="p-1.5">{body}</GlowFrame>;
-
   return (
     <div className={cn(
       "rounded-2xl border p-1.5 transition-all",
-      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
+      solid
+        ? "border-border bg-background shadow-xs focus-within:border-foreground/25"
+        : glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
     )}>
       {body}
     </div>

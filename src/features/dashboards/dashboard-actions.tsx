@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Copy, Download, FileDown, FolderInput, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Share2, Trash2,
+  Check, Copy, Download, FileDown, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,7 +20,7 @@ import { REFRESH_INTERVALS } from "./auto-refresh";
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
   isDefault, loading, fullscreen, autoSec,
-  onRefresh, onToggleFullscreen, onAutoSec, onRename, onMove, onShare, onExportPdf, onDuplicate, onDelete,
+  onRefresh, onToggleFullscreen, onAutoSec, onRename, onShare, onExportPdf, onDuplicate, onDelete,
 }: {
   readonly isDefault: boolean;
   readonly loading: boolean;
@@ -30,8 +30,6 @@ export function DashboardActionsMenu({
   readonly onToggleFullscreen: () => void;
   readonly onAutoSec: (value: string) => void;
   readonly onRename: () => void;
-  /** Absent when the viewer cannot file dashboards into folders. */
-  readonly onMove?: () => void;
   readonly onShare: () => void;
   readonly onExportPdf: () => void;
   readonly onDuplicate: () => void;
@@ -90,11 +88,6 @@ export function DashboardActionsMenu({
                 <Pencil className="size-4" /> Rename
               </DropdownMenuItem>
             )}
-            {!isDefault && onMove ? (
-              <DropdownMenuItem onClick={onMove}>
-                <FolderInput className="size-4" /> Move to folder…
-              </DropdownMenuItem>
-            ) : null}
             {!isDefault ? (
               <DropdownMenuItem onClick={onShare}>
                 <Share2 className="size-4" /> Share…

@@ -81,6 +81,19 @@ once a first release is tagged.
   category via `quantilesExact`), and calendar heatmap (daily values, up
   to the last year of data). Available in the builder, to the Copilot, and
   on SQL sources.
+- Maps: the map chart is no longer Jakarta only. A `map` id (bundled maps:
+  `dki-jakarta`, `id-provinces`, `id-regencies`; the console owns the list,
+  the API checks only the id's shape) picks the outline; region names are
+  matched case-insensitively with `Kabupaten`/`Kab.`/`Kota Administrasi`
+  and province aliases handled, and rows that match no region are counted
+  under the map instead of dropped silently. Two new kinds draw rows with a
+  latitude and a longitude column (`lat`, `lon`) on an outline: `pointmap`
+  (symbols sized and coloured by the first measure) and `geoheat` (density
+  heatmap), each capped at the top 5,000 rows by value (2,000 on a SQL
+  source). All three maps pan by dragging and zoom 1x-20x with buttons on
+  the tile; there is no wheel zoom. Stored specs need no
+  migration: `map`/`lat`/`lon` are optional and absent on every chart saved
+  before. Boundary files and their licence: `public/geo/README.md`.
 
 - Gold Exports console page: per-mart last export (`snapshotId`/
   `exportedAt`, read straight off the Iceberg table's own snapshot), an

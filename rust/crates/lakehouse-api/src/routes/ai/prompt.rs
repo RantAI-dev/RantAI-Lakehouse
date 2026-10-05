@@ -76,10 +76,31 @@ pub(super) fn closing(latest_user_message: &str) -> String {
             "\n\nLANGUAGE: the user's latest message is in {lang}. Reply in {lang}, even though \
              the data, table names and DATA MAP may be in another language."
         ),
+        // Undecided, but written in Latin letters: say so. With only
+        // "reply in the user's language" to go on, a model whose own
+        // default is another language answered "Explain the charts on
+        // \"Main\"" in Chinese (QA, DeepSeek). Naming the script rules
+        // that out without guessing which Latin-script language it is.
+        None if is_latin_script(latest_user_message) => {
+            "\n\nLANGUAGE: reply in the language of the user's latest message. It is written in \
+             Latin script, so reply in that same language and script (English if you cannot \
+             tell), never in Chinese or any other script. The language of the data, table \
+             names or DATA MAP does not change this."
+                .to_owned()
+        }
         None => "\n\nLANGUAGE: reply in the language of the user's latest message. The language \
                  of the data, table names or DATA MAP does not change this."
             .to_owned(),
     }
+}
+
+/// Whether every letter in `text` is a Latin one (ASCII or accented), with
+/// at least one letter present. A message in Chinese, Arabic or Cyrillic is
+/// not, and keeps the plain "reply in the user's language" line.
+fn is_latin_script(text: &str) -> bool {
+    let mut letters = text.chars().filter(|c| c.is_alphabetic()).peekable();
+    letters.peek().is_some()
+        && letters.all(|c| c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))
 }
 
 /// Everyday Indonesian function words: common in any Indonesian sentence,
@@ -127,9 +148,58 @@ const INDONESIAN_WORDS: &[&str] = &[
 
 /// Common English function words, for the same test the other way.
 const ENGLISH_WORDS: &[&str] = &[
-    "the", "and", "what", "which", "how", "many", "much", "is", "are", "was", "were", "do", "does",
-    "did", "of", "in", "for", "to", "with", "show", "me", "give", "list", "create", "make", "have",
-    "has", "any", "our", "we", "there",
+    "the",
+    "and",
+    "what",
+    "which",
+    "how",
+    "many",
+    "much",
+    "is",
+    "are",
+    "was",
+    "were",
+    "do",
+    "does",
+    "did",
+    "of",
+    "in",
+    "for",
+    "to",
+    "with",
+    "show",
+    "me",
+    "give",
+    "list",
+    "create",
+    "make",
+    "have",
+    "has",
+    "any",
+    "our",
+    "we",
+    "there",
+    // Short prompts ("Explain the charts on Main", "Why did the job fail?")
+    // had one word from the list above and were read as undecided.
+    "a",
+    "an",
+    "on",
+    "at",
+    "by",
+    "from",
+    "this",
+    "that",
+    "it",
+    "why",
+    "where",
+    "when",
+    "who",
+    "can",
+    "explain",
+    "summarize",
+    "tell",
+    "add",
+    "about",
 ];
 
 /// `"Indonesian"` or `"English"` for `text`, or `None` when neither clearly
@@ -518,5 +588,42 @@ mod tests {
         assert_eq!(reply_language("mart_wisman"), None);
         assert!(closing("How many rows are there?").contains("Reply in English"));
         assert!(closing("ok").contains("language of the user's latest message"));
+    }
+
+    #[test]
+    fn a_short_english_prompt_is_read_as_english() {
+        // The prompt that came back in Chinese: one listed word ("the")
+        // used to leave it undecided.
+        assert_eq!(
+            reply_language("Explain the charts on \"Main\""),
+            Some("English")
+        );
+        assert_eq!(
+            reply_language("Why did gold_export_job fail?"),
+            Some("English")
+        );
+        // One Indonesian word is still not enough to decide.
+        assert_eq!(reply_language("Jelaskan chart ini"), None);
+    }
+
+    #[test]
+    fn an_undecided_latin_script_message_is_never_answered_in_another_script() {
+        for text in ["ok", "Jelaskan chart ini", "mart_wisman"] {
+            let line = closing(text);
+            assert!(line.contains("Latin script"), "{text}: {line}");
+            assert!(line.contains("never in Chinese"), "{text}: {line}");
+        }
+        // A message in another script keeps the plain rule: the user's
+        // language is the one to reply in.
+        for text in ["这个图表是什么", "что это"] {
+            let line = closing(text);
+            assert!(!line.contains("Latin script"), "{text}: {line}");
+            assert!(
+                line.contains("language of the user's latest message"),
+                "{text}"
+            );
+        }
+        // No letters at all is not "Latin".
+        assert!(!closing("123 ?").contains("Latin script"));
     }
 }

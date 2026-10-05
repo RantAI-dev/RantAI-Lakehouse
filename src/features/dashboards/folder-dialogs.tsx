@@ -157,7 +157,7 @@ export function ManageFoldersDialog({
   );
 }
 
-/** Move the open dashboard into a folder (or back to the top level). */
+/** Move a dashboard into a folder (or back to the top level). */
 export function MoveBoardDialog({
   open, onOpenChange, folders, boardId, currentFolderId, onMoved,
 }: {
@@ -197,7 +197,7 @@ export function MoveBoardDialog({
           </SelectContent>
         </Select>
         {flat.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No folders yet — create one from the dashboard title menu.</p>
+          <p className="text-xs text-muted-foreground">No folders yet. Create one with Folders on the dashboard list.</p>
         ) : null}
         {moveAct.error ? <p className="text-sm text-destructive">{moveAct.error.message}</p> : null}
         <DialogFooter>
