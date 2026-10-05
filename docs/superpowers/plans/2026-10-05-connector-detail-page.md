@@ -457,3 +457,44 @@ stays; this is layout.
   the tile facts, the tab counts) has tests.
 - The reviewer looks at each tab in both themes at 1440 px and 1024 px in a
   headless browser, then the product owner looks.
+
+### Touch-ups, round 2 (reviewer, 2026-10-05)
+
+Reviewed the uncommitted working tree against section 10.
+
+**Findings: four `SHOULD-FIX`, all fixed in the same working tree. None
+open.**
+
+- `R1`: the header said the type and the environment twice. "Type" and
+  "Environment" left the facts row.
+- `R2`: the test history's message rendered larger than body text.
+- `R3`: in the two-column Ingest layout a run's "when · took" wrapped
+  mid-phrase and its summary was cut. A run row has two lines there now.
+- `R4`: the pipeline names in "Used by" were larger than the card's text.
+
+What was checked:
+
+- `HealthTile` and the tab strip were lifted into
+  `src/components/patterns/`; the asset page's tests pass unchanged.
+- The ingest panel has a `layout` prop; the create page keeps the embedded
+  look. No label or `aria-label` changed.
+- U6: the toast and the notice follow the test's result. `withNotify` is
+  untouched; `notify.ts` gained `notifyFailure`.
+- One more request per page load than before: the newest test, for the
+  danger count on the Connection tests tab. Accepted.
+
+Seen signed in, in a headless browser on the product owner's console: the
+three tabs at 1440 px in the dark theme before and after the fixes; Ingest
+and Overview at 1024 px and Connection tests at 1440 px in the light theme;
+the result notice after pressing "Test connection". Nothing overflows
+sideways.
+
+Verification re-run by the reviewer on the working tree: `bun run
+typecheck` pass; `bun run lint` 0 errors, the 5 warnings of the base; `bun
+run test` 556 passed in 74 files.
+
+Not verified: `next build` (the dev server runs in this checkout); change
+capture and Kafka connectors on screen (none exists on this stack; their
+layouts are covered by component tests only).
+
+Committed as `bc73551` after the product owner's look (2026-10-05).
