@@ -174,4 +174,144 @@ test`) once before the handoff.
 
 ## 8. Handoff (developer)
 
+Written by the developer agent (Claude Sonnet 5.5), 2026-10-05. Base
+`e452e47`; the handoff itself is the commit after these three.
+
+### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `733a5ae` | `feat(connectors): T1 a page for one connector at /connectors/<id>` |
+| T2 | `fad7b77` | `feat(connectors): T2 the Sources list opens the connector's page, not a sheet` |
+| T3 | `9cfcee0` | `feat(connectors): T3 what points at a connector points at its page` |
+
+### The page as built
+
+Address `/connectors/<id>`; the route file
+`src/app/(data)/connectors/[id]/page.tsx` reads `id` with `useParams` the
+way the edit route does and renders `ConnectorDetailPage`
+(`src/features/connectors/connector-detail-page.tsx`).
+
+- **Loading:** the link "Sources" (to `/connectors`) above the shared
+  loading skeleton.
+- **Error** (unknown id, another tenant's, or any refused read): the link
+  "Sources" above the shared `ErrorState`, which shows its title (for a 404
+  "Not found"), the API's own sentence plus the shared hint, and "Retry".
+  There are no tabs and no actions. The link sits above the state, not in
+  it, because `ErrorState` has no slot but Retry.
+- **Loaded:** `EntityHeader`. Eyebrow: "Sources" (link to `/connectors`).
+  Title: the connector's name. Beside it: the health badge, a direction pill
+  (Source, Sink, Bidirectional) and, when set, an environment pill.
+  Description: the connector's type. Actions on the right: "Test
+  connection" ("Testing…" while it runs), "Edit" (to
+  `/connectors/<id>/edit`), "Create pipeline" (to
+  `/pipelines/create?connectorId=<id>`), "Audit" (only when the connector has
+  an audit event) and "Delete" (disabled with the title "Used by N
+  pipeline(s) (see Used by); those must be deleted or moved first" while
+  pipelines use it; otherwise it opens the delete dialog, and a delete goes
+  to `/connectors`).
+- **Under the header:** the test's result line (the message and the latency,
+  or "Not testable · <message>"), then the tabs "Overview", "Ingest" and
+  "Connection tests". The open tab is in `?tab=ingest` / `?tab=tests`;
+  Overview is the default and leaves the address clean; an unknown `?tab=`
+  falls back to Overview. The Ingest tab stays mounted. The Overview's
+  "Manage", "Test history" and "Runs" buttons change the page's tab.
+- **Overview layout:** one column, and from the `xl` breakpoint (1280 px) the
+  four sections (Details, Connection, Ingest, Used by) in two columns;
+  "Needs attention", when shown, spans both.
+- **List (T2):** the name is a link to `/connectors/<id>`; the row menu has
+  "View details" as a link and "Create pipeline"; a press anywhere else on a
+  row opens the page; there is no side sheet.
+- **T3:** the edit page's "Cancel" (every state) and the link after saving go
+  to `/connectors/<id>`, the latter now labelled "Back to connector"; deleting
+  from the edit page goes to `/connectors`; the create page's result card has
+  "Open connector" beside "View connectors"; a connector node in a lineage
+  map opens `/connectors/<id>`.
+
+### Commands run (all from `/home/hv/lakehouse-upload`, foreground)
+
+On the final commit (`9cfcee0`):
+
+- `bun run typecheck`: passes, no output.
+- `bun run lint`: 0 errors, 5 warnings, all in files this work does not touch
+  (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`, `use-data-table.ts`,
+  `dashboard-specs.ts`), the same five as the base.
+- `bun run test`: 520 pass, 0 fail, 73 files (before this work: 501 in 72).
+  The 19 added: 14 in `connector-detail-page.test.tsx`, 4 in
+  `connectors-page.test.tsx` (the list), 1 in `connector-edit-page.test.tsx`
+  (Cancel). New assertions went into existing tests of the edit page (the
+  link after saving, the push after a forced delete), the create page ("Open
+  connector") and `asset-detail-tabs.test.tsx` (the lineage address).
+- Per commit: `bun run typecheck`, `bun run lint` (same 5 warnings) and the
+  test files touched, each passing (T1: 14; T2: `src/features/connectors`,
+  100; T3: edit, create and asset-detail-tabs, 79).
+- Mutation checks, each restored afterwards: without `keepMounted` the
+  "Ingest tab mounted" test fails; with `keepDataOnReload: false` the
+  "reloads the detail" test fails; removing any one of the three
+  `stopPropagation` calls in `connectors-columns.tsx` fails its list test.
+- `curl` on the dev server on port 3200: `/connectors/some-id`,
+  `/connectors` and `/connectors/some-id/edit` each answer 200, and the
+  shell has no build-error text. That is the page shell only.
+- `git status` is clean; nothing generated is staged.
+
+### Not verified, or skipped
+
+- **`next build`: not verified**, as the plan says: it would write under
+  `.next/` while the dev server runs.
+- **Not seen in a browser, signed in.** The page, its layout (the two
+  columns at `xl`, the header wrapping on a narrow screen) and every
+  acceptance row in section 7 were checked only through the tests above,
+  against stubbed responses. The checklist's Result column is untouched.
+- What the API answers for another tenant's connector (404 or 403) was not
+  read in the Rust code (no Rust here). The connector client turns a 404 into
+  "Not found" and any other 4xx into "Request could not be processed" with the
+  API's sentence; the page shows either with the way back.
+- Browser behaviours the tests cannot show: a ctrl-click on the name opening a
+  new tab without also navigating this one (the `stopPropagation` keeps the
+  row from also pushing; the browser does the rest), and the real History API
+  keeping `?tab=` across a reload (the tests stub `replaceState`).
+
+### Where the plan and the code differed, and choices made
+
+1. **The error state has no slot for a link.** The plan says "the existing
+   error state ... and a link back to Sources". `ErrorState` accepts only
+   Retry, so the link is rendered above it.
+2. **`keepDataOnReload` on the detail read (not in the plan).** The sheet
+   reloaded the detail after a test and showed a skeleton for a moment. On a
+   whole page that would blank the header and, because the skeleton replaces
+   everything, unmount the Ingest tab and drop the table picks it is kept
+   mounted to protect. The page reloads with `keepDataOnReload`; the test
+   action still reloads the detail and refreshes the overview and the history.
+3. **"Open connector" is beside the card's "View connectors", not the
+   header's.** The create page shows "View connectors" twice (header and
+   card); the plan did not say which. The header keeps its one button.
+4. **The edit page's post-save link was labelled "Back to connectors"**; going
+   to the connector's page made that wrong, so it reads "Back to connector".
+5. **`FEATURE_COVERAGE.md`: the "Dedicated connector detail route" row is
+   removed** from the "Intentionally missing / still mocked" table (it is no
+   longer missing or partial) and the Connectors row names the page and its
+   route. The row's own `testConnection` backend note was left as it was.
+6. **The name's focus style** changed from none (`focus:outline-none`) to an
+   underline on keyboard focus, since the name is now the keyboard route to
+   the page.
+7. **The two-column breakpoint is `xl`**, not `lg`: with the sidebar open the
+   content is about 1000 px wide at a 1280 px window, and two columns of label
+   and value pairs would be cramped below that.
+8. **The plan's `onOpenTab` line:** the Overview's `onOpenTab` was already a
+   callback, so the only change in `connector-overview.tsx` besides the grid
+   is its doc comment; the page passes its tab setter.
+
+### Seen and not changed
+
+- The "Connection test passed" toast (`withNotify` around `testConnection`)
+  fires for any answer with an HTTP success, including a probe that returned
+  `ok: false`; the result line under the header is the accurate one. This is
+  how the sheet behaved; the plan keeps the actions as they are.
+- `Button render={<Link />}` renders an anchor with `role="button"`, so the
+  header's Edit, Create pipeline and Audit are announced as buttons although
+  they navigate. Shared component behaviour, as before.
+- `ErrorState`'s shared hint for a 404 reads "It may already have been
+  deleted. Reload the list.", written for lists; on this page it is slightly
+  off. It lives in `src/lib/notify-message.ts` and is used everywhere.
+
 ## 9. Review (planner)
