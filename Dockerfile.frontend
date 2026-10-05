@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+# Staging / demo frontend image.
+#
+# Build:   docker build -f Dockerfile.frontend -t lakehouse-frontend:staging .
+# Run:     docker run -d --name lakehouse-frontend --network rantai-lakehouse_default \
+#            -p 3000:3000 -e RUST_API_URL=http://lakehouse-api:8080 \
+#            --restart unless-stopped lakehouse-frontend:staging
+#
+# The Next.js `output: "standalone"` config produces a self-contained
+# Node.js server in .next/standalone/server.js — we do NOT need Bun at
+# runtime, only for the build.
+
+FROM oven/bun:1-alpine AS builder
+WORKDIR /app
+
+# Dependencies (cached unless lockfiles change)
+COPY package.json bun.lock bunfig.toml ./
+RUN bun install --frozen-lockfile
+
+# Source
+COPY . .
+
+# Build-time NEXT_PUBLIC_* vars — anything that must be baked into the
+# static JS bundle.  The SSO toggle is one; add others here as needed.
+ARG NEXT_PUBLIC_SSO_ENABLED=${NEXT_PUBLIC_SSO_ENABLED:-}
+ENV NEXT_PUBLIC_SSO_ENABLED=${NEXT_PUBLIC_SSO_ENABLED}
+
+# Produce .next/standalone (see next.config.ts — output: "standalone")
+RUN bun run build
+
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Standalone bundle (includes minimal node_modules)
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+EXPOSE 3000
+
+# RUST_API_URL can be changed at runtime — Next.js rewrites use it per-request
+ENV RUST_API_URL=http://localhost:8080
+
+CMD ["node", "server.js"]
