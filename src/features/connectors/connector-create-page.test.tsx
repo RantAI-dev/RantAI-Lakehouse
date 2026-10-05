@@ -204,6 +204,15 @@ describe("ConnectorCreatePage", () => {
     expect(page.queryByText(/s3cret-pass/)).toBeNull()
     fireEvent.click(page.getByRole("button", { name: "Create connector" }))
     await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+    // Once created, the new connector's own page is one press away, beside
+    // the way back to the list (which the header repeats).
+    expect(page.getByRole("button", { name: "Open connector" }).getAttribute("href")).toBe(
+      "/connectors/conn-orders-k3x9"
+    )
+    expect(page.getAllByRole("button", { name: "View connectors" }).map((b) => b.getAttribute("href"))).toEqual([
+      "/connectors",
+      "/connectors",
+    ])
 
     const create = calls.find((c) => c.url.endsWith("/api/connectors") && c.method === "POST")
     const body = create?.body as Record<string, unknown>

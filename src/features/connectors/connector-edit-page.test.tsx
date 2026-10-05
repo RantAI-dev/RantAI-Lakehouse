@@ -1,11 +1,14 @@
 // `AuthProvider` (needed by the tenant picker's `useAuth()`) calls
 // `usePathname()`/`useRouter()`; stub `next/navigation` before any import
 // resolves (`mock.module` is hoisted by bun's test runner).
+const pushed: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/connectors/conn-a/edit",
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
-    push: () => {},
+    push: (to: string) => {
+      pushed.push(to)
+    },
     replace: () => {},
     refresh: () => {},
     back: () => {},
@@ -23,6 +26,7 @@ const originalFetch = global.fetch
 
 afterEach(() => {
   global.fetch = originalFetch
+  pushed.length = 0
   cleanup()
 })
 
@@ -151,6 +155,8 @@ describe("ConnectorEditPage", () => {
     expect(page.queryByText(/n3w-pass/)).toBeNull()
     fireEvent.click(page.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+    // After saving, the way on is the connector's own page, not the list.
+    expect(page.getByRole("button", { name: "Back to connector" }).getAttribute("href")).toBe("/connectors/conn-a")
 
     expect(writes(calls).map((c) => `${c.method} ${c.url.replace(/^https?:\/\/[^/]+/, "")}`)).toEqual([
       "PATCH /api/connectors/conn-a",
@@ -182,6 +188,13 @@ describe("ConnectorEditPage", () => {
     expect(page.getByText(/Saved · Name, direction/)).toBeDefined()
     expect(page.getByText(/Not saved · Credential .*authentication failed/)).toBeDefined()
     expect(calls.some((c) => c.url.endsWith("/test"))).toBe(false)
+  })
+
+  it("cancels back to the connector's page", async () => {
+    stubFetch()
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    expect(page.getByRole("button", { name: "Cancel" }).getAttribute("href")).toBe("/connectors/conn-a")
   })
 
   it("will not save when nothing changed", async () => {
@@ -304,6 +317,8 @@ describe("ConnectorEditPage", () => {
         "/api/connectors/conn-a?force=true",
       ])
     )
+    // The connector is gone, so there is no page of it to go back to: the list.
+    await waitFor(() => expect(pushed).toEqual(["/connectors"]))
   })
 
   /**

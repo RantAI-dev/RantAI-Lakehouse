@@ -255,7 +255,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   if (!adapter) {
     return (
       <div className="flex flex-col gap-4">
-        <EditHeader />
+        <EditHeader connectorId={detail.id} />
         <p className="text-sm text-muted-foreground">
           This connector&apos;s type ({detail.type}) has no connection form in this build, so it cannot be edited here.
         </p>
@@ -268,7 +268,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     const failed = saveSteps.some((s) => s.status === "failed")
     return (
       <div className="flex flex-col gap-4">
-        <EditHeader />
+        <EditHeader connectorId={detail.id} />
         <SectionCard
           title={failed ? "Some changes were not saved" : "Changes saved"}
           description={failed ? "Saving stopped at the first failure. Parts marked saved are in effect." : undefined}
@@ -305,8 +305,8 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
             </p>
           ) : null}
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button size="sm" render={<Link href="/connectors" />}>
-              Back to connectors
+            <Button size="sm" render={<Link href={`/connectors/${detail.id}`} />}>
+              Back to connector
             </Button>
             <Button size="sm" variant="outline" onClick={onReload}>
               Edit again
@@ -360,7 +360,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
 
   return (
     <div className="flex flex-col gap-4">
-      <EditHeader />
+      <EditHeader connectorId={detail.id} />
       <FormStepLayout
         steps={STEPS}
         currentIndex={step}
@@ -517,13 +517,14 @@ function DeleteSection({ detail }: { detail: ConnectorDetail }) {
   )
 }
 
-function EditHeader() {
+/** Cancel goes back to the connector's page, where "Edit" was pressed. */
+function EditHeader({ connectorId }: { connectorId: string }) {
   return (
     <PageHeader
       title="Edit Connector"
       description="Change a connector's settings; the connection is tested again after saving."
       actions={
-        <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+        <Button variant="outline" size="sm" render={<Link href={`/connectors/${connectorId}`} />}>
           Cancel
         </Button>
       }

@@ -266,6 +266,9 @@ export function ConnectorCreatePage() {
               <Button size="sm" render={<Link href="/connectors" />}>
                 View connectors
               </Button>
+              <Button size="sm" variant="outline" render={<Link href={`/connectors/${createdId}`} />}>
+                Open connector
+              </Button>
               <Button
                 type="button"
                 size="sm"

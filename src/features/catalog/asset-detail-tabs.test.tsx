@@ -296,7 +296,7 @@ describe("Lineage tab", () => {
     ])
     expect(within(graph).getByTitle("orders_clean").closest("a")?.getAttribute("href")).toBe("/pipelines/pl-clean")
     // Its neighbours open their own pages; the asset itself is not a link to itself.
-    expect(within(graph).getByText("Postgres").closest("a")?.getAttribute("href")).toBe("/connectors/conn-pg/edit")
+    expect(within(graph).getByText("Postgres").closest("a")?.getAttribute("href")).toBe("/connectors/conn-pg")
     expect(within(graph).getByTitle("silver.orders_clean").closest("a")?.getAttribute("href")).toBe(
       "/data/assets/silver.orders_clean"
     )

@@ -57,7 +57,7 @@ export function nodeHref(node: LineageNode): string | null {
   const ref = encodeURIComponent(rest)
   switch (prefix) {
     case "connector":
-      return `/connectors/${ref}/edit`
+      return `/connectors/${ref}`
     case "dataset":
       return `/data/assets/${ref}`
     case "table":
