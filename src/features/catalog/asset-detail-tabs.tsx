@@ -12,8 +12,13 @@ import {
   ShieldCheck,
   type LucideIcon,
 } from "lucide-react"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { cn } from "@/lib/utils"
+import {
+  keepStripInView,
+  LineTabsList,
+  type LineTab,
+  type LineTabCount,
+} from "@/components/patterns/line-tabs"
+import { Tabs, TabsContent } from "@/components/ui/tabs"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetAccess } from "./asset-access"
 import { AssetActivity } from "./asset-activity"
@@ -28,31 +33,6 @@ import { AssetQuality } from "./asset-quality"
 import { AssetSample } from "./asset-sample"
 import { AssetSchema } from "./asset-schema"
 import { useIcebergTable } from "./asset-storage"
-
-type CountTone = "danger" | "warning"
-
-/**
- * How much is behind a tab, so the empty ones can be skipped without a
- * click. A zero is dimmed; failing quality checks turn the count red.
- */
-function TabCount({ count, tone }: { count: number; tone?: CountTone }) {
-  return (
-    <span
-      className={cn(
-        "min-w-4 rounded-full px-1 text-center text-[11px] leading-4 font-medium tabular-nums",
-        tone === "danger"
-          ? "bg-destructive/10 text-destructive"
-          : tone === "warning"
-            ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
-            : count === 0
-              ? "text-muted-foreground/50"
-              : "bg-muted text-muted-foreground group-data-active/tab:bg-primary/10 group-data-active/tab:text-primary"
-      )}
-    >
-      {count}
-    </span>
-  )
-}
 
 /** The seven tabs, in order. `?tab=` names any but the first. */
 const TABS: { value: AssetTab; label: string; icon: LucideIcon }[] = [
@@ -78,7 +58,7 @@ function tabCount(
   a: AssetDetail,
   lineage: AssetLineageState,
   tab: AssetTab
-): { count: number; tone?: CountTone } | null {
+): LineTabCount | null {
   switch (tab) {
     case "schema":
       return { count: a.schema.length }
@@ -99,12 +79,6 @@ function tabCount(
       return null
   }
 }
-
-/**
- * The app navbar's height (`h-16` in `app-navbar.tsx`): the tab strip
- * sticks right under it.
- */
-const STICKY_TOP_PX = 64
 
 /**
  * Tab strip for the asset detail page. The open tab lives in `?tab=`, so a
@@ -130,22 +104,8 @@ export function AssetDetailTabs({
     setTab(urlTab)
   }
   const rootRef = React.useRef<HTMLDivElement>(null)
-  const stripRef = React.useRef<HTMLDivElement>(null)
   const iceberg = useIcebergTable(a)
   const lineage = useAssetLineage(a)
-
-  // On a narrow screen the strip scrolls sideways; keep the open tab in
-  // it, so a link to `?tab=activity` does not open a tab you cannot see.
-  // Sideways only: the page itself never moves for this.
-  React.useEffect(() => {
-    const strip = stripRef.current
-    const active = strip?.querySelector<HTMLElement>("[role=tab][data-active]")
-    if (!strip || !active) return
-    const s = strip.getBoundingClientRect()
-    const t = active.getBoundingClientRect()
-    if (t.left < s.left) strip.scrollLeft += t.left - s.left - 16
-    else if (t.right > s.right) strip.scrollLeft += t.right - s.right + 16
-  }, [tab])
 
   const selectTab = React.useCallback(
     (next: AssetTab) => {
@@ -158,52 +118,17 @@ export function AssetDetailTabs({
       // `useSearchParams` in step with it, and a tab switch needs no
       // server round trip.
       window.history.replaceState(null, "", query ? `${pathname}?${query}` : pathname)
-      // Scrolled past the strip, a new tab would open mid-page; start it
-      // at the top instead, just under the stuck strip.
-      const top = rootRef.current?.getBoundingClientRect().top
-      if (top !== undefined && top < STICKY_TOP_PX && window.scrollY > 0) {
-        window.scrollTo({ top: window.scrollY + top - STICKY_TOP_PX })
-      }
+      keepStripInView(rootRef.current)
     },
     [pathname, searchParams]
   )
 
+  const stripTabs: LineTab[] = TABS.map((t) => ({ ...t, count: tabCount(a, lineage, t.value) }))
+
   return (
     <div ref={rootRef}>
       <Tabs value={tab} onValueChange={(v) => selectTab(v as AssetTab)} className="gap-3">
-        {/* Sticky under the navbar, bled to the edges of `<main>`'s padding
-            (`app-frame.tsx`) so content scrolling underneath never shows
-            beside it. Two layers repeat the page's own background: the
-            inset's `bg-muted/25` over the body's `bg-background`. */}
-        <div className="sticky top-16 z-10 -mx-4 bg-background sm:-mx-5 lg:-mx-6">
-          <div
-            ref={stripRef}
-            className="overflow-x-auto border-b border-border bg-muted/25 px-4 [scrollbar-width:none] sm:px-5 lg:px-6"
-          >
-            <TabsList
-              variant="line"
-              className="w-max justify-start gap-0.5 p-0 group-data-horizontal/tabs:h-10"
-            >
-              {TABS.map(({ value, label, icon: Icon }) => {
-                const count = tabCount(a, lineage, value)
-                return (
-                  <TabsTrigger
-                    key={value}
-                    value={value}
-                    className="group/tab h-full flex-none px-2.5 after:bg-primary group-data-horizontal/tabs:after:bottom-0"
-                  >
-                    <Icon
-                      className="size-3.5 text-muted-foreground group-data-active/tab:text-primary"
-                      aria-hidden
-                    />
-                    {label}
-                    {count ? <TabCount count={count.count} tone={count.tone} /> : null}
-                  </TabsTrigger>
-                )
-              })}
-            </TabsList>
-          </div>
-        </div>
+        <LineTabsList tabs={stripTabs} active={tab} />
 
         <TabsContent value="overview">
           <AssetOverview

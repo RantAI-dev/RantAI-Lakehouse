@@ -13,6 +13,7 @@ import {
   XIcon,
 } from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -22,6 +23,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
+import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import type {
   Dial,
@@ -175,18 +177,37 @@ function toSourceObjects(selection: Selection, withModes: boolean): SourceObject
  * A connector that has been created and tested moves no data until at
  * least one table is saved here: every run of the shared `ingest_job`
  * reads this list.
+ *
+ * `layout` is where it sits. "embedded" (the default) is one column with no
+ * card of its own, for a page that already wraps it in one (the page shown
+ * after creating a connector). "page" is the connector page's Ingest tab:
+ * three cards, in two columns from `xl` up. Nothing but the arrangement
+ * differs. `onTableCount` is told how many tables the connector has saved,
+ * as soon as the saved spec is known and after every save, so the page can
+ * show it on the tab without asking the API a second time.
  */
 export function ConnectorIngestPanel({
   connectorId,
   connectorName,
+  layout = "embedded",
+  onTableCount,
 }: {
   connectorId: string
   connectorName: string
+  layout?: "page" | "embedded"
+  onTableCount?: (count: number) => void
 }) {
   const spec = useService((s) => connectorService.getIngestSpec(connectorId, s), [connectorId])
   // The spec a save returned, so saving does not refetch (and unmount the
   // editor, losing the tables it just found).
   const [savedSpec, setSavedSpec] = React.useState<IngestSpec | null>(null)
+  const known = savedSpec ?? spec.data
+  // No count for a connector with no connection saved: nothing can be
+  // ingested there, which is not the same fact as "no tables picked".
+  const tableCount = known?.adapter && known.ingestMode ? known.sourceObjects.length : null
+  React.useEffect(() => {
+    if (tableCount !== null) onTableCount?.(tableCount)
+  }, [tableCount, onTableCount])
 
   if (spec.status === "loading") return <LoadingSkeleton rows={3} />
   if (spec.status === "error") return <ErrorState error={spec.error} onRetry={spec.reload} />
@@ -208,6 +229,7 @@ export function ConnectorIngestPanel({
       connectorId={connectorId}
       connectorName={connectorName}
       spec={current}
+      layout={layout}
       onSaved={setSavedSpec}
     />
   )
@@ -217,11 +239,13 @@ function IngestEditor({
   connectorId,
   connectorName,
   spec,
+  layout,
   onSaved,
 }: {
   connectorId: string
   connectorName: string
   spec: IngestSpec
+  layout: "page" | "embedded"
   onSaved: (spec: IngestSpec) => void
 }) {
   const adapter = spec.adapter ?? ""
@@ -307,267 +331,264 @@ function IngestEditor({
   const shown = needle ? found.filter((o) => o.name.toLowerCase().includes(needle)) : found
   const allShownSelected = shown.length > 0 && shown.every((o) => selectedNames.has(o.name))
 
-  return (
-    <div className="space-y-5">
-      <div className="space-y-1">
-        <h3 className="flex items-center gap-2 text-sm font-medium">
-          <TableIcon className="size-4 text-muted-foreground" />
-          Tables to ingest
-        </h3>
-        <p className="text-xs text-muted-foreground">
-          {isStream
-            ? "A Kafka connector reads its topic; each run takes one micro-batch."
-            : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."}
-        </p>
-      </div>
+  const page = layout === "page"
+  const tablesIntro = isStream
+    ? "A Kafka connector reads its topic; each run takes one micro-batch."
+    : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
 
+  const cdcNotes = (
+    <>
       {isCdc ? (
         <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           {backfillTriggerMessage(typeof spec.dial.driver === "string" ? spec.dial.driver : "cdc")}
         </p>
       ) : null}
       {isCdc && saved[0] ? <DebeziumPanel connectorId={connectorId} table={saved[0].name} /> : null}
+    </>
+  )
 
-      {!isStream ? (
-        <>
-          {/* Selected tables: the list that is saved. */}
-          <div className="space-y-2">
-            <p className="text-xs font-medium text-muted-foreground">
-              Selected · {selection.length} {selection.length === 1 ? "table" : "tables"}
-            </p>
-            {selection.length === 0 ? (
-              <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-                No tables selected yet.{canDiscover ? " Find tables below and tick the ones to copy." : ""}
-              </p>
-            ) : (
-              <ul className="divide-y divide-border rounded-md border border-border">
-                {selection.map((s, i) => (
-                  <li key={s.name} className="space-y-1.5 px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate font-mono text-xs" title={s.name}>
-                        {s.name}
-                      </span>
-                      <button
-                        type="button"
-                        aria-label={`Remove ${s.name}`}
-                        onClick={() => toggle(s.name)}
-                        className="rounded p-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                      >
-                        <XIcon className="size-3.5" />
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <span className="shrink-0 text-xs text-muted-foreground">→ bronze.</span>
-                      <Input
-                        aria-label={`Bronze table for ${s.name}`}
-                        value={s.target}
-                        onChange={(e) => change(s.name, { target: e.target.value })}
-                        className="h-7 font-mono text-xs"
-                        aria-invalid={problems[i] !== null}
-                        autoComplete="off"
-                      />
-                    </div>
-                    {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
-                    {!isCdc ? (
-                      <LoadModeFields
-                        selected={s}
-                        modes={loadModesFor(adapter)}
-                        columns={columnsOf.get(s.name) ?? null}
-                        problem={modeProblems[i]}
-                        onChange={(patch) => change(s.name, patch)}
-                      />
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-
-          {/* Finding tables. */}
-          {canDiscover ? (
-            <div className="space-y-2 rounded-md border border-border p-3">
-              <div className="flex items-end gap-2">
-                <div className="min-w-0 flex-1 space-y-1">
-                  <Label htmlFor="discover-schema" className="text-xs">
-                    Schema
-                  </Label>
+  const tablesBody = !isStream ? (
+    <>
+      {/* Selected tables: the list that is saved. */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium text-muted-foreground">
+          Selected · {selection.length} {selection.length === 1 ? "table" : "tables"}
+        </p>
+        {selection.length === 0 ? (
+          <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+            No tables selected yet.{canDiscover ? " Find tables below and tick the ones to copy." : ""}
+          </p>
+        ) : (
+          <ul className="divide-y divide-border rounded-md border border-border">
+            {selection.map((s, i) => (
+              <li key={s.name} className="space-y-1.5 px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate font-mono text-xs" title={s.name}>
+                    {s.name}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${s.name}`}
+                    onClick={() => toggle(s.name)}
+                    className="rounded p-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  >
+                    <XIcon className="size-3.5" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="shrink-0 text-xs text-muted-foreground">→ bronze.</span>
                   <Input
-                    id="discover-schema"
-                    value={schema}
-                    onChange={(e) => setSchema(e.target.value)}
-                    className="h-8"
+                    aria-label={`Bronze table for ${s.name}`}
+                    value={s.target}
+                    onChange={(e) => change(s.name, { target: e.target.value })}
+                    className={cn("h-7 font-mono text-xs", page && "max-w-xs")}
+                    aria-invalid={problems[i] !== null}
                     autoComplete="off"
                   />
                 </div>
+                {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
+                {!isCdc ? (
+                  <LoadModeFields
+                    selected={s}
+                    modes={loadModesFor(adapter)}
+                    columns={columnsOf.get(s.name) ?? null}
+                    problem={modeProblems[i]}
+                    onChange={(patch) => change(s.name, patch)}
+                  />
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Finding tables. */}
+      {canDiscover ? (
+        <div className="space-y-2 rounded-md border border-border p-3">
+          <div className="flex items-end gap-2">
+            <div className={cn("min-w-0 flex-1 space-y-1", page && "max-w-xs")}>
+              <Label htmlFor="discover-schema" className="text-xs">
+                Schema
+              </Label>
+              <Input
+                id="discover-schema"
+                value={schema}
+                onChange={(e) => setSchema(e.target.value)}
+                className="h-8"
+                autoComplete="off"
+              />
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={discover.status === "pending" || schema.trim() === ""}
+              onClick={() => discover.run(connectorId, schema.trim())}
+            >
+              <SearchIcon data-icon="inline-start" />
+              {discover.status === "pending" ? "Finding…" : "Find tables"}
+            </Button>
+          </div>
+          {discover.status === "error" ? <ErrorState error={discover.error} /> : null}
+          {discover.data && !discover.data.supported ? (
+            <p className="text-xs text-muted-foreground">Cannot list tables · {discover.data.reason}</p>
+          ) : null}
+          {discover.data?.supported && found.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No tables in schema &ldquo;{schema.trim()}&rdquo;. Check the schema name.
+            </p>
+          ) : null}
+          {found.length > 0 ? (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                {found.length > 8 ? (
+                  <Input
+                    aria-label="Filter tables"
+                    value={filter}
+                    onChange={(e) => setFilter(e.target.value)}
+                    placeholder={`Filter ${found.length} tables`}
+                    className={cn("h-7 text-xs", page && "max-w-xs")}
+                    autoComplete="off"
+                  />
+                ) : (
+                  <span className="flex-1 text-xs text-muted-foreground">{found.length} tables found</span>
+                )}
                 <Button
                   type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={discover.status === "pending" || schema.trim() === ""}
-                  onClick={() => discover.run(connectorId, schema.trim())}
+                  size="xs"
+                  variant="ghost"
+                  className="shrink-0"
+                  onClick={() =>
+                    setSelection((current) => {
+                      if (allShownSelected) return current.filter((s) => !shown.some((o) => o.name === s.name))
+                      const missing = shown.filter((o) => !current.some((s) => s.name === o.name))
+                      return [
+                        ...current,
+                        ...missing.map((o) => ({
+                          name: o.name,
+                          target: defaultTarget(connectorName, o.name),
+                          loadMode: DEFAULT_LOAD_MODE,
+                        })),
+                      ]
+                    })
+                  }
                 >
-                  <SearchIcon data-icon="inline-start" />
-                  {discover.status === "pending" ? "Finding…" : "Find tables"}
+                  {allShownSelected ? "Clear shown" : "Select shown"}
                 </Button>
               </div>
-              {discover.status === "error" ? <ErrorState error={discover.error} /> : null}
-              {discover.data && !discover.data.supported ? (
-                <p className="text-xs text-muted-foreground">Cannot list tables · {discover.data.reason}</p>
-              ) : null}
-              {discover.data?.supported && found.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No tables in schema &ldquo;{schema.trim()}&rdquo;. Check the schema name.
-                </p>
-              ) : null}
-              {found.length > 0 ? (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    {found.length > 8 ? (
-                      <Input
-                        aria-label="Filter tables"
-                        value={filter}
-                        onChange={(e) => setFilter(e.target.value)}
-                        placeholder={`Filter ${found.length} tables`}
-                        className="h-7 text-xs"
-                        autoComplete="off"
-                      />
-                    ) : (
-                      <span className="flex-1 text-xs text-muted-foreground">{found.length} tables found</span>
-                    )}
-                    <Button
-                      type="button"
-                      size="xs"
-                      variant="ghost"
-                      className="shrink-0"
-                      onClick={() =>
-                        setSelection((current) => {
-                          if (allShownSelected) return current.filter((s) => !shown.some((o) => o.name === s.name))
-                          const missing = shown.filter((o) => !current.some((s) => s.name === o.name))
-                          return [
-                            ...current,
-                            ...missing.map((o) => ({
-                              name: o.name,
-                              target: defaultTarget(connectorName, o.name),
-                              loadMode: DEFAULT_LOAD_MODE,
-                            })),
-                          ]
-                        })
-                      }
-                    >
-                      {allShownSelected ? "Clear shown" : "Select shown"}
-                    </Button>
-                  </div>
-                  <ul className="max-h-64 space-y-0.5 overflow-y-auto">
-                    {shown.map((object) => {
-                      const id = `discover-${object.name}`
-                      return (
-                        <li key={object.name}>
-                          <label
-                            htmlFor={id}
-                            className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/50"
-                          >
-                            <input
-                              id={id}
-                              type="checkbox"
-                              checked={selectedNames.has(object.name)}
-                              onChange={() => toggle(object.name)}
-                            />
-                            <span className="min-w-0 flex-1 truncate font-mono text-xs">{object.name}</span>
-                            <span className="shrink-0 text-xs text-muted-foreground">
-                              {object.columns.length} cols
-                            </span>
-                          </label>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </div>
-              ) : null}
+              <ul className="max-h-64 space-y-0.5 overflow-y-auto">
+                {shown.map((object) => {
+                  const id = `discover-${object.name}`
+                  return (
+                    <li key={object.name}>
+                      <label
+                        htmlFor={id}
+                        className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/50"
+                      >
+                        <input
+                          id={id}
+                          type="checkbox"
+                          checked={selectedNames.has(object.name)}
+                          onChange={() => toggle(object.name)}
+                        />
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs">{object.name}</span>
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          {object.columns.length} cols
+                        </span>
+                      </label>
+                    </li>
+                  )
+                })}
+              </ul>
             </div>
-          ) : (
-            <div className="space-y-1.5">
-              <Label htmlFor="manual-object" className="text-xs">
-                Add by name
-              </Label>
-              <div className="flex gap-2">
-                <Input
-                  id="manual-object"
-                  value={manualName}
-                  onChange={(e) => setManualName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault()
-                      addManual()
-                    }
-                  }}
-                  placeholder={adapter === "sftp" || adapter === "files" ? "orders.csv" : "object name"}
-                  className="h-8 font-mono text-xs"
-                  autoComplete="off"
-                />
-                <Button type="button" size="sm" variant="outline" disabled={!manualName.trim()} onClick={addManual}>
-                  <PlusIcon data-icon="inline-start" />
-                  Add
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                This connector type cannot list its objects, so type each one as the source names it.
-              </p>
-            </div>
-          )}
-        </>
-      ) : null}
-
-      {/* Schedule. CDC streams on its own and has none. */}
-      {!isCdc ? (
+          ) : null}
+        </div>
+      ) : (
         <div className="space-y-1.5">
-          <Label htmlFor="ingest-schedule" className="text-xs">
-            Schedule
+          <Label htmlFor="manual-object" className="text-xs">
+            Add by name
           </Label>
-          <select
-            id="ingest-schedule"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-            value={cronChoice}
-            onChange={(e) => setCronChoice(e.target.value)}
-          >
-            {SCHEDULE_PRESETS.map((p) => (
-              <option key={p.label} value={p.value}>
-                {p.label}
-              </option>
-            ))}
-            <option value="custom">Custom cron…</option>
-          </select>
-          {cronChoice === "custom" ? (
+          <div className={cn("flex gap-2", page && "max-w-md")}>
             <Input
-              aria-label="Cron expression"
-              value={customCron}
-              onChange={(e) => setCustomCron(e.target.value)}
-              placeholder="30 1 * * 1-5"
+              id="manual-object"
+              value={manualName}
+              onChange={(e) => setManualName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault()
+                  addManual()
+                }
+              }}
+              placeholder={adapter === "sftp" || adapter === "files" ? "orders.csv" : "object name"}
               className="h-8 font-mono text-xs"
               autoComplete="off"
             />
-          ) : null}
-          {scheduleProblem ? (
-            <p className="text-xs text-destructive">{scheduleProblem}</p>
-          ) : cronChoice === "custom" ? (
-            <p className="text-xs text-muted-foreground">Minute, hour, day, month, weekday — in UTC.</p>
-          ) : null}
-          {cron !== savedCron ? (
-            cron ? (
-              <p className="text-xs text-muted-foreground">Runs on this schedule within a minute of saving.</p>
-            ) : null
-          ) : spec.nextRunAt ? (
-            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <CalendarClockIcon className="size-3.5 shrink-0" />
-              <span>
-                Next run{" "}
-                <span className="font-medium text-foreground">{formatDateTime(spec.nextRunAt)}</span> your time
-                ({formatTimeUntil(spec.nextRunAt)})
-              </span>
-            </p>
-          ) : null}
+            <Button type="button" size="sm" variant="outline" disabled={!manualName.trim()} onClick={addManual}>
+              <PlusIcon data-icon="inline-start" />
+              Add
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            This connector type cannot list its objects, so type each one as the source names it.
+          </p>
         </div>
-      ) : null}
+      )}
+    </>
+  ) : null
 
+  // Schedule. CDC streams on its own and has none.
+  const scheduleBlock = !isCdc ? (
+    <div className="space-y-1.5">
+      <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
+        Schedule
+      </Label>
+      <select
+        id="ingest-schedule"
+        className={cn("h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm", page && "max-w-xs")}
+        value={cronChoice}
+        onChange={(e) => setCronChoice(e.target.value)}
+      >
+        {SCHEDULE_PRESETS.map((p) => (
+          <option key={p.label} value={p.value}>
+            {p.label}
+          </option>
+        ))}
+        <option value="custom">Custom cron…</option>
+      </select>
+      {cronChoice === "custom" ? (
+        <Input
+          aria-label="Cron expression"
+          value={customCron}
+          onChange={(e) => setCustomCron(e.target.value)}
+          placeholder="30 1 * * 1-5"
+          className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
+          autoComplete="off"
+        />
+      ) : null}
+      {scheduleProblem ? (
+        <p className="text-xs text-destructive">{scheduleProblem}</p>
+      ) : cronChoice === "custom" ? (
+        <p className="text-xs text-muted-foreground">Minute, hour, day, month, weekday — in UTC.</p>
+      ) : null}
+      {cron !== savedCron ? (
+        cron ? (
+          <p className="text-xs text-muted-foreground">Runs on this schedule within a minute of saving.</p>
+        ) : null
+      ) : spec.nextRunAt ? (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <CalendarClockIcon className="size-3.5 shrink-0" />
+          <span>
+            Next run{" "}
+            <span className="font-medium text-foreground">{formatDateTime(spec.nextRunAt)}</span> your time
+            ({formatTimeUntil(spec.nextRunAt)})
+          </span>
+        </p>
+      ) : null}
+    </div>
+  ) : null
+
+  const saveRow = (
+    <>
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" size="sm" disabled={!canSave || save.status === "pending"} onClick={async () => {
             const result = await save.run()
@@ -586,18 +607,68 @@ function IngestEditor({
         ) : null}
       </div>
       {save.status === "error" ? <p className="text-xs text-destructive">{save.error.message}</p> : null}
+    </>
+  )
 
-      <IngestRuns
-        connectorId={connectorId}
-        tableCount={saved.length}
-        blockedReason={
-          dirty
-            ? "Save your changes before running."
-            : !isStream && saved.length === 0
-              ? "Save at least one table to run."
-              : null
-        }
-      />
+  const runs = (
+    <IngestRuns
+      layout={layout}
+      connectorId={connectorId}
+      tableCount={saved.length}
+      blockedReason={
+        dirty
+          ? "Save your changes before running."
+          : !isStream && saved.length === 0
+            ? "Save at least one table to run."
+            : null
+      }
+    />
+  )
+
+  if (page) {
+    // Cards, two columns once the page is wide: what is ingested and when on
+    // the left, what has run on the right. The one Save button sits in the
+    // Schedule card and saves both; CDC has no schedule, so there it ends the
+    // tables card.
+    return (
+      <div className="grid items-start gap-3 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+        <div className="flex min-w-0 flex-col gap-3">
+          <SectionCard size="sm" title="Tables to ingest" description={isStream ? undefined : tablesIntro}>
+            <div className="space-y-4">
+              {isStream ? <p className="text-sm text-muted-foreground">{tablesIntro}</p> : null}
+              {cdcNotes}
+              {tablesBody}
+              {isCdc ? saveRow : null}
+            </div>
+          </SectionCard>
+          {!isCdc ? (
+            <SectionCard size="sm" title="Schedule">
+              <div className="space-y-4">
+                {scheduleBlock}
+                {saveRow}
+              </div>
+            </SectionCard>
+          ) : null}
+        </div>
+        {runs}
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="space-y-1">
+        <h3 className="flex items-center gap-2 text-sm font-medium">
+          <TableIcon className="size-4 text-muted-foreground" />
+          Tables to ingest
+        </h3>
+        <p className="text-xs text-muted-foreground">{tablesIntro}</p>
+      </div>
+      {cdcNotes}
+      {tablesBody}
+      {scheduleBlock}
+      {saveRow}
+      {runs}
     </div>
   )
 }
@@ -755,10 +826,12 @@ export function groupResultsByRun(runs: IngestJobRun[], results: IngestRun[]): R
  * lists are checked every few seconds.
  */
 function IngestRuns({
+  layout,
   connectorId,
   tableCount,
   blockedReason,
 }: {
+  layout: "page" | "embedded"
   connectorId: string
   tableCount: number
   blockedReason: string | null
@@ -801,26 +874,25 @@ function IngestRuns({
 
   const groups = groupResultsByRun(runs, results.data ?? [])
 
-  return (
-    <div className="space-y-3 border-t border-border pt-4">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-xs font-medium text-muted-foreground">Runs</p>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={runNow.status === "pending" || watching || blockedReason !== null}
-          onClick={async () => {
-            const result = await runNow.run(connectorId)
-            if (result?.runId) setLaunchedRunId(result.runId)
-            refreshRuns()
-          }}
-        >
-          <PlayIcon data-icon="inline-start" />
-          {runNow.status === "pending" ? "Starting…" : "Run now"}
-        </Button>
-      </div>
+  const runNowButton = (
+    <Button
+      type="button"
+      size="sm"
+      variant="outline"
+      disabled={runNow.status === "pending" || watching || blockedReason !== null}
+      onClick={async () => {
+        const result = await runNow.run(connectorId)
+        if (result?.runId) setLaunchedRunId(result.runId)
+        refreshRuns()
+      }}
+    >
+      <PlayIcon data-icon="inline-start" />
+      {runNow.status === "pending" ? "Starting…" : "Run now"}
+    </Button>
+  )
 
+  const body = (
+    <>
       {blockedReason && !watching ? <p className="text-xs text-muted-foreground">{blockedReason}</p> : null}
       {activeRun ? (
         <p className="flex items-center gap-1.5 text-xs text-primary">
@@ -852,6 +924,7 @@ function IngestRuns({
           {groups.map((group, index) => (
             <RunGroupCard
               key={group.run?.runId ?? "earlier"}
+              layout={layout}
               group={group}
               tableCount={tableCount}
               defaultOpen={index === 0}
@@ -859,15 +932,35 @@ function IngestRuns({
           ))}
         </div>
       )}
+    </>
+  )
+
+  if (layout === "page") {
+    return (
+      <SectionCard size="sm" title="Runs" action={runNowButton}>
+        <div className="space-y-3">{body}</div>
+      </SectionCard>
+    )
+  }
+
+  return (
+    <div className="space-y-3 border-t border-border pt-4">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-medium text-muted-foreground">Runs</p>
+        {runNowButton}
+      </div>
+      {body}
     </div>
   )
 }
 
 function RunGroupCard({
+  layout,
   group,
   tableCount,
   defaultOpen,
 }: {
+  layout: "page" | "embedded"
   group: RunGroup
   tableCount: number
   defaultOpen: boolean
@@ -889,24 +982,49 @@ function RunGroupCard({
             notLoaded > 0 ? ` · ${notLoaded} not loaded` : ""
           }`
 
+  const status = run ? (
+    <Pill tone={RUN_STATUS_TONE[run.status]}>{RUN_STATUS_LABEL[run.status]}</Pill>
+  ) : (
+    <Pill tone="neutral">Earlier</Pill>
+  )
+  const runId = run ? <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span> : null
+  const when = run ? (
+    <>
+      {formatRelativeTime(run.startedAt)}
+      {start !== null && end !== null ? ` · took ${formatDuration(end - start)}` : ""}
+    </>
+  ) : null
+  const summaryClass =
+    "flex cursor-pointer list-none gap-2 px-3 py-2 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden"
+  const chevron = "size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90"
+
   return (
     <details open={defaultOpen} className="group rounded-md border border-border">
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-        <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
-        {run ? (
-          <Pill tone={RUN_STATUS_TONE[run.status]}>{RUN_STATUS_LABEL[run.status]}</Pill>
-        ) : (
-          <Pill tone="neutral">Earlier</Pill>
-        )}
-        {run ? <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span> : null}
-        {run ? (
-          <span className="text-xs text-muted-foreground">
-            {formatRelativeTime(run.startedAt)}
-            {start !== null && end !== null ? ` · took ${formatDuration(end - start)}` : ""}
+      {layout === "page" ? (
+        // In the half-width Runs card one line cannot hold the pill, the id,
+        // when and how long, and the summary: the first line is the verdict
+        // and the summary (not truncated), the second is when and how long.
+        // Spans, since a summary only takes phrasing content.
+        <summary className={cn(summaryClass, "items-start")}>
+          <ChevronRightIcon className={cn(chevron, "mt-[3px]")} />
+          <span className="min-w-0 flex-1 space-y-0.5">
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              {status}
+              {runId}
+              <span className="ml-auto text-xs text-muted-foreground">{summary}</span>
+            </span>
+            {when ? <span className="block text-xs text-muted-foreground">{when}</span> : null}
           </span>
-        ) : null}
-        <span className="ml-auto truncate pl-2 text-xs text-muted-foreground">{summary}</span>
-      </summary>
+        </summary>
+      ) : (
+        <summary className={cn(summaryClass, "items-center")}>
+          <ChevronRightIcon className={chevron} />
+          {status}
+          {runId}
+          {when ? <span className="text-xs text-muted-foreground">{when}</span> : null}
+          <span className="ml-auto truncate pl-2 text-xs text-muted-foreground">{summary}</span>
+        </summary>
+      )}
       <div className="border-t border-border">
         {results.length === 0 ? (
           <p className="px-3 py-2 text-xs text-muted-foreground">

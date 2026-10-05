@@ -28,6 +28,15 @@ export function notifyInfo(message: string, description?: string): void {
 }
 
 /**
+ * A failure that is a result, not a thrown error: an action that resolved
+ * and whose answer says it did not work (a connection test that ran and
+ * failed). No description is derived, since there is no error to translate.
+ */
+export function notifyFailure(message: string, description?: string): void {
+  toast.error(message, { description })
+}
+
+/**
  * Notifikasi gagal dari nilai apa pun yang dilempar.
  *
  * Mengembalikan `false` ketika error-nya `aborted` (tidak ada toast yang

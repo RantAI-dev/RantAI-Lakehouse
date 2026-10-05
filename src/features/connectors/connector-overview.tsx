@@ -1,10 +1,12 @@
 "use client"
 
-import * as React from "react"
 import Link from "next/link"
 import { TriangleAlertIcon } from "lucide-react"
+import { HealthTile } from "@/components/patterns/health-tile"
 import { MetadataList } from "@/components/patterns/metadata-list"
-import { Pill } from "@/components/patterns/status-badge"
+import { SectionCard } from "@/components/patterns/section-card"
+import { HealthBadge, Pill } from "@/components/patterns/status-badge"
+import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatRelativeTime, formatTimeUntil } from "@/lib/format"
@@ -23,7 +25,6 @@ import {
   scheduleLabel,
 } from "./connector-ingest-panel"
 import { connectionReviewItems } from "./connector-review"
-import { DIRECTION_LABEL } from "./connectors-columns"
 
 /** Something about the connector that needs a look, newest source first. */
 export type Problem = { key: string; message: string; at: string | null }
@@ -86,12 +87,14 @@ export function recentProblems(
 }
 
 /**
- * The connector page's first tab: what the connector is, where it connects,
- * what it ingests and when, and what needs a look. Every value comes from the
- * API; a part that could not be loaded says so instead of showing an empty or
- * zero value that would read as a real one. `onOpenTab` changes the page's
- * open tab. The four sections sit in two columns once the page is wide
- * enough; "Needs attention", when there is something, stays full width above.
+ * The connector page's first tab: a strip of four tiles (health, tables,
+ * schedule, last run, each opening the tab that holds the detail behind it),
+ * then where the connector connects and who reads from it. What the connector
+ * is (type, tenant, owner, ...) is the page header's row of facts, not
+ * repeated here. Every value comes from the API; a part that could not be
+ * loaded says so instead of showing an empty or zero value that would read as
+ * a real one. `onOpenTab` changes the page's open tab. "Needs attention",
+ * when there is something, stays above the tiles.
  */
 export function ConnectorOverview({
   detail,
@@ -109,13 +112,29 @@ export function ConnectorOverview({
   const problems = recentProblems(probes.data?.results ?? null, runs.data, results.data)
   const lastRun = runs.data?.[0] ?? null
   const adapter = spec.data?.adapter ?? null
+  const tables = spec.data?.sourceObjects.length ?? 0
+
+  // What the two ingest tiles say when the spec is not there to read: still
+  // loading, could not be loaded, or no connection saved yet (so nothing can
+  // be ingested). Never a zero or a blank.
+  const specGap =
+    spec.status === "loading" ? (
+      <Skeleton className="h-5 w-20" />
+    ) : spec.status === "error" ? (
+      <span className="text-muted-foreground">Could not be loaded</span>
+    ) : !adapter ? (
+      <span className="text-muted-foreground">Not set up yet</span>
+    ) : null
+  // The error's own sentence is on the Connection card below; repeating it in
+  // two tiles would only be noise.
+  const specGapHint = spec.status === "success" && !adapter ? "Save the connection first" : undefined
 
   return (
-    <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-2">
+    <div className="flex flex-col gap-2">
       {problems.length > 0 ? (
         <section
           aria-labelledby="connector-problems"
-          className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 xl:col-span-2"
+          className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5"
         >
           <h3 id="connector-problems" className="flex items-center gap-1.5 text-sm font-medium text-destructive">
             <TriangleAlertIcon className="size-4" />
@@ -139,154 +158,109 @@ export function ConnectorOverview({
         </section>
       ) : null}
 
-      <OverviewSection title="Details">
-        <MetadataList
-          items={[
-            { label: "Type", value: detail.type },
-            { label: "Direction", value: DIRECTION_LABEL[detail.direction] },
-            { label: "Environment", value: detail.environment || "—" },
-            { label: "Tenant", value: detail.tenant || "Unassigned" },
-            { label: "Residency", value: detail.residency || "—" },
-            { label: "Owner", value: detail.owner || "—" },
-            {
-              label: "Credential",
-              value: detail.credentialManaged ? "Stored by lakehouse" : "Provisioned on the server",
-            },
-            {
-              label: "Last test",
-              value: detail.lastTestAt === null ? "Never tested" : formatRelativeTime(detail.lastTestAt),
-            },
-          ]}
-        />
-      </OverviewSection>
-
-      <OverviewSection
-        title="Connection"
-        action={
-          <Link href={`/connectors/${id}/edit`} className="text-xs font-medium text-primary hover:underline">
-            Edit
-          </Link>
-        }
-      >
-        {spec.status === "loading" ? (
-          <Skeleton className="h-12 w-full" />
-        ) : spec.status === "error" ? (
-          <p className="text-xs text-destructive">Connection settings could not be loaded · {spec.error.message}</p>
-        ) : !adapter ? (
-          <p className="text-sm text-muted-foreground">No connection settings saved yet.</p>
-        ) : (
-          <MetadataList
-            items={connectionReviewItems(adapter, spec.data.dial).map((item) => ({
-              label: item.label,
-              value: item.value || "—",
-            }))}
-          />
-        )}
-      </OverviewSection>
-
-      <OverviewSection
-        title="Ingest"
-        action={
-          <button
-            type="button"
-            onClick={() => onOpenTab("ingest")}
-            className="text-xs font-medium text-primary hover:underline"
-          >
-            Manage
-          </button>
-        }
-      >
-        {spec.status === "loading" ? (
-          <Skeleton className="h-12 w-full" />
-        ) : spec.status === "error" || !adapter ? (
-          <p className="text-sm text-muted-foreground">Nothing to ingest until the connection is saved.</p>
-        ) : (
-          <MetadataList
-            items={[
-              {
-                label: adapter === "cdc" ? "Tables streamed" : "Tables",
-                value:
-                  spec.data.sourceObjects.length === 0
-                    ? "None picked yet"
-                    : `${spec.data.sourceObjects.length} ${spec.data.sourceObjects.length === 1 ? "table" : "tables"}`,
-              },
-              {
-                label: "Schedule",
-                value:
-                  adapter === "cdc" ? (
-                    "Streams continuously"
-                  ) : (
-                    <>
-                      {scheduleLabel(spec.data.scheduleCron)}
-                      {spec.data.nextRunAt ? (
-                        <span className="block text-xs text-muted-foreground">
-                          Next {formatDateTime(spec.data.nextRunAt)} ({formatTimeUntil(spec.data.nextRunAt)})
-                        </span>
-                      ) : null}
-                    </>
-                  ),
-              },
-              {
-                label: "Last run",
-                value:
-                  runs.status === "loading" ? (
-                    "…"
-                  ) : runs.status === "error" ? (
-                    <span className="text-xs text-muted-foreground">Could not ask the orchestrator</span>
-                  ) : lastRun ? (
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <Pill tone={RUN_STATUS_TONE[lastRun.status]}>{RUN_STATUS_LABEL[lastRun.status]}</Pill>
-                      <span className="text-xs text-muted-foreground">{formatRelativeTime(lastRun.startedAt)}</span>
-                    </span>
-                  ) : (
-                    "Never run"
-                  ),
-              },
-            ]}
-          />
-        )}
-      </OverviewSection>
-
-      <OverviewSection title="Used by">
-        {detail.dependentPipelines.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No pipeline reads from this connector.</p>
-        ) : (
-          <>
-            <ul className="space-y-1">
-              {detail.dependentPipelines.map((p) => (
-                <li key={p.id} className="text-sm">
-                  <Link href={`/pipelines/${p.id}`} className="font-mono text-primary hover:underline">
-                    {p.name}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              The connector cannot be deleted while these read from it.
-            </p>
-          </>
-        )}
-      </OverviewSection>
-    </div>
-  )
-}
-
-function OverviewSection({
-  title,
-  action,
-  children,
-}: {
-  title: string
-  action?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <section className="space-y-2">
-      <div className="flex items-center justify-between gap-2 border-b border-border pb-1.5">
-        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">{title}</h3>
-        {action}
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <HealthTile
+          label="Health"
+          hint={detail.lastTestAt === null ? "Never tested" : `Tested ${formatRelativeTime(detail.lastTestAt)}`}
+          onClick={() => onOpenTab("tests")}
+        >
+          <HealthBadge health={detail.health} />
+        </HealthTile>
+        <HealthTile
+          label={adapter === "cdc" ? "Tables streamed" : "Tables"}
+          hint={specGapHint}
+          onClick={() => onOpenTab("ingest")}
+        >
+          {specGap ??
+            (tables === 0 ? (
+              <span className="text-muted-foreground">None picked yet</span>
+            ) : (
+              <span className="tabular-nums">
+                {tables} {tables === 1 ? "table" : "tables"}
+              </span>
+            ))}
+        </HealthTile>
+        <HealthTile
+          label="Schedule"
+          hint={
+            spec.status === "success" && adapter && adapter !== "cdc" && spec.data.nextRunAt
+              ? `Next ${formatDateTime(spec.data.nextRunAt)} (${formatTimeUntil(spec.data.nextRunAt)})`
+              : specGapHint
+          }
+          onClick={() => onOpenTab("ingest")}
+        >
+          {specGap ?? (adapter === "cdc" ? "Streams continuously" : scheduleLabel(spec.data?.scheduleCron ?? null))}
+        </HealthTile>
+        <HealthTile
+          label="Last run"
+          hint={
+            lastRun ? (
+              <span title={lastRun.startedAt ? formatDateTime(lastRun.startedAt) : undefined}>
+                {formatRelativeTime(lastRun.startedAt)}
+              </span>
+            ) : undefined
+          }
+          onClick={() => onOpenTab("ingest")}
+        >
+          {runs.status === "loading" ? (
+            <Skeleton className="h-5 w-20" />
+          ) : runs.status === "error" ? (
+            <span className="text-muted-foreground">Could not ask the orchestrator</span>
+          ) : lastRun ? (
+            <Pill tone={RUN_STATUS_TONE[lastRun.status]}>{RUN_STATUS_LABEL[lastRun.status]}</Pill>
+          ) : (
+            <span className="text-muted-foreground">Never run</span>
+          )}
+        </HealthTile>
       </div>
-      {children}
-    </section>
+
+      <div className="grid items-start gap-2 xl:grid-cols-2">
+        <SectionCard
+          size="sm"
+          title="Connection"
+          action={
+            <Button size="sm" variant="ghost" render={<Link href={`/connectors/${id}/edit`} />}>
+              Edit
+            </Button>
+          }
+        >
+          {spec.status === "loading" ? (
+            <Skeleton className="h-12 w-full" />
+          ) : spec.status === "error" ? (
+            <p className="text-xs text-destructive">Connection settings could not be loaded · {spec.error.message}</p>
+          ) : !adapter ? (
+            <p className="text-sm text-muted-foreground">No connection settings saved yet.</p>
+          ) : (
+            <MetadataList
+              items={connectionReviewItems(adapter, spec.data.dial).map((item) => ({
+                label: item.label,
+                value: item.value || "—",
+              }))}
+            />
+          )}
+        </SectionCard>
+
+        <SectionCard size="sm" title="Used by">
+          {detail.dependentPipelines.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No pipeline reads from this connector.</p>
+          ) : (
+            <>
+              <ul className="divide-y divide-border text-sm">
+                {detail.dependentPipelines.map((p) => (
+                  <li key={p.id} className="py-1.5 first:pt-0 last:pb-0">
+                    <Link href={`/pipelines/${p.id}`} className="font-mono text-sm text-primary hover:underline">
+                      {p.name}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-muted-foreground">
+                The connector cannot be deleted while these read from it.
+              </p>
+            </>
+          )}
+        </SectionCard>
+      </div>
+    </div>
   )
 }

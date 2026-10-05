@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import {
   ConnectorIngestPanel,
@@ -33,7 +33,10 @@ const SPEC = {
 
 type Call = { url: string; method: string; body: unknown }
 
-function stubFetch(spec: typeof SPEC = SPEC): Call[] {
+function stubFetch(
+  spec: typeof SPEC = SPEC,
+  history: { runs: unknown[]; results: unknown[] } = { runs: [], results: [] }
+): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -45,8 +48,11 @@ function stubFetch(spec: typeof SPEC = SPEC): Call[] {
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.includes("/api/governance/ingest-runs")) return json([])
-    if (url.includes("/ingest/runs")) return json([])
+    if (url.includes("/api/governance/ingest-runs")) return json(history.results)
+    if (url.includes("/ingest/runs")) return json(history.runs)
+    if (url.includes("/debezium-properties")) {
+      return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
+    }
     if (url.includes("/discover")) {
       return json({
         supported: true,
@@ -208,6 +214,202 @@ describe("ConnectorIngestPanel", () => {
     fireEvent.change(target, { target: { value: "Bad Name" } })
     expect(screen.getByText(/Lower-case letters, digits and _ only/)).toBeDefined()
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+/**
+ * Where the panel sits (plan `2026-10-05-connector-detail-page.md`, section 10,
+ * U5): the page shows three cards, two columns from `xl`; the page after
+ * creating a connector, which already wraps the panel in a card, keeps one
+ * column and no card of its own. Nothing but the arrangement differs.
+ */
+describe("ConnectorIngestPanel layout", () => {
+  const cardTitles = (root: HTMLElement) =>
+    [...root.querySelectorAll("[data-slot=card-title]")].map((t) => t.textContent)
+
+  it("is one column with no card of its own by default, as on the page after creating a connector", async () => {
+    stubFetch()
+    const { container } = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    await screen.findByText("No tables selected yet. Find tables below and tick the ones to copy.")
+    expect(container.querySelector("[data-slot=card]")).toBeNull()
+    expect(container.querySelector("[class*=xl\\:grid-cols]")).toBeNull()
+    expect(screen.getByRole("heading", { name: "Tables to ingest" })).toBeDefined()
+    expect(screen.getByRole("button", { name: "Run now" })).toBeDefined()
+  })
+
+  it("is three cards on the connector page, Tables to ingest, Schedule and Runs, with Save in Schedule and Run now in Runs", async () => {
+    stubFetch()
+    const { container } = render(
+      <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
+    )
+    await screen.findByText("No tables selected yet. Find tables below and tick the ones to copy.")
+    expect(cardTitles(container)).toEqual(["Tables to ingest", "Schedule", "Runs"])
+    const card = (title: string) =>
+      within(
+        screen.getByText(title, { selector: "[data-slot=card-title]" }).closest("[data-slot=card]") as HTMLElement
+      )
+    expect(card("Tables to ingest").getByLabelText("Schema")).toBeDefined()
+    expect(card("Tables to ingest").getByRole("button", { name: "Find tables" })).toBeDefined()
+    expect(card("Schedule").getByLabelText("Schedule")).toBeDefined()
+    expect(card("Schedule").getByRole("button", { name: "Save tables and schedule" })).toBeDefined()
+    expect(card("Runs").getByRole("button", { name: "Run now" })).toBeDefined()
+    expect(card("Runs").getByText("No runs yet.")).toBeDefined()
+  })
+
+  it("puts tables and schedule in a wider left column and the runs in the right one from xl up", async () => {
+    stubFetch()
+    const { container } = render(
+      <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
+    )
+    await screen.findByText("No tables selected yet. Find tables below and tick the ones to copy.")
+    const grid = container.firstElementChild as HTMLElement
+    expect(grid.className).toContain("xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]")
+    const [left, right] = [...grid.children] as HTMLElement[]
+    expect(cardTitles(left)).toEqual(["Tables to ingest", "Schedule"])
+    expect(cardTitles(right)).toEqual(["Runs"])
+  })
+
+  it("keeps every behaviour in the card layout: find, tick, save, with the same labels", async () => {
+    const calls = stubFetch()
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    expect((screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement).value).toBe("northwind_orders")
+    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { scheduleCron: string }).scheduleCron).toBe("0 2 * * *")
+  })
+
+  it("stops its inputs stretching across the page, and keeps the embedded ones as they were", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    const page = render(
+      <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
+    )
+    expect((await screen.findByLabelText("Bronze table for public.orders")).className).toContain("max-w-xs")
+    expect(screen.getByLabelText("Schedule").className).toContain("max-w-xs")
+    page.unmount()
+
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    expect((await screen.findByLabelText("Bronze table for public.orders")).className).not.toContain("max-w-")
+    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-")
+  })
+
+  /**
+   * Reviewer SHOULD-FIX R3: in the half-width Runs card the old single line
+   * wrapped "2d ago · took 6.0 s" mid-phrase and cut the summary. The card
+   * layout gives a run two lines; the embedded one keeps its single line.
+   */
+  describe("a run's row", () => {
+    const history = {
+      runs: [
+        { runId: "run-1234567890", status: "completed", startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z" },
+      ],
+      results: [
+        {
+          connectorId: "conn-northwind",
+          job: "ingest_job",
+          object: "public.orders",
+          rows: 7,
+          startedAt: "2026-09-29T08:22:00.000Z",
+          endedAt: "2026-09-29T08:22:10.000Z",
+          status: "succeeded",
+          error: "",
+        },
+      ],
+    }
+
+    it("has two lines in the card layout: the verdict, id and untruncated summary, then when and how long", async () => {
+      stubFetch(SPEC, history)
+      render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      expect(summaryText.className).not.toContain("truncate")
+      const firstLine = summaryText.parentElement as HTMLElement
+      expect(within(firstLine).getByText("Completed")).toBeDefined()
+      expect(within(firstLine).getByText("run-1234")).toBeDefined()
+      // When and how long is on its own, muted line below, whole.
+      const second = screen.getByText(/took 42 s|took 42\.\d s/)
+      expect(firstLine.contains(second)).toBe(false)
+      expect(second.parentElement).toBe(firstLine.parentElement)
+      expect(second.className).toContain("block")
+      expect(second.className).toContain("text-muted-foreground")
+    })
+
+    it("keeps one line, with the summary truncated, in the embedded layout", async () => {
+      stubFetch(SPEC, history)
+      render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      expect(summaryText.className).toContain("truncate")
+      const line = summaryText.parentElement as HTMLElement
+      expect(within(line).getByText("Completed")).toBeDefined()
+      expect(within(line).getByText(/took /)).toBeDefined()
+    })
+  })
+
+  it("has no Schedule card for a change-data-capture connector, whose Save ends the tables card", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "stream",
+      dial: { ...SPEC.dial, driver: "postgres" },
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders" }],
+    })
+    const { container } = render(
+      <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
+    )
+    await screen.findByText(/Debezium properties/)
+    expect(cardTitles(container)).toEqual(["Tables to ingest", "Runs"])
+    const tables = (screen.getByText("Tables to ingest", { selector: "[data-slot=card-title]" }).closest(
+      "[data-slot=card]"
+    ) as HTMLElement)
+    expect(within(tables).getByRole("button", { name: "Save tables and schedule" })).toBeDefined()
+    expect(screen.queryByLabelText("Schedule")).toBeNull()
+  })
+
+  it("says in the tables card that a Kafka connector reads its topic, and has no table list to edit", async () => {
+    stubFetch({ ...SPEC, adapter: "kafka", ingestMode: "stream", sourceObjects: [] })
+    const { container } = render(
+      <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
+    )
+    expect(await screen.findByText("A Kafka connector reads its topic; each run takes one micro-batch.")).toBeDefined()
+    expect(cardTitles(container)).toEqual(["Tables to ingest", "Schedule", "Runs"])
+    expect(screen.queryByText(/Selected ·/)).toBeNull()
+  })
+})
+
+describe("ConnectorIngestPanel onTableCount", () => {
+  it("reports how many tables are saved once the spec is read, and the new number after a save", async () => {
+    const counts: number[] = []
+    const calls = stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    render(
+      <ConnectorIngestPanel
+        connectorId="conn-northwind"
+        connectorName="northwind"
+        onTableCount={(n) => counts.push(n)}
+      />
+    )
+    await screen.findByLabelText("Bronze table for public.orders")
+    expect(counts).toEqual([1])
+
+    fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
+    fireEvent.click(await screen.findByLabelText(/public\.customers/))
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    await waitFor(() => expect(counts).toEqual([1, 2]))
+  })
+
+  it("reports nothing, rather than a zero, for a connector with no connection saved", async () => {
+    const counts: number[] = []
+    stubFetch({ ...SPEC, adapter: null as unknown as string, ingestMode: null as unknown as string })
+    render(
+      <ConnectorIngestPanel
+        connectorId="conn-northwind"
+        connectorName="northwind"
+        onTableCount={(n) => counts.push(n)}
+      />
+    )
+    await screen.findByText(/has no connection settings saved yet/)
+    expect(counts).toEqual([])
   })
 })
 

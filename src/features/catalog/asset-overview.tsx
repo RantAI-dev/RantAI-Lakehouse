@@ -4,6 +4,7 @@ import Link from "next/link"
 import { Copy } from "lucide-react"
 import { CodeBlock } from "@/components/patterns/code-block"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
+import { HealthTile } from "@/components/patterns/health-tile"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import {
@@ -83,43 +84,6 @@ async function copyText(value: string, what: string) {
   } catch (err) {
     notifyError("Failed to copy", err)
   }
-}
-
-/**
- * One tile of the health strip. A button, not a link: every tile opens a
- * tab on this same page, where the detail behind the number lives.
- */
-function HealthTile({
-  label,
-  children,
-  hint,
-  onClick,
-}: {
-  label: string
-  children: React.ReactNode
-  hint?: React.ReactNode
-  onClick?: () => void
-}) {
-  const className = cn(
-    "flex flex-col items-start gap-1.5 rounded-lg border border-border bg-card p-3 text-left",
-    onClick && "transition-colors hover:border-primary/40 hover:bg-muted/30"
-  )
-  const body = (
-    <>
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <span className="flex min-h-6 flex-wrap items-center gap-1.5 text-sm font-medium">
-        {children}
-      </span>
-      {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
-    </>
-  )
-  return onClick ? (
-    <button type="button" className={className} onClick={onClick}>
-      {body}
-    </button>
-  ) : (
-    <div className={className}>{body}</div>
-  )
 }
 
 /**

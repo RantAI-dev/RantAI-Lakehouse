@@ -22,6 +22,7 @@ mock.module("next/navigation", () => ({
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { toast } from "sonner"
 import { ConnectorDetailPage } from "./connector-detail-page"
 
 const originalFetch = global.fetch
@@ -122,8 +123,13 @@ const settle = () =>
     await new Promise((resolve) => setTimeout(resolve, 0))
   })
 
+/** A tab by its label; a count it carries ("Ingest 2") is part of its name. */
+function tab(name: string): HTMLElement {
+  return screen.getByRole("tab", { name: new RegExp(`^${name}`) })
+}
+
 function selected(name: string): string | null {
-  return screen.getByRole("tab", { name }).getAttribute("aria-selected")
+  return tab(name).getAttribute("aria-selected")
 }
 
 describe("ConnectorDetailPage", () => {
@@ -177,7 +183,11 @@ describe("ConnectorDetailPage", () => {
     stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)
     expect(await screen.findByText("No pipeline reads from this connector.")).toBeDefined()
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["Overview", "Ingest", "Connection tests"])
+    const names = screen.getAllByRole("tab").map((t) => t.textContent ?? "")
+    // Ingest carries a count once the saved spec is read; the others none.
+    expect(names[0]).toBe("Overview")
+    expect(names[1]).toMatch(/^Ingest\d*$/)
+    expect(names[2]).toBe("Connection tests")
     expect(selected("Overview")).toBe("true")
     expect(selected("Ingest")).toBe("false")
     expect(selected("Connection tests")).toBe("false")
@@ -212,13 +222,13 @@ describe("ConnectorDetailPage", () => {
     render(<ConnectorDetailPage connectorId="conn-a" />)
     await screen.findByText("No pipeline reads from this connector.")
 
-    fireEvent.click(screen.getByRole("tab", { name: "Ingest" }))
+    fireEvent.click(tab("Ingest"))
     expect(window.history.replaceState).toHaveBeenLastCalledWith(null, "", "/connectors/conn-a?tab=ingest")
     await screen.findByText("No tables selected yet. Find tables below and tick the ones to copy.")
-    fireEvent.click(screen.getByRole("tab", { name: "Connection tests" }))
+    fireEvent.click(tab("Connection tests"))
     expect(window.history.replaceState).toHaveBeenLastCalledWith(null, "", "/connectors/conn-a?tab=tests")
     await screen.findByText("Not tested yet. Only tests this build can run are recorded.")
-    fireEvent.click(screen.getByRole("tab", { name: "Overview" }))
+    fireEvent.click(tab("Overview"))
     expect(window.history.replaceState).toHaveBeenLastCalledWith(null, "", "/connectors/conn-a")
     await settle()
   })
@@ -226,7 +236,7 @@ describe("ConnectorDetailPage", () => {
   it("lets the Overview open the Ingest tab of the page", async () => {
     stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)
-    fireEvent.click(await screen.findByRole("button", { name: "Manage" }))
+    fireEvent.click(await screen.findByRole("button", { name: /^Tables/ }))
     await waitFor(() => expect(selected("Ingest")).toBe("true"))
     expect(window.history.replaceState).toHaveBeenLastCalledWith(null, "", "/connectors/conn-a?tab=ingest")
   })
@@ -235,14 +245,14 @@ describe("ConnectorDetailPage", () => {
     stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)
     await screen.findByText("No pipeline reads from this connector.")
-    fireEvent.click(screen.getByRole("tab", { name: "Ingest" }))
+    fireEvent.click(tab("Ingest"))
     const schema = (await screen.findByLabelText("Schema")) as HTMLInputElement
     expect(schema.value).toBe("public")
     fireEvent.change(schema, { target: { value: "sales" } })
 
-    fireEvent.click(screen.getByRole("tab", { name: "Connection tests" }))
+    fireEvent.click(tab("Connection tests"))
     await screen.findByText("Not tested yet. Only tests this build can run are recorded.")
-    fireEvent.click(screen.getByRole("tab", { name: "Ingest" }))
+    fireEvent.click(tab("Ingest"))
     expect(((await screen.findByLabelText("Schema")) as HTMLInputElement).value).toBe("sales")
   })
 
@@ -271,10 +281,12 @@ describe("ConnectorDetailPage", () => {
     expect(screen.queryByRole("status", { name: "Loading" })).toBeNull()
     expect(screen.getByRole("heading", { level: 1, name: "db demo" })).toBeDefined()
     release(json({ ...DETAIL, health: "degraded" }))
-    expect(await screen.findByText("Degraded")).toBeDefined()
+    // The new health shows in the header and in the Overview's Health tile.
+    await waitFor(() => expect(screen.getAllByText("Degraded").length).toBe(2))
 
-    fireEvent.click(screen.getByRole("tab", { name: "Connection tests" }))
-    expect(await screen.findByText(/^Passed · Connected via PostgreSQL/)).toBeDefined()
+    fireEvent.click(tab("Connection tests"))
+    expect(await screen.findByText("Passed")).toBeDefined()
+    expect(screen.getByText("Connected via PostgreSQL")).toBeDefined()
   })
 
   it("says plainly when the connector type cannot be tested", async () => {
@@ -284,7 +296,205 @@ describe("ConnectorDetailPage", () => {
     })
     render(<ConnectorDetailPage connectorId="conn-a" />)
     fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
-    expect(await screen.findByText("Not testable · This build has no probe for MQTT")).toBeDefined()
+    expect(await screen.findByText("Not testable")).toBeDefined()
+    expect(screen.getByText("This build has no probe for MQTT")).toBeDefined()
+  })
+
+  it("lists the connector's facts in a row under the title, and takes them out of the Overview", async () => {
+    stubFetch()
+    const { container } = render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    // The first definition list of the page is the header's row of facts.
+    const facts = within(container.querySelector("dl") as HTMLElement)
+    const fact = (label: string) => facts.getByText(label).nextElementSibling?.textContent
+    expect(fact("Tenant")).toBe("Acme Co")
+    expect(fact("Residency")).toBe("id-jakarta")
+    expect(fact("Owner")).toBe("admin")
+    expect(fact("Credential")).toBe("Stored by lakehouse")
+    expect(fact("Last test")).toBe("Never tested")
+    // The type (the description) and the environment (a pill by the name) are
+    // in the header already, so the row does not say them a second time.
+    expect(facts.queryByText("Type")).toBeNull()
+    expect(facts.queryByText("Environment")).toBeNull()
+    expect(screen.getAllByText("PostgreSQL").length).toBe(1)
+    expect(screen.getAllByText("production").length).toBe(1)
+    // The Overview no longer has a "Details" section repeating them.
+    await screen.findByText("No pipeline reads from this connector.")
+    expect(screen.queryByText("Details")).toBeNull()
+    expect(screen.queryByText("Direction")).toBeNull()
+  })
+
+  it("says plainly what a fact lacks, and when the last test was, with the full time on hover", async () => {
+    stubFetch(
+      {},
+      {
+        ...DETAIL,
+        tenant: "",
+        environment: "",
+        residency: "",
+        owner: "",
+        credentialManaged: false,
+        lastTestAt: "2026-10-04T00:00:00.000Z",
+      }
+    )
+    const { container } = render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    const facts = within(container.querySelector("dl") as HTMLElement)
+    const fact = (label: string) => facts.getByText(label).nextElementSibling
+    expect(fact("Tenant")?.textContent).toBe("Unassigned")
+    expect(fact("Residency")?.textContent).toBe("—")
+    expect(fact("Owner")?.textContent).toBe("—")
+    expect(fact("Credential")?.textContent).toBe("Provisioned on the server")
+    const lastTest = fact("Last test")
+    expect(lastTest?.textContent).not.toBe("Never tested")
+    expect(lastTest?.querySelector("[title]")?.getAttribute("title")).toMatch(/2026/)
+  })
+
+  it("gives each tab its icon", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText("No pipeline reads from this connector.")
+    for (const t of screen.getAllByRole("tab")) expect(t.querySelector("svg")).not.toBeNull()
+  })
+
+  it("counts the saved tables on the Ingest tab, and none on the tab with nothing to count", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({
+          ...SPEC,
+          sourceObjects: [
+            { name: "public.orders", target: "db_demo_orders" },
+            { name: "public.customers", target: "db_demo_customers" },
+          ],
+        }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await waitFor(() => expect(tab("Ingest").textContent).toBe("Ingest2"))
+    expect(tab("Overview").textContent).toBe("Overview")
+    // No test yet: nothing to flag on Connection tests.
+    expect(tab("Connection tests").textContent).toBe("Connection tests")
+  })
+
+  it("counts a zero for a connector whose connection is saved but that has no tables", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await waitFor(() => expect(tab("Ingest").textContent).toBe("Ingest0"))
+  })
+
+  it("puts no count on the Ingest tab for a connector with no connection saved, rather than a zero", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({ ...SPEC, adapter: null, ingestMode: null, sourceObjects: [] }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    // Both ingest tiles of the Overview say so, and the panel has read the
+    // same spec by then.
+    expect((await screen.findAllByText("Not set up yet")).length).toBe(2)
+    await settle()
+    expect(tab("Ingest").textContent).toBe("Ingest")
+  })
+
+  it("flags Connection tests with a red 1 while the latest test failed, and clears it after a passing one", async () => {
+    let failing = true
+    const probe = () => ({
+      testedAt: "2026-10-05T00:00:00.000Z",
+      ok: !failing,
+      latencyMs: failing ? null : 5,
+      message: failing ? "connection refused" : "Connected via PostgreSQL",
+    })
+    stubFetch({
+      "GET /api/connectors/conn-a/probe-history?limit=1": () => json({ results: [probe()] }),
+      "POST /api/connectors/conn-a/test": () => {
+        failing = false
+        return json({ ok: true, supported: true, latencyMs: 5, message: "Connected via PostgreSQL", testedAt: probe().testedAt })
+      },
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await waitFor(() => expect(tab("Connection tests").textContent).toBe("Connection tests1"))
+    // A failure reads as trouble: the count is in the danger tone.
+    expect(within(tab("Connection tests")).getByText("1").className).toContain("text-destructive")
+
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }))
+    await waitFor(() => expect(tab("Connection tests").textContent).toBe("Connection tests"))
+  })
+
+  it("puts no count on Connection tests when the latest test passed, even if an older one failed", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/probe-history?limit=1": () =>
+        json({ results: [{ testedAt: "2026-10-05T00:00:00.000Z", ok: true, latencyMs: 5, message: "Connected via PostgreSQL" }] }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText("No pipeline reads from this connector.")
+    await settle()
+    expect(tab("Connection tests").textContent).toBe("Connection tests")
+  })
+
+  describe("the result of Test connection", () => {
+    function spyToasts() {
+      return {
+        success: spyOn(toast, "success").mockImplementation(() => 1),
+        error: spyOn(toast, "error").mockImplementation(() => 1),
+        info: spyOn(toast, "info").mockImplementation(() => 1),
+      }
+    }
+    const titleOf = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map((c) => c[0])
+
+    it("announces a pass only when the probe ran and passed, and shows a notice in the success tone", async () => {
+      const toasts = spyToasts()
+      stubFetch()
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+      const notice = (await screen.findByText("Connection test passed")).closest("[role=status]") as HTMLElement
+      expect(notice.textContent).toContain("Connected via PostgreSQL · 5 ms")
+      expect(notice.className).toContain("emerald")
+      expect(titleOf(toasts.success)).toEqual(["Connection test passed"])
+      expect(toasts.error).not.toHaveBeenCalled()
+      expect(toasts.info).not.toHaveBeenCalled()
+    })
+
+    it("announces a failure, not a pass, when the probe ran and did not connect, though the request itself succeeded", async () => {
+      const toasts = spyToasts()
+      stubFetch({
+        "POST /api/connectors/conn-a/test": () =>
+          json({ ok: false, supported: true, latencyMs: 12, message: "connection refused", testedAt: "2026-10-05T01:00:00.000Z" }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+      const notice = (await screen.findByText("Connection test failed")).closest("[role=status]") as HTMLElement
+      expect(notice.textContent).toContain("connection refused · 12 ms")
+      expect(notice.className).toContain("destructive")
+      expect(titleOf(toasts.error)).toEqual(["Connection test failed"])
+      expect(toasts.success).not.toHaveBeenCalled()
+      expect(toasts.info).not.toHaveBeenCalled()
+    })
+
+    it("says the type cannot be tested, as neither a pass nor a failure", async () => {
+      const toasts = spyToasts()
+      stubFetch({
+        "POST /api/connectors/conn-a/test": () =>
+          json({ ok: false, supported: false, latencyMs: null, message: "This build has no probe for MQTT", testedAt: null }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+      const notice = (await screen.findByText("Not testable")).closest("[role=status]") as HTMLElement
+      expect(notice.textContent).toContain("This build has no probe for MQTT")
+      expect(notice.textContent).not.toContain("ms")
+      expect(titleOf(toasts.info)).toEqual(["This connector type cannot be tested"])
+      expect(toasts.success).not.toHaveBeenCalled()
+      expect(toasts.error).not.toHaveBeenCalled()
+    })
+
+    it("still reports a request that failed outright as a failed test, with the translated error, and shows no notice", async () => {
+      const toasts = spyToasts()
+      stubFetch({ "POST /api/connectors/conn-a/test": () => json({ error: "probe worker down" }, 500) })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+      await waitFor(() => expect(toasts.error).toHaveBeenCalledTimes(1))
+      expect(toasts.error.mock.calls[0][0]).toBe("Connection test failed")
+      expect(toasts.success).not.toHaveBeenCalled()
+      // A refused request has no result to put in a notice.
+      expect(screen.queryByText(/^Connection test (passed|failed)$/)).toBeNull()
+    })
   })
 
   it("disables Delete, with the reason, while pipelines use the connector", async () => {
