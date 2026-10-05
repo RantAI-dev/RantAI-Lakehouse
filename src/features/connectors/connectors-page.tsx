@@ -2,178 +2,37 @@
 
 import { useCallback, useMemo, useState } from "react"
 import Link from "next/link"
-import { usePathname, useSearchParams } from "next/navigation"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { PlusIcon, UploadIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
-import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { PageHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
   ErrorState,
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
-import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useDataTable } from "@/hooks/use-data-table"
-import { useService, useServiceAction } from "@/hooks/use-service"
+import { useService } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
-import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
-import type { Connector } from "@/services/contracts/connectors"
-import { ConnectorDeleteDialog } from "./connector-delete-dialog"
-import { ConnectorIngestPanel } from "./connector-ingest-panel"
-import { ConnectorOverview } from "./connector-overview"
-import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
-import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
+import { getConnectorColumns } from "./connectors-columns"
 import { UploadsPanel } from "./uploads-panel"
 
-type DrawerTab = "overview" | "ingest" | "tests"
-
 /**
- * Drawer body — fetches full connector detail for the selected row. The
- * status and actions stay on top; below, one tab each for the overview,
- * what the connector ingests (kept mounted, so tables picked but not yet
- * saved survive a look at another tab) and its connection tests.
- */
-function ConnectorDetail({
-  id,
-  onDeleted,
-}: {
-  readonly id: string
-  readonly onDeleted: () => void
-}) {
-  const state = useService((s) => connectorService.getConnector(id, s), [id])
-  const [deleteOpen, setDeleteOpen] = useState(false)
-  const [tab, setTab] = useState<DrawerTab>("overview")
-  const testAction = useServiceAction(
-    withNotify(
-      { success: "Connection test passed", error: "Connection test failed" },
-      (signal, connectorId: string) =>
-        connectorService.testConnection(connectorId, signal)
-    )
-  )
-  const [historyKey, setHistoryKey] = useState(0)
-
-  if (state.status === "loading") return <LoadingSkeleton rows={4} />
-  if (state.status === "error")
-    return <ErrorState error={state.error} onRetry={state.reload} />
-  const c = state.data
-  const inUse = c.dependentPipelines.length
-
-  return (
-    <>
-      <div className="flex flex-wrap items-center gap-2">
-        <HealthBadge health={c.health} />
-        <Pill tone="neutral">{DIRECTION_LABEL[c.direction]}</Pill>
-        {c.environment ? <Pill tone="neutral">{c.environment}</Pill> : null}
-      </div>
-      <div className="flex flex-wrap gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={testAction.status === "pending"}
-          onClick={async () => {
-            await testAction.run(id)
-            state.reload()
-            setHistoryKey((k) => k + 1)
-          }}
-        >
-          {testAction.status === "pending" ? "Testing…" : "Test connection"}
-        </Button>
-        <Button size="sm" variant="outline" render={<Link href={`/connectors/${id}/edit`} />}>
-          Edit
-        </Button>
-        <Button size="sm" render={<Link href={`/pipelines/create?connectorId=${id}`} />}>
-          Create pipeline
-        </Button>
-        {c.auditEventId ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            render={<Link href={`/audit?event=${c.auditEventId}`} />}
-          >
-            Audit
-          </Button>
-        ) : null}
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-destructive hover:text-destructive"
-          disabled={inUse > 0}
-          title={
-            inUse > 0
-              ? `Used by ${inUse} pipeline${inUse === 1 ? "" : "s"} (see Used by); those must be deleted or moved first`
-              : undefined
-          }
-          onClick={() => setDeleteOpen(true)}
-        >
-          Delete
-        </Button>
-      </div>
-      <ConnectorDeleteDialog
-        connector={c}
-        dependents={c.dependentPipelines}
-        open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        onDeleted={onDeleted}
-      />
-      {testAction.data ? (
-        <p
-          className={
-            !testAction.data.supported
-              ? "text-sm text-muted-foreground"
-              : testAction.data.ok
-                ? "text-sm text-emerald-600 dark:text-emerald-400"
-                : "text-sm text-destructive"
-          }
-        >
-          {testAction.data.supported ? (
-            <>
-              {testAction.data.message}
-              {testAction.data.latencyMs !== null ? ` · ${testAction.data.latencyMs} ms` : ""}
-            </>
-          ) : (
-            <>Not testable · {testAction.data.message}</>
-          )}
-        </p>
-      ) : null}
-      <Tabs value={tab} onValueChange={(v) => setTab(v as DrawerTab)} className="gap-4">
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="ingest">Ingest</TabsTrigger>
-          <TabsTrigger value="tests">Connection tests</TabsTrigger>
-        </TabsList>
-        <TabsContent value="overview">
-          {/* Remounted on every visit (and after a test), so it never
-              shows a schedule or a run from before a change elsewhere. */}
-          <ConnectorOverview key={historyKey} detail={c} onOpenTab={setTab} />
-        </TabsContent>
-        <TabsContent value="ingest" keepMounted>
-          <ConnectorIngestPanel connectorId={id} connectorName={c.name} />
-        </TabsContent>
-        <TabsContent value="tests">
-          <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
-        </TabsContent>
-      </Tabs>
-    </>
-  )
-}
-
-/**
- * The "Connectors" tab: what the page showed before it had tabs, unchanged.
+ * The "Connectors" tab: the list. A connector opens on its own page,
+ * `/connectors/<id>`, from its name, the row menu, or a press anywhere on its
+ * row (plan `docs/superpowers/plans/2026-10-05-connector-detail-page.md`).
  */
 function ConnectorsTab() {
+  const router = useRouter()
   const state = useService((s) => connectorService.listConnectors(s), [])
-  const [selected, setSelected] = useState<Connector | null>(null)
 
-  const columns = useMemo(
-    () => getConnectorColumns({ onSelect: setSelected }),
-    []
-  )
+  const columns = useMemo(() => getConnectorColumns(), [])
 
   const tableUrlState = useTableUrlState()
   const filteredData = useMemo(
@@ -232,30 +91,13 @@ function ConnectorsTab() {
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">
-            <DataTable table={table} />
+            <DataTable
+              table={table}
+              onRowClick={(connector) => router.push(`/connectors/${connector.id}`)}
+            />
           </div>
         </div>
       ) : null}
-
-      <DetailDrawer
-        open={selected !== null}
-        onOpenChange={(open) => {
-          if (!open) setSelected(null)
-        }}
-        title={selected?.name ?? ""}
-        description={selected?.type}
-        wide
-      >
-        {selected ? (
-          <ConnectorDetail
-            id={selected.id}
-            onDeleted={() => {
-              setSelected(null)
-              state.reload()
-            }}
-          />
-        ) : null}
-      </DetailDrawer>
     </div>
   )
 }
