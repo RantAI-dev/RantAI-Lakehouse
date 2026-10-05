@@ -1,0 +1,93 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # manual trigger from GitHub UI
+
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to staging VM
+    # Runs on the VM via self-hosted runner registered with label "staging"
+    runs-on: [self-hosted, staging]
+    environment:
+      name: staging
+      url: http://localhost:3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # compose.sh needs git rev-parse
+
+      - name: Setup staging .env
+        working-directory: ${{ github.workspace }}
+        run: |
+          cp .env.example .env
+          cat .env.staging >> .env
+          echo "=== staging .env ready ==="
+
+      - name: Build & start backend stack (core + seaweedfs + dagster + trino)
+        working-directory: ${{ github.workspace }}
+        run: |
+          scripts/compose.sh \
+            --profile seaweedfs \
+            --profile dagster \
+            --profile trino \
+            up -d --build --remove-orphans
+        timeout-minutes: 30
+
+      - name: Health-check lakehouse-api
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health; then
+              echo "lakehouse-api healthy"
+              exit 0
+            fi
+            echo "waiting ... ${i}/30"
+            sleep 2
+          done
+          echo "::error::lakehouse-api did not become healthy"
+          exit 1
+
+      - name: Build frontend image
+        working-directory: ${{ github.workspace }}
+        run: |
+          docker build -f Dockerfile.frontend -t lakehouse-frontend:staging .
+        timeout-minutes: 10
+
+      - name: Deploy frontend
+        run: |
+          docker stop  lakehouse-frontend 2>/dev/null || true
+          docker rm    lakehouse-frontend 2>/dev/null || true
+          docker run -d \
+            --name lakehouse-frontend \
+            --network rantai-lakehouse_default \
+            -p 3000:3000 \
+            -e RUST_API_URL=http://lakehouse-api:8080 \
+            --restart unless-stopped \
+            lakehouse-frontend:staging
+
+      - name: Verify frontend
+        run: |
+          sleep 3
+          curl -sf -o /dev/null -w '%{http_code}' http://localhost:3000 || true
+          echo ""
+
+      - name: Summary
+        run: |
+          echo "### Staging services" >> "$GITHUB_STEP_SUMMARY"
+          docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Endpoint | URL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Frontend | http://localhost:3000 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| API      | http://localhost:8080 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dagster  | http://localhost:3001 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trino    | http://localhost:8091 |" >> "$GITHUB_STEP_SUMMARY"
+        continue-on-error: true
