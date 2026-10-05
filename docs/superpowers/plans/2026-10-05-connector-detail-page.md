@@ -315,3 +315,51 @@ On the final commit (`9cfcee0`):
   off. It lives in `src/lib/notify-message.ts` and is used everywhere.
 
 ## 9. Review (planner)
+
+### T1, T2, T3 (reviewer, 2026-10-05)
+
+Reviewed `733a5ae`, `fad7b77` and `9cfcee0` against the plan.
+
+**Findings: none. No `BLOCKER`, no `SHOULD-FIX`.**
+
+What was checked:
+
+- The page is the sheet's body moved, with the header and the tab-in-address
+  the plan asked for. The three tab components are used as they were.
+- The developer's two choices beyond the plan are accepted: the detail read
+  keeps its data while it reloads (otherwise a test would blank the header
+  and drop unsaved table picks in the Ingest tab), and the Overview goes to
+  two columns at `xl`, not `lg`.
+- Nothing under `src/features/connectors/` imports `DetailDrawer` any more.
+- The route file is a thin default export; the component starts with
+  `"use client"` and imports `@/services` only.
+
+Seen signed in, in a headless browser against the trial console and the
+development API:
+
+- A press on a cell of a row in the Sources list lands on
+  `/connectors/<id>`; no side sheet opens.
+- The page shows the name, health, direction and environment, the five
+  actions, and the tabs Overview, Ingest, Connection tests.
+- `/connectors/<id>?tab=tests` opens on Connection tests.
+- `/connectors/does-not-exist` shows "Not found", the API's sentence, and
+  the "Sources" link.
+
+Verification re-run by the reviewer on `ba6971d`:
+
+- `bun run typecheck` — pass.
+- `bun run lint` — 0 errors, the 5 warnings of the base.
+- `bun run test` — 520 passed in 73 files.
+- `bun --bun next build`, in a throwaway copy of the branch so the trial
+  console was not disturbed — pass; `/connectors/[id]` is built.
+
+Not verified: rows 5, 6, 9 and 10 of the checklist in a browser (a test,
+Edit and Cancel, the lineage node, a delete). The component tests cover
+them; the product owner's run is the check.
+
+Noted, not findings against this change (all existed in the sheet):
+
+- The "Connection test passed" toast fires for any answered test, a failed
+  probe included; the line under the header is the accurate one.
+- The shared hint under a 404 says "Reload the list.", which reads oddly on
+  a page.
