@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Copy, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
+import { Copy, FolderInput, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { Pill } from "@/components/patterns/status-badge"
@@ -21,6 +21,57 @@ export type BoardRowActions = {
   onRename: (board: Board) => void
   onDuplicate: (board: Board) => void
   onDelete: (board: Board) => void
+  /** Absent when the viewer may not file dashboards (`dashboard:write`). */
+  onMove?: (board: Board) => void
+}
+
+/**
+ * The ⋯ menu of one dashboard, shared by the table row and the gallery
+ * card so both offer the same actions. Renders nothing for the built-in
+ * board: it has no table row, so it cannot be renamed, moved or deleted,
+ * and a menu whose every item is dead is worse than none.
+ */
+export function BoardActionsMenu({
+  board: b,
+  actions,
+}: {
+  readonly board: Board
+  readonly actions: BoardRowActions
+}) {
+  if (b.builtin) return null
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 p-0"
+            aria-label={`Actions for ${b.name}`}
+          />
+        }
+      >
+        <MoreHorizontal className="size-4" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onClick={() => actions.onRename(b)}>
+          <Pencil className="size-4" /> Rename
+        </DropdownMenuItem>
+        {actions.onMove ? (
+          <DropdownMenuItem onClick={() => actions.onMove?.(b)}>
+            <FolderInput className="size-4" /> Move to folder…
+          </DropdownMenuItem>
+        ) : null}
+        <DropdownMenuItem onClick={() => actions.onDuplicate(b)}>
+          <Copy className="size-4" /> Duplicate
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem variant="destructive" onClick={() => actions.onDelete(b)}>
+          <Trash2 className="size-4" /> Delete
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
 }
 
 /**
@@ -42,7 +93,15 @@ export function ShareBadges({ board }: { readonly board: Board }) {
   )
 }
 
-export function getDashboardColumns(actions: BoardRowActions): ColumnDef<Board>[] {
+/**
+ * `folderPathOf` turns a board's `folderId` into "Sales / Q1" ("" for no
+ * folder). The table shows it as a column, sortable and filterable, since
+ * a flat table cannot carry the gallery's folder sections.
+ */
+export function getDashboardColumns(
+  actions: BoardRowActions,
+  folderPathOf: (board: Board) => string,
+): ColumnDef<Board>[] {
   return [
     {
       accessorKey: "name",
@@ -65,6 +124,16 @@ export function getDashboardColumns(actions: BoardRowActions): ColumnDef<Board>[
       },
       enableColumnFilter: true,
       meta: { label: "Dashboard", variant: "text" },
+    },
+    {
+      id: "folder",
+      accessorFn: (b) => folderPathOf(b),
+      header: ({ column }) => <DataTableColumnHeader column={column} label="Folder" />,
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{folderPathOf(row.original) || "—"}</span>
+      ),
+      enableColumnFilter: true,
+      meta: { label: "Folder", variant: "text" },
     },
     {
       accessorKey: "chartCount",
@@ -106,9 +175,6 @@ export function getDashboardColumns(actions: BoardRowActions): ColumnDef<Board>[
       header: () => <span className="sr-only">Actions</span>,
       cell: ({ row }) => {
         const b = row.original
-        // Board bawaan tidak punya baris di tabel: tidak bisa di-rename,
-        // dibagikan, atau dihapus. Menampilkan menu yang seluruh isinya
-        // mati lebih membingungkan daripada tidak menampilkannya.
         if (b.builtin) {
           return (
             <div className="flex items-center justify-end">
@@ -118,32 +184,7 @@ export function getDashboardColumns(actions: BoardRowActions): ColumnDef<Board>[
         }
         return (
           <div className="flex items-center justify-end">
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-8 p-0"
-                    aria-label={`Actions for ${b.name}`}
-                  />
-                }
-              >
-                <MoreHorizontal className="size-4" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-48">
-                <DropdownMenuItem onClick={() => actions.onRename(b)}>
-                  <Pencil className="size-4" /> Rename
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => actions.onDuplicate(b)}>
-                  <Copy className="size-4" /> Duplicate
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem variant="destructive" onClick={() => actions.onDelete(b)}>
-                  <Trash2 className="size-4" /> Delete
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <BoardActionsMenu board={b} actions={actions} />
           </div>
         )
       },

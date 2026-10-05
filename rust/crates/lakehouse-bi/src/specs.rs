@@ -44,8 +44,15 @@ pub enum ChartKind {
     Radar,
     /// Waterfall chart.
     Waterfall,
-    /// Geographic choropleth map.
+    /// Geographic choropleth map: one value per region of the chart's
+    /// `map`, joined by region name.
     Geomap,
+    /// One symbol per row at (`lon`, `lat`) over the chart's `map` outline;
+    /// size and colour follow the first measure.
+    Pointmap,
+    /// Density heatmap of the same (`lon`, `lat`) rows, weighted by the
+    /// first measure.
+    Geoheat,
     /// Flow between two dimensions (`x` → `series`), width = value.
     /// Needs a breakdown.
     Sankey,

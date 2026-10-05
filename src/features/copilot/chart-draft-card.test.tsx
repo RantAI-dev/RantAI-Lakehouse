@@ -18,3 +18,13 @@ test("a mart chart is unchanged", () => {
   expect(def.mart).toBe("mart_x")
   expect(def.sqlSource).toBeUndefined()
 })
+
+test("a map chart keeps its map and coordinate columns for the preview and the builder", () => {
+  const def = chartDefFromArgs({
+    title: "Visitors by place", kind: "pointmap", mart: "mart_x", measures: ["visitors"],
+    map: "id-provinces", lat: "lat", lon: "lon",
+  })
+  expect([def.map, def.lat, def.lon]).toEqual(["id-provinces", "lat", "lon"])
+  const plain = chartDefFromArgs({ title: "T", kind: "bar", mart: "mart_x", dimension: "d", measures: ["m"], lat: "  " })
+  expect([plain.map, plain.lat, plain.lon]).toEqual([undefined, undefined, undefined])
+})

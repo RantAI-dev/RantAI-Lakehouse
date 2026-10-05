@@ -175,6 +175,8 @@
               "radar",
               "waterfall",
               "geomap",
+              "pointmap",
+              "geoheat",
               "sankey",
               "sunburst",
               "boxplot",
@@ -209,6 +211,18 @@
           },
           "breakdown": {
             "type": "string"
+          },
+          "map": {
+            "type": "string",
+            "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta (Jakarta cities), id-provinces (Indonesian provinces), id-regencies (Indonesian kabupaten/kota)"
+          },
+          "lat": {
+            "type": "string",
+            "description": "pointmap and geoheat only (required): the latitude column"
+          },
+          "lon": {
+            "type": "string",
+            "description": "pointmap and geoheat only (required): the longitude column"
           },
           "aggregate": {
             "type": "string",
@@ -280,6 +294,8 @@
               "radar",
               "waterfall",
               "geomap",
+              "pointmap",
+              "geoheat",
               "sankey",
               "sunburst",
               "boxplot",
@@ -308,6 +324,18 @@
           },
           "caption": {
             "type": "string"
+          },
+          "map": {
+            "type": "string",
+            "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta, id-provinces, id-regencies"
+          },
+          "lat": {
+            "type": "string",
+            "description": "pointmap and geoheat only (required): the latitude column"
+          },
+          "lon": {
+            "type": "string",
+            "description": "pointmap and geoheat only (required): the longitude column"
           },
           "target": {
             "type": "number"

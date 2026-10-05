@@ -138,7 +138,7 @@ export function CommandPalette() {
 
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-          <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/copilot")} />
+          <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
           {/* "Open Dashboards" sengaja menuju `/dashboards`: itu penerus yang
               membawa ke board terakhir, jadi label ini menepati janjinya.
               Mengelola daftarnya adalah tujuan lain, maka barisnya sendiri. */}

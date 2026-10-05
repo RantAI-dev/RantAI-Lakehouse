@@ -14,7 +14,6 @@ import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { useCopilot } from "@/features/copilot/use-copilot";
-import { useAuth } from "@/features/auth/auth-provider";
 import { useService } from "@/hooks/use-service";
 import { dashboardService } from "@/services";
 import { apiFetch } from "@/services/http";
@@ -29,7 +28,6 @@ import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-gri
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
-import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
@@ -58,8 +56,10 @@ const NO_RESULTS: Record<string, Cell> = {};
  * real mart column — except on time series, whose axis is a derived period.
  */
 function drillColumn(spec: ChartCard): string | undefined {
-  // Nodes, rings, distributions and days are not one category value to drill into.
-  if (["geomap", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
+  // Nodes, rings, distributions and days are not one category value to drill
+  // into, and neither is a map (points have no category, and a region click
+  // would drill into a name that was matched, not stored).
+  if (["geomap", "pointmap", "geoheat", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
   if (spec.source !== "builtin") return spec.def?.dimension || undefined;
   return ["line", "area"].includes(spec.kind) ? undefined : spec.x || undefined;
 }
@@ -94,12 +94,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
-  const [foldersOpen, setFoldersOpen] = React.useState(false);
-  const [moveOpen, setMoveOpen] = React.useState(false);
-  // Folders are listed to everyone who can see dashboards; filing needs
-  // dashboard:write, which the API enforces (policy.rs).
-  const { hasPermission } = useAuth();
-  const canFile = hasPermission("dashboard:write");
+  // Folders only group the title switcher here. Managing them and filing
+  // a dashboard are on the dashboard list (`dashboard-list-page.tsx`).
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
   const folders = foldersState.data ?? [];
   const [shareOpen, setShareOpen] = React.useState(false);
@@ -213,12 +209,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setRecords({ ...rows, value, loading: false });
   }, []);
 
-  // Open /dashboards (demo) → jump straight to the newest user dashboard if one exists.
-  React.useEffect(() => {
-    if (data && isDefault && data.boards.length > 1) {
-      router.replace(`/dashboards?board=${data.boards[data.boards.length - 1].id}`);
-    }
-  }, [data, isDefault, router]);
+  // No "jump to the newest user dashboard" from the built-in board here.
+  // That effect dated from when `/dashboards` was this page; it now is the
+  // resolver (`dashboard-resolver.tsx`), which sends you to the board you
+  // last had open. Opening Main from the list remembered "default", this
+  // effect replaced the URL with `/dashboards?board=<newest>`, the resolver
+  // sent you back to Main, and the page reloaded forever. Where to land is
+  // the resolver's decision alone; Main is a board you can choose to open.
 
   // Save layout (debounced). The built-in board saves too: the backend
   // accepts a layout — and only a layout — for id "default".
@@ -392,7 +389,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             onSelect={(id) => router.push(`/dashboards/${id}`)}
             onCreate={() => void createDashboard()}
             folders={folders}
-            onManageFolders={canFile ? () => setFoldersOpen(true) : undefined}
           />
 
         }
@@ -410,7 +406,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onToggleFullscreen={() => setFullscreen((f) => !f)}
               onAutoSec={setAutoSec}
               onRename={() => setRenameOpen(true)}
-              onMove={canFile ? () => setMoveOpen(true) : undefined}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDuplicate={() => void duplicateDashboard()}
@@ -542,24 +537,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
-      ) : null}
-      {canFile ? (
-        <ManageFoldersDialog
-          open={foldersOpen}
-          onOpenChange={setFoldersOpen}
-          folders={folders}
-          onChanged={notifyDashboardsChanged}
-        />
-      ) : null}
-      {canFile && !isDefault ? (
-        <MoveBoardDialog
-          open={moveOpen}
-          onOpenChange={setMoveOpen}
-          folders={folders}
-          boardId={board}
-          currentFolderId={boards.find((b) => b.id === board)?.folderId ?? ""}
-          onMoved={notifyDashboardsChanged}
-        />
       ) : null}
     </div>
   );
