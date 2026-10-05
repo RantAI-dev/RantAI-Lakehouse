@@ -86,10 +86,12 @@ export function recentProblems(
 }
 
 /**
- * The drawer's first tab: what the connector is, where it connects, what it
- * ingests and when, and what needs a look. Every value comes from the API;
- * a part that could not be loaded says so instead of showing an empty or
- * zero value that would read as a real one.
+ * The connector page's first tab: what the connector is, where it connects,
+ * what it ingests and when, and what needs a look. Every value comes from the
+ * API; a part that could not be loaded says so instead of showing an empty or
+ * zero value that would read as a real one. `onOpenTab` changes the page's
+ * open tab. The four sections sit in two columns once the page is wide
+ * enough; "Needs attention", when there is something, stays full width above.
  */
 export function ConnectorOverview({
   detail,
@@ -109,11 +111,11 @@ export function ConnectorOverview({
   const adapter = spec.data?.adapter ?? null
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-2">
       {problems.length > 0 ? (
         <section
           aria-labelledby="connector-problems"
-          className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5"
+          className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 xl:col-span-2"
         >
           <h3 id="connector-problems" className="flex items-center gap-1.5 text-sm font-medium text-destructive">
             <TriangleAlertIcon className="size-4" />
