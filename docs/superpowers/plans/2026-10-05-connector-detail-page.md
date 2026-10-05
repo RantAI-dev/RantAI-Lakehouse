@@ -363,3 +363,97 @@ Noted, not findings against this change (all existed in the sheet):
   probe included; the line under the header is the accurate one.
 - The shared hint under a 404 says "Reload the list.", which reads oddly on
   a page.
+
+---
+
+## 10. Touch-ups (round 2, asked for by the product owner on 2026-10-05)
+
+"In the detail, can you do some touch-ups to the look?" The page works; it
+still looks like the side sheet stretched across a page. The reference is
+the asset page (`/data/assets/<id>`): facts under the title, line tabs with
+icons, a strip of tiles, cards.
+
+Seen by the planner at 1440 px on the trial console before this round:
+
+- Overview: four plain lists under small capital headings in two columns,
+  half the page empty. "Details" repeats what the header says (type,
+  direction, environment), and "Ingest" is three facts.
+- Ingest: every input runs the full 1,100 px; the saved tables, the
+  schedule and the runs are stacked with no grouping.
+- Connection tests: bare lines of text, the message larger than its
+  heading, a failure as a whole red line.
+- Tabs: a pill group, where the asset page has line tabs with icons.
+
+Working rules for this round differ from section 6: the branch is
+`feat/connectors`, in `/home/hv/lakehouse`, where the product owner's own
+dev server (port 3000) reloads every save. **Leave the changes uncommitted**
+for the product owner's look in the browser; the commit comes after. Never
+leave the tree in a state that does not compile.
+
+No behaviour changes except U6. No API change. Labels the checklist in
+section 7 names stay. Both themes; nothing breaks at 1024 px.
+
+### U1 — Tabs like the asset page
+
+Line tabs with an icon each (`TabsList variant="line"`, the markup of
+`asset-detail-tabs.tsx`). Ingest carries the number of saved tables as a
+count; Connection tests carries a danger count of `1` only when the latest
+test failed.
+
+### U2 — Facts under the title
+
+The header gains the row of label-and-value facts the asset page has under
+its description: Type, Tenant, Environment, Residency, Owner, Credential,
+Last test. "Details" leaves the Overview. Reuse the asset page's markup for
+that row; if it is local to the asset page, lift it into
+`src/components/patterns/` and use it from both (rule 4), with the asset
+page's look unchanged.
+
+### U3 — Overview: tiles, then cards
+
+- A strip of four tiles in the style of the asset page's (`HealthTile` in
+  `asset-overview.tsx`; lift it the same way): **Health** (badge; hint
+  "Tested <when>" or "Never tested"; opens Connection tests), **Tables**
+  ("<n> tables" or "None picked yet"; opens Ingest), **Schedule** (the
+  schedule's label; hint "Next <when>"; "Streams continuously" for change
+  capture), **Last run** (status pill and when; "Never run"; opens Ingest).
+  A fact that could not be loaded says so; never a zero or an empty tile.
+- "Needs attention" stays above the tiles when there is something.
+- Below: **Connection** and **Used by** as `SectionCard`s side by side,
+  with the "Edit" action on Connection. The old "Ingest" section goes; the
+  tiles say what it said.
+
+### U4 — Connection tests as a card of rows
+
+A `SectionCard` "Test history". One row per test: a status pill (Passed /
+Failed, the tones the run list uses), the message at body size and in the
+normal text colour, and at the right the latency and when, with the full
+date and time as the hover title. The empty sentence stays as it is.
+
+### U5 — Ingest in cards, two columns when wide
+
+Three `SectionCard`s: "Tables to ingest" (the saved tables, finding tables,
+adding one by name), "Schedule" (with the save button, which saves both, as
+now), "Runs" (with "Run now"). From `xl` up: tables and schedule in a wider
+left column, runs in the right one. The panel is also shown after creating
+a connector, inside a card of its own: there it stays one column and gets
+no card inside a card. Inputs stop stretching across the page. Every label,
+every `aria-label` and every behaviour of `connector-ingest-panel.tsx`
+stays; this is layout.
+
+### U6 — The test's result says what happened
+
+- The toast: "Connection test passed" only when the test ran and passed;
+  "Connection test failed" when it ran and failed; "This connector type
+  cannot be tested" when it is unsupported. Today it says "passed" for any
+  answer.
+- The result line under the header becomes a small bordered notice in the
+  matching tone, with the message and the latency.
+
+### Accept
+
+- `bun run typecheck && bun run lint && bun run test` pass; tests are
+  changed only where the markup they query changed, and new behaviour (U6,
+  the tile facts, the tab counts) has tests.
+- The reviewer looks at each tab in both themes at 1440 px and 1024 px in a
+  headless browser, then the product owner looks.
