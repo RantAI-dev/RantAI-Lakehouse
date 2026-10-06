@@ -22,6 +22,8 @@ import {
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
+import { BrandMark } from "@/components/patterns/brand-mark"
+import { brandMarkForTypeName } from "@/lib/connectors/brand-marks"
 import type { Connector, ConnectorType, IngestAdapter } from "@/services/contracts/connectors"
 import { cn } from "@/lib/utils"
 
@@ -52,6 +54,35 @@ function metaFor(type: ConnectorType) {
     return { category: "soon" as const, icon: PlugIcon, blurb: "Not available yet" }
   }
   return ADAPTER_META[type.adapter] ?? { category: "apps" as const, icon: PlugIcon, blurb: "" }
+}
+
+/**
+ * The type's own product mark when the set publishes one (see
+ * `@/lib/connectors/brand-marks`), else the adapter's generic icon. Tile and
+ * strip both render this so they cannot differ. On the primary-coloured chip
+ * (`onPrimary`) a mark takes the chip's foreground like the generic icons.
+ */
+function TypeIcon({
+  type,
+  fallback: Fallback,
+  onPrimary = false,
+}: {
+  type: ConnectorType
+  fallback: LucideIcon
+  onPrimary?: boolean
+}) {
+  const mark = brandMarkForTypeName(type.name)
+  if (!mark) return <Fallback className="size-4" aria-hidden="true" />
+  return (
+    <BrandMark
+      paths={mark.paths}
+      viewBox={mark.viewBox}
+      hex={mark.hex}
+      foregroundInDark={mark.needsForegroundInDark}
+      tone={onPrimary ? "inherit" : "brand"}
+      className="size-[18px]"
+    />
+  )
 }
 
 /**
@@ -166,7 +197,6 @@ function TypeCard({
   onSelect: () => void
 }) {
   const meta = metaFor(type)
-  const Icon = meta.icon
   const disabled = !type.supported
   return (
     <button
@@ -189,7 +219,7 @@ function TypeCard({
           checked ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
         )}
       >
-        <Icon className="size-4" />
+        <TypeIcon type={type} fallback={meta.icon} onPrimary={checked} />
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
@@ -218,11 +248,10 @@ function TypeCard({
  */
 export function SelectedTypeSummary({ type, onChange }: { type: ConnectorType; onChange?: () => void }) {
   const meta = metaFor(type)
-  const Icon = meta.icon
   return (
     <div className="flex items-center gap-3 rounded-lg border border-border bg-muted/30 px-3 py-2.5">
       <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
-        <Icon className="size-4" />
+        <TypeIcon type={type} fallback={meta.icon} onPrimary />
       </span>
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium">{type.name}</span>

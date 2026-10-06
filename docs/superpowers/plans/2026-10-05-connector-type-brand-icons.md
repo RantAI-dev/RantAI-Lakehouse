@@ -176,4 +176,38 @@ Sources, New connector:
 
 ## 8. Handoff (developer)
 
+Left uncommitted. Not viewed in a browser (none available to the developer).
+
+**Files**
+
+- `src/lib/connectors/brand-marks.ts` (new): the eight marks (`paths`, `viewBox`, hex, `needsForegroundInDark`; seven from Simple Icons, MySQL from SVG Logos, see R1 below), the licence/rule header, `brandMarkForTypeName` (strip one trailing " CDC", then exact own-property match).
+- `src/lib/connectors/brand-marks.test.ts` (new): lookup tests; a path-vs-SVG byte comparison that runs only when `BRAND_ICON_DIR` points at the downloaded files (it did, once, and passed).
+- `src/components/patterns/brand-mark.tsx` (new): generic `BrandMark` (`tone="brand"|"inherit"`).
+- `src/features/connectors/connector-type-picker.tsx` (changed): `TypeIcon` used by `TypeCard` and `SelectedTypeSummary`.
+- `src/features/connectors/connector-type-picker.test.tsx` (new): 9 tests.
+- `CHANGELOG.md`: one bullet under `[Unreleased]` / Added.
+
+**Run (foreground)**: `bun run typecheck` exit 0; `bun run lint` exit 0 (0 errors, 6 warnings, none in these files); `bun run test` exit 0, 716 pass, 1 skip, 0 fail, 80 files.
+
+**Contrast** (WCAG, brand hex against the chip `bg-muted`; tokens in `design-system/tokens/colors.css`; dark theme is the `.dark` class on `html`):
+
+| Mark | Light | Dark |
+| --- | --- | --- |
+| PostgreSQL | 4.36 | 3.05 |
+| MySQL | 4.20 | 3.16 |
+| MariaDB | 11.83 | 1.12 |
+| MongoDB | 2.89 | 4.60 |
+| Kafka | 14.65 | 1.10 |
+| Google Sheets | 2.75 | 4.84 |
+| SAP | 2.30 | 5.78 |
+| MQTT | 10.74 | 1.24 |
+
+Foreground on chip: 17.72 light, 14.25 dark. At the 3:1 bar for graphics, Kafka, MariaDB and MQTT fall back to the foreground in the dark theme, as guessed (MySQL joins them by eye, see R2). PostgreSQL and MySQL pass in dark only just. **Finding, not acted on:** in the light theme MongoDB (2.89), Google Sheets (2.75) and SAP (2.30) are below 3:1 on the chip; the settled decision names a dark-theme fallback only, so they are drawn in brand colour. Reviewer to judge in the light screenshots.
+
+**R1 (review fix, MySQL)**: Simple Icons' MySQL is the wordmark and unreadable at 18 px, so MySQL uses the dolphin alone: `mysql-icon` of SVG Logos by Gil Barbara, CC0-1.0, from `@iconify-json/logos` 1.2.15, two paths kept as published on `0 0 256 252`, colour still `#4479A1` (the drawing's own `#00546b` fails on the dark chip). `BrandMark` and the data now take `paths` and `viewBox`; the other seven are unchanged. Contrast 4.20 light, 3.16 dark; R2: the dolphin is a thin line drawing and 3.16:1 was too faint on the dark screenshot, so MySQL joins the foreground-in-dark set (now Kafka, MariaDB, MQTT, MySQL); light stays `#4479A1`. The byte-comparison test, run with `BRAND_ICON_DIR`, covers all eight files.
+
+**Departures**: none from the decisions (before R1). Mark size is 18 px (generic icons stay 16 px). The dark fallback is the class `dark:text-foreground` over a `--brand-mark` custom property (inline `color` would have beaten the class).
+
+**Third-party record**: the repo has no third-party or licence register (grep found none); `brand-marks.ts`'s header is the record, plus the CHANGELOG bullet.
+
 ## 9. Review (planner)
