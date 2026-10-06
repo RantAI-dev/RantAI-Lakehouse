@@ -437,6 +437,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // not a permission-scoped subset.
     ("GET",  "/api/notifications",       Policy::RequiresAuth),
 
+    // The caller's own Home layout (`routes::home`): per-user display
+    // preference, keyed by the principal like Copilot sessions, so the
+    // `RequiresAuth` floor is the whole policy. A caller can only ever
+    // reach their own row.
+    ("GET",    "/api/home/layout",       Policy::RequiresAuth),
+    ("PUT",    "/api/home/layout",       Policy::RequiresAuth),
+    ("DELETE", "/api/home/layout",       Policy::RequiresAuth),
+
     // ── Identity (Phase 2 directory): permission-gated (D1 fix). Reads
     //    require `identity:read`, mutations (create user/role/tenant/
     //    service-identity — the last of which can mint a `*:*` role and

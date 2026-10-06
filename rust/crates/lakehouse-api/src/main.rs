@@ -116,6 +116,12 @@ async fn main() -> anyhow::Result<()> {
     // it's unset, and why this identity carries no scopes at all.
     bootstrap_gold_export_service(&state).await;
 
+    // SEC-5: spawn the auth-cleanup background task (purges expired
+    // sessions, revoked credentials, and stale throttle rows once an
+    // hour). Without a Postgres pool it logs once and spawns nothing —
+    // cleanup depends on the database being reachable.
+    spawn_auth_cleanup(&state);
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -679,6 +685,51 @@ async fn shutdown_signal() {
         tracing::error!(%err, "failed to install ctrl-c handler");
         std::future::pending::<()>().await;
     }
+}
+
+/// Spawn the background task that periodically purges expired sessions,
+/// revoked service credentials, and stale throttle rows (SEC-5). Runs
+/// once at start and then every hour via `tokio::time::interval` (missed
+/// ticks skipped). Logs counts at `info` and an error at `warn`; an error
+/// never takes the process down. Without a Postgres pool, logs once and
+/// spawns nothing.
+fn spawn_auth_cleanup(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; auth-cleanup background task will not run");
+        return;
+    };
+    let retention = time::Duration::days(i64::from(state.config.auth_retention_days));
+    let throttle_window =
+        time::Duration::seconds(i64::from(state.config.login_failure_window_secs));
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let run = || async {
+            match lakehouse_auth::cleanup::purge(&pool, retention, throttle_window).await {
+                Ok(counts) => {
+                    tracing::info!(
+                        session_rows = counts.sessions,
+                        service_credential_rows = counts.service_credentials,
+                        throttle_rows = counts.throttle_entries,
+                        "auth cleanup purge complete",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "auth cleanup purge failed");
+                }
+            }
+        };
+
+        // Run once at start before entering the hourly loop.
+        run().await;
+
+        loop {
+            interval.tick().await;
+            run().await;
+        }
+    });
 }
 
 /// Log ONCE at boot when this deployment refuses the shared catalog and

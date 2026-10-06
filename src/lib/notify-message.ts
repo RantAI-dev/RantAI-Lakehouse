@@ -20,6 +20,7 @@ const HINTS: Record<ServiceErrorCode, string> = {
     "This account does not have permission. Ask a workspace admin.",
   unavailable: "The service is unavailable right now. Try again shortly.",
   invalid_request: "Check the input before sending it again.",
+  too_many_requests: "Wait for the lockout to end, then try again.",
   aborted: "",
 }
 

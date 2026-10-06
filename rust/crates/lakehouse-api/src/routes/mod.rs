@@ -20,6 +20,7 @@ mod dashboard_sources;
 mod embed;
 mod gold;
 mod governance;
+mod home;
 mod identity;
 mod knowledge;
 mod lakehouse;
@@ -717,6 +718,13 @@ pub fn router(state: AppState) -> Router {
         // lists (never a fabricated `unreadCount`, never a zero that reads
         // as "genuinely nothing" without Postgres — see `routes::notifications`).
         .route("/api/notifications", get(notifications::list))
+        // Per-user Home layout; see `routes::home`.
+        .route(
+            "/api/home/layout",
+            get(home::get_layout)
+                .put(home::put_layout)
+                .delete(home::delete_layout),
+        )
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.

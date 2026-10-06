@@ -87,9 +87,10 @@ export function CopilotHistoryPage() {
 
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["copilot-sessions"] });
 
+  // A conversation is started on Home, the one place with the composer.
   function startNewChat() {
     c.newChat();
-    router.push("/copilot");
+    router.push("/");
   }
 
   function clearFilters() {
