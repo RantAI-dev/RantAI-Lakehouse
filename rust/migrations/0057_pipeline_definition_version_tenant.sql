@@ -33,7 +33,7 @@
 --   3. `0053` says `changed_by` is NULL "for a service identity's own
 --      principal, which has no `app_user` row to FK against". A service
 --      identity has a UUID too (`lakehouse_auth::service_token` /
-      `PrincipalId::Service(uuid)`); the route layer writes its
+--      `PrincipalId::Service(uuid)`); the route layer writes its
 --      `principal.id.uuid()` verbatim, the column is just nullable for
 --      the no-principal call sites (`create_pipeline` /
 --      `delete_pipeline` when the route did not thread one through, e.g.
