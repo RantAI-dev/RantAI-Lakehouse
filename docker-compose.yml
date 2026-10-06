@@ -2401,23 +2401,39 @@ services:
   # `G4` job logs `manifest unknown` for that digest — the registry no
   # longer has it. P5-RESULT.md's measurements were taken on the earlier
   # `c49ebd…` image; G4 is what re-proves them on this one.
+  # see the note on `debezium-server`: the pinned upstream image dials its
+  # built-in http://localhost:8181 when a static token is configured, so this
+  # proxy makes that exact address resolve to the real Lakekeeper. Sharing a
+  # netns (`network_mode: service:...`) puts this listener inside the
+  # debezium container's own localhost.
+  debezium-localhost-proxy:
+    profiles: ["dagster"]
+    image: alpine/socat:latest
+    command: tcp-listen:8181,fork,reuseaddr tcp:lakekeeper:8181
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    restart: unless-stopped
+
   debezium-server:
     profiles: ["dagster"]
     image: ghcr.io/memiiso/debezium-server-iceberg:1.1.1.Final@sha256:2ad14b158914097985e98933e6f541e2f4e34fabd1c5d47d655067b9db0282b8
+    # upstream 1.1.1 bug: when a static `token` is configured, the Iceberg
+    # REST client ignores the rendered `uri` and dials its built-in default
+    # http://localhost:8181 instead (reproduced with a bare `docker run`).
+    # Lakekeeper needs the token, so instead of fighting the property we
+    # share the proxy sidecar's netns: inside THIS container localhost:8181
+    # IS lakekeeper (see debezium-localhost-proxy below).
+    network_mode: "service:debezium-localhost-proxy"
     depends_on:
+      debezium-localhost-proxy:
+        condition: service_started
       g4-source-init:
         condition: service_completed_successfully
       lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
-      # Belt & braces: some environments fail to surface `uri` from the
-      # rendered application.properties to the Iceberg REST client (it then
-      # falls back to the image default http://localhost:8181 and
-      # crash-loops). Env var + system property both outrank the properties
-      # file in SmallRye Config, so the URI always lands.
-      DEBEZIUM_SINK_ICEBERG_URI: ${LAKEKEEPER_CATALOG_URI:-http://lakekeeper:8181/catalog}
-      DEBEZIUM_OPTS: -Ddebezium.sink.iceberg.uri=${LAKEKEEPER_CATALOG_URI:-http://lakekeeper:8181/catalog}
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
