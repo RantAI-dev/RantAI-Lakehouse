@@ -2411,6 +2411,13 @@ services:
         condition: service_completed_successfully
     environment:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      # Belt & braces: some environments fail to surface `uri` from the
+      # rendered application.properties to the Iceberg REST client (it then
+      # falls back to the image default http://localhost:8181 and
+      # crash-loops). Env var + system property both outrank the properties
+      # file in SmallRye Config, so the URI always lands.
+      DEBEZIUM_SINK_ICEBERG_URI: ${LAKEKEEPER_CATALOG_URI:-http://lakekeeper:8181/catalog}
+      DEBEZIUM_OPTS: -Ddebezium.sink.iceberg.uri=${LAKEKEEPER_CATALOG_URI:-http://lakekeeper:8181/catalog}
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
