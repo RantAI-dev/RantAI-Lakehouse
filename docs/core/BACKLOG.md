@@ -35,16 +35,16 @@ The one list of known work. Look at it weekly; pick what is next.
 | `BI-7` | Joins in the chart builder without writing SQL | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-8` | Calculated fields and custom expressions: maths, text, dates, conditions, running totals | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-9` | Group by day, week, month, quarter, year | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-10` | Bins, groups, sets and hierarchies | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-10` | Bins, groups and hierarchies | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-11` | Parameters, usable in charts, SQL and dashboards | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-12` | Curated datasets (models) for chart authors, with column names, descriptions and formats | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-13` | Combine two sources on one chart | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-14` | Lineage from a chart to its sources, reachable from the dashboard | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-15` | A very good SQL editor: column autocomplete, variables, snippets, edit and delete saved queries, version history | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-16` | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-17` | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-18` | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; automatic dashboards; favourites; version history; trash; personal space | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-19` | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; embedding SDK; editing inside embeds; white-labelling; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG and PowerPoint export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1` | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-18` | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; favourites; version history; trash; personal space | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-26` | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-19` | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BLD-1` | Joins and aggregations in the pipeline builder | Build | PRODUCT §2 |
 | `VER-1` | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters | Data, Governance | PRODUCT §2 |
 | `BI-2` | Metrics users can define once and reuse across dashboards (a semantic layer) | Dashboards | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
@@ -82,7 +82,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `DATA-4` | Publish Silver in open format | Build | `features/gold-publish-per-mart.md` |
 | `DATA-5` | Measure outside readers of published tables | Build | `routes::gold::consumers` |
 | `BI-3` | Import dashboards from Tableau and Power BI | Dashboards | PRODUCT §2 |
-| `BI-20` | The rest of the BI matrix, to be considered later: field metadata in the BI layer, data preparation, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-20` | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `QRY-1` | Query other systems in place, without loading | Data | PRODUCT §2 |
 | `SRC-2` | Processing over streams | Data | PRODUCT §2 |
 | `INT-2` | Search over documents | Ask AI | PRODUCT §2 |
@@ -115,5 +115,10 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | --- | --- | --- | --- |
 | `PM-1` | Customer-facing product name | Decided: RantAI Lakehouse | 2026-10-02 |
 | `DEC-7` | Write-back from dashboards (buttons and forms that change data) | Rejected: we are a lakehouse, not an ERP | 2026-10-06 |
+| `BI-12` | Curated datasets (models) inside BI | Rejected: Gold tables in the lakehouse are the curated datasets | 2026-10-06 |
+| `BI-22` | Data preparation inside BI | Rejected: the Build module is our data preparation | 2026-10-06 |
+| `BI-23` | Sets (a Tableau power-user feature) | Rejected: groups and hierarchies cover it | 2026-10-06 |
+| `BI-24` | PowerPoint export | Rejected: PDF and images cover it | 2026-10-06 |
+| `BI-25` | Automatic dashboards from a table (Metabase X-ray) | Rejected: the assistant builds dashboards on request | 2026-10-06 |
 | `BI-21` | Where charts read data | Decided: only data in the lakehouse, for now | 2026-10-06 |
 | `SEC-8` | Dependency security checks green on `main` | Done: PR #62. Three TLS-library vulnerabilities cleared by updating the SQL Server client; licence check fixed | 2026-10-02 |

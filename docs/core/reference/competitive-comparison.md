@@ -145,18 +145,20 @@ panels). Metabase is the realistic benchmark; Tableau is the ceiling.
 | Joins without writing SQL | Build it | `BI-7` |
 | Calculated fields and custom expressions | Build it | `BI-8` |
 | Group by day, week, month, year | Build it | `BI-9` |
-| Bins, groups, sets, hierarchies | Build them | `BI-10` |
+| Bins, groups, hierarchies | Build them. Sets: no | `BI-10`; `BI-23` (rejected) |
 | Parameters | Build them | `BI-11` |
 | Reusable metrics | Build them | `BI-2` |
-| Curated datasets for authors | Build them | `BI-12` |
+| Curated datasets for authors | No: Gold tables are the curated datasets | `BI-12` (rejected) |
 | Combine two sources on one chart | Build it | `BI-13` |
 | Write-back from dashboards | No: we are a lakehouse, not an ERP | `DEC-7` (rejected) |
 | Lineage from a chart to its sources | Build it | `BI-14` |
 | SQL editor | Make it very good | `BI-15` |
-| Chart types | Cover every type Tableau and Metabase have | `BI-16` |
-| Chart formatting | Reach both competitors' level | `BI-17` |
-| Dashboards | Reach both competitors' level | `BI-18` |
-| Sharing and delivery | Cover everything except integrations with Slack, Teams, Office and Google | `BI-19`, `RPT-1`, `BI-1` |
+| Chart types | Cover every type Tableau and Metabase have, including spatial analysis and Gantt | `BI-16` |
+| Chart formatting | Reach both competitors' level, including forecasting and clustering | `BI-17` |
+| Dashboards | Reach both competitors' level, except automatic dashboards (the assistant does that) | `BI-18`; `BI-25` (rejected) |
+| Sharing and delivery | Cover everything except integrations with Slack, Teams, Office and Google, and except PowerPoint export | `BI-19`, `RPT-1`, `BI-1`; `BI-24` (rejected) |
+| Embedding | Make it better without overdoing it: no SDK, no editing inside embeds | `BI-26` |
+| Data preparation inside BI | No: the Build module is our data preparation | `BI-22` (rejected) |
 | Everything else in the matrix | Noted; to be considered later | `BI-20` |
 
 ### The matrix
