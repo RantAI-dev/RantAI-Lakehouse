@@ -556,3 +556,66 @@ the same 5 warnings; 654 pass, 0 fail, 77 files (the R5 test was rewritten,
 not added to).
 
 ## 9. Review (planner)
+
+### 2026-10-05 — C1 to C3, four rounds
+
+Read: `asset-columns.tsx`, `src/lib/column-profile.ts`,
+`src/lib/column-type.ts`, the diffs of the shared files, the CHANGELOG
+entry. Ran myself, from this tree, after the last round:
+
+| Command | Result |
+| --- | --- |
+| `bun run typecheck` | exit 0 |
+| `bun run lint` | exit 0: 0 errors, 5 warnings, none in a changed file |
+| `bun run test` | exit 0: 654 passed, 0 failed, 77 files |
+
+Not run: `next build` (the product owner's dev server holds this tree).
+
+**Findings, all closed.** Each was seen on a screenshot, which is where
+this kind of work fails; the tests were green throughout.
+
+- **R1 (SHOULD-FIX).** A bar's track was as wide as the label beside it
+  left it, so at 1440 px a 97.7% bar was drawn 213 px long and a 100% bar
+  192 px. Closed: bar and label on two tracks of fixed proportion.
+  Measured after: every track 127 px at 1440, 138 px at 1280, 79 px at
+  390.
+- **R2 (SHOULD-FIX).** One null share read "<0.1%" in the opened column's
+  list and "0.1%" in its facts and in the row. Closed: one spelling.
+- **R3 (SHOULD-FIX).** At 390 px a mark squeezed its column's name to two
+  letters ("pl…"). Closed: below the first threshold the marks sit on the
+  type's line.
+- **R4 (SHOULD-FIX, the plan's error).** Section 5 told the developer to
+  keep "Mostly unique" for a column with no listed value. An empty list
+  means more distinct values than the route counts exactly (100), not
+  uniqueness: a column of about 500 distinct values in 2,000 rows read
+  "Mostly unique" beside its own "Distinct ≈ 500". Closed: "All null",
+  "Mostly unique" (distinct at least 90% of the non-null rows) or "Many
+  distinct values", from the numbers.
+- **R5, R6 (widths).** After R1 a date range was cut at 1440 px; giving
+  the range a fixed track (R5) then cut every type at 1280 px. Closed
+  (R6): the type has a fixed track that holds `Nullable(Float64)` from
+  the third threshold, and the range shows only from the widest one.
+  Measured after: no cell cut at 1280 or 1440; the range column is absent
+  at 1280 and whole at 1440.
+
+**Accepted departures from this plan:** container queries on the list's
+width instead of viewport breakpoints (the sidebar takes 16rem of the
+viewport); the filter above the list instead of in the card's header
+slot, which cannot shrink; shares to one decimal; the sort key split
+only at top-level commas; Masked and Classification among the opened
+column's facts; the marks rendered twice, one copy per placement, the
+hidden one `display: none`.
+
+**In a browser** (headless; 1440 and 1280 dark, 1440 and 390 light, 900
+dark; a Silver table of 18 columns and a raw table of 4): rows of one
+height at every width; no sideways scroll at 390 px; a pressed row opens
+under itself with its values, "Other values", "Null" and its facts; the
+two columns the table is sorted by carry "sort key"; the raw table's
+"System columns" and "Schema versions" cards are as they were.
+
+**Not checked by anyone:** a screen reader; keyboard use in a real
+browser (the control is a native button, the tests press it by click);
+a table past 25 columns on the dev stack (none exists; the unit tests
+cover the page sizes); a masked or classified column on the dev stack.
+
+**Verdict:** ready for the product owner's look. Nothing is committed.
