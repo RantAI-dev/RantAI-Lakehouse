@@ -34,13 +34,22 @@ jobs:
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
         working-directory: ${{ github.workspace }}
+        # Retry: transient registry/PyPI flakes fail the whole compose build;
+        # each retry reuses BuildKit layer cache, so a re-attempt is cheap.
         run: |
-          scripts/compose.sh \
-            --profile seaweedfs \
-            --profile dagster \
-            --profile trino \
-            up -d --build --remove-orphans
-        timeout-minutes: 60
+          for attempt in 1 2 3; do
+            echo "=== compose up attempt ${attempt}/3 ==="
+            if scripts/compose.sh \
+              --profile seaweedfs \
+              --profile dagster \
+              --profile trino \
+              up -d --build --remove-orphans; then
+              exit 0
+            fi
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+        timeout-minutes: 120
 
       - name: Health-check lakehouse-api
         run: |
