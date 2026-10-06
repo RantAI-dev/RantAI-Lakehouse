@@ -256,4 +256,303 @@ On a Silver table with many columns (Data Explorer, Schema tab):
 
 ## 8. Handoff (developer)
 
+Written by the developer agent (Claude Sonnet) on 2026-10-05. Everything is
+uncommitted. **Not looked at in a browser**: the developer agent has none, so
+nothing below says how the page looks; layout is reasoned from the CSS and
+needs the reviewer's screenshots (390, 768, 1024, 1440; light and dark).
+
+### Files
+
+Added:
+
+- `src/lib/column-type.ts`, `column-type.test.ts`: `typeFamily` (C1).
+- `src/lib/column-profile.ts`, `column-profile.test.ts`: `valueShares`,
+  `formatShare`, `sortKeyColumns` (C1); `noValuesLabel` (round 2, R4).
+- `src/features/catalog/asset-columns.tsx`: the "Columns" card (C2): the
+  list, a row, the opened column, `NullMeter`, `ProfileNote`, the filter and
+  page-size controls; also now owns `visibleColumns`, `SchemaRow` and
+  `ProfileState`.
+- `src/features/catalog/asset-columns.test.tsx`: 44 component tests (37
+  in round 1, 7 in round 2) that drive `ColumnsCard` with a hand-built
+  profile (C2 accept list).
+
+Changed:
+
+- `src/features/catalog/asset-schema.tsx`: renders `ColumnsCard`; keeps
+  `schemaRows`, `useProfile`, `ColumnCells` (for "System columns"),
+  `AssetSchema`. Removed what moved (`COLUMN_PAGE_SIZES`, `visibleColumns`,
+  `NullMeter`, the two types, `ProfileNote`, `StatCells`) and the imports
+  they used. `SchemaVersions` is untouched (its hunks in `git diff` are the
+  other change's, as before); the only shared line is the `@/lib/format`
+  import, which lost `formatCompactNumber`, `formatNumber` and
+  `formatPercent` and keeps the other change's three.
+- `src/features/catalog/asset-detail-tabs.test.tsx`: `stubApi` takes an
+  optional `profile` (default `PROFILE`, so every other test is unchanged);
+  one test rewritten; one new `describe("Schema tab: the column explorer")`
+  of four tests after the wide-table block. Nothing in or near
+  `describe("Schema versions of a Silver or Gold table")` was touched.
+- `CHANGELOG.md`: one new bullet at the top of `[Unreleased]` / Added,
+  directly above the schema-versions bullet, which is unchanged.
+- This plan, section 8.
+
+Not changed, on purpose: `docs/FEATURE_COVERAGE.md`. C3 says "if it
+describes the Schema tab's columns"; its asset detail row does not, so there
+was nothing true to add.
+
+### Commands (foreground, from `/home/hv/lakehouse`)
+
+Round 1 (superseded by the round 2 run at the end of this section: 637
+pass, 77 files):
+
+- `bun run typecheck`: exit 0.
+- `bun run lint`: exit 0; 0 errors, 5 warnings, the same five as the
+  baseline (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`,
+  `use-data-table.ts`, `dashboard-specs.ts`), none in a file of this change.
+- `bun run test`: exit 0; 637 pass, 0 fail, 77 files (baseline 563 in 74;
+  +74 = 37 card tests, 33 `src/lib` tests, 4 new tab tests; the rewritten
+  test is not an addition). Nothing was skipped.
+- Not run: `next build`, `bun install`, prettier, any browser or `docker`
+  command, any Rust or Python check (no such file changed).
+
+### Departures from the plan, and what the plan had wrong
+
+1. **Container queries, not viewport breakpoints.** The plan says the row
+   sheds things below `xl`, `md`, `sm`. The sidebar takes 16rem from a
+   viewport of `md` up, so at a 768 px viewport the card is roughly 450 to
+   500 px wide (768 less the sidebar, the page and the card padding) and a
+   viewport breakpoint would keep columns it has no room for. The
+   list is an `@container`; the thresholds are the list's own width:
+   `@lg` (32rem): the type gets a track, below it the type sits under the
+   name; `@2xl` (42rem): label beside the bar, and the distinct count;
+   `@4xl` (56rem): the range. Same order of shedding as the plan; the
+   numbers differ. At 390 px the list is about 320 px wide.
+2. **The filter and the page-size toggle are in the card body, above the
+   list, not in the card header's `action` slot.** `SectionCard` wraps
+   `action` in a `shrink-0` div, so a 176 px box beside a page-size toggle
+   cannot fit a phone's card (from the CSS, for a table of more than 25
+   columns it did not before either; not seen in a browser), and the filter
+   now appears from 11 columns. The controls still go with the card, with no
+   change to the shared pattern.
+3. **Shares read "60.0%", not "60%"**: `formatPercent`, one decimal, like
+   the null share beside it. A share under 0.1% reads "<0.1%"
+   (`formatShare`), never "0.0%", which would say the value is absent.
+4. **`valueShares` states less than the plan's shape in one case.** When the
+   profile gives neither `nullFraction` nor `nullCount`, `nullShare` and
+   `otherShare` are `null` (not 0), since "other" would then include nulls
+   it cannot tell apart; the opened column then draws neither line. It also
+   returns `otherCount` and `nullCount` for the lines' count column. A hair
+   of float noise from adding fractions (`0.1 + 0.2 + 0.7`) is not turned
+   into a sliver of "Other values".
+5. **`sortKeyColumns` splits at top-level commas only** (outside parentheses,
+   brackets and quotes) and reads a name in backticks or double quotes as the
+   name. The plan's plain split on commas would mark `b` as a sort key for
+   `cityHash64(a, b, c)`; a test pins that. Every case the plan names behaves
+   as the plan says.
+6. **Two facts the plan did not list: "Masked" and "Classification"**, only
+   when the column has them. The row's marks can be cut short at narrow
+   widths (they never push the row wider), and "nothing the row sheds is
+   lost" needs them in the opened column.
+7. **`visibleColumns`, `SchemaRow`, `ProfileState` live in
+   `asset-columns.tsx`**, not `asset-schema.tsx`, so that
+   `asset-schema.tsx -> asset-columns.tsx` is one direction (no import
+   cycle). Same names, same behaviour. No test or other file imported any
+   of them (grepped), so nothing needed to follow. `schemaRows` and
+   `useProfile` stayed.
+8. **Segments' tooltips are the native `title`**, not the `Tooltip`
+   component: 25 rows of up to five segments would be 125 popup roots. The
+   text is the plan's `value · N rows (P%)`. Not available by touch; the
+   bar's `aria-label` and the opened column carry the same.
+9. **No rows profiled gives "—" in the bar cell**, not a label (an empty
+   table has no values to describe). The label itself changed in round 2
+   (R4, below): an empty list no longer reads "Mostly unique" by default.
+10. The plan said tests that asserted the chip list were to be rewritten. **No
+    test asserted the chips**: every `PROFILE` fixture in the tabs test has
+    `topValues: []`. What broke was the `td`-based row-name selector and the
+    "Yes" in the old Nullable cell (below).
+11. The plan said `schemaRows`, `visibleColumns`, `useProfile` are "exported
+    or used by tests". `schemaRows` and `visibleColumns` were exported;
+    `useProfile` and `ProfileState` were not; no test imported any.
+
+### Existing tests rewritten or removed
+
+One test rewritten, none removed, no assertion dropped:
+
+- `describe("Schema tab")` > "lists columns in the table's order with their
+  statistics, and system columns apart":
+  - the row names read from `r.querySelector("td")` now read from the
+    button in each `role="row"` (same expected `["id", "amount"]`);
+  - "`amount` is optional in Iceberg" asserted `Yes` in the row's Nullable
+    cell; it now presses the `amount` row and asserts "Can be null" is
+    `Yes` in the opened column, and also `No` for the required `id`;
+  - the `25.0%` wait, the "System columns" assertions and the "Schema
+    versions" assertions are unchanged.
+- `describe("Schema tab: a wide table")`: unchanged and passing (they count
+  `role="row"`, so the header row is still the `- 1`; 25 / 50 / All; filter
+  by name or description across the whole table; neither control for two
+  columns).
+
+New in round 1: `asset-columns.test.tsx` (37), and in the tabs file "draws each
+column's most frequent values from the profile route, and opens the column",
+"marks the column the storage card's sorting key names...", "marks no sort
+key for a table that has no storage card", "asks for no statistics, and says
+why, without query:read, yet still opens a column".
+
+### How the row is built, and the 390 px rule
+
+The list is `div`s with the ARIA table roles (`table`, `rowgroup`, `row`,
+`columnheader`, `cell`), not the shared `Table`, whose `overflow-x-auto`
+wrapper plus a seven-cell row is what scrolled sideways. Every row (and the
+header) is a CSS grid whose tracks are fixed `rem` or `minmax(0, …fr)`, so a
+cell can only truncate; the list is a container and sheds cells by its own
+width (departure 1). At phone width the row is glyph, name (with the type on
+a second grid line under it, then the marks after the type: round 2, R3),
+bar, null share, chevron; the page's and the card's sideways scroll was
+confirmed gone by the reviewer's screenshots at 390 px. What to look at in
+round 2: 390 px (a column with a mark still shows its whole name, the type
+truncates, rows stay equal), 768 and 1024 px with the sidebar open (range
+gone at 1024 unless the card is 56rem wide), a bar's length at 1440 px
+against rows with a short and a long commonest value, and an opened column
+at each width.
+
+### Unsure
+
+- Everything visual, as above; in particular `line-clamp-2` on the "Not
+  profiled" message as a grid cell.
+- The dark theme: the ladder is `chart-3` at 100, 80, 60, 45, 30 percent on
+  the muted track; the faintest step may be hard to see on the dark track.
+  `chart-5` at full strength was rejected as too close to it.
+- "Commonest" is the first listed value; that relies on the route's
+  `approx_top_k` answering most frequent first (ClickHouse documents it;
+  nothing in this repository states it, and `exact_top_values` only
+  filters). If the order were ever different, the label and the steps would
+  be wrong; a sort in `valueShares` would fix it at the cost of "in the
+  profile's order".
+- Enter and Space on the name button are the browser's own button
+  behaviour; happy-dom does not turn a key press into a click, so the tests
+  press with `click`. The row's own `onClick` serves a pointer and is not
+  focusable; the button is the keyboard and screen-reader path.
+
+### Round 2: the planner's review (R1 to R4)
+
+Files touched: `src/features/catalog/asset-columns.tsx`,
+`asset-columns.test.tsx`, `asset-detail-tabs.test.tsx` (one assertion),
+`src/lib/column-profile.ts`, `column-profile.test.ts`, `CHANGELOG.md` (the
+same bullet, three sentences), this section. Nothing else.
+
+- **R1, one track for a bar on every row.** The bar and its label are now
+  two tracks of a grid, `grid-cols-1` below `@2xl` (the bar takes the whole
+  cell, as before) and `minmax(0,1fr) minmax(0,1fr)` from it. The bar is
+  `w-full` with no floor and no `flex-1`; the label is its own track, the
+  value left and truncating, the share at the right edge in tabular
+  numbers. To leave the label room, the values track is `2fr` at `@2xl` and
+  `@4xl` (it was `1.6fr` and `1.8fr`); the other tracks are unchanged. The
+  "no listed value" label is not in the grid: it spans the cell.
+- **R2, one spelling for the null share.** `NullMeter`'s number and the
+  "Nulls" fact now use `formatShare`, like the opened column's "Null" line:
+  under 0.1% reads "<0.1%" in all three, exactly zero stays "0.0%".
+  `formatPercent` is no longer used in the card.
+- **R3, the name wins over its marks below `@lg`.** The marks are rendered
+  twice, by a `Marks` component: beside the name (`hidden @lg:flex`) and on
+  the type's line after the type (`flex @lg:hidden`). CSS shows one; the
+  other is `display: none`, so nothing is read twice. I chose two copies
+  because the type and the marks must share a line below `@lg` but sit in
+  different tracks from `@lg`, which one element cannot do. The type's line
+  is `h-5` like the name's, so a marked row is as tall as an unmarked one
+  (the row's floor is now `min-h-13`, 52 px, from `min-h-12`); the type
+  truncates first, the marks are `shrink-0`. Consequence for tests: a marked
+  column has each mark twice in the DOM (happy-dom shows no CSS), so mark
+  assertions name the place.
+- **R4, an empty list is not "unique".** `noValuesLabel(column, rows)` in
+  `column-profile.ts`: all null (rows minus nulls is zero) reads "All null";
+  a distinct count of at least 90% of the non-null rows reads "Mostly
+  unique"; otherwise, or with no distinct count, "Many distinct values".
+  `null` for a column not profiled or no rows. Without a null count the
+  non-null rows are taken as all rows, which can only make "Mostly unique"
+  harder to reach. The row shows the label where the bar would be, with the
+  `title` "No value is listed: the profile states a value's count only where
+  it is exact."; the opened column's sentence is the same constant.
+
+Tests changed in round 2 (nothing dropped):
+
+- Replaced: "says a column with no listed values is mostly unique, as the
+  chips' empty case did" (it used `AMOUNT`, 40 distinct of 1,500 non-null
+  rows, where "Mostly unique" is false) by four tests: mostly unique (1,990
+  distinct, no nulls), many distinct values (`AMOUNT`), many distinct values
+  with no distinct count, all null (including its opened column).
+- Edited, same assertion with a wider regex: the three places that asserted
+  `queryByText("Mostly unique")` is absent (no rows profiled, the three
+  no-profile states, loading) now assert none of the three labels is there.
+- Edited, same assertions: the two mark tests ("marks masked, classified
+  and partitioned columns as before..." and "marks a column the sorting key
+  names...") use `expectMark`, which asserts each mark in both places; in
+  the tabs file "marks the column the storage card's sorting key names..."
+  expects `sort key` twice in the marked row (and still none in the other).
+- Added: bar track independent of the label (short and long value); null
+  share under 0.1% in the row, list and facts; null share of exactly zero;
+  marks off the name's line below `@lg`; and 9 `noValuesLabel` tests (all
+  null, from the fraction, the 90% line and just below it, about 500
+  distinct in 2,000 rows, the line against non-null rows, no distinct
+  count, no null count, nothing to say), plus one `formatShare` case.
+
+- **R5, the range's own track from `@4xl`** (superseded in width and in the
+  name's track by R6, below; the fixed 11.5rem range track stands). After the values track went to
+  `2fr` a date range read "2019-01-20 – 2025-09-…" at 1440 px. The `@4xl`
+  template (header and rows, one string) now gives the range a fixed
+  `11.5rem` track (it was `minmax(0,1.1fr)`; two ISO dates and the dash are
+  23 characters of mono `text-xs`, about 10.4rem) and the name `1.4fr` (it
+  was `1.2fr`); the type (`1fr`) and values (`2fr`) tracks are unchanged, so
+  the room comes from the flexible tracks and the bar and the label stay two
+  equal tracks. Arithmetic at the narrowest container that shows the range,
+  56rem: 54.4rem inside the border and padding, 30rem for the fixed tracks
+  and the gaps, 24.4rem shared 1.4 : 1 : 2, so name 7.8rem (what it had
+  before this change), type 5.5rem (was 6.5rem), bar and label 5.3rem each
+  (were 6.3rem); nothing is squeezed to nothing, so the width at which the
+  range appears stays `@4xl`. At 1440 px (a list about 1,070 px wide by the
+  reviewer's 142 px bar) that is name about 188 px, type 134 px, bar and
+  label about 130 px each, range 184 px. A longer range (two timestamps) may
+  still truncate; its title and the opened column carry it. New test: "gives
+  the range, from @4xl, a fixed track that holds two ISO dates and the dash
+  between them" (the template is the same in the header and the rows, the
+  range's track is a fixed `rem` size of at least 23 x 0.6 x 0.75).
+
+- **R6, the type before the range.** At a 1280 px viewport (the list about
+  58.5rem, just past `@4xl`) R5's range track left every type cut to
+  "Nullable(Str…" and the label to "2023-0…", while the range was "–" on
+  most rows. The type matters more on this tab, so the range waits. The
+  range now appears from `@5xl` (64rem) instead of `@4xl` (header, rows, the
+  skeleton cell and the "Not profiled" `col-span` all follow), and the type
+  has a fixed `9rem` track from `@3xl` (48rem): 20 characters of mono
+  `text-xs`, `Nullable(Float64)` being 17; below `@3xl` it stays `1fr`. The
+  name is `1.4fr` and the values `2fr` from `@3xl`, so the bar and the label
+  remain two equal tracks and every bar track the same length. The
+  templates: `@3xl:grid-cols-[1.25rem_minmax(0,1.4fr)_9rem_minmax(0,2fr)_6.5rem_4.5rem_1rem]`
+  and `@5xl:grid-cols-[1.25rem_minmax(0,1.4fr)_9rem_minmax(0,2fr)_6.5rem_4.5rem_11.5rem_1rem]`,
+  replacing R5's `@4xl` template. Arithmetic (a row is the container less
+  1.625rem of border and padding, gaps 0.75rem, the rest shared 1.4 : 2),
+  agreeing with the planner's: at `@3xl` 48rem 19.6rem free, name 8.1rem,
+  values 11.5rem; at 58.5rem (1280 px, no range) name 12.4rem, values
+  17.7rem; at `@5xl` 64rem 23.4rem free, name 9.6rem, values 13.8rem; at
+  68.5rem (1440 px) name 11.5rem, values 16.4rem. Outcome: `Nullable(Float64)`
+  whole at 1280 and 1440 px; the range, wherever it shows, whole
+  ("2019-01-20 – 2025-09-23", 10.4rem in 11.5rem); no range column at 1280
+  px. The R5 test is now "holds the type whole from @3xl and shows the
+  range, whole, only from @5xl" (templates equal in header and rows at
+  `@2xl`, `@3xl` and `@5xl`; the type a fraction at `@2xl` and a fixed size
+  of at least 17 characters from `@3xl`; the range a fixed size of at least
+  23 characters, from `@5xl`; its header and cell `hidden @5xl:block`; no
+  `@4xl` left in the card). Not looked at in a browser.
+
+Commands, round 2, once, in the foreground:
+`cd /home/hv/lakehouse && bun run typecheck && bun run lint && bun run test`:
+exit 0; typecheck clean; lint 0 errors and the same 5 warnings; 653 pass, 0
+fail, 77 files (637 before this round: +7 card tests, +9 `noValuesLabel`
+tests). Still **not looked at in a browser**.
+
+After R5 the same command again: exit 0; typecheck clean; lint 0 errors and
+the same 5 warnings; 654 pass, 0 fail, 77 files (+1, the R5 test).
+
+After R6 the same command again: exit 0; typecheck clean; lint 0 errors and
+the same 5 warnings; 654 pass, 0 fail, 77 files (the R5 test was rewritten,
+not added to).
+
 ## 9. Review (planner)

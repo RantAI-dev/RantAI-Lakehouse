@@ -181,7 +181,8 @@ function json(body: unknown, status = 200) {
 function stubApi({
   permissions = ["*:*"],
   lineage = GRAPH,
-}: { permissions?: string[]; lineage?: unknown } = {}) {
+  profile = PROFILE,
+}: { permissions?: string[]; lineage?: unknown; profile?: unknown } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
@@ -207,7 +208,7 @@ function stubApi({
       return json({ id: "u1", name: "Reader", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
     if (path.includes("/api/governance/lineage")) return json(lineage)
-    if (path.endsWith("/profile")) return json(PROFILE)
+    if (path.endsWith("/profile")) return json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
     return json({ error: "not stubbed" }, 404)
@@ -375,14 +376,22 @@ describe("Schema tab", () => {
     await screen.findByText("System columns")
     const columns = screen.getByText("Columns").closest("[data-slot=card]") as HTMLElement
     await waitFor(() => expect(within(columns).getByText("25.0%")).toBeTruthy())
+    // One row per column after the header, each led by the button that names it.
     const names = within(columns)
       .getAllByRole("row")
       .slice(1)
-      .map((r) => r.querySelector("td")?.textContent)
+      .map((r) => within(r).getByRole("button").textContent)
     expect(names).toEqual(["id", "amount"])
-    // `amount` is optional in Iceberg; `id` is required.
-    const amount = within(columns).getByText("amount").closest("tr") as HTMLElement
-    expect(within(amount).getByText("Yes")).toBeTruthy()
+    // `amount` is optional in Iceberg; `id` is required. The row has no Nullable column any
+    // more: whether a column can be null is a fact of the opened column.
+    const canBeNull = (name: string) => {
+      const button = within(columns).getByRole("button", { name })
+      fireEvent.click(button)
+      const panel = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement
+      return within(panel).getByText("Can be null").nextElementSibling?.textContent
+    }
+    expect(canBeNull("amount")).toBe("Yes")
+    expect(canBeNull("id")).toBe("No")
 
     const system = screen.getByText("System columns").closest("[data-slot=card]") as HTMLElement
     expect(within(system).getByText("_ingested_at")).toBeTruthy()
@@ -1179,6 +1188,122 @@ describe("Schema tab: a wide table", () => {
     const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
     expect(within(card).queryByRole("group", { name: "Columns to show" })).toBeNull()
     expect(within(card).queryByLabelText("Filter columns")).toBeNull()
+  })
+})
+
+describe("Schema tab: the column explorer", () => {
+  const SILVER_ORDERS: AssetDetail = {
+    ...BRONZE,
+    id: "silver.orders",
+    name: "orders",
+    namespace: "silver",
+    type: "table",
+    layer: "silver",
+    tier: "hot",
+    format: "ClickHouse MergeTree",
+    tableName: undefined,
+    tableKey: "silver.orders",
+    queryTarget: undefined,
+    schema: [
+      { name: "city", dataType: "Nullable(String)", description: "Where the order shipped" },
+      { name: "plnt", dataType: "String" },
+      { name: "d", dataType: "Date" },
+    ],
+    storage: {
+      table: "silver.orders",
+      engine: "MergeTree",
+      partitionKey: null,
+      sortingKey: "toYYYYMM(d), plnt",
+      parts: 1,
+      partitions: 1,
+      bytesOnDisk: 1000,
+      uncompressedBytes: 4000,
+      tableColumns: 3,
+    },
+  }
+  const WITH_VALUES = {
+    ...PROFILE,
+    columns: [
+      {
+        name: "city",
+        dataType: "Nullable(String)",
+        profiled: true,
+        nullCount: 100,
+        nullFraction: 0.05,
+        distinctCount: 4,
+        topValues: [
+          { value: "Jakarta", count: 1200 },
+          { value: "Bandung", count: 500 },
+        ],
+      },
+      { name: "plnt", dataType: "String", profiled: true, nullCount: 0, nullFraction: 0, distinctCount: 9, topValues: [] },
+      { name: "d", dataType: "Date", profiled: true, nullCount: 0, nullFraction: 0, distinctCount: 30, min: "2026-09-01", max: "2026-09-30", topValues: [] },
+    ],
+  }
+  const rowOf = (card: HTMLElement, name: string) =>
+    within(card).getByRole("button", { name }).closest("[role=row]") as HTMLElement
+
+  it("draws each column's most frequent values from the profile route, and opens the column", async () => {
+    stubApi({ profile: WITH_VALUES })
+    url.search = "tab=schema"
+    renderTabs(SILVER_ORDERS)
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const city = rowOf(card, "city")
+    await waitFor(() => expect(within(city).getByText("Jakarta")).toBeTruthy())
+    expect(within(city).getByText("60.0%")).toBeTruthy()
+    expect(within(city).getByText("≈ 4")).toBeTruthy()
+    // The description is in the opened column, not under the name.
+    expect(within(card).queryByText("Where the order shipped")).toBeNull()
+
+    fireEvent.click(within(city).getByRole("button", { name: "city" }))
+    const panel = city.nextElementSibling as HTMLElement
+    expect(within(panel).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Jakarta1,20060.0%",
+      "Bandung50025.0%",
+      "Other values20010.0%",
+      "Null1005.0%",
+    ])
+    expect(within(panel).getByText("Where the order shipped")).toBeTruthy()
+  })
+
+  it("marks the column the storage card's sorting key names, and not the one inside an expression", async () => {
+    stubApi({ profile: WITH_VALUES })
+    url.search = "tab=schema"
+    renderTabs(SILVER_ORDERS)
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    // A row renders its marks twice, beside the name and on the type's line (CSS shows one), so
+    // one marked column is two "sort key" and an unmarked column none.
+    expect(within(rowOf(card, "plnt")).getAllByText("sort key")).toHaveLength(2)
+    expect(within(rowOf(card, "d")).queryByText("sort key")).toBeNull()
+    expect(within(card).getAllByText("sort key")).toHaveLength(2)
+  })
+
+  it("marks no sort key for a table that has no storage card", async () => {
+    stubApi({ profile: WITH_VALUES })
+    url.search = "tab=schema"
+    renderTabs({ ...SILVER_ORDERS, storage: undefined })
+
+    await screen.findByText("Columns")
+    expect(screen.queryByText("sort key")).toBeNull()
+  })
+
+  it("asks for no statistics, and says why, without query:read, yet still opens a column", async () => {
+    const fetchSpy = stubApi({ permissions: ["catalog:read"], profile: WITH_VALUES })
+    url.search = "tab=schema"
+    renderTabs(SILVER_ORDERS)
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/they need the query:read permission/)).toBeTruthy()
+    expect(within(card).queryByRole("columnheader", { name: "Nulls" })).toBeNull()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/profile"))).toBe(false)
+
+    const city = within(card).getByRole("button", { name: "city" })
+    fireEvent.click(city)
+    const panel = document.getElementById(city.getAttribute("aria-controls") ?? "") as HTMLElement
+    expect(within(panel).getByText("Nullable(String)")).toBeTruthy()
+    expect(within(panel).getByText("Where the order shipped")).toBeTruthy()
   })
 })
 
