@@ -294,3 +294,69 @@ Uncommitted. The first part (P1, P2, the grid, the inspector, the moves, the tes
 **Unsure.** Row hover is the opaque `--muted`, slightly stronger than other tables.
 
 ## 9. Review (planner)
+
+### 2026-10-05 — P1 to P4, two rounds
+
+The developer was cut off once by a session restart and resumed from its
+own record; nothing was lost, and every command was run again afterwards.
+
+Read: `sample-grid.tsx` in full, the Rust change, the diffs of the shared
+files. Ran myself, from this tree, after the last round:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-api` (default parallelism) | exit 0: 2,622 passed, 0 failed, 4 ignored, 28 binaries |
+| `bun run typecheck` | exit 0 |
+| `bun run lint` | exit 0: 0 errors, 5 warnings, none in a changed file |
+| `bun run test` | exit 0: 719 passed, 1 skipped, 0 failed, 80 files |
+
+The Rust run is from before round 2, which changed no Rust. The skipped
+test belongs to the connector marks (it needs their source files).
+
+The developer's own Rust run failed 69 tests at default parallelism:
+the shared test Postgres held 2,082 databases the API test harness had
+leaked. I dropped the 1,858 that were idle and older than thirty minutes
+and ran the suite again. The leak is on the base and still needs its own
+change.
+
+**Findings of round 1, all closed.** Found on screenshots, with the
+tests green.
+
+- **S1.** The grid's sticky cells were painted over the page's own
+  sticky tab bar once the page scrolled. Closed: the frame is its own
+  stacking context.
+- **S2.** At 390 px the card's title and description were crushed to one
+  word per line by the controls in the header slot. Closed: the controls
+  are the first line of the card body.
+- **S3.** A failed request for more rows hid the rows the page already
+  had. Closed: the rows stay and a line above them says so, with Retry.
+- **S4.** Copy was offered for an empty text. Closed.
+
+**Accepted departures from this plan:** the inspector beside the grid
+from 1280 px, not 1024 (the grid would be 20rem wide); the first column
+sticky by the grid's own width; a cell is picked by a press, Enter or
+Space, not by focus alone, and after that the arrow keys move the pick;
+in a number column, values that are not numbers sort after the numbers.
+
+**On the dev stack** (API rebuilt from this tree, only its container
+recreated, no migration; the image before it is tagged
+`pre-sample-null-2026-10-05`): the sample route answers `null` for a
+`NULL` cell (67 of them in the first 25 rows of an 18-column Silver
+table).
+
+**In a browser** (headless; 1440 dark and light, 1280 light, 900 dark,
+390 light): 25 rows on opening; headers with glyph, name, type and sort
+control; `NULL` in the quiet italic; numbers right-aligned; the first
+column and the row numbers holding while the grid scrolls sideways; a
+sorted column saying so in the card; a picked cell and a picked column in
+the inspector, beside the grid at 1440 and 1280 and under it at 900 and
+390; no sideways scroll of the page at 390.
+
+**Not checked by anyone:** a screen reader; the keyboard in a real
+browser (the tests send the key events); an empty text and a masked
+value on the dev stack (the tests cover both; the table looked at has
+neither); 100 rows of a table with long text.
+
+**Verdict:** ready for the product owner's look. Nothing is committed.
