@@ -37,7 +37,7 @@ dependencies = [
     # 5.0.0) but these exact pins are still real, installable releases for
     # this interpreter, so they are kept as specified rather than bumped
     # without a reason recorded here.
-    "pymongo==4.9.2",
+    "pymongo==4.18.2",
     "oracledb==2.5.1",
     # adapters/sql.py builds mysql+pymysql / mssql+pyodbc connection
     # strings for the mysql/mariadb/mssql drivers, but neither driver
