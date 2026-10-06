@@ -328,7 +328,38 @@ fn schedule_label(job: &DgJob) -> String {
 /// `unavailable` set, not 503: "there are no runs" and "nobody could be
 /// asked" are different answers, and the page that shows them should be
 /// able to say which one it got.
-pub async fn runs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+///
+/// F2.1 (PR #59 review): the route applies [`crate::routes::
+/// authored_pipelines::in_scope`] to `pl-` ids before reaching for the
+/// orchestrator — an out-of-scope id cannot have a job in Dagster, so
+/// returning an empty list would leak the existence of a row in another
+/// tenant. Dagster-native ids are un-tenanted (no DB row to check) and
+/// proceed as before.
+pub async fn runs(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // The auth middleware populates `Extension<Principal>` on every
+    // `/api/*` request; this is `Some(_)` for a normal HTTP caller. Tool
+    // calls bypass the middleware and pass `None`; the helper fails
+    // closed (`Restricted(None)` sees nothing) and the route returns
+    // the standard 404. The `Option<Extension<Principal>>` shape matches
+    // `trigger` / `pause` / `resume` / `cancel_run` for the same reason.
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let body = runs_body(&state, &id).await;
     (StatusCode::OK, ApiJson(body)).into_response()
 }
@@ -381,8 +412,15 @@ async fn runs_body(state: &AppState, id: &str) -> Value {
 /// path in [`runs_body`] instead.
 pub async fn get_sla(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // F2.1 (PR #59 review): tenant scope check on `pl-` ids. A SLA row
+    // is per-pipeline, and revealing "this pipeline has no SLA
+    // configured" vs "this SLA exists" is itself a row-existence leak.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let pool = pool(&state)?;
     let sla = pipelines::get_pipeline_sla(pool, &id)
         .await
@@ -411,6 +449,7 @@ pub async fn get_sla(
 pub async fn put_sla(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -429,6 +468,35 @@ pub async fn put_sla(
         return Err(
             ApiError::BadRequest("lateAfterSeconds must be positive when set".to_owned()).into(),
         );
+    }
+    // F2.1 (PR #59 review): refuse `id` values that are neither an
+    // in-scope `pl-` row nor a Dagster job the orchestrator knows
+    // about. The pre-fix route accepted any string and silently
+    // upserted a `pipeline_sla` row for it (the `pipeline_sla.pipeline_id`
+    // column has no FK to `pipeline_definition`, so a typo wrote a
+    // phantom row). For `pl-` ids the scope check below is the same
+    // one the read side now applies, so the read and write sides agree
+    // on "this id exists in the caller's tenant". A non-`pl-` id must
+    // match a Dagster job the orchestrator reports (the same list
+    // `dagster_detail` uses to 404 unknown jobs).
+    if id.starts_with("pl-") {
+        crate::routes::authored_pipelines::in_scope(
+            state.pg.as_deref(),
+            &principal,
+            &headers,
+            &id,
+        )
+        .await?;
+    } else {
+        match state.dagster.list_jobs_with_schedules().await {
+            Ok(jobs) if jobs.iter().any(|j| j.name == id) => {}
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "{id:?} is neither a known pipeline nor a Dagster job"
+                ))
+                .into());
+            }
+        }
     }
     let actor = principal.id.uuid();
     let pool = pool(&state)?;
@@ -478,7 +546,25 @@ pub struct PutSlaBody {
 /// unreachable, mirroring [`runs_body`]'s degraded branch (so the UI
 /// can show "no runs right now, but here's why" rather than confusing
 /// it with a hard 503).
-pub async fn volume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn volume(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // F2.1 (PR #59 review): scope check before asking the orchestrator for
+    // a `pl-` id's runs. See `runs` for the rationale — Dagster-native ids
+    // are un-tenanted and proceed.
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let job = if id.starts_with("pl-") {
         authored_pipelines::job_name(&id)
     } else {
@@ -557,7 +643,36 @@ fn volume_body(runs: &[lakehouse_dagster::DgRunWithRows]) -> Value {
 /// (for an authored pipeline) its stored definition. Dispatches on the
 /// `pl-` id prefix exactly like [`pause`]/[`resume`] (WS4 item C1, grand
 /// plan §6, closes WS1 T2's "graph tab has nothing real to show").
-pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn detail(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // The auth middleware populates `Extension<Principal>` on every
+    // `/api/*` request, so this is `Some(_)` for a normal HTTP caller.
+    // Tool calls bypass the middleware and pass `None`; the helper then
+    // fails closed (Restricted(None) sees nothing) and the route
+    // returns the standard 404. The `Option<Extension<Principal>>` shape
+    // matches the same `trigger` / `pause` / `resume` handlers take,
+    // all of which the AI tool wrappers already call directly.
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    // F2.1 (PR #59 review): scope check before reaching for the row or
+    // the orchestrator. `authored_detail` would otherwise load the row
+    // (and its `depends_on` + downstream list), leaking the existence
+    // of a pipeline in another tenant.
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     if id.starts_with("pl-") {
         return authored_detail(&state, &id).await;
     }
@@ -574,17 +689,23 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
 pub async fn list_versions(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Vec<pipelines::PipelineVersionMeta>>> {
     if !id.starts_with("pl-") {
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     }
+    // F2.1 (PR #59 review): tenant scope check on top of the prefix
+    // check. Same body the existing 404 produces, so a caller cannot
+    // tell whether an out-of-scope id exists in another tenant or has
+    // simply never been authored.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let Some(pool) = state.pg.as_deref() else {
         return Err(
             ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
         );
     };
-    let _ = &principal; // permission gate is at the policy table
     let versions = pipelines::list_definition_versions(pool, &id)
         .await
         .map_err(ApiError::from)?;
@@ -601,17 +722,20 @@ pub async fn list_versions(
 pub async fn get_version(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((id, version)): Path<(String, i32)>,
 ) -> ApiResult<ApiJson<pipelines::PipelineDefinitionSnapshot>> {
     if !id.starts_with("pl-") {
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     }
+    // F2.1 (PR #59 review): tenant scope check before the store read.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let Some(pool) = state.pg.as_deref() else {
         return Err(
             ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
         );
     };
-    let _ = &principal; // permission gate is at the policy table
     let snapshot = pipelines::get_definition_version(pool, &id, version)
         .await
         .map_err(ApiError::from)?
@@ -1025,8 +1149,20 @@ pub struct SourceQuery {
 /// this client cannot actually tell apart from "no steps recorded yet".
 pub async fn run_steps(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((_id, run_id)): Path<(String, String)>,
 ) -> Response {
+    // F2.1 (PR #59 review): the path's `id` is unused (the
+    // orchestrator's `runSteps` keys on `runId` alone), so the scope
+    // check has to come from the run's `pipelineName`. An
+    // `authored__<id>` name maps back to `pl-<id>` and goes through
+    // `in_scope`; a `Dagster`-native name is un-tenanted and proceeds.
+    if let Err(rejection) =
+        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
+    {
+        return rejection;
+    }
     match state.dagster.run_steps(&run_id).await {
         Ok(steps) => (
             StatusCode::OK,
@@ -1086,7 +1222,24 @@ fn step_to_json(s: &lakehouse_dagster::RunStep) -> Value {
 /// already shows "orchestrator unreachable" for the same shape (see
 /// [`runs_body`]); a fabricated list of runs would silently lose the
 /// signal that something is wrong.
-pub async fn runs_step_matrix(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn runs_step_matrix(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // F2.1 (PR #59 review): scope check before the orchestrator lookup.
+    // See `runs` for the rationale.
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let job = if id.starts_with("pl-") {
         authored_pipelines::job_name(&id)
     } else {
@@ -1184,9 +1337,18 @@ const MAX_LOG_LINES_PER_PAGE: u32 = 500;
 /// takes for a `Dagster` failure.
 pub async fn run_logs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((_id, run_id)): Path<(String, String)>,
     Query(params): Query<LogsQuery>,
 ) -> Response {
+    // F2.1 (PR #59 review): scope check from the run's `pipelineName`;
+    // see `run_steps` for the rationale.
+    if let Err(rejection) =
+        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
+    {
+        return rejection;
+    }
     let limit = params.limit.unwrap_or(200).min(MAX_LOG_LINES_PER_PAGE);
     match state
         .dagster
@@ -1478,12 +1640,24 @@ pub(super) async fn record_pipeline_audit(
 pub async fn trigger(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Option<Json<TriggerBody>>,
 ) -> Response {
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
+    // F2.1 (PR #59 review): tenant scope check before validation or
+    // launch. A `pl-` id out of scope cannot have a job in Dagster, so
+    // validation would 400 and launch would 422, but only AFTER the
+    // orchestrator has been told about a job it shouldn't know the
+    // caller can see.
+    if let Err(rejection) =
+        crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+            .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     // `Option<Json<T>>` distinguishes "no body" (`Ok(None)`) from "valid
     // body" (`Ok(Some(_))`) without 400-ing on the missing `Content-Type`
     // header the existing curl corpus entry uses — axum 0.8's
@@ -2572,12 +2746,21 @@ struct SetStatusBody {
 /// never folded into 400, since an outage is not a caller error.
 pub async fn set_status_route(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<pipelines::Pipeline>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     if !id.starts_with("pl-") {
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     }
+    // F2.1 (PR #59 review): tenant scope check before any store read or
+    // orchestrator reload.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let body: SetStatusBody = parse_body(&body)?;
 
     // Unknown/run-derived target status -> 400, before touching the store
@@ -2641,11 +2824,22 @@ pub async fn set_status_route(
 pub async fn pause(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
+    // F2.1 (PR #59 review): tenant scope check on `pl-` ids. The pause
+    // route also flips a schedule on/off in Dagster — without the check,
+    // a caller from another tenant could pause a running chain in their
+    // own tenant by accident.
+    if let Err(rejection) =
+        crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+            .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let response = set_pipeline_paused(&state, &id, true).await;
     if response.status().is_success() {
         record_pipeline_audit(&state, &principal, "pipeline.pause", &id, Value::Null).await;
@@ -2662,11 +2856,20 @@ pub async fn pause(
 pub async fn resume(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
+    // F2.1 (PR #59 review): tenant scope check on `pl-` ids; see
+    // `pause` for the rationale.
+    if let Err(rejection) =
+        crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+            .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let response = set_pipeline_paused(&state, &id, false).await;
     if response.status().is_success() {
         record_pipeline_audit(&state, &principal, "pipeline.resume", &id, Value::Null).await;
@@ -2810,6 +3013,81 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
     })
 }
 
+/// F2.1 (PR #59 review) helper: the runId-keyed pipeline routes
+/// (`run_steps` / `run_logs` / `retry_run` / `cancel_run`) do not carry
+/// a path `id` (the `/api/pipelines/runs/{runId}/retry` and `/cancel`
+/// paths have no `{id}` segment); the scope has to come from the run's
+/// owning pipeline name, looked up once at the top of the route via
+/// `pipeline_run_pipeline_name`. An `authored__<id>` name maps back to
+/// `pl-<id>` and goes through
+/// [`crate::routes::authored_pipelines::in_scope`]; a `Dagster`-native
+/// name is un-tenanted (every other `Dagster` job in the orchestrator is)
+/// and proceeds.
+///
+/// The helper returns a `Response` so the caller can `return rejection;`
+/// directly. A `RunNotFoundError` (or `__typename != "Run"`) becomes the
+/// same "run not found" body the routes' other branches produce, so a
+/// caller cannot tell "out of scope" from "no such run". A transport
+/// failure surfaces as 503 with the classified error string (AGENTS.md
+/// rule 4).
+async fn enforce_run_id_pipeline_scope(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    run_id: &str,
+) -> Result<(), Response> {
+    let pipeline_name = match state.dagster.pipeline_run_pipeline_name(run_id).await {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                ApiJson(json!({ "error": format!("run {run_id} not found") })),
+            )
+                .into_response());
+        }
+        Err(err) => {
+            return Err(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiJson(json!({ "error": js_error(err) })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let Some(suffix) = crate::routes::authored_pipelines::pipeline_id_from_job_name(&pipeline_name)
+    else {
+        // Dagster-native job name — un-tenanted, proceed.
+        return Ok(());
+    };
+    // The factory's `_dagster_safe_name` replaces every character
+    // outside `[A-Za-z0-9_]` with `_`, so a `pl-foo.bar` row's run id
+    // shows up here as `authored__pl_foo_bar_baz` (the whole `pl-`
+    // prefix is preserved verbatim). Strip the `pl-` and let
+    // `in_scope` decide — its own DB lookup handles both the
+    // "unknown id" and "out of scope" cases with the same 404.
+    let pl_id = if let Some(rest) = suffix.strip_prefix("pl-") {
+        format!("pl-{rest}")
+    } else {
+        // `authored__` name without a `pl-` body: a tenantless
+        // authored job. Conservative behavior is to refuse it, since
+        // this code path should not exist for any row the store
+        // accepts — the create route enforces the `pl-` prefix.
+        format!("pl-{suffix}")
+    };
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        principal,
+        headers,
+        &pl_id,
+    )
+    .await
+    {
+        return Err(ApiRejection(rejection.0).into_response());
+    }
+    Ok(())
+}
+
 /// `POST /api/pipelines/runs/{runId}/cancel` — terminate a running
 /// `Dagster` run.
 ///
@@ -2818,7 +3096,28 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// 404 if `Dagster` reports the run doesn't exist; 409 if it exists but
 /// can't be terminated (already finished, ...); 503 on a transport
 /// failure.
-pub async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String>) -> Response {
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Response {
+    // The auth middleware populates `Extension<Principal>` on every
+    // `/api/*` request, so this is `Some(_)` for a normal HTTP caller.
+    // Tool calls bypass the middleware and pass `None`; the helper
+    // then fails closed (Restricted(None) sees nothing) and the route
+    // returns the standard 404 — same posture as `trigger` /
+    // `pause` / `resume` for the same reason.
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    // F2.1 (PR #59 review): scope check before any orchestrator mutation
+    // or status query. See `retry_run` for the rationale.
+    if let Err(rejection) =
+        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
+    {
+        return rejection;
+    }
     // The run being cancelled is the SAME run whose real start time is
     // already knowable via `pipeline_run_status` (cheaper than
     // `run_steps`, since only the run's own `startTime` is needed here,
@@ -2864,9 +3163,33 @@ pub async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String
 /// strategy.
 pub async fn retry_run(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
     body: Bytes,
 ) -> Response {
+    // The auth middleware populates `Extension<Principal>` on every
+    // `/api/*` request; this is `Some(_)` for a normal HTTP caller. Tool
+    // calls bypass the middleware and pass `None`; the helper fails
+    // closed and the route returns the standard 404. The shape matches
+    // `cancel_run` for the same reason.
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    // F2.1 (PR #59 review): tenant scope check before any work. The
+    // route does not carry a path `id` (cancel/retry are keyed on
+    // `runId` alone); the scope has to come from the run's
+    // `pipelineName`, which `enforce_run_id_pipeline_scope` looks up
+    // via the new `DgClient::pipeline_run_pipeline_name` method.
+    // Failing closed here means a run in another tenant's chain
+    // cannot be retried by a caller in this one — a run's existence
+    // would otherwise be observable through the run-failed/run-
+    // finished sensor payloads.
+    if let Err(rejection) =
+        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
+    {
+        return rejection;
+    }
     let request = match parse_retry_request(&body) {
         Ok(r) => r,
         Err(err) => {

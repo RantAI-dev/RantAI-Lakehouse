@@ -1778,7 +1778,52 @@ impl DgClient {
         Ok(sensor_ticks_from(&data["sensorOrError"]))
     }
 
-    /// A single run's live status + per-step status, matching
+    /// A single run's owning pipeline name, matching
+    /// `pipelineRunOrError(runId:$rid){ __typename ... on Run { pipelineName } }`.
+    /// Used by the runId-keyed pipeline routes (`run_steps` / `run_logs`
+    /// / `retry_run`) to map a `run_id` back to its owning pipeline for
+    /// the F2.1 scope check (PR #59 review F2.1): an `authored__<id>`
+    /// name maps back to the pipeline id `pl-<id>` so
+    /// `authored_pipelines::in_scope` can apply the per-tenant rule. A
+    /// `Dagster`-native job name (no `authored__` prefix) is not a
+    /// pipeline the DB knows about and the route leaves it alone —
+    /// un-tenanted like every other `Dagster`-native job.
+    ///
+    /// Same `__typename` check [`DgClient::pipeline_run_status`] already
+    /// uses — `Ok(None)` for a missing or non-`Run` `__typename`
+    /// (`RunNotFoundError`), never `Err`. `Err` is reserved for a
+    /// transport-level failure or a response body that isn't valid
+    /// `JSON`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    pub async fn pipeline_run_pipeline_name(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<String>, DgError> {
+        let query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename \
+                      ... on Run { pipelineName } } }";
+        let body = json!({ "query": query, "variables": { "rid": run_id } });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let text = resp.text().await?;
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        let run = parsed.pointer("/data/pipelineRunOrError");
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        if run.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(None);
+        }
+        let Some(name) = run.get("pipelineName").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        Ok(Some(name.to_owned()))
+    }
+
+/// A single run's live status + per-step status, matching
     /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
     /// `Run`).
     ///

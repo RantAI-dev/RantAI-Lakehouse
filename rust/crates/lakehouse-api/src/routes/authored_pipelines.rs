@@ -33,13 +33,15 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
+use lakehouse_store::PgPool;
 use lakehouse_store::pipelines::{self, UpdatePipelineInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
@@ -82,6 +84,138 @@ pub fn schedule_name(id: &str) -> String {
 #[must_use]
 pub fn sensor_name(id: &str) -> String {
     format!("{}_after", job_name(id))
+}
+
+/// The id part of an `authored__<id>` Dagster job name (the prefix every
+/// authored factory job carries, see [`job_name`]). Used by the
+/// runId-keyed pipeline routes (`run_steps` / `run_logs` / `retry_run`)
+/// to map a run's `pipelineName` back to its `pl-` row so the F2.1 scope
+/// check can apply the per-tenant rule (PR #59 review F2.1).
+///
+/// Returns `None` when `pipeline_name` is not an authored job name (a
+/// `Dagster`-native job is un-tenanted, like every other `Dagster`-native
+/// resource, and the route leaves it alone).
+#[must_use]
+pub fn pipeline_id_from_job_name(pipeline_name: &str) -> Option<&str> {
+    pipeline_name.strip_prefix("authored__")
+}
+
+/// The scope applied by [`in_scope`] for a caller whose resolved tenant
+/// (via [`crate::tenant_scope::resolve`]) was `Some(uuid)`. Carried
+/// separately from `Resolved::None` so a tenantless restricted principal
+/// (one with no `app_user_tenant` rows) is fail-closed — the helper
+/// returns 404 for every `pl-` id, never a wide-open access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerScope {
+    /// Restricted caller; only rows whose `tenant_id` matches `Some(t)`
+    /// are visible (a row whose `tenant_id IS NULL` is never visible to
+    /// a restricted caller, even one whose resolved tenant is `Some(t)`
+    /// — the same fail-closed rule [`crate::routes::pipelines::list`]
+    /// already applies for the list endpoint).
+    Restricted(Option<Uuid>),
+    /// Platform Admin (`*:*`) with no active tenant: every row, including
+    /// `tenant_id IS NULL` ones, is visible.
+    Unrestricted,
+}
+
+/// F2.1 / F2.3 (PR #59 review): every per-id pipeline route's scope
+/// check. Returns `Ok(())` when `id` is in scope, `Err(ApiError::
+/// NotFound)` otherwise. The error body matches the existing
+/// "unknown id" 404 body for the route, so a caller cannot tell whether
+/// an out-of-scope `pl-` id exists in another tenant or simply has
+/// never been authored — same rule the route layer already follows for
+/// cross-tenant reads (`tenant_scope::resolve`'s no-existence-leak
+/// comment).
+///
+/// Rule order (matches [`crate::routes::pipelines::list`]'s same logic
+/// for `all_tenants`):
+///
+/// 1. `id` does not start with `pl-` — Dagster-native job name: in
+///    scope, no DB row to check (the orchestrator owns it, the DB does
+///    not). Caller proceeds with whatever Dagster-side lookup the route
+///    was going to make.
+/// 2. `pool` is `None` — no Postgres configured: a `pl-` id cannot
+///    possibly exist, so 404, same body as case 3.
+/// 3. `id` starts with `pl-` but no row matches in
+///    `pipeline_definition` — unknown id: 404, the standard
+///    "Pipeline <id> not found" body.
+/// 4. Row exists and its `tenant_id` matches the caller's resolved
+///    tenant — in scope.
+/// 5. Row exists and its `tenant_id IS NULL` AND caller is
+///    `Unrestricted` — in scope (an unassigned row is invisible to
+///    every restricted caller).
+/// 6. Row exists and caller is `Unrestricted` (no resolved tenant —
+///    Platform Admin who picked "all tenants") — in scope (this is the
+///    same "Platform Admin sees every row" rule `list` uses).
+/// 7. Otherwise — 404, same body as case 3.
+pub async fn in_scope(
+    pool: Option<&PgPool>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    id: &str,
+) -> ApiResult<()> {
+    if !id.starts_with("pl-") {
+        return Ok(());
+    }
+    let Some(pool) = pool else {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    };
+    let scope = resolve_caller_scope(principal, headers)?;
+    let row: Option<(Option<Uuid>,)> = sqlx::query_as(
+        "SELECT tenant_id FROM pipeline_definition WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(lakehouse_store::StoreError::from)?;
+    let Some((row_tenant,)) = row else {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    };
+    if matches_scope(scope, row_tenant) {
+        return Ok(());
+    }
+    Err(ApiError::NotFound(format!("Pipeline {id} not found")).into())
+}
+
+/// Resolve the F2.1 scope for `principal` against the request's
+/// `X-Tenant` header, reusing the same `tenant_scope::resolve` and
+/// `catalog::is_unrestricted` helpers [`crate::routes::pipelines::list`]
+/// uses so the two per-id and list responses agree on what "in scope"
+/// means.
+pub fn resolve_caller_scope(
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> ApiResult<CallerScope> {
+    // `Unrestricted` only when BOTH conditions hold: caller is a Platform
+    // Admin (`*:*`) AND they have NOT picked a specific tenant via
+    // `X-Tenant`. A Platform Admin who sends `X-Tenant: <some-tenant>`
+    // is acting as that tenant and gets `Restricted(Some(t))`, not
+    // `Unrestricted` — so an `Unrestricted` reader literally sees every
+    // tenant's `rows`, the same wide-open posture `list`'s `all_tenants`
+    // rule applies.
+    let resolved = crate::tenant_scope::resolve(principal, headers)?;
+    Ok(match resolved {
+        Some(t) => CallerScope::Restricted(Some(t)),
+        None if crate::routes::catalog::is_unrestricted(principal) => {
+            CallerScope::Unrestricted
+        }
+        None => CallerScope::Restricted(None),
+    })
+}
+
+/// The per-`CallerScope` branch of [`in_scope`]. A pure helper so the
+/// rule is unit-testable independently of the DB / Dagster stack.
+pub fn matches_scope(scope: CallerScope, row_tenant_id: Option<Uuid>) -> bool {
+    match scope {
+        CallerScope::Restricted(Some(t)) => row_tenant_id == Some(t),
+        // Restricted with no resolved tenant (a tenantless restricted
+        // caller, e.g. a freshly-provisioned user with no
+        // `app_user_tenant` rows) sees nothing — fail closed.
+        CallerScope::Restricted(None) => false,
+        // Unrestricted (`*:*` with no `X-Tenant`): every row visible,
+        // including `tenant_id IS NULL` (unassigned).
+        CallerScope::Unrestricted => true,
+    }
 }
 
 /// Maximum number of upstream pipelines a downstream may declare. The
@@ -503,10 +637,17 @@ fn with_orchestrator(pipeline: &pipelines::Pipeline, reloaded: bool) -> Value {
 pub async fn update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     authored_only(&id)?;
+    // F2.1 (PR #59 review): tenant scope check after the `pl-` prefix
+    // check. The route mutates the row AND reloads the orchestrator
+    // — both leak out of scope (the row's existing payload, and the
+    // fact that the orchestrator rebuilds a job) without it.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
     for (index, transform) in body.transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
@@ -605,10 +746,25 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     if let Err(rejection) = authored_only(&id) {
         return rejection.into_response();
+    }
+    // F2.1 (PR #59 review): tenant scope check before any store read.
+    // The 400 refusal message in F2.2 names in-scope dependents only
+    // and falls back to a count for out-of-scope ones — that fallback
+    // needs `in_scope` to have run first.
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
     }
     let pool = match crate::routes::pipelines::pool(&state) {
         Ok(pool) => pool,
@@ -675,9 +831,15 @@ pub async fn delete(
 pub async fn restore_version(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((id, version)): Path<(String, i32)>,
 ) -> ApiResult<ApiJson<Value>> {
     authored_only(&id)?;
+    // F2.1 (PR #59 review): tenant scope check before the version
+    // snapshot read. A restore is replaying the row's editable state,
+    // so the row itself must be visible to the caller.
+    crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+        .await?;
     let pool = crate::routes::pipelines::pool(&state)?;
     let snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
@@ -760,7 +922,26 @@ pub async fn restore_version(
 /// from the schedule's launch / skip / fail outcomes. No schedule reads
 /// as an empty list with `schedule: null`; an unreachable orchestrator as
 /// `unavailable`.
-pub async fn schedule_ticks(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn schedule_ticks(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // F2.1 (PR #59 review): tenant scope check on `pl-` ids. The
+    // schedule's existence (and the sensor's ticks, when the pipeline
+    // has `depends_on`) are derivable from the row, so the same
+    // out-of-scope posture the read routes already apply applies here.
+    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
+        state.pg.as_deref(),
+        &principal,
+        &headers,
+        &id,
+    )
+    .await
+    {
+        return ApiRejection(rejection.0).into_response();
+    }
     let schedule = if id.starts_with("pl-") {
         Some(schedule_name(&id))
     } else {

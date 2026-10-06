@@ -94,6 +94,18 @@ pub struct Pipeline {
     /// for a pipeline that runs only on its own trigger. The factory's
     /// `authored__<id>_after` sensor is built only when this is non-empty.
     pub depends_on: Vec<String>,
+    /// F2.3: `pipeline_definition.tenant_id` (migration `0042`),
+    /// surfaced on the public type so the F2.1 scope helper in
+    /// `routes::authored_pipelines` can decide access without a
+    /// separate read. Skipped from the wire payload when `None` (an
+    /// unassigned pipeline, the state every freshly authored row is in
+    /// until `PUT /api/pipelines/{id}/tenant` is called) so the
+    /// existing console contract stays bit-for-bit unchanged; the TS
+    /// client would see a `tenantId: "<uuid>"` field on assigned
+    /// pipelines and ignore it, matching its existing handling of
+    /// every other `skip_serializing_if` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// The full stored shape of an authored pipeline's definition, returned by
@@ -145,6 +157,14 @@ struct PipelineRow {
     max_retries: i16,
     description: Option<String>,
     depends_on: Vec<String>,
+    /// F2.3: `pipeline_definition.tenant_id` (migration `0042`), read
+    /// on every `PipelineRow` query so the F2.1 scope helper can match
+    /// the row's tenant against the caller's resolved tenant without a
+    /// separate read. Kept on the private row even though the public
+    /// `Pipeline` type does not expose it — the per-row scope check
+    /// needs the value, but exposing it on the public type would be a
+    /// new wire field that no current caller wants.
+    tenant_id: Option<Uuid>,
 }
 
 /// A row shape for [`get_definition`], carrying the three columns migration
@@ -190,13 +210,19 @@ impl From<PipelineRow> for Pipeline {
             max_retries: row.max_retries,
             description: row.description,
             depends_on: row.depends_on,
+            // F2.3: copy the live row's `tenant_id` onto the public
+            // `Pipeline` so the F2.1 scope helper can match without a
+            // separate read. `None` keeps the wire payload identical
+            // to the pre-F2.3 shape (see `tenant_id`'s `skip_serializing_if`
+            // on the struct).
+            tenant_id: row.tenant_id,
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
-freshness_lag_seconds, max_retries, description, depends_on";
+freshness_lag_seconds, max_retries, description, depends_on, tenant_id";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -207,7 +233,7 @@ freshness_lag_seconds, max_retries, description, depends_on";
 const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
-     transforms, fbic_enabled";
+     transforms, fbic_enabled, tenant_id";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -270,14 +296,32 @@ pub struct PipelineVersionMeta {
     /// `pipeline_definition_version.version` (1-based, gap-free per
     /// `pipeline_id`).
     pub version: i32,
-    /// `"created" | "updated" | "restored" | "deleted"` — fixed
-    /// vocabulary from migration `0053`'s CHECK constraint.
+    /// `"created" | "updated" | "restored" | "deleted" | "baseline"` —
+    /// fixed vocabulary from migration `0055`'s CHECK constraint. The
+    /// fifth value, `"baseline"`, is the migration-`0055` backfill's own
+    /// marker; a row's `baseline` event is by construction a synthetic
+    /// insert (no real create/update/restore/delete path writes it).
     pub event: String,
     /// `pipeline_definition_version.changed_by` — `principal.id.uuid()`
-    /// from the route, `None` when no principal was present.
+    /// from the route, `None` when no principal was present (the
+    /// `baseline` backfill rows fall into this branch — there is no
+    /// recorded principal to attribute them to).
     pub changed_by: Option<Uuid>,
     /// `pipeline_definition_version.changed_at`, ISO 8601 milliseconds.
     pub changed_at: String,
+    /// `pipeline_definition_version.tenant_id` — the live row's
+    /// `tenant_id` at the moment the version was stamped, copied into
+    /// the version row so the per-version scope check (PR #59 review
+    /// F2.1) does not need to re-join `pipeline_definition` (and so
+    /// it still works for a deleted pipeline, whose live row is gone
+    /// by design — see migration `0053`'s "Why no foreign key"
+    /// comment). `None` for a row whose live pipeline has been
+    /// reassigned since the version was written: the version row
+    /// stays on the tenant that owned the pipeline at write time,
+    /// exactly the same immutable-history contract `0053`'s "no
+    /// foreign key" choice buys for `pipeline_id` itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]
@@ -286,6 +330,7 @@ struct VersionRow {
     event: String,
     changed_by: Option<Uuid>,
     changed_at: OffsetDateTime,
+    tenant_id: Option<Uuid>,
 }
 
 impl From<VersionRow> for PipelineVersionMeta {
@@ -295,6 +340,7 @@ impl From<VersionRow> for PipelineVersionMeta {
             event: row.event,
             changed_by: row.changed_by,
             changed_at: iso_millis(row.changed_at),
+            tenant_id: row.tenant_id,
         }
     }
 }
@@ -304,25 +350,33 @@ impl From<VersionRow> for PipelineVersionMeta {
 /// written this way — the same transaction holds the matching live
 /// write, so a snapshot can never appear without its live write (or
 /// vice versa). `version` is computed inside this call from the
-/// `MAX(version)` for `pipeline_id`, so a `created` row is always 1 and
-/// every subsequent event is one greater than the last.
+/// `MAX(version)` for `pipeline_id`, so the first row for a pipeline
+/// (whether `created` or the `baseline` migration backfill that
+/// precedes this function's callers) is `1`, and every subsequent event
+/// is one greater than the last.
 ///
 /// `event` is one of `"created"`, `"updated"`, `"restored"`,
 /// `"deleted"`; the migration's CHECK constraint is the database-level
 /// guard, this caller's contract. `changed_by` is bound verbatim and
-/// may be `None`.
+/// may be `None`. `tenant_id` is the live `pipeline_definition.tenant_id`
+/// at the moment of the write, copied verbatim so a per-version scope
+/// check does not have to re-join `pipeline_definition` (and works for
+/// a deleted pipeline, whose live row is gone). Pass `None` only from
+/// the `baseline` backfill migration itself; every other write path
+/// always has a live row to read from.
 async fn insert_definition_version(
     tx: &mut sqlx::PgConnection,
     pipeline_id: &str,
     snapshot: &PipelineDefinitionSnapshot,
     event: &str,
     changed_by: Option<Uuid>,
+    tenant_id: Option<Uuid>,
 ) -> Result<(), StoreError> {
     let snapshot_value = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
     let row: (i32,) = sqlx::query_as(
         "INSERT INTO pipeline_definition_version \
-            (pipeline_id, version, snapshot, event, changed_by) \
-         SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4 \
+            (pipeline_id, version, snapshot, event, changed_by, tenant_id) \
+         SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5 \
            FROM pipeline_definition_version WHERE pipeline_id = $1 \
          RETURNING version",
     )
@@ -330,6 +384,7 @@ async fn insert_definition_version(
     .bind(snapshot_value)
     .bind(event)
     .bind(changed_by)
+    .bind(tenant_id)
     .fetch_one(tx)
     .await?;
     let _ = row; // inserted; the version row's auto-incrementing gap-free
@@ -368,6 +423,14 @@ struct FullPipelineRow {
     incremental_column: Option<String>,
     transforms: serde_json::Value,
     fbic_enabled: bool,
+    /// F2.3: `pipeline_definition.tenant_id` (migration `0042`), read
+    /// here so the create/update/restore write paths can copy it onto
+    /// the new `pipeline_definition_version` row in the same
+    /// transaction. Kept on the row even though the public `Pipeline`
+    /// type does not expose it: the per-version scope check needs the
+    /// value, and threading it as a separate query at write time would
+    /// race against the live row's own tenant reassignment.
+    tenant_id: Option<Uuid>,
 }
 
 impl From<FullPipelineRow> for Pipeline {
@@ -391,6 +454,12 @@ impl From<FullPipelineRow> for Pipeline {
             max_retries: row.max_retries,
             description: row.description,
             depends_on: row.depends_on,
+            // F2.3 (PR #59 review): the row's `tenant_id` is the
+            // per-version scope the version-history endpoints filter on;
+            // it stays on `Pipeline` (with `skip_serializing_if =
+            // "Option::is_none"`) so the wire shape is unchanged for
+            // every pre-0055 caller.
+            tenant_id: row.tenant_id,
         }
     }
 }
@@ -747,7 +816,20 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .fetch_one(&mut *tx)
         .await?;
     let snapshot = PipelineDefinitionSnapshot::from(&row);
-    insert_definition_version(&mut tx, &row.id, &snapshot, "created", changed_by).await?;
+    insert_definition_version(
+        &mut tx,
+        &row.id,
+        &snapshot,
+        "created",
+        changed_by,
+        // F2.3: stamp `tenant_id` from the just-inserted live row, not
+        // from `input.tenant_id`, so a `DEFAULT`d value (the migration
+        // schema permits `tenant_id NULL`) cannot desync the version
+        // row's tenant from the live row's. Both end up the same in
+        // practice, but the `RETURNING` is the single source of truth.
+        row.tenant_id,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Pipeline::from(row))
 }
@@ -907,7 +989,17 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         return Ok(None);
     };
     let snapshot = PipelineDefinitionSnapshot::from(&row);
-    insert_definition_version(&mut tx, &row.id, &snapshot, event, changed_by).await?;
+    insert_definition_version(
+        &mut tx,
+        &row.id,
+        &snapshot,
+        event,
+        changed_by,
+        // F2.3: same as `create_pipeline` — stamp from the post-update
+        // `RETURNING`, not from a separate read.
+        row.tenant_id,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Some(Pipeline::from(row)))
 }
@@ -955,7 +1047,20 @@ pub async fn delete_pipeline(
         tx.rollback().await?;
         return Ok(false);
     }
-    insert_definition_version(&mut tx, id, &snapshot, "deleted", changed_by).await?;
+    insert_definition_version(
+        &mut tx,
+        id,
+        &snapshot,
+        "deleted",
+        changed_by,
+        // F2.3: stamp from the pre-delete SELECT in this same call so
+        // the `deleted` version row carries the tenant the live row
+        // held at the moment of removal. After this transaction the
+        // live row is gone, so a re-read would be impossible; the
+        // in-hand `row` is the only source available.
+        row.tenant_id,
+    )
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -1249,7 +1354,7 @@ pub async fn list_definition_versions(
     pipeline_id: &str,
 ) -> Result<Vec<PipelineVersionMeta>, StoreError> {
     let rows: Vec<VersionRow> = sqlx::query_as(
-        "SELECT version, event, changed_by, changed_at \
+        "SELECT version, event, changed_by, changed_at, tenant_id \
            FROM pipeline_definition_version \
           WHERE pipeline_id = $1 \
           ORDER BY version DESC",
@@ -1328,6 +1433,11 @@ mod tests {
             max_retries: 2,
             description: None,
             depends_on: Vec::new(),
+            // F2.3: a `None` here is the default-unassigned case; the
+            // `skip_serializing_if = "Option::is_none"` on the struct
+            // keeps `tenantId` out of the wire payload, matching the
+            // pre-F2.3 assertion that only the listed fields appear.
+            tenant_id: None,
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [
@@ -1378,6 +1488,10 @@ mod tests {
             max_retries: 2,
             description: None,
             depends_on: Vec::new(),
+            // F2.3: tenant_id is now a real column on the live row;
+            // `None` here matches the "never been assigned a tenant"
+            // fixture this test stands for.
+            tenant_id: None,
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, None);
@@ -1418,6 +1532,11 @@ mod tests {
             max_retries: 3,
             description: Some("does a thing".to_owned()),
             depends_on: vec!["pl-up".to_owned(), "ingest_job".to_owned()],
+            // F2.3: a row stored with a real tenant surfaces it on
+            // the public `Pipeline`. `Some(...)` here exercises the
+            // serialization path; `serialized_field_names_match_…` above
+            // exercises the `None` / no-serialization path.
+            tenant_id: Some(uuid::Uuid::from_u128(42)),
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, Some(iso_millis(ran_at)));

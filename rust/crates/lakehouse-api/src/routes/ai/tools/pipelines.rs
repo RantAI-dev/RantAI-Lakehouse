@@ -232,12 +232,32 @@ pub(super) async fn list_pipelines(state: &AppState, principal: Option<&Principa
     .await
 }
 
-pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn list_pipeline_runs(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    response_to_value(crate::routes::pipelines::runs(State(state.clone()), Path(id)).await).await
+    // F2.1 (PR #59 review): forward the principal to the route so the
+    // F2.1 scope check (`in_scope`) runs — a tool call WITHOUT a
+    // principal (e.g. an internal caller that bypasses the AI auth
+    // middleware) would see the route fail closed and return 404. Same
+    // `principal: Option<&Principal>` shape as `trigger_pipeline` /
+    // `pause_pipeline` already take.
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::runs(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
+    )
+    .await
 }
 
 /// `principal` is forwarded as `Option<Extension<Principal>>` — the same
@@ -268,13 +288,23 @@ pub(super) async fn trigger_pipeline(
     let body = Json(TriggerBody { run_config });
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::trigger(State(state.clone()), extension, Path(id), Some(body))
-            .await,
+        crate::routes::pipelines::trigger(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+            Some(body),
+        )
+        .await,
     )
     .await
 }
 
-pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn retry_pipeline_run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
@@ -297,8 +327,20 @@ pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Valu
     } else {
         Bytes::new()
     };
+    // F2.1 (PR #59 review): forward the principal so the route's runId
+    // scope check (`enforce_run_id_pipeline_scope`) runs. A tool call
+    // without a principal returns 404 from the same path it does for
+    // a restricted caller — `Restricted(None)` sees nothing.
+    let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::retry_run(State(state.clone()), Path(run_id), body).await,
+        crate::routes::pipelines::retry_run(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(run_id),
+            body,
+        )
+        .await,
     )
     .await
 }
@@ -314,7 +356,13 @@ pub(super) async fn pause_pipeline(
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::pause(State(state.clone()), extension, Path(id)).await,
+        crate::routes::pipelines::pause(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
     )
     .await
 }
@@ -330,18 +378,37 @@ pub(super) async fn resume_pipeline(
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::resume(State(state.clone()), extension, Path(id)).await,
+        crate::routes::pipelines::resume(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
     )
     .await
 }
 
-pub(super) async fn cancel_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn cancel_pipeline_run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
     }
+    // F2.1 (PR #59 review): forward the principal so the route's runId
+    // scope check runs. Same posture as `retry_pipeline_run` above.
+    let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::cancel_run(State(state.clone()), Path(run_id)).await,
+        crate::routes::pipelines::cancel_run(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(run_id),
+        )
+        .await,
     )
     .await
 }
@@ -377,7 +444,20 @@ pub(super) async fn get_pipeline(state: &AppState, args: &Map<String, Value>) ->
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    response_to_value(crate::routes::pipelines::detail(State(state.clone()), Path(id)).await).await
+    // F2.1 (PR #59 review): tool calls run with no `x-tenant` header
+    // and no principal — the helper fails closed and the route returns the
+    // standard 404. A principal-bearing tool entry point already runs
+    // the F2.1 scope check on the matching path.
+    response_to_value(
+        crate::routes::pipelines::detail(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
+    )
+    .await
 }
 
 pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Value>) -> Value {
@@ -388,6 +468,8 @@ pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Val
     api_result_to_value(
         crate::routes::pipelines::set_status_route(
             State(state.clone()),
+            None,
+            HeaderMap::new(),
             Path(id),
             axum::body::Bytes::from(json!({ "status": "ready" }).to_string()),
         )
