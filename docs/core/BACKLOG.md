@@ -107,7 +107,6 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | `DEC-4` | Train and serve models | No |
 | `DEC-5` | Mobile app | No |
 | `DEC-6` | Share data with another organisation | Defer |
-| `DEC-7` | Write-back: buttons and forms on a dashboard that change data, turning it into a small app (Metabase actions, Tableau external actions) | Defer |
 | `INT-1` | Digital employees | Parked by the product owner, 2026-10-02 |
 
 ## Done and rejected
@@ -115,5 +114,6 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | ID | Item | Outcome | Date |
 | --- | --- | --- | --- |
 | `PM-1` | Customer-facing product name | Decided: RantAI Lakehouse | 2026-10-02 |
+| `DEC-7` | Write-back from dashboards (buttons and forms that change data) | Rejected: we are a lakehouse, not an ERP | 2026-10-06 |
 | `BI-21` | Where charts read data | Decided: only data in the lakehouse, for now | 2026-10-06 |
 | `SEC-8` | Dependency security checks green on `main` | Done: PR #62. Three TLS-library vulnerabilities cleared by updating the SQL Server client; licence check fixed | 2026-10-02 |

@@ -150,7 +150,7 @@ panels). Metabase is the realistic benchmark; Tableau is the ceiling.
 | Reusable metrics | Build them | `BI-2` |
 | Curated datasets for authors | Build them | `BI-12` |
 | Combine two sources on one chart | Build it | `BI-13` |
-| Write-back from dashboards | Not decided; explained to the owner | `DEC-7` |
+| Write-back from dashboards | No: we are a lakehouse, not an ERP | `DEC-7` (rejected) |
 | Lineage from a chart to its sources | Build it | `BI-14` |
 | SQL editor | Make it very good | `BI-15` |
 | Chart types | Cover every type Tableau and Metabase have | `BI-16` |
