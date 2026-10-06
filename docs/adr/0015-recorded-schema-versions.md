@@ -1,6 +1,7 @@
 # ADR 0015 — Schema versions of Silver and Gold tables are recorded, not read
 
-- **Status:** Accepted (product owner, 2026-10-05); implementation in progress
+- **Status:** Accepted (product owner, 2026-10-05); built and on the dev
+  stack, waiting for the product owner's look
 - **Phase:** plan `docs/superpowers/plans/2026-10-05-schema-versions-silver-gold.md`
 - **Date:** 2026-10-05
 
@@ -81,4 +82,24 @@ Rejected: a read should not write.
 
 ## Verification
 
-None yet. Written with the plan, before the code.
+On the dev stack, 2026-10-05, `ClickHouse` 26.8 (the record is section 9 of
+the plan):
+
+- The pass at API start recorded one version for each of the seven tables
+  in the two databases, each "First recorded with N columns".
+- On a demo Gold table: an added column, a retyped plus a dropped column,
+  and a moved column each gave the next version with its sentence; a look
+  with nothing changed recorded nothing.
+- A column added before the orchestrator's 15-minute schedule was recorded
+  at that schedule, with no other trigger.
+- The page showed the versions on the Schema tab, the About card and the
+  change history; a raw table's page was unchanged.
+
+Corrected while building: the plan first had the recorder look at the
+export setting `GOLD_SOURCE_SCHEMA`; the catalog serves `silver` and
+`serving` whatever that setting is, so the recorder looks there. And the
+engine refused the first form of one read (`Code: 184`) that the unit
+tests' fake engine had accepted.
+
+Not run: more than 2,000 tables, two API processes against one engine, an
+install without the orchestrator.

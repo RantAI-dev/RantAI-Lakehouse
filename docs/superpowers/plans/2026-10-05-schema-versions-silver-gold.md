@@ -293,3 +293,84 @@ until it is.
   the exact commands and counts.
 
 ## 9. Review (planner)
+
+### 2026-10-05 — T1 to T3, two rounds
+
+Read: the whole of `routes/schema_versions.rs` outside its tests, every
+other diff, the documents. Ran myself, from this tree, after round 2:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-api` | exit 0: 2,620 passed, 0 failed, 4 ignored, 28 binaries |
+| `bun run typecheck` | exit 0 |
+| `bun run lint` | exit 0: 0 errors, 5 warnings, none in a changed file |
+| `bun run test` | exit 0: 563 passed, 0 failed, 74 files |
+
+Not run: the other crates' tests (no file of theirs changed), the
+orchestrator's tests (no Python changed), `next build`.
+
+**Findings of round 1, all closed in round 2.**
+
+- **B1 (BLOCKER).** The read of the newest version per table aliased
+  `max(version) AS version`. The engine resolves the alias inside
+  `argMax(columns, version)` and refuses the statement (`Code: 184`), so
+  no pass could ever have recorded anything. No test could see it: the
+  engine in the tests is a fake. Found by running the module's statements
+  in a scratch database on the dev engine. Closed: aliases that shadow no
+  column, and a test on the statement's text with the reason beside it.
+- **R1 (SHOULD-FIX, the plan's error).** Section 3 had the recorder look
+  at `Config::gold_source_schema`. The catalog serves `silver` and
+  `serving` whatever that setting is; the developer found it. Closed: the
+  recorder looks at the pair the catalog serves, and the section is
+  corrected in place.
+- **R2 (SHOULD-FIX).** The engine client reads a `2xx` body that is not
+  JSON as an empty result. In the newest-version read that would mean
+  "nothing recorded" and version 1 again for every table. Closed: an
+  answer without `meta` is a failed read, in the pass and on the page.
+- **R3 (SHOULD-FIX, AGENTS.md rule 4).** A third copy of "unknown table or
+  database". Closed: one helper beside `is_unknown_table_error`, used by
+  all three.
+- **R4.** One writer assumed, and no cap on the page's read: both now in
+  the module doc and in `docs/OPERATIONS.md`.
+
+**On the dev stack** (image built from this tree, only the API container
+recreated; the earlier image is tagged `pre-schema-versions-2026-10-05`;
+no migration, so that tag alone is the way back):
+
+| Step | Seen |
+| --- | --- |
+| API start | `schema versions: pass finished`, `recorded: 7` (five Gold, two Silver) |
+| Detail of a Gold table, a Silver table, a Gold view | each `v1`, "First recorded with N columns", `current` |
+| Demo table `serving.schema_version_demo` created, a look | `v1`, "First recorded with 4 columns" |
+| `ADD COLUMN email String`, a look | `v2`, "Added email (String)" |
+| `DROP COLUMN name`, `MODIFY COLUMN amount Decimal(38, 4)`, a look | `v3`, "Changed amount from Decimal(18, 2) to Decimal(38, 4) · Dropped name (String)" |
+| A column moved, a look | `v4`, "Reordered columns" |
+| A look with nothing changed | `recorded: 0`, still four versions |
+| `ADD COLUMN note Nullable(String)` at 06:14 UTC, no look | `v5` at 06:15:12, "Added note (Nullable(String))": the orchestrator's schedule |
+
+A "look" was a finished-run report for a job name nothing owns, sent as an
+administrator: it starts a pass and does nothing else. The 06:15 pass was
+started by the orchestrator at its schedule; the API log does not say
+whether by the alerts tick or by a finished-run report.
+
+In a browser (headless, 1440 dark and 390 light): the Schema tab lists
+the versions with the `current` pill and "since Oct 5, 2026"; the About
+card reads "v4 · recorded just now"; the change history has "Schema v4"
+to "Schema v1"; before the API was rebuilt the same tab read "No schema
+version recorded yet"; a raw table's card is as it was. No sideways
+scroll at either width.
+
+**Left as it is, on purpose.**
+
+- The alerts tick test asks up to 100 times for a pass of its own,
+  because the flag is one per process and another test's pass may hold
+  it. Its comment says so.
+- A version's time has seconds, an audit entry's has milliseconds. Within
+  one second the change history may order the two either way.
+- `serving.schema_version_demo` stays on the dev stack for the product
+  owner's look (checklist 6 and 7 are already visible on it). Dropping it
+  leaves its five rows in the store.
+
+**Verdict:** ready for the product owner's look. Nothing is committed.
