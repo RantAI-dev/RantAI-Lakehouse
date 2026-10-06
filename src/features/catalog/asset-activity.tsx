@@ -347,12 +347,19 @@ type Change = AssetDetail["changeHistory"][number]
 
 /**
  * One history of what changed about the asset, newest first: what people
- * did to it (the audit trail) and what its table's schema became (the
- * Iceberg table's own schema versions). A schema version has no author on
- * record, so it is named by its version; one with no time on record
- * cannot be placed among the others and is left to the Schema tab.
+ * did to it (the audit trail) and what its table's schema became — an
+ * Iceberg table's own schema versions, or for a Silver or Gold table the
+ * versions the console recorded (`recorded`, `AssetDetail.schemaVersions`).
+ * A schema version has no author on record, so it is named by its version;
+ * an Iceberg version with no time on record cannot be placed among the
+ * others and is left to the Schema tab. A recorded version is dated when
+ * the console saw the table change, which is the only time there is.
  */
-export function changeTimeline(history: Change[], versions: LakehouseSchemaVersion[]): Change[] {
+export function changeTimeline(
+  history: Change[],
+  versions: LakehouseSchemaVersion[],
+  recorded: AssetDetail["schemaVersions"] = []
+): Change[] {
   const schema = schemaHistory(versions).flatMap((v) =>
     v.sinceMs === null
       ? []
@@ -365,7 +372,13 @@ export function changeTimeline(history: Change[], versions: LakehouseSchemaVersi
           },
         ]
   )
-  return [...history, ...schema].sort((a, b) => b.at.localeCompare(a.at))
+  const seen = recorded.map((v) => ({
+    id: `schema-recorded-${v.version}`,
+    at: v.at,
+    actor: `Schema v${v.version}`,
+    summary: v.change,
+  }))
+  return [...history, ...schema, ...seen].sort((a, b) => b.at.localeCompare(a.at))
 }
 
 /**
@@ -385,7 +398,8 @@ export function AssetActivity({
 }) {
   const changes = changeTimeline(
     a.changeHistory,
-    iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : []
+    iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : [],
+    a.schemaVersions
   )
   const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
   const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])

@@ -518,6 +518,69 @@ Iceberg table. What that asks of the operator:
   table appears in the shared catalog, which only the tenant that owns the
   catalog sees.
 
+### Schema versions of Silver and Gold tables (ADR 0015)
+
+A raw table's page shows its schema versions from its Iceberg metadata. The
+analytics engine keeps only a table's current columns, so for a table in
+`silver` or `serving` (the two databases the catalog serves) the API records
+the versions itself, in a `ClickHouse` table it creates on first use:
+
+- **`console.table_schema_version`** holds `table_key` (`<database>.<table>`),
+  `version` (from 1), `columns` (a JSON array of `[name, type]` pairs in the
+  table's column order) and `observed_at` (`DateTime64(3, 'UTC')`), as a
+  `MergeTree` ordered by `(table_key, version)`. The DDL is owned by
+  `rust/crates/lakehouse-api/src/routes/schema_versions.rs`, like
+  `console.quality_run`; there is no `PostgreSQL` migration, and nothing
+  prunes it. A row is added only when a table's ordered `(name, type)` list
+  differs from the last one recorded for it.
+- **When it is recorded.** One pass reads every table's columns in `silver`
+  and in `serving` and compares them with the newest recorded list of each;
+  it is two reads and, when something changed, one `INSERT`. A pass runs when the API starts, on `POST /api/alerts/run`
+  (the orchestrator's `alerts_run_schedule`, every 15 minutes; the answer
+  carries `schemaPassStarted`), and when the orchestrator reports a finished
+  run (`POST /api/pipelines/events/run-finished`, from Dagster's
+  `pipeline_run_finished_sensor`, which needs `PIPELINE_RUN_TOKEN`). **An
+  install without the orchestrator records versions only at start-up**: a
+  table that changes later is not noticed until the API restarts. One pass
+  runs at a time; a start while one runs is refused, not queued.
+- **A failed pass changes nothing.** If the engine is not reachable (it may
+  not be yet when the API starts) the log line `schema versions: pass failed`
+  says so and the next trigger tries again. An answer from the engine that is
+  not a result (a `200` whose body is not `FORMAT JSON`, which `ClickHouse`
+  can send before failing mid-stream) counts as a failed read, never as an
+  empty store. The asset page reads the store only: a store that does not
+  exist yet, or any failed read, shows as "No schema version recorded yet".
+- **One API per engine is assumed.** One pass runs at a time within an API
+  process, not across processes: two APIs against one engine could each
+  record the same number for a table. The page folds two equal consecutive
+  versions into one.
+- **The page reads every version of a table, with no cap.** A table whose
+  columns differ at every look adds one row per look. It is not capped on
+  purpose: a cut list would label its oldest shown version "First recorded".
+- **At most 2,000 tables are looked at per pass**, the first by name; when
+  there are more, `schema versions: more tables than a pass looks at` is
+  logged with how many were left out.
+- **Limits to tell a customer.** Versions start the day this is deployed and
+  the first one is dated by the console's first look at the table, not by
+  the table's creation. A version's time is when the console saw the change,
+  up to one trigger after it; two changes between two looks are recorded as
+  one, and a change undone before the next look is not recorded. A renamed
+  column reads as one dropped and one added. Only the definition is kept,
+  not the rows. A table that is dropped records nothing, and its rows stay.
+- **Who can see it.** The versions are a field of the asset detail
+  (`GET /api/catalog/{id}`), behind that route's permission and tenant gate;
+  no route was added.
+- **What was run.** On the dev stack on 2026-10-05 (`ClickHouse` 26.8): the
+  pass at start-up recorded one version for each of the seven tables in
+  `silver` and `serving`; on a demo table an added column, a retyped plus a
+  dropped column and a moved column each gave the next version, a look with
+  nothing changed recorded nothing, and a column added before the
+  orchestrator's 15-minute schedule was recorded at that schedule. Before
+  that, the engine refused one statement the unit tests' fake engine had
+  accepted (the aliases of the newest-version read, `Code: 184`), which is
+  why that statement carries a test on its text. Not run: more than 2,000
+  tables, two APIs against one engine, an install without the orchestrator.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

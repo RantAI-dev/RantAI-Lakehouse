@@ -33,6 +33,7 @@ mod overview;
 mod pipelines;
 mod quality;
 mod query;
+pub(crate) mod schema_versions;
 mod storage;
 pub(crate) mod support;
 mod uploads;

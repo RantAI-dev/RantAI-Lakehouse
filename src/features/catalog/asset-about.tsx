@@ -172,8 +172,9 @@ export function AssetAbout({
 }: {
   asset: AssetDetail
   /**
-   * The current schema version, worked out by the overview; `null` for a
-   * table that records none (only Iceberg tables do).
+   * The current schema version, worked out by the overview: an Iceberg
+   * table's own, or the one the console recorded for a Silver or Gold
+   * table; `null` when there is none yet.
    */
   schemaLabel: string | null
   /** Called after a save, to reload the asset. */

@@ -17,7 +17,14 @@ import {
 } from "@/components/ui/table"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
-import { formatCompactNumber, formatNumber, formatPercent, formatRelativeTime } from "@/lib/format"
+import {
+  formatCompactNumber,
+  formatDate,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+  formatRelativeTime,
+} from "@/lib/format"
 import { snapshotRelativeTime } from "@/lib/lakehouse-view"
 import { schemaHistory } from "@/lib/schema-history"
 import { assetService } from "@/services"
@@ -256,17 +263,30 @@ function ColumnCells({ row }: { row: SchemaRow }) {
 }
 
 /**
- * How the table's schema got to where it is: one entry per Iceberg schema,
- * newest first, saying what changed from the one before. A ClickHouse
- * table keeps no such history, and the card says so rather than "none".
+ * How the table's schema got to where it is, newest first, each saying what
+ * changed from the one before. An Iceberg table carries every schema it has
+ * had, so those are listed as they are. A ClickHouse table keeps only its
+ * current columns, so for a `silver.*`/`serving.*` table the list is the one
+ * the console recorded itself (ADR 0015): it starts when the console first
+ * looked, and the card says so rather than presenting it as the table's
+ * whole history.
  */
 function SchemaVersions({ asset: a, table }: { asset: AssetDetail; table: LakehouseTableDetail | null }) {
   const history = schemaHistory(table?.schemaVersions ?? [])
+  const recorded = a.schemaVersions
+  // The list is newest first, so the oldest entry is the last.
+  const firstRecorded = recorded.length > 0 ? recorded[recorded.length - 1].at : null
   return (
     <SectionCard
       size="sm"
       title="Schema versions"
-      description="Every schema the table has had, most recent first."
+      description={
+        history.length > 0 || a.type === "iceberg-table"
+          ? "Every schema the table has had, most recent first."
+          : firstRecorded
+            ? `Recorded by the console each time this table's columns change, since ${formatDate(firstRecorded, { month: "short" })}. Changes before that are not known, and a renamed column shows as one dropped and one added.`
+            : "Recorded by the console each time this table's columns change. A renamed column shows as one dropped and one added."
+      }
     >
       {history.length > 0 ? (
         <ul className="divide-y divide-border text-sm">
@@ -284,22 +304,29 @@ function SchemaVersions({ asset: a, table }: { asset: AssetDetail; table: Lakeho
             </li>
           ))}
         </ul>
-      ) : a.schemaVersions.length > 0 ? (
+      ) : recorded.length > 0 ? (
         <ul className="divide-y divide-border text-sm">
-          {a.schemaVersions.map((v) => (
-            <li key={v.version} className="flex flex-wrap items-baseline gap-2 py-1.5">
+          {recorded.map((v) => (
+            <li key={v.version} className="flex flex-wrap items-baseline gap-x-2 gap-y-1 py-1.5">
               <span className="font-mono text-xs text-muted-foreground">v{v.version}</span>
-              <span>{v.change}</span>
-              <span className="ml-auto text-xs text-muted-foreground">{formatRelativeTime(v.at)}</span>
+              {v.current ? <Pill tone="neutral">current</Pill> : null}
+              <span className="min-w-0 flex-1">{v.change}</span>
+              <span
+                className="text-xs text-muted-foreground"
+                title={`When the console saw the table with these columns: ${formatDateTime(v.at)}`}
+              >
+                recorded {formatRelativeTime(v.at)}
+              </span>
             </li>
           ))}
         </ul>
       ) : (
         <EmptyState
-          title={
+          title={a.type === "iceberg-table" ? "No schema history available" : "No schema version recorded yet"}
+          description={
             a.type === "iceberg-table"
-              ? "No schema history available"
-              : "Only Iceberg tables record schema history"
+              ? undefined
+              : "The console records a version the next time it looks at this table: when a run finishes, and on a schedule."
           }
           className="py-4"
         />

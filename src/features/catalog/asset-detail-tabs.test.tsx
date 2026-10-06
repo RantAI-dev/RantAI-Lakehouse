@@ -22,6 +22,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { formatDate } from "@/lib/format"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 import { relatedTables } from "./asset-lineage"
@@ -1293,5 +1294,124 @@ describe("Access tab: taking a classification back", () => {
     renderTabs({ ...BRONZE, classificationRules: [] })
     await screen.findByText("Classification")
     expect(screen.queryByLabelText(/Remove the classification/)).toBeNull()
+  })
+})
+
+// ADR 0015: ClickHouse keeps only a table's current columns, so the console
+// records each version it sees (`routes/schema_versions.rs`) and the page
+// shows them where a raw table shows its Iceberg ones — saying since when,
+// and never calling the list the table's whole history.
+describe("Schema versions of a Silver or Gold table", () => {
+  const FIRST = "2026-10-01T12:00:00Z"
+  const SECOND = "2026-10-03T12:00:00Z"
+  const SILVER: AssetDetail = {
+    ...BRONZE,
+    id: "silver.orders",
+    name: "orders",
+    namespace: "silver",
+    type: "table",
+    layer: "silver",
+    tier: "hot",
+    format: "ClickHouse MergeTree",
+    tableName: undefined,
+    tableKey: "silver.orders",
+    queryTarget: undefined,
+    schemaVersions: [
+      { version: 2, at: SECOND, change: "Added email (String)", current: true },
+      { version: 1, at: FIRST, change: "First recorded with 2 columns", current: false },
+    ],
+  }
+
+  it("lists the recorded versions newest first, marks the current one, and says since when", () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs(SILVER)
+
+    const card = screen.getByText("Schema versions").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringContaining("v2currentAdded email (String)recorded"),
+      expect.stringContaining("v1First recorded with 2 columns"),
+    ])
+    // Only the newest carries the pill.
+    expect(within(card).getAllByText("current")).toHaveLength(1)
+    expect(
+      within(card).getByText(
+        `Recorded by the console each time this table's columns change, since ${formatDate(FIRST, { month: "short" })}. ` +
+          "Changes before that are not known, and a renamed column shows as one dropped and one added."
+      )
+    ).toBeTruthy()
+    // The sentence that an engine table keeps no history is gone.
+    expect(screen.queryByText("Only Iceberg tables record schema history")).toBeNull()
+  })
+
+  it("says no version is recorded yet, and when the console records one, for a table it has not looked at", () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs({ ...SILVER, schemaVersions: [] })
+
+    const card = screen.getByText("Schema versions").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText("No schema version recorded yet")).toBeTruthy()
+    expect(
+      within(card).getByText(/records a version the next time it looks at this table: when a run finishes, and on a schedule/)
+    ).toBeTruthy()
+    expect(within(card).queryByRole("listitem")).toBeNull()
+    expect(screen.queryByText("Only Iceberg tables record schema history")).toBeNull()
+  })
+
+  it("places each recorded version among what people changed in the change history", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...SILVER,
+      changeHistory: [
+        { id: "audit-2", at: "2026-10-04T09:00:00.000Z", actor: "Rina", summary: "Edited description" },
+        { id: "audit-1", at: "2026-10-02T09:00:00.000Z", actor: "Budi", summary: "Added quality rule orders_id_unique" },
+      ],
+    })
+
+    const history = screen.getByText("Change history").closest("[data-slot=card]") as HTMLElement
+    expect(within(history).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringContaining("RinaEdited description"),
+      expect.stringContaining("Schema v2Added email (String)"),
+      expect.stringContaining("BudiAdded quality rule orders_id_unique"),
+      expect.stringContaining("Schema v1First recorded with 2 columns"),
+    ])
+  })
+
+  it("shows the current version in the About card as recorded, not as the table's age", async () => {
+    stubApi()
+    renderTabs(SILVER)
+
+    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    expect(within(about).getByText("Schema")).toBeTruthy()
+    expect(within(about).getByText(/^v2 · recorded /)).toBeTruthy()
+  })
+
+  it("leaves the About card without a schema row until a version is recorded", async () => {
+    stubApi()
+    renderTabs({ ...SILVER, schemaVersions: [] })
+
+    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    expect(within(about).queryByText("Schema")).toBeNull()
+  })
+
+  it("leaves a raw table's cards as they were: its versions come from the catalog", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs()
+
+    const card = (await screen.findByText("Schema versions")).closest("[data-slot=card]") as HTMLElement
+    await waitFor(() => expect(within(card).getAllByRole("listitem")).toHaveLength(2))
+    expect(within(card).getByText("Every schema the table has had, most recent first.")).toBeTruthy()
+    expect(within(card).queryByText(/recorded/i)).toBeNull()
+  })
+
+  it("still says a raw table has no schema history when the catalog has none, not that none is recorded", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs({ ...BRONZE, tableName: "missing_table", tableKey: "bronze.missing_table" })
+
+    expect(await screen.findByText("No schema history available")).toBeTruthy()
+    expect(screen.queryByText("No schema version recorded yet")).toBeNull()
   })
 })

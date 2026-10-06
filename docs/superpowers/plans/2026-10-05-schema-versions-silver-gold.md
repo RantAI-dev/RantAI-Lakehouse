@@ -62,8 +62,11 @@ Line numbers drift; re-find by symbol.
   The file is the pipeline team's, taken from `main`: add one line and
   nothing else (`routes/lineage.rs` is treated the same way).
 - **Start-up:** `main.rs`, after the `bootstrap_*` calls (~83-115).
-- **Which databases:** `silver`, and `Config::gold_source_schema`
-  (`config.rs` ~512, default `serving`).
+- **Which databases:** `silver` and `serving`, the pair
+  `routes/catalog.rs::clickhouse_asset_detail` serves (`db != "silver" &&
+  db != "serving"`). *Corrected in review (R1):* this line first named
+  `Config::gold_source_schema`, which only the export routes read; the
+  catalog opens Gold tables as `serving.<table>` whatever that setting is.
 - **How a table's columns are read today:** `routes/catalog_source.rs`
   `clickhouse_source` (~64: `system.columns … ORDER BY position`).
 - **Where the detail of a Silver or Gold table is built:**
@@ -112,9 +115,9 @@ and what a version is not.
     column list (two passes that raced) are one entry.
 - **One pass**, `observe(state) -> Result<usize, ChError>` (how many
   versions it recorded):
-  1. Read every table's ordered columns in `silver` and the Gold schema
-     from `system.columns`, in one statement. The two database names are
-     passed as `SqlLiteral`s.
+  1. Read every table's ordered columns in `silver` and `serving` (see
+     section 3; not the export setting) from `system.columns`, in one
+     statement. The two database names are passed as `SqlLiteral`s.
   2. Read the newest recorded column list per table from the store, in one
      statement.
   3. For each table whose list differs from its newest recorded one, or
@@ -233,5 +236,60 @@ and what a version is not.
 | 7 | (operator) Drop that column, wait, reload | v3, "Dropped <name> (<type>)" | |
 
 ## 8. Handoff (developer)
+
+T1, T2 and T3 are in the working tree, uncommitted. Round 1 built them;
+round 2 applied the planner's review (R1-R4) and one blocker (B1). A pass of
+a running API against a running `ClickHouse` has not been run, and the
+console was not looked at in a browser: the API on the dev stack has not been
+rebuilt, so a Silver or Gold page shows "No schema version recorded yet"
+until it is.
+
+- **API.** New `routes/schema_versions.rs` (store, `changes`, `entries`,
+  `observe`, `spawn_pass`, `for_table`), declared `pub(crate)` in
+  `routes/mod.rs` because `main.rs` calls it. Hooks: `main.rs` after the
+  bootstraps, `alerts::run` (`schemaPassStarted`, not on `?id=`), one
+  statement in `pipelines::run_finished_event` right after the caller check,
+  and `catalog::mark_schema_versions` in `clickhouse_asset_detail`.
+- **Console.** `contracts/assets.ts` (`current`), `asset-schema.tsx`
+  (list, `current` pill, since-date description, new empty state),
+  `asset-activity.tsx` (`changeTimeline` takes the recorded list as a third
+  argument), `asset-overview.tsx` ("v2 · recorded 3d ago"), the in-browser
+  fixture, tests in `asset-detail-tabs.test.tsx`.
+- **Sentence order in `changes`:** Added and Changed in the table's column
+  order, then Dropped, the order the raw-table wording already has
+  (`src/lib/schema-history.ts`). `Reordered columns` only when it is the
+  only difference.
+- **Round 2.**
+  - **R1.** The pass looks at the constants `SILVER_DATABASE` (`silver`) and
+    `GOLD_DATABASE` (`serving`), the pair `catalog::clickhouse_asset_detail`
+    serves, and no longer reads `Config::gold_source_schema` (the export
+    routes' setting). Their docs name that function. Module doc and
+    `docs/OPERATIONS.md` follow; the paragraph about the non-default setting
+    is gone, since the gap is. Tests pin the two names and that a
+    non-default `GOLD_SOURCE_SCHEMA` does not change them. The plan's anchor
+    "Which databases" (section 3) and step 1 of T1 name the setting; they are
+    superseded by this.
+  - **R2.** The pass's two reads and `for_table` go through `read`, which
+    uses `ChClient::query` and treats an answer with empty `meta` as a failed
+    read (`ChClient` turns a `2xx` body that is not JSON into an empty
+    result, which `rows` would call "no rows" and the pass would answer with
+    version 1 for every table). `observe` returns a private `EngineError`
+    (`Failed(ChError)` or `NotAResult`, `thiserror`); `observe` is now private
+    to the module for that reason. The fake engine's reads now send a real
+    `meta`; tests cover an empty `200` on each read and on `for_table`.
+  - **R3.** `is_unknown_table_or_database_error` in `routes/lakehouse.rs`
+    beside `is_unknown_table_error`, with unit tests. Used in
+    `schema_versions.rs` (the private copy is gone), `quality.rs` (one
+    condition) and `governance.rs::is_missing_quality_source`, which keeps
+    only its `Code: 81.`.
+  - **R4.** Both limits (one writer per engine; no cap on the read, and why)
+    are in the module doc and in `docs/OPERATIONS.md`.
+  - **B1.** The newest-version read aliased `max(version) AS version`, which
+    the real engine refuses (`Code: 184`, `ILLEGAL_AGGREGATION`). It now
+    selects `AS newest_version` and `AS newest_columns`; the row readers and
+    mocks follow, and a test asserts on the sent text that no aggregate is
+    aliased to a column name.
+- **Ran, from this tree.** See the report that came with this handoff for
+  the exact commands and counts.
 
 ## 9. Review (planner)

@@ -402,6 +402,16 @@ pub(crate) fn is_unknown_table_error(body: &str) -> bool {
     body.contains("(UNKNOWN_TABLE)") || body.contains("Code: 60.")
 }
 
+/// [`is_unknown_table_error`], or `ClickHouse` saying the whole database
+/// does not exist (`Code: 81 … (UNKNOWN_DATABASE)`). The answer for a table
+/// a job creates lazily in a database it creates lazily too (`console.*`),
+/// where "nothing has been recorded yet" is the truthful reading of either.
+/// Classifies the text into a `bool` and returns none of it, like its
+/// neighbour.
+pub(crate) fn is_unknown_table_or_database_error(body: &str) -> bool {
+    is_unknown_table_error(body) || body.contains("(UNKNOWN_DATABASE)")
+}
+
 /// `bronze_meta.maintenance_verb_run` is created lazily by
 /// `dagster/dispar_orchestrate/bronze_catalog.py::record_maintenance_verb_run`
 /// on the first verb run, so `ClickHouse` reporting it does not exist
@@ -1383,6 +1393,29 @@ mod tests {
     fn is_unknown_table_error_rejects_an_unrelated_clickhouse_error() {
         let body = "Code: 62. DB::Exception: Syntax error: failed at position 1 (SYNTAX_ERROR)";
         assert!(!is_unknown_table_error(body));
+    }
+
+    #[test]
+    fn is_unknown_table_or_database_error_accepts_both_a_missing_table_and_a_missing_database() {
+        let table = "Code: 60. DB::Exception: Unknown table expression identifier \
+                     'console.quality_run' in scope SELECT 1 FROM console.quality_run. \
+                     (UNKNOWN_TABLE) (version 26.7.3.19 (official build))";
+        assert!(is_unknown_table_or_database_error(table));
+        // The shape `ClickHouse` answers with when the database itself is
+        // missing; the text is that server's, not invented.
+        let database = "Code: 81. DB::Exception: Database console does not exist. \
+                        (UNKNOWN_DATABASE) (version 26.7.3.19 (official build))";
+        assert!(is_unknown_table_or_database_error(database));
+        assert!(
+            !is_unknown_table_error(database),
+            "the database case is what this adds to its neighbour"
+        );
+    }
+
+    #[test]
+    fn is_unknown_table_or_database_error_rejects_an_unrelated_clickhouse_error() {
+        let body = "Code: 62. DB::Exception: Syntax error: failed at position 1 (SYNTAX_ERROR)";
+        assert!(!is_unknown_table_or_database_error(body));
     }
 
     #[test]

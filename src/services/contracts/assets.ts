@@ -171,7 +171,21 @@ export type AssetDetail = Asset & {
   dependents: { id: string; name: string; kind: string; detail?: string }[]
   changeHistory: { id: string; at: string; actor: string; summary: string }[]
   snapshots: { id: string; committedAt: string; operation: string; records: number }[]
-  schemaVersions: { version: number; at: string; change: string }[]
+  /**
+   * The versions of the table's schema, newest first. Where they come from
+   * depends on the kind of table:
+   * - `silver.*`/`serving.*`: recorded by the console itself (ADR 0015,
+   *   `routes/schema_versions.rs`), because `ClickHouse` keeps only the current
+   *   columns. A version is added each time a look at the table finds its
+   *   ordered columns changed, so `at` is when the console *saw* the table in
+   *   that shape, not when it changed, and the first version is dated by the
+   *   first look. `change` is a sentence ("Added email (String)"; "First
+   *   recorded with 4 columns" for the first); `current` is true on the newest
+   *   only. Empty until the first look has recorded one.
+   * - a Bronze Iceberg table: always `[]`. Its own versions are in the
+   *   catalog's table detail (`useIcebergTable`, `LakehouseTableDetail`).
+   */
+  schemaVersions: { version: number; at: string; change: string; current: boolean }[]
   upstream: { id: string; name: string }[]
   downstream: { id: string; name: string }[]
   /**

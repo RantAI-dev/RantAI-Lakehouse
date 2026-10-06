@@ -114,6 +114,11 @@ async fn main() -> anyhow::Result<()> {
     // it's unset, and why this identity is scoped to `ingest:read` only.
     bootstrap_ingest_run_service(&state).await;
 
+    // ADR 0015: record the columns of the Silver and Gold tables as they are
+    // now, in the background — an engine that is not reachable yet is a
+    // warning in the log, and the alerts tick tries again.
+    routes::schema_versions::spawn_pass(&state);
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");

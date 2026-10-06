@@ -26,7 +26,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::lakehouse::is_unknown_table_error;
+use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
 use crate::routes::support::{nullable_u64_col, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
@@ -227,9 +227,7 @@ async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> 
 /// has no database at all (`Code: 81 ... (UNKNOWN_DATABASE)`), not just no
 /// table.
 fn is_missing_quality_source(body: &str) -> bool {
-    is_unknown_table_error(body)
-        || body.contains("(UNKNOWN_DATABASE)")
-        || body.contains("Code: 81.")
+    is_unknown_table_or_database_error(body) || body.contains("Code: 81.")
 }
 
 /// One observed check as a `QualityRule` (`contracts/governance.ts`): the

@@ -59,6 +59,7 @@ use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::routes::catalog_governance;
 use crate::routes::catalog_query;
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
+use crate::routes::schema_versions;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -1696,6 +1697,19 @@ pub(crate) fn split_db_table(id: &str) -> (String, String) {
     (db, table)
 }
 
+/// Fills `schemaVersions` of a Silver or Gold detail body with the versions
+/// the console recorded for `table_key` (`<database>.<table>`, ADR 0015),
+/// newest first. The engine keeps no history of its own, so the body starts
+/// with the empty list; nothing recorded, or a store that cannot be read,
+/// leaves it empty. A read never writes: recording belongs to
+/// `schema_versions::spawn_pass`.
+async fn mark_schema_versions(ch: &ChClient, body: &mut Value, table_key: &str) {
+    let versions = schema_versions::for_table(ch, table_key).await;
+    if let Some(o) = body.as_object_mut() {
+        o.insert("schemaVersions".to_owned(), json!(versions));
+    }
+}
+
 async fn clickhouse_asset_detail(
     state: &AppState,
     principal: &Principal,
@@ -1795,6 +1809,7 @@ async fn clickhouse_asset_detail(
         &[id.to_owned(), key.clone(), table.clone()],
     )
     .await;
+    mark_schema_versions(ch, &mut body, &key).await;
     mark_annotation_and_history(state, &mut body, id, &[key]).await;
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
@@ -2095,6 +2110,9 @@ async fn enrich_bronze_detail(state: &AppState, body: &mut Value, slug: &str, ta
 ///
 /// `engine` is empty when the lookup failed; the format then names no
 /// engine rather than a guessed one.
+///
+/// `schemaVersions` starts empty here like the other lists; the async caller
+/// fills it ([`mark_schema_versions`]).
 fn clickhouse_detail_body(
     id: &str,
     table: &str,
@@ -3997,6 +4015,184 @@ mod tests {
                 "no sample query may run for a caller without query:read"
             );
             Ok(())
+        }
+
+        /// The schema versions the console recorded for a Silver or Gold
+        /// table (ADR 0015) come on the detail body, and a page view only
+        /// reads them. It sits here for the helpers this module already has.
+        mod schema_versions {
+            #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+            use super::*;
+
+            /// `detail` for `id` as an analyst of the catalog tenant, over a
+            /// mock engine that also answers what `mock_clickhouse` does.
+            async fn detail_of(
+                pool: &lakehouse_store::PgPool,
+                server: &MockServer,
+                id: &str,
+            ) -> (StatusCode, Value) {
+                mock_clickhouse(server).await;
+                let mut env = HashMap::new();
+                env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+                env.insert("CH_URL".to_owned(), server.uri());
+                env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+                let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+                let resp = detail(
+                    State(state),
+                    Extension(analyst("catalog:read, query:read")),
+                    HeaderMap::new(),
+                    Path(id.to_owned()),
+                )
+                .await
+                .expect("detail answers");
+                response_json(resp).await
+            }
+
+            /// Two stored versions of one table, as the store read answers them.
+            async fn mount_store(server: &MockServer) {
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(ch_json(
+                        &[
+                            ("version", "UInt32"),
+                            ("columns", "String"),
+                            ("observed", "String"),
+                        ],
+                        &json!([
+                            {
+                                "version": 1,
+                                "columns": r#"[["id","UInt64"]]"#,
+                                "observed": "2026-10-01T08:00:00Z",
+                            },
+                            {
+                                "version": 2,
+                                "columns": r#"[["id","UInt64"],["email","String"]]"#,
+                                "observed": "2026-10-03T09:30:00Z",
+                            },
+                        ]),
+                    ))
+                    .mount(server)
+                    .await;
+            }
+
+            async fn requests_of(server: &MockServer) -> Vec<String> {
+                server
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                    .collect()
+            }
+
+            fn recorded_versions() -> Value {
+                json!([
+                    {
+                        "version": 2,
+                        "at": "2026-10-03T09:30:00Z",
+                        "change": "Added email (String)",
+                        "current": true,
+                    },
+                    {
+                        "version": 1,
+                        "at": "2026-10-01T08:00:00Z",
+                        "change": "First recorded with 1 column",
+                        "current": false,
+                    },
+                ])
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_silver_detail_carries_the_recorded_versions_newest_first(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                mount_store(&server).await;
+                let (status, body) = detail_of(&pool, &server, "silver.orders").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], recorded_versions());
+                let requests = requests_of(&server).await;
+                assert!(
+                    requests
+                        .iter()
+                        .any(|b| b.contains("WHERE table_key = 'silver.orders'")),
+                    "the versions are read under the database and table the page serves"
+                );
+                // A page view only reads: nothing was created or recorded.
+                assert!(
+                    requests
+                        .iter()
+                        .all(|b| !b.contains("INSERT") && !b.contains("CREATE")),
+                    "a read must not write"
+                );
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_gold_detail_reads_its_versions_under_the_serving_key(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                mount_store(&server).await;
+                let (status, body) = detail_of(&pool, &server, "serving.mart_x").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], recorded_versions());
+                assert!(
+                    requests_of(&server)
+                        .await
+                        .iter()
+                        .any(|b| b.contains("WHERE table_key = 'serving.mart_x'"))
+                );
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_failed_read_of_the_store_leaves_the_detail_an_empty_list(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(
+                        ResponseTemplate::new(500)
+                            .set_body_string("Code: 999. DB::Exception: secret upstream text"),
+                    )
+                    .mount(&server)
+                    .await;
+                let (status, body) = detail_of(&pool, &server, "silver.orders").await;
+
+                assert_eq!(status, StatusCode::OK, "the page still loads");
+                assert_eq!(body["schemaVersions"], json!([]));
+                assert!(
+                    !body.to_string().contains("secret upstream text"),
+                    "upstream error text never reaches the response"
+                );
+                // The rest of the body is untouched by the failed read.
+                assert_eq!(body["tableKey"], json!("silver.orders"));
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_store_that_does_not_exist_yet_leaves_the_detail_an_empty_list(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(ResponseTemplate::new(404).set_body_string(
+                        "Code: 60. DB::Exception: Table console.table_schema_version does not exist. (UNKNOWN_TABLE)",
+                    ))
+                    .mount(&server)
+                    .await;
+                let (status, body) = detail_of(&pool, &server, "serving.mart_x").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], json!([]));
+                Ok(())
+            }
         }
     }
 }

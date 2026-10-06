@@ -49,7 +49,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
-use crate::routes::lakehouse::is_unknown_table_error;
+use crate::routes::lakehouse::is_unknown_table_or_database_error;
 use crate::routes::support::{num_or_zero, str_col};
 use crate::state::AppState;
 
@@ -425,9 +425,7 @@ pub(crate) async fn latest_runs(ch: &ChClient) -> HashMap<String, LatestRun> {
                 )
             })
             .collect(),
-        Err(ChError::Server(ref body))
-            if is_unknown_table_error(body) || body.contains("(UNKNOWN_DATABASE)") =>
-        {
+        Err(ChError::Server(ref body)) if is_unknown_table_or_database_error(body) => {
             HashMap::new()
         }
         Err(err) => {

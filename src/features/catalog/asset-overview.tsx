@@ -123,14 +123,16 @@ export function AssetOverview({
   const maskedCount = a.schema.filter((c) => c.masked).length
   const healthReasons = a.healthReasons ?? []
   // The Iceberg table's current schema version, once loaded; the API's
-  // own list otherwise.
+  // own list otherwise — for a Silver or Gold table, the version the console
+  // recorded. That one is dated when the console saw it, so it says
+  // "recorded", not a time that would read as the table's own age.
   const icebergSchema = icebergTableOf(iceberg)?.schemaVersions?.find((v) => v.current)
-  const latestSchema = a.schemaVersions[0]
+  const latestSchema = a.schemaVersions.find((v) => v.current) ?? a.schemaVersions[0]
   const schemaLabel = icebergSchema
     ? `v${icebergSchema.schemaId}` +
       (icebergSchema.sinceMs === null ? "" : ` · since ${snapshotRelativeTime(icebergSchema.sinceMs)}`)
     : latestSchema
-      ? `v${latestSchema.version} · ${formatRelativeTime(latestSchema.at)}`
+      ? `v${latestSchema.version} · recorded ${formatRelativeTime(latestSchema.at)}`
       : null
   const recentChanges = a.changeHistory.slice(0, RECENT_CHANGES)
   const sql = assetStarterSql(a)

@@ -1924,6 +1924,8 @@ pub async fn run_finished_event(
         )
         .into());
     }
+    // ADR 0015: a finished run may have changed a table's columns; look, whatever job it was.
+    crate::routes::schema_versions::spawn_pass(&state);
     let req: RunFailedBody = parse_body(&body)?;
     let pool = pool(&state)?;
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
