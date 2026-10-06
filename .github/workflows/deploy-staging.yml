@@ -40,7 +40,7 @@ jobs:
             --profile dagster \
             --profile trino \
             up -d --build --remove-orphans
-        timeout-minutes: 30
+        timeout-minutes: 60
 
       - name: Health-check lakehouse-api
         run: |
@@ -59,7 +59,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           docker build -f Dockerfile.frontend -t lakehouse-frontend:staging .
-        timeout-minutes: 10
+        timeout-minutes: 20
 
       - name: Deploy frontend
         run: |
