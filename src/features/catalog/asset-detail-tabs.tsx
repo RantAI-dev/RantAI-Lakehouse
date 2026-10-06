@@ -145,7 +145,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="sample">
-          <AssetSample asset={a} />
+          <AssetSample asset={a} iceberg={iceberg} />
         </TabsContent>
 
         <TabsContent value="quality">

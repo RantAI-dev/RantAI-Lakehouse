@@ -105,7 +105,7 @@ export const clickhouseAssetService: AssetService = {
     );
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load sample rows");
-    return (json?.rows ?? []) as Record<string, string>[];
+    return (json?.rows ?? []) as Record<string, string | null>[];
   },
   async updateAnnotation(id, input, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/annotation`, {

@@ -21,8 +21,10 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { toast } from "sonner"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { formatDate } from "@/lib/format"
+import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 import { relatedTables } from "./asset-lineage"
@@ -178,11 +180,15 @@ function json(body: unknown, status = 200) {
   })
 }
 
+/** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
+type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
+
 function stubApi({
   permissions = ["*:*"],
   lineage = GRAPH,
   profile = PROFILE,
-}: { permissions?: string[]; lineage?: unknown; profile?: unknown } = {}) {
+  sample = (limit) => Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })),
+}: { permissions?: string[]; lineage?: unknown; profile?: unknown; sample?: SampleAnswer } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
@@ -199,7 +205,8 @@ function stubApi({
     if (method === "DELETE" && path.includes("/api/governance/policies/")) return json({ ok: true })
     if (path.includes("/sample?limit=")) {
       const limit = Number(path.split("limit=")[1])
-      return json({ rows: Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })), limit })
+      const answer = sample(limit)
+      return answer instanceof Response ? answer : json({ rows: answer, limit })
     }
     if (method === "POST" && path.endsWith("/run")) return json({ id: "q2", status: "passed", value: "0 repeated values in 50 rows" })
     if (method === "POST" && path.endsWith("/api/governance/quality")) return json({ id: "new" }, 201)
@@ -208,7 +215,7 @@ function stubApi({
       return json({ id: "u1", name: "Reader", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
     if (path.includes("/api/governance/lineage")) return json(lineage)
-    if (path.endsWith("/profile")) return json(profile)
+    if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
     return json({ error: "not stubbed" }, 404)
@@ -762,7 +769,14 @@ describe("Activity tab: freshness target", () => {
 })
 
 describe("Sample tab", () => {
-  it("shows the rows the asset carries, and asks for more only when asked", async () => {
+  /** The `limit` of every request the page made to the sample route, in order. */
+  const sampleLimits = (fetchSpy: ReturnType<typeof stubApi>) =>
+    fetchSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((path) => path.includes("/sample?limit="))
+      .map((path) => Number(path.split("limit=")[1]))
+
+  it("asks for 25 rows on opening, and shows the rows the page carries until they arrive", async () => {
     const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs()
@@ -770,23 +784,516 @@ describe("Sample tab", () => {
     const sizes = screen.getByRole("group", { name: "Rows to show" })
     // Labelled, so the numbers read as a choice of how many rows to show.
     expect(within(sizes).getByText("Rows")).toBeTruthy()
-    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["5", "25", "50", "100"])
-    expect(within(sizes).getByText("5").getAttribute("aria-pressed")).toBe("true")
+    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["25", "50", "100"])
+    expect(within(sizes).getByText("25").getAttribute("aria-pressed")).toBe("true")
+    // The detail body's one row is on screen at once (the header row and that row) while 25 load.
     expect(screen.getAllByRole("row")).toHaveLength(2)
-    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/sample"))).toBe(false)
+    expect(screen.getByText(/Loading 25 rows… showing the first 1 row,/)).toBeTruthy()
 
-    fireEvent.click(within(sizes).getByText("25"))
     await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
+    expect(screen.getByText(/The first 25 rows, as you would read them/)).toBeTruthy()
+    expect(sampleLimits(fetchSpy)).toEqual([25])
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=25"))).toBe(true)
   })
 
-  it("offers no row count to a reader who may not read rows", () => {
-    stubApi()
+  it("asks again for 50 and for 100 rows when they are chosen", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=sample"
+    renderTabs()
+    const sizes = screen.getByRole("group", { name: "Rows to show" })
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
+
+    fireEvent.click(within(sizes).getByText("50"))
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(51))
+    expect(within(sizes).getByText("50").getAttribute("aria-pressed")).toBe("true")
+    fireEvent.click(within(sizes).getByText("100"))
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
+    expect(sampleLimits(fetchSpy)).toEqual([25, 50, 100])
+  })
+
+  it("shows the rows the page carries, with no size to choose, where the deployment cannot fetch more", () => {
+    const fetchSpy = stubApi()
+    const fetchMore = assetService.getAssetSample
+    assetService.getAssetSample = undefined
+    try {
+      url.search = "tab=sample"
+      renderTabs()
+
+      expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+      expect(screen.getAllByRole("row")).toHaveLength(2)
+      expect(screen.getByText(/The first 1 row, as you would read them/)).toBeTruthy()
+      expect(screen.queryByText(/Loading/)).toBeNull()
+      expect(sampleLimits(fetchSpy)).toEqual([])
+    } finally {
+      assetService.getAssetSample = fetchMore
+    }
+  })
+
+  it("offers no row count to a reader who may not read rows, and asks for no rows", () => {
+    const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs({ ...BRONZE, sample: [], sampleRestricted: true })
 
     expect(screen.getByText("Sample rows need query access")).toBeTruthy()
     expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+    expect(sampleLimits(fetchSpy)).toEqual([])
+  })
+
+  it("says there are no rows when the table has none, and why when the rows cannot be read", async () => {
+    stubApi({ sample: () => [] })
+    url.search = "tab=sample"
+    renderTabs({ ...BRONZE, sample: [] })
+
+    expect(await screen.findByText("No sample rows available")).toBeTruthy()
+    expect(screen.queryByRole("grid")).toBeNull()
+    cleanup()
+
+    // No rows at all: the error stands alone.
+    stubApi({ sample: () => json({ error: "sample read failed" }, 502) })
+    renderTabs({ ...BRONZE, sample: [] })
+    expect(await screen.findByText(/sample read failed/)).toBeTruthy()
+    expect(screen.getByRole("button", { name: /Retry/ })).toBeTruthy()
+    expect(screen.queryByRole("grid")).toBeNull()
+  })
+
+  it("keeps the rows the page has when the larger sample fails, and says so above them with Retry", async () => {
+    const fetchSpy = stubApi({ sample: () => json({ error: "sample read failed" }, 502) })
+    url.search = "tab=sample"
+    renderTabs()
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("The larger sample could not be loaded. Showing the 1 row the page already has.")
+    // Upstream text is not repeated, and the grid and its description say only what is shown.
+    expect(alert.textContent).not.toContain("sample read failed")
+    expect(document.querySelectorAll("table[role=grid] tbody tr")).toHaveLength(1)
+    expect(screen.getByText(/^The first 1 row, as you would read them/)).toBeTruthy()
+    fireEvent.click(within(alert).getByRole("button", { name: "Retry" }))
+    await waitFor(() => expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/sample?limit=")).length).toBe(2))
+  })
+
+  it("puts the row count and Query Studio in the card's body, not the header slot that cannot shrink", () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs()
+
+    const card = screen.getByText("Sample rows").closest("[data-slot=card]") as HTMLElement
+    const controls = within(card).getByRole("group", { name: "Rows to show" })
+    expect(card.querySelector("[data-slot=card-header]")?.contains(controls)).toBe(false)
+    expect(card.querySelector("[data-slot=card-content]")?.contains(controls)).toBe(true)
+    const studio = within(card).getByText("Open in Query Studio")
+    expect(card.querySelector("[data-slot=card-header]")?.contains(studio)).toBe(false)
+  })
+})
+
+describe("Sample tab: the data preview", () => {
+  const LONG = "a-value-of-sixty-characters-that-no-column-is-wide-enough-for-"
+  /**
+   * Three rows over a number column, a text column that can be null, a number
+   * column with a gap, a masked column, and `free`, which the schema does not
+   * list. The ids are as stored: `0250161` is not 250,161.
+   */
+  const ROWS: Record<string, string | null>[] = [
+    { id: "10", city: "Jakarta", amount: "9.5", email: "***", free: "NULL" },
+    { id: "9", city: null, amount: "100", email: "***", free: "" },
+    { id: "0250161", city: "", amount: null, email: "***", free: LONG },
+  ]
+  const PREVIEW: AssetDetail = {
+    ...BRONZE,
+    schema: [
+      { name: "id", dataType: "Int64" },
+      { name: "city", dataType: "Nullable(String)" },
+      { name: "amount", dataType: "Decimal(12, 2)" },
+      { name: "email", dataType: "String", masked: true },
+    ],
+    sample: ROWS,
+  }
+
+  // The grid's structure is read through the DOM, not role queries: a role query walks every
+  // ancestor's computed style, and a few hundred of them over a 15-cell grid time the test out.
+  // The roles themselves are asserted once, in the first tests.
+  const grid = () => document.querySelector("table[role=grid]") as HTMLElement
+  const headers = () => Array.from(grid().querySelectorAll<HTMLElement>("thead th[scope=col]")).slice(1)
+  const nameOf = (h: HTMLElement) => h.querySelector("[data-head=name]")?.textContent
+  const headerOf = (name: string) => headers().find((h) => nameOf(h) === name) as HTMLElement
+  const bodyRows = () => Array.from(grid().querySelectorAll<HTMLElement>("tbody tr"))
+  const cellsOf = (row: HTMLElement) => Array.from(row.querySelectorAll<HTMLElement>("td[role=gridcell]"))
+  const cellOf = (row: number, name: string) => cellsOf(bodyRows()[row])[headers().indexOf(headerOf(name))]
+  const columnOf = (name: string) => {
+    const at = headers().indexOf(headerOf(name))
+    return bodyRows().map((r) => cellsOf(r)[at].textContent)
+  }
+  const rowNumbers = () => bodyRows().map((r) => r.querySelector("th")?.textContent)
+  const amountSort = (name: string) => within(headerOf("amount")).getByRole("button", { name }) as HTMLElement
+  const inspector = () => document.querySelector<HTMLElement>("[data-slot=sample-inspector]")
+  const profileRequests = (fetchSpy: ReturnType<typeof stubApi>) =>
+    fetchSpy.mock.calls.filter((c) => String(c[0]).endsWith("/profile")).length
+
+  /** Opens the tab on `PREVIEW` and waits until the 25-row answer has replaced the page's own rows. */
+  async function openPreview(api: Parameters<typeof stubApi>[0] = {}, asset: AssetDetail = PREVIEW) {
+    const fetchSpy = stubApi({ sample: () => ROWS, ...api })
+    url.search = "tab=sample"
+    renderTabs(asset)
+    // The card's description says "The first 3 rows" once the 25-row answer is in.
+    await screen.findByText(/^The first 3 rows, as you would read them/)
+    return fetchSpy
+  }
+
+  it("heads each column with a glyph, its name and its type, and a column the schema does not list with the name alone", async () => {
+    await openPreview()
+
+    expect(screen.getByRole("grid", { name: "Sample rows" })).toBe(grid())
+    // The grid's sticky z-indexes stay inside its frame, under the page's own sticky tab bar.
+    expect(grid().closest(".isolate")).not.toBeNull()
+    expect(headers().map(nameOf)).toEqual(["id", "city", "amount", "email", "free"])
+    const amount = headerOf("amount")
+    expect(within(amount).getByRole("img", { name: "Number" })).toBeTruthy()
+    expect(within(amount).getByText("Decimal(12, 2)")).toBeTruthy()
+    expect(within(headerOf("city")).getByRole("img", { name: "Text" })).toBeTruthy()
+    expect(within(headerOf("city")).getByText("Nullable(String)")).toBeTruthy()
+    // Not listed: no glyph, no type, never a guess from the values.
+    const free = headerOf("free")
+    expect(within(free).queryByRole("img")).toBeNull()
+    expect(free.textContent).toBe("free")
+  })
+
+  it("writes NULL and an empty text out, right-aligns numbers, and shows a masked value and an id as they come", async () => {
+    await openPreview()
+
+    expect(columnOf("city")).toEqual(["Jakarta", "NULL", "(empty)"])
+    const nullCell = cellOf(1, "city")
+    expect(nullCell.querySelector(".italic")?.textContent).toBe("NULL")
+    expect(cellOf(2, "city").querySelector(".italic")?.textContent).toBe("(empty)")
+    // The text "NULL" in a cell is a value, not the absence of one: it is not set in the quiet tone.
+    expect(cellOf(0, "free").textContent).toBe("NULL")
+    expect(cellOf(0, "free").querySelector(".italic")).toBeNull()
+    expect(columnOf("email")).toEqual(["***", "***", "***"])
+    // An id is not reformatted.
+    expect(columnOf("id")).toEqual(["10", "9", "0250161"])
+    // Numbers are right-aligned (in a number column, `NULL` too); text and an unlisted column are not.
+    expect(cellOf(0, "amount").className).toContain("text-right")
+    expect(cellOf(0, "amount").firstElementChild?.className).toContain("tabular-nums")
+    expect(cellOf(2, "amount").className).toContain("text-right")
+    expect(cellOf(0, "city").className).not.toContain("text-right")
+    expect(cellOf(0, "free").className).not.toContain("text-right")
+  })
+
+  it("gives a long value its whole as a title, since the cell cuts it", async () => {
+    await openPreview()
+
+    expect(cellOf(2, "free").textContent).toBe(LONG)
+    expect(cellOf(2, "free").firstElementChild?.getAttribute("title")).toBe(LONG)
+    // A short value needs no title.
+    expect(cellOf(0, "city").firstElementChild?.getAttribute("title")).toBeNull()
+  })
+
+  it("numbers the rows from 1, and the numbers follow the order the rows are shown in", async () => {
+    await openPreview()
+    expect(rowNumbers()).toEqual(["1", "2", "3"])
+
+    fireEvent.click(within(headerOf("id")).getByRole("button", { name: "Sort id ascending" }))
+    expect(columnOf("id")).toEqual(["9", "10", "0250161"])
+    expect(rowNumbers()).toEqual(["1", "2", "3"])
+    // The row that was second is first now.
+    expect(within(bodyRows()[0]).getByText("NULL", { selector: ".italic" })).toBeTruthy()
+  })
+
+  it("sorts the rows shown, ascending, descending, then back to the table's order, and says so", async () => {
+    const fetchSpy = await openPreview()
+    const calls = fetchSpy.mock.calls.length
+    const idHeader = headerOf("id")
+    expect(idHeader.getAttribute("aria-sort")).toBeNull()
+
+    fireEvent.click(within(idHeader).getByRole("button", { name: "Sort id ascending" }))
+    // Numbers as numbers: 9 before 10 before 250,161, and the id as stored.
+    expect(columnOf("id")).toEqual(["9", "10", "0250161"])
+    expect(idHeader.getAttribute("aria-sort")).toBe("ascending")
+    expect(screen.getByText(/Sorted by id \(ascending\), among the rows shown\./)).toBeTruthy()
+
+    fireEvent.click(within(idHeader).getByRole("button", { name: "Sort id descending" }))
+    expect(columnOf("id")).toEqual(["0250161", "10", "9"])
+    expect(idHeader.getAttribute("aria-sort")).toBe("descending")
+    expect(screen.getByText(/Sorted by id \(descending\), among the rows shown\./)).toBeTruthy()
+
+    fireEvent.click(within(idHeader).getByRole("button", { name: "Stop sorting by id" }))
+    expect(columnOf("id")).toEqual(["10", "9", "0250161"])
+    expect(idHeader.getAttribute("aria-sort")).toBeNull()
+    expect(screen.queryByText(/Sorted by/)).toBeNull()
+    // Sorting orders what is on screen: it asks the API for nothing.
+    expect(fetchSpy.mock.calls.length).toBe(calls)
+  })
+
+  it("starts another column at ascending, and puts NULL last either way", async () => {
+    await openPreview()
+
+    fireEvent.click(within(headerOf("id")).getByRole("button", { name: "Sort id ascending" }))
+    fireEvent.click(amountSort("Sort amount ascending"))
+    expect(headerOf("id").getAttribute("aria-sort")).toBeNull()
+    expect(headerOf("amount").getAttribute("aria-sort")).toBe("ascending")
+    expect(columnOf("amount")).toEqual(["9.5", "100", "NULL"])
+    fireEvent.click(amountSort("Sort amount descending"))
+    expect(columnOf("amount")).toEqual(["100", "9.5", "NULL"])
+  })
+
+  it("keeps a picked row picked when a sort moves it", async () => {
+    await openPreview()
+
+    // The NULL city is the second row; sorted by id it is the first.
+    fireEvent.click(cellOf(1, "city"))
+    expect(cellOf(1, "city").getAttribute("aria-selected")).toBe("true")
+    fireEvent.click(within(headerOf("id")).getByRole("button", { name: "Sort id ascending" }))
+    expect(cellOf(0, "city").getAttribute("aria-selected")).toBe("true")
+    expect(cellOf(1, "city").getAttribute("aria-selected")).toBe("false")
+    const panel = inspector() as HTMLElement
+    expect(within(panel).getByText("Row").nextElementSibling?.textContent).toBe("1")
+  })
+
+  describe("the inspector", () => {
+    const clipboard = { writeText: mock(async (value: string) => void value) }
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard")
+    const withClipboard = () => {
+      clipboard.writeText.mockClear()
+      Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true })
+    }
+    afterEach(() => {
+      if (original) Object.defineProperty(navigator, "clipboard", original)
+      else Reflect.deleteProperty(navigator, "clipboard")
+    })
+
+    it("is closed until something is picked, and a pressed cell opens it on its row, column, whole value and Copy", async () => {
+      const fetchSpy = await openPreview()
+      expect(inspector()).toBeNull()
+      // Nothing is asked of the table's data for a profile until a column is shown.
+      expect(profileRequests(fetchSpy)).toBe(0)
+
+      fireEvent.click(cellOf(2, "free"))
+      const panel = inspector() as HTMLElement
+      expect(within(panel).getByText("Cell")).toBeTruthy()
+      expect(within(panel).getByText("Row").nextElementSibling?.textContent).toBe("3")
+      expect(within(panel).getByText("Column").nextElementSibling?.textContent).toBe("free")
+      // The whole value, not the cell's cut of it.
+      expect(within(panel).getByText(LONG)).toBeTruthy()
+      expect(within(panel).getByRole("button", { name: "Copy value" })).toBeTruthy()
+      expect(cellOf(2, "free").getAttribute("aria-selected")).toBe("true")
+    })
+
+    it("copies the value, and says it did", async () => {
+      withClipboard()
+      const toasts = spyOn(toast, "success").mockImplementation(() => 1)
+      await openPreview()
+
+      fireEvent.click(cellOf(2, "free"))
+      fireEvent.click(within(inspector() as HTMLElement).getByRole("button", { name: "Copy value" }))
+
+      await waitFor(() => expect(toasts).toHaveBeenCalled())
+      expect(clipboard.writeText.mock.calls).toEqual([[LONG]])
+      expect(toasts.mock.calls[0][0]).toBe("Copied value")
+    })
+
+    it("explains NULL and an empty text in a sentence, and offers Copy for a value only", async () => {
+      await openPreview()
+
+      fireEvent.click(cellOf(1, "city"))
+      let panel = inspector() as HTMLElement
+      expect(within(panel).getByText(/the table holds no value in this cell/)).toBeTruthy()
+      expect(within(panel).queryByRole("button", { name: "Copy value" })).toBeNull()
+
+      fireEvent.click(cellOf(2, "city"))
+      panel = inspector() as HTMLElement
+      expect(within(panel).getByText(/the cell holds an empty text/)).toBeTruthy()
+      // Nothing to copy in an empty text either.
+      expect(within(panel).queryByRole("button", { name: "Copy value" })).toBeNull()
+
+      // A masked value and the text "NULL" are values.
+      fireEvent.click(cellOf(0, "email"))
+      expect(within(inspector() as HTMLElement).getByRole("button", { name: "Copy value" })).toBeTruthy()
+      fireEvent.click(cellOf(0, "free"))
+      expect(within(inspector() as HTMLElement).getByRole("button", { name: "Copy value" })).toBeTruthy()
+    })
+
+    it("opens on a column when its name is pressed, asking for the profile then and not before", async () => {
+      const fetchSpy = await openPreview()
+      expect(profileRequests(fetchSpy)).toBe(0)
+
+      fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
+      const panel = inspector() as HTMLElement
+      expect(within(panel).getByText("Column")).toBeTruthy()
+      expect(within(panel).queryByText("Cell")).toBeNull()
+      // The loading state is in words while the profile is on its way.
+      expect(within(panel).getByText("Profiling columns…")).toBeTruthy()
+      // The same opened column the Schema tab shows: the facts, from the table's own profile.
+      await waitFor(() => expect(within(panel).getByText(/Statistics over 2,000 rows of/)).toBeTruthy())
+      expect(within(panel).getByText("1.5 – 99")).toBeTruthy()
+      expect(within(panel).getByText("Can be null").nextElementSibling?.textContent).toBe("Yes")
+      expect(within(panel).getByText("Decimal(12, 2)")).toBeTruthy()
+      expect(profileRequests(fetchSpy)).toBe(1)
+      // The picked column's cells are tinted all the way down.
+      expect(cellOf(0, "amount").className).toContain("color-mix")
+      expect(cellOf(0, "city").className).not.toContain("color-mix")
+    })
+
+    it("shows the column of a picked cell too, and reads the profile once however many are picked", async () => {
+      const fetchSpy = await openPreview()
+
+      fireEvent.click(cellOf(0, "amount"))
+      const panel = inspector() as HTMLElement
+      expect(within(panel).getByText("About the column")).toBeTruthy()
+      await waitFor(() => expect(within(panel).getByText("1.5 – 99")).toBeTruthy())
+      fireEvent.click(within(panel).getByRole("button", { name: "Close inspector" }))
+      expect(inspector()).toBeNull()
+      fireEvent.click(cellOf(1, "id"))
+      await waitFor(() => expect(within(inspector() as HTMLElement).getByText("1 – 2000", { exact: false })).toBeTruthy())
+      expect(profileRequests(fetchSpy)).toBe(1)
+    })
+
+    it("opens a column the schema does not list, on the facts that need no schema", async () => {
+      await openPreview()
+
+      fireEvent.click(within(headerOf("free")).getByRole("button", { name: "free" }))
+      const panel = inspector() as HTMLElement
+      expect(within(panel).getByText("Not in the schema")).toBeTruthy()
+      await waitFor(() => expect(within(panel).getByText("This column is not in the profile.")).toBeTruthy())
+    })
+
+    it("says in words that the profile needs query:read, and asks for none, yet opens the column", async () => {
+      const fetchSpy = await openPreview({ permissions: ["catalog:read"] })
+
+      fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
+      const panel = inspector() as HTMLElement
+      expect(within(panel).getByText(/need the query:read permission/)).toBeTruthy()
+      expect(within(panel).getByText("Type")).toBeTruthy()
+      expect(profileRequests(fetchSpy)).toBe(0)
+    })
+
+    it("says in words when the table cannot be profiled", async () => {
+      await openPreview({ profile: { supported: false, reason: "this table's engine cannot be profiled" } })
+
+      fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
+      expect(await within(inspector() as HTMLElement).findByText(/No column statistics: this table's engine cannot be profiled/)).toBeTruthy()
+    })
+
+    it("says in words when the profile failed to load, with a way to try again", async () => {
+      await openPreview({ profile: json({ error: "profile read failed" }, 502) })
+
+      fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
+      const panel = inspector() as HTMLElement
+      expect(await within(panel).findByText(/Column statistics failed to load: profile read failed/)).toBeTruthy()
+      expect(within(panel).getByRole("button", { name: "Retry" })).toBeTruthy()
+    })
+
+    it("closes on its button and on Escape, and puts the focus back on the grid", async () => {
+      await openPreview()
+
+      fireEvent.click(cellOf(0, "id"))
+      fireEvent.click(within(inspector() as HTMLElement).getByRole("button", { name: "Close inspector" }))
+      expect(inspector()).toBeNull()
+      expect(document.activeElement).toBe(cellOf(0, "id"))
+
+      fireEvent.click(cellOf(0, "id"))
+      expect(inspector()).not.toBeNull()
+      fireEvent.keyDown(cellOf(0, "id"), { key: "Escape" })
+      expect(inspector()).toBeNull()
+      expect(cellOf(0, "id").getAttribute("aria-selected")).toBe("false")
+      // Escape with nothing open does nothing.
+      fireEvent.keyDown(cellOf(0, "id"), { key: "Escape" })
+      expect(inspector()).toBeNull()
+    })
+
+    it("closes on Escape pressed inside the panel, and gives the focus to the grid", async () => {
+      await openPreview()
+
+      fireEvent.click(cellOf(1, "id"))
+      const copy = within(inspector() as HTMLElement).getByRole("button", { name: "Copy value" })
+      copy.focus()
+      fireEvent.keyDown(copy, { key: "Escape" })
+      expect(inspector()).toBeNull()
+      // The tab stop is the first cell until the reader moves; here it has moved to the picked one.
+      expect(document.activeElement).toBe(cellOf(1, "id"))
+    })
+
+    it("drops a picked cell when another size is chosen, and keeps a picked column", async () => {
+      await openPreview()
+      const sizes = screen.getByRole("group", { name: "Rows to show" })
+
+      fireEvent.click(cellOf(0, "id"))
+      fireEvent.click(within(sizes).getByText("50"))
+      expect(inspector()).toBeNull()
+
+      fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
+      fireEvent.click(within(sizes).getByText("100"))
+      expect(inspector()).not.toBeNull()
+    })
+  })
+
+  describe("the keyboard", () => {
+    const tabStops = () => bodyRows().flatMap(cellsOf).filter((c) => c.getAttribute("tabindex") === "0")
+
+    it("makes the grid one tab stop, and the header two", async () => {
+      await openPreview()
+
+      // 3 rows of 5 cells, and exactly one of them can be tabbed to: the first.
+      expect(within(grid()).getAllByRole("gridcell")).toHaveLength(15)
+      expect(tabStops()).toEqual([cellOf(0, "id")])
+      // The header's tab stops are the active column's name and sort control, not one per column.
+      const stops = Array.from(grid().querySelectorAll<HTMLElement>("thead button")).filter(
+        (b) => b.getAttribute("tabindex") === "0"
+      )
+      expect(stops.map((b) => b.getAttribute("data-head"))).toEqual(["name", "sort"])
+    })
+
+    it("moves the picked cell with the arrow keys, Home and End, and the inspector follows", async () => {
+      await openPreview()
+
+      fireEvent.click(cellOf(0, "id"))
+      const panel = () => inspector() as HTMLElement
+      const at = () => [
+        within(panel()).getByText("Row").nextElementSibling?.textContent,
+        within(panel()).getByText("Column").nextElementSibling?.textContent,
+      ]
+      expect(at()).toEqual(["1", "id"])
+
+      fireEvent.keyDown(cellOf(0, "id"), { key: "ArrowRight" })
+      expect(at()).toEqual(["1", "city"])
+      expect(document.activeElement).toBe(cellOf(0, "city"))
+      // The tab stop moved with the focus.
+      expect(tabStops()).toEqual([cellOf(0, "city")])
+      fireEvent.keyDown(cellOf(0, "city"), { key: "ArrowDown" })
+      expect(at()).toEqual(["2", "city"])
+      fireEvent.keyDown(cellOf(1, "city"), { key: "End" })
+      expect(at()).toEqual(["2", "free"])
+      fireEvent.keyDown(cellOf(1, "free"), { key: "ArrowRight" })
+      expect(at()).toEqual(["2", "free"])
+      fireEvent.keyDown(cellOf(1, "free"), { key: "Home" })
+      expect(at()).toEqual(["2", "id"])
+      fireEvent.keyDown(cellOf(1, "id"), { key: "ArrowUp" })
+      fireEvent.keyDown(cellOf(0, "id"), { key: "ArrowUp" })
+      expect(at()).toEqual(["1", "id"])
+    })
+
+    it("moves the focus without opening the inspector, and opens it on Enter", async () => {
+      const fetchSpy = await openPreview()
+
+      fireEvent.keyDown(cellOf(0, "id"), { key: "ArrowRight" })
+      expect(document.activeElement).toBe(cellOf(0, "city"))
+      // Passing through the grid changes nothing on the page and reads nothing.
+      expect(inspector()).toBeNull()
+      expect(profileRequests(fetchSpy)).toBe(0)
+
+      fireEvent.keyDown(cellOf(0, "city"), { key: "Enter" })
+      expect(within(inspector() as HTMLElement).getByText("Column").nextElementSibling?.textContent).toBe("city")
+    })
+
+    it("moves along the header with the arrow keys, one column's two controls at a time", async () => {
+      await openPreview()
+
+      const idName = within(headerOf("id")).getByRole("button", { name: "id" })
+      fireEvent.keyDown(idName, { key: "ArrowRight" })
+      const cityName = within(headerOf("city")).getByRole("button", { name: "city" })
+      expect(document.activeElement).toBe(cityName)
+      expect(cityName.getAttribute("tabindex")).toBe("0")
+      expect(idName.getAttribute("tabindex")).toBe("-1")
+      fireEvent.keyDown(cityName, { key: "End" })
+      expect(document.activeElement).toBe(within(headerOf("free")).getByRole("button", { name: "free" }))
+    })
   })
 })
 

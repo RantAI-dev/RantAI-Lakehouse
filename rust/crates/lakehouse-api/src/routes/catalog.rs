@@ -1616,6 +1616,8 @@ pub async fn sample(
 /// the way — an invalid name, unresolvable obligations, a refused rewrite,
 /// a missing table — yields NO rows rather than the raw ones: an empty
 /// sample is an honest "not available", an unmasked one is a leak.
+///
+/// Every cell is a string, except a `NULL`, which is JSON `null`.
 async fn governed_sample(
     state: &AppState,
     principal: &Principal,
@@ -1670,7 +1672,15 @@ async fn governed_sample(
             let mut o = Map::new();
             for m in &result.meta {
                 if !m.name.starts_with('_') {
-                    o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
+                    // A `NULL` stays JSON `null` where `js_string` would
+                    // make it `""`: a reader of the sample must be able to
+                    // tell "no value" from an empty text. Only here; the
+                    // other routes that use `js_string` keep its reading.
+                    let cell = match row.get(&m.name) {
+                        None | Some(Value::Null) => Value::Null,
+                        present => Value::String(js_string(present)),
+                    };
+                    o.insert(m.name.clone(), cell);
                 }
             }
             Value::Object(o)
@@ -3938,6 +3948,62 @@ mod tests {
                 reads.iter().all(|b| b.contains("replaceRegexpOne")),
                 "the sample must never reach ClickHouse unmasked"
             );
+            Ok(())
+        }
+
+        /// A `NULL` cell is JSON `null` and an empty text is `""`, in both
+        /// places the sample is served (the detail body and the larger
+        /// sample), so the console can tell "no value" from "empty". Every
+        /// other cell is the string it was, a number included, and a masked
+        /// cell is whatever the rewrite made it.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn sample_keeps_a_null_cell_null_and_an_empty_text_empty(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Mounted before `mock_clickhouse`'s own answer to the masked
+            // read, and at a higher priority, so it is the one that answers.
+            Mock::given(method("POST"))
+                .and(body_string_contains("replaceRegexpOne"))
+                .respond_with(ch_json(
+                    &[
+                        ("id", "UInt64"),
+                        ("email", "String"),
+                        ("note", "Nullable(String)"),
+                    ],
+                    &json!([
+                        {"id": "1", "email": "***", "note": null},
+                        {"id": 2, "email": "***", "note": ""},
+                    ]),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let expected = json!([
+                {"id": "1", "email": "***", "note": null},
+                {"id": "2", "email": "***", "note": ""},
+            ]);
+
+            let (status, body) =
+                detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], expected);
+
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+            let ApiJson(body) = sample(
+                State(state),
+                Extension(analyst("catalog:read, query:read")),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+                Query(SampleQuery { limit: Some(25) }),
+            )
+            .await
+            .expect("sample answers");
+            assert_eq!(body["rows"], expected);
             Ok(())
         }
 

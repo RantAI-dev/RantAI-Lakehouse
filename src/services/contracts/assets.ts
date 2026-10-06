@@ -98,7 +98,12 @@ export type AssetColumn = {
 
 export type AssetDetail = Asset & {
   schema: AssetColumn[]
-  sample: Record<string, string>[]
+  /**
+   * The first rows, as the caller may read them. A cell is a string as
+   * stored, or `null` for a `NULL`: an empty text is `""`, never `null`
+   * (`routes/catalog.rs::governed_sample`).
+   */
+  sample: Record<string, string | null>[]
   /**
    * Checks that name this asset: verdicts a quality job recorded
    * (`origin: "observed"`) and rules people authored (`"rule"`). `status`
@@ -402,7 +407,7 @@ export interface AssetService {
     id: string,
     limit: number,
     signal?: AbortSignal
-  ): Promise<Record<string, string>[]>
+  ): Promise<Record<string, string | null>[]>
   /**
    * `PUT /api/catalog/{id}/annotation` — replace the asset's annotation
    * (needs `catalog:write`). Optional for the same dead-fixture reason.

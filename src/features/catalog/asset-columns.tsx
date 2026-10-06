@@ -78,7 +78,8 @@ const COLUMN_PAGE_SIZES = [25, 50, 100] as const
 /** A table with more columns than this gets the filter box. */
 const FILTER_ABOVE = 10
 
-const EMPTY_VALUE = "(empty)"
+/** How an empty text is written wherever a value is listed; the Sample tab writes its empty cells the same way. */
+export const EMPTY_VALUE = "(empty)"
 const NOT_PROFILED = "Not profiled (type not supported)"
 /** Said under a row's label where a bar would be, and in the opened column, when no value is listed. */
 const NO_VALUE_LISTED = "No value is listed: the profile states a value's count only where it is exact."
@@ -167,7 +168,8 @@ const shownValue = (value: string) => (value === "" ? EMPTY_VALUE : value)
 const describeValue = (v: ValueShare) =>
   `${shownValue(v.value)} · ${formatNumber(v.count)} rows (${formatShare(v.share)})`
 
-const FAMILY: Record<TypeFamily, { label: string; icon: LucideIcon }> = {
+/** The glyph and the word for each kind of data; the Sample tab's headers use the same table. */
+export const FAMILY: Record<TypeFamily, { label: string; icon: LucideIcon }> = {
   text: { label: "Text", icon: Type },
   number: { label: "Number", icon: Hash },
   time: { label: "Date or time", icon: CalendarClock },
@@ -200,7 +202,7 @@ function NullMeter({ fraction }: { fraction: number }) {
 }
 
 /** What the stats were computed over, or why there are none. */
-function ProfileNote({ state }: { state: ProfileState }) {
+export function ProfileNote({ state }: { state: ProfileState }) {
   if (state.kind === "loading") return <span>Profiling columns…</span>
   if (state.kind === "restricted") {
     return <span>Column statistics are read from the data, so they need the query:read permission.</span>
@@ -497,8 +499,11 @@ function factsOf(row: SchemaRow, column: ColumnProfile | undefined, sortKey: boo
   return items
 }
 
-/** The opened column: its values on the left where there is room, its facts beside or under them. */
-function ColumnDetail({
+/**
+ * The opened column: its values on the left where there is room, its facts
+ * beside or under them. The Sample tab's inspector opens the same one.
+ */
+export function ColumnDetail({
   row,
   state,
   column,
