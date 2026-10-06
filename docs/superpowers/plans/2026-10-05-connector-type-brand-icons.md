@@ -211,3 +211,41 @@ Foreground on chip: 17.72 light, 14.25 dark. At the 3:1 bar for graphics, Kafka,
 **Third-party record**: the repo has no third-party or licence register (grep found none); `brand-marks.ts`'s header is the record, plus the CHANGELOG bullet.
 
 ## 9. Review (planner)
+
+### 2026-10-05 — B1 to B3, three rounds
+
+Read: the developer's reports and the diffs. Ran myself, from this tree,
+after the last round: `bun run typecheck` exit 0; `bun run lint` exit 0
+(0 errors, 5 warnings, none in a changed file); `bun run test` exit 0
+(719 passed, 1 skipped, 0 failed, 80 files); and the skipped test on its
+own with the source files in place (`BRAND_ICON_DIR` set): 8 passed, so
+every path in the repository is the published one, byte for byte.
+
+**Findings, both closed, both seen on a screenshot at twice the size.**
+
+- **R1 (the plan's error).** Simple Icons' MySQL drawing is the whole
+  logo, the word with a small dolphin over it. At 18 px it was a smudge.
+  Closed: MySQL alone uses the dolphin from SVG Logos (CC0-1.0), two
+  paths as published. The rule for which products get a mark is
+  unchanged.
+- **R2.** In the dark theme the dolphin, a line drawing, was too faint
+  in its brand colour although it measured 3.16:1. Closed: it joins
+  Kafka, MariaDB and MQTT in the foreground colour in that theme.
+
+**Accepted as it is:** MongoDB, Google Sheets and SAP measure under 3:1
+on the light chip (2.89, 2.75, 2.30). They are brand colours beside a
+name that is always there, and they read clearly on the screenshots.
+
+**In a browser** (headless, 1440, both themes, at 1x and 2x): the eight
+products and the two CDC forms show their marks; Oracle, SQL Server, SQL
+Server CDC, Object storage, SFTP and REST API their generic icons; the
+selected tile's mark takes the chip's foreground; SAP and MQTT are
+dimmed with their tiles; no mark is a dark shape on the dark chip.
+
+**Not checked by anyone:** the strip on the edit page in a browser (the
+component test covers the strip; it is the same component as the tile's).
+
+**Left to the product owner:** whether Oracle and SQL Server should show
+their marks despite section 2, decision 3.
+
+**Verdict:** ready for the product owner's look. Nothing is committed.
