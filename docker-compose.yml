@@ -175,6 +175,16 @@ services:
       # off; `true`, empty or unset leaves it on; any other value stops the
       # API at start (see config.rs).
       AI_SEMANTIC_LAYER: ${AI_SEMANTIC_LAYER:-}
+      # Ask-back: the chat may ask once which reading of an unclear word the
+      # person means (the `ask_user` tool) and reads the words that person
+      # has answered before. `false` turns it off; `true`, empty or unset
+      # leaves it on; any other value stops the API at start (see config.rs).
+      AI_ASK_BACK: ${AI_ASK_BACK:-}
+      # Relevant tables: the chat's data map writes in full only the tables
+      # a question names and the others on one line. `false` turns it off;
+      # `true`, empty or unset leaves it on; any other value stops the API
+      # at start (see config.rs).
+      AI_RELEVANT_TABLES: ${AI_RELEVANT_TABLES:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
