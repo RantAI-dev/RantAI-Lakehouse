@@ -128,8 +128,8 @@ means Pro or Enterprise, which have the same features; **OSS** is the free
 edition. Tableau's tiers are its Creator/Explorer/Viewer roles and its
 Standard, Enterprise, Cloud+ and Tableau+ editions.
 
-Summary: 148 capabilities compared. We have 46, have 32 partly and lack 68.
-A competitor has it fully where we are partial or missing in 99 rows; we
+Summary: 148 capabilities compared. We have 39, have 39 partly and lack 68.
+A competitor has it fully where we are partial or missing in 106 rows; we
 lead both in 8 (BI, lakehouse and pipelines in one product; AI that acts
 with human approval; rose, calendar and radar charts; query cost and plan
 panels). Metabase is the realistic benchmark; Tableau is the ceiling.
@@ -164,6 +164,8 @@ panels). Metabase is the realistic benchmark; Tableau is the ceiling.
 ### The matrix
 
 Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
+**Have** means we match or beat the best competitor that offers it; anything
+less is **Partial** (product owner, 2026-10-07).
 
 ### Data and modelling
 
@@ -195,7 +197,7 @@ Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
 
 | Capability | RantAI Lakehouse | Tableau | Metabase |
 | --- | --- | --- | --- |
-| Editor with highlighting and format | **Have**. CodeMirror, Format button, run with Ctrl/Cmd+Enter, draft kept on reload | **Partial**. Custom SQL dialog only; no ad-hoc SQL workspace | **Have** |
+| Editor with highlighting and format | **Partial**. Highlighting and a small formatter; no tabs, themes or formatting rules | **Partial**. Custom SQL dialog only; no ad-hoc SQL workspace | **Have** |
 | Autocomplete | **Partial**. Tables and keywords; no columns | **Missing** | **Have**. Tables, fields, snippets |
 | Variables in SQL | **Missing** | **Have**. Parameters in custom and initial SQL | **Have**. Text, number, date, multi-value, field filters, optional clauses |
 | Snippets | **Missing** | **Missing** | **Have**. Snippets; folder permissions Pro+ |
@@ -204,7 +206,7 @@ Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
 | Two engines to choose from | **Have**. ClickHouse or Trino in Query Studio (charts use ClickHouse only) | **n/a** | **n/a** |
 | Cost estimate and query plan panels | **Have** | **Missing**. Not found | **Missing**. Not found |
 | Stop a running query | **Partial**. Aborts the browser request; the server query keeps running | **Not verified** | **Not verified** |
-| AI writes or fixes SQL | **Have**. Natural language to SQL (see finding on masking) | **Missing**. Tableau Agent writes calculations, not SQL | **Have**. Metabot, bring your own key on OSS |
+| AI writes or fixes SQL | **Partial**. Writes SQL but skips governance (see findings); cannot fix a failing query | **Missing**. Tableau Agent writes calculations, not SQL | **Have**. Metabot, bring your own key on OSS |
 
 ### Chart types
 
@@ -238,7 +240,7 @@ Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
 | Density map | **Have**. Density heatmap from latitude and longitude (new in #68) | **Have** | **Have**. Grid map |
 | Map pan and zoom | **Have**. Drag to pan, 1x–20x zoom buttons; outlines are bundled, no outside map server (new in #68) | **Have** | **Have**. Pin and grid maps |
 | Spatial analysis (spatial joins, drive time) | **Missing** | **Have** | **Missing** |
-| Text / markdown card | **Have** | **Have** | **Have**. With variables from filters |
+| Text / markdown card | **Partial**. Plain markdown; no values from filters | **Have** | **Have**. With variables from filters |
 | Image card | **Missing** | **Have** | **Have**. Images through markdown and table columns |
 | Web page / iframe card | **Missing** | **Have** | **Have** |
 | Custom chart plugins | **Missing** | **Have**. Viz extensions | **Have**. Custom visualization SDK, Pro+ |
@@ -274,7 +276,7 @@ Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
 | Number and text filters | **Missing** | **Have** | **Have** |
 | Linked (cascading) filters | **Missing** | **Have**. Only relevant values | **Have** |
 | Default filter values | **Partial**. Any editor's ad-hoc change is silently saved as the shared default, which also changes public and embed views | **Have**. Custom views | **Have**. Defaults and required values |
-| Cross-filtering by clicking a chart | **Have**. For charts users created | **Have**. Filter and highlight actions | **Have** |
+| Cross-filtering by clicking a chart | **Partial**. Only for charts users created; built-in tiles ignore it | **Have**. Filter and highlight actions | **Have** |
 | Drill down to underlying records | **Partial**. Up to 100 rows; not for SQL-source charts or nine chart types | **Have** | **Have**. Many drill-through actions |
 | Click to another dashboard or URL | **Missing** | **Have**. Go-to-sheet and URL actions | **Have**. Custom destinations passing filter values |
 | Parameter and set actions | **Missing** | **Have** | **Partial**. Click behaviour can set filters |
@@ -296,9 +298,9 @@ Status words: **Have**, **Partial**, **Missing**, **Not verified**, **n/a**.
 
 | Capability | RantAI Lakehouse | Tableau | Metabase |
 | --- | --- | --- | --- |
-| Public link | **Have**. Random token, revocable; no expiry or password; built-in board cannot be shared | **Partial**. Only through Tableau Public | **Have**. All plans; admins can list and disable |
-| Embed in another website (iframe) | **Have**. Whole board or one chart (the single-chart view is not a security boundary) | **Have** | **Have** |
-| Signed embedding | **Have**. JWT with locked filters; expiry optional, no revocation | **Have**. Connected apps (JWT or OAuth) | **Have**. Guest embeds; 'Powered by Metabase' badge on OSS |
+| Public link | **Partial**. Random token, revocable; no expiry or password; built-in board cannot be shared | **Partial**. Only through Tableau Public | **Have**. All plans; admins can list and disable |
+| Embed in another website (iframe) | **Partial**. Whole board or one chart, but the single-chart view is not enforced | **Have** | **Have** |
+| Signed embedding | **Partial**. JWT with locked filters; expiry optional, no revocation | **Have**. Connected apps (JWT or OAuth) | **Have**. Guest embeds; 'Powered by Metabase' badge on OSS |
 | Embedding SDK (JavaScript / React) | **Missing** | **Have**. Embedding API v3 web components | **Have**. Modular embedding and React SDK, Pro+ |
 | Edit dashboards inside an embed | **Missing** | **Have**. Embedded web authoring | **Have**. Pro+ |
 | White-labelling | **Missing**. 'Rantai Lake' is hard-coded in public and embed views | **Partial**. Logo, domain, toolbar; Tableau branding stays | **Have**. Pro+ |
