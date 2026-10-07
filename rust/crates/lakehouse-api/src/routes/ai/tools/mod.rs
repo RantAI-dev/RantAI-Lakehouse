@@ -3,6 +3,8 @@
 //!
 //! - [`data`] — `run_sql`, `list_datasets`, `describe_dataset`,
 //!   `get_lineage`, `get_quality`, `describe_mart`.
+//! - [`ask`] — `ask_user`, the question with options the console shows as
+//!   buttons.
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
@@ -18,6 +20,7 @@
 //!   caller (`trigger_build`), rather than a one-tool `maintenance` module.
 
 mod alerts;
+mod ask;
 mod connectors;
 mod dashboards;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -102,6 +105,7 @@ pub(in crate::routes) async fn run_tool(
     let ch = &state.clickhouse;
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
+        "ask_user" => ask::ask_user(args),
         "list_datasets" => data::list_datasets(ch, args).await,
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,

@@ -26,8 +26,9 @@ use uuid::Uuid;
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
-/// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE` and
-/// `AI_SEMANTIC_LAYER` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
+/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK` and `AI_RELEVANT_TABLES` can fail
+/// resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -73,6 +74,24 @@ pub enum ConfigError {
         "AI_SEMANTIC_LAYER must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiSemanticLayer(String),
+    /// `AI_ASK_BACK` was set to something other than `"true"` or `"false"`.
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiSemanticLayer`]: a typo such as `"no"` would
+    /// leave the chat asking questions for an operator who meant to stop it.
+    #[error("AI_ASK_BACK must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}")]
+    UnsupportedAiAskBack(String),
+    /// `AI_RELEVANT_TABLES` was set to something other than `"true"` or
+    /// `"false"`.
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiSemanticLayer`]: a typo such as `"0"` would
+    /// leave the whole map in the prompt for an operator who meant to
+    /// narrow it.
+    #[error(
+        "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
+    )]
+    UnsupportedAiRelevantTables(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -679,6 +698,16 @@ pub struct Config {
     /// unset or empty, and for `"true"`; `false` only for `"false"`. The
     /// routes that read and correct the descriptions answer either way.
     pub ai_semantic_layer: bool,
+    /// Whether the chat may ask the user which reading of an unclear word
+    /// they mean (`AI_ASK_BACK`): the `ask_user` tool, the rules that tell
+    /// the model when to ask, and the user's remembered words in the
+    /// prompt. `true` when unset or empty, and for `"true"`; `false` only
+    /// for `"false"`. The routes under `/api/ai/terms` answer either way.
+    pub ai_ask_back: bool,
+    /// Whether the prompt carries only the tables a question names
+    /// (`AI_RELEVANT_TABLES`), instead of every table in full. `true` when
+    /// unset or empty, and for `"true"`; `false` only for `"false"`.
+    pub ai_relevant_tables: bool,
     /// The commit this image was built from — `rust/Dockerfile`'s `ARG
     /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
     /// same convention `dagster/Dockerfile` already uses for the code
@@ -889,6 +918,8 @@ impl std::fmt::Debug for Config {
             .field("catalog_tenant_id", &self.catalog_tenant_id)
             .field("ai_default_reply_language", &self.ai_default_reply_language)
             .field("ai_semantic_layer", &self.ai_semantic_layer)
+            .field("ai_ask_back", &self.ai_ask_back)
+            .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
             .field("login_failure_window_secs", &self.login_failure_window_secs)
@@ -971,6 +1002,11 @@ impl Config {
     ///   `id` nor `en`.
     /// - [`ConfigError::UnsupportedAiSemanticLayer`], if `AI_SEMANTIC_LAYER`
     ///   is set and non-empty but is neither `true` nor `false`.
+    /// - [`ConfigError::UnsupportedAiAskBack`], if `AI_ASK_BACK` is set and
+    ///   non-empty but is neither `true` nor `false`.
+    /// - [`ConfigError::UnsupportedAiRelevantTables`], if
+    ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
+    ///   nor `false`.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1174,6 +1210,22 @@ impl Config {
                 Some("false") => false,
                 Some(other) => {
                     return Err(ConfigError::UnsupportedAiSemanticLayer(other.to_owned()));
+                }
+            },
+            // Same reading as `ai_semantic_layer`: empty is unset, unset is
+            // on, only the exact word `false` turns it off.
+            ai_ask_back: match truthy(env, "AI_ASK_BACK").as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(other) => {
+                    return Err(ConfigError::UnsupportedAiAskBack(other.to_owned()));
+                }
+            },
+            ai_relevant_tables: match truthy(env, "AI_RELEVANT_TABLES").as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(other) => {
+                    return Err(ConfigError::UnsupportedAiRelevantTables(other.to_owned()));
                 }
             },
             git_sha: or_default(env, "GIT_SHA", "unknown"),
@@ -2017,6 +2069,81 @@ mod tests {
         assert_eq!(
             err,
             ConfigError::UnsupportedAiSemanticLayer("yes".to_owned())
+        );
+        let message = err.to_string();
+        assert!(message.contains("\"true\""), "{message}");
+        assert!(message.contains("\"false\""), "{message}");
+    }
+
+    fn env_with(key: &str, value: &str) -> HashMap<String, String> {
+        HashMap::from([(key.to_owned(), value.to_owned())])
+    }
+
+    #[test]
+    fn ask_back_is_on_when_the_setting_is_absent_or_empty() {
+        // docker-compose.yml passes `${AI_ASK_BACK:-}`, an empty string on
+        // every deployment that sets nothing.
+        assert!(Config::from_map(&HashMap::new()).unwrap().ai_ask_back);
+        assert!(
+            Config::from_map(&env_with("AI_ASK_BACK", ""))
+                .unwrap()
+                .ai_ask_back
+        );
+        assert!(
+            Config::from_map(&env_with("AI_ASK_BACK", "true"))
+                .unwrap()
+                .ai_ask_back
+        );
+    }
+
+    #[test]
+    fn ask_back_setting_false_means_off() {
+        let cfg = Config::from_map(&env_with("AI_ASK_BACK", "false")).unwrap();
+        assert!(!cfg.ai_ask_back);
+    }
+
+    #[test]
+    fn an_unknown_ask_back_setting_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with("AI_ASK_BACK", "no"))
+            .expect_err("only true and false are accepted, a typo must not leave the chat asking");
+        assert_eq!(err, ConfigError::UnsupportedAiAskBack("no".to_owned()));
+        let message = err.to_string();
+        assert!(message.contains("\"true\""), "{message}");
+        assert!(message.contains("\"false\""), "{message}");
+    }
+
+    #[test]
+    fn relevant_tables_is_on_when_the_setting_is_absent_or_empty() {
+        assert!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .ai_relevant_tables
+        );
+        assert!(
+            Config::from_map(&env_with("AI_RELEVANT_TABLES", ""))
+                .unwrap()
+                .ai_relevant_tables
+        );
+        assert!(
+            Config::from_map(&env_with("AI_RELEVANT_TABLES", "true"))
+                .unwrap()
+                .ai_relevant_tables
+        );
+    }
+
+    #[test]
+    fn relevant_tables_setting_false_means_off() {
+        let cfg = Config::from_map(&env_with("AI_RELEVANT_TABLES", "false")).unwrap();
+        assert!(!cfg.ai_relevant_tables);
+    }
+
+    #[test]
+    fn an_unknown_relevant_tables_setting_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with("AI_RELEVANT_TABLES", "0"))
+            .expect_err("only true and false are accepted, a typo must not leave the full map on");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiRelevantTables("0".to_owned())
         );
         let message = err.to_string();
         assert!(message.contains("\"true\""), "{message}");

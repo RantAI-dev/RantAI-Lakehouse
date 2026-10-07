@@ -1655,5 +1655,39 @@
         "properties": {}
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ask_user",
+      "description": "Ask the user which reading of an unclear word they mean, with two to four options taken from the DATA MAP. Use it only when a word fits two or more tables, columns or values and nothing in the DATA MAP or THIS USER'S WORDS settles it. Ask once, run no query in that turn, and write nothing else after the call.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "term": {
+            "type": "string",
+            "description": "the unclear word, as the user wrote it (1 to 60 characters)"
+          },
+          "question": {
+            "type": "string",
+            "description": "one sentence asking which they mean (at most 200 characters)"
+          },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 4,
+            "items": {
+              "type": "string"
+            },
+            "description": "the readings to choose from: names from the DATA MAP, each 1 to 80 characters"
+          }
+        },
+        "required": [
+          "term",
+          "question",
+          "options"
+        ]
+      }
+    }
   }
 ]
