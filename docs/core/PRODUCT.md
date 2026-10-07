@@ -142,7 +142,7 @@ hands-on testing.
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
 | SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
-| Ask in plain language, get SQL | **Partial.** Works, but the model's SQL skips masking and row filters | Yes, inside the user's permissions | `SEC-9` |
+| Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct. | Yes, inside the user's permissions | `AI-16` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
@@ -257,9 +257,9 @@ in `README.md` ("Status / Known limitations").
 - Open findings from the 2026-10-07 code audits, fixed before feature work:
   a connector's stored password can be sent to a new host (`SEC-14`);
   connection tests and alert webhooks can reach internal addresses
-  (`SEC-15`, `SEC-10`); plain-language queries skip masking (`SEC-9`); raw
-  database errors reach the screen (`SEC-11`); queries are not scoped to the
-  tenant (`SEC-20`). The full list is `SEC-9` to `SEC-21` in `BACKLOG.md`.
+  (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
+  tiles and embeds (`SEC-11`); queries are not scoped to the tenant
+  (`SEC-20`). The full list is `SEC-10` to `SEC-21` in `BACKLOG.md`.
 - The audit trail does not cover every console change.
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history
@@ -290,7 +290,7 @@ run without the product owner fixing things by hand.
 | 3 | No human security review | Commission one |
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`), plain-language queries skipping masking (`SEC-9`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table
@@ -320,7 +320,7 @@ customer would hit first, not matching every feature.
 | Item | Why |
 | --- | --- |
 | Accept the merged features: Gold publishing (`DATA-1`), login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`) | Blocker 1; merged is not accepted |
-| Fix the security findings under Now: `SEC-9`, `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
+| Fix the security findings under Now: `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 
 ### Next

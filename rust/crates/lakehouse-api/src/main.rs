@@ -119,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
     // warning in the log, and the alerts tick tries again.
     routes::schema_versions::spawn_pass(&state);
 
+    // AI-16: draft a description for every table that has none, in the
+    // background; the alerts tick and a finished run start the next passes.
+    routes::ai::semantic::spawn_pass(&state);
+
     // Gold-publish-per-mart plan T1: same shape, for Dagster's nightly
     // Gold export schedule (`dagster/dispar_orchestrate/gold_export.py`),
     // from `GOLD_EXPORT_RUN_TOKEN` — see

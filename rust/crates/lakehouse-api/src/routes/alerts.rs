@@ -585,6 +585,15 @@ pub async fn run(
     // reason, and not on a single-rule run either.
     let schema_started = query.id.is_none() && crate::routes::schema_versions::spawn_pass(&state);
 
+    // The semantic layer's drafting pass (AI-16): asks the deployment's
+    // model for a description of each table that has none, up to ten per
+    // tick, in the background for the same reason. The response does not
+    // report it: it changes no verdict, and a pass that starts nothing
+    // (switch off, no key, one already running) is not a fault to show.
+    if query.id.is_none() {
+        crate::routes::ai::semantic::spawn_pass(&state);
+    }
+
     Ok(ApiJson(json!({
         "ran": results.len(),
         "results": results,

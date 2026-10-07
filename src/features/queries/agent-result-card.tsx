@@ -2,6 +2,7 @@
 
 import { SectionCard } from "@/components/patterns/section-card"
 import { RowsTable } from "@/components/patterns/rows-table"
+import { MiniMarkdown } from "@/features/copilot/mini-markdown"
 import { formatNumber } from "@/lib/format"
 import type { NlAnswer } from "@/services/contracts/queries"
 
@@ -16,11 +17,16 @@ const PREVIEW_ROWS = 10
 export function AgentResultCard({ result }: { readonly result: NlAnswer }) {
   return (
     <SectionCard title="Agent answer">
-      <p className="text-sm">{result.answer}</p>
-      <p className="mt-2 text-xs text-muted-foreground">
-        {formatNumber(result.rowCount)} rows
-        {result.sql !== undefined ? " · the final SQL is loaded in the SQL tab." : null}
-      </p>
+      {/* The chat writes Markdown and marks unverified numbers with a span; render both as the Copilot does. */}
+      <div className="text-sm">
+        <MiniMarkdown text={result.answer} />
+      </div>
+      {/* `sql` is absent when the model ran no query, and then "0 rows" would claim a result that never existed. */}
+      {result.sql !== undefined ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {formatNumber(result.rowCount)} rows · the final SQL is loaded in the SQL tab.
+        </p>
+      ) : null}
       <details className="mt-3">
         <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
           Agent steps ({result.steps.length})

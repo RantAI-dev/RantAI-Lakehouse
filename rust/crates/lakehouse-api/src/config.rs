@@ -26,8 +26,8 @@ use uuid::Uuid;
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
-/// Only `PORT`, `CATALOG_TENANT_ID` and `AI_DEFAULT_REPLY_LANGUAGE` can
-/// fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE` and
+/// `AI_SEMANTIC_LAYER` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -62,6 +62,17 @@ pub enum ConfigError {
     /// language, with nothing in the logs to explain it.
     #[error("AI_DEFAULT_REPLY_LANGUAGE must be \"id\" or \"en\", got {0:?}")]
     UnsupportedAiDefaultReplyLanguage(String),
+    /// `AI_SEMANTIC_LAYER` was set to something other than `"true"` or
+    /// `"false"`.
+    ///
+    /// Fails config resolution rather than being ignored: a typo such as
+    /// `"no"` would leave the layer on for an operator who meant to turn it
+    /// off, and the model would keep drafting descriptions with nothing in
+    /// the logs to explain why.
+    #[error(
+        "AI_SEMANTIC_LAYER must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
+    )]
+    UnsupportedAiSemanticLayer(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -662,6 +673,12 @@ pub struct Config {
     /// letters gets none). A detected language always wins over this
     /// default.
     pub ai_default_reply_language: Option<ReplyLanguage>,
+    /// Whether the semantic layer is on (`AI_SEMANTIC_LAYER`): the
+    /// background pass that drafts a description of each table and column,
+    /// and the copilot's DATA MAP reading those descriptions. `true` when
+    /// unset or empty, and for `"true"`; `false` only for `"false"`. The
+    /// routes that read and correct the descriptions answer either way.
+    pub ai_semantic_layer: bool,
     /// The commit this image was built from — `rust/Dockerfile`'s `ARG
     /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
     /// same convention `dagster/Dockerfile` already uses for the code
@@ -871,6 +888,7 @@ impl std::fmt::Debug for Config {
             .field("openfga_url", &self.openfga_url)
             .field("catalog_tenant_id", &self.catalog_tenant_id)
             .field("ai_default_reply_language", &self.ai_default_reply_language)
+            .field("ai_semantic_layer", &self.ai_semantic_layer)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
             .field("login_failure_window_secs", &self.login_failure_window_secs)
@@ -942,7 +960,7 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] in three cases:
+    /// Returns [`ConfigError`] in four cases:
     ///
     /// - [`ConfigError::InvalidPort`], if `PORT` is set to a value that does
     ///   not parse as a `u16`.
@@ -951,6 +969,8 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiDefaultReplyLanguage`], if
     ///   `AI_DEFAULT_REPLY_LANGUAGE` is set and non-empty but is neither
     ///   `id` nor `en`.
+    /// - [`ConfigError::UnsupportedAiSemanticLayer`], if `AI_SEMANTIC_LAYER`
+    ///   is set and non-empty but is neither `true` nor `false`.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1147,6 +1167,15 @@ impl Config {
                     _ => Err(ConfigError::UnsupportedAiDefaultReplyLanguage(raw)),
                 })
                 .transpose()?,
+            // Same `truthy` reason as above: an empty string means unset,
+            // and unset means on. Only the exact word `false` turns it off.
+            ai_semantic_layer: match truthy(env, "AI_SEMANTIC_LAYER").as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(other) => {
+                    return Err(ConfigError::UnsupportedAiSemanticLayer(other.to_owned()));
+                }
+            },
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
             login_failure_window_secs: parse_positive_u32_or_default(
@@ -1947,5 +1976,50 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("\"id\""), "{message}");
         assert!(message.contains("\"en\""), "{message}");
+    }
+
+    fn env_with_semantic_layer(value: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AI_SEMANTIC_LAYER".to_owned(), value.to_owned());
+        env
+    }
+
+    #[test]
+    fn the_semantic_layer_is_on_when_the_setting_is_absent() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert!(cfg.ai_semantic_layer);
+    }
+
+    #[test]
+    fn an_empty_semantic_layer_setting_means_on_not_an_error() {
+        // docker-compose.yml passes `${AI_SEMANTIC_LAYER:-}`, an empty string
+        // on every deployment that sets nothing.
+        let cfg = Config::from_map(&env_with_semantic_layer("")).unwrap();
+        assert!(cfg.ai_semantic_layer);
+    }
+
+    #[test]
+    fn the_semantic_layer_setting_true_means_on() {
+        let cfg = Config::from_map(&env_with_semantic_layer("true")).unwrap();
+        assert!(cfg.ai_semantic_layer);
+    }
+
+    #[test]
+    fn the_semantic_layer_setting_false_means_off() {
+        let cfg = Config::from_map(&env_with_semantic_layer("false")).unwrap();
+        assert!(!cfg.ai_semantic_layer);
+    }
+
+    #[test]
+    fn an_unknown_semantic_layer_setting_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with_semantic_layer("yes"))
+            .expect_err("only true and false are accepted, a typo must not leave the layer on");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiSemanticLayer("yes".to_owned())
+        );
+        let message = err.to_string();
+        assert!(message.contains("\"true\""), "{message}");
+        assert!(message.contains("\"false\""), "{message}");
     }
 }
