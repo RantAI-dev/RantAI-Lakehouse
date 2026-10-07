@@ -5,6 +5,7 @@ import { Sparkles } from "lucide-react"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
+import { MiniMarkdown } from "@/features/copilot/mini-markdown"
 import type { useQueryStudio } from "./use-query-studio"
 import { AgentResultCard } from "./agent-result-card"
 
@@ -69,7 +70,9 @@ export function NaturalLanguagePanel({
 
       {generateAct.data ? (
         <SectionCard title="Explanation">
-          <p className="text-sm">{generateAct.data.explanation}</p>
+          <div className="text-sm">
+            <MiniMarkdown text={generateAct.data.explanation} />
+          </div>
         </SectionCard>
       ) : null}
     </div>
