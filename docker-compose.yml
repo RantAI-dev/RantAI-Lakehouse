@@ -429,6 +429,16 @@ services:
       TENANT_SITE: ${TENANT_SITE:-}
       BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
       CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
+      # README.md "Environment variables" + docs/OPERATIONS.md "Upgrade
+      # note": UUID of the tenant owning this deployment's single shared
+      # catalog and its Dagster-job list. Both are no-tenant-column
+      # surfaces, so with >1 seeded tenant and this unset they are refused
+      # (fail closed) for every principal without the unrestricted grant —
+      # i.e. setting the value in .env alone does nothing, this service's
+      # block must forward it to the process (config.rs reads it from env
+      # only). Empty default: an unset value degrades to the documented
+      # refusal, not a boot failure.
+      CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}
       # Built-in "Main" dashboard tile catalog (Task 6, lakehouse-bi::specs):
       # this compose file's default tenant has the Dispar marts, so it points
       # at the shipped default the Dockerfile bakes into the image. Not a
