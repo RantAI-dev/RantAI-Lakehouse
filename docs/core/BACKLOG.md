@@ -29,7 +29,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SEC-11` | Dashboard tiles (also on public and embed links) and the agent endpoints return raw database error text. Same rule as `SEC-6`. **Shared with the AI team for the agent endpoints** | Security | `routes/support.rs`, `routes/agent.rs` |
 | `SEC-14` | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server | Security | `routes/connectors.rs`, `connector_probe.rs` |
 | `SEC-15` | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Security | `docker-compose.yml`, `connector_probe.rs` |
-| `SEC-13` | Check `.env.staging`, pushed straight to `main` in `df14b78`, for real credentials or hostnames; rotate anything real | Security | commit `df14b78` |
+| `SEC-13` | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Security | commit `7ec3a81` |
 
 ## Next
 
@@ -99,11 +99,11 @@ The one list of known work. Look at it weekly; pick what is next.
 | `DATA-14` | Data quality in depth: a library of ready checks, freshness and volume anomaly detection, an incidents overview | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-15` | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-16` | Time travel proven safe: a gate test that past-version queries pass the masking rewrite | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-17` | Upload more formats (Excel, JSON, Parquet), several files at once, a larger measured size limit | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-17` | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Column types on upload, with names and types editable before loading | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Uploaded tables can feed pipelines and so reach dashboards | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `QS-1` | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Query Studio results: larger configurable results, grid filters and column stats, server downloads, server-side Stop, configurable timeouts | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-4` | Query history page with filters, and a query profile | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -122,7 +122,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | ID | Item | Area | Source |
 | --- | --- | --- | --- |
 | `OPS-3` | Run on several servers; high availability | Platform | PRODUCT §1, §2 |
-| `SRC-3` | Connectors for business apps (pick by customer demand). **Waits for `DEC-9`** | Data | PRODUCT §2 |
+| `SRC-3` | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | PRODUCT §2 |
 | `SRC-4` | Live change capture for databases other than PostgreSQL | Data | PRODUCT §2 |
 | `DATA-8` | Instant copies of a table for testing | Data | PRODUCT §2 |
 | `BLD-2` | Tables that refresh themselves when their inputs change | Build | PRODUCT §2 |

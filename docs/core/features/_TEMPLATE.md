@@ -8,6 +8,7 @@ can observe; how it is built belongs in the engineering plan.
 | --- | --- |
 | Module | <module> |
 | Backlog | <ID> |
+| Spec | `docs/core/specs/<id>.md` (target numbers; every *(proposed)* one is signed under Decisions) |
 | Status | Draft / Decisions signed <date> / In build / Accepted <date> |
 | Plan | `docs/superpowers/plans/<date>-<slug>.md` |
 
@@ -34,6 +35,7 @@ not?
 ## Decisions
 
 Anything the product owner must choose. Until signed, the default is used.
+Every number marked *(proposed)* in the task's spec is listed here.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |

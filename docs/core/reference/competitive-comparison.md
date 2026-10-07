@@ -116,6 +116,12 @@ Honest gaps against the mature platforms, from
 Add a topic when a feature is researched. Date every addition. Remove a
 claim rather than leave it unverified for more than two releases.
 
+The matrices below are the evidence for the task specs in
+[`../specs/`](../specs/): each spec's target numbers (for example 10 files
+and 2 GB per upload, 64,000 rows shown in Query Studio) come from the
+competitor rows here. When a competitor's number changes, change the spec
+too.
+
 ## BI feature matrix: Tableau and Metabase
 
 Compiled 2026-10-05 and updated the same day after PR #68 (map charts,
@@ -133,6 +139,9 @@ A competitor has it fully where we are partial or missing in 106 rows; we
 lead both in 8 (BI, lakehouse and pipelines in one product; AI that acts
 with human approval; rose, calendar and radar charts; query cost and plan
 panels). Metabase is the realistic benchmark; Tableau is the ceiling.
+The task list is backlog `BI-1` to `BI-19`, `BI-26` and `RPT-1`, with the
+assistant's counterparts in `AI-1` to `AI-15`; each has a spec in
+[`../specs/`](../specs/).
 
 ### The product owner's decisions (2026-10-06)
 
@@ -364,7 +373,8 @@ registry, October 2026. Airbyte is compared for Sources only. **Have** means we
 match or beat the best competitor that offers it; anything less is
 **Partial**. The product owner has not yet decided this module area by area;
 the task list is backlog `SEC-14` to `SEC-18`, `SRC-3`, `SRC-6` to `SRC-13`
-and `DATA-11` to `DATA-19`, with edge cases in `DEC-10`.
+and `DATA-11` to `DATA-19`, with edge cases in `DEC-10`. Each task has a
+spec with target numbers in [`../specs/`](../specs/).
 
 Summary: 69 capabilities. We have 25, have 23 partly and lack 19.
 
@@ -478,7 +488,8 @@ Summary: 69 capabilities. We have 25, have 23 partly and lack 19.
 Compiled 2026-10-07, same method. Query Studio is a main feature of its own,
 shared by BI and the lakehouse (product owner, 2026-10-07), so it is compared
 with the lakehouse platforms' SQL workspaces and with Metabase's SQL editor.
-The task list is backlog `QS-1` to `QS-5` and `SEC-9`, `SEC-19` to `SEC-21`.
+The task list is backlog `QS-1` to `QS-5` and `SEC-9`, `SEC-19` to `SEC-21`,
+each with a spec in [`../specs/`](../specs/).
 
 Summary: 29 capabilities. We have 4, have 11 partly and lack 11.
 

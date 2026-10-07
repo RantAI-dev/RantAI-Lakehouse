@@ -12,8 +12,9 @@ RantAI Lakehouse: a Next.js console (`src/`), a Rust API workspace
 are in `docs/adr/`, phases/gates/risks in
 `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`, measurements in
 `docs/plans/*-RESULT.md`. Product documents are in `docs/core/`: `PRODUCT.md`
-(what the product is, has, lacks, and what is next), `BACKLOG.md`, and one
-page per feature in `docs/core/features/`. A planner or reviewer taking over
+(what the product is, has, lacks, and what is next), `BACKLOG.md`, one spec
+per backlog task in `docs/core/specs/` (target numbers against the best
+competitor), and one page per feature in `docs/core/features/`. A planner or reviewer taking over
 reads `docs/core/HANDOFF.md` for the current state.
 
 ## Who plans, who writes, who reviews
@@ -37,10 +38,12 @@ review worth having.
 
 The loop, per feature:
 
-0. **Ready.** The feature has a backlog ID and a page in
-   `docs/core/features/` (what the user can do, decisions, limits, acceptance
-   checklist). The planner may draft it; the product owner signs the
-   decisions.
+0. **Ready.** The feature has a backlog ID, a spec in `docs/core/specs/`
+   (its target numbers), and a page in `docs/core/features/` (what the user
+   can do, decisions, limits, acceptance checklist). The planner may draft
+   both; the product owner signs the decisions, including every number the
+   spec marks *(proposed)*. The plan builds to the spec's targets; a target
+   that cannot be met is reported, not quietly lowered.
 1. **Plan.** The planner writes `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`:
    decisions already made, anchors (`file:line`, verified at a named
    commit), numbered tasks each with its acceptance check, PR slicing, and

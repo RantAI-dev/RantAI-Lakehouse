@@ -4,14 +4,14 @@
 | --- | --- |
 | Backlog | `SEC-13` in [BACKLOG.md](../BACKLOG.md) |
 | Area | Security |
-| Who builds it | Whoever pushed df14b78 |
+| Who builds it | Whoever pushed 7ec3a81 |
 | When | Now |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
 
 ## Why
 
-Commit df14b78 added .env.staging straight to main. The planner could not read it, so nobody has confirmed it holds no real credentials or hostnames.
+Commit 7ec3a81 added .env.staging straight to main, without a pull request (an earlier note named df14b78, which is not on main). The planner could not read it, so nobody has confirmed it holds no real credentials or hostnames.
 
 ## What users get
 
@@ -28,7 +28,7 @@ Confidence that the repository holds no real password or server address.
 
 ## Benchmark
 
-Commit df14b78; AGENTS.md rule 12.
+Commit 7ec3a81; AGENTS.md rule 12.
 
 ## Acceptance checklist
 
