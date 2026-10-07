@@ -21,12 +21,13 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
+from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
     gold_export_after_authored_sensor,
     gold_export_job,
     gold_export_schedule,
 )
-from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedules
+from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
     bronze_maintenance_schedule,
@@ -81,6 +82,13 @@ from dispar_orchestrate.replication_metrics import (
 # per scheduled employee; with it unset, `agent_run_schedules` is `[]` and
 # `agent_run_job` stays launchable on demand only, exactly like
 # `gold_export_job`.
+#
+# `file_ingest_job` (DATA-9, ADR 0014, T7 of
+# `docs/superpowers/plans/2026-10-02-upload-file.md`) loads a file a user
+# uploaded into a raw table. It is launched only by
+# `POST /api/uploads/{id}/ingest`, with a run config naming the file, so it
+# has no schedule and no sensor: there is no such thing as "the" uploaded
+# file to run it on.
 defs = Definitions(
     jobs=[
         bronze_ingest_job,
@@ -91,6 +99,7 @@ defs = Definitions(
         alerts_run_job,
         capacity_snapshot_job,
         ingest_job,
+        file_ingest_job,
         *authored_jobs,
     ],
     schedules=[
@@ -100,10 +109,13 @@ defs = Definitions(
         *agent_run_schedules,
         capacity_snapshot_schedule,
         gold_export_schedule,
-        *ingest_schedules,
         *authored_schedules,
     ],
     sensors=[
+        # `ingest_job`'s connector schedules: one sensor reading them from
+        # lakehouse-api, so a schedule saved in the console needs no reload --
+        # see `ingest_factory.py`'s "Schedules" section.
+        ingest_schedule_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
         gold_export_after_authored_sensor,

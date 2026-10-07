@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use lakehouse_core::ident::Ident;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -47,6 +48,12 @@ pub enum ConfigError {
     /// request-time surprise.
     #[error("CATALOG_TENANT_ID must be a valid UUID, got {0:?}")]
     InvalidCatalogTenantId(String),
+    /// `CONNECTOR_PROBE_ALLOWED_CIDRS` holds an entry that is not a network
+    /// or an address. Fails config resolution for the same reason
+    /// [`ConfigError::InvalidCatalogTenantId`] does: dropping the bad entry
+    /// would quietly refuse the hosts the operator meant to allow.
+    #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
+    MalformedAllowedCidrs(String),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -122,6 +129,19 @@ pub struct Config {
     /// posture is what a deployment gets unless it says otherwise. `true`
     /// only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
+    /// Private networks a connector may dial even though the SSRF guard
+    /// refuses internal addresses (`CONNECTOR_PROBE_ALLOWED_CIDRS`, e.g.
+    /// `192.168.18.0/24`): the narrow alternative to
+    /// `connector_probe_allow_internal_hosts`. Empty by default. See
+    /// [`crate::internal_hosts`] for what the list can never open.
+    pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Where connector credential files physically live
+    /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
+    /// `file:/run/secrets/...`, the path Dagster reads inside its own
+    /// container; this moves only where the API itself reads and writes
+    /// them — e.g. when it runs outside Docker, where `/run/secrets` does
+    /// not exist and every stored credential would fail with a 503.
+    pub connector_secrets_dir: std::path::PathBuf,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -311,6 +331,15 @@ pub struct Config {
     /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
     /// Default `"default"`.
     pub lakekeeper_warehouse: String,
+    /// `ICEBERG_QUERY_DB` — the `ClickHouse` `DataLakeCatalog` database
+    /// this API reads Iceberg tables through (compose's
+    /// `clickhouse-iceberg-init` creates it as `icecat_api`). Used to
+    /// resolve an Iceberg table's real columns for policy enforcement
+    /// (`policy_engine`) and to read Iceberg-only catalog assets
+    /// (`routes::catalog`, `routes::catalog_profile`). `None` when unset
+    /// or not a plain identifier: Iceberg tables then stay unreadable
+    /// through those paths, and a governed one is refused, never read raw.
+    pub iceberg_query_db: Option<Ident>,
     /// Base URL of Lakekeeper's own `management/v1/*` REST API (e.g.
     /// `http://lakekeeper:8181`), used ONLY by
     /// `lakehouse_auth::openfga::LakekeeperAdminClient`
@@ -704,6 +733,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
                 "lakekeeper_credential_secret_ref",
@@ -748,6 +778,11 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
             )
+            .field(
+                "connector_probe_allowed_cidrs",
+                &self.connector_probe_allowed_cidrs,
+            )
+            .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
@@ -998,6 +1033,15 @@ impl Config {
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
+            connector_probe_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("CONNECTOR_PROBE_ALLOWED_CIDRS")
+                    .map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedAllowedCidrs)?,
+            connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
+                || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
+                std::path::PathBuf::from,
+            ),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -1014,6 +1058,7 @@ impl Config {
                 "http://localhost:8181/catalog",
             ),
             lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            iceberg_query_db: truthy(env, "ICEBERG_QUERY_DB").and_then(|v| Ident::new(v).ok()),
             lakekeeper_base_url: or_default(env, "LAKEKEEPER_BASE_URI", "http://localhost:8181"),
             lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
             rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
@@ -1123,6 +1168,17 @@ impl Config {
         let env: HashMap<String, String> = std::env::vars().collect();
         Self::from_map(&env)
     }
+
+    /// The internal addresses a connector dial may reach: every one of
+    /// them, or only the allowlisted networks. Passed to
+    /// `connector_probe`/`connector_discover`'s SSRF check.
+    #[must_use]
+    pub fn connector_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.connector_probe_allow_internal_hosts,
+            allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1136,6 +1192,19 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// A plain identifier is kept; anything that could not be interpolated
+    /// safely into `ClickHouse` SQL turns the feature off instead.
+    #[test]
+    fn iceberg_query_db_accepts_only_a_plain_identifier() {
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "icecat_api")])).unwrap();
+        assert_eq!(
+            cfg.iceberg_query_db.as_ref().map(Ident::as_str),
+            Some("icecat_api")
+        );
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "x`; DROP")])).unwrap();
+        assert_eq!(cfg.iceberg_query_db, None);
     }
 
     /// H1: `{:?}` must never leak a secret value, however it's populated.
@@ -1204,6 +1273,7 @@ mod tests {
         );
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.iceberg_query_db, None);
         assert_eq!(cfg.lakekeeper_base_url, "http://localhost:8181");
         assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
         assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");
@@ -1422,6 +1492,32 @@ mod tests {
         let cfg =
             Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
         assert!(cfg.connector_probe_allow_internal_hosts);
+    }
+
+    /// The narrow alternative: listed networks only, parsed at startup,
+    /// and a bad entry refuses to boot rather than being dropped.
+    #[test]
+    fn connector_probe_allowed_cidrs_parses_the_list_and_refuses_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert!(cfg.connector_probe_allowed_cidrs.is_empty());
+        assert_eq!(
+            cfg.connector_internal_hosts(),
+            crate::internal_hosts::InternalHosts::NONE
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "CONNECTOR_PROBE_ALLOWED_CIDRS",
+            "192.168.18.0/24, 10.1.2.3",
+        )]))
+        .unwrap();
+        assert_eq!(cfg.connector_probe_allowed_cidrs.len(), 2);
+        assert!(
+            cfg.connector_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
     }
 
     /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset

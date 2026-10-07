@@ -79,6 +79,21 @@ export function useQueryStudio() {
   React.useEffect(() => {
     if (hydratedRef.current) return
     hydratedRef.current = true
+    // A `?sql=` link (e.g. an asset's "Open in Query Studio") names the
+    // query the user came here to run, so it wins over any stored draft.
+    // `?engine=` rides along because the SQL is only valid on the engine it
+    // was written for (e.g. `iceberg.bronze.*` names exist only on Trino).
+    // Read from `window.location`, like the `?saved=` handoff below, to
+    // avoid a `useSearchParams` Suspense boundary.
+    const params = new URLSearchParams(window.location.search)
+    const linkedSql = params.get("sql")
+    if (linkedSql && hasStatement(linkedSql)) {
+      setSql(linkedSql)
+      setTab("sql")
+      const linkedEngine = params.get("engine")
+      if (linkedEngine === "clickhouse" || linkedEngine === "trino") setEngine(linkedEngine)
+      return
+    }
     const draft = readDraft()
     if (!draft) return
     if (draft.sql) setSql(draft.sql)

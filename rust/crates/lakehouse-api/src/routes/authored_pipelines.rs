@@ -1398,6 +1398,7 @@ mod tests {
                 max_retries: None,
                 tenant_id: None,
                 depends_on,
+                connector_id: None,
                 // The route mints an id before the validator runs (PR
                 // #57 review F1.7). The store fixtures here want the
                 // slug-derived default; that is exactly what `id: None`
@@ -1523,6 +1524,7 @@ mod tests {
                 max_retries: None,
                 tenant_id: None,
                 depends_on,
+                connector_id: None,
                 // The route mints an id before the validator runs (PR
                 // #57 review F1.7). The store fixtures here want the
                 // slug-derived default; that is exactly what `id: None`
@@ -1681,6 +1683,7 @@ mod tests {
                 max_retries: None,
                 tenant_id: None,
                 depends_on,
+                connector_id: None,
                 id: None,
             }
         }

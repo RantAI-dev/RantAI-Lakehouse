@@ -25,11 +25,12 @@ Update only with verified repository facts.
 | Overview | Activity feed | `/activity` | [COMPLETE] | [REAL] |
 | Overview | Alerts triage | `/alerts` | [COMPLETE] | [REAL] |
 | Data | Data Explorer (tier + layer) | `/data` | [COMPLETE] | [REAL] |
-| Data | Asset detail tabs | `/data/assets/[assetId]` | [COMPLETE] | [REAL] |
+| Data | Asset detail tabs | `/data/assets/[assetId]` | [COMPLETE] | [REAL] (a raw table's schema versions come from its Iceberg metadata; a Silver or Gold table's are recorded by the console from its first look at the table, ADR 0015, and shown on the Schema tab, the About card and the change history; verified on the dev stack 2026-10-05: start-up pass, added, retyped, dropped and moved columns, and a change recorded at the orchestrator's schedule) |
 | Data | Gold per-mart publish switch on asset page | `/data/assets/[assetId]` (Gold only) | [COMPLETE] | [REAL] |
 | Data | Catalog namespaces (incl. Bronze Iceberg tables) | `/catalog` | [COMPLETE] | [REAL] |
 | Data | Storage lifecycle + restore (Hot/Warm real; Cold/AI always 0 — see README limitations) | `/storage` | [COMPLETE] | [REAL] |
-| Data | Connectors list / create / test / discover | `/connectors` | [COMPLETE] | [REAL] (CRUD is real Postgres; `testConnection` returns hardcoded latency — see `lakehouse-store/src/connectors.rs`, not a live socket check) |
+| Data | Connectors list / create / test / discover; a page per connector (header, Overview, Ingest and Connection tests tabs in `?tab=`) | `/connectors`, `/connectors/[id]` | [COMPLETE] | [REAL] (CRUD is real Postgres; `testConnection` returns hardcoded latency — see `lakehouse-store/src/connectors.rs`, not a live socket check) |
+| Data | Upload a file into a raw table (File, Check, Table, Review; "Uploaded files" tab) | `/connectors/upload`, `/connectors?tab=uploads` | [PARTIAL] | [REAL] (screens, routes and the load job are built and tested piecewise; no load has been run end to end on a deployed stack, so the acceptance checklist in `docs/core/features/upload-file.md` is still open. Delimited text only, every column text; the load is a Dagster run, `file_ingest_job`) |
 | Build | Pipelines list / create / agentic draft | `/pipelines` | [COMPLETE] | [REAL] |
 | Build | Pipeline detail + graph + runs | `/pipelines/[pipelineId]` | [COMPLETE] | [REAL] |
 | Build | Pipeline run cancel / retry | (run drawer) | [COMPLETE] | [REAL] |
@@ -67,7 +68,6 @@ Update only with verified repository facts.
 | Real streaming engine (Kafka/Flink/etc.) | [MISSING] (backend) — CDC via Debezium exists but is not a streaming engine. The mocked streaming UI surface was removed (not kept as a mock) rather than fabricate lag/throughput numbers for an engine that doesn't exist. |
 | Vector store / embedding-backed semantic search | [MISSING] (backend) |
 | Live connector health checks (`testConnection` dials nothing) | [MISSING] (backend) |
-| Dedicated connector detail route | [PARTIAL] (drawer sufficient for preview) |
 | Dedicated pipeline run route | [PARTIAL] (drawer + actions) |
 | Workflow detail canvas route | [PARTIAL] |
 | Observability log/trace explorer | [MISSING] |

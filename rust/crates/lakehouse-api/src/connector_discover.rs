@@ -48,6 +48,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_probe::{self, DIAL_TIMEOUT, DialTarget};
+use crate::internal_hosts::InternalHosts;
 
 /// One discovered column.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -131,7 +132,7 @@ pub enum DiscoverError {
     #[error("connector's dial is invalid: {0}")]
     InvalidDial(#[from] IngestSpecError),
     /// The dial's `host` resolves to (or is) a private/internal address
-    /// and `allow_internal_hosts` is not set — see
+    /// that `internal_hosts` does not permit — see
     /// `connector_probe::resolve_checked`.
     #[error("{0}")]
     Blocked(String),
@@ -300,9 +301,9 @@ async fn discover_dial(
     secret_ref: &str,
     schema: &str,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Result<Vec<DiscoveredObject>, DiscoverError> {
-    connector_probe::resolve_checked(target.host, target.port, allow_internal_hosts)
+    connector_probe::resolve_checked(target.host, target.port, internal_hosts)
         .await
         .map_err(DiscoverError::Blocked)?;
     let password = resolver
@@ -413,7 +414,7 @@ pub async fn discover(
     dial_info: &ConnectorDialInfo,
     schema: Option<&str>,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Result<DiscoverResult, DiscoverError> {
     match dial_info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
@@ -443,7 +444,7 @@ pub async fn discover(
                 &dial_info.secret_ref,
                 schema,
                 resolver,
-                allow_internal_hosts,
+                internal_hosts,
             )
             .await?;
             Ok(DiscoverResult::ok(objects))

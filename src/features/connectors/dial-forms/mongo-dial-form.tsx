@@ -62,6 +62,7 @@ export function MongoDialForm({
               value={host}
               onChange={(e) => setHost(index, e.target.value)}
               placeholder="mongo-0.internal:27017"
+              autoComplete="off"
             />
             {dial.hosts.length > 1 ? (
               <button
@@ -85,6 +86,7 @@ export function MongoDialForm({
             id="mongo-dial-database"
             value={dial.database}
             onChange={(e) => set("database", e.target.value)}
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -95,6 +97,7 @@ export function MongoDialForm({
             id="mongo-dial-username"
             value={dial.username}
             onChange={(e) => set("username", e.target.value)}
+            autoComplete="off"
           />
         </div>
       </div>

@@ -194,7 +194,7 @@ async fn render_board_payload(
     let ch: &ChClient = &state.clickhouse;
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), ch);
+    let obligations = PolicyEngineObligations::from_state(state);
     let stored = store::list_stored_charts(ch).await?;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()

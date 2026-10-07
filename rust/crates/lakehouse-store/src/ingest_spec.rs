@@ -723,6 +723,20 @@ pub enum IngestSpecError {
     },
 }
 
+/// How one run's rows meet the Bronze table they land in. Mirrors
+/// `LOAD_MODES` in `dagster/dispar_orchestrate/adapters/sink.py`, which is
+/// what acts on it; the wire form is the lowercase name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadMode {
+    /// Overwrite the table with what the source returns now.
+    Replace,
+    /// Add every row the source returns; two runs leave two copies.
+    Append,
+    /// Add only rows beyond the cursor column's last seen value.
+    Incremental,
+}
+
 /// One object (table, endpoint, sheet range) an ingest job targets.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -730,10 +744,105 @@ pub struct SourceObject {
     /// `"<schema>.<table>"`-shaped for `sql`/`cdc`, or an adapter-specific
     /// name otherwise.
     pub name: String,
-    /// An optional column used for incremental (watermark-based) reads.
+    /// The cursor column of an [`LoadMode::Incremental`] object.
     pub incremental_key: Option<String>,
+    /// `None` for an object saved before load modes existed; the ingest
+    /// job then replaces.
+    #[serde(default)]
+    pub load_mode: Option<LoadMode>,
     /// The Bronze target this object lands at.
     pub target: String,
+}
+
+/// The longest cursor column name accepted, generous for any SQL
+/// identifier (`PostgreSQL` 63, `MySQL` 64, SQL Server 128).
+const MAX_INCREMENTAL_KEY_LEN: usize = 128;
+
+/// Why a spec's `sourceObjects` cannot be ingested as written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidLoadMode {
+    /// `loadMode` is not a [`LoadMode`].
+    #[error("source object {name:?} has loadMode {mode:?}; use replace, append or incremental")]
+    Unknown {
+        /// The source object's name.
+        name: String,
+        /// The offending value, as sent.
+        mode: String,
+    },
+    /// `incremental` for an adapter the ingest job does not run it for.
+    #[error(
+        "source object {name:?} asks for loadMode incremental, which only SQL connectors support"
+    )]
+    NotForAdapter {
+        /// The source object's name.
+        name: String,
+    },
+    /// `incremental` without a usable cursor column.
+    #[error(
+        "source object {name:?} asks for loadMode incremental, which needs incrementalKey: the \
+         column that marks new rows"
+    )]
+    NoCursor {
+        /// The source object's name.
+        name: String,
+    },
+}
+
+/// Check each source object's load mode, the one part of `sourceObjects`
+/// checked at save time: a mode the ingest job cannot run would otherwise
+/// surface only as a rejected run. Everything else in an object is left
+/// as it is, as before.
+///
+/// # Errors
+///
+/// Returns [`InvalidLoadMode`] for the first object with an unknown
+/// `loadMode`, or with `incremental` on a non-`sql` adapter or without a
+/// cursor column that is a plain name of sensible length.
+pub fn validate_load_modes(
+    adapter: &str,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidLoadMode> {
+    let Some(objects) = source_objects.as_array() else {
+        return Ok(());
+    };
+    for object in objects {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mode = match object.get("loadMode") {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(value) => match LoadMode::deserialize(value) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    return Err(InvalidLoadMode::Unknown {
+                        name,
+                        mode: value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned),
+                    });
+                }
+            },
+        };
+        if mode != LoadMode::Incremental {
+            continue;
+        }
+        if adapter != "sql" {
+            return Err(InvalidLoadMode::NotForAdapter { name });
+        }
+        let cursor = object
+            .get("incrementalKey")
+            .and_then(serde_json::Value::as_str)
+            .map_or("", str::trim);
+        if cursor.is_empty()
+            || cursor.len() > MAX_INCREMENTAL_KEY_LEN
+            || cursor.chars().any(char::is_control)
+        {
+            return Err(InvalidLoadMode::NoCursor { name });
+        }
+    }
+    Ok(())
 }
 
 /// This [`SourceObject`] failed application-level validation.
@@ -1123,6 +1232,7 @@ mod tests {
         let object = SourceObject {
             name: "public.orders".to_owned(),
             incremental_key: None,
+            load_mode: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1134,9 +1244,70 @@ mod tests {
         let object = SourceObject {
             name: "public.orders".to_owned(),
             incremental_key: Some("updated_at".to_owned()),
+            load_mode: Some(LoadMode::Incremental),
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
+    }
+
+    #[test]
+    fn source_object_reads_a_load_mode_and_defaults_to_none() {
+        let with: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders",
+            "loadMode": "incremental", "incrementalKey": "updated_at"
+        }))
+        .expect("valid");
+        assert_eq!(with.load_mode, Some(LoadMode::Incremental));
+        let without: SourceObject = serde_json::from_value(
+            serde_json::json!({ "name": "public.orders", "target": "orders" }),
+        )
+        .expect("valid");
+        assert_eq!(without.load_mode, None);
+    }
+
+    #[test]
+    fn validate_load_modes_accepts_what_the_ingest_job_can_run() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a" },
+            { "name": "b", "target": "b", "loadMode": "replace" },
+            { "name": "c", "target": "c", "loadMode": "append" },
+            { "name": "d", "target": "d", "loadMode": "incremental", "incrementalKey": "updated_at" },
+        ]);
+        assert_eq!(validate_load_modes("sql", &objects), Ok(()));
+        // Not an array (never saved, or null): nothing to check.
+        assert_eq!(validate_load_modes("sql", &serde_json::Value::Null), Ok(()));
+    }
+
+    #[test]
+    fn validate_load_modes_refuses_what_would_only_fail_at_run_time() {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        assert!(matches!(
+            check("sql", serde_json::json!({ "name": "a", "target": "a", "loadMode": "merge" })),
+            Err(InvalidLoadMode::Unknown { mode, .. }) if mode == "merge"
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental" })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental", "incrementalKey": "  " })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+        assert!(matches!(
+            check(
+                "rest",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental", "incrementalKey": "id" })
+            ),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
     }
 
     #[test]

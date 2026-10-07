@@ -56,7 +56,10 @@ use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::lakehouse_catalog::{self, CatalogAccessError};
+use crate::routes::catalog_governance;
 use crate::routes::catalog_query;
+use crate::routes::catalog_source::{self, ReadSource, SourceKind};
+use crate::routes::schema_versions;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -218,28 +221,17 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
-    match list_body(&state.clickhouse).await {
+    match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
         Ok((mut body, bronze_pairs)) => {
-            enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
-            if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-                let annotations = match state.pg.as_deref() {
-                    Some(pool) => match lakehouse_store::annotation::list_all(pool).await {
-                        Ok(rows) => rows,
-                        Err(err) => {
-                            // Annotations widen the search; they never gate
-                            // it. A store failure here degrades to
-                            // name/description/id matching only, not a
-                            // failed request.
-                            tracing::warn!(%err, "asset_annotation lookup failed during catalog search");
-                            Vec::new()
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                if let Some(assets) = body.get("assets").and_then(Value::as_array) {
-                    let filtered = filter_assets_by_query(assets, q, &annotations);
-                    body["assets"] = Value::Array(filtered);
-                }
+            apply_sla_targets(&state, &mut body, &bronze_pairs).await;
+            enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
+            let annotations = apply_annotations(&state, &mut body).await;
+            apply_badges(&state, &mut body, &bronze_pairs).await;
+            if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty())
+                && let Some(assets) = body.get("assets").and_then(Value::as_array)
+            {
+                let filtered = filter_assets_by_query(assets, q, &annotations);
+                body["assets"] = Value::Array(filtered);
             }
             (StatusCode::OK, ApiJson(body)).into_response()
         }
@@ -343,7 +335,8 @@ pub async fn query(
     let group_by = catalog_query::parse_group_by(params.group_by.as_deref())?;
     let join = catalog_query::JoinOperator::parse(params.join_operator.as_deref());
 
-    let (mut body, bronze_pairs) = match list_body(&state.clickhouse).await {
+    let listed = list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await;
+    let (mut body, bronze_pairs) = match listed {
         Ok(v) => v,
         // Matches `list`'s contract: the catalog being unreachable is a
         // 503 with an empty result, not a 500.
@@ -362,7 +355,10 @@ pub async fn query(
                 .into_response());
         }
     };
-    enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+    apply_sla_targets(&state, &mut body, &bronze_pairs).await;
+    enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
+    apply_annotations(&state, &mut body).await;
+    apply_badges(&state, &mut body, &bronze_pairs).await;
 
     let assets = body
         .get("assets")
@@ -470,7 +466,17 @@ fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRo
 /// Returns the catalog body plus every Bronze row's `(slug, table_name)`
 /// pair, straight from the `cat` registry rows — `list` hands these to
 /// [`enrich_bronze_assets`] rather than re-deriving slugs from table names.
-async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChError> {
+///
+/// `bronze_is_readable` says whether this deployment can read a Bronze
+/// table itself (`Config::iceberg_query_db`). When it can, a Bronze
+/// dataset's page shows the Bronze table and the Silver model of the same
+/// name is listed as the asset it is. When it cannot, the dataset's page
+/// reads that Silver model (`catalog_source`), and the model stays folded
+/// into the dataset rather than listed beside it as a second copy.
+async fn list_body(
+    ch: &ChClient,
+    bronze_is_readable: bool,
+) -> Result<(Value, Vec<(String, String)>), ChError> {
     let cat = ch
         .rows(
             "SELECT slug, title, description, tier, updated_at, table_name,
@@ -517,6 +523,12 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
             .find(|c| str_col(c, "slug") == slug)
             .map_or(0, |c| num_or_zero(Some(c), "n"))
     };
+    let frequency_of = |slug: &str| -> Option<i64> {
+        sync_rows
+            .iter()
+            .find(|s| str_col(s, "slug") == slug)
+            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
+    };
 
     let mut assets: Vec<Value> = cat
         .iter()
@@ -527,7 +539,7 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
             let owner = author_of(slug);
             let description = str_col(c, "description");
             let updated_at = str_col(c, "updated_at");
-            bronze_catalog_row(
+            let mut row = bronze_catalog_row(
                 slug,
                 str_col(c, "title"),
                 sekunder,
@@ -536,7 +548,11 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
                 rows,
                 col_of(slug),
                 updated_at,
-            )
+            );
+            if let Some(seconds) = frequency_of(slug) {
+                set_freshness_target(&mut row, seconds, "frequency");
+            }
+            row
         })
         .collect();
 
@@ -555,6 +571,11 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
         })
         .collect();
 
+    let parts_sql = format!(
+        "SELECT database db, table, {PART_STATS_COLUMNS}
+         FROM system.parts WHERE database IN ('silver','serving') AND active
+         GROUP BY database, table"
+    );
     let (tbl_rows, col_count_rows, part_rows) = tokio::try_join!(
         ch.rows(
             "SELECT database db, name, engine FROM system.tables
@@ -566,13 +587,7 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
          WHERE database IN ('silver','serving') GROUP BY database, table",
             None,
         ),
-        ch.rows(
-            "SELECT database db, table, toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
-              toString(dateDiff('second', max(modification_time), now())) lag
-         FROM system.parts WHERE database IN ('silver','serving') AND active
-         GROUP BY database, table",
-            None,
-        ),
+        ch.rows(&parts_sql, None),
     )?;
 
     let col_count_of = |db: &str, table: &str| -> i64 {
@@ -588,33 +603,32 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
         part_rows
             .iter()
             .find(|p| str_col(p, "db") == db && str_col(p, "table") == table)
+            .and_then(part_stats)
     };
-    let gold_rows_of =
-        |table: &str| -> i64 { part_of("serving", table).map_or(0, |p| num_or_zero(Some(p), "r")) };
 
     for t in &tbl_rows {
         let db = str_col(t, "db");
         let name = str_col(t, "name");
         let engine = str_col(t, "engine");
         if db == "silver" {
-            if bronze_table_names.contains(name) {
+            if !lists_silver_table(bronze_table_names.contains(name), bronze_is_readable) {
                 continue;
             }
             assets.push(silver_catalog_row(
                 name,
                 engine,
                 col_count_of("silver", name),
+                part_of("silver", name).as_ref(),
             ));
         } else {
             if name.ends_with("_baru") {
                 continue;
             }
-            let rows = gold_rows_of(name);
             assets.push(gold_catalog_row(
                 name,
                 engine,
-                rows,
                 col_count_of("serving", name),
+                part_of("serving", name).as_ref(),
             ));
         }
     }
@@ -673,6 +687,14 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
 /// slow page. Covers the connect, the (possibly cached) namespace listing,
 /// and the per-table loads together, not each separately.
 const ICEBERG_ENRICHMENT_BUDGET: Duration = Duration::from_millis(300);
+/// The same read's budget on an asset's DETAIL page: one table, not every
+/// Bronze table, and a page whose health verdict rests on the answer — a
+/// table's freshness is one of its health signals. Cut short at the list's
+/// budget (a cold cache on a busy host is enough), the page showed no
+/// size, "Not measured" freshness and a health that left a late load out,
+/// beside a Storage card that had the real numbers. Still bounded: an
+/// unreachable Lakekeeper costs the page this long at most.
+const ICEBERG_DETAIL_BUDGET: Duration = Duration::from_secs(3);
 /// At most this many concurrent Lakekeeper `load_table` calls at once.
 const ICEBERG_ENRICHMENT_MAX_CONCURRENT: usize = 8;
 
@@ -881,6 +903,47 @@ where
     by_slug
 }
 
+/// Records the age beyond which `row` is late, and where that came from:
+/// `"sla"` (an authored freshness SLA) or `"frequency"` (the registry's
+/// stated refresh cadence). A row with neither carries no target, and the
+/// console then shows its age without calling it fresh or stale.
+fn set_freshness_target(row: &mut Value, seconds: i64, source: &str) {
+    if let Some(o) = row.as_object_mut() {
+        o.insert("freshnessTargetSeconds".to_owned(), json!(seconds));
+        o.insert("freshnessTargetSource".to_owned(), json!(source));
+    }
+}
+
+/// Puts each asset's authored freshness SLA on its list row, over any
+/// registry frequency [`list_body`] set. An SLA names a table
+/// (`bronze.orders`, `silver.orders`): a Bronze row is matched through its
+/// registry `table_name`, every other row by its id.
+async fn apply_sla_targets(state: &AppState, body: &mut Value, bronze_pairs: &[(String, String)]) {
+    let slas = catalog_governance::sla_targets(state).await;
+    if slas.is_empty() {
+        return;
+    }
+    let table_of: HashMap<&str, &str> = bronze_pairs
+        .iter()
+        .map(|(slug, table)| (slug.as_str(), table.as_str()))
+        .collect();
+    let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for asset in assets {
+        let Some(id) = asset.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = match table_of.get(id) {
+            Some(table) => format!("bronze.{table}"),
+            None => id.to_owned(),
+        };
+        if let Some(seconds) = slas.get(&key.to_lowercase()) {
+            set_freshness_target(asset, *seconds, "sla");
+        }
+    }
+}
+
 /// Wires [`enrich_bronze_stats`] to production: the real cache on
 /// `AppState`, the real budget/concurrency constants, and
 /// `lakehouse_catalog::client` as the connect seam. Mutates `body`'s
@@ -927,7 +990,9 @@ async fn enrich_bronze_assets(
 // `freshnessLagSeconds` from Iceberg snapshot timestamps — but only for
 // Bronze rows whose `table_name` is confirmed present in Lakekeeper's
 // `bronze` namespace listing, via `list`'s enrichment (see the module
-// comment above `iceberg_candidates`); nothing yet measures asset health.
+// comment above `iceberg_candidates`). Silver and Gold rows take both from
+// their own active `system.parts` ([`PartStats`]). Nothing yet measures
+// asset health.
 
 /// One Bronze/Iceberg asset row for the catalog list. `rows` and
 /// `last_updated` are real (from the `dataset_sync`/`dataset_catalog`
@@ -968,58 +1033,163 @@ fn bronze_catalog_row(
     })
 }
 
-/// One Silver/`ClickHouse` view/table row for the catalog list. Silver row
-/// counts are not queried (an unfilled gap, not a measured zero), so `rows`
-/// and `sizeBytes` are `null` rather than the literal zeros they used to be;
-/// `lastUpdated` is `null` in place of the empty-string placeholder for
-/// "unknown".
-fn silver_catalog_row(name: &str, engine: &str, col_count: i64) -> Value {
+/// The `system.parts` aggregate [`part_stats`] reads, for one table: part
+/// count, rows, bytes on disk, seconds since the newest part was written,
+/// and that write time in the `YYYY-MM-DDTHH:MM:SSZ` shape `lastUpdated`
+/// uses everywhere else.
+const PART_STATS_COLUMNS: &str = "toString(count()) n, toString(sum(rows)) r, \
+     toString(sum(bytes_on_disk)) b, \
+     toString(dateDiff('second', max(modification_time), now())) lag, \
+     formatDateTime(max(modification_time), '%Y-%m-%dT%H:%i:%SZ', 'UTC') at";
+
+/// What the detail reads off `system.parts` beyond [`PART_STATS_COLUMNS`],
+/// for the Storage card: how many partitions the active parts span, and
+/// how large their data is before compression.
+const PART_STORAGE_COLUMNS: &str = "toString(uniqExact(partition)) partitions, \
+     toString(sum(data_uncompressed_bytes)) raw";
+
+/// How `ClickHouse` physically holds a Silver or Gold table — the Storage
+/// card of its asset page, the counterpart of what an Iceberg table's own
+/// metadata says about a Bronze one. `table_row` is the table's
+/// `system.tables` row and `parts_row` its `system.parts` aggregate; a
+/// read that failed leaves its fields `null` rather than zero. An empty
+/// key is `null`: the table is unpartitioned, or unsorted.
+fn clickhouse_storage(
+    key: &str,
+    table_row: Option<&Map<String, Value>>,
+    parts_row: Option<&Map<String, Value>>,
+    table_columns: usize,
+) -> Value {
+    let text = |column: &str| {
+        table_row
+            .map(|r| str_col(r, column).trim())
+            .filter(|v| !v.is_empty())
+            .map_or(Value::Null, |v| json!(v))
+    };
+    let count =
+        |column: &str| parts_row.map_or(Value::Null, |r| json!(num_or_zero(Some(r), column)));
+    json!({
+        "table": key,
+        "engine": text("engine"),
+        "partitionKey": text("partition_key"),
+        "sortingKey": text("sorting_key"),
+        "parts": count("n"),
+        "partitions": count("partitions"),
+        "bytesOnDisk": count("b"),
+        "uncompressedBytes": count("raw"),
+        "tableColumns": table_columns,
+    })
+}
+
+/// What a `ClickHouse` table's active parts say about it. Only a table that
+/// has parts has any of this measured: a view stores nothing, and an empty
+/// table has no newest write to date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartStats {
+    rows: i64,
+    bytes: i64,
+    /// `None` when the newest part is dated after `now()` on the server.
+    lag_seconds: Option<i64>,
+    last_write: Option<String>,
+}
+
+/// Reads one [`PART_STATS_COLUMNS`] row. `None` when the table has no
+/// active parts: without a `GROUP BY`, `max(modification_time)` over no
+/// parts is the 1970 epoch, which would read as fifty years stale.
+fn part_stats(row: &Map<String, Value>) -> Option<PartStats> {
+    if num_or_zero(Some(row), "n") == 0 {
+        return None;
+    }
+    let lag = str_col(row, "lag")
+        .parse::<i64>()
+        .ok()
+        .filter(|lag| *lag >= 0);
+    let at = str_col(row, "at");
+    Some(PartStats {
+        rows: num_or_zero(Some(row), "r"),
+        bytes: num_or_zero(Some(row), "b"),
+        lag_seconds: lag,
+        last_write: (!at.is_empty()).then(|| at.to_owned()),
+    })
+}
+
+/// `sizeBytes`, `freshnessLagSeconds` and `lastUpdated` from `parts`, each
+/// `null` when not measured.
+fn part_fields(parts: Option<&PartStats>) -> (Value, Value, Value) {
+    (
+        parts.map_or(Value::Null, |p| json!(p.bytes)),
+        parts
+            .and_then(|p| p.lag_seconds)
+            .map_or(Value::Null, |lag| json!(lag)),
+        parts
+            .and_then(|p| p.last_write.as_deref())
+            .map_or(Value::Null, |at| json!(at)),
+    )
+}
+
+/// One Silver/`ClickHouse` view/table row for the catalog list. `rows`,
+/// `sizeBytes`, `freshnessLagSeconds` and `lastUpdated` come from the
+/// table's active parts ([`PartStats`]) and are `null` when it has none —
+/// a view stores nothing, so none of them is a measured zero there.
+fn silver_catalog_row(
+    name: &str,
+    engine: &str,
+    col_count: i64,
+    parts: Option<&PartStats>,
+) -> Value {
+    let (size_bytes, freshness_lag, last_updated) = part_fields(parts);
     json!({
         "id": format!("silver.{name}"),
         "name": prettify(name),
         "namespace": "silver",
         "type": if engine == "View" { "view" } else { "table" },
         "layer": "silver",
-        "tier": "warm",
+        // Hot is what sits in `ClickHouse` parts (`routes::storage`); a
+        // view stores nothing of its own and reads the Warm Bronze data.
+        "tier": if parts.is_some() { "hot" } else { "warm" },
         "classification": "internal",
         "owner": TENANT_OWNER.as_str(),
         "domain": TENANT_DOMAIN.as_str(),
         "description": "Model Silver terkurasi (bersih & terkonform) di ClickHouse.",
         "format": if engine == "View" { "ClickHouse View".to_owned() } else { format!("ClickHouse {engine}") },
         "engine": "hot-store",
-        "rows": Value::Null,
-        "sizeBytes": Value::Null,
+        "rows": parts.map_or(Value::Null, |p| json!(p.rows)),
+        "sizeBytes": size_bytes,
         "columnCount": col_count,
-        "freshnessLagSeconds": Value::Null,
-        "lastUpdated": Value::Null,
+        "freshnessLagSeconds": freshness_lag,
+        "lastUpdated": last_updated,
         "health": "unknown",
         "residency": TENANT_RESIDENCY.as_str(),
     })
 }
 
-/// One Gold/`ClickHouse` mart row for the catalog list. `rows` is real (from
-/// `system.parts`); `sizeBytes`, `freshnessLagSeconds`, and `health` are
-/// not measured, and `lastUpdated` is `null` in place of the empty-string
-/// placeholder for "unknown".
-fn gold_catalog_row(name: &str, engine: &str, rows: i64, col_count: i64) -> Value {
+/// One Gold/`ClickHouse` mart row for the catalog list. `rows`, `sizeBytes`,
+/// `freshnessLagSeconds` and `lastUpdated` come from the table's active
+/// parts ([`PartStats`]). A mart with no parts holds zero rows; the other
+/// three are then `null`, since nothing was written to measure. `health` is
+/// not measured. A view in `serving` is said to be one, as on a Silver row:
+/// it stores nothing, so its row count is not a measured zero either.
+fn gold_catalog_row(name: &str, engine: &str, col_count: i64, parts: Option<&PartStats>) -> Value {
+    let (size_bytes, freshness_lag, last_updated) = part_fields(parts);
+    let is_view = engine == "View";
     json!({
         "id": format!("serving.{name}"),
         "name": prettify(name),
         "namespace": "serving",
-        "type": "table",
+        "type": if is_view { "view" } else { "table" },
         "layer": "gold",
-        "tier": "hot",
+        "tier": if is_view { "warm" } else { "hot" },
         "classification": "internal",
         "owner": TENANT_OWNER.as_str(),
         "domain": TENANT_DOMAIN.as_str(),
         "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
         "format": format!("ClickHouse {engine}"),
         "engine": "hot-store",
-        "rows": rows,
-        "sizeBytes": Value::Null,
+        "rows": if is_view { Value::Null } else { json!(parts.map_or(0, |p| p.rows)) },
+        "sizeBytes": size_bytes,
         "columnCount": col_count,
-        "freshnessLagSeconds": Value::Null,
-        "lastUpdated": Value::Null,
+        "freshnessLagSeconds": freshness_lag,
+        "lastUpdated": last_updated,
         "health": "unknown",
         "residency": TENANT_RESIDENCY.as_str(),
     })
@@ -1101,9 +1271,422 @@ pub async fn detail(
             .into_response());
     }
     if id.starts_with("silver.") || id.starts_with("serving.") {
-        return clickhouse_asset_detail(&state.clickhouse, &id).await;
+        return clickhouse_asset_detail(&state, &principal, &id).await;
     }
-    bronze_asset_detail(&state.clickhouse, &id).await
+    bronze_asset_detail(&state, &principal, &id).await
+}
+
+/// The permission reading an asset's rows needs — the same one
+/// `POST /api/query/run` and `GET /api/catalog/{id}/profile` require.
+/// `catalog:read` alone shows that a table exists and what shape it has,
+/// never what it holds.
+const SAMPLE_PERMISSION: &str = "query:read";
+
+/// Marks a detail body whose `sample` is empty because the caller lacks
+/// [`SAMPLE_PERMISSION`], so the console can say "needs access" instead of
+/// "no rows".
+fn mark_sample_restricted(body: &mut Value, principal: &Principal) {
+    if let Some(o) = body.as_object_mut() {
+        o.insert(
+            "sampleRestricted".to_owned(),
+            json!(!principal.has(SAMPLE_PERMISSION)),
+        );
+    }
+}
+
+/// An annotation field that says something: set, and not blank.
+fn set(value: Option<&String>) -> Option<&str> {
+    value.map(|v| v.trim()).filter(|v| !v.is_empty())
+}
+
+/// Puts what people recorded about an asset in the console over what its
+/// registry row says: a set `owner` or `description` replaces the
+/// registry's (an ingest job's name is not an owner), and `steward` and
+/// `tags` are added. A blank annotation field changes nothing.
+fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
+    let Some(o) = row.as_object_mut() else {
+        return;
+    };
+    if let Some(owner) = set(annotation.owner.as_ref()) {
+        o.insert("owner".to_owned(), json!(owner));
+    }
+    if let Some(description) = set(annotation.description.as_ref()) {
+        o.insert("description".to_owned(), json!(description));
+    }
+    if let Some(steward) = set(annotation.steward.as_ref()) {
+        o.insert("steward".to_owned(), json!(steward));
+    }
+    if !annotation.tags.is_empty() {
+        o.insert("tags".to_owned(), json!(annotation.tags));
+    }
+}
+
+/// [`apply_annotation`] over every row of a list body, and the annotations
+/// themselves for the caller's search. They decorate the list; they never
+/// gate it — a store failure is logged and leaves the registry's values.
+async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<AnnotationRow> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Vec::new();
+    };
+    let annotations = match lakehouse_store::annotation::list_all(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "asset_annotation lookup failed; the catalog list shows registry values");
+            return Vec::new();
+        }
+    };
+    if annotations.is_empty() {
+        return annotations;
+    }
+    let by_id: HashMap<&str, &AnnotationRow> = annotations
+        .iter()
+        .map(|row| (row.asset_id.as_str(), row))
+        .collect();
+    if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+        for asset in assets {
+            let id = asset.get("id").and_then(Value::as_str).unwrap_or_default();
+            if let Some(annotation) = by_id.get(id).copied() {
+                apply_annotation(asset, annotation);
+            }
+        }
+    }
+    annotations
+}
+
+/// The detail page's share of the same: the overlay, plus the raw
+/// annotation (`annotation`, what the edit form holds) and what the
+/// registry itself says (`registry`, what clearing a field falls back to),
+/// and the asset's `changeHistory` from the audit trail.
+async fn mark_annotation_and_history(
+    state: &AppState,
+    body: &mut Value,
+    id: &str,
+    tables: &[String],
+) {
+    let registry = json!({
+        "owner": body.get("owner").cloned().unwrap_or(Value::Null),
+        "description": body.get("description").cloned().unwrap_or(Value::Null),
+    });
+    let annotation = match state.pg.as_deref() {
+        Some(pool) => lakehouse_store::annotation::get_annotation(pool, id)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "asset_annotation lookup failed; the detail shows registry values");
+                None
+            }),
+        None => None,
+    };
+    if let Some(annotation) = &annotation {
+        apply_annotation(body, annotation);
+    }
+    let mut keys = vec![id.to_owned()];
+    keys.extend(tables.iter().cloned());
+    let history = catalog_governance::change_history(state, &keys).await;
+    if let Some(o) = body.as_object_mut() {
+        o.insert("registry".to_owned(), registry);
+        o.insert(
+            "annotation".to_owned(),
+            annotation.map_or(Value::Null, |a| {
+                json!({
+                    "owner": a.owner,
+                    "steward": a.steward,
+                    "tags": a.tags,
+                    "description": a.description,
+                })
+            }),
+        );
+        o.insert("changeHistory".to_owned(), Value::Array(history));
+    }
+}
+
+/// Sets the header badges that are worked out rather than stored, on a
+/// list row or a detail body:
+///
+/// - `classification`, with `classificationSource` (`"rule"` when a
+///   classification rule names the asset, `"default"` otherwise), and each
+///   classified column's own level in `schema` when the row has one;
+/// - `health`, with `healthReasons` saying which signals it rests on —
+///   empty when nothing measures the asset and it is `"unknown"`.
+///
+/// Health reads the row's own `freshnessLagSeconds` and
+/// `freshnessTargetSeconds`, so this runs after both are filled in.
+fn set_badges(row: &mut Value, classified: &catalog_governance::Classified, checks: &[Value]) {
+    let Some(o) = row.as_object_mut() else {
+        return;
+    };
+    let seconds = |key: &str| o.get(key).and_then(Value::as_i64);
+    let (health, reasons) = catalog_governance::health(
+        seconds("freshnessLagSeconds"),
+        seconds("freshnessTargetSeconds"),
+        checks,
+    );
+    o.insert("health".to_owned(), json!(health));
+    o.insert("healthReasons".to_owned(), json!(reasons));
+    o.insert("classification".to_owned(), json!(classified.level));
+    o.insert(
+        "classificationSource".to_owned(),
+        json!(if classified.from_rule {
+            "rule"
+        } else {
+            "default"
+        }),
+    );
+    if let Some(schema) = o.get_mut("schema").and_then(Value::as_array_mut) {
+        for column in schema {
+            let name = column
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let level = classified.columns.iter().find(|(c, _)| c == name);
+            if let (Some((_, level)), Some(column)) = (level, column.as_object_mut()) {
+                column.insert("classification".to_owned(), json!(level));
+            }
+        }
+    }
+}
+
+/// [`set_badges`] for a detail body: classified by `names` (the asset's
+/// keys, plus its display name — a rule may be written against either),
+/// with health from the `qualityChecks` already on the body.
+async fn mark_badges(state: &AppState, body: &mut Value, names: &[String]) {
+    let mut names = names.to_vec();
+    if let Some(title) = body.get("name").and_then(Value::as_str) {
+        names.push(title.to_owned());
+    }
+    let rules = catalog_governance::classification_rules(state).await;
+    let classified = catalog_governance::classify(&rules, &names);
+    let checks = body
+        .get("qualityChecks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    set_badges(body, &classified, &checks);
+    // The rules behind the classification, each removable by its id.
+    let in_force: Vec<Value> = classified
+        .in_force
+        .iter()
+        .map(|(id, column, level)| {
+            let mut rule = Map::new();
+            rule.insert("id".to_owned(), json!(id));
+            if let Some(column) = column {
+                rule.insert("column".to_owned(), json!(column));
+            }
+            rule.insert("classification".to_owned(), json!(level));
+            Value::Object(rule)
+        })
+        .collect();
+    if let Some(o) = body.as_object_mut() {
+        o.insert("classificationRules".to_owned(), Value::Array(in_force));
+    }
+}
+
+/// [`set_badges`] for every row of a list body, from one load of the
+/// classification rules and the quality index. A Bronze row is known by
+/// its slug, its title and its registry table (`bronze.<table>`); any
+/// other row by its id, its title and its bare table name.
+async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(String, String)]) {
+    let (rules, quality) = tokio::join!(
+        catalog_governance::classification_rules(state),
+        catalog_governance::QualityIndex::load(state, None),
+    );
+    let table_of: HashMap<&str, &str> = bronze_pairs
+        .iter()
+        .map(|(slug, table)| (slug.as_str(), table.as_str()))
+        .collect();
+    let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for asset in assets {
+        let text = |key: &str| {
+            asset
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let id = text("id");
+        let mut names = vec![id.clone(), text("name")];
+        match table_of.get(id.as_str()).filter(|t| !t.is_empty()) {
+            Some(table) => names.extend([format!("bronze.{table}"), (*table).to_owned()]),
+            None => names.extend(id.split_once('.').map(|(_, table)| table.to_owned())),
+        }
+        let classified = catalog_governance::classify(&rules, &names);
+        let checks = quality.checks_for(&names);
+        set_badges(asset, &classified, &checks);
+    }
+}
+
+/// Fills what governs and what uses the asset — see `catalog_governance`:
+/// `policySummary` (policies bound to `tables`, qualified as policies name
+/// them), `qualityChecks` (checks naming the asset by any of `names`),
+/// `dependents` (saved queries and dashboards reading `tables`), and
+/// `usage`/`recentQueries` (the last week's queries on them).
+async fn mark_governance(
+    state: &AppState,
+    principal: &Principal,
+    body: &mut Value,
+    tables: &[String],
+    names: &[String],
+) {
+    let policies = catalog_governance::policy_summary(state, principal, tables).await;
+    let checks = catalog_governance::QualityIndex::load(state, Some(names))
+        .await
+        .checks_for(names);
+    let dependents = catalog_governance::dependents(state, principal, tables).await;
+    let (usage, recent_queries) = catalog_governance::usage(state, principal, tables).await;
+    if let Some(o) = body.as_object_mut() {
+        o.insert("policySummary".to_owned(), Value::Array(policies));
+        o.insert("qualityChecks".to_owned(), Value::Array(checks));
+        o.insert("dependents".to_owned(), Value::Array(dependents));
+        o.insert("usage".to_owned(), usage);
+        o.insert("recentQueries".to_owned(), Value::Array(recent_queries));
+    }
+}
+
+/// Tells the console what to put after `FROM` to query this asset in
+/// Query Studio (always `ClickHouse`, including an Iceberg table read
+/// through `Config::iceberg_query_db`). Absent when no readable table was
+/// found; the console then falls back to its own guess. `policyTable` is
+/// the name a policy must bind to for it to govern those reads.
+fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
+    if let (Some(o), Some(source)) = (body.as_object_mut(), source) {
+        o.insert(
+            "queryTarget".to_owned(),
+            json!({
+                "engine": "clickhouse",
+                "table": source.from,
+                "policyTable": source.policy_key,
+            }),
+        );
+    }
+}
+
+/// How many sample rows the detail body itself carries.
+const DETAIL_SAMPLE_ROWS: u32 = 5;
+/// The most `GET /api/catalog/{id}/sample` returns: a look at the data,
+/// not an export — Query Studio is one click away for more.
+const SAMPLE_MAX_ROWS: u32 = 100;
+
+/// Query parameters accepted by `GET /api/catalog/{id}/sample`.
+#[derive(Debug, Deserialize)]
+pub struct SampleQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /api/catalog/{id}/sample?limit=N` — up to [`SAMPLE_MAX_ROWS`]
+/// sample rows of an asset, for a reader who wants more than the five the
+/// detail body carries. The same rows that reader could select in Query
+/// Studio: masked and row-filtered by [`governed_sample`], and gated by
+/// the same `query:read`.
+///
+/// # Errors
+///
+/// `404` when no asset has that id; `503` when the registry cannot be
+/// read.
+pub async fn sample(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<SampleQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Ok(ApiJson(
+            json!({ "rows": [], "supported": false, "reason": reason }),
+        ));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(DETAIL_SAMPLE_ROWS)
+        .clamp(1, SAMPLE_MAX_ROWS);
+    let source = super::catalog_profile::resolve_source(&state, &id).await?;
+    let (rows, _) = governed_sample(&state, &principal, source.as_ref(), limit).await;
+    Ok(ApiJson(json!({ "rows": rows, "limit": limit })))
+}
+
+/// Sample rows of `source` exactly as `principal` could read them in
+/// Query Studio, plus the column names policy masks for them. No rows at
+/// all without [`SAMPLE_PERMISSION`]; the masked names still come back,
+/// since they describe policy, not data.
+///
+/// The sample is data, so it goes through the same
+/// `query::rewrite_sql_for_principal` as `POST /api/query/run`: masked
+/// columns come back as `***` and row filters apply. Every failure along
+/// the way — an invalid name, unresolvable obligations, a refused rewrite,
+/// a missing table — yields NO rows rather than the raw ones: an empty
+/// sample is an honest "not available", an unmasked one is a leak.
+///
+/// Every cell is a string, except a `NULL`, which is JSON `null`.
+async fn governed_sample(
+    state: &AppState,
+    principal: &Principal,
+    source: Option<&ReadSource>,
+    limit: u32,
+) -> (Vec<Value>, HashSet<String>) {
+    let Some(source) = source else {
+        return (Vec::new(), HashSet::new());
+    };
+    let key = source.policy_key.as_str();
+    let obligations = crate::policy_engine::PolicyEngineObligations::from_state(state);
+    let masked: HashSet<String> = match obligations
+        .obligations_for_async(key, &principal.role_names)
+        .await
+    {
+        Ok(Some(o)) => o.mask.into_iter().collect(),
+        Ok(None) => HashSet::new(),
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample withheld: obligations unresolved");
+            return (Vec::new(), HashSet::new());
+        }
+    };
+    if !principal.has(SAMPLE_PERMISSION) {
+        return (Vec::new(), masked);
+    }
+    let raw_sql = format!("SELECT * FROM {} LIMIT {limit}", source.from);
+    let sql = match crate::routes::query::rewrite_sql_for_principal(
+        state,
+        &raw_sql,
+        "clickhouse",
+        principal,
+    )
+    .await
+    {
+        Ok(sql) => sql,
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample withheld: policy rewrite refused");
+            return (Vec::new(), masked);
+        }
+    };
+    let result = match state.clickhouse.query(&sql, None).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample unavailable: read failed");
+            return (Vec::new(), masked);
+        }
+    };
+    let sample = result
+        .data
+        .iter()
+        .map(|row| {
+            let mut o = Map::new();
+            for m in &result.meta {
+                if !m.name.starts_with('_') {
+                    // A `NULL` stays JSON `null` where `js_string` would
+                    // make it `""`: a reader of the sample must be able to
+                    // tell "no value" from an empty text. Only here; the
+                    // other routes that use `js_string` keep its reading.
+                    let cell = match row.get(&m.name) {
+                        None | Some(Value::Null) => Value::Null,
+                        present => Value::String(js_string(present)),
+                    };
+                    o.insert(m.name.clone(), cell);
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    (sample, masked)
 }
 
 /// `[db, table]` parsed from a `silver.*`/`serving.*` id, matching
@@ -1113,7 +1696,7 @@ pub async fn detail(
 /// just inserted — so a multi-segment id like `silver.a.b` yields table
 /// `"ab"`, not `"a.b"`. Reproduced here for fidelity, not because it's
 /// intentional upstream.
-fn split_db_table(id: &str) -> (String, String) {
+pub(crate) fn split_db_table(id: &str) -> (String, String) {
     let mut parts = id.split('.');
     let db = parts.next().unwrap_or("").to_owned();
     let rest = parts.collect::<Vec<_>>().join(".");
@@ -1124,32 +1707,47 @@ fn split_db_table(id: &str) -> (String, String) {
     (db, table)
 }
 
-async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
+/// Fills `schemaVersions` of a Silver or Gold detail body with the versions
+/// the console recorded for `table_key` (`<database>.<table>`, ADR 0015),
+/// newest first. The engine keeps no history of its own, so the body starts
+/// with the empty list; nothing recorded, or a store that cannot be read,
+/// leaves it empty. A read never writes: recording belongs to
+/// `schema_versions::spawn_pass`.
+async fn mark_schema_versions(ch: &ChClient, body: &mut Value, table_key: &str) {
+    let versions = schema_versions::for_table(ch, table_key).await;
+    if let Some(o) = body.as_object_mut() {
+        o.insert("schemaVersions".to_owned(), json!(versions));
+    }
+}
+
+async fn clickhouse_asset_detail(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ApiResult<Response> {
+    let ch = &state.clickhouse;
     let (db, table) = split_db_table(id);
     if (db != "silver" && db != "serving") || table.is_empty() {
         return Err(not_found());
     }
-    let is_gold = db == "serving";
 
-    let query = format!("SELECT * FROM {db}.`{table}` LIMIT 5");
-    let Ok(result) = ch.query(&query, None).await else {
+    // No such table is the same 404 the old unguarded `SELECT *` failing
+    // used to produce.
+    let Ok(Some(source)) = catalog_source::clickhouse_source(ch, &db, &table).await else {
         return Err(not_found());
     };
-    let schema: Vec<Value> = result
-        .meta
+    let (sample, masked) =
+        governed_sample(state, principal, Some(&source), DETAIL_SAMPLE_ROWS).await;
+    let schema: Vec<Value> = source
+        .columns
         .iter()
-        .filter(|m| !m.name.starts_with('_'))
-        .map(|m| json!({ "name": m.name, "dataType": m.ty }))
-        .collect();
-    let sample: Vec<Value> = result
-        .data
-        .iter()
-        .map(|row| {
+        .filter(|(name, _)| !name.starts_with('_'))
+        .map(|(name, ty)| {
             let mut o = Map::new();
-            for m in &result.meta {
-                if !m.name.starts_with('_') {
-                    o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
-                }
+            o.insert("name".to_owned(), json!(name));
+            o.insert("dataType".to_owned(), json!(ty));
+            if masked.contains(name) {
+                o.insert("masked".to_owned(), json!(true));
             }
             Value::Object(o)
         })
@@ -1159,22 +1757,79 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
     // db/table are already constrained to a fixed set / alphanumeric-only
     // above, so this is safe despite the raw interpolation, matching the
     // TypeScript exactly.
-    let rows_sql = format!(
-        "SELECT toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
-           toString(dateDiff('second', max(modification_time), now())) lag
+    let parts_sql = format!(
+        "SELECT {PART_STATS_COLUMNS}, {PART_STORAGE_COLUMNS}
          FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
     );
-    let rows = match ch.rows(&rows_sql, None).await {
-        Ok(rr) => num_or_zero(rr.first(), "r"),
-        Err(_) => 0, // "view: no parts" — swallowed in the TypeScript too.
-    };
+    // What kind of table this is — a view, a MergeTree — is the engine's
+    // to say, exactly as on the list row. The detail used to call every
+    // Silver asset a view and every mart a MergeTree. Its keys come with
+    // it, for the Storage card.
+    let engine_sql = format!(
+        "SELECT engine, partition_key, sorting_key FROM system.tables \
+         WHERE database='{db}' AND name='{table}'"
+    );
+    // A failed read costs the stats or the engine name, never the page.
+    let (parts_rows, engine_rows) =
+        tokio::join!(ch.rows(&parts_sql, None), ch.rows(&engine_sql, None));
+    let parts_row = parts_rows.ok().and_then(|rr| rr.into_iter().next());
+    let table_row = engine_rows.ok().and_then(|rr| rr.into_iter().next());
+    let parts = parts_row.as_ref().and_then(part_stats);
+    let engine = table_row
+        .as_ref()
+        .map(|r| str_col(r, "engine").to_owned())
+        .unwrap_or_default();
 
-    let body = clickhouse_detail_body(id, &table, &db, is_gold, rows, &schema, &sample);
+    let mut body =
+        clickhouse_detail_body(id, &table, &db, &engine, parts.as_ref(), &schema, &sample);
+    if let Some(o) = body.as_object_mut() {
+        o.insert(
+            "storage".to_owned(),
+            clickhouse_storage(
+                &format!("{db}.{table}"),
+                table_row.as_ref(),
+                parts_row.as_ref(),
+                source.columns.len(),
+            ),
+        );
+        if db == "silver" {
+            o.insert(
+                "upstream".to_owned(),
+                json!(bronze_upstream(ch, &table).await),
+            );
+        }
+    }
+    mark_sample_restricted(&mut body, principal);
+    mark_query_table(&mut body, Some(&source));
+    let key = format!("{db}.{table}");
+    if let Some(seconds) = catalog_governance::sla_target_seconds(state, &key).await {
+        set_freshness_target(&mut body, seconds, "sla");
+    }
+    mark_governance(
+        state,
+        principal,
+        &mut body,
+        std::slice::from_ref(&key),
+        &[key.clone(), table.clone()],
+    )
+    .await;
+    mark_badges(
+        state,
+        &mut body,
+        &[id.to_owned(), key.clone(), table.clone()],
+    )
+    .await;
+    mark_schema_versions(ch, &mut body, &key).await;
+    mark_annotation_and_history(state, &mut body, id, &[key]).await;
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
-async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
-    match bronze_asset_detail_body(ch, id).await {
+async fn bronze_asset_detail(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ApiResult<Response> {
+    match bronze_asset_detail_body(state, principal, id).await {
         Ok(Some(body)) => Ok((StatusCode::OK, ApiJson(body)).into_response()),
         Ok(None) => Err(not_found()),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
@@ -1194,7 +1849,12 @@ async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
               independent reuse, hurting rather than helping readability of \
               the port"
 )]
-async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Value>, ChError> {
+async fn bronze_asset_detail_body(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<Option<Value>, ChError> {
+    let ch = &state.clickhouse;
     let escaped_id = SqlLiteral::from(id);
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
@@ -1221,35 +1881,53 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={escaped_id}
        UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={escaped_id}"
     );
-    let cols = ch.rows(&cols_sql, None).await?;
+    let mut cols = ch.rows(&cols_sql, None).await?;
 
     let table = str_col(sync, "table_name");
-    let (sample, type_of): (Vec<Value>, Map<String, Value>) = match ch
-        .query(&format!("SELECT * FROM silver.`{table}` LIMIT 5"), None)
+    // The Bronze table itself, else the Silver model of the same name (see
+    // `catalog_source`). A lookup failure only costs the sample.
+    let source = catalog_source::bronze_source(state, table)
         .await
-    {
-        Ok(r) => {
-            let sample = r
-                .data
-                .iter()
-                .map(|row| {
-                    let mut o = Map::new();
-                    for m in &r.meta {
-                        if !m.name.starts_with('_') {
-                            o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
-                        }
-                    }
-                    Value::Object(o)
-                })
-                .collect();
-            let mut type_of = Map::new();
-            for m in &r.meta {
-                type_of.insert(m.name.clone(), Value::String(m.ty.clone()));
-            }
-            (sample, type_of)
-        }
-        Err(_) => (Vec::new(), Map::new()), // "silver not yet available" — swallowed in the TypeScript too.
+        .unwrap_or_default();
+    // The Silver model is the dataset's downstream whether or not this
+    // page reads from it.
+    let has_silver = match source.as_ref() {
+        Some(s) if s.kind == SourceKind::ClickHouse => true,
+        _ => catalog_source::clickhouse_source(ch, "silver", table)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
     };
+    let (sample, masked) =
+        governed_sample(state, principal, source.as_ref(), DETAIL_SAMPLE_ROWS).await;
+    // Declared types from whichever table was found; the registry's own
+    // `tipe` otherwise (see the `data_type` fallback below).
+    let type_of: HashMap<String, String> = source
+        .as_ref()
+        .map(|s| s.columns.iter().cloned().collect())
+        .unwrap_or_default();
+    // The registry lists columns in no particular order (alphabetical, for
+    // a table a connector registered). The table's own order is the one a
+    // reader recognizes, and the one the sample rows come back in, so the
+    // schema follows it when the table was found; a column the table does
+    // not have keeps its registry place, after the rest.
+    let position: HashMap<&str, usize> = source
+        .as_ref()
+        .map(|s| {
+            s.columns
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| (name.as_str(), i))
+                .collect()
+        })
+        .unwrap_or_default();
+    cols.sort_by_key(|c| {
+        position
+            .get(str_col(c, "key_asli"))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 
     let schema: Vec<Value> = cols
         .iter()
@@ -1264,13 +1942,13 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
             // absent-from-`system.columns` triggers the missing-key case
             // handled by `type_of.get`), so the `"String"` literal fallback
             // is unreachable in real data and intentionally omitted here.
-            let data_type = type_of
-                .get(key_asli)
-                .and_then(Value::as_str)
-                .unwrap_or(tipe);
+            let data_type = type_of.get(key_asli).map_or(tipe, String::as_str);
             let mut o = Map::new();
             o.insert("name".to_owned(), json!(key_asli));
             o.insert("dataType".to_owned(), json!(data_type));
+            if masked.contains(key_asli) {
+                o.insert("masked".to_owned(), json!(true));
+            }
             if !deskripsi.is_empty() {
                 o.insert("description".to_owned(), json!(deskripsi));
             }
@@ -1285,14 +1963,10 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     let description = str_col(sync, "description");
     let updated_at = str_col(sync, "updated_at");
 
-    let downstream = if sekunder {
-        vec![]
-    } else {
-        vec![json!({ "id": format!("silver.{table}"), "name": format!("silver.{table}") })]
-    };
+    let downstream = silver_downstream(table, has_silver);
 
     let col_count = cols.len();
-    let body = bronze_detail_body(
+    let mut body = bronze_detail_body(
         slug,
         str_col(sync, "title"),
         sekunder,
@@ -1309,68 +1983,198 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         str_col(sync, "klasifikasi"),
         table,
     );
+    mark_sample_restricted(&mut body, principal);
+    mark_query_table(&mut body, source.as_ref());
+    enrich_bronze_detail(state, &mut body, slug, table).await;
+    // Expected freshness: an authored SLA on the Bronze table, else the
+    // registry's own refresh cadence — the same order the list uses.
+    let sla = if table.is_empty() {
+        None
+    } else {
+        catalog_governance::sla_target_seconds(state, &format!("bronze.{table}")).await
+    };
+    if let Some(seconds) = sla {
+        set_freshness_target(&mut body, seconds, "sla");
+    } else if let Some(seconds) =
+        catalog_governance::frequency_target_seconds(str_col(sync, "frekuensi"))
+    {
+        set_freshness_target(&mut body, seconds, "frequency");
+    }
+    // The dataset is its Bronze table and, when that cannot be read, the
+    // Silver model its rows are read from instead: a policy or a check on
+    // either governs what this page shows.
+    let mut tables = Vec::new();
+    if !table.is_empty() {
+        tables.push(format!("bronze.{table}"));
+    }
+    if let Some(key) = source.as_ref().map(|s| s.policy_key.clone())
+        && !tables.contains(&key)
+    {
+        tables.push(key);
+    }
+    let mut names = tables.clone();
+    names.push(slug.to_owned());
+    if !table.is_empty() {
+        names.push(table.to_owned());
+    }
+    mark_governance(state, principal, &mut body, &tables, &names).await;
+    mark_badges(state, &mut body, &names).await;
+    mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
 }
 
-/// Detail body for a `silver.*`/`serving.*` asset. `rows` is real (from
-/// `system.parts`); `sizeBytes`, `freshnessLagSeconds`, `health`, and `usage`
-/// are not measured, `lastUpdated` is `null` in place of the empty-string
-/// placeholder for "unknown", and `lifecyclePolicy` is no longer emitted
-/// (it named a policy that exists nowhere) — see the WS1 task 1.9 comment
-/// above `bronze_catalog_row`.
+/// Whether the catalog list shows a Silver table as a row of its own. One
+/// that is the model of a Bronze dataset (`models_a_bronze_dataset`) is
+/// folded into that dataset only where the dataset's page reads the model
+/// — see [`list_body`].
+fn lists_silver_table(models_a_bronze_dataset: bool, bronze_is_readable: bool) -> bool {
+    bronze_is_readable || !models_a_bronze_dataset
+}
+
+/// The Silver model built from a Bronze dataset, as its one downstream —
+/// only when `silver.<table>` exists. This used to be listed for every
+/// non-sekunder dataset whether or not the table was there, so the
+/// Lineage tab linked to an asset that answered 404.
+fn silver_downstream(table: &str, has_silver: bool) -> Vec<Value> {
+    if has_silver {
+        vec![json!({ "id": format!("silver.{table}"), "name": format!("silver.{table}") })]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The Bronze dataset a Silver model is built from: the registry row whose
+/// `table_name` is the model's own name, as the model's one upstream —
+/// the other end of [`silver_downstream`]. Empty when the registry has no
+/// such row, or could not be read: that costs the link, never the page.
+async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
+    registered_slug(ch, table)
+        .await
+        .ok()
+        .flatten()
+        .map(|slug| vec![json!({ "id": slug, "name": format!("bronze.{table}") })])
+        .unwrap_or_default()
+}
+
+/// The slug of the registry row whose `table_name` is `table`, from either
+/// registry (`bronze_meta`, `bronze_meta_sec`): `None` when no dataset is
+/// registered under that name.
+///
+/// One query for two readers with different needs. [`bronze_upstream`] makes
+/// a missing answer cost a link, so it drops the error. `routes::uploads`
+/// asks it to decide whether a name is taken, where an error must not read
+/// as "free", so it gets the error.
+///
+/// # Errors
+///
+/// Returns [`ChError`] when `ClickHouse` cannot answer, including when a
+/// registry table does not exist yet.
+pub(crate) async fn registered_slug(ch: &ChClient, table: &str) -> Result<Option<String>, ChError> {
+    let name = SqlLiteral::from(table);
+    let sql = format!(
+        "SELECT slug FROM lake.`bronze_meta.dataset_catalog` WHERE table_name = {name}
+         UNION ALL
+         SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` WHERE table_name = {name}
+         LIMIT 1"
+    );
+    Ok(ch
+        .rows(&sql, None)
+        .await?
+        .first()
+        .map(|r| str_col(r, "slug").to_owned())
+        .filter(|slug| !slug.is_empty()))
+}
+
+/// `sizeBytes`/`freshnessLagSeconds` on a Bronze detail body from its
+/// Iceberg table, through the same cached, time-boxed path the catalog
+/// list uses ([`enrich_bronze_stats`]), so the list and the detail page
+/// never disagree about one table. It waits longer than the list does
+/// ([`ICEBERG_DETAIL_BUDGET`]); a Lakekeeper that is slower still, or
+/// unreachable, leaves both `null`.
+async fn enrich_bronze_detail(state: &AppState, body: &mut Value, slug: &str, table: &str) {
+    if table.is_empty() {
+        return;
+    }
+    let Ok(bronze_ns) = NamespaceIdent::from_strs(["bronze"]) else {
+        return;
+    };
+    let by_slug = enrich_bronze_stats(
+        vec![(slug.to_owned(), table.to_owned())],
+        &state.bronze_stats_cache,
+        ICEBERG_DETAIL_BUDGET,
+        ICEBERG_ENRICHMENT_MAX_CONCURRENT,
+        &bronze_ns,
+        || lakehouse_catalog::client(state),
+    )
+    .await;
+    apply_iceberg_enrichment(std::slice::from_mut(body), &by_slug, now_millis());
+}
+
+/// Detail body for a `silver.*`/`serving.*` asset: its catalog list row
+/// ([`silver_catalog_row`], [`gold_catalog_row`]) plus what only the detail
+/// page shows. Built from that row so the two cannot disagree about the
+/// asset's type, format, rows, size or freshness. `health` and `usage` are
+/// not measured, and `lifecyclePolicy` is no longer emitted (it named a
+/// policy that exists nowhere) — see the WS1 task 1.9 comment above
+/// `bronze_catalog_row`.
+///
+/// `engine` is empty when the lookup failed; the format then names no
+/// engine rather than a guessed one.
+///
+/// `schemaVersions` starts empty here like the other lists; the async caller
+/// fills it ([`mark_schema_versions`]).
 fn clickhouse_detail_body(
     id: &str,
     table: &str,
     db: &str,
-    is_gold: bool,
-    rows: i64,
+    engine: &str,
+    parts: Option<&PartStats>,
     schema: &[Value],
     sample: &[Value],
 ) -> Value {
-    json!({
-        "id": id,
-        "name": prettify(table),
-        "namespace": db,
-        "type": if is_gold { "table" } else { "view" },
-        "layer": if is_gold { "gold" } else { "silver" },
-        "tier": if is_gold { "hot" } else { "warm" },
-        "classification": "internal",
-        "owner": TENANT_OWNER.as_str(),
-        "domain": TENANT_DOMAIN.as_str(),
-        "description": if is_gold {
-            "Mart Gold penyaji dashboard (agregat siap pakai)."
-        } else {
-            "Model Silver terkurasi (bersih & terkonform) di ClickHouse."
-        },
-        "format": if is_gold { "ClickHouse MergeTree" } else { "ClickHouse View" },
-        "engine": "hot-store",
-        "rows": rows,
-        "sizeBytes": Value::Null,
-        "columnCount": schema.len(),
-        "freshnessLagSeconds": Value::Null,
-        "lastUpdated": Value::Null,
-        "health": "unknown",
-        "residency": TENANT_RESIDENCY.as_str(),
-        "schema": schema,
-        "sample": sample,
-        "qualityChecks": [],
-        "policySummary": [],
-        "usage": Value::Null,
-        "recentQueries": [],
-        "dependents": [],
-        "changeHistory": [],
-        "snapshots": [],
-        "schemaVersions": [],
-        "upstream": [],
-        "downstream": [],
-    })
+    let col_count = i64::try_from(schema.len()).unwrap_or(i64::MAX);
+    let mut body = if db == "serving" {
+        gold_catalog_row(table, engine, col_count, parts)
+    } else {
+        silver_catalog_row(table, engine, col_count, parts)
+    };
+    let Some(o) = body.as_object_mut() else {
+        return body;
+    };
+    // The id as requested: the row builder's own is `db.table`, which a
+    // multi-segment id (see `split_db_table`) does not equal.
+    o.insert("id".to_owned(), json!(id));
+    if engine.is_empty() {
+        o.insert("format".to_owned(), json!("ClickHouse"));
+    }
+    o.insert("schema".to_owned(), json!(schema));
+    o.insert("sample".to_owned(), json!(sample));
+    for list in [
+        "qualityChecks",
+        "policySummary",
+        "recentQueries",
+        "dependents",
+        "changeHistory",
+        "snapshots",
+        "schemaVersions",
+        "upstream",
+        "downstream",
+    ] {
+        o.insert(list.to_owned(), json!([]));
+    }
+    o.insert("usage".to_owned(), Value::Null);
+    // The key the lineage graph, policies and quality rules name this
+    // table by. Here it is the id itself.
+    o.insert("tableKey".to_owned(), json!(format!("{db}.{table}")));
+    body
 }
 
 /// Detail body for a Bronze/Iceberg asset. `rows` and `last_updated` are
-/// real (from the `dataset_sync`/`dataset_catalog` registry); `sizeBytes`,
-/// `freshnessLagSeconds`, `health`, and `usage` are not measured, and
-/// `lifecyclePolicy` is no longer emitted — see the WS1 task 1.9 comment
-/// above `bronze_catalog_row`.
+/// real (from the `dataset_sync`/`dataset_catalog` registry); `sizeBytes`
+/// and `freshnessLagSeconds` are filled from Iceberg afterward by
+/// [`enrich_bronze_detail`] when the table is found there; `health` and
+/// `usage` are not measured, and `lifecyclePolicy` is no longer emitted —
+/// see the WS1 task 1.9 comment above `bronze_catalog_row`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one-to-one port of the original inline `json!` body; every \
@@ -1433,6 +2237,9 @@ fn bronze_detail_body(
         // real Bronze Iceberg table). The frontend uses it to try loading
         // Iceberg snapshots for this asset, and handles a 404 quietly.
         "tableName": if table_name.is_empty() { Value::Null } else { json!(table_name) },
+        // The key the lineage graph, policies and quality rules name this
+        // dataset by: its Bronze table, not the registry slug in `id`.
+        "tableKey": if table_name.is_empty() { Value::Null } else { json!(format!("bronze.{table_name}")) },
         "_meta": {
             "frekuensi": frekuensi,
             "satuan": satuan,
@@ -1603,6 +2410,7 @@ pub async fn get_annotation(
 pub async fn put_annotation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     validate_annotation_id(&id)?;
@@ -1610,10 +2418,12 @@ pub async fn put_annotation(
         .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
     validate_annotation_body(&parsed)?;
     let pool = annotation_pool(&state)?;
+    let before = lakehouse_store::annotation::get_annotation(pool, &id).await?;
+    let changed = changed_annotation_fields(before.as_ref(), &parsed);
     lakehouse_store::annotation::upsert_annotation(
         pool,
         &lakehouse_store::annotation::AnnotationInput {
-            asset_id: id,
+            asset_id: id.clone(),
             owner: parsed.owner,
             steward: parsed.steward,
             tags: parsed.tags,
@@ -1621,7 +2431,50 @@ pub async fn put_annotation(
         },
     )
     .await?;
+    // The asset's Change history reads this. Best-effort, like every other
+    // audit write here: it never fails the edit it records. A save that
+    // changed nothing records nothing.
+    if !changed.is_empty() {
+        let _ = lakehouse_store::audit::insert(
+            pool,
+            lakehouse_store::audit::NewAuditEvent {
+                principal_id: Some(principal.id.uuid().to_string()),
+                principal_kind: Some("user".to_owned()),
+                actor_label: Some(principal.display_name.clone()),
+                action: "catalog.annotate".to_owned(),
+                resource_kind: Some("catalog".to_owned()),
+                resource_id: Some(id),
+                args: Some(json!({ "fields": changed })),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+/// Which annotation fields a `PUT` body changes from the stored row —
+/// names only: the audit trail says what was edited, not what it said.
+fn changed_annotation_fields(
+    before: Option<&AnnotationRow>,
+    after: &AnnotationBody,
+) -> Vec<&'static str> {
+    let text = |v: Option<&String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    let mut changed = Vec::new();
+    if text(before.and_then(|b| b.description.as_ref())) != text(after.description.as_ref()) {
+        changed.push("description");
+    }
+    if text(before.and_then(|b| b.owner.as_ref())) != text(after.owner.as_ref()) {
+        changed.push("owner");
+    }
+    if text(before.and_then(|b| b.steward.as_ref())) != text(after.steward.as_ref()) {
+        changed.push("steward");
+    }
+    if before.map_or(&[][..], |b| b.tags.as_slice()) != after.tags.as_slice() {
+        changed.push("tags");
+    }
+    changed
 }
 
 // ── POST /api/catalog/{id}/access-request (WS7 item E2) ────────────────
@@ -1696,6 +2549,7 @@ pub async fn access_request(
             action: "catalog.access_request".to_owned(),
             resource_kind: Some("catalog".to_owned()),
             resource_id: Some(id.clone()),
+            args: Some(json!({ "permission": permission })),
             outcome: "needs_approval".to_owned(),
             approval_id: Some(req.id.clone()),
             ..Default::default()
@@ -1973,19 +2827,316 @@ mod tests {
         assert_eq!(bronze["health"], json!("unknown"));
         assert_eq!(bronze["lastUpdated"], json!("2026-01-01T00:00:00Z"));
 
-        let silver = silver_catalog_row("mart_wisman", "View", 5);
+        // A view has no parts: nothing about it is measured.
+        let silver = silver_catalog_row("mart_wisman", "View", 5, None);
         assert_eq!(silver["rows"], Value::Null);
         assert_eq!(silver["sizeBytes"], Value::Null);
         assert_eq!(silver["freshnessLagSeconds"], Value::Null);
         assert_eq!(silver["health"], json!("unknown"));
         assert_eq!(silver["lastUpdated"], Value::Null);
 
-        let gold = gold_catalog_row("mart_wisman", "MergeTree", 99, 5);
-        assert_eq!(gold["rows"], json!(99));
+        // An empty mart holds zero rows, but was never written to.
+        let gold = gold_catalog_row("mart_wisman", "MergeTree", 5, None);
+        assert_eq!(gold["rows"], json!(0));
         assert_eq!(gold["sizeBytes"], Value::Null);
         assert_eq!(gold["freshnessLagSeconds"], Value::Null);
         assert_eq!(gold["health"], json!("unknown"));
         assert_eq!(gold["lastUpdated"], Value::Null);
+        assert_eq!(gold["type"], json!("table"));
+        assert_eq!(gold["tier"], json!("hot"));
+
+        // A view among the marts used to read "Table · Hot · 0 rows".
+        let view = gold_catalog_row("slot_health", "View", 7, None);
+        assert_eq!(view["type"], json!("view"));
+        assert_eq!(view["tier"], json!("warm"));
+        assert_eq!(view["rows"], Value::Null);
+        assert_eq!(view["format"], json!("ClickHouse View"));
+    }
+
+    fn parts_row(n: &str, lag: &str, at: &str) -> Map<String, Value> {
+        let Value::Object(row) = json!({
+            "n": n, "r": "99", "b": "4096", "lag": lag, "at": at,
+        }) else {
+            unreachable!("a JSON object literal")
+        };
+        row
+    }
+
+    /// A table with parts reports what its parts measure, on the list row
+    /// and the detail body alike.
+    #[test]
+    fn part_stats_fill_size_freshness_and_last_write() {
+        let parts = part_stats(&parts_row("3", "120", "2026-09-30T08:00:00Z"));
+        let expected = PartStats {
+            rows: 99,
+            bytes: 4096,
+            lag_seconds: Some(120),
+            last_write: Some("2026-09-30T08:00:00Z".to_owned()),
+        };
+        assert_eq!(parts.as_ref(), Some(&expected));
+
+        for row in [
+            silver_catalog_row("orders", "MergeTree", 5, parts.as_ref()),
+            gold_catalog_row("mart_orders", "MergeTree", 5, parts.as_ref()),
+            clickhouse_detail_body(
+                "silver.orders",
+                "orders",
+                "silver",
+                "MergeTree",
+                parts.as_ref(),
+                &[],
+                &[],
+            ),
+        ] {
+            assert_eq!(row["rows"], json!(99));
+            assert_eq!(row["sizeBytes"], json!(4096));
+            assert_eq!(row["freshnessLagSeconds"], json!(120));
+            assert_eq!(row["lastUpdated"], json!("2026-09-30T08:00:00Z"));
+        }
+    }
+
+    /// The detail page names an asset's type and format from its engine,
+    /// as the list does. It used to call every Silver asset a view.
+    #[test]
+    fn detail_type_and_format_follow_the_engine_like_the_list_row() {
+        let table = clickhouse_detail_body(
+            "silver.orders",
+            "orders",
+            "silver",
+            "MergeTree",
+            None,
+            &[],
+            &[],
+        );
+        let row = silver_catalog_row("orders", "MergeTree", 0, None);
+        assert_eq!(table["type"], json!("table"));
+        assert_eq!(table["format"], json!("ClickHouse MergeTree"));
+        assert_eq!(
+            (&table["type"], &table["format"]),
+            (&row["type"], &row["format"])
+        );
+
+        let view = clickhouse_detail_body("silver.v", "v", "silver", "View", None, &[], &[]);
+        assert_eq!(view["type"], json!("view"));
+        assert_eq!(view["format"], json!("ClickHouse View"));
+        // A view stores nothing: no row count is claimed for it.
+        assert_eq!(view["rows"], Value::Null);
+
+        let mart = clickhouse_detail_body(
+            "serving.mart_x",
+            "mart_x",
+            "serving",
+            "ReplacingMergeTree",
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(mart["layer"], json!("gold"));
+        assert_eq!(mart["format"], json!("ClickHouse ReplacingMergeTree"));
+        assert_eq!(mart["rows"], json!(0));
+
+        // The engine lookup failed: no engine is named, none is guessed.
+        let unknown = clickhouse_detail_body("silver.t", "t", "silver", "", None, &[], &[]);
+        assert_eq!(unknown["format"], json!("ClickHouse"));
+    }
+
+    fn annotation(owner: Option<&str>, description: Option<&str>, tags: &[&str]) -> AnnotationRow {
+        AnnotationRow {
+            asset_id: "silver.orders".to_owned(),
+            owner: owner.map(str::to_owned),
+            steward: None,
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            description: description.map(str::to_owned),
+        }
+    }
+
+    /// What a person recorded wins over the registry; a blank field does
+    /// not erase the registry's value.
+    #[test]
+    fn an_annotation_overrides_the_registry_only_where_it_says_something() {
+        let mut row = silver_catalog_row("orders", "MergeTree", 0, None);
+        let registry_description = row["description"].clone();
+        apply_annotation(
+            &mut row,
+            &annotation(Some("Data Platform"), Some("  "), &["pii"]),
+        );
+        assert_eq!(row["owner"], json!("Data Platform"));
+        assert_eq!(row["description"], registry_description);
+        assert_eq!(row["tags"], json!(["pii"]));
+        assert!(row.get("steward").is_none());
+    }
+
+    /// The audit trail names the fields an edit changed, and a save that
+    /// changes nothing names none.
+    #[test]
+    fn changed_annotation_fields_names_only_what_differs() {
+        let before = annotation(Some("Data Platform"), Some("Orders"), &["pii"]);
+        let body = |owner: &str, description: &str, tags: &[&str]| AnnotationBody {
+            owner: Some(owner.to_owned()),
+            steward: None,
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            description: Some(description.to_owned()),
+        };
+        assert!(
+            changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"]))
+                .is_empty()
+        );
+        assert_eq!(
+            changed_annotation_fields(Some(&before), &body("Finance", "Orders", &[])),
+            vec!["owner", "tags"]
+        );
+        assert_eq!(
+            changed_annotation_fields(None, &body("", "First description", &[])),
+            vec!["description"]
+        );
+    }
+
+    /// A Silver table that holds data in `ClickHouse` is Hot, as a mart is;
+    /// a Silver view is not.
+    #[test]
+    fn a_silver_table_with_parts_is_hot_and_a_view_is_warm() {
+        let parts = part_stats(&parts_row("1", "60", "2026-09-30T08:00:00Z"));
+        assert_eq!(
+            silver_catalog_row("orders", "MergeTree", 4, parts.as_ref())["tier"],
+            json!("hot")
+        );
+        assert_eq!(
+            silver_catalog_row("v_orders", "View", 4, None)["tier"],
+            json!("warm")
+        );
+    }
+
+    /// The badges are worked out from the row itself: health from its
+    /// freshness against its target and its checks, classification from
+    /// the rules, down to the columns.
+    #[test]
+    fn set_badges_fills_health_and_classification_with_their_reasons() {
+        let mut row = clickhouse_detail_body(
+            "silver.orders",
+            "orders",
+            "silver",
+            "MergeTree",
+            None,
+            &[
+                json!({ "name": "email", "dataType": "String" }),
+                json!({ "name": "id", "dataType": "UInt64" }),
+            ],
+            &[],
+        );
+        // Nothing measured, nothing classified.
+        let unclassified = catalog_governance::classify(&[], &["silver.orders".to_owned()]);
+        set_badges(&mut row, &unclassified, &[]);
+        assert_eq!(row["health"], json!("unknown"));
+        assert_eq!(row["healthReasons"], json!([]));
+        assert_eq!(row["classification"], json!("internal"));
+        assert_eq!(row["classificationSource"], json!("default"));
+
+        // Late against its target, one failed high-severity check, and a
+        // column a rule calls restricted.
+        row["freshnessLagSeconds"] = json!(9 * 86_400);
+        set_freshness_target(&mut row, 129_600, "frequency");
+        let classified = catalog_governance::Classified {
+            level: "restricted".to_owned(),
+            from_rule: true,
+            columns: vec![("email".to_owned(), "restricted".to_owned())],
+            in_force: vec![(
+                "rule-1".to_owned(),
+                Some("email".to_owned()),
+                "restricted".to_owned(),
+            )],
+        };
+        let checks = [json!({ "name": "id_unique", "status": "failed", "severity": "high" })];
+        set_badges(&mut row, &classified, &checks);
+        assert_eq!(row["health"], json!("unhealthy"));
+        assert_eq!(row["healthReasons"].as_array().map(Vec::len), Some(3));
+        assert_eq!(row["classification"], json!("restricted"));
+        assert_eq!(row["classificationSource"], json!("rule"));
+        assert_eq!(row["schema"][0]["classification"], json!("restricted"));
+        assert!(row["schema"][1].get("classification").is_none());
+    }
+
+    /// A row's freshness target says how old is too old, and on whose word.
+    #[test]
+    fn set_freshness_target_records_the_seconds_and_their_source() {
+        let mut row = silver_catalog_row("orders", "MergeTree", 0, None);
+        assert!(row.get("freshnessTargetSeconds").is_none());
+        set_freshness_target(&mut row, 3600, "sla");
+        assert_eq!(row["freshnessTargetSeconds"], json!(3600));
+        assert_eq!(row["freshnessTargetSource"], json!("sla"));
+    }
+
+    /// Without a `GROUP BY`, no parts still yields one row — dated 1970.
+    /// That must read as "not measured", never as fifty years stale; and a
+    /// part dated in the future is clock skew, not a negative lag.
+    /// The Storage card's facts for a `ClickHouse` table: its engine and
+    /// keys, and what its active parts add up to. An empty key means there
+    /// is none, and a read that failed is unknown, not zero.
+    #[test]
+    fn clickhouse_storage_reports_keys_parts_and_sizes() {
+        let table = json!({ "engine": "ReplacingMergeTree", "partition_key": "", "sorting_key": "plnt, material" });
+        let parts = json!({ "n": "3", "partitions": "2", "b": "807944", "raw": "8000498" });
+        let storage = clickhouse_storage(
+            "silver.sap_material_master",
+            table.as_object(),
+            parts.as_object(),
+            18,
+        );
+        assert_eq!(
+            storage,
+            json!({
+                "table": "silver.sap_material_master",
+                "engine": "ReplacingMergeTree",
+                "partitionKey": null,
+                "sortingKey": "plnt, material",
+                "parts": 3,
+                "partitions": 2,
+                "bytesOnDisk": 807_944,
+                "uncompressedBytes": 8_000_498,
+                "tableColumns": 18,
+            })
+        );
+
+        let unread = clickhouse_storage("serving.mart_x", None, None, 4);
+        for field in [
+            "engine",
+            "partitionKey",
+            "sortingKey",
+            "parts",
+            "bytesOnDisk",
+        ] {
+            assert_eq!(unread[field], Value::Null, "{field}");
+        }
+        assert_eq!(unread["tableColumns"], 4);
+    }
+
+    #[test]
+    fn part_stats_is_none_without_parts_and_drops_a_negative_lag() {
+        assert_eq!(
+            part_stats(&parts_row("0", "1790000000", "1970-01-01T00:00:00Z")),
+            None
+        );
+        let skewed = part_stats(&parts_row("1", "-5", "2026-09-30T08:00:00Z")).expect("has parts");
+        assert_eq!(skewed.lag_seconds, None);
+    }
+
+    /// The Silver model is a Bronze dataset's downstream only when it
+    /// exists — whichever of the two tables the page reads.
+    #[test]
+    fn silver_downstream_only_when_the_silver_table_exists() {
+        assert_eq!(
+            silver_downstream("orders", true),
+            vec![json!({ "id": "silver.orders", "name": "silver.orders" })]
+        );
+        assert!(silver_downstream("orders", false).is_empty());
+
+        // A Silver model is listed as its own asset once Bronze itself is
+        // readable; on a deployment where it is not, the dataset's page IS
+        // the model, and listing it too would show one table twice.
+        assert!(lists_silver_table(true, true));
+        assert!(!lists_silver_table(true, false));
+        // A Silver table with no Bronze dataset of its name is always listed.
+        assert!(lists_silver_table(false, true));
+        assert!(lists_silver_table(false, false));
     }
 
     // WS1 task 1.9 — usage was three hardcoded zeros (nothing counts
@@ -1997,8 +3148,8 @@ mod tests {
             "silver.mart_wisman",
             "mart_wisman",
             "silver",
-            false,
-            10,
+            "View",
+            None,
             &[],
             &[],
         );
@@ -2010,6 +3161,7 @@ mod tests {
         // Silver/Gold detail never emits tableName — only the Bronze
         // registry carries a table_name to report.
         assert!(ch_detail.get("tableName").is_none());
+        assert_eq!(ch_detail["tableKey"], json!("silver.mart_wisman"));
 
         let bronze_detail = bronze_detail_body(
             "slug-1",
@@ -2034,6 +3186,9 @@ mod tests {
         assert_eq!(bronze_detail["freshnessLagSeconds"], Value::Null);
         assert_eq!(bronze_detail["health"], json!("unknown"));
         assert_eq!(bronze_detail["tableName"], json!("commerce_orders"));
+        // Lineage, policies and quality rules name it by its Bronze table,
+        // not by the registry slug.
+        assert_eq!(bronze_detail["tableKey"], json!("bronze.commerce_orders"));
     }
 
     // WS2 §4 — the Bronze asset detail exposes the registry's table_name so
@@ -2059,6 +3214,7 @@ mod tests {
             "",
         );
         assert_eq!(bronze_detail["tableName"], Value::Null);
+        assert_eq!(bronze_detail["tableKey"], Value::Null);
     }
 
     #[test]
@@ -2140,7 +3296,7 @@ mod tests {
 
     #[test]
     fn apply_iceberg_enrichment_leaves_a_non_bronze_row_untouched() {
-        let mut assets = vec![silver_catalog_row("mart_wisman", "View", 1)];
+        let mut assets = vec![silver_catalog_row("mart_wisman", "View", 1, None)];
         let mut by_slug = HashMap::new();
         by_slug.insert(
             "silver.mart_wisman".to_owned(),
@@ -2589,6 +3745,520 @@ mod tests {
             let (status, body) = response_json(resp).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["supported"], json!(false));
+        }
+    }
+
+    /// The detail route's sample rows are data, so they must go through
+    /// the same policy rewrite as `POST /api/query/run`. Before this, the
+    /// route sent a literal `SELECT * … LIMIT 5` and returned the raw
+    /// values of a masked column to anyone holding `catalog:read`.
+    mod sample_masking {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::governance::CreatePolicyInput;
+        use lakehouse_test_support as _;
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        /// `0002_seed_identity.sql`'s first tenant — configured as the
+        /// catalog tenant below, so a member passes the tenant gate.
+        const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+
+        /// An Analyst in the catalog tenant holding `permissions`. Masking
+        /// keys on `role_names`, so the policy below binds them either way.
+        fn analyst(permissions: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: vec![TENANT_A.parse().unwrap()],
+                display_name: "alice".to_owned(),
+                permissions: PermissionSet::parse(permissions),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: vec!["Analyst".to_owned()],
+            }
+        }
+
+        fn ch_json(meta: &[(&str, &str)], data: &Value) -> ResponseTemplate {
+            let meta: Vec<Value> = meta
+                .iter()
+                .map(|(n, t)| json!({ "name": n, "type": t }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "meta": meta,
+                "data": data,
+                "rows": data.as_array().map_or(0, Vec::len),
+            }))
+        }
+
+        async fn mock_clickhouse(server: &MockServer) {
+            // Answers both `declared_columns` and the policy engine's own
+            // `system.columns` read.
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .respond_with(ch_json(
+                    &[
+                        ("name", "String"),
+                        ("type", "String"),
+                        ("default_kind", "String"),
+                        ("default_expression", "String"),
+                    ],
+                    &json!([
+                        {"name": "id", "type": "UInt64", "default_kind": "", "default_expression": ""},
+                        {"name": "email", "type": "String", "default_kind": "", "default_expression": ""},
+                    ]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.tables"))
+                .respond_with(ch_json(
+                    &[
+                        ("database", "String"),
+                        ("name", "String"),
+                        ("engine", "String"),
+                        ("create_table_query", "String"),
+                    ],
+                    &json!([{"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""}]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("replaceRegexpOne"))
+                .respond_with(ch_json(
+                    &[("id", "UInt64"), ("email", "String")],
+                    &json!([{"id": "1", "email": "***"}]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.parts"))
+                .respond_with(ch_json(&[("r", "String")], &json!([{"r": "1"}])))
+                .mount(server)
+                .await;
+        }
+
+        async fn response_json(resp: Response) -> (StatusCode, Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        /// Seeds a `mask: ["email"]` policy on `serving.mart_x` for
+        /// Analysts, then calls `detail` for it as `principal`.
+        async fn detail_as(
+            pool: &lakehouse_store::PgPool,
+            server: &MockServer,
+            principal: Principal,
+        ) -> (StatusCode, Value) {
+            lakehouse_store::governance::create_policy(
+                pool,
+                &CreatePolicyInput {
+                    name: "catalog-sample-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            mock_clickhouse(server).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let resp = detail(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+            )
+            .await
+            .expect("detail answers");
+            response_json(resp).await
+        }
+
+        /// The larger sample goes through the same rewrite as the five rows
+        /// on the detail body, and never asks for more than the cap.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn sample_route_masks_rows_and_caps_the_limit(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Seeds the policy and mounts the mocks.
+            detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let ApiJson(body) = sample(
+                State(state),
+                Extension(analyst("catalog:read, query:read")),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+                Query(SampleQuery { limit: Some(5000) }),
+            )
+            .await
+            .expect("sample answers");
+
+            assert_eq!(body["limit"], json!(100));
+            assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
+            let requests = server.received_requests().await.expect("recorded");
+            let reads: Vec<String> = requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| b.contains("LIMIT 100"))
+                .collect();
+            assert!(
+                !reads.is_empty(),
+                "the sample must be read at the capped limit"
+            );
+            assert!(
+                reads.iter().all(|b| b.contains("replaceRegexpOne")),
+                "the sample must never reach ClickHouse unmasked"
+            );
+            Ok(())
+        }
+
+        /// A `NULL` cell is JSON `null` and an empty text is `""`, in both
+        /// places the sample is served (the detail body and the larger
+        /// sample), so the console can tell "no value" from "empty". Every
+        /// other cell is the string it was, a number included, and a masked
+        /// cell is whatever the rewrite made it.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn sample_keeps_a_null_cell_null_and_an_empty_text_empty(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // Mounted before `mock_clickhouse`'s own answer to the masked
+            // read, and at a higher priority, so it is the one that answers.
+            Mock::given(method("POST"))
+                .and(body_string_contains("replaceRegexpOne"))
+                .respond_with(ch_json(
+                    &[
+                        ("id", "UInt64"),
+                        ("email", "String"),
+                        ("note", "Nullable(String)"),
+                    ],
+                    &json!([
+                        {"id": "1", "email": "***", "note": null},
+                        {"id": 2, "email": "***", "note": ""},
+                    ]),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let expected = json!([
+                {"id": "1", "email": "***", "note": null},
+                {"id": "2", "email": "***", "note": ""},
+            ]);
+
+            let (status, body) =
+                detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], expected);
+
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+            let ApiJson(body) = sample(
+                State(state),
+                Extension(analyst("catalog:read, query:read")),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+                Query(SampleQuery { limit: Some(25) }),
+            )
+            .await
+            .expect("sample answers");
+            assert_eq!(body["rows"], expected);
+            Ok(())
+        }
+
+        /// The requests that read the asset's own rows: the sample's
+        /// `LIMIT 5`. The quality lookup's `LIMIT 500` contains the same
+        /// text but reads `_silver_meta.quality`, never the table.
+        fn sample_requests(bodies: &[wiremock::Request]) -> Vec<String> {
+            bodies
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| b.contains("LIMIT 5") && !b.contains("_silver_meta.quality"))
+                .collect()
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_masks_sample_rows_and_flags_masked_columns(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let (status, body) =
+                detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], json!([{"id": "1", "email": "***"}]));
+            assert_eq!(
+                body["schema"],
+                json!([
+                    {"name": "id", "dataType": "UInt64"},
+                    {"name": "email", "dataType": "String", "masked": true},
+                ])
+            );
+            // The policy behind the mask is listed with what it does to
+            // this caller; without `policy:read`, not who else it targets.
+            assert_eq!(body["tableKey"], json!("serving.mart_x"));
+            // How ClickHouse holds the table, for the Storage card.
+            assert_eq!(body["storage"]["table"], json!("serving.mart_x"));
+            assert_eq!(body["storage"]["engine"], json!("MergeTree"));
+            assert_eq!(body["storage"]["sortingKey"], Value::Null);
+            assert_eq!(body["storage"]["tableColumns"], json!(2));
+            let policy = &body["policySummary"][0];
+            assert_eq!(policy["name"], json!("catalog-sample-masking-test"));
+            assert_eq!(policy["appliesToYou"], json!(true));
+            assert_eq!(policy["mask"], json!(["email"]));
+            assert!(policy.get("roles").is_none());
+            // Every row read of the table went out rewritten: no request
+            // carried the literal sample statement.
+            assert_eq!(body["sampleRestricted"], json!(false));
+            let requests = server.received_requests().await.expect("recorded");
+            assert!(
+                sample_requests(&requests)
+                    .iter()
+                    .all(|b| b.contains("replaceRegexpOne")),
+                "the sample must never reach ClickHouse unmasked"
+            );
+            Ok(())
+        }
+
+        /// `catalog:read` alone shows the table's shape, never its rows:
+        /// the sample is not even queried, and the body says why it is
+        /// empty. The masked flags still come back — they are policy.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_withholds_sample_rows_without_query_read(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let (status, body) = detail_as(&pool, &server, analyst("catalog:read")).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], json!([]));
+            assert_eq!(body["sampleRestricted"], json!(true));
+            assert_eq!(body["schema"][1]["masked"], json!(true));
+            let requests = server.received_requests().await.expect("recorded");
+            assert!(
+                sample_requests(&requests).is_empty(),
+                "no sample query may run for a caller without query:read"
+            );
+            Ok(())
+        }
+
+        /// The schema versions the console recorded for a Silver or Gold
+        /// table (ADR 0015) come on the detail body, and a page view only
+        /// reads them. It sits here for the helpers this module already has.
+        mod schema_versions {
+            #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+            use super::*;
+
+            /// `detail` for `id` as an analyst of the catalog tenant, over a
+            /// mock engine that also answers what `mock_clickhouse` does.
+            async fn detail_of(
+                pool: &lakehouse_store::PgPool,
+                server: &MockServer,
+                id: &str,
+            ) -> (StatusCode, Value) {
+                mock_clickhouse(server).await;
+                let mut env = HashMap::new();
+                env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+                env.insert("CH_URL".to_owned(), server.uri());
+                env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+                let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+                let resp = detail(
+                    State(state),
+                    Extension(analyst("catalog:read, query:read")),
+                    HeaderMap::new(),
+                    Path(id.to_owned()),
+                )
+                .await
+                .expect("detail answers");
+                response_json(resp).await
+            }
+
+            /// Two stored versions of one table, as the store read answers them.
+            async fn mount_store(server: &MockServer) {
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(ch_json(
+                        &[
+                            ("version", "UInt32"),
+                            ("columns", "String"),
+                            ("observed", "String"),
+                        ],
+                        &json!([
+                            {
+                                "version": 1,
+                                "columns": r#"[["id","UInt64"]]"#,
+                                "observed": "2026-10-01T08:00:00Z",
+                            },
+                            {
+                                "version": 2,
+                                "columns": r#"[["id","UInt64"],["email","String"]]"#,
+                                "observed": "2026-10-03T09:30:00Z",
+                            },
+                        ]),
+                    ))
+                    .mount(server)
+                    .await;
+            }
+
+            async fn requests_of(server: &MockServer) -> Vec<String> {
+                server
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                    .collect()
+            }
+
+            fn recorded_versions() -> Value {
+                json!([
+                    {
+                        "version": 2,
+                        "at": "2026-10-03T09:30:00Z",
+                        "change": "Added email (String)",
+                        "current": true,
+                    },
+                    {
+                        "version": 1,
+                        "at": "2026-10-01T08:00:00Z",
+                        "change": "First recorded with 1 column",
+                        "current": false,
+                    },
+                ])
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_silver_detail_carries_the_recorded_versions_newest_first(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                mount_store(&server).await;
+                let (status, body) = detail_of(&pool, &server, "silver.orders").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], recorded_versions());
+                let requests = requests_of(&server).await;
+                assert!(
+                    requests
+                        .iter()
+                        .any(|b| b.contains("WHERE table_key = 'silver.orders'")),
+                    "the versions are read under the database and table the page serves"
+                );
+                // A page view only reads: nothing was created or recorded.
+                assert!(
+                    requests
+                        .iter()
+                        .all(|b| !b.contains("INSERT") && !b.contains("CREATE")),
+                    "a read must not write"
+                );
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_gold_detail_reads_its_versions_under_the_serving_key(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                mount_store(&server).await;
+                let (status, body) = detail_of(&pool, &server, "serving.mart_x").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], recorded_versions());
+                assert!(
+                    requests_of(&server)
+                        .await
+                        .iter()
+                        .any(|b| b.contains("WHERE table_key = 'serving.mart_x'"))
+                );
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_failed_read_of_the_store_leaves_the_detail_an_empty_list(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(
+                        ResponseTemplate::new(500)
+                            .set_body_string("Code: 999. DB::Exception: secret upstream text"),
+                    )
+                    .mount(&server)
+                    .await;
+                let (status, body) = detail_of(&pool, &server, "silver.orders").await;
+
+                assert_eq!(status, StatusCode::OK, "the page still loads");
+                assert_eq!(body["schemaVersions"], json!([]));
+                assert!(
+                    !body.to_string().contains("secret upstream text"),
+                    "upstream error text never reaches the response"
+                );
+                // The rest of the body is untouched by the failed read.
+                assert_eq!(body["tableKey"], json!("silver.orders"));
+                Ok(())
+            }
+
+            #[sqlx::test(migrations = "../../migrations")]
+            async fn a_store_that_does_not_exist_yet_leaves_the_detail_an_empty_list(
+                pool: lakehouse_store::PgPool,
+            ) -> sqlx::Result<()> {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(body_string_contains("FROM console.table_schema_version"))
+                    .respond_with(ResponseTemplate::new(404).set_body_string(
+                        "Code: 60. DB::Exception: Table console.table_schema_version does not exist. (UNKNOWN_TABLE)",
+                    ))
+                    .mount(&server)
+                    .await;
+                let (status, body) = detail_of(&pool, &server, "serving.mart_x").await;
+
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["schemaVersions"], json!([]));
+                Ok(())
+            }
         }
     }
 }

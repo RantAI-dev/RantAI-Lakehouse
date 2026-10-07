@@ -19,7 +19,7 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{AuditFilter, NewAuditEvent, insert, list};
+use lakehouse_store::audit::{AuditFilter, NewAuditEvent, insert, list, list_for_resources};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -222,5 +222,48 @@ async fn insert_with_unknown_run_id_is_a_foreign_key_violation(pool: PgPool) -> 
     event.run_id = Some("run-does-not-exist".to_owned());
     let err = insert(&pool, event).await.unwrap_err();
     assert!(matches!(err, StoreError::ForeignKeyViolation));
+    Ok(())
+}
+
+/// One asset is recorded under several ids; its history is every event
+/// under any of them, of that resource kind only, newest first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_for_resources_gathers_one_kind_across_several_ids(pool: PgPool) -> sqlx::Result<()> {
+    let event = |kind: &str, id: &str, action: &str| NewAuditEvent {
+        action: action.to_owned(),
+        resource_kind: Some(kind.to_owned()),
+        resource_id: Some(id.to_owned()),
+        outcome: "executed".to_owned(),
+        ..Default::default()
+    };
+    insert(&pool, event("catalog", "demo-orders", "catalog.annotate"))
+        .await
+        .unwrap();
+    insert(
+        &pool,
+        event("catalog", "bronze.demo_orders", "quality.rule_create"),
+    )
+    .await
+    .unwrap();
+    insert(&pool, event("catalog", "silver.other", "catalog.annotate"))
+        .await
+        .unwrap();
+    insert(&pool, event("connector", "demo-orders", "connector.test"))
+        .await
+        .unwrap();
+
+    let ids = ["demo-orders".to_owned(), "bronze.demo_orders".to_owned()];
+    let found = list_for_resources(&pool, "catalog", &ids, 50)
+        .await
+        .unwrap();
+    let actions: Vec<&str> = found.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(actions, vec!["quality.rule_create", "catalog.annotate"]);
+
+    assert!(
+        list_for_resources(&pool, "catalog", &[], 50)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     Ok(())
 }

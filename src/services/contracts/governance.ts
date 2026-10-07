@@ -43,11 +43,27 @@ export type QualityRule = {
   dimension: string
   threshold: string
   severity: Severity
-  // `null` until something actually evaluates the rule — WS1 finding J18,
-  // no evaluator exists anywhere in the workspace yet.
+  // `null` until the rule is run (`POST /api/governance/quality/{id}/run`)
+  // — never a placeholder verdict.
   lastStatus: CheckStatus | null
   // `null` for the same reason as `lastStatus`.
   lastRunAt: string | null
+  /** What the latest run measured, e.g. "97.2% not null". Authored rules only. */
+  lastValue?: string | null
+  /**
+   * Whether the rule's threshold is written in the form the evaluator
+   * reads; `hint` says how to write one when it is not. Absent on a
+   * verdict a quality job recorded, which is not run from here.
+   */
+  evaluable?: boolean
+  hint?: string | null
+}
+
+/** What one run of a rule found (`routes::quality::run_rule`). */
+export type QualityRunResult = {
+  id: string
+  status: CheckStatus
+  value: string
 }
 
 export type LineageEdge = {
@@ -107,6 +123,13 @@ export type CreateQualityRuleInput = {
   name: string
   asset: string
   dimension: string
+  threshold: string
+  severity: Severity
+}
+
+/** What rewriting a rule may change; its name stays. */
+export type UpdateQualityRuleInput = {
+  asset: string
   threshold: string
   severity: Severity
 }
@@ -177,10 +200,30 @@ export interface GovernanceService {
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
   listReplicationSlots(signal?: AbortSignal): Promise<ReplicationSlot[]>
   createPolicy(input: CreatePolicyInput, signal?: AbortSignal): Promise<Policy>
+  /**
+   * Enforce a policy (`"ready"`) or stop enforcing it (`"draft"`); needs
+   * `policy:write`. It applies from the next query on.
+   */
+  setPolicyStatus(id: string, status: "ready" | "draft", signal?: AbortSignal): Promise<Policy>
+  /** Remove a policy, enforced or not; needs `policy:write`. */
+  deletePolicy(id: string, signal?: AbortSignal): Promise<void>
   createQualityRule(
     input: CreateQualityRuleInput,
     signal?: AbortSignal
   ): Promise<QualityRule>
+  /** Evaluate one authored rule now; needs `query:read`. */
+  runQualityRule(id: string, signal?: AbortSignal): Promise<QualityRunResult>
+  /**
+   * Rewrite an authored rule; needs `governance:write`. Changing its table
+   * or threshold clears the results recorded for it.
+   */
+  updateQualityRule(
+    id: string,
+    input: UpdateQualityRuleInput,
+    signal?: AbortSignal
+  ): Promise<QualityRule>
+  /** Remove an authored rule and its recorded runs; needs `governance:write`. */
+  deleteQualityRule(id: string, signal?: AbortSignal): Promise<void>
   createClassificationRule(
     input: CreateClassificationRuleInput,
     signal?: AbortSignal
@@ -189,4 +232,11 @@ export interface GovernanceService {
   listDatasetSla(signal?: AbortSignal): Promise<DatasetSla[]>
   /** Author or replace one table's freshness SLA — `PUT /api/governance/sla`. */
   putDatasetSla(input: DatasetSla, signal?: AbortSignal): Promise<DatasetSla>
+  /** Remove a table's freshness SLA; needs `governance:write`. */
+  deleteDatasetSla(tableName: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Remove a classification rule; needs `governance:write`. An older rule
+   * for the same asset or column applies again, or the default level.
+   */
+  deleteClassificationRule(id: string, signal?: AbortSignal): Promise<void>
 }

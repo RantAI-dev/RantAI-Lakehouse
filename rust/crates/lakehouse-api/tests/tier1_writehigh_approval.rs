@@ -90,9 +90,11 @@ async fn delete_connector_creates_a_pending_approval_and_does_not_delete() {
     // A real connector row, so "still present after the call" is a
     // meaningful assertion rather than vacuously true.
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, health, environment, tenant, host, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, health, environment, tenant, host, \
          secret_ref, residency, capabilities, owner) VALUES \
-         ('conn-t1', 'Test Connector', 'PostgreSQL', 'source', 'healthy', 'production', \
+         ('conn-t1', '11111111-1111-4111-8111-000000000001', \
+         'Test Connector', 'PostgreSQL', 'source', 'healthy', 'production', \
          'Meridian', 'db:5432', 'env:PW', '', '{}', 'ops@meridian.example')",
     )
     .execute(&pool)

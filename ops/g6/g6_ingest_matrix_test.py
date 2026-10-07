@@ -99,6 +99,16 @@ GATE_SECRETS_DIR = "/gate-secrets"
 FILE_REF_PREFIX = "file:/run/secrets/connector_"
 
 API = requests.Session()
+# The tenant every connector of this run is created in; set by
+# `step_ensure_tenant` right after login.
+TENANT_ID = ""
+# The tenant that owns the seeded connectors this gate drives
+# (`conn-pg-lakehouse`; `rust/migrations/0042_tenant_provisioning.sql`
+# backfills the seeded connectors to the seed tenant `meridian-group`,
+# `0002_seed_identity.sql`). Per-connector routes answer only for a
+# connector in one of the caller's tenants, so the account must be a member
+# of this one, and the gate's own connectors are created in it too.
+GATE_TENANT_SLUG = "meridian-group"
 
 
 class G6Failure(Exception):
@@ -173,6 +183,55 @@ def step_login() -> None:
         if not relogin.ok:
             raise G6Failure(f"re-login after rotation failed: {relogin.status_code} {relogin.text}")
     print("[g6] logged in as bootstrap admin")
+
+
+def _me_tenant_ids() -> list[str]:
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G6Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def step_ensure_tenant() -> None:
+    """Make sure the logged-in account belongs to `GATE_TENANT_SLUG`, and
+    remember that tenant's id for creating the gate's connectors.
+
+    The bootstrap admin of a fresh database belongs to no tenant, and a
+    connector created by an account with no tenant is stored with no tenant
+    id, so every `/api/connectors/{id}/*` route answers 404 for it (per-
+    connector routes are tenant-scoped, `ensure_connector_in_tenants`: the
+    connector's tenant must be one of the caller's). The seeded
+    `conn-pg-lakehouse` the matrix also runs belongs to `meridian-group`
+    (0042), so that is the tenant the account joins, even when it already
+    has others: with `PUT /api/identity/users/{id}/tenants/{tenant_id}`
+    (the unrestricted admin may add itself to any tenant), then
+    `/api/auth/me` is read again to confirm. Membership is read per
+    request, so no new login. An account already in it changes nothing.
+
+    Duplicated, not shared, in ops/g6/g6_linklocal_test.py: the two gates
+    share no module (see the module docstring)."""
+    global TENANT_ID
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G6Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise G6Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
+    gate_tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if gate_tenant is None:
+        raise G6Failure(
+            f"tenant {GATE_TENANT_SLUG!r} does not exist: it owns the seeded connector "
+            "conn-pg-lakehouse (0042_tenant_provisioning.sql) this gate runs"
+        )
+    if gate_tenant["id"] not in _me_tenant_ids():
+        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{gate_tenant['id']}", timeout=10)
+        if not added.ok:
+            raise G6Failure(f"add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}")
+        if gate_tenant["id"] not in _me_tenant_ids():
+            raise G6Failure(f"the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it")
+        print(f"[g6] added the account to tenant {GATE_TENANT_SLUG!r}")
+    TENANT_ID = gate_tenant["id"]
 
 
 def _seed_mysql_fixture() -> None:
@@ -334,7 +393,7 @@ def _create_connector(*, name: str, kind: str, host: str, credential: dict) -> d
         f"{API_URL}/api/connectors",
         json={
             "name": name, "type": kind, "direction": "source", "host": host, "credential": credential,
-            "environment": "production", "tenant": "g6", "residency": "", "capabilities": [],
+            "environment": "production", "tenant": "g6", "tenantId": TENANT_ID, "residency": "", "capabilities": [],
         },
         timeout=10,
     )
@@ -807,6 +866,7 @@ def main() -> int:
     try:
         step_wait_for_services()
         step_login()
+        step_ensure_tenant()
         step_ingest_matrix()
         step_column_gate_rejects_an_unsupported_column()
         step_cdc_reports_unsupported_not_a_launch()

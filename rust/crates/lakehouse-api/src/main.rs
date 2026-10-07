@@ -14,11 +14,13 @@ mod config;
 mod connector_deprovision;
 mod connector_discover;
 mod connector_probe;
+mod connector_secret_store;
 mod error;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;
 mod health;
+mod internal_hosts;
 mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
@@ -27,12 +29,15 @@ mod pipeline_source;
 mod policy;
 mod policy_engine;
 mod routes;
+mod rustfs_client;
 mod sql_guard;
 mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
 mod transform_grammar;
+mod upload_parse;
+mod upload_store;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
@@ -108,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
     // `bootstrap_ingest_run_service`'s doc comment for what happens when
     // it's unset, and why this identity is scoped to `ingest:read` only.
     bootstrap_ingest_run_service(&state).await;
+
+    // ADR 0015: record the columns of the Silver and Gold tables as they are
+    // now, in the background — an engine that is not reachable yet is a
+    // warning in the log, and the alerts tick tries again.
+    routes::schema_versions::spawn_pass(&state);
 
     // Gold-publish-per-mart plan T1: same shape, for Dagster's nightly
     // Gold export schedule (`dagster/dispar_orchestrate/gold_export.py`),

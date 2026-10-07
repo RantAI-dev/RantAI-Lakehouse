@@ -12,7 +12,10 @@ mod alerts;
 pub mod auth;
 mod authored_pipelines;
 mod catalog;
+mod catalog_governance;
+mod catalog_profile;
 mod catalog_query;
+mod catalog_source;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
@@ -29,14 +32,17 @@ mod notifications;
 mod ops;
 mod overview;
 mod pipelines;
+mod quality;
 mod query;
+pub(crate) mod schema_versions;
 mod storage;
 pub(crate) mod support;
+mod uploads;
 
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -95,6 +101,15 @@ fn auth_router() -> Router<AppState> {
 /// [`route_timeout`]).
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `/api/uploads`'s timeout. `POST /api/uploads` receives up to 50 MB
+/// ([`uploads::MAX_UPLOAD_BYTES`]) before it can answer, and a request that is
+/// still sending when the deadline passes is cut off mid-file. Five minutes
+/// lets a slow link finish: it is a bound for a slow link, not a measurement
+/// (50 MiB is about 84 seconds at 5 Mbit/s, which is arithmetic, and nothing
+/// here measured any link). `GET /api/uploads` shares the path and so the
+/// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
+const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
@@ -108,6 +123,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// | `/api/query/run`                | 60               |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
+/// `/api/uploads` has no TypeScript handler to mirror and takes
+/// [`UPLOAD_REQUEST_TIMEOUT`] (300), for the reason given there.
+///
 /// The timeout is NOT uniform in the TypeScript — `ai/chat`'s 120s and
 /// `agent/query`'s 90s cover legitimate multi-round LLM tool loops that a
 /// blanket 60s bound would 408 mid-flight. Matched on `req.uri().path()`
@@ -118,6 +136,7 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/agent/query" => Duration::from_secs(90),
+        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -344,6 +363,16 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // Evaluates one authored quality rule on request. Three segments
+        // deep, so it cannot collide with the `{kind}` capture.
+        .route(
+            "/api/governance/quality/{id}/run",
+            axum::routing::post(quality::run_rule),
+        )
+        .route(
+            "/api/governance/quality/{id}",
+            axum::routing::put(quality::update_rule).delete(quality::delete_rule),
+        )
         .route(
             // A dedicated route (WS3 item 17), mounted alongside `lineage`
             // immediately above — never a seventh `{kind}` dispatch value
@@ -353,7 +382,7 @@ fn governance_static_router() -> Router<AppState> {
         )
         .route(
             "/api/governance/policies",
-            get(governance::list_policies).post(governance::create_policy),
+            get(governance::list_policies).post(governance::create_policy_route),
         )
         // WS7 item A5: real policy impact preview (closes WS1 task 12's
         // deferred half).
@@ -361,10 +390,26 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/policies/preview",
             axum::routing::post(governance::preview_policy),
         )
+        .route(
+            "/api/governance/policies/{id}",
+            axum::routing::delete(governance::delete_policy),
+        )
+        .route(
+            "/api/governance/policies/{id}/status",
+            axum::routing::put(governance::set_policy_status),
+        )
         // WS5 item E1 (Y6): dataset freshness SLA.
         .route(
             "/api/governance/sla",
             get(governance::get_sla).put(governance::put_sla),
+        )
+        .route(
+            "/api/governance/sla/{table}",
+            axum::routing::delete(governance::delete_sla),
+        )
+        .route(
+            "/api/governance/classification/{id}",
+            axum::routing::delete(governance::delete_classification_rule),
         )
 }
 
@@ -410,7 +455,60 @@ fn overview_alerts_router() -> Router<AppState> {
 
 /// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
-fn connectors_router() -> Router<AppState> {
+///
+/// Every `/api/connectors/{id}/*` route sits behind
+/// [`connectors::require_connector_in_tenants`]: the caller must belong to
+/// the connector's tenant. `PUT .../tenant` stays outside it — it is
+/// identity administration (`identity:write`), and the only way a
+/// connector with no tenant gets one.
+fn connectors_router(state: &AppState) -> Router<AppState> {
+    let per_connector = Router::new()
+        .route(
+            "/api/connectors/{id}",
+            get(connectors::detail)
+                .patch(connectors::update)
+                .delete(connectors::delete),
+        )
+        .route(
+            "/api/connectors/{id}/test",
+            axum::routing::post(connectors::test_connection),
+        )
+        .route(
+            "/api/connectors/{id}/probe-history",
+            get(connectors::probe_history),
+        )
+        .route(
+            "/api/connectors/{id}/secret",
+            axum::routing::put(connectors::rotate_secret),
+        )
+        .route(
+            "/api/connectors/{id}/credential",
+            axum::routing::put(connectors::set_credential),
+        )
+        .route(
+            "/api/connectors/{id}/discover",
+            axum::routing::post(connectors::discover),
+        )
+        .route(
+            "/api/connectors/{id}/debezium-properties",
+            get(connectors::debezium_properties),
+        )
+        .route(
+            "/api/connectors/{id}/ingest-spec",
+            get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
+        )
+        .route(
+            "/api/connectors/{id}/ingest/run",
+            axum::routing::post(connectors::ingest_run),
+        )
+        .route(
+            "/api/connectors/{id}/ingest/runs",
+            get(connectors::ingest_run_history),
+        )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            connectors::require_connector_in_tenants,
+        ));
     Router::new()
         .route(
             "/api/connectors",
@@ -436,44 +534,49 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/types",
             get(connectors::list_types),
         )
-        .route(
-            "/api/connectors/{id}",
-            get(connectors::detail).delete(connectors::delete),
-        )
-        .route(
-            "/api/connectors/{id}/test",
-            axum::routing::post(connectors::test_connection),
-        )
-        .route(
-            "/api/connectors/{id}/probe-history",
-            get(connectors::probe_history),
-        )
-        .route(
-            "/api/connectors/{id}/secret",
-            axum::routing::put(connectors::rotate_secret),
-        )
-        .route(
-            "/api/connectors/{id}/discover",
-            axum::routing::post(connectors::discover),
-        )
-        .route(
-            "/api/connectors/{id}/debezium-properties",
-            get(connectors::debezium_properties),
-        )
-        .route(
-            "/api/connectors/{id}/ingest-spec",
-            get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
-        )
-        .route(
-            "/api/connectors/{id}/ingest/run",
-            axum::routing::post(connectors::ingest_run),
-        )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
             "/api/connectors/{id}/tenant",
             axum::routing::put(connectors::assign_connector_tenant),
         )
+        .merge(per_connector)
+}
+
+/// The `/api/uploads/*` sub-router (ADR 0014, plan T6), shaped like
+/// [`connectors_router`].
+///
+/// Every `/api/uploads/{id}/*` route sits behind
+/// [`uploads::require_upload_in_tenants`]: the caller must belong to the
+/// upload's tenant, and another tenant's upload answers the 404 an unknown id
+/// gets. `POST /api/uploads` alone takes a larger body than axum's 2 MB
+/// default, up to the cap plus the multipart framing
+/// ([`uploads::MAX_REQUEST_BODY_BYTES`]); `.layer` on that one method router
+/// is what keeps the raised limit off every other route, `GET /api/uploads`
+/// included (it is added after the layer).
+fn uploads_router(state: &AppState) -> Router<AppState> {
+    let per_upload = Router::new()
+        .route(
+            "/api/uploads/{id}",
+            get(uploads::get).delete(uploads::delete),
+        )
+        .route("/api/uploads/{id}/preview", get(uploads::preview))
+        .route(
+            "/api/uploads/{id}/ingest",
+            axum::routing::post(uploads::ingest),
+        )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            uploads::require_upload_in_tenants,
+        ));
+    Router::new()
+        .route(
+            "/api/uploads",
+            axum::routing::post(uploads::create)
+                .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
+                .get(uploads::list),
+        )
+        .merge(per_upload)
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
@@ -492,6 +595,12 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
+        )
+        // Give an existing user a tenant. Both ids are validated inside
+        // the handler (400 when malformed, 404 when unknown).
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::put(identity::add_user_to_tenant),
         )
         .route(
             "/api/identity/roles",
@@ -595,6 +704,8 @@ pub fn router(state: AppState) -> Router {
         // that `query` is a literal path and not an asset called "query".
         .route("/api/catalog/query", get(catalog::query))
         .route("/api/catalog/{id}", get(catalog::detail))
+        .route("/api/catalog/{id}/profile", get(catalog_profile::profile))
+        .route("/api/catalog/{id}/sample", get(catalog::sample))
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
@@ -728,7 +839,10 @@ pub fn router(state: AppState) -> Router {
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
-        .merge(connectors_router())
+        .merge(connectors_router(&state))
+        // ADR 0014: files uploaded from the console and loaded into raw
+        // tables. Tenant-scoped like connectors.
+        .merge(uploads_router(&state))
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
@@ -826,6 +940,29 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// `POST /api/uploads` receives up to 50 MB: it gets the longer bound
+    /// (300 s), and only on its own path. `GET /api/uploads` shares that path
+    /// by necessity; the per-upload routes, whose handlers only read a row or
+    /// start a job, keep the default.
+    #[test]
+    fn the_upload_route_takes_five_minutes_and_the_per_upload_routes_the_default() {
+        assert_eq!(route_timeout("/api/uploads"), Duration::from_secs(300));
+        assert_eq!(UPLOAD_REQUEST_TIMEOUT, Duration::from_secs(300));
+        for per_upload in [
+            "/api/uploads/up-1",
+            "/api/uploads/up-1/preview",
+            "/api/uploads/up-1/ingest",
+            "/api/uploads/",
+            "/api/uploads/x/y",
+        ] {
+            assert_eq!(
+                route_timeout(per_upload),
+                DEFAULT_REQUEST_TIMEOUT,
+                "{per_upload}"
+            );
+        }
     }
 }
 

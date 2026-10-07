@@ -35,6 +35,7 @@ export function SheetsDialForm({
           id="sheets-dial-spreadsheet-id"
           value={dial.spreadsheetId}
           onChange={(e) => onChange({ ...dial, spreadsheetId: e.target.value })}
+          autoComplete="off"
         />
       </div>
       <div className="space-y-2">
@@ -49,6 +50,7 @@ export function SheetsDialForm({
               value={range}
               onChange={(e) => setRange(index, e.target.value)}
               placeholder="Sheet1!A1:D"
+              autoComplete="off"
             />
             {dial.ranges.length > 1 ? (
               <Button type="button" variant="outline" size="sm" onClick={() => removeRange(index)}>

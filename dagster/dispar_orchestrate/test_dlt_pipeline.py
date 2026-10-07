@@ -100,7 +100,7 @@ def test_run_bronze_ingest_pins_postgres_via_hostaddr(monkeypatch) -> None:
     monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.ssrf_guard.resolve_checked", fake_resolve_checked)
     monkeypatch.setattr(
         "dispar_orchestrate.dlt_pipeline.load_via_sink",
-        lambda source, table_name, sink_config: _FakeLoadResult(),
+        lambda source, table_name, sink_config, plan: _FakeLoadResult(),
     )
 
     run_bronze_ingest(_base_config())
@@ -183,8 +183,9 @@ class _FakePipeline:
     def __init__(self, **kwargs) -> None:
         self.materialized_rows: list[dict] = []
         self.last_trace = None
+        self.state: dict = {}
 
-    def run(self, source, table_name, table_format):
+    def run(self, source, table_name, table_format, write_disposition):
         self.materialized_rows = list(source)
         return _FakeLoadInfo()
 

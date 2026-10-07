@@ -369,8 +369,7 @@ pub async fn export(
             principal_tenant_ids: p.tenant_ids.iter().map(ToString::to_string).collect(),
         },
     );
-    let obligations =
-        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = crate::policy_engine::PolicyEngineObligations::from_state(&state);
 
     let started_at = time::OffsetDateTime::now_utc();
     let export_result = gold_export::export_mart(

@@ -167,3 +167,73 @@ def test_checking_resolver_refuses_an_address_it_cannot_evaluate_at_all():
     with checking_resolver(allow_internal_hosts=False, getaddrinfo=fake):
         with pytest.raises(SsrfBlocked, match="not an address this guard can evaluate"):
             socket.getaddrinfo("broker.invalid", 9092)
+
+
+# -- INGEST_ALLOWED_CIDRS: the narrow alternative to allowing every internal host --
+
+
+def test_resolve_checked_admits_an_address_inside_an_allowed_network():
+    resolved = resolve_checked(
+        "northwind.invalid",
+        55432,
+        allowed_cidrs="192.168.18.0/24",
+        getaddrinfo=_fake_getaddrinfo("192.168.18.205"),
+    )
+    assert resolved.ip == "192.168.18.205"
+
+
+def test_resolve_checked_refuses_an_internal_address_outside_the_allowed_networks():
+    with pytest.raises(SsrfBlocked, match="INGEST_ALLOWED_CIDRS"):
+        resolve_checked(
+            "compose.invalid",
+            5432,
+            allowed_cidrs="192.168.18.0/24",
+            getaddrinfo=_fake_getaddrinfo("172.18.0.4"),
+        )
+
+
+def test_a_single_address_allows_that_host_only():
+    resolve_checked(
+        "one.invalid", 5432, allowed_cidrs="192.168.18.205", getaddrinfo=_fake_getaddrinfo("192.168.18.205")
+    )
+    with pytest.raises(SsrfBlocked):
+        resolve_checked(
+            "neighbour.invalid", 5432, allowed_cidrs="192.168.18.205", getaddrinfo=_fake_getaddrinfo("192.168.18.202")
+        )
+
+
+@pytest.mark.parametrize("never", ["127.0.0.1", "169.254.169.254", "0.0.0.0", "224.0.0.1", "::1", "fe80::1"])
+def test_the_allowlist_never_opens_loopback_link_local_multicast_or_unspecified(never):
+    with pytest.raises(SsrfBlocked):
+        resolve_checked(
+            "sneaky.invalid", 80, allowed_cidrs="0.0.0.0/0, ::/0", getaddrinfo=_fake_getaddrinfo(never)
+        )
+
+
+def test_an_ipv4_mapped_address_matches_its_ipv4_network():
+    resolve_checked(
+        "mapped.invalid",
+        5432,
+        allowed_cidrs="192.168.18.0/24",
+        getaddrinfo=_fake_getaddrinfo("::ffff:192.168.18.205"),
+    )
+
+
+@pytest.mark.parametrize("bad", ["lan", "192.168.18.0/33", "192.168.18.5/24"])
+def test_a_malformed_allowlist_refuses_every_internal_address_and_names_the_entry(bad):
+    with pytest.raises(SsrfBlocked, match="INGEST_ALLOWED_CIDRS entry"):
+        resolve_checked("x.invalid", 5432, allowed_cidrs=bad, getaddrinfo=_fake_getaddrinfo("192.168.18.205"))
+
+
+def test_resolve_checked_reads_the_allowlist_env_var_when_not_passed_explicitly(monkeypatch):
+    monkeypatch.setenv("INGEST_ALLOWED_CIDRS", "192.168.18.0/24")
+    resolved = resolve_checked("lan.invalid", 5432, getaddrinfo=_fake_getaddrinfo("192.168.18.205"))
+    assert resolved.ip == "192.168.18.205"
+
+
+def test_checking_resolver_honours_the_allowlist_mid_context():
+    with checking_resolver(allowed_cidrs="192.168.18.0/24", getaddrinfo=_fake_getaddrinfo("192.168.18.205")):
+        assert socket.getaddrinfo("lan.invalid", 9092)[0][4][0] == "192.168.18.205"
+    with pytest.raises(SsrfBlocked):
+        with checking_resolver(allowed_cidrs="192.168.18.0/24", getaddrinfo=_fake_getaddrinfo("10.0.0.9")):
+            socket.getaddrinfo("elsewhere.invalid", 9092)

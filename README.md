@@ -320,11 +320,13 @@ usage share the same documented source docker-compose already uses:
 | `GOLD_EXPORT_RUN_TOKEN` | Shared token gating `POST`/`GET /api/gold/export/{mart}` and `GET /api/gold/exports` (same D4 shape as `ALERTS_RUN_TOKEN`; the `.../consumers` route needs only a session, no token); a session holding the `gold:export` permission always passes regardless (WS6 — this is what lets the console's "Export now" button work even when this is set for the Dagster schedule); with neither, only a service-identity principal may call it | unset | No |
 | `GOLD_EXPORT_MAX_ROWS` | Hard cap on rows a single Gold export will read/append; a mart over this fails outright (error names the mart and the cap) instead of silently truncating | `5000000` | No |
 | `GOLD_EXPORT_BATCH_SIZE` | Rows read from ClickHouse and appended to Iceberg per batch, instead of materializing the whole mart in memory at once | `20000` | No |
-| `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets | `http://localhost:9010` | No |
+| `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets, and the one the API's store for uploaded files and its RustFS health probe dial (ADR 0014). Under compose the `lakehouse-api` container does not read this `.env` value: it gets the name from `CH_RUSTFS_S3_ENDPOINT` (default `http://rustfs:9000`), because `localhost` inside a container is the container itself | `http://localhost:9010` (`http://rustfs:9000` in compose) | No |
 | `RUSTFS_S3_REGION` | Region string sent to the S3 client (RustFS does not enforce AWS region semantics, but the S3 API requires a value) | `us-east-1` | No |
 | `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
-| `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` for a static RustFS/S3 access key, used only as a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc) | unset | No |
-| `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` for the matching static secret key | unset | No |
+| `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` (ADR 0002) for a static RustFS/S3 access key: the credential the API's store for uploaded files and its RustFS health probe use (ADR 0014), and a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc). A reference, not a secret; unset, or resolving to an empty value, means uploads are "not configured" | unset (`env:UPLOAD_S3_ACCESS_KEY` in compose) | No |
+| `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` (ADR 0002) for the matching static secret key. Same notes as the access-key reference above | unset (`env:UPLOAD_S3_SECRET_KEY` in compose) | No |
+| `UPLOAD_S3_ACCESS_KEY` | Access key the default `RUSTFS_ACCESS_KEY_SECRET_REF` resolves to, for the API's store of uploaded files (ADR 0014, decision 1). DEDICATED, never `RUSTFS_ACCESS_KEY` (ADR 0002 Addendum 2). No default credential: empty means uploads answer 503 "Upload storage is not configured." Give it a credential limited to the warehouse bucket (and its `uploads/` prefix where the store supports per-prefix policies) | empty | No, but uploads do not work without it |
+| `UPLOAD_S3_SECRET_KEY` | Secret key half of the pair above | empty | No, but uploads do not work without it |
 | `TRINO_URL` | Trino coordinator base URL used only by the WS5 health probe (`GET /api/ops/services`); unset means "never probed," reported as `health: "unknown"`, never a fabricated outage for a deployment that never enables the `trino` compose profile. (Separate from the always-present, always-defaulted `trino_url` the `query.rs` Trino engine route dials — that one keeps its own `http://trino:8080` default so an unreachable Trino there stays a per-request 503, not a boot-time assumption.) | unset | No |
 | `OPENFGA_URL` | `OpenFGA` base URL used only by the WS5 health probe; unset means "never probed," reported as `health: "unknown"` — `OpenFGA` has no host port in this compose file by default, so a bare-metal or single-service deployment may have no route to it at all | unset | No |
 
@@ -386,6 +388,15 @@ issue about any of the following — they're known, not bugs:
   streaming engine** and is not relabeled as one — it's a
   change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
   instead under Governance → "Ingestion (CDC)".
+- **Uploading a file is limited to delimited text, and every column is text.**
+  The console accepts a CSV or TSV (UTF-8 or UTF-16; comma, semicolon, tab or
+  pipe) of up to 50 MB and 2,000,000 data rows, and refuses a workbook, JSON or
+  Parquet file, or anything over a limit, with the reason, never cutting a file
+  short. The table it becomes stays in the raw layer: the pipeline builder
+  cannot read raw tables yet and a dashboard reads Gold tables only. The
+  original file is kept until someone deletes the upload, and uploading needs
+  the object-storage settings and the orchestrator (see `docs/OPERATIONS.md`,
+  "Uploaded files"). It has not been run end to end on a deployed stack.
 - **`knowledge.search` is mocked.** There is no vector store or embeddings
   API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
   Postgres (`lakehouse-store::knowledge`) — only the search-query path
