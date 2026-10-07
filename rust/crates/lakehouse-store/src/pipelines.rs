@@ -297,8 +297,8 @@ pub struct PipelineVersionMeta {
     /// `pipeline_id`).
     pub version: i32,
     /// `"created" | "updated" | "restored" | "deleted" | "baseline"` —
-    /// fixed vocabulary from migration `0055`'s CHECK constraint. The
-    /// fifth value, `"baseline"`, is the migration-`0055` backfill's own
+    /// fixed vocabulary from migration `0057`'s CHECK constraint. The
+    /// fifth value, `"baseline"`, is the migration-`0057` backfill's own
     /// marker; a row's `baseline` event is by construction a synthetic
     /// insert (no real create/update/restore/delete path writes it).
     pub event: String,
@@ -364,6 +364,14 @@ impl From<VersionRow> for PipelineVersionMeta {
 /// a deleted pipeline, whose live row is gone). Pass `None` only from
 /// the `baseline` backfill migration itself; every other write path
 /// always has a live row to read from.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] when `snapshot` cannot be
+/// encoded into JSON — a programmer-error class (this crate owns the
+/// type), classified as `Unknown` -> 500 by [`crate::error::StoreError`],
+/// and never leaks serde's column/line fragments. Returns
+/// [`StoreError::Database`] for any other failure.
 async fn insert_definition_version(
     tx: &mut sqlx::PgConnection,
     pipeline_id: &str,
@@ -372,28 +380,43 @@ async fn insert_definition_version(
     changed_by: Option<Uuid>,
     tenant_id: Option<Uuid>,
 ) -> Result<(), StoreError> {
-    let snapshot_value = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
-    let row: (i32,) = sqlx::query_as(
+    // F2.10 (PR #59 review): `to_value(snapshot).unwrap_or(Value::Null)`
+    // used to silently write JSON `null` when the encode failed. A
+    // `PipelineDefinitionSnapshot` is a Rust struct this crate owns and
+    // controls, so a failure to encode is a `Version::new_v4`-class bug,
+    // not a caller-facing input error. Propagate it as a typed
+    // `StoreError::Serialization` (500, classified, never leaks serde
+    // text) so the row never gets a NULL snapshot — and the bug stops
+    // being a silent corruption.
+    let snapshot_value = serde_json::to_value(snapshot)?;
+    // F2.10 (PR #59 review): `.fetch_one` + `let _ = row;` used to be
+    // the cheap way to assert the INSERT happened without consuming a
+    // RETURNING column. `fetch_one` returns at most one row anyway, so
+    // the post-bind check was double bookkeeping — `.execute` makes the
+    // single success criterion (rows_affected == 1) explicit, which is
+    // the test `VersionRowWasInserted` (F2.10 NIT) pins at the
+    // database boundary.
+    let result = sqlx::query(
         "INSERT INTO pipeline_definition_version \
             (pipeline_id, version, snapshot, event, changed_by, tenant_id) \
          SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5 \
-           FROM pipeline_definition_version WHERE pipeline_id = $1 \
-         RETURNING version",
+           FROM pipeline_definition_version WHERE pipeline_id = $1",
     )
     .bind(pipeline_id)
     .bind(snapshot_value)
     .bind(event)
     .bind(changed_by)
     .bind(tenant_id)
-    .fetch_one(tx)
+    .execute(&mut *tx)
     .await?;
-    let _ = row; // inserted; the version row's auto-incrementing gap-free
-    // sequence is the only thing the caller would care about, and a
-    // successful INSERT is the proof. `row.0` is left unused here
-    // because every caller obtains `version` from a separate list/get
-    // call rather than threading the value back through the store
-    // function signatures (the snapshot's identity is its `version`
-    // column, not the caller's local knowledge).
+    if result.rows_affected() != 1 {
+        // A zero-rows insert cannot happen for this query (the SELECT
+        // is over a `WHERE pipeline_id = $1` predicate that matches
+        // either 0 or >= 1 row, and `COALESCE(MAX(version), 0) + 1` is
+        // defined on both). Treat the unexpected shape as a database
+        // failure so the caller still gets the right status.
+        return Err(StoreError::Database(sqlx::Error::RowNotFound));
+    }
     Ok(())
 }
 
@@ -1024,8 +1047,17 @@ pub async fn delete_pipeline(
     changed_by: Option<Uuid>,
 ) -> Result<bool, StoreError> {
     let mut tx = pool.begin().await?;
+    // F2.10 (PR #59 review): the snapshot read here used to be a plain
+    // SELECT, which let a concurrent writer race the same row between
+    // the SELECT and the DELETE that follows — a second version row
+    // written by a concurrent update would either be silently lost
+    // (captured only by this delete) or duplicated. `FOR UPDATE` takes
+    // a row lock that survives the transaction: any concurrent writer
+    // waits on it and then reads the same final state we are about to
+    // delete, so the deleted-version row's snapshot is the stable
+    // last-known state, not whatever it was at the moment of the SELECT.
     let row: Option<FullPipelineRow> = sqlx::query_as(&format!(
-        "SELECT {FULL_PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1"
+        "SELECT {FULL_PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
     .fetch_optional(&mut *tx)

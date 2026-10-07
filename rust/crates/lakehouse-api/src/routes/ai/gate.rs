@@ -221,12 +221,49 @@ pub async fn create_write_high_approval(
 /// execute. One arm per `WriteLow` tool; an unlisted tool (there is none
 /// today, but a future `WriteLow` addition that forgets to extend this
 /// falls through here rather than failing to compile) gets a generic
-/// fallback.
+/// fallback. The `trigger_pipeline` arm is the one whose summary the
+/// user actually sees — it names the pipeline id and the top-level
+/// keys of `runConfig` when one is supplied, because the
+/// `WriteHigh`-elevation call ([`effective_risk`]) only fires when
+/// `runConfig` is present, and a model confirming a call without
+/// seeing those keys would be confirming in the dark.
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
         "trigger_lakehouse_build" => {
             "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
+        }
+        "trigger_pipeline" => {
+            // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+            // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
+            // gate had no `trigger_pipeline` arm, so the user confirmed
+            // a call without seeing WHICH pipeline the copilot was
+            // about to run, or whether it carried a `runConfig`
+            // override (the latter being the operationally interesting
+            // half, because a non-default config is what elevates the
+            // tool's risk to `WriteHigh` — see [`effective_risk`]).
+            //
+            // The summary's format follows the same Indonesian one-liner
+            // shape every other `WriteLow` arm produces, with the
+            // pipeline id and the top-level keys of `runConfig` when
+            // one was supplied. Listing the KEYS (not the values)
+            // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
+            // own `configKeys` audit shape, so the chat confirmation and
+            // the audit row agree on what the run actually carried.
+            let pipeline_id = s("id");
+            match args.get("runConfig") {
+                Some(Value::Object(map)) => {
+                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    let keys_part = if keys.is_empty() {
+                        "tanpa kunci konfigurasi".to_owned()
+                    } else {
+                        format!("dengan runConfig ({})", keys.join(", "))
+                    };
+                    format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
+                }
+                _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
+            }
         }
         "create_chart" => {
             // A chart reads either a mart or a dashboard SQL source; name
@@ -349,7 +386,16 @@ pub fn decide(
     spec: &ToolSpec,
     args: &Map<String, Value>,
 ) -> Option<Value> {
-    if !is_build && spec.risk != Risk::Read {
+    // F2.9 (PR #59 review): the Ask-mode / permission gates check the
+    // STATIC risk (a Read tool must never refuse in Ask mode regardless
+    // of args), but the risk-tier branch at the bottom uses the
+    // context-dependent [`effective_risk`] — so `trigger_pipeline` with
+    // `runConfig` routes through the `WriteHigh` approval flow instead
+    // of the `WriteLow` confirmation path. Ask mode is intentionally
+    // unaffected: a non-Read call is refused in Ask mode whether the
+    // tool is `WriteLow` or `WriteHigh` in this call.
+    let effective = effective_risk(spec, args);
+    if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
     if !spec.permission.is_empty() {
@@ -358,7 +404,7 @@ pub fn decide(
             return Some(permission_refusal(spec.name, spec.permission));
         }
     }
-    match spec.risk {
+    match effective {
         Risk::Read => None,
         Risk::WriteHigh => Some(write_high_pending_marker(spec.name)),
         Risk::WriteLow => {
@@ -370,6 +416,36 @@ pub fn decide(
             }
         }
     }
+}
+
+/// F2.9 (PR #59 review): the effective risk tier for a tool call,
+/// resolved from the static [`ToolSpec::risk`] PLUS any
+/// context-dependent elevation the registry permits. Today exactly
+/// one rule:
+///
+/// - `trigger_pipeline` with a `runConfig` is `WriteHigh`, not the
+///   static `WriteLow`. A custom run config is the only way a
+///   `pipeline:write` holder can drive an `ingest_job` or `agent_run_job`
+///   with an arbitrary `connector_id` / `employee_id`, the resource
+///   the dedicated routes gate on a stricter permission for
+///   (`connector:manage` / `agent:manage`); the route layer refuses
+///   the disallowed jobs at the config-shape check, but a model that
+///   has not been steered away from the bad config still deserves a
+///   `WriteHigh` approval before the run lands. The elevation is
+///   per-call, not per-tool — a `trigger_pipeline` call without
+///   `runConfig` keeps its `WriteLow` confirmation path, the same
+///   posture every other config-less run has.
+///
+/// Pure: every input is passed in by the caller. The helper is
+/// `pub` because the `decide` / `decide_by_name` arms in this module
+/// consult it directly, and the tests in `mod tests` pin both
+/// directions (with / without `runConfig`).
+#[must_use]
+pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
+    if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
+        return Risk::WriteHigh;
+    }
+    spec.risk
 }
 
 /// [`decide`] by tool name, looking the [`ToolSpec`] up via
@@ -547,6 +623,146 @@ mod tests {
         assert!(summary.contains("Kunjungan Harian"));
         assert!(summary.contains("bar"));
         assert!(summary.contains("mart_wisman"));
+    }
+
+    /// F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    /// f2-tenant-scope-and-run-config.md` Part D): `trigger_pipeline`'s
+    /// gate summary names the id AND the top-level keys of `runConfig`
+    /// when one is supplied — a model that did not see the id or the
+    /// config keys in its confirmation was confirming in the dark. The
+    /// arm follows the existing Indonesian one-liner shape
+    /// ([`summary_for`]'s other WriteLow arms) so a UI rendering one
+    /// arm renders the other the same way.
+    ///
+    /// **Planned**: removing the `trigger_pipeline` arm from
+    /// `summary_for` makes the test fall through to the generic
+    /// `"{} is ready: …"` summary — a body that names neither the id
+    /// nor the keys.
+    #[test]
+    fn trigger_pipeline_summary_names_the_id_and_runconfig_keys() {
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("pl-orders-hourly"));
+        args.insert(
+            "runConfig".to_owned(),
+            json!({ "resources": {}, "execution": { "config": { "in_process": true } } }),
+        );
+        let summary = summary_for(spec("trigger_pipeline"), &args);
+        assert!(
+            summary.contains("pl-orders-hourly"),
+            "summary must name the pipeline id: {summary:?}"
+        );
+        // Top-level KEYS are listed (not values); the audit row carries
+        // the same shape via [`record_pipeline_audit`]'s
+        // `configKeys` column, so chat + audit agree on what the
+        // call carried.
+        assert!(
+            summary.contains("execution") && summary.contains("resources"),
+            "summary must list the top-level runConfig keys: {summary:?}"
+        );
+    }
+
+    /// F2.9 (PR #59 review): `trigger_pipeline` without `runConfig`
+    /// keeps its static `WriteLow` risk — the contextual elevation
+    /// [`effective_risk`] applies is gated on the `runConfig` key
+    /// being present as a JSON object (a null / array / string does
+    /// not elevate; the dedicated route's job-name allowlist already
+    /// refuses the dangerous ones).
+    ///
+    /// **Planned**: editing [`effective_risk`] to always return
+    /// `WriteHigh` for `trigger_pipeline` makes this test fail (the
+    /// call would be `WriteHigh` instead of `WriteLow`).
+    #[test]
+    fn trigger_pipeline_without_run_config_keeps_write_low_risk() {
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("pl-orders-hourly"));
+        let spec = spec("trigger_pipeline");
+        assert_eq!(
+            effective_risk(spec, &args),
+            Risk::WriteLow,
+            "trigger_pipeline without runConfig MUST stay WriteLow"
+        );
+        // The decision reflects the same — admin with confirmed:true
+        // gets `None` (allowed). The WriteHigh elevation would have
+        // routed through the pending-approval flow instead.
+        let perms = admin_perms();
+        assert_eq!(
+            decide(true, Some(&perms), spec, &confirmed_args()),
+            None,
+            "trigger_pipeline without runConfig + confirmed:true must dispatch normally"
+        );
+    }
+
+    /// F2.9 (PR #59 review): `trigger_pipeline` WITH a `runConfig`
+    /// object is elevated to `WriteHigh` regardless of the static
+    /// `WriteLow` registry entry — the elevation is the whole point
+    /// of F2.9 (a custom run config is what bypasses the dedicated
+    /// route's stricter permission; the approvals is the human gate
+    /// that closes that gap).
+    ///
+    /// **Planned**: editing [`effective_risk`] to ignore `runConfig`
+    /// makes this test fail (the call would be `WriteLow` and would
+    /// dispatch after a confirmed, not wait for an approval).
+    #[test]
+    fn trigger_pipeline_with_run_config_is_elevated_to_write_high() {
+        // The decision has to see the `runConfig` (the elevation is
+        // args-dependent) AND the `confirmed: true` flag (the
+        // "WriteHigh never respects confirmed" invariant the gate
+        // enforces — see `decide`'s match arm and T0.4). `confirmed_args()`
+        // alone would not trigger the elevation, so the args Map is
+        // built from scratch here.
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("pl-orders-hourly"));
+        args.insert(
+            "runConfig".to_owned(),
+            json!({ "execution": { "config": { "in_process": true } } }),
+        );
+        args.insert("confirmed".to_owned(), json!(true));
+        let spec = spec("trigger_pipeline");
+        assert_eq!(
+            effective_risk(spec, &args),
+            Risk::WriteHigh,
+            "trigger_pipeline WITH runConfig MUST be WriteHigh (elevation to F2.9)"
+        );
+        // The decision reflects the same — admin with confirmed:true
+        // STILL gets the pending marker (WriteHigh never executes
+        // through `confirmed`, only `WriteLow` does; T0.4 documented
+        // this contract). The end-to-end flow would then call
+        // [`create_write_high_approval`].
+        let perms = admin_perms();
+        let pending = decide(true, Some(&perms), spec, &args)
+            .expect("WriteHigh must never return None (i.e. must never execute) from this gate");
+        assert!(
+            is_write_high_pending(&pending),
+            "trigger_pipeline with runConfig + confirmed:true must route through approvals, not dispatch"
+        );
+    }
+
+    /// F2.9 (PR #59 review): a `trigger_pipeline` whose `runConfig` is
+    /// `null`, a string, an array, or a number does NOT elevate the
+    /// risk — the elevation is gated on `Value::Object(_)` because
+    /// the route layer's contract is "a JSON object or nothing" (a
+    /// string runs through `pipeline:write` as a YAML payload and
+    /// would be refused at the route layer anyway; same for an array
+    /// or number). Without the type guard, a model that typed the
+    /// wrong shape would inadvertently route through approvals.
+    #[test]
+    fn trigger_pipeline_with_non_object_run_config_does_not_elevate_risk() {
+        let spec = spec("trigger_pipeline");
+        for non_object in [
+            json!(null),
+            json!("ops.silver_rebuild_op.config.target_table=foo"),
+            json!(["ops"]),
+            json!(42),
+        ] {
+            let mut args = Map::new();
+            args.insert("id".to_owned(), json!("pl-orders-hourly"));
+            args.insert("runConfig".to_owned(), non_object);
+            assert_eq!(
+                effective_risk(spec, &args),
+                Risk::WriteLow,
+                "non-object runConfig MUST NOT elevate: got {args:?}"
+            );
+        }
     }
 
     /// T0.5: `WriteHigh` (`delete_chart`) is never executed by this gate,

@@ -1712,16 +1712,18 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// (WS3 plan review Z9)
 ///
 /// [`lakehouse_dagster::DgClient::launch_run_with_config`] returns
-/// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`, for
-/// a GraphQL-level launch failure (a bad job name, a
+/// `Ok(LaunchOutcome { run_id: None, failure: Some(_) })`, NOT `Err`,
+/// for a GraphQL-level launch failure (a bad job name, a
 /// `RunConfigValidationInvalid`) — exactly the branching
-/// `routes::pipelines::trigger` (`pipelines.rs:184-207`) already proves
-/// out: `Err` is reserved for transport failures and malformed GraphQL
-/// responses. This handler branches the identical way: `outcome.error`
-/// present becomes a 422 naming that error; `Err(err)` becomes a 503,
-/// classified through [`js_error`] the same way `trigger`'s own 503
-/// branch is (`DgError`'s `Display` is already sanitized — see that
-/// type's doc comment — so this is not a fourteenth Phase-1
+/// `routes::pipelines::trigger` already proves out: `Err` is reserved
+/// for transport failures and malformed GraphQL responses. This
+/// handler branches the identical way: `outcome.failure` present
+/// becomes a 422 with the fixed body string `"Dagster did not accept
+/// the ingest run"` (F2.7 — Dagster's own text was logged at the
+/// dagster crate boundary); `Err(err)` becomes a 503, classified
+/// through [`js_error`] the same way `trigger`'s own 503 branch is
+/// (`DgError`'s `Display` is already sanitized — see that type's doc
+/// comment — so this is not a fourteenth Phase-1
 /// `ApiError::Internal(err.to_string())` leak).
 ///
 /// # Errors
@@ -1758,8 +1760,15 @@ pub async fn ingest_run(
         .await
     {
         Ok(outcome) => {
-            if let Some(error) = outcome.error {
-                return Err(ApiError::Unprocessable(error).into());
+            // F2.7: `outcome.failure` is the typed `LaunchFailure`.
+            // The 422 body is the FIXED classified string — Dagster's
+            // own `message` / `errors[].message` text was logged at
+            // the dagster crate boundary.
+            if outcome.failure.is_some() {
+                return Err(ApiError::Unprocessable(
+                    "Dagster did not accept the ingest run".to_owned(),
+                )
+                .into());
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }

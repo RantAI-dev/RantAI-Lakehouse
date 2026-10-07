@@ -2693,6 +2693,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 

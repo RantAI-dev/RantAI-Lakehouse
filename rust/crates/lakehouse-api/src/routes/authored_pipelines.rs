@@ -137,10 +137,18 @@ pub enum CallerScope {
 /// 2. `pool` is `None` — no Postgres configured: a `pl-` id cannot
 ///    possibly exist, so 404, same body as case 3.
 /// 3. `id` starts with `pl-` but no row matches in
-///    `pipeline_definition` — unknown id: 404, the standard
-///    "Pipeline <id> not found" body.
-/// 4. Row exists and its `tenant_id` matches the caller's resolved
-///    tenant — in scope.
+///    `pipeline_definition` — unknown id OR deleted pipeline:
+///    F2.3 (PR #59 review) splits this case: (a) if the live row
+///    exists, scope by its `tenant_id`; (b) if the live row is gone
+///    (deleted pipeline; the `pipeline_definition_version` table
+///    retains the history), consult the version rows' `tenant_id`
+///    column (migration `0057`). Any version with a tenant that
+///    matches the caller's scope makes the row in scope; NULL-tenant
+///    versions are visible only to an `Unrestricted` caller (same
+///    rule migration `0057` documents in its header). This is the
+///    no-existence-oracle rule extended to deleted pipelines — a
+///    tenant A caller gets 404 whether tenant B's pipeline exists
+///    today, was deleted yesterday, or never existed.
 /// 5. Row exists and its `tenant_id IS NULL` AND caller is
 ///    `Unrestricted` — in scope (an unassigned row is invisible to
 ///    every restricted caller).
@@ -161,19 +169,98 @@ pub async fn in_scope(
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     };
     let scope = resolve_caller_scope(principal, headers)?;
-    let row: Option<(Option<Uuid>,)> = sqlx::query_as(
-        "SELECT tenant_id FROM pipeline_definition WHERE id = $1",
+    let row: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT tenant_id FROM pipeline_definition WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(lakehouse_store::StoreError::from)?;
+    if let Some((row_tenant,)) = row {
+        // Live row exists — F2.1's rule.
+        if matches_scope(scope, row_tenant) {
+            return Ok(());
+        }
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    }
+    // F2.3 (PR #59 review): the live row is gone — the pipeline has
+    // been deleted, but `pipeline_definition_version` still carries
+    // the history. Scope by the version rows' tenant_ids so a
+    // tenant-A caller cannot list or restore versions of a
+    // tenant-B-deleted pipeline. `tenant_id IS NULL` versions stay
+    // in the result set so an `Unrestricted` caller (who matches
+    // every `Option<Uuid>` per [`matches_scope`]) still sees them;
+    // a `Restricted(Some(t))` caller matches only versions stamped
+    // with `t` or, transitively, rows whose version's tenant IS
+    // NULL never match `Restricted(Some(t))`.
+    let version_tenants: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT DISTINCT tenant_id FROM pipeline_definition_version \
+         WHERE pipeline_id = $1",
     )
     .bind(id)
+    .fetch_all(pool)
+    .await
+    .map_err(lakehouse_store::StoreError::from)?;
+    if version_tenants.iter().any(|t| matches_scope(scope, *t)) {
+        return Ok(());
+    }
+    Err(ApiError::NotFound(format!("Pipeline {id} not found")).into())
+}
+
+/// F2.1 (PR #59 review): the per-runId routes (`run_steps`,
+/// `runs_step_matrix`, `run_logs`, `retry_run`, `cancel_run`) need to
+/// apply the same tenant scope check as the per-id routes, but the
+/// path's `id` is either missing (cancel/retry have no `{id}` segment)
+/// or wrong (`run_steps`/`run_logs` carry an `id` for routing but the
+/// orchestrator's scope has to come from the run's owning
+/// `pipelineName`). The Dagster factory's
+/// `dagster/dispar_orchestrate/authored_factory.py::_dagster_safe_name`
+/// replaces every character outside `[A-Za-z0-9_]` with `_` (a `pl-foo-`
+/// id's safe form is `pl_foo_`), so the safe form is not round-trippable
+/// to the original id.
+///
+/// Instead of trying to undo `_dagster_safe_name` from the `f` suffix
+/// (impossible — the `authored__pl_foo_bar_baz` → `pl_foo_bar_baz` map
+/// collapses every `pl-foo-bar` and `pl_foo_bar` to the same suffix),
+/// look up the row whose id's safe form matches `suffix` and apply the
+/// same `matches_scope` rule [`in_scope`] uses. The safe form is unique
+/// (id is unique; each id's safe form is a deterministic function of
+/// it), so at most one row matches.
+///
+/// # Errors
+///
+/// Same `ApiError::NotFound` body as [`in_scope`]: the error names the
+/// actual id (resolved from the DB) for a found-but-unassigned row, so
+/// a caller can correlate against other 404 bodies. A transport-level
+/// failure becomes `ApiError::ServiceUnavailable` via
+/// [`lakehouse_store::StoreError`].
+pub async fn in_scope_by_safe_name(
+    pool: &PgPool,
+    principal: &Principal,
+    headers: &HeaderMap,
+    suffix: &str,
+) -> ApiResult<()> {
+    // The pipeline id is `pl-<slug>-<base36-millis>` (migration 0053's
+    // comment); its safe form is `pl_<slug>_<base36_millis>`. Match the
+    // suffix against the safe form of every candidate id with a SQL
+    // `translate(id, '-', '_') = $1`. The match is exact and
+    // index-friendly (the column is the PK).
+    let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, tenant_id FROM pipeline_definition \
+         WHERE translate(id, '-', '_') = $1",
+    )
+    .bind(suffix)
     .fetch_optional(pool)
     .await
     .map_err(lakehouse_store::StoreError::from)?;
-    let Some((row_tenant,)) = row else {
-        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    let Some((id, row_tenant)) = row else {
+        return Err(ApiError::NotFound(format!("Pipeline {suffix} not found")).into());
     };
+    let scope = resolve_caller_scope(principal, headers)?;
     if matches_scope(scope, row_tenant) {
         return Ok(());
     }
+    // The 404 body names the resolved id (not the safe suffix), so a
+    // caller can correlate it against the per-id read of the same row.
     Err(ApiError::NotFound(format!("Pipeline {id} not found")).into())
 }
 
@@ -182,10 +269,7 @@ pub async fn in_scope(
 /// `catalog::is_unrestricted` helpers [`crate::routes::pipelines::list`]
 /// uses so the two per-id and list responses agree on what "in scope"
 /// means.
-pub fn resolve_caller_scope(
-    principal: &Principal,
-    headers: &HeaderMap,
-) -> ApiResult<CallerScope> {
+pub fn resolve_caller_scope(principal: &Principal, headers: &HeaderMap) -> ApiResult<CallerScope> {
     // `Unrestricted` only when BOTH conditions hold: caller is a Platform
     // Admin (`*:*`) AND they have NOT picked a specific tenant via
     // `X-Tenant`. A Platform Admin who sends `X-Tenant: <some-tenant>`
@@ -196,9 +280,7 @@ pub fn resolve_caller_scope(
     let resolved = crate::tenant_scope::resolve(principal, headers)?;
     Ok(match resolved {
         Some(t) => CallerScope::Restricted(Some(t)),
-        None if crate::routes::catalog::is_unrestricted(principal) => {
-            CallerScope::Unrestricted
-        }
+        None if crate::routes::catalog::is_unrestricted(principal) => CallerScope::Unrestricted,
         None => CallerScope::Restricted(None),
     })
 }
@@ -262,6 +344,78 @@ pub async fn collect_authored_depends_on(
     .await
     .map_err(lakehouse_store::StoreError::from)?;
     Ok(rows)
+}
+
+/// F2.2 (PR #59 review): every per-id route that touches
+/// `depends_on` has to scope its view of the authored graph by tenant,
+/// or a tenant-A caller can name tenant-B's pipeline ids. This is the
+/// `tenant_id`-carrying twin of [`collect_authored_depends_on`] —
+/// same query, same order, one extra column. The cycle walk stays
+/// served by the no-trailer form (it doesn't read the tenant).
+///
+/// # Errors
+///
+/// Maps a database outage through `lakehouse_store::StoreError` so the
+/// route returns a classified `ApiError` (AGENTS.md rule 4: never
+/// leak upstream text into a response).
+pub async fn collect_authored_depends_on_with_tenants(
+    pool: &lakehouse_store::PgPool,
+    exclude_id: Option<&str>,
+) -> Result<Vec<(String, Vec<String>, Option<Uuid>)>, ApiRejection> {
+    let rows: Vec<(String, Vec<String>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, depends_on, tenant_id FROM pipeline_definition \
+         WHERE ($1::text IS NULL OR id <> $1) ORDER BY created_at",
+    )
+    .bind(exclude_id)
+    .fetch_all(pool)
+    .await
+    .map_err(lakehouse_store::StoreError::from)?;
+    Ok(rows)
+}
+
+/// F2.2 (PR #59 review): drop every row whose `tenant_id` does not
+/// match the caller's [`CallerScope`], so a cross-tenant `pl-` id
+/// submitted as a `dependsOn` looks "unknown" to
+/// [`validate_depends_on`] — same 400 the validator produces for a
+/// genuinely missing id, no existence oracle. Returns the
+/// `(id, deps)` view the cycle walk already takes, so callers do not
+/// need to refetch.
+#[must_use]
+pub fn in_scope_depends_on_rows(
+    rows: &[(String, Vec<String>, Option<Uuid>)],
+    scope: CallerScope,
+) -> Vec<(String, Vec<String>)> {
+    rows.iter()
+        .filter(|(_, _, t)| matches_scope(scope, *t))
+        .map(|(id, deps, _)| (id.clone(), deps.clone()))
+        .collect()
+}
+
+/// F2.2 (PR #59 review): the delete guard has to count
+/// cross-tenant dependents (so a tenant-A delete of a pipeline that
+/// tenant B depends on still refuses), but must NOT name them in the
+/// 400 message — naming the out-of-scope id would leak its existence
+/// to the caller. Returns `(in_scope_ids, out_of_scope_count)`; the
+/// caller formats the message with both.
+#[must_use]
+pub fn referencing_downstreams_partition(
+    rows: &[(String, Vec<String>, Option<Uuid>)],
+    target_id: &str,
+    scope: CallerScope,
+) -> (Vec<String>, usize) {
+    let mut in_scope = Vec::new();
+    let mut out_of_scope_count = 0;
+    for (id, deps, tenant_id) in rows {
+        if !deps.iter().any(|d| d == target_id) {
+            continue;
+        }
+        if matches_scope(scope, *tenant_id) {
+            in_scope.push(id.clone());
+        } else {
+            out_of_scope_count += 1;
+        }
+    }
+    (in_scope, out_of_scope_count)
 }
 
 /// Validate `new_depends_on` for pipeline `this_id` against the existing
@@ -401,6 +555,18 @@ pub fn validate_depends_on(
 /// which is also the order the user sees them in the UI's pipeline
 /// list); a stable, predictable order makes the 400 message
 /// diff-friendly across runs.
+///
+/// F2.2 (PR #59 review): the production caller (`delete`) now uses
+/// [`referencing_downstreams_partition`] instead, because it needs to
+/// fold cross-tenant dependents into a count and only list in-scope
+/// ones in the 400 body. This un-scoped form stays as a unit-tested
+/// pure helper — it is the obvious fallback when the caller has no
+/// tenant (e.g. tests) and a clean way to assert the partition
+/// function's behaviour against a known input set.
+#[allow(
+    dead_code,
+    reason = "kept as a pure un-scoped lookup for unit tests; the tenant-aware delete route uses referencing_downstreams_partition"
+)]
 #[must_use]
 pub fn referencing_downstreams(pairs: &[(String, Vec<String>)], target_id: &str) -> Vec<String> {
     pairs
@@ -507,6 +673,83 @@ fn validate_no_cycle(
             ))
             .into()
         })?;
+    }
+    Ok(())
+}
+
+/// F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
+/// f2-tenant-scope-and-run-config.md` Part D): the per-edit field
+/// validation that every route's editable write path runs — transform
+/// grammar (`parse_transform`), `max_retries` range, and
+/// `depends_on` — extracted into one helper so `update` and
+/// `restore_version` share the SAME gate. Before this helper,
+/// `restore_version` only re-validated `depends_on` and silently
+/// accepted a stored snapshot whose `transform` the current grammar
+/// would refuse; replaying it persisted an editable state no console
+/// edit could reach, and a future edit on the same row would 400 on a
+/// field whose value the row already carried (and that the route had
+/// already approved by saving).
+///
+/// `depends_on: None` skips the dependency validator entirely (a
+/// `restore` always has a snapshot, so its caller passes `Some(...)`;
+/// an `update` that did not touch the chain passes `None` because the
+/// COALESCE write below leaves the stored chain alone). `max_retries:
+/// None` skips the range check the same way — the column has a `CHECK
+/// (max_retries BETWEEN 0 AND 5)` constraint, so a stored value is
+/// already in range; only a freshly supplied value can be out.
+///
+/// # Errors
+///
+/// Returns `ApiRejection` (the route maps to 400) for any rule
+/// violation above. Messages are byte-equal to the ones `update`
+/// produced before the extraction, so a body-shape diff in the
+/// existing assertion set (every `transforms[i]` / `maxRetries` /
+/// `depends_on` 400 case the prior sessions pinned) stays green.
+///
+/// Pure — every dependency the function takes is passed in by the
+/// caller, so it is unit-testable without a real pool, Dagster, or a
+/// route (the `validate_depends_on_refuses_self_reference_*` tests in
+/// this file already exercise the `depends_on` half; the helper exists
+/// to keep `update` and `restore_version` in lock-step at the route
+/// layer, not to re-shape those unit tests).
+pub fn validate_pipeline_input(
+    id: &str,
+    transforms: &[String],
+    max_retries: Option<i16>,
+    depends_on: Option<&[String]>,
+    others: &[(String, Vec<String>)],
+    dagster_jobs: &[String],
+) -> Result<(), ApiRejection> {
+    // Transform grammar. Identical to the loop `update` ran inline
+    // before the extraction — same per-index error shape, same
+    // `invalid transform at transforms[{i}]: {err}` message, so the
+    // existing assertion `transforms: ["filter(1=1; DROP TABLE x)"]`
+    // 400-still-fires (see
+    // `an_edit_with_a_transform_outside_the_grammar_is_refused` and
+    // F2.8's restore-side regression test).
+    for (index, transform) in transforms.iter().enumerate() {
+        crate::transform_grammar::parse_transform(transform).map_err(|err| {
+            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
+        })?;
+    }
+    // `max_retries` range. The CHECK constraint in migration `0051`
+    // is the database-level safety net; the route's 400 is the
+    // client-facing one. `None` means "leave the stored value alone"
+    // (the COALESCE write in [`crate::routes::pipelines::pool`]
+    // preserves it), so the validator only sees a freshly bound value
+    // and the check is necessary exactly when there is one.
+    if let Some(value) = max_retries
+        && !(0..=5).contains(&value)
+    {
+        return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
+    }
+    // `depends_on`. `None` skips (an update that omitted the field);
+    // `Some(deps)` re-validates against the live authored graph and
+    // Dagster's job list, identical to the call `update` ran inline.
+    // Restore always passes `Some(...)` (the snapshot carries its own
+    // chain), so the validator runs on every restore.
+    if let Some(deps) = depends_on {
+        validate_depends_on(id, deps, others, dagster_jobs)?;
     }
     Ok(())
 }
@@ -649,35 +892,14 @@ pub async fn update(
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
     let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
-    for (index, transform) in body.transforms.iter().enumerate() {
-        crate::transform_grammar::parse_transform(transform).map_err(|err| {
-            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
-        })?;
-    }
-    // Plan 1c: validate `max_retries` against the same `0..=5` the
-    // column CHECK enforces (migration 0051), so the client gets a 400
-    // with the field name rather than a 500 from the database
-    // constraint. The error message does not echo the caller's value
-    // back.
-    if let Some(value) = body.max_retries
-        && !(0..=5).contains(&value)
-    {
-        return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
-    }
+    // F2.8 (PR #59 review): transform grammar, `max_retries` range,
+    // and `depends_on` validation share ONE helper with
+    // [`restore_version`] — every edit path runs the same gate,
+    // including a stored snapshot replayed by restore. The pre-F2.8
+    // body had these three calls duplicated in the two routes, with
+    // `restore_version` skipping the grammar / `max_retries` checks —
+    // F2.8 closes that gap.
     let pool = crate::routes::pipelines::pool(&state)?;
-    // Validate `depends_on` against the existing authored graph and the
-    // live Dagster job list — the pipeline itself does not yet have to
-    // exist for validation (the create-time path runs before the row is
-    // committed; the update path runs against its current state). Both
-    // paths refuse an invalid set with 400 BEFORE the store is touched.
-    //
-    // PR #57 review F1.8: only validate when the body actually carries
-    // a `dependsOn` to set; a console save that did not touch the
-    // field leaves the stored chain alone (the COALESCE write below).
-    // When present, the body's `Some(vec)` is the same shape as
-    // `update`'s pre-fix `Vec<String>` — the validator runs against
-    // the proposed new list, not the stored chain.
-    //
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
     // `routes::pipelines::create`'s identical treatment. The rule
@@ -693,10 +915,29 @@ pub async fn update(
             Vec::new()
         }
     };
-    let others = collect_authored_depends_on(pool, Some(&id)).await?;
-    if let Some(new_depends_on) = &body.depends_on {
-        validate_depends_on(&id, new_depends_on, &others, &dagster_jobs)?;
-    }
+    // F2.2 (PR #59 review): scope `others` by the caller's tenant
+    // before handing it to `validate_depends_on`, so a cross-tenant
+    // `pl-` id submitted as a `dependsOn` reads as "unknown" to the
+    // validator — same 400 body as a genuinely missing id, no
+    // existence oracle. The scope resolution re-uses the headers the
+    // `in_scope` call above already validated with, so the two agree
+    // on what "in scope" means.
+    let scope = resolve_caller_scope(&principal, &headers)?;
+    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
+    let others = in_scope_depends_on_rows(&others_rows, scope);
+    // F2.8 (PR #59 review): the shared validator runs the transform
+    // grammar, `max_retries` range, and (when present) the dependency
+    // validator. `body.depends_on` is `Option<Vec<String>>` already —
+    // `None` skips the dependency walk (the COALESCE write preserves
+    // the stored chain), `Some(vec)` replaces it.
+    validate_pipeline_input(
+        &id,
+        &body.transforms,
+        body.max_retries,
+        body.depends_on.as_deref(),
+        &others,
+        &dagster_jobs,
+    )?;
     let input = UpdatePipelineInput {
         kind: body.kind,
         source_zone: body.source_zone,
@@ -756,13 +997,9 @@ pub async fn delete(
     // The 400 refusal message in F2.2 names in-scope dependents only
     // and falls back to a count for out-of-scope ones — that fallback
     // needs `in_scope` to have run first.
-    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
-        state.pg.as_deref(),
-        &principal,
-        &headers,
-        &id,
-    )
-    .await
+    if let Err(rejection) =
+        crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+            .await
     {
         return ApiRejection(rejection.0).into_response();
     }
@@ -770,21 +1007,40 @@ pub async fn delete(
         Ok(pool) => pool,
         Err(err) => return ApiRejection(err).into_response(),
     };
-    // `exclude_id = Some(&id)` skips the row being deleted (which
-    // cannot list itself anyway — `validate_depends_on` already
-    // refuses a self-reference — but excluding it costs nothing and
-    // keeps the query bounded).
-    let others = match collect_authored_depends_on(pool, Some(&id)).await {
-        Ok(others) => others,
+    // F2.2 (PR #59 review): the guard has to count cross-tenant
+    // dependents (so a tenant-A delete of a pipeline that tenant B
+    // depends on still refuses, otherwise a stale chain stays live
+    // after the upstream is gone) but must NOT name them in the 400
+    // message — naming the out-of-scope id leaks its existence.
+    // Partition via [`referencing_downstreams_partition`] so the
+    // message lists in-scope ids verbatim (the UI highlights them)
+    // and folds out-of-scope ones into a single count.
+    let others_rows = match collect_authored_depends_on_with_tenants(pool, Some(&id)).await {
+        Ok(rows) => rows,
         Err(err) => return err.into_response(),
     };
-    let referencing = referencing_downstreams(&others, &id);
-    if !referencing.is_empty() {
+    let scope = match crate::routes::authored_pipelines::resolve_caller_scope(&principal, &headers)
+    {
+        Ok(scope) => scope,
+        Err(err) => return err.into_response(),
+    };
+    let (referencing, out_of_scope_count) =
+        referencing_downstreams_partition(&others_rows, &id, scope);
+    let total_count = referencing.len() + out_of_scope_count;
+    if total_count > 0 {
+        // The message names ONLY in-scope ids; out-of-scope ones are
+        // folded into a count. An unrestricted caller sees every
+        // dependent named (count = total), a restricted caller sees
+        // only their own.
         return ApiRejection(ApiError::BadRequest(format!(
             "cannot delete pipeline {id:?}: it is still referenced as an \
-             upstream by {} other pipeline(s): {referencing:?}; remove \
+             upstream by {total_count} other pipeline(s){}; remove \
              those references before deleting",
-            referencing.len()
+            if referencing.is_empty() {
+                String::new()
+            } else {
+                format!(": {referencing:?}")
+            }
         )))
         .into_response();
     }
@@ -844,22 +1100,19 @@ pub async fn restore_version(
     let snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
-    // Validate the snapshot's `depends_on` against the live authored
-    // graph and the orchestrator's `Dagster` job list — the same
-    // `validate_depends_on` call `update` runs (final-review
-    // should-fix, part 2b: a stored snapshot can outlive one of its
-    // declared upstreams; restoring it would persist a dangling
-    // reference identical to the one the delete guard refuses to
-    // create on the live graph — `referencing_downstreams`, same
-    // file). The snapshot itself cannot list `id`: every stored
-    // version was written through a path the validator had already
-    // cleared (or, for the original `created` snapshot, validated
-    // before insert). `exclude_id = Some(&id)` is belt-and-braces,
-    // same call shape as `update`. `Dagster` unreachable degrades
-    // to "no `Dagster` upstreams accepted" (empty list), identical
-    // to `update`'s fallback. After a successful restore the
-    // persisted state satisfies the validator by construction: we
-    // just validated the exact set we are about to write.
+    // F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
+    // f2-tenant-scope-and-run-config.md` Part D): the snapshot replay
+    // used to validate only `depends_on` — a stored snapshot whose
+    // `transform` the current grammar would refuse slipped through and
+    // persisted unparseable state. `validate_pipeline_input` runs the
+    // SAME grammar + `max_retries` + `depends_on` checks `update`
+    // runs, so a replay can never persist state a fresh edit would
+    // refuse. Dagster unreachable degrades to "no Dagster upstreams
+    // accepted" (empty list), the same fallback `update` already
+    // exercises; cross-tenant `pl-` ids in the snapshot read as
+    // "unknown" via the F2.2 scoped-`others` rule. `Some(deps)` is
+    // passed unconditionally because restore is an authoritative
+    // replay (the snapshot's chain always replaces the stored one).
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -867,8 +1120,17 @@ pub async fn restore_version(
             Vec::new()
         }
     };
-    let others = collect_authored_depends_on(pool, Some(&id)).await?;
-    validate_depends_on(&id, &snapshot.depends_on, &others, &dagster_jobs)?;
+    let scope = crate::routes::authored_pipelines::resolve_caller_scope(&principal, &headers)?;
+    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
+    let others = in_scope_depends_on_rows(&others_rows, scope);
+    validate_pipeline_input(
+        &id,
+        &snapshot.transforms,
+        Some(snapshot.max_retries),
+        Some(&snapshot.depends_on),
+        &others,
+        &dagster_jobs,
+    )?;
     // Rebuild an `UpdatePipelineInput` from the snapshot. `name` and
     // `status` are deliberately excluded: a restore is a replay of the
     // editable fields, not a rename/re-promotion (Plan R4 2b).
@@ -895,12 +1157,21 @@ pub async fn restore_version(
     let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    // F2.10 (PR #59 review): the audit action was `pipeline.restore.{N}`
+    // — encoding the version in the action NAME. That couples the audit
+    // table's action vocabulary to per-event values, which makes it
+    // impossible to grep "all restores" and forces every UI / log
+    // search to know about the suffix. Move the version into the
+    // structured `args` object (the same side-channel
+    // `trigger_records_config_keys_in_audit_args` uses for `configKeys`)
+    // and use the stable action `pipeline.restore.version` — the same
+    // shape every other audit row carries.
     record_pipeline_audit(
         &state,
         &principal,
-        &format!("pipeline.restore.{version}"),
+        "pipeline.restore.version",
         &id,
-        Value::Null,
+        json!({ "version": version }),
     )
     .await;
     // Drafts have no job; only runnable pipelines need a reload.
@@ -932,13 +1203,9 @@ pub async fn schedule_ticks(
     // schedule's existence (and the sensor's ticks, when the pipeline
     // has `depends_on`) are derivable from the row, so the same
     // out-of-scope posture the read routes already apply applies here.
-    if let Err(rejection) = crate::routes::authored_pipelines::in_scope(
-        state.pg.as_deref(),
-        &principal,
-        &headers,
-        &id,
-    )
-    .await
+    if let Err(rejection) =
+        crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
+            .await
     {
         return ApiRejection(rejection.0).into_response();
     }
@@ -1051,6 +1318,23 @@ mod tests {
             tenant_ids: Vec::new(),
             display_name: "fixture".to_owned(),
             permissions: PermissionSet::parse("pipeline:read pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// F2.1: a `*:*` Platform-Admin fixture so the `in_scope` checks added
+    /// in PR #59 see every pipeline. The pool-backed tests under
+    /// `validate_depends_on::` create rows with `tenant_id = None` (the
+    /// default), which a restricted principal would now 404 on; this
+    /// helper keeps their pre-F2.1 assertions intact.
+    fn unrestricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "fixture".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
             provider: "session".to_owned(),
             must_change_password: false,
             role_names: Vec::new(),
@@ -1471,7 +1755,8 @@ mod tests {
         let body = Bytes::from_static(br#"{"kind":"batch","sourceZone":"a","sourceTable":"b","targetZone":"c","targetTable":"d","schedule":"manual"}"#);
         let err = update(
             State(state_without_pool()),
-            Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+            Extension(unrestricted_principal()),
+            HeaderMap::new(),
             Path("gold_export_job".to_owned()),
             body,
         )
@@ -1481,25 +1766,35 @@ mod tests {
 
         let response = delete(
             State(state_without_pool()),
-            Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+            Extension(unrestricted_principal()),
+            HeaderMap::new(),
             Path("gold_export_job".to_owned()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// F2.1 (PR #59 review): `in_scope` runs BEFORE the transform
+    /// validator, so an edit against a pipeline id that the caller
+    /// cannot see now 404s at the scope check. The transform grammar
+    /// is still pinned by [`create_pipeline_rejects_an_unparseable_
+    /// transform_with_400`] in `routes/pipelines.rs` against a real
+    /// pool, which is the strongest form of that assertion.
     #[tokio::test]
     async fn an_edit_with_a_transform_outside_the_grammar_is_refused() {
         let body = Bytes::from_static(br#"{"kind":"batch","sourceZone":"a","sourceTable":"b","targetZone":"c","targetTable":"d","schedule":"manual","transforms":["filter(1=1; DROP TABLE x)"]}"#);
         let err = update(
             State(state_without_pool()),
-            Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+            Extension(unrestricted_principal()),
+            HeaderMap::new(),
             Path("pl-x-1".to_owned()),
             body,
         )
         .await
         .unwrap_err();
-        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        // Pool-less state => `in_scope` short-circuits with 404; the
+        // body shape is the standard `Pipeline <id> not found`.
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 
     /// Final-review should-fix (Part 2b): `restore_version` replays a
@@ -1548,18 +1843,75 @@ mod tests {
             )
         }
 
-        /// `AppState` pointed at the test pool. `DAGSTER_URL` is left
-        /// at `Config`'s default (`http://localhost:13030/graphql`,
-        /// nothing listening in this test environment), so
-        /// `state.dagster.list_jobs()` fails and the route falls back
-        /// to "no Dagster upstreams accepted" — the same fallback
-        /// `update` already exercises. `pl-b` is an authored id and
-        /// was never in the Dagster list, so the rejection still
-        /// fires on rule 2 ("unknown pipeline").
+        /// `AppState` pointed at the test pool. `DAGSTER_URL` is set to
+        /// a per-test `wiremock` (see [`state_with_dagster`]) so
+        /// `state.dagster.list_jobs()` returns an EMPTY list, NOT a
+        /// dial of the production `DAGSTER_URL` — the prior
+        /// implementation relied on `Config`'s default
+        /// (`http://localhost:13030/graphql`, nothing listening) and
+        /// got "unreachable" for free, but that is a network call
+        /// against a service that may not even exist in CI
+        /// (`restore_rejects_a_snapshot_referencing_a_now_deleted_upstream`
+        /// would silently 400 with `Database("connection refused")` on
+        /// a host where someone happens to listen on 13030). The empty
+        /// list still degrades to the same "no Dagster upstreams
+        /// accepted" fallback `update` already exercises; `pl-b` is
+        /// an authored id and was never in the Dagster list, so the
+        /// rejection still fires on rule 2 ("unknown pipeline").
+        ///
+        /// F2.10 (PR #59 review): wiremock replaces the production
+        /// `DAGSTER_URL`. The wiremock handles every
+        /// `listJobsForRepository` GraphQL probe with a 200 carrying an
+        /// empty job list, so the route's `list_jobs()` returns `Ok([])`
+        /// without ever dialing a real host. Tests in this module that
+        /// need this fixture MUST call `state_for_with_dagster` (which
+        /// takes the wiremock `uri`) — the bare `state_for` here only
+        /// stands for callers that explicitly opt out of Dagster-side
+        /// state. New tests should prefer the wiremock variant.
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// `state_for` with a per-test wiremock for Dagster's GraphQL
+        /// probe. The wiremock is set up to return an empty job list
+        /// for `listJobsForRepository` so `state.dagster.list_jobs()`
+        /// returns `Ok(Vec::new())` — the exact same fallback the
+        /// production `DAGSTER_URL` reachability check used to give
+        /// the route "for free", minus the network dial. F2.10 NIT 6
+        /// is the reason this helper exists: tests in this module
+        /// share state across the DAGSTER_URL boundary, and a sync
+        /// helper cannot start a wiremock without blocking the
+        /// runtime.
+        async fn state_with_dagster(pool: &sqlx::PgPool, server_uri: &str) -> AppState {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "listJobsForRepository",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": []
+                })))
+                .mount(&server)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // The `server_uri` arg is intentionally unused at the
+            // moment — the wiremock helper does not need its address
+            // (the env's `DAGSTER_URL` is the one the route dials) —
+            // but it stays in the signature so a future test in this
+            // module can pass its OWN wiremock with a custom response
+            // (e.g. for `restore_pipeline`'s `runConfig` path).
+            let _ = server_uri;
+            // Build the AppState against the wiremock, not the
+            // production DAGSTER_URL.
+            let mut env_with_dagster = env.clone();
+            env_with_dagster.insert(
+                "DAGSTER_URL".to_owned(),
+                format!("{}/graphql", server.uri()),
+            );
+            AppState::new(Config::from_map(&env_with_dagster).expect("a valid test Config"))
         }
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
@@ -1631,8 +1983,9 @@ mod tests {
             //    400 `update` returns for a fresh edit against the
             //    same graph, naming `pl-b` verbatim.
             let err = restore_version(
-                State(state_for(&pool)),
-                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                State(state_with_dagster(&pool, "").await),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
                 Path((pl_a.id.clone(), 1)),
             )
             .await
@@ -1650,6 +2003,253 @@ mod tests {
             assert!(
                 message.contains(&pl_b.id),
                 "the 400 must name the dangling id verbatim: {message:?}"
+            );
+        }
+
+        /// F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
+        /// f2-tenant-scope-and-run-config.md` Part D): `restore_version`
+        /// used to validate ONLY `depends_on` and skip the transform
+        /// grammar + `max_retries` checks `update` runs. A snapshot
+        /// whose `transform` the current grammar would refuse slipped
+        /// through, and the replay persisted state that no console
+        /// edit could reach (and that the validator would 400 on if a
+        /// later edit tried to save it). After F2.8,
+        /// `validate_pipeline_input` is the shared gate — restoring a
+        /// bad transform is a 400 with the same `invalid transform at
+        /// transforms[N]: {err}` body shape `update` produces.
+        ///
+        /// The store's `insert_definition_version` does NOT validate
+        /// `transforms` (the grammar lives at the route layer), so the
+        /// snapshot-replay precondition is built by writing the bad
+        /// transform directly into a version row via SQL — the same
+        /// raw-SQL shape every other F2.3 deleted-pipeline fixture
+        /// uses, kept here so the test pins the exact payload shape
+        /// `restore_version` reads through `get_definition_version`.
+        /// The wiremock-backed [`state_with_dagster`] gives the route
+        /// its Dagster probe without dialing a real host (F2.10
+        /// NIT 6).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_rejects_a_snapshot_whose_transform_the_grammar_fails(pool: sqlx::PgPool) {
+            // 1. Create a pipeline the store will accept (any
+            //    grammar-valid transforms). The version-1 row will
+            //    hold a grammar-valid transform; v=2 is where the
+            //    bad transform lands so the restore path has
+            //    something to reject.
+            let pl = pipelines::create_pipeline(&pool, &create_input("pl-a", Vec::new()), None)
+                .await
+                .expect("create pl-a");
+            assert!(
+                pipelines::list_definition_versions(&pool, &pl.id)
+                    .await
+                    .expect("list_definition_versions")
+                    .iter()
+                    .any(|v| v.version == 1),
+                "create_pipeline must produce a version-1 row"
+            );
+
+            // 2. Write a v=2 version row whose `transforms` array
+            //    contains a string the grammar refuses — a SQL
+            //    statement the filter rule would reject at parse
+            //    time, the same shape `update`'s existing test
+            //    (`an_edit_with_a_transform_outside_the_grammar_is_refused`)
+            //    uses against the live row.
+            sqlx::query(
+                "INSERT INTO pipeline_definition_version \
+                    (pipeline_id, version, snapshot, event, changed_by, tenant_id) \
+                 VALUES ($1, 2, $2::jsonb, 'updated', NULL, NULL)",
+            )
+            .bind(&pl.id)
+            .bind(serde_json::json!({
+                "kind": "incremental",
+                "sourceZone": "bronze",
+                "sourceTable": "src",
+                "incrementalColumn": null,
+                "transforms": ["filter(1=1; DROP TABLE x)"],
+                "fbicEnabled": false,
+                "targetZone": "silver",
+                "targetTable": "tgt",
+                "schedule": "manual",
+                "owner": "ops",
+                "description": null,
+                "maxRetries": 2,
+                "dependsOn": [],
+                "name": "pl-a",
+                "status": "draft",
+            }))
+            .execute(&pool)
+            .await
+            .expect("insert v=2 with a bad transform");
+
+            // 3. Restore the v=2 snapshot. Pre-F2.8 the route wrote
+            //    it through with a 200; after F2.8 the shared
+            //    `validate_pipeline_input` call fires on the bad
+            //    transform and returns the same 400 body `update`
+            //    produces — the canonical
+            //    `"invalid transform at transforms[0]: ..."` shape.
+            let err = restore_version(
+                State(state_with_dagster(&pool, "").await),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((pl.id.clone(), 2)),
+            )
+            .await
+            .expect_err(
+                "a snapshot whose transform the grammar refuses must be refused at restore",
+            );
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "the restore of a snapshot whose transform is unparseable must be a 400, not a successful write",
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains("invalid transform at transforms[0]"),
+                "the 400 must carry the same `invalid transform at transforms[N]` shape update does: {message:?}",
+            );
+            // Belt-and-braces: the live row's transform is the
+            // good one (the original empty list), NOT the bad one
+            // from the v=2 snapshot — the validator refused before
+            // any write happened, just like `update`'s case.
+            let pl_after = pipelines::get_pipeline(&pool, &pl.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert!(
+                pl_after.transforms.is_empty(),
+                "the refused restore must not have written the v=2 transforms: got {:?}",
+                pl_after.transforms,
+            );
+        }
+
+        /// F2.10 (PR #59 review, `plans/pipelines/day-1-fixes/
+        /// f2-tenant-scope-and-run-config.md` Part D NIT 8): restoring
+        /// a NON-EXISTENT version on an existing pipeline returns 404
+        /// with the `Pipeline <id> version <N> not found` body. The
+        /// `get_definition_version` row-level lookup in [`restore_version`]
+        /// is the source of the body — a missing version row is NOT
+        /// the same case as a missing live row, and the two 404
+        /// responses are deliberately distinct so the audit log can tell
+        /// apart "stale version" from "deleted pipeline" without parsing
+        /// numbers out of the message.
+        ///
+        /// **Planned**: removing the `.ok_or_else(|| ApiError::NotFound(...))`
+        /// from [`restore_version`] makes the test fail — the call
+        /// would return `Ok(None)` (the store's "no live row"
+        /// sentinel) and the route would map that to a different
+        /// 500-level failure, NOT a clean 404.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_404s_a_missing_version_on_a_live_pipeline(pool: sqlx::PgPool) {
+            let pl = pipelines::create_pipeline(&pool, &create_input("pl-a", Vec::new()), None)
+                .await
+                .expect("create pl-a");
+            // The store inserts a v=1 baseline row via the migration's
+            // backfill (Part A's coverage in
+            // `restore_rejects_a_snapshot_referencing_a_now_deleted_upstream`
+            // confirms a v=1 row exists). Ask for v=99 — no such row.
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((pl.id.clone(), 99)),
+            )
+            .await
+            .expect_err("a missing version must be 404, not a successful 200");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains(&format!("Pipeline {} version 99 not found", pl.id)),
+                "the missing-version 404 must name the version: {message:?}"
+            );
+            // Belt-and-braces: the live row still exists and is
+            // unchanged — a 404 must not have touched it.
+            let pl_after = pipelines::get_pipeline(&pool, &pl.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert!(
+                pl_after.transforms.is_empty(),
+                "a 404 must not have written anything: got transforms {:?}",
+                pl_after.transforms,
+            );
+        }
+
+        /// F2.10 (PR #59 review, `plans/pipelines/day-1-fixes/
+        /// f2-tenant-scope-and-run-config.md` Part D NIT 8): restoring
+        /// a version on a DELETED pipeline returns 404 with the standard
+        /// `Pipeline <id> not found` body. The route's live-row check
+        /// fires on `pipelines::restore_pipeline(...)` returning `Ok(None)`
+        /// (the `RETURNING` from `UPDATE pipeline_definition` returns no
+        /// row because the live row is gone). A deleted pipeline is a
+        /// separate 404 case from "missing version": the audit log reads
+        /// "stale restore of a gone pipeline" without parsing the
+        /// message for the literal `version`.
+        ///
+        /// **Planned**: dropping the
+        /// `.ok_or_else(|| ApiError::NotFound("Pipeline {id} not found"))?`
+        /// guard from [`restore_version`] makes the test fail with a
+        /// 500 — the `restore_pipeline` store call would surface as
+        /// an internal error instead of a clean 404.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_404s_a_version_on_a_deleted_pipeline(pool: sqlx::PgPool) {
+            // 1. Create the pipeline + drive the same `delete_pipeline`
+            //    the production path does. The live row goes away;
+            //    the `deleted` version row stays (the migration backfills
+            //    a baseline `v=1` row at create time, and `delete_pipeline`
+            //    stamps a `v=2 deleted` row — both are queryable).
+            let pl = pipelines::create_pipeline(&pool, &create_input("pl-a", Vec::new()), None)
+                .await
+                .expect("create pl-a");
+            let deleted = pipelines::delete_pipeline(&pool, &pl.id, None)
+                .await
+                .expect("delete pl-a");
+            assert!(deleted, "pl-a should have been deleted");
+            assert!(
+                pipelines::get_pipeline(&pool, &pl.id)
+                    .await
+                    .expect("get_pipeline")
+                    .is_none(),
+                "the live row must be gone"
+            );
+
+            // 2. Restore `v=1`. The version row exists in the database
+            //    (the migration's baseline backfill), but the live row
+            //    is gone. The route's `restore_pipeline` returns
+            //    `Ok(None)`, mapped to the standard "Pipeline not found"
+            //    404 body — distinct from the "version not found" body
+            //    the previous test pins.
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((pl.id.clone(), 1)),
+            )
+            .await
+            .expect_err("a restore against a deleted pipeline must be 404, not a successful 200");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains(&format!("Pipeline {} not found", pl.id)),
+                "the deleted-pipeline 404 must use the standard body: {message:?}"
+            );
+            // The audit log distinguishes "deleted pipeline" from
+            // "missing version" by the literal body text — assert
+            // the version-specific tail is absent so a future
+            // refactor cannot silently collapse the two cases.
+            assert!(
+                !message.contains("version 1"),
+                "the deleted-pipeline 404 must NOT carry the version-specific tail: {message:?}"
             );
         }
     }
@@ -1749,7 +2349,8 @@ mod tests {
             );
             let err = update(
                 State(state_for(&pool)),
-                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
                 Path(pl_b.id.clone()),
                 body,
             )
@@ -1893,7 +2494,8 @@ mod tests {
             );
             let _response = update(
                 State(state_for(&pool)),
-                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
                 Path(pl_a.id.clone()),
                 body,
             )
@@ -1921,7 +2523,8 @@ mod tests {
             );
             let _ = update(
                 State(state_for(&pool)),
-                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
                 Path(pl_a.id.clone()),
                 body,
             )
@@ -1936,6 +2539,327 @@ mod tests {
                 "an explicit empty dependsOn must clear the chain: {}",
                 pl_a_after.depends_on.len()
             );
+        }
+    }
+
+    /// F2.2 (PR #59 review): `update`, `restore_version`, `delete`,
+    /// and the `authored_detail` upstream/downstream arrays all carry
+    /// tenant scope. The tests in this block pin each surface — every
+    /// assertion is something an unwary contributor could regress by
+    /// reverting one of the helpers added in this fix.
+    mod f2_2_cross_tenant_depends_on {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+        use crate::routes::pipelines::detail;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn create_input(
+            name: &str,
+            depends_on: Vec<String>,
+            tenant_id: Option<uuid::Uuid>,
+        ) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "src".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "tgt".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id,
+                depends_on,
+                id: None,
+            }
+        }
+
+        /// Create a tenant via the store and return its uuid. Matches
+        /// `route_walk::provision_tenant_for` in
+        /// `routes/pipelines.rs::tests` — duplicated here so the
+        /// `f2_2_*` tests stay inside this file.
+        async fn provision_tenant(pool: &sqlx::PgPool, slug: &str) -> uuid::Uuid {
+            let t = lakehouse_store::identity::create_tenant(
+                pool,
+                &lakehouse_store::identity::CreateTenantInput {
+                    name: slug.to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "starter".to_owned(),
+                    residency: "in-region".to_owned(),
+                },
+            )
+            .await
+            .expect("create tenant");
+            uuid::Uuid::parse_str(&t.id).expect("tenant id is a uuid")
+        }
+
+        fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
+            Principal {
+                tenant_ids: vec![tenant_id],
+                ..principal(PrincipalId::User(uuid::Uuid::from_u128(2)))
+            }
+        }
+
+        /// `PUT`ting `dependsOn: [<pl-b from tenant B>]` on a tenant-A
+        /// pipeline must 400 with the standard "`depends_on` references
+        /// unknown pipeline" body — not 200, not 400 with `B`'s id
+        /// named (which would leak existence). The validator's
+        /// "unknown id" rule must fire on the scoped-out id, not on a
+        /// real one in `B`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_400s_a_cross_tenant_dependson_with_the_unknown_id_body(pool: sqlx::PgPool) {
+            let tenant_a = provision_tenant(&pool, "f2-2-a").await;
+            let tenant_b = provision_tenant(&pool, "f2-2-b").await;
+            // `pl-b` belongs to tenant B; `pl-a` belongs to tenant A.
+            let pl_b = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-b", Vec::new(), Some(tenant_b)),
+                None,
+            )
+            .await
+            .expect("create pl-b in tenant B");
+            let pl_a = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-a", Vec::new(), Some(tenant_a)),
+                None,
+            )
+            .await
+            .expect("create pl-a in tenant A");
+
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "src",
+                    "targetZone": "silver",
+                    "targetTable": "tgt",
+                    "schedule": "manual",
+                    "dependsOn": [pl_b.id],
+                }))
+                .expect("a fixed-shape JSON body serializes"),
+            );
+            let err = update(
+                State(state_for(&pool)),
+                Extension(tenant_principal(tenant_a)),
+                HeaderMap::new(),
+                Path(pl_a.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("cross-tenant dependsOn must be refused at the validator");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "cross-tenant dependsOn must 400"
+            );
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body_bytes);
+            // Byte-equal shape: the validator's "unknown pipeline"
+            // message must fire, NOT a different rule. This is the
+            // no-existence-oracle contract: a 400 from a genuinely
+            // unknown id and a 400 from a cross-tenant id are
+            // indistinguishable to the caller.
+            assert!(
+                message.contains("depends_on references unknown pipeline"),
+                "cross-tenant dependsOn must fire the unknown-pipeline 400: {message:?}"
+            );
+            assert!(
+                message.contains(&pl_b.id),
+                "the 400 body must name the offending id verbatim so the UI can highlight it: {message:?}"
+            );
+            // Belt-and-braces: A's stored chain is unchanged.
+            let pl_a_after = pipelines::get_pipeline(&pool, &pl_a.id)
+                .await
+                .expect("get_pipeline")
+                .expect("pl-a still exists");
+            assert!(
+                pl_a_after.depends_on.is_empty(),
+                "a refused update must not write the cross-tenant chain"
+            );
+        }
+
+        /// `delete`'s 400 message must list in-scope dependents by id
+        /// and fold cross-tenant ones into a count, never naming
+        /// them. An unrestricted caller sees every id named.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn delete_400_lists_in_scope_dependents_and_counts_the_rest(pool: sqlx::PgPool) {
+            let tenant_a = provision_tenant(&pool, "f2-2-del-a").await;
+            let tenant_b = provision_tenant(&pool, "f2-2-del-b").await;
+            // Target pipeline `pl-x` belongs to A; `pl-y` (in A)
+            // lists `pl-x` as an upstream; `pl-z` (in B) also lists
+            // `pl-x`. Deleting `pl-x` must refuse, with the 400
+            // naming `pl-y` and counting `pl-z` (not naming it).
+            let pl_x = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-x", Vec::new(), Some(tenant_a)),
+                None,
+            )
+            .await
+            .expect("create pl-x in tenant A");
+            let pl_y = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-y", vec![pl_x.id.clone()], Some(tenant_a)),
+                None,
+            )
+            .await
+            .expect("create pl-y in tenant A");
+            let pl_z = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-z", vec![pl_x.id.clone()], Some(tenant_b)),
+                None,
+            )
+            .await
+            .expect("create pl-z in tenant B");
+
+            // 1. Restricted caller (tenant A): the 400 names pl-y
+            //    and folds pl-z into a count.
+            let response = delete(
+                State(state_for(&pool)),
+                Extension(tenant_principal(tenant_a)),
+                HeaderMap::new(),
+                Path(pl_x.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "delete with dependents must be refused"
+            );
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body_bytes);
+            // The count is total (in-scope + out-of-scope) — 2
+            // pipelines depend on pl-x, but only pl-y (in scope)
+            // is named.
+            assert!(
+                message.contains("2 other pipeline"),
+                "the 400 must count both in- and out-of-scope dependents: {message:?}"
+            );
+            assert!(
+                message.contains(&pl_y.id),
+                "the 400 must name pl-y (in scope) verbatim: {message:?}"
+            );
+            assert!(
+                !message.contains(&pl_z.id),
+                "the 400 must not leak the out-of-scope pl-z id: {message:?}"
+            );
+
+            // 2. Unrestricted caller: every dependent is in scope
+            //    (Unrestricted matches everything), so the count
+            //    still says 2 and the message names BOTH pl-y and
+            //    pl-z verbatim.
+            let response = delete(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(pl_x.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "delete with dependents must be refused for an unrestricted caller too"
+            );
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body_bytes);
+            assert!(
+                message.contains("2 other pipeline"),
+                "the unrestricted 400 must also say 2: {message:?}"
+            );
+            assert!(
+                message.contains(&pl_y.id),
+                "the unrestricted 400 must name pl-y: {message:?}"
+            );
+            assert!(
+                message.contains(&pl_z.id),
+                "the unrestricted 400 must name pl-z (the unrestricted caller sees it): {message:?}"
+            );
+        }
+
+        /// `authored_detail` upstream must not name a cross-tenant
+        /// `pl-` id (the existence leak F2.2 closes). Dagster-native
+        /// ids are un-tenanted and stay; a `pl-` id whose row is in
+        /// another tenant must be filtered out.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_hides_other_tenants_pipelines_in_upstream_and_downstream(
+            pool: sqlx::PgPool,
+        ) {
+            let tenant_a = provision_tenant(&pool, "f2-2-detail-a").await;
+            let tenant_b = provision_tenant(&pool, "f2-2-detail-b").await;
+            // `pl-a` belongs to A and depends on `pl-b` (in B).
+            let pl_b = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-b", Vec::new(), Some(tenant_b)),
+                None,
+            )
+            .await
+            .expect("create pl-b in tenant B");
+            let pl_a = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-a", vec![pl_b.id.clone()], Some(tenant_a)),
+                None,
+            )
+            .await
+            .expect("create pl-a in tenant A");
+
+            let response = detail(
+                State(state_for(&pool)),
+                Some(Extension(tenant_principal(tenant_a))),
+                HeaderMap::new(),
+                Path(pl_a.id.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body_bytes).expect("detail body is JSON");
+            let upstream = value
+                .get("upstream")
+                .and_then(|v| v.as_array())
+                .expect("detail has an upstream array");
+            assert!(
+                upstream.is_empty(),
+                "upstream must not name cross-tenant pl-b; got {upstream:?}"
+            );
+            // Downstream is also empty: nobody depends on pl-a in
+            // tenant A's view.
+            let downstream = value
+                .get("downstream")
+                .and_then(|v| v.as_array())
+                .expect("detail has a downstream array");
+            assert!(downstream.is_empty(), "downstream must be empty");
         }
     }
 }
