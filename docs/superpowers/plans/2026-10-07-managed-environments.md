@@ -1,12 +1,14 @@
 # Environments as a managed list — Implementation Plan
 
 **Status:** proposed on 2026-10-07 at the product owner's request ("write
-the plan first"). **Not started, and not to be started until the decisions
-in section 3 are signed and `main` is merged into this branch** (section 8).
-Written by the planner (Claude Opus) for a developer agent, under the role
-split in `AGENTS.md` on `main`. The planner writes no product code.
+the plan first"); the same day the product owner asked for it to be run
+and implemented as written, which is taken as signing section 3. Work
+starts on the branch as it is, before the merge of `main` (section 8 says
+what that changes). Written by the planner (Claude Opus) for a developer
+agent, under the role split in `AGENTS.md` on `main`. The planner writes
+no product code.
 
-**Base:** `feat/connectors`, after the merge of `main`.
+**Base:** `feat/connectors`, in `/home/hv/lakehouse`.
 
 **Where it comes from:** another team recommended that a connector's
 environment "can be CRUD". Nothing in `docs/core/` on `main` says what they
@@ -60,7 +62,7 @@ connector; nothing says which stage is the real one.
    that is in use cannot be deleted, and the page says how many things use
    it.
 
-## 3. Decisions (proposed; the product owner signs before a developer starts)
+## 3. Decisions (signed by the product owner on 2026-10-07, by asking for the plan to be implemented as written)
 
 1. **One list for the deployment, not one per tenant.** An environment
    names a stage of the source systems; tenants are kept apart by the
@@ -124,7 +126,8 @@ One task per commit, each leaving the tree building and its tests green.
 
 ### E1 — The table and the store
 
-- One migration, the next free number after the merge of `main`, with a
+- One migration, `0056_environment.sql` (the branch's next number; see
+  section 8 for what happens to it at the merge of `main`), with a
   why-header: decision 2 and 3, in that order of statements. Never edited
   once applied.
 - `lakehouse-store`: a module for the list (`list` with the two usage
@@ -225,17 +228,24 @@ One task per commit, each leaving the tree building and its tests green.
   delete one).
 - Colours, icons, manual ordering.
 
-## 8. Before work starts
+## 8. Order of work, and what is owed at the merge of `main`
 
-1. The product owner signs section 3, or changes it.
-2. The question in section 9 is answered.
-3. `main` is merged into `feat/connectors`. This plan adds a migration,
-   and the branch's own two already carry numbers `main` has since used;
-   they are renumbered in that merge, and this one takes the next free
-   number after it.
-4. A backlog entry on `main`'s `docs/core/BACKLOG.md`, proposed as
-   "Environments as a managed list" under the area that holds Sources,
-   with the ID that file gives it.
+This section first said the work waits for the merge of `main`. The
+product owner asked for the plan to be implemented now, so it does not
+wait; this is what that costs and where it is paid.
+
+1. Section 3 is signed (see its heading).
+2. The question in section 9 is still open. The work goes ahead on the
+   first reading; the second reading would add to it, not undo it.
+3. The migration is `0056_environment.sql` on this branch. `main` already
+   has a `0056` of its own, as it has a `0054` and a `0055`: at the merge
+   this migration is renumbered with the branch's other two (to the three
+   next free numbers, in their present order), and the dev database's
+   record of applied migrations is corrected by hand for all three.
+4. Owed after the merge: a feature page under `docs/core/features/` and a
+   backlog entry on `docs/core/BACKLOG.md`, proposed as "Environments as
+   a managed list" under the area that holds Sources, with the ID that
+   file gives it.
 
 ## 9. To ask the team that recommended it
 
@@ -247,10 +257,31 @@ needs its own decision record.
 
 ## 10. Working on this machine
 
-To be filled when the work is scheduled: the checkout, what else is
-uncommitted in it, the cargo target directory, and the rule that the dev
-stack is rebuilt by the reviewer. The rules in section 6 of
-`2026-10-05-sample-tab-data-preview.md` apply unchanged.
+- Work in `/home/hv/lakehouse` on `feat/connectors`. The tree is clean
+  when you start. It is the product owner's checkout: their console dev
+  server (port 3000) reloads every saved file under `src/`. Never kill or
+  restart it, never run `next build`, `bun install` or `bun add` here,
+  and do not leave `src/` in a state that does not compile.
+- **Leave the work uncommitted.** The product owner looks first. No `git
+  add`, commit, stash, reset, checkout, restore or branch switch. Never
+  push.
+- Untracked and not yours: `docs/plans/FEAT-CONNECTORS-REPORT.md`,
+  `lark-import/`, `ops/g3/bronze_catalog.py`. Never read or print `.env`.
+- Rust: `cd rust && export
+  CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target
+  CARGO_BUILD_JOBS=4`. `df -h /` before a build; stop and report under
+  15 GB free. No `cargo clean`, no `--release`, no rebuild loops.
+  `sqlx::test` embeds the migrations at compile time: rebuild after
+  editing one. `rustfmt` only a file whose every hunk is yours.
+- No `docker` commands and no statement against the dev database. The
+  reviewer backs the database up, builds and restarts the API; the
+  migration reaches the dev stack only then.
+- No prettier: match the file's style by hand.
+- Before the handoff, once, in the foreground: `cargo fmt --check &&
+  cargo clippy --workspace --all-targets --all-features -- -D warnings &&
+  cargo test --workspace`; `bun run typecheck && bun run lint && bun run
+  test`; `python3 ops/lint/check_intra_package_imports.py && python3
+  ops/lint/check_bare_iceberg_count.py`.
 
 ## 11. Handoff (developer)
 
