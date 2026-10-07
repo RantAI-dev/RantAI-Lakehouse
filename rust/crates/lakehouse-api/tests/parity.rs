@@ -103,12 +103,7 @@ struct RequestSpec {
 /// only — never by value or array length/content, since a different model
 /// run can legitimately call different tools or return a different number
 /// of results.
-const STRUCTURE_ONLY: &[&str] = &[
-    "ai-chat-ok",
-    "agent-ask-ok",
-    "agent-query-ok",
-    "agent-text-to-sql-ok",
-];
+const STRUCTURE_ONLY: &[&str] = &["ai-chat-ok"];
 
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/corpus")

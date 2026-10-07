@@ -989,22 +989,27 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The three old agent endpoints ran a model's SQL straight on
+    /// `ClickHouse` with no masking or row filter (`SEC-9`, `SEC-11`). They
+    /// are gone: the console's natural-language box asks `/api/ai/chat`
+    /// instead. `auth_gate` fails closed on a path no route matched (it has
+    /// no `MatchedPath`, so the answer is a 500, not a 404, for every
+    /// caller, signed in or not), so "no longer mounted" is asserted as
+    /// "answers exactly like a path that never existed". A still-mounted
+    /// route would answer 401 here (`RequiresAuth`, no credentials).
     #[tokio::test]
-    async fn agent_ask_route_is_registered() {
-        let resp = post(test_router(), "/api/agent/ask").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn agent_query_route_is_registered() {
-        let resp = post(test_router(), "/api/agent/query").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn agent_text_to_sql_route_is_registered() {
-        let resp = post(test_router(), "/api/agent/text-to-sql").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    async fn removed_agent_endpoints_answer_like_an_unknown_path() {
+        let unknown = post(test_router(), "/api/never-existed").await.status();
+        assert_ne!(
+            unknown,
+            StatusCode::UNAUTHORIZED,
+            "an unmounted path must not reach the auth check"
+        );
+        for leaf in ["ask", "query", "text-to-sql"] {
+            let uri = format!("/api/agent/{leaf}");
+            let resp = post(test_router(), &uri).await;
+            assert_eq!(resp.status(), unknown, "still mounted: {uri}");
+        }
     }
 
     #[tokio::test]
@@ -1025,16 +1030,15 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// The final tally this task calls out explicitly: all 30 route paths
-    /// (8 pre-existing + alerts×2 + the 21 ported in this task) must be
+    /// The final tally: all 29 route paths listed below must be
     /// mounted and reachable (concrete path segments substituted for
     /// captures so the request actually resolves to a handler, not just
     /// "some path"). A tripwire against silently dropping a route during a
     /// future refactor of `routes::router` — every path here must yield a
-    /// non-404 status, and the list itself must have exactly 32 entries.
+    /// non-404 status, and the list itself must have exactly 29 entries.
     #[tokio::test]
-    async fn router_exposes_all_thirty_two_route_paths() {
-        const EXPECTED_PATHS: [&str; 32] = [
+    async fn router_exposes_all_twenty_nine_route_paths() {
+        const EXPECTED_PATHS: [&str; 29] = [
             "/api/catalog",
             "/api/catalog/query",
             "/api/catalog/some-id",
@@ -1061,14 +1065,11 @@ mod tests {
             "/api/dashboard/embed-info",
             "/api/embed/data",
             "/api/public/dashboard/some-token",
-            "/api/agent/ask",
-            "/api/agent/query",
-            "/api/agent/text-to-sql",
             "/api/ai/chat",
             "/api/ai/sessions",
             "/api/ai/build-status",
         ];
-        assert_eq!(EXPECTED_PATHS.len(), 32);
+        assert_eq!(EXPECTED_PATHS.len(), 29);
         for uri in EXPECTED_PATHS {
             // GET is enough to prove a path is mounted: axum returns 405
             // Method Not Allowed (not 404) for a registered path hit with

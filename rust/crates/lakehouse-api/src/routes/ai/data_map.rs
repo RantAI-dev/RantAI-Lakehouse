@@ -3,9 +3,9 @@
 //!
 //! # Why this replaced the old schema context
 //!
-//! `routes::agent::schema_context` gave the model table names and column
-//! types only: Gold marts with types, Silver as bare names, and Bronze as
-//! catalog slugs. Measured on the local stack
+//! The schema context the removed text-to-SQL endpoints used gave the model
+//! table names and column types only: Gold marts with types, Silver as bare
+//! names, and Bronze as catalog slugs. Measured on the local stack
 //! (`ops/ai_eval/ai_eval.py`), that left three classes of wrong answer:
 //!
 //! - **Wrong literal.** Categorical values are stored in the source's own

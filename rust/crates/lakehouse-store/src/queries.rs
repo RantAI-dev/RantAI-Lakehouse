@@ -5,8 +5,8 @@
 //!
 //! `src/services/clients/queries.ts` splits `QueryService` into a real half
 //! (`run`/`estimate`, `ClickHouse`-backed, ported in Phase 1;
-//! `generateSql`, LLM-backed, also ported in Phase 1 as
-//! `/api/agent/text-to-sql`) and a mock half (`listSaved`, `listHistory`).
+//! `generateSql`, LLM-backed, which asks the copilot's `/api/ai/chat`) and a
+//! mock half (`listSaved`, `listHistory`).
 //! This module is the Postgres backing for that mock half, plus one
 //! addition: `routes::query::run` calls [`record_history`] after a
 //! successful `ClickHouse` execution, so [`list_history`] returns *real*

@@ -20,10 +20,10 @@
 mod alerts;
 mod connectors;
 mod dashboards;
-// WS7 item F5: `pub(in crate::routes)` (not merely `mod`) so
-// `routes::agent::schema_context` — a SIBLING module of `routes::ai`, not
-// a descendant — can reuse `data::CATALOG_UNION`, the SAME bronze-catalog
-// query `list_datasets` already runs, rather than re-deriving it.
+// `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
+// SIBLING module of `routes::ai`, not a descendant — can reuse
+// `data::CATALOG_UNION`, the SAME bronze-catalog query `list_datasets`
+// already runs, rather than re-deriving it.
 pub(in crate::routes) mod data;
 mod gold;
 mod governance;

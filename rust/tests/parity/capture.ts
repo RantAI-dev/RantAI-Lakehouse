@@ -101,9 +101,6 @@ const REDACT_TEXT_IN = new Set([
   "ai-sessions-list",
   "ai-sessions-detail",
   "ai-chat-ok",
-  "agent-ask-ok",
-  "agent-query-ok",
-  "agent-text-to-sql-ok",
 ])
 
 /**
@@ -122,11 +119,6 @@ const REDACT_TEXT_IN = new Set([
  *    carrying no credential or personal data. Redacting it while the identical
  *    text sits in `steps[].detail` produced the inconsistency this comment
  *    exists to prevent. Non-determinism here is the harness's job.
- *  - `question` — in `agent/*` this is the synthetic question WE sent, echoed
- *    verbatim by the handler, so it is deterministic and worth asserting on.
- *    Real user questions in persisted sessions arrive under `content`, which
- *    is redacted. Redacting it would also achieve nothing: the same plaintext
- *    sits in `request.body.question`, since redaction applies only to responses.
  *  - `detail` — only `steps[1].detail` is model-generated; the rest are
  *    hardcoded literals the Rust port must reproduce byte-for-byte.
  */

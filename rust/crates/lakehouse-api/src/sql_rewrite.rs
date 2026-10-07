@@ -2741,7 +2741,8 @@ mod parses_real_repository_query_shapes {
         // routes/ai/tools/data.rs, the dataset catalog UNION view.
         "SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
          UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`",
-        // routes/agent.rs schema_context's DESCRIBE call shape mirrored as a query.
+        // A column lookup in the shape the removed text-to-SQL schema
+        // context used for its DESCRIBE call, mirrored as a query.
         "SELECT name, type FROM system.columns WHERE database='serving'",
         // lakehouse-bi specs.rs's kpi_gci (backtick-qualified, two aggregates).
         "SELECT sum(data_tersedia) AS v, count() AS total FROM serving.mart_gci_readiness",
