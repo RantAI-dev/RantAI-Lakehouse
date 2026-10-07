@@ -2051,11 +2051,17 @@ mod tests {
                 .to_string(),
             TABLE_NAME_RULE
         );
+        // The sheet is checked last, after the fields a text file needs, so
+        // the text case carries a complete body (CI failure on fe3dffc: the
+        // test sent the bare body, and a text upload is rightly asked for its
+        // encoding first).
         let mut bad_sheet = bare;
         bad_sheet["sheet"] = json!(3);
-        for workbook in [true, false] {
+        let mut bad_text_sheet = valid();
+        bad_text_sheet["sheet"] = json!(3);
+        for (workbook, body_with_bad_sheet) in [(true, &bad_sheet), (false, &bad_text_sheet)] {
             assert_eq!(
-                parse_ingest_request(&body(&bad_sheet), workbook)
+                parse_ingest_request(&body(body_with_bad_sheet), workbook)
                     .unwrap_err()
                     .to_string(),
                 "sheet must be text."
