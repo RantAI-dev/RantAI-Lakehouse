@@ -21,9 +21,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { formatRelativeTime } from "@/lib/format";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
 import { cn } from "@/lib/utils";
+import type { AskAnswer } from "./answer-ask";
+import { askFromStep } from "./ask-options";
 import { BuildTree } from "./build-tree";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
+import { SuggestionButton } from "./suggestion-button";
 import { FinishedToolRow, RunningToolRow, ToolStepCard, asObj, toolLabel } from "./tool-step";
 import type { ChatProgress, Msg } from "./use-copilot";
 
@@ -214,7 +217,7 @@ function MessageFooter({
 export function ChatMessages({
   messages, busy, progress, error, className, onRetry,
   onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, draft, liveReasoning,
-  onEdit, onDelete, onDismissError,
+  onEdit, onDelete, onDismissError, onAnswerAsk, askNotice,
 }: {
   messages: Msg[];
   busy: boolean;
@@ -240,6 +243,14 @@ export function ChatMessages({
   /** Remove the message at `index`. */
   onDelete?: (index: number) => void;
   onDismissError?: () => void;
+  /**
+   * The user picked an option of a question the chat asked. Only the newest
+   * assistant message offers buttons; without this handler its options show
+   * as text too.
+   */
+  onAnswerAsk?: (answer: AskAnswer) => void;
+  /** One line under the list, e.g. that a picked answer was not remembered. */
+  askNotice?: string | null;
 }) {
   const reduce = useReducedMotion() ?? false;
   // Agents' message entrance; skipped under reduced motion.
@@ -263,6 +274,10 @@ export function ChatMessages({
         const isEditing = editing?.index === i;
         const pendingIndex = m.tools?.findIndex((t) => Boolean(asObj(t.result).needs_confirmation)) ?? -1;
         const pendingStep = pendingIndex >= 0 ? m.tools?.[pendingIndex] : undefined;
+        // The ask is drawn as options under the text, not as a tool card.
+        // `m.tools` itself stays whole: `pendingIndex` indexes into it.
+        const ask = m.tools?.map(askFromStep).find((a) => a !== null) ?? null;
+        const askedAbout = messages.slice(0, i).findLast((p) => p.role === "user")?.content ?? "";
         return (
           <motion.div key={key} {...enter} className="py-3">
             <div className={cn("group flex gap-3", isUser && "justify-end")}>
@@ -302,13 +317,27 @@ export function ChatMessages({
                     {m.reasoning ? <ReasoningBox text={m.reasoning} ms={m.reasoningMs} /> : null}
                     {m.tools?.length ? (
                       <div className="mb-1 space-y-0.5">
-                        {m.tools.map((t, j) => (
-                          <ToolStepCard key={j} step={t} />
-                        ))}
+                        {m.tools.map((t, j) =>
+                          askFromStep(t) ? null : <ToolStepCard key={j} step={t} />,
+                        )}
                       </div>
                     ) : null}
                     {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
                     {m.content ? <MiniMarkdown text={m.content} /> : null}
+                    {ask && onAnswerAsk && i === lastIndex ? (
+                      <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                        {ask.options.map((option) => (
+                          <SuggestionButton
+                            key={option}
+                            text={option}
+                            disabled={busy}
+                            onClick={() => onAnswerAsk({ term: ask.term, option, question: askedAbout })}
+                          />
+                        ))}
+                      </div>
+                    ) : ask ? (
+                      <p className="mt-2 text-xs text-muted-foreground">Options: {ask.options.join(" · ")}</p>
+                    ) : null}
                     {m.stopped ? (
                       <p className="flex items-center gap-2 text-sm text-muted-foreground">
                         Response stopped.
@@ -376,6 +405,12 @@ export function ChatMessages({
             </div>
           </div>
         </div>
+      ) : null}
+
+      {askNotice ? (
+        <p className="text-xs text-muted-foreground" role="status">
+          {askNotice}
+        </p>
       ) : null}
 
       <AnimatePresence>

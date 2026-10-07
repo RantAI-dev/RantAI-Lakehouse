@@ -453,6 +453,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PATCH",  "/api/ai/sessions",       Policy::RequiresAuth),
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
     ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
+    // The caller's own remembered words for the chat (`routes::ai::terms`):
+    // keyed by the principal like Copilot sessions, so the `RequiresAuth`
+    // floor is the whole policy. A caller can only ever reach their own rows.
+    ("GET",    "/api/ai/terms",          Policy::RequiresAuth),
+    ("PUT",    "/api/ai/terms",          Policy::RequiresAuth),
+    ("DELETE", "/api/ai/terms",          Policy::RequiresAuth),
 
     // WS5 item F1: navbar bell — same `RequiresAuth` floor as every other
     // authenticated-but-not-permission-scoped read in this table (e.g.

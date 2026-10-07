@@ -822,6 +822,13 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
+        // The caller's own remembered words for the chat; see `routes::ai::terms`.
+        .route(
+            "/api/ai/terms",
+            get(ai::terms::list_terms)
+                .put(ai::terms::put_term)
+                .delete(ai::terms::delete_term),
+        )
         // WS5 item F1: navbar bell — real, honest open-alert/pending-approval
         // lists (never a fabricated `unreadCount`, never a zero that reads
         // as "genuinely nothing" without Postgres — see `routes::notifications`).
