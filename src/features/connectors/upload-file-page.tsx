@@ -16,7 +16,7 @@ import {
   TABLE_NAME_RULE,
   delimiterLabel,
   encodingLabel,
-  fileSizeProblem,
+  fileProblem,
   headerRowDisplay,
   isUploadedTable,
   suggestTableName,
@@ -51,8 +51,9 @@ function setAddress(pathname: string, id: string | null) {
 
 /**
  * Step 1: a real, labelled file control (reachable by keyboard) and a drop
- * area that sets the same file. A file over 50 MB is refused here, naming the
- * limit, and nothing is sent.
+ * area that sets the same file. A file over 50 MB, or one whose name says it is
+ * a workbook or another binary, is refused here with the reason, and nothing
+ * is sent.
  */
 function FileStep({
   file,
@@ -70,7 +71,7 @@ function FileStep({
 }) {
   const [dragging, setDragging] = React.useState(false)
   const [several, setSeveral] = React.useState(false)
-  const problem = file ? fileSizeProblem(file.name, file.size) : null
+  const problem = file ? fileProblem(file.name, file.size) : null
 
   function take(files: FileList | null) {
     setSeveral((files?.length ?? 0) > 1)
@@ -107,12 +108,19 @@ function FileStep({
         className={`space-y-3 rounded-lg border border-dashed p-6 ${dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"}`}
       >
         <p className="text-sm text-muted-foreground">
-          Drop a CSV or TSV file here, or choose one. Up to 50 MB; other kinds of file are refused with the
-          reason.
+          Drop a CSV or TSV file here, or choose one. Delimited text files (CSV, TSV) up to 50 MB are accepted.
+          Excel workbooks (.xls, .xlsx) are not: save the sheet as CSV first. Other kinds of file are refused
+          with the reason.
         </p>
         <div className="space-y-1.5">
           <Label htmlFor="upload-file-input">Choose a file</Label>
-          <Input id="upload-file-input" type="file" onChange={(e) => take(e.target.files)} />
+          {/* `accept` only steers the picker; drag and drop is not limited by it, and the checks above decide. */}
+          <Input
+            id="upload-file-input"
+            type="file"
+            accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain"
+            onChange={(e) => take(e.target.files)}
+          />
         </div>
       </div>
       {file ? (
@@ -230,7 +238,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
 
   const canProceed =
     step === FILE_STEP
-      ? upload !== null || (file !== null && fileSizeProblem(file.name, file.size) === null)
+      ? upload !== null || (file !== null && fileProblem(file.name, file.size) === null)
       : step === CHECK_STEP
         ? view.ready
         : step === TABLE_STEP
