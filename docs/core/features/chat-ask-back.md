@@ -54,6 +54,9 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 - Buttons work only under the last message of a conversation. In an older message, or in a conversation reopened from history, the options show as plain text.
 - If saving the clicked answer fails, the option is still sent and the chat says the answer was not remembered.
 - The data map matches a question to tables by an equal word, or by a prefix of at least 4 characters, against table and column name parts, sample values, synonyms and description words. When no table matches, every table is written in full as before. When at least one matches, the other tables are written on one line each, even if the whole map would fit.
+- The data map is built to a budget of 14,000 characters. When the tables that match a question already use it, the matching tables after that point and all the one-line tables get no description. They are listed by name in the closing "more tables not described here" line.
+- With `AI_RELEVANT_TABLES` on, column statistics are queried for every table when the map is built. The built map is cached for 120 seconds, and not cached at all when a masking policy exists. With the switch off, only the tables that fit the budget are queried, as before.
+- A saved word brings the words of its meaning into the match only when the question uses it. The question is the last two user messages together. The word counts as used when every one of its words (ignoring words of fewer than 3 characters and common function words) appears in those messages, in any order, or when the word stands as a phrase in one message with no letter, digit or `_` next to it. A word made only of ignored words never matches.
 - A table with a policy row filter has no sample values or ranges in the data map, so a question cannot match on them. When the policies cannot be read, no table has them.
 - `AI_ASK_BACK=false` removes the `ask_user` tool, the rules about unclear words and the saved words from the prompt. The `/api/ai/terms` routes still answer.
 - `AI_RELEVANT_TABLES=false` makes the data map write every table in full.
@@ -76,8 +79,9 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 | 9 | Set `AI_ASK_BACK=false` and restart the API (operator). Ask the question from row 1. | The chat shows no buttons and no `ask_user` step. | |
 | 10 | Set `AI_ASK_BACK=maybe` and restart the API (operator). | The API stops with a `ConfigError` naming the accepted values. | |
 | 11 | In Query Studio's "Natural language" box, ask the question from row 1. | The box answers and shows no buttons. | |
+| 12 | Ask a question that names one table of the seed data. Then set `AI_RELEVANT_TABLES=false` and restart the API (operator), and ask the same question. | Both answers use that table. The console does not show the prompt. By design, with the switch on the prompt holds that table in full and every other table on one line, even when the whole map would fit. With the switch off it holds every table in full. | |
 
-The data map change of `AI_RELEVANT_TABLES` shows only when a question names a table and the deployment has several that do not all fit, so this checklist does not test it. The unit tests do.
+The data map change of `AI_RELEVANT_TABLES` has one row above (row 12). The prompt text is not shown in the console, so the row checks what a reader can see: the answer. The unit tests check the prompt text itself.
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 

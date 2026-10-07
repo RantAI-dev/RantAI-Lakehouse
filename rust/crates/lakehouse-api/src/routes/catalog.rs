@@ -113,11 +113,13 @@ const CATALOG_TENANT_REFUSAL_NOT_OWNER: &str = "this deployment's shared catalog
 /// Refusal reason when `CATALOG_TENANT_ID` is unset and more than one
 /// tenant exists — the same honest gap the first draft of this task
 /// disclosed, now naming the exact setting an operator sets to open it
-/// back up for one tenant's members.
+/// back up for one tenant's members. The reads and [`put_annotation`] share
+/// this text, so it says "access", not "reads".
 const CATALOG_TENANT_REFUSAL_UNCONFIGURED: &str = "per-dataset tenant ownership is not tracked in bronze_meta.dataset_catalog \
      (six columns: slug, title, description, tier, updated_at, table_name — \
      no tenant/connector reference), and CATALOG_TENANT_ID is not set; catalog \
-     and Dagster-job reads are refused for a non-platform-admin principal \
+     and Dagster-job access, including writing an annotation, is refused for a \
+     non-platform-admin principal \
      while more than one tenant exists — set \
      CATALOG_TENANT_ID to the id of the tenant that owns this deployment's \
      shared catalog to restore access for its members";
@@ -2401,14 +2403,17 @@ pub async fn get_annotation(
 /// permission string, no grant migration (WS2 plan review W8).
 ///
 /// # Errors
-/// [`ApiError::PermissionDenied`] (`403`) when [`catalog_tenant_refusal`]
-/// refuses the caller, before the body is read; nothing is written.
-/// `400` if the body is not JSON, or if `id`/`owner`/`steward`/
-/// `description`/any `tags` entry exceeds its bound — see the module doc
-/// above. [`ApiError::Unavailable`] if no Postgres pool is configured; a
-/// classified [`lakehouse_store::StoreError`] on any other database
-/// failure (including a `CHECK` constraint the validation above should
-/// have already caught).
+/// The tenant gate runs first. It answers [`ApiError::PermissionDenied`]
+/// (`403`) with a fixed reason when [`catalog_tenant_refusal`] refuses the
+/// caller, before the body is read, and nothing is written. Without a
+/// Postgres pool the gate refuses every caller except an unrestricted one,
+/// so [`ApiError::Unavailable`] for a missing pool reaches only that caller;
+/// the gate itself also answers `Unavailable` when it cannot read the tenant
+/// count. A caller the gate admits then gets `400` if the body is not JSON,
+/// or if `id`/`owner`/`steward`/`description`/any `tags` entry exceeds its
+/// bound (see the module doc above), or a classified
+/// [`lakehouse_store::StoreError`] on any database failure (including a
+/// `CHECK` constraint the validation above should have already caught).
 pub async fn put_annotation(
     State(state): State<AppState>,
     Path(id): Path<String>,

@@ -6,14 +6,13 @@
 //! console's click is what saves the person's answer (`PUT /api/ai/terms`);
 //! the model has no way to write a term itself.
 
+use lakehouse_store::chat_term::MAX_TERM_CHARS;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
 
-/// Longest `term`, in characters. Matches the store's rule for a saved term
-/// (`lakehouse_store::chat_term::MAX_TERM_CHARS`), so an option the console
-/// saves cannot be refused for its term.
-const MAX_TERM_CHARS: usize = 60;
+// `term` is bounded by the store's own `MAX_TERM_CHARS`, imported above, so
+// an option the console saves cannot be refused for its term.
 /// Longest `question`, in characters: one sentence.
 const MAX_QUESTION_CHARS: usize = 200;
 /// Fewest and most `options`. One option is not a choice, and more than four

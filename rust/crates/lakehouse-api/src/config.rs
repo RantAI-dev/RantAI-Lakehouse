@@ -941,6 +941,22 @@ fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
 }
 
+/// Reads an on/off switch that is on unless set. Empty is unset (see
+/// [`truthy`]), unset and `true` are on, only the exact word `false` is off.
+/// Any other value is an error built by `unsupported`, so a typo such as
+/// `no` fails startup instead of silently keeping the switch on.
+fn parse_switch(
+    env: &HashMap<String, String>,
+    key: &str,
+    unsupported: fn(String) -> ConfigError,
+) -> Result<bool, ConfigError> {
+    match truthy(env, key).as_deref() {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(unsupported(other.to_owned())),
+    }
+}
+
 /// Parses `key` as a `u64`, falling back to `default` when absent or
 /// unparseable. Same non-load-bearing posture as
 /// [`Config::oidc_clock_skew_seconds`]: a garbage override must not fail
@@ -1205,29 +1221,17 @@ impl Config {
                 .transpose()?,
             // Same `truthy` reason as above: an empty string means unset,
             // and unset means on. Only the exact word `false` turns it off.
-            ai_semantic_layer: match truthy(env, "AI_SEMANTIC_LAYER").as_deref() {
-                None | Some("true") => true,
-                Some("false") => false,
-                Some(other) => {
-                    return Err(ConfigError::UnsupportedAiSemanticLayer(other.to_owned()));
-                }
-            },
-            // Same reading as `ai_semantic_layer`: empty is unset, unset is
-            // on, only the exact word `false` turns it off.
-            ai_ask_back: match truthy(env, "AI_ASK_BACK").as_deref() {
-                None | Some("true") => true,
-                Some("false") => false,
-                Some(other) => {
-                    return Err(ConfigError::UnsupportedAiAskBack(other.to_owned()));
-                }
-            },
-            ai_relevant_tables: match truthy(env, "AI_RELEVANT_TABLES").as_deref() {
-                None | Some("true") => true,
-                Some("false") => false,
-                Some(other) => {
-                    return Err(ConfigError::UnsupportedAiRelevantTables(other.to_owned()));
-                }
-            },
+            ai_semantic_layer: parse_switch(
+                env,
+                "AI_SEMANTIC_LAYER",
+                ConfigError::UnsupportedAiSemanticLayer,
+            )?,
+            ai_ask_back: parse_switch(env, "AI_ASK_BACK", ConfigError::UnsupportedAiAskBack)?,
+            ai_relevant_tables: parse_switch(
+                env,
+                "AI_RELEVANT_TABLES",
+                ConfigError::UnsupportedAiRelevantTables,
+            )?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
             login_failure_window_secs: parse_positive_u32_or_default(
