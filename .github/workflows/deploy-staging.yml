@@ -45,10 +45,20 @@ jobs:
           cp .env.example .env
           cat .env.staging >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
-          # public): appended last so it wins over .env.example's empty
-          # `LLM_KEY=`. Unset secret -> empty value -> AI chat / agent /
-          # text-to-SQL keep degrading to 503, never a broken deploy.
-          echo "LLM_KEY=${{ secrets.LLM_KEY }}" >> .env
+          # public): inject it as the ONLY LLM_KEY= line in the file.
+          # .env.example ships an empty `LLM_KEY=` too; compose resolves
+          # a duplicated .env key last-wins, but the line must actually
+          # START a line — .env.staging historically ended without a
+          # trailing newline, so a naive append glued LLM_KEY= onto its
+          # final comment line and compose never saw the key (container
+          # booted with LLM_KEY empty while the file held the real one;
+          # that silent 503 cost a full deploy run to notice). Delete
+          # existing LLM_KEY= lines, then force a leading newline:
+          # exactly one line, always its own line. Unset secret -> that
+          # single line is empty -> AI chat / agent / text-to-SQL keep
+          # degrading to 503, never a broken deploy.
+          sed -i '/^LLM_KEY=/d' .env
+          printf '\nLLM_KEY=%s\n' "${{ secrets.LLM_KEY }}" >> .env
           echo "=== staging .env ready ==="
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
