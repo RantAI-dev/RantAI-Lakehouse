@@ -218,6 +218,24 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     }
 }
 
+/// A seeded Analyst (no `identity:write`) is denied
+/// `PUT /api/identity/users/{id}/tenants/{tenant_id}`, the route that gives
+/// an existing user a tenant. The two loops above walk this entry through
+/// `POLICY_TABLE`; this one names it, with a real principal.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp =
+        request_with_cookie(&router, "PUT", "/api/identity/users/x/tenants/x", &cookie).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied identity:write"
+    );
+}
+
 /// A seeded Analyst (no `governance:write`) is denied
 /// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4),
 /// a fifth `Policy::RequiresPermission` route added after the four-family

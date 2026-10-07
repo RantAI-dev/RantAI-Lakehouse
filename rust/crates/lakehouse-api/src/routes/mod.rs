@@ -596,6 +596,12 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
         )
+        // Give an existing user a tenant. Both ids are validated inside
+        // the handler (400 when malformed, 404 when unknown).
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::put(identity::add_user_to_tenant),
+        )
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),

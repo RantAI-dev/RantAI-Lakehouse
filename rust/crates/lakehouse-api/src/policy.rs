@@ -472,6 +472,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    Admin's `*:*` grants either today; see the module doc comment. ───
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
+    ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
