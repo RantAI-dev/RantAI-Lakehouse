@@ -110,10 +110,10 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Connect to common databases | **Have.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle |
+| Connect to common databases | **Partial.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle, MariaDB, Teradata (`SRC-4`) |
 | Files and APIs | **Have.** CSV files and REST sources (gate `ops/g6`). Adapters for SFTP, Google Sheets and Oracle exist; *Not verified* end to end | Yes | Verify the three |
 | Business-app connectors (CRM, ads, support tools) | **Missing** | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Large (`SRC-3`) |
-| Live change capture | **Have** for PostgreSQL | Yes | Other databases |
+| Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
 | Upload a file from the console | **Partial.** One CSV or TSV file of up to 50 MB, every column stored as text; merged (PR #71), not accepted | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Formats, size, types (`DATA-17`, `DATA-18`) |
 
@@ -332,7 +332,7 @@ an order in its roadmap phase.
 | --- | --- | --- |
 | Dashboards | Filters, time grain, calculated fields, tables and KPIs first (`BI-18`, `BI-9`, `BI-8`, `BI-16`); then the builder, joins, metrics, formatting, layout, reports and sharing | The gaps a Metabase user hits on day one |
 | Assistant for dashboards | `AI-1`, `AI-12`, `AI-15` now; each other `AI-` item ships with its BI item | Agentic-first: what a user can click, they can ask for (`AGENTS.md`) |
-| Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
+| Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), more databases with live change capture (`SRC-4`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
 | Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
 | Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
 | Pipelines | Joins and aggregations in the builder (`BLD-1`) | Today these need SQL written outside the builder |
