@@ -166,6 +166,10 @@ services:
       # 30..1800). Raise it only for a slow self-hosted model, e.g. a
       # small model on CPU; see routes/mod.rs `AI_CHAT_TIMEOUT`.
       AI_CHAT_TIMEOUT_SECS: ${AI_CHAT_TIMEOUT_SECS:-}
+      # Reply language for a chat message too short to detect: `id`
+      # (Indonesian) or `en` (English). Empty means unset; any other value
+      # stops the API at start (see config.rs).
+      AI_DEFAULT_REPLY_LANGUAGE: ${AI_DEFAULT_REPLY_LANGUAGE:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}

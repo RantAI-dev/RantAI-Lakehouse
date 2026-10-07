@@ -10,6 +10,11 @@ once a first release is tagged.
 
 ### Added
 
+- `AI_DEFAULT_REPLY_LANGUAGE` sets the language the copilot answers in when
+  a chat message is too short to detect its language, such as a one-word
+  follow-up. Accepted values are `id` (Indonesian) and `en` (English); unset
+  or empty keeps the previous behavior. A language detected in the message
+  always wins. Any other value stops the API at start with a config error.
 - Login throttling and session cleanup (backlog `SEC-2`/`SEC-5`).
   `POST /api/auth/login` now throttles failed password attempts per email
   (SHA-256 of the trimmed lower-cased address, stored in a new
