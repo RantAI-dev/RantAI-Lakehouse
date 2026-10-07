@@ -19,6 +19,7 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -89,6 +90,9 @@ export const uploadService = uploadClientService
 // `/api/home/layout`; honest `supported: false` when no Postgres pool is
 // configured. No mock ever existed for this domain.
 export const homeService = homeClientService
+// The words a user defined for the chat (`PUT /api/ai/terms`), stored when
+// they pick an answer to a question the chat asked. No mock ever existed.
+export const chatTermService = chatTermClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
