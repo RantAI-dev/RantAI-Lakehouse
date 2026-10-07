@@ -197,6 +197,46 @@ export function fileSizeProblem(name: string, sizeBytes: number): string | null 
 }
 
 /**
+ * The sentence for a file a person must not send, and the extensions it is
+ * for. The words follow the API's `WORKBOOK`, `PARQUET` and `OTHER_BINARY`
+ * (`routes/uploads.rs`); the API still decides by content, so a file that
+ * passes here can be refused there, and only a name that is clearly not
+ * delimited text is refused here.
+ */
+const WORKBOOK_EXTENSIONS = ["xls", "xlsx", "xlsm", "xlsb", "ods"]
+const ARCHIVE_EXTENSIONS = ["zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar"]
+const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "avro", "orc", "db", "sqlite"]
+
+/**
+ * Why a file cannot be sent judging by its NAME alone, or `null`. An Excel
+ * workbook, archive, Parquet file or other binary is refused at once, before
+ * any byte is sent, in words consistent with the API's. A name with no
+ * extension or an unknown one (`.txt`, `.dat`, an extension-less export) is
+ * never refused here: it may be delimited text, and the API judges content.
+ * Case does not matter.
+ */
+export function fileKindProblem(name: string): string | null {
+  const dot = name.lastIndexOf(".")
+  if (dot < 0) return null
+  const extension = name.slice(dot + 1).toLowerCase()
+  if (WORKBOOK_EXTENSIONS.includes(extension) || ARCHIVE_EXTENSIONS.includes(extension)) {
+    return `${name} looks like an Excel workbook or a zip archive. Only delimited text files (CSV, TSV) can be uploaded; save the sheet as CSV first.`
+  }
+  if (extension === "parquet") {
+    return `${name} looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded.`
+  }
+  if (OTHER_BINARY_EXTENSIONS.includes(extension)) {
+    return `${name} is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.`
+  }
+  return null
+}
+
+/** Why a chosen file cannot be sent (its kind by name, then its size), or `null`. */
+export function fileProblem(name: string, sizeBytes: number): string | null {
+  return fileKindProblem(name) ?? fileSizeProblem(name, sizeBytes)
+}
+
+/**
  * The body "Try again" sends: exactly what the failed load was told, which
  * the API records on the upload (`parseOptions`, `bronzeTable`, `loadMode`),
  * or `null` when the upload does not carry all of it (nothing is guessed).

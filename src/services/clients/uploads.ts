@@ -33,11 +33,24 @@ function errorCode(status: number): ServiceErrorCode {
   return "invalid_request"
 }
 
-async function failure(res: Response): Promise<ServiceError> {
+/**
+ * What a person reads when the answer to a file upload is not the API's JSON
+ * error: a proxy or a gateway answered (a plain-text 500, a 413 from a size
+ * limit in front of the API), so the file never reached the service. The raw
+ * body is not shown (principle 4).
+ */
+function notReached(status: number): string {
+  return `The upload did not reach the service (answered ${status}). Files up to 50 MB are accepted; check that this one is under the limit and try again.`
+}
+
+async function failure(res: Response, fallback?: (status: number) => string): Promise<ServiceError> {
   const body: unknown = await res.json().catch(() => null)
   const sentence =
     typeof body === "object" && body !== null && "error" in body ? (body as { error: unknown }).error : null
-  const message = typeof sentence === "string" && sentence.trim() !== "" ? sentence : `Failed (${res.status})`
+  const message =
+    typeof sentence === "string" && sentence.trim() !== ""
+      ? sentence
+      : (fallback ?? ((status: number) => `Failed (${status})`))(res.status)
   return new ServiceError(errorCode(res.status), message, res.status)
 }
 
@@ -64,7 +77,9 @@ export const uploadService: UploadService = {
     form.append("file", file, file.name)
     // No `Content-Type`: the browser writes `multipart/form-data` with the
     // boundary of this body, and a header set here would carry none.
-    return readJson<CreateUploadResponse>(await apiFetch(base, { method: "POST", body: form, signal }))
+    const res = await apiFetch(base, { method: "POST", body: form, signal })
+    if (!res.ok) throw await failure(res, notReached)
+    return (await res.json()) as CreateUploadResponse
   },
   async preview(id, options, signal) {
     // A parameter that is sent must be valid (the API refuses an empty one

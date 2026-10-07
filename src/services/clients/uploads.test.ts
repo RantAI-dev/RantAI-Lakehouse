@@ -217,6 +217,18 @@ describe("uploadService errors", () => {
     }
   })
 
+  it("answers a create that a proxy cut off with a sentence naming the limit, not the body, and keeps the API's own sentence", async () => {
+    stubFetch(() => new Response("Internal Server Error", { status: 500 }))
+    const cut = await rejection(uploadService.create(new File(["x"], "a.csv")))
+    expect(cut.status).toBe(500)
+    expect(cut.message).toContain("did not reach the service")
+    expect(cut.message).toContain("50 MB")
+    expect(cut.message).not.toContain("Internal Server Error")
+
+    stubFetch(() => json({ error: "The file is empty." }, 400))
+    expect((await rejection(uploadService.create(new File(["x"], "a.csv")))).message).toBe("The file is empty.")
+  })
+
   it("refuses a delete with the API's sentence and keeps its status", async () => {
     stubFetch(() => json({ error: "This upload is being loaded, so it cannot be deleted yet." }, 409))
     const err = await rejection(uploadService.remove("up-1"))

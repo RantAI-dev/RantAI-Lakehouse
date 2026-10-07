@@ -136,12 +136,55 @@ describe("UploadFilePage, first step", () => {
     const sentence = "This looks like a workbook. Save it as CSV and upload that."
     stubFetch({ create: json({ error: sentence }, 400) })
     render(<UploadFilePage />)
-    chooseFile(new File(["x"], "stock.xlsx"))
+    // A name the console does not refuse by itself (it refuses .xlsx before any
+    // request, see below), so the API's own refusal by content is what shows.
+    chooseFile(new File(["x"], "stock.dat"))
     fireEvent.click(next())
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
     expect(screen.getByLabelText("Choose a file")).toBeDefined()
+  })
+
+  it("refuses an Excel workbook by its name before any request, saying to save it as CSV", async () => {
+    const calls = stubFetch()
+    render(<UploadFilePage />)
+    chooseFile(new File(["x"], "stock.XLSX"))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("stock.XLSX")
+    expect(alert.textContent).toContain("Excel workbook")
+    expect(alert.textContent).toContain("save the sheet as CSV first")
+    expect(next().disabled).toBe(true)
+    fireEvent.click(next())
+    expect(calls.filter((c) => c.method === "POST")).toEqual([])
+  })
+
+  it("states the accepted kinds, the workbook refusal and the 50 MB limit up front, and suggests text files in the picker", () => {
+    stubFetch()
+    render(<UploadFilePage />)
+    const hint = screen.getByText(/Delimited text files \(CSV, TSV\) up to 50 MB are accepted/)
+    expect(hint.textContent).toContain("Excel workbooks (.xls, .xlsx) are not")
+    expect(hint.textContent).toContain("save the sheet as CSV first")
+    const input = screen.getByLabelText("Choose a file") as HTMLInputElement
+    expect(input.accept).toContain(".csv")
+    expect(input.accept).toContain(".tsv")
+  })
+
+  it("does not show a proxy's plain-text 500 or 413 as such: it says the upload did not reach the service and names the limit", async () => {
+    for (const status of [500, 413]) {
+      stubFetch({ create: new Response("Internal Server Error", { status }) })
+      render(<UploadFilePage />)
+      chooseFile(CSV())
+      fireEvent.click(next())
+
+      const alert = await screen.findByRole("alert")
+      expect(alert.textContent).toContain("did not reach the service")
+      expect(alert.textContent).toContain(`${status}`)
+      expect(alert.textContent).toContain("50 MB")
+      expect(alert.textContent).not.toContain("Internal Server Error")
+      cleanup()
+    }
   })
 
   it("sends the file as a multipart form and moves to the Check step, with the repeated-file notice", async () => {
