@@ -56,7 +56,7 @@ async fn semantic_insert_draft_writes_a_draft_with_the_models_name(
     Ok(())
 }
 
-/// Decision 3 of the plan: a person's text always wins. A draft over a
+/// A person's text always wins over a draft. A draft over a
 /// confirmed entry writes nothing and leaves every field as it was.
 #[sqlx::test(migrations = "../../migrations")]
 async fn semantic_insert_draft_over_a_confirmed_entry_writes_nothing(

@@ -113,6 +113,23 @@ pub(crate) async fn clear_cache() {
     *CACHE.lock().await = None;
 }
 
+/// Held by every test that reads or writes [`CACHE`], so two of them never
+/// race on the one static.
+#[cfg(test)]
+pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Put a built map into [`CACHE`], as a chat turn would.
+#[cfg(test)]
+pub(crate) async fn seed_cache_for_test() {
+    *CACHE.lock().await = Some((Instant::now(), "DATA MAP text".to_owned()));
+}
+
+/// Whether [`CACHE`] holds no map.
+#[cfg(test)]
+pub(crate) async fn cache_is_empty_for_test() -> bool {
+    CACHE.lock().await.is_none()
+}
+
 /// `(database.table, column)` pairs a masking policy covers for anyone,
 /// read from the authored policies' structured `conditions`. Samples are
 /// withheld for these columns so the prompt never carries a value the
@@ -146,6 +163,8 @@ pub(crate) const COLUMN_TEXT_CHARS: usize = 200;
 pub(crate) const MAX_SYNONYMS: usize = 6;
 /// Longest single synonym, in characters.
 pub(crate) const SYNONYM_CHARS: usize = 40;
+/// The roles a column may have (the `CHECK` on `semantic_entry.role`).
+pub(crate) const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
 
 /// What people and the drafting pass wrote about tables and columns, to be
 /// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
@@ -202,6 +221,12 @@ impl Notes {
                 })
                 .collect(),
         }
+    }
+
+    /// Whether no row was indexed.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.annotations.is_empty() && self.entries.is_empty()
     }
 
     /// The text after a table's line: the annotation's, else a confirmed
@@ -1172,8 +1197,9 @@ mod tests {
     /// refills the cache between the call and the check.
     #[tokio::test]
     async fn clearing_the_cache_drops_the_built_map() {
-        *CACHE.lock().await = Some((Instant::now(), "DATA MAP text".to_owned()));
+        let _serial = CACHE_TEST_LOCK.lock().await;
+        seed_cache_for_test().await;
         clear_cache().await;
-        assert!(CACHE.lock().await.is_none());
+        assert!(cache_is_empty_for_test().await);
     }
 }

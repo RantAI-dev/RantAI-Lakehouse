@@ -46,15 +46,12 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::data_map::{
-    COLUMN_TEXT_CHARS, Live, MAX_SYNONYMS, SYNONYM_CHARS, TABLE_TEXT_CHARS, clear_cache,
+    COLUMN_TEXT_CHARS, Live, MAX_SYNONYMS, ROLES, SYNONYM_CHARS, TABLE_TEXT_CHARS, clear_cache,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::catalog::catalog_tenant_refusal;
 use crate::state::AppState;
-
-/// The roles a column can have (the `CHECK` on `semantic_entry.role`).
-const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
 
 /// One entry as the console reads it. The table's own entry has
 /// `column: null`.
@@ -338,4 +335,97 @@ async fn check_live(state: &AppState, input: &SemanticInput) -> Result<(), ApiEr
 
 fn not_a_table(asset: &str) -> ApiError {
     ApiError::NotFound(format!("`{asset}` is not a table in serving or silver"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::super::data_map::{CACHE_TEST_LOCK, cache_is_empty_for_test, seed_cache_for_test};
+    use super::*;
+    use crate::config::Config;
+
+    /// A `ClickHouse` that lists `serving.orders` with one column, `id`.
+    async fn clickhouse() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [
+                { "database": "serving", "name": "orders", "total_rows": "3" },
+            ]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [
+                { "database": "serving", "table": "orders", "name": "id", "type": "UInt32" },
+            ]})))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn state_for(pool: &PgPool, ch: &MockServer) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let env = HashMap::from([
+            ("DATABASE_URL".to_owned(), url),
+            ("CH_URL".to_owned(), ch.uri()),
+        ]);
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    fn admin() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "Fajar Nugroho".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// The chat's cached DATA MAP would otherwise keep the old text for up
+    /// to its time to live.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_confirmation_drops_the_cached_data_map(pool: PgPool) {
+        let _serial = CACHE_TEST_LOCK.lock().await;
+        let ch = clickhouse().await;
+        let state = state_for(&pool, &ch);
+        seed_cache_for_test().await;
+        let body = Bytes::from(json!({ "description": "Orders placed online." }).to_string());
+
+        let reply = put_entry(
+            State(state),
+            Extension(admin()),
+            HeaderMap::new(),
+            Path("serving.orders".to_owned()),
+            body,
+        )
+        .await
+        .expect("the confirmation is accepted");
+
+        assert!(
+            reply.0.get("supported").is_none(),
+            "the write must not be refused: {}",
+            reply.0
+        );
+        assert!(cache_is_empty_for_test().await);
+    }
 }

@@ -1,5 +1,5 @@
 //! Route-level tests for the semantic layer's API (`GET /api/semantic`,
-//! `GET`/`PUT /api/semantic/{asset}`, AI-16 Step 5).
+//! `GET`/`PUT /api/semantic/{asset}`, AI-16).
 //!
 //! `ClickHouse` is a `wiremock` server that lists two tables, the way the
 //! DATA MAP reads them (`system.tables`, `system.columns`): the `PUT` needs

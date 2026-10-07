@@ -1746,6 +1746,72 @@ mod tests {
 
     use super::*;
 
+    /// A state over the test database, with the semantic-layer switch set.
+    fn state_with_switch(pool: &lakehouse_store::PgPool, switch: &str) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let env = std::collections::HashMap::from([
+            ("DATABASE_URL".to_owned(), url),
+            ("AI_SEMANTIC_LAYER".to_owned(), switch.to_owned()),
+        ]);
+        AppState::new(crate::config::Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// One confirmed semantic entry and one annotation.
+    async fn write_notes(pool: &lakehouse_store::PgPool) {
+        lakehouse_store::semantic::confirm(
+            pool,
+            &lakehouse_store::semantic::SemanticInput {
+                asset: "serving.orders".to_owned(),
+                column_name: String::new(),
+                description: "Orders placed online.".to_owned(),
+                synonyms: Vec::new(),
+                role: None,
+            },
+            uuid::Uuid::nil(),
+        )
+        .await
+        .expect("a confirmed entry");
+        lakehouse_store::annotation::upsert_annotation(
+            pool,
+            &lakehouse_store::annotation::AnnotationInput {
+                asset_id: "serving.orders".to_owned(),
+                owner: None,
+                steward: None,
+                tags: Vec::new(),
+                description: Some("From the catalog.".to_owned()),
+            },
+        )
+        .await
+        .expect("an annotation");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_chat_reads_no_notes_when_the_semantic_layer_is_switched_off(
+        pool: lakehouse_store::PgPool,
+    ) {
+        write_notes(&pool).await;
+        let notes = semantic_notes(&state_with_switch(&pool, "false")).await;
+        assert!(notes.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_chat_reads_the_notes_when_the_semantic_layer_is_switched_on(
+        pool: lakehouse_store::PgPool,
+    ) {
+        write_notes(&pool).await;
+        let notes = semantic_notes(&state_with_switch(&pool, "true")).await;
+        assert!(!notes.is_empty());
+    }
+
     #[test]
     fn an_llm_error_body_never_carries_the_providers_text() {
         let err = lakehouse_llm::LlmError::Api(

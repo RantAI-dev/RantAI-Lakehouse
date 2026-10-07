@@ -51,7 +51,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::data_map::{
-    COLUMN_TEXT_CHARS, Live, LiveTable, MAX_SYNONYMS, SYNONYM_CHARS, TABLE_TEXT_CHARS, one_line,
+    COLUMN_TEXT_CHARS, Live, LiveTable, MAX_SYNONYMS, ROLES, SYNONYM_CHARS, TABLE_TEXT_CHARS,
+    one_line,
 };
 use crate::routes::schema_versions::PassGuard;
 use crate::routes::support::extract_json_object;
@@ -70,8 +71,6 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOKENS: u32 = 4_000;
 /// The longest `asset` or `column_name` the table's `CHECK` allows.
 const NAME_CHARS: usize = 200;
-/// The roles a column may have (the `CHECK` on `semantic_entry.role`).
-const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
 
 /// Set while a pass is running, so a slow pass is not joined by another.
 static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
