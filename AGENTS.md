@@ -12,8 +12,9 @@ RantAI Lakehouse: a Next.js console (`src/`), a Rust API workspace
 are in `docs/adr/`, phases/gates/risks in
 `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`, measurements in
 `docs/plans/*-RESULT.md`. Product documents are in `docs/core/`: `PRODUCT.md`
-(what the product is, has, lacks, and what is next), `BACKLOG.md`, and one
-page per feature in `docs/core/features/`. A planner or reviewer taking over
+(what the product is, has, lacks, and what is next), `BACKLOG.md`, one spec
+per backlog task in `docs/core/specs/` (target numbers against the best
+competitor), and one page per feature in `docs/core/features/`. A planner or reviewer taking over
 reads `docs/core/HANDOFF.md` for the current state.
 
 ## Who plans, who writes, who reviews
@@ -37,10 +38,12 @@ review worth having.
 
 The loop, per feature:
 
-0. **Ready.** The feature has a backlog ID and a page in
-   `docs/core/features/` (what the user can do, decisions, limits, acceptance
-   checklist). The planner may draft it; the product owner signs the
-   decisions.
+0. **Ready.** The feature has a backlog ID, a spec in `docs/core/specs/`
+   (its target numbers), and a page in `docs/core/features/` (what the user
+   can do, decisions, limits, acceptance checklist). The planner may draft
+   both; the product owner signs the decisions, including every number the
+   spec marks *(proposed)*. The plan builds to the spec's targets; a target
+   that cannot be met is reported, not quietly lowered.
 1. **Plan.** The planner writes `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`:
    decisions already made, anchors (`file:line`, verified at a named
    commit), numbered tasks each with its acceptance check, PR slicing, and
@@ -70,6 +73,20 @@ The loop, per feature:
 7. **Done.** Merged is not Done. The product owner runs the acceptance
    checklist on the feature page, and the planner updates
    `docs/core/PRODUCT.md` and `docs/core/BACKLOG.md`.
+
+**Assistant parity (product owner, 2026-10-07).** Dashboards are built
+through the assistant, not by drag and drop, so a BI feature is not
+complete until the assistant can use it. Every BI feature's plan names the
+assistant change that goes with it: the tool and its schema (regenerate
+`tests/fixtures/tool_schemas.json`), what the dashboard page sends as
+context, and the standard request set (`AI-15`). The AI team reviews that
+part of the plan and of the diff. This covers the assistant's work for
+dashboards only (backlog `AI-1` to `AI-15`); the AI team plans the
+assistant's other work itself.
+
+**Waits for.** A backlog item that cannot start until another merges says
+so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
+merged; the planner checks this before writing its plan.
 
 ## Five principles
 

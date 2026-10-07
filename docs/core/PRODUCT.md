@@ -3,11 +3,16 @@
 The one product document. Read this to know what the product is, what it
 has, what it lacks, and what comes next.
 
-Last updated 2026-10-02, against commit `6a2b29f`. Vision confirmed with the
-product owner on that date. Statuses come from reading the repository, not
+Last updated 2026-10-07, against commit `ee0251e`. Vision confirmed with the
+product owner on 2026-10-02. Statuses come from reading the repository, not
 from testing a running system; anything unconfirmed says *Not verified*.
-Audited against the code on 2026-10-02: seven rows that were *Not verified*
-were checked and given a real status.
+
+On 2026-10-07 the Dashboards, Data and Query Studio rows were re-graded
+under the product owner's strict rule: **Have** means we match or beat the
+best competitor; anything less is **Partial**. The full matrices (148 BI
+rows, 69 Data rows, 29 Query Studio rows) are in
+`reference/competitive-comparison.md`; every task they produced has a spec
+with target numbers in [`specs/`](specs/).
 
 ---
 
@@ -77,9 +82,10 @@ The modules are the groups in the console's navigation
 | Module | What a user does there | State |
 | --- | --- | --- |
 | **Home** | Starts work: ask, instruct, see what needs attention | Built |
-| **Ask AI** | Chats with the assistant, which answers questions and performs actions | Built; needs a model endpoint |
-| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built |
-| **Data** | Browses the catalog and assets; writes SQL or asks in plain language; registers sources; switches a Gold table's open-format publishing on or off from its page | Built; publishing is merged but not yet accepted |
+| **History (Ask AI)** | Returns to past conversations with the assistant, which answers questions and performs actions; a conversation starts on Home (PR #68) | Built; needs a model endpoint |
+| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
+| **Data** | Browses the catalog and assets; registers sources; uploads a file; switches a Gold table's open-format publishing on or off from its page | Built; publishing (PR #64) and file upload (PR #71) are merged but not yet accepted |
+| **Query Studio** | Writes SQL or asks in plain language; saves queries; downloads results | Built; in the Data menu today. A main module of its own, shared by BI and the lakehouse (product owner, 2026-10-07). Matrix: 4 have, 11 partial, 11 missing |
 | **Build** | Creates, schedules and operates pipelines | Built |
 | **Governance** | Sets policies, classifies and masks data, checks quality, views lineage, approves AI actions | Built; policies and lineage are partial |
 | **Monitoring** | Checks health, alerts, audit log, workloads, services, capacity, table maintenance, ingestion | Built; some pages partial |
@@ -104,19 +110,19 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Connect to common databases | **Have.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle |
+| Connect to common databases | **Partial.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle, MariaDB, Teradata (`SRC-4`) |
 | Files and APIs | **Have.** CSV files and REST sources (gate `ops/g6`). Adapters for SFTP, Google Sheets and Oracle exist; *Not verified* end to end | Yes | Verify the three |
-| Business-app connectors (CRM, ads, support tools) | **Missing** | Yes: large managed connector libraries | Large |
-| Live change capture | **Have** for PostgreSQL | Yes | Other databases |
+| Business-app connectors (CRM, ads, support tools) | **Missing** | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Large (`SRC-3`) |
+| Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
-| Upload a file from the console | **Missing.** Not found in the console or API | Yes | Yes |
+| Upload a file from the console | **Partial.** One CSV or TSV file of up to 50 MB, every column stored as text; merged (PR #71), not accepted | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Formats, size, types (`DATA-17`, `DATA-18`) |
 
 #### Storing data
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
 | Open table format | **Partial.** Raw data is Iceberg. Curated (Gold) data is in the engine's own format; an Iceberg copy is kept automatically for tables switched on (merged, not yet accepted) | Yes; most keep one open copy as the source of truth | Open-first storage, later |
-| Query a table as it was at an earlier time | **Missing.** Past snapshots are listed on the table page but cannot be queried | Yes (Snowflake Time Travel and equivalents) | Yes |
+| Query a table as it was at an earlier time | **Partial.** A version picker exists (PR #71); no test yet proves masking applies to past versions | Yes (Snowflake Time Travel and equivalents) | Prove it safe (`DATA-16`) |
 | Instant copies of a table for testing | **Missing** | Yes (zero-copy clone, branching) | Yes |
 | Share data with another organisation | **Missing** | Yes (built-in sharing) | Yes |
 | Retention and cleanup of old versions | **Missing** for raw tables; small-file cleanup is optional | Yes, automatic | Yes |
@@ -135,8 +141,8 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| SQL editor, saved queries, result download | **Have** | Yes | — |
-| Ask in plain language, get SQL | **Have** | Yes | — |
+| SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
+| Ask in plain language, get SQL | **Partial.** Works, but the model's SQL skips masking and row filters | Yes, inside the user's permissions | `SEC-9` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
@@ -147,9 +153,9 @@ hands-on testing.
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
-| Catalog and search | **Have** | Yes | — |
+| Catalog and search | **Partial.** Search matches table names only; no certification | Yes: columns, tags, certification | `DATA-11`, `DATA-12` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
-| Data quality checks | **Have** | Yes | — |
+| Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
 | Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. `README.md` still describes this as unbuilt | Yes | Test it |
 
@@ -157,12 +163,14 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Dashboards with filters, cross-filter and drill | **Have** | Yes | — |
-| Chart types | **Have.** About two dozen, including maps, sankey, sunburst, box plot, calendar | Yes | — |
-| Share by link and embed in other sites | **Have** | Yes; often a paid extra | — |
-| Alerts on a threshold | **Have.** Email and webhook | Yes | — |
-| Scheduled reports with PDF or spreadsheet attached | **Missing.** Text digests only | Yes, all three BI tools | Yes |
-| Export to PDF or spreadsheet | **Partial.** Browser print; CSV | Yes | Server-made PDF, Excel |
+| Dashboards with filters, cross-filter and drill | **Partial.** One year filter; no relative dates, number, text or linked filters; drill-down missing for nine chart types | Yes, every plan | `BI-18`, `BI-9` |
+| Calculated fields | **Missing** | Yes: Metabase about 100 functions | `BI-8` |
+| Chart types | **Partial.** About two dozen, including maps, sankey, sunburst, box plot, calendar; no pivot table, KPI comparison, raw-row table or Gantt | Yes | `BI-16` |
+| Chart formatting | **Partial.** The saved number format is ignored; one palette | Yes | `BI-17` |
+| Share by link and embed in other sites | **Partial.** Public links never expire; embed tokens can lack an expiry | Yes; often a paid extra | `BI-19`, `BI-26`, `SEC-12` |
+| Alerts on a threshold | **Partial.** Email and webhook; one aggregate per table, re-fires every check | Yes | `BI-19` |
+| Scheduled reports with PDF or spreadsheet attached | **Missing.** Text digests only | Yes, all three BI tools | `RPT-1` |
+| Export to PDF or spreadsheet | **Partial.** Browser print; CSV | Yes | `BI-1` |
 | Shared business definitions (a governed metrics layer) | **Partial.** Built-in dashboard cards are defined once in code; users cannot define and reuse their own metrics | Yes, all three BI tools | User-defined metrics |
 | Mobile app | **Missing** | Tableau and Power BI | Decide if wanted |
 | Import dashboards from another BI tool | **Missing** | Databricks imports Tableau and Power BI | Helps switching |
@@ -173,7 +181,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Assistant that performs actions, not only answers | **Have** | Yes, recently | — |
 | Human approval before a risky AI action | **Have**, built in | Varies | A strength |
-| Assistant builds charts and dashboards | **Have** | Yes | — |
+| Assistant builds charts and dashboards | **Partial.** Builds them; cannot rename, arrange or delete them | Yes | `AI-1`, then one assistant item per BI item |
 | Assistant aware of the page you are on | **Have** | Yes | — |
 | AI functions inside SQL | **Missing** | Yes | Decide if wanted |
 | Search over documents | **Missing** | Yes | Yes |
@@ -202,11 +210,14 @@ hands-on testing.
 
 ### Where the biggest gaps are
 
-1. Business-app connectors.
-2. Scheduled reports with attachments.
-3. Scale beyond one server.
-4. Richer transformations in the console (joins, aggregations).
-5. Notebooks and Python, if we decide we want them.
+1. Open security findings in the Data module and Query Studio (section 3).
+2. Dashboard depth: filters, calculated fields, formatting, scheduled
+   reports.
+3. Business-app connectors.
+4. Query Studio basics: autocomplete, results, saved queries.
+5. Scale beyond one server.
+6. Richer transformations in the console (joins, aggregations).
+7. Notebooks and Python, if we decide we want them.
 
 ---
 
@@ -225,10 +236,14 @@ in `README.md` ("Status / Known limitations").
   versions. The product's own queries avoid this; a hand-written one may not.
 
 **Queries and dashboards**
-- One engine; no querying other systems in place. A table cannot be
-  queried as it was at an earlier time.
-- No file upload from the console; data arrives through registered sources.
-- A chart built on a saved query is limited to 2,000 rows and 30 seconds.
+- One engine; no querying other systems in place. Querying a table as it
+  was earlier works from a version picker, but no test yet proves masking
+  applies to past versions (`DATA-16`).
+- File upload takes one CSV or TSV file of up to 50 MB, and every column is
+  stored as text (merged, not accepted).
+- Dashboards filter by year only; there are no calculated fields.
+- Query Studio shows at most 2,000 rows. A chart built on a saved query is
+  limited to 2,000 rows and 30 seconds.
 - No scheduled reports with attachments. "Export PDF" is the browser's print.
 
 **AI**
@@ -236,9 +251,15 @@ in `README.md` ("Status / Known limitations").
 - Digital employees are not available.
 
 **Security**
-- No login rate limiting. Sessions and tokens are not cleaned up
-  automatically. Single sign-on exists in the API but has not been tested
+- Login rate limiting and session cleanup are merged (PR #67), not yet
+  accepted. Single sign-on exists in the API but has not been tested
   against a real identity provider.
+- Open findings from the 2026-10-07 code audits, fixed before feature work:
+  a connector's stored password can be sent to a new host (`SEC-14`);
+  connection tests and alert webhooks can reach internal addresses
+  (`SEC-15`, `SEC-10`); plain-language queries skip masking (`SEC-9`); raw
+  database errors reach the screen (`SEC-11`); queries are not scoped to the
+  tenant (`SEC-20`). The full list is `SEC-9` to `SEC-21` in `BACKLOG.md`.
 - The audit trail does not cover every console change.
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history
@@ -269,10 +290,11 @@ run without the product owner fixing things by hand.
 | 3 | No human security review | Commission one |
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
+| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`), plain-language queries skipping masking (`SEC-9`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
-Not blockers, but will be found in a customer's evaluation: login rate
-limiting, full audit coverage, single sign-on, tested backup restore,
-cleanup of old table versions.
+Not blockers, but will be found in a customer's evaluation: full audit
+coverage, single sign-on, tested backup restore, cleanup of old table
+versions.
 
 ### Risks worth knowing
 
@@ -297,30 +319,32 @@ customer would hit first, not matching every feature.
 
 | Item | Why |
 | --- | --- |
-| Accept Gold publishing: run its checklist on a real deployment | Built and merged; "open" is only proven once someone has seen it work |
-| Accept the built features one by one | Blocker 1; also gives a true picture of what works |
+| Accept the merged features: Gold publishing (`DATA-1`), login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`) | Blocker 1; merged is not accepted |
+| Fix the security findings under Now: `SEC-9`, `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 
 ### Next
 
-| Item | Why |
-| --- | --- |
-| Scheduled reports with PDF and spreadsheet attachments | Every BI competitor has it; a switching customer expects it |
-| Richer transformations in the console: joins, aggregations | Today these need SQL written outside the builder |
-| Verify the two remaining *Not verified* rows in section 2 (SFTP, Sheets and Oracle sources) and test single sign-on and row filters | Turns guesses into a real picture |
-| Security basics: rate limiting, audit coverage, single sign-on | Found in every evaluation |
-| Cleanup of old table versions | Storage grows without bound |
-| Metrics users can define once and reuse across dashboards | Expected with BI; today only built-in cards are defined this way |
-| Upload a file from the console | The simplest way for a new user to get data in |
-| Usage and cost view | Expected by anyone coming from a metered platform |
+One task list per module, each task with a spec in [`specs/`](specs/) and
+an order in its roadmap phase.
+
+| Module | Item | Why |
+| --- | --- | --- |
+| Dashboards | Filters, time grain, calculated fields, tables and KPIs first (`BI-18`, `BI-9`, `BI-8`, `BI-16`); then the builder, joins, metrics, formatting, layout, reports and sharing | The gaps a Metabase user hits on day one |
+| Assistant for dashboards | `AI-1`, `AI-12`, `AI-15` now; each other `AI-` item ships with its BI item | Agentic-first: what a user can click, they can ask for (`AGENTS.md`) |
+| Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), more databases with live change capture (`SRC-4`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
+| Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
+| Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
+| Pipelines | Joins and aggregations in the builder (`BLD-1`) | Today these need SQL written outside the builder |
 
 ### Later
 
 | Item | Why later |
 | --- | --- |
 | Run on several servers | A stated goal; larger work |
-| Business-app connectors | Large; pick the few customers ask for |
-| Query a table as of an earlier time; instant copies; self-refreshing tables | Expected by Snowflake users |
+| Business-app connectors (`SRC-3`): Databricks' ten generally available ones first | Large; waits for the reuse decision `DEC-9` |
+| Parameters, snippets and charts from SQL results (`QS-5`) | The bridge from Query Studio to dashboards, after the basics |
+| Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
 | Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
 | Import dashboards from other BI tools | Eases switching |
 | Search over documents | Needs a vector store |
@@ -341,9 +365,19 @@ is large. Saying no to some is how the product stays simple.
 | 1 | Which role may publish a table in open format | Platform admins only for now. Today the Data Engineer role cannot |
 | 2 | What switching publishing off does | Stop updating; keep the table |
 | 3 | The "decide whether we want these" list in section 5 | Say no to model training and mobile app; defer the rest |
-| 4 | Which single competitor is the one to beat | Snowflake, since replacing it is the stated goal |
+| 4 | Which competitor is the one to beat | Per module, as the specs already use: Metabase for dashboards (Tableau as the ceiling), Databricks for Data and Query Studio, Airbyte for connectors |
 | 5 | What happens to the old documents | Archive `PRODUCT_SPECS.md` and `docs/UX_FLOWS.md`; rewrite `docs/FEATURE_COVERAGE.md` from section 2 |
 | 6 | Rewrite the sales playbook around the new positioning | Yes; it leads with on-premises, which is no longer the main message |
+| 7 | Which assistant actions need human approval (`DEC-8`) | Also making a dashboard public or embeddable, changing who can see it, and email outside the company |
+| 8 | How to get business-app connectors (`DEC-9`) | Reuse dlt verified sources first; our loader already runs on dlt |
+| 9 | Data and Query Studio edge cases (`DEC-10`) | Drop or defer all six |
+| 10 | The four login defaults (5 failures in 15 minutes, 5-minute lock, 30-day retention, no off switch) | Keep them |
+| 11 | Every target marked *(proposed)* in `specs/` | Confirm or change on each feature page before its plan is written |
+
+Decided on 2026-10-06 and 2026-10-07: the BI scope (write-back, curated
+datasets, data preparation, sets, PowerPoint export and automatic dashboards
+rejected; see `reference/competitive-comparison.md`), Query Studio as its
+own module, and the strict Have rule above.
 
 ---
 
