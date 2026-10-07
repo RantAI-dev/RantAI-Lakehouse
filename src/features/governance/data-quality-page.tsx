@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
@@ -19,6 +20,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import type { Severity } from "@/lib/status"
@@ -28,6 +30,7 @@ import {
   SEVERITY_OPTIONS,
   getDataQualityColumns,
 } from "./data-quality-columns"
+import { EditRuleDialog } from "./quality-rule-edit-dialog"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -56,6 +59,21 @@ export function DataQualityPage() {
     )
   )
 
+  const runCheck = useServiceAction(
+    withNotify(
+      { success: "Check ran", error: "The check could not be run" },
+      (signal, id: string) => governanceService.runQualityRule(id, signal)
+    )
+  )
+  const { hasPermission } = useAuth()
+  const [deleting, setDeleting] = React.useState<QualityRule | null>(null)
+  const [editing, setEditing] = React.useState<QualityRule | null>(null)
+  const removeRule = useServiceAction(
+    withNotify(
+      { success: "Quality rule deleted", error: "The rule could not be deleted" },
+      (signal, id: string) => governanceService.deleteQualityRule(id, signal)
+    )
+  )
   const columns = React.useMemo(
     () => getDataQualityColumns({ onSelect: setSelected }),
     []
@@ -104,6 +122,29 @@ export function DataQualityPage() {
     setFormDimension("")
     setThreshold("")
     setSeverity("medium")
+  }
+
+  async function handleRun(rule: QualityRule) {
+    const result = await runCheck.run(rule.id)
+    if (!result) return
+    // The drawer shows what just ran; the list catches up behind it.
+    setSelected({
+      ...rule,
+      lastStatus: result.status,
+      lastValue: result.value,
+      lastRunAt: new Date().toISOString(),
+    })
+    state.reload()
+  }
+
+  async function handleDelete() {
+    if (!deleting) return
+    // `run` resolves to `null` only on failure, which `withNotify` reports.
+    const ok = await removeRule.run(deleting.id)
+    if (ok === null) return
+    setDeleting(null)
+    setSelected(null)
+    state.reload()
   }
 
   async function handleCreate() {
@@ -158,14 +199,22 @@ export function DataQualityPage() {
           <>
             <div className="flex items-center gap-2">
               {selected.lastStatus === null ? (
-                // A rule nobody has evaluated has no verdict to badge —
-                // render that honestly instead of guessing a `CheckStatus`.
-                <span className="text-muted-foreground">Not evaluated</span>
+                // A rule nobody has run has no verdict to badge — render
+                // that honestly instead of guessing a `CheckStatus`.
+                <span className="text-muted-foreground">
+                  {selected.evaluable === false ? "Can't be run" : "Not run yet"}
+                </span>
               ) : (
                 <CheckBadge status={selected.lastStatus} />
               )}
               <SeverityBadge severity={selected.severity} />
+              {selected.lastValue ? (
+                <span className="text-sm text-muted-foreground">{selected.lastValue}</span>
+              ) : null}
             </div>
+            {selected.evaluable === false && selected.hint ? (
+              <p className="text-sm text-muted-foreground">{selected.hint}</p>
+            ) : null}
             <MetadataList
               items={[
                 { label: "Asset", value: selected.asset },
@@ -177,20 +226,65 @@ export function DataQualityPage() {
                 },
               ]}
             />
-            <Button
-              variant="outline"
-              size="sm"
-              className="self-start"
-              render={
-                <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
-              }
-            >
-              Inspect in Data Explorer
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              {selected.evaluable ? (
+                <Button
+                  size="sm"
+                  onClick={() => void handleRun(selected)}
+                  disabled={runCheck.status === "pending"}
+                >
+                  {runCheck.status === "pending" ? "Running…" : "Run check"}
+                </Button>
+              ) : null}
+              <Button
+                variant="outline"
+                size="sm"
+                render={
+                  <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+                }
+              >
+                Inspect in Data Explorer
+              </Button>
+              {/* `evaluable` is only on an authored rule; a verdict a job
+                  recorded is not a rule this page can change or delete. */}
+              {selected.evaluable !== undefined && hasPermission("governance:write") ? (
+                <>
+                  <Button variant="outline" size="sm" onClick={() => setEditing(selected)}>
+                    Edit rule
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => setDeleting(selected)}>
+                    Delete rule
+                  </Button>
+                </>
+              ) : null}
+            </div>
           </>
         ) : null}
       </DetailDrawer>
 
+      {editing ? (
+        <EditRuleDialog
+          rule={editing}
+          onClose={() => setEditing(null)}
+          onSaved={(saved) => {
+            setEditing(null)
+            // The drawer shows the rule as it now reads; the list catches up.
+            setSelected(saved)
+            state.reload()
+          }}
+        />
+      ) : null}
+      <ConfirmActionDialog
+        open={deleting !== null}
+        onOpenChange={(open) => (open ? undefined : setDeleting(null))}
+        title="Delete quality rule"
+        description={`Delete ${deleting?.name ?? "this rule"}?`}
+        impact="The rule and the results recorded for it are removed."
+        confirmLabel="Delete rule"
+        confirming={removeRule.status === "pending"}
+        destructive
+        onConfirm={() => void handleDelete()}
+      />
       <CreateSheet
         open={createOpen}
         onOpenChange={(open) => {
@@ -236,8 +330,15 @@ export function DataQualityPage() {
             id="qr-threshold"
             value={threshold}
             onChange={(e) => setThreshold(e.target.value)}
-            placeholder=">= 99%"
+            placeholder="email not null >= 99%"
           />
+          <p className="text-xs text-muted-foreground">
+            To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
+            <span className="font-mono">column not null &gt;= 95%</span>,{" "}
+            <span className="font-mono">column unique</span> or{" "}
+            <span className="font-mono">column between 0 and 100</span>. Name the asset as
+            silver.table, serving.table or bronze.table.
+          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="qr-severity">Severity</Label>

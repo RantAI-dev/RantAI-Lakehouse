@@ -19,16 +19,18 @@
 
 use std::collections::HashMap;
 
+use lakehouse_core::ident::Ident;
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
-/// Only `PORT` can fail resolution: it is load-bearing and Rust-only (the
-/// TypeScript backend runs under Next.js and never binds a port itself), so
-/// an unparseable value refusing to boot is the correct, Rust-specific
-/// failure mode. `SMTP_PORT` deliberately has no equivalent error variant —
+/// Only `PORT`, `CATALOG_TENANT_ID` and `AI_DEFAULT_REPLY_LANGUAGE` can
+/// fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// backend runs under Next.js and never binds a port itself), so an
+/// unparseable value refusing to boot is the correct, Rust-specific failure
+/// mode. `SMTP_PORT` deliberately has no equivalent error variant —
 /// see the doc comment on [`Config::smtp_port`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -46,6 +48,42 @@ pub enum ConfigError {
     /// request-time surprise.
     #[error("CATALOG_TENANT_ID must be a valid UUID, got {0:?}")]
     InvalidCatalogTenantId(String),
+    /// `CONNECTOR_PROBE_ALLOWED_CIDRS` holds an entry that is not a network
+    /// or an address. Fails config resolution for the same reason
+    /// [`ConfigError::InvalidCatalogTenantId`] does: dropping the bad entry
+    /// would quietly refuse the hosts the operator meant to allow.
+    #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
+    MalformedAllowedCidrs(String),
+    /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
+    /// `"en"`.
+    ///
+    /// Fails config resolution rather than being ignored: a mistyped value
+    /// would leave every message too short to detect answered in the wrong
+    /// language, with nothing in the logs to explain it.
+    #[error("AI_DEFAULT_REPLY_LANGUAGE must be \"id\" or \"en\", got {0:?}")]
+    UnsupportedAiDefaultReplyLanguage(String),
+}
+
+/// The language the copilot answers in when the user's message is too short
+/// to tell (`AI_DEFAULT_REPLY_LANGUAGE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyLanguage {
+    /// `AI_DEFAULT_REPLY_LANGUAGE=id`.
+    Indonesian,
+    /// `AI_DEFAULT_REPLY_LANGUAGE=en`.
+    English,
+}
+
+impl ReplyLanguage {
+    /// The name the system prompt uses for this language, the same two names
+    /// `routes::ai::prompt::reply_language` returns for a detected one.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Indonesian => "Indonesian",
+            Self::English => "English",
+        }
+    }
 }
 
 /// Resolved application configuration.
@@ -91,6 +129,19 @@ pub struct Config {
     /// posture is what a deployment gets unless it says otherwise. `true`
     /// only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
+    /// Private networks a connector may dial even though the SSRF guard
+    /// refuses internal addresses (`CONNECTOR_PROBE_ALLOWED_CIDRS`, e.g.
+    /// `192.168.18.0/24`): the narrow alternative to
+    /// `connector_probe_allow_internal_hosts`. Empty by default. See
+    /// [`crate::internal_hosts`] for what the list can never open.
+    pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Where connector credential files physically live
+    /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
+    /// `file:/run/secrets/...`, the path Dagster reads inside its own
+    /// container; this moves only where the API itself reads and writes
+    /// them — e.g. when it runs outside Docker, where `/run/secrets` does
+    /// not exist and every stored credential would fail with a 503.
+    pub connector_secrets_dir: std::path::PathBuf,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -280,6 +331,15 @@ pub struct Config {
     /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
     /// Default `"default"`.
     pub lakekeeper_warehouse: String,
+    /// `ICEBERG_QUERY_DB` — the `ClickHouse` `DataLakeCatalog` database
+    /// this API reads Iceberg tables through (compose's
+    /// `clickhouse-iceberg-init` creates it as `icecat_api`). Used to
+    /// resolve an Iceberg table's real columns for policy enforcement
+    /// (`policy_engine`) and to read Iceberg-only catalog assets
+    /// (`routes::catalog`, `routes::catalog_profile`). `None` when unset
+    /// or not a plain identifier: Iceberg tables then stay unreadable
+    /// through those paths, and a governed one is refused, never read raw.
+    pub iceberg_query_db: Option<Ident>,
     /// Base URL of Lakekeeper's own `management/v1/*` REST API (e.g.
     /// `http://lakekeeper:8181`), used ONLY by
     /// `lakehouse_auth::openfga::LakekeeperAdminClient`
@@ -594,6 +654,14 @@ pub struct Config {
     /// seeded `0002_seed_identity.sql` group tenant) — see the
     /// `docs/OPERATIONS.md` upgrade note.
     pub catalog_tenant_id: Option<Uuid>,
+    /// Language the copilot replies in when the latest chat message is too
+    /// short for `routes::ai::prompt::reply_language` to detect one
+    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// prompt's wording is then unchanged from before the setting existed
+    /// (the Latin-script line keeps its English fallback, a message with no
+    /// letters gets none). A detected language always wins over this
+    /// default.
+    pub ai_default_reply_language: Option<ReplyLanguage>,
     /// The commit this image was built from — `rust/Dockerfile`'s `ARG
     /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
     /// same convention `dagster/Dockerfile` already uses for the code
@@ -665,6 +733,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
                 "lakekeeper_credential_secret_ref",
@@ -709,6 +778,11 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
             )
+            .field(
+                "connector_probe_allowed_cidrs",
+                &self.connector_probe_allowed_cidrs,
+            )
+            .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
@@ -796,6 +870,7 @@ impl std::fmt::Debug for Config {
             .field("trino_health_url", &self.trino_health_url)
             .field("openfga_url", &self.openfga_url)
             .field("catalog_tenant_id", &self.catalog_tenant_id)
+            .field("ai_default_reply_language", &self.ai_default_reply_language)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
             .field("login_failure_window_secs", &self.login_failure_window_secs)
@@ -867,9 +942,17 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if `PORT` is set to a value that does not
-    /// parse as a `u16`. An unparseable `SMTP_PORT` does NOT error — see
-    /// [`Config::smtp_port`].
+    /// Returns [`ConfigError`] in three cases:
+    ///
+    /// - [`ConfigError::InvalidPort`], if `PORT` is set to a value that does
+    ///   not parse as a `u16`.
+    /// - [`ConfigError::InvalidCatalogTenantId`], if `CATALOG_TENANT_ID` is
+    ///   set and non-empty but is not a valid UUID.
+    /// - [`ConfigError::UnsupportedAiDefaultReplyLanguage`], if
+    ///   `AI_DEFAULT_REPLY_LANGUAGE` is set and non-empty but is neither
+    ///   `id` nor `en`.
+    ///
+    /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
         clippy::too_many_lines,
         reason = "one flat env->field mapping, one line per Config field; \
@@ -950,6 +1033,15 @@ impl Config {
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
+            connector_probe_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("CONNECTOR_PROBE_ALLOWED_CIDRS")
+                    .map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedAllowedCidrs)?,
+            connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
+                || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
+                std::path::PathBuf::from,
+            ),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -966,6 +1058,7 @@ impl Config {
                 "http://localhost:8181/catalog",
             ),
             lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            iceberg_query_db: truthy(env, "ICEBERG_QUERY_DB").and_then(|v| Ident::new(v).ok()),
             lakekeeper_base_url: or_default(env, "LAKEKEEPER_BASE_URI", "http://localhost:8181"),
             lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
             rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
@@ -1044,6 +1137,16 @@ impl Config {
                         .map_err(|_err| ConfigError::InvalidCatalogTenantId(raw))
                 })
                 .transpose()?,
+            // `truthy`, not a direct read: docker-compose.yml passes an empty
+            // string on every deployment that sets nothing, and that must
+            // mean unset, not a startup failure.
+            ai_default_reply_language: truthy(env, "AI_DEFAULT_REPLY_LANGUAGE")
+                .map(|raw| match raw.as_str() {
+                    "id" => Ok(ReplyLanguage::Indonesian),
+                    "en" => Ok(ReplyLanguage::English),
+                    _ => Err(ConfigError::UnsupportedAiDefaultReplyLanguage(raw)),
+                })
+                .transpose()?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
             login_failure_window_secs: parse_positive_u32_or_default(
@@ -1065,6 +1168,17 @@ impl Config {
         let env: HashMap<String, String> = std::env::vars().collect();
         Self::from_map(&env)
     }
+
+    /// The internal addresses a connector dial may reach: every one of
+    /// them, or only the allowlisted networks. Passed to
+    /// `connector_probe`/`connector_discover`'s SSRF check.
+    #[must_use]
+    pub fn connector_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.connector_probe_allow_internal_hosts,
+            allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1078,6 +1192,19 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// A plain identifier is kept; anything that could not be interpolated
+    /// safely into `ClickHouse` SQL turns the feature off instead.
+    #[test]
+    fn iceberg_query_db_accepts_only_a_plain_identifier() {
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "icecat_api")])).unwrap();
+        assert_eq!(
+            cfg.iceberg_query_db.as_ref().map(Ident::as_str),
+            Some("icecat_api")
+        );
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "x`; DROP")])).unwrap();
+        assert_eq!(cfg.iceberg_query_db, None);
     }
 
     /// H1: `{:?}` must never leak a secret value, however it's populated.
@@ -1146,6 +1273,7 @@ mod tests {
         );
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.iceberg_query_db, None);
         assert_eq!(cfg.lakekeeper_base_url, "http://localhost:8181");
         assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
         assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");
@@ -1364,6 +1492,32 @@ mod tests {
         let cfg =
             Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
         assert!(cfg.connector_probe_allow_internal_hosts);
+    }
+
+    /// The narrow alternative: listed networks only, parsed at startup,
+    /// and a bad entry refuses to boot rather than being dropped.
+    #[test]
+    fn connector_probe_allowed_cidrs_parses_the_list_and_refuses_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert!(cfg.connector_probe_allowed_cidrs.is_empty());
+        assert_eq!(
+            cfg.connector_internal_hosts(),
+            crate::internal_hosts::InternalHosts::NONE
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "CONNECTOR_PROBE_ALLOWED_CIDRS",
+            "192.168.18.0/24, 10.1.2.3",
+        )]))
+        .unwrap();
+        assert_eq!(cfg.connector_probe_allowed_cidrs.len(), 2);
+        assert!(
+            cfg.connector_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
     }
 
     /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
@@ -1733,5 +1887,65 @@ mod tests {
             err,
             ConfigError::InvalidCatalogTenantId("not-a-uuid".to_owned())
         );
+    }
+
+    fn env_with_default_reply_language(value: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AI_DEFAULT_REPLY_LANGUAGE".to_owned(), value.to_owned());
+        env
+    }
+
+    #[test]
+    fn the_default_reply_language_is_none_when_the_setting_is_absent() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, None);
+    }
+
+    #[test]
+    fn an_empty_default_reply_language_means_unset_not_an_error() {
+        // docker-compose.yml passes `${AI_DEFAULT_REPLY_LANGUAGE:-}`, an
+        // empty string on every deployment that sets nothing.
+        let cfg = Config::from_map(&env_with_default_reply_language("")).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, None);
+    }
+
+    #[test]
+    fn the_default_reply_language_id_parses_to_indonesian() {
+        let cfg = Config::from_map(&env_with_default_reply_language("id")).unwrap();
+        assert_eq!(
+            cfg.ai_default_reply_language,
+            Some(ReplyLanguage::Indonesian)
+        );
+        assert_eq!(ReplyLanguage::Indonesian.name(), "Indonesian");
+    }
+
+    #[test]
+    fn the_default_reply_language_en_parses_to_english() {
+        let cfg = Config::from_map(&env_with_default_reply_language("en")).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, Some(ReplyLanguage::English));
+        assert_eq!(ReplyLanguage::English.name(), "English");
+    }
+
+    #[test]
+    fn an_upper_case_default_reply_language_is_refused() {
+        let err = Config::from_map(&env_with_default_reply_language("ID"))
+            .expect_err("only the lower-case values id and en are accepted");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiDefaultReplyLanguage("ID".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unknown_default_reply_language_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with_default_reply_language("fr"))
+            .expect_err("a language other than id or en must fail config resolution");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiDefaultReplyLanguage("fr".to_owned())
+        );
+        let message = err.to_string();
+        assert!(message.contains("\"id\""), "{message}");
+        assert!(message.contains("\"en\""), "{message}");
     }
 }

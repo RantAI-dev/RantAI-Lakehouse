@@ -670,6 +670,10 @@ pub struct CreatePipelineInput {
     /// Defaults to empty when the field is absent (route omits it, the
     /// migration's `DEFAULT '{}'` fills the column). Migration `0052`.
     pub depends_on: Vec<String>,
+    /// The connector this pipeline reads from, when there is one — what
+    /// `connectors::dependent_pipelines` finds, and what stops that
+    /// connector from being deleted underneath it.
+    pub connector_id: Option<String>,
     /// Optional id. PR #57 review F1.7: the create route mints the id
     /// BEFORE running the `depends_on` validator, so the validator's
     /// self-reference rule names the real id the row will carry.
@@ -724,8 +728,8 @@ pub async fn create_pipeline(
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
 schedule, description, incremental_column, fbic_enabled, transforms, \
-         max_retries, tenant_id, depends_on) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         max_retries, tenant_id, depends_on, connector_id) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
@@ -744,6 +748,7 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(max_retries)
         .bind(input.tenant_id)
         .bind(&input.depends_on)
+        .bind(&input.connector_id)
         .fetch_one(&mut *tx)
         .await?;
     let snapshot = PipelineDefinitionSnapshot::from(&row);

@@ -2,6 +2,7 @@ import type {
   AssetService,
   Asset,
   AssetDetail,
+  AssetProfile,
   AssetFilter,
   CatalogNamespace,
   DecideAccessRequestResult,
@@ -90,6 +91,31 @@ export const clickhouseAssetService: AssetService = {
     const json = await res.json();
     if (!res.ok) throw new ServiceError("not_found", json?.error ?? "Asset not found");
     return json as AssetDetail;
+  },
+  async getAssetProfile(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/profile`, { signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to profile asset");
+    return json as AssetProfile;
+  },
+  async getAssetSample(id, limit, signal) {
+    const res = await apiFetch(
+      `/api/catalog/${encodeURIComponent(id)}/sample?limit=${encodeURIComponent(limit)}`,
+      { signal }
+    );
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load sample rows");
+    return (json?.rows ?? []) as Record<string, string | null>[];
+  },
+  async updateAnnotation(id, input, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/annotation`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the asset's details");
   },
   async listNamespaces(signal) {
     return (await loadCatalog(undefined, signal)).namespaces;

@@ -53,7 +53,12 @@ export function FilesDialForm({
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-bucket">Bucket / root</Label>
-        <Input id="files-dial-bucket" value={dial.bucket} onChange={(e) => set("bucket", e.target.value)} />
+        <Input
+          id="files-dial-bucket"
+          value={dial.bucket}
+          onChange={(e) => set("bucket", e.target.value)}
+          autoComplete="off"
+        />
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-prefix">Prefix (optional)</Label>
@@ -61,6 +66,7 @@ export function FilesDialForm({
           id="files-dial-prefix"
           value={dial.prefix ?? ""}
           onChange={(e) => set("prefix", e.target.value === "" ? null : e.target.value)}
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -70,6 +76,7 @@ export function FilesDialForm({
           value={dial.endpoint ?? ""}
           onChange={(e) => set("endpoint", e.target.value === "" ? null : e.target.value)}
           placeholder="https://rustfs.internal:9000"
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -78,6 +85,7 @@ export function FilesDialForm({
           id="files-dial-region"
           value={dial.region ?? ""}
           onChange={(e) => set("region", e.target.value === "" ? null : e.target.value)}
+          autoComplete="off"
         />
       </div>
     </div>

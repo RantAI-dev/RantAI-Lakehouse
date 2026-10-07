@@ -64,17 +64,22 @@ export function snapshotsNewestFirst(snapshots: LakehouseSnapshot[]): LakehouseS
 }
 
 /**
- * An asset can only have Iceberg snapshots surfaced when it is a Bronze
- * asset AND the registry recorded a (possibly Iceberg, possibly not —
- * see the module comment in `catalog.rs`) `tableName` for it. The
- * actual existence check happens server-side via a 404 on
+ * An asset can only have Iceberg snapshots surfaced when the registry
+ * recorded a `tableName` for it AND it is either a Bronze asset or typed
+ * `"iceberg-table"`. The latter matters because the detail route files
+ * every non-curated registry dataset under layer `raw` while still typing
+ * it `"iceberg-table"` (`catalog.rs`), and those have real Bronze tables
+ * too. Neither signal proves the table exists (see the module comment in
+ * `catalog.rs`) — that check happens server-side via a 404 on
  * `getTableDetail`.
  */
 export function isIcebergCandidate(asset: {
   layer: string
+  type?: string
   tableName?: string | null
 }): boolean {
-  return asset.layer === "bronze" && typeof asset.tableName === "string" && asset.tableName.length > 0
+  const icebergish = asset.layer === "bronze" || asset.type === "iceberg-table"
+  return icebergish && typeof asset.tableName === "string" && asset.tableName.length > 0
 }
 
 /** ISO-8601 UTC string from an Iceberg epoch-millisecond timestamp, for `formatRelativeTime`. */

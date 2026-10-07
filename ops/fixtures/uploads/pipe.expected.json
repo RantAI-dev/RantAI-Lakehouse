@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-8",
+  "delimiter": "|",
+  "headerRow": 0,
+  "columns": ["code", "name", "qty"],
+  "rows": [
+    ["X1", "Gasket", "4"],
+    ["X2", "O-ring, large", "9"]
+  ]
+}

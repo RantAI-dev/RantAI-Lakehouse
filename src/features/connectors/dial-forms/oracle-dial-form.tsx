@@ -47,7 +47,12 @@ export function OracleDialForm({
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
           <Label htmlFor="oracle-dial-host">Host</Label>
-          <Input id="oracle-dial-host" value={dial.host} onChange={(e) => set("host", e.target.value)} />
+          <Input
+            id="oracle-dial-host"
+            value={dial.host}
+            onChange={(e) => set("host", e.target.value)}
+            autoComplete="off"
+          />
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="oracle-dial-port">Port</Label>
@@ -56,6 +61,7 @@ export function OracleDialForm({
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -64,13 +70,19 @@ export function OracleDialForm({
             id="oracle-dial-database"
             value={dial.database}
             onChange={(e) => set("database", e.target.value)}
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
           {/* A literal username, never a secretRef picker -- same
               reasoning as SqlDialForm's User field. */}
           <Label htmlFor="oracle-dial-user">User</Label>
-          <Input id="oracle-dial-user" value={dial.user} onChange={(e) => set("user", e.target.value)} />
+          <Input
+            id="oracle-dial-user"
+            value={dial.user}
+            onChange={(e) => set("user", e.target.value)}
+            autoComplete="off"
+          />
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="oracle-dial-ssl-mode">SSL mode (optional)</Label>
@@ -78,6 +90,7 @@ export function OracleDialForm({
             id="oracle-dial-ssl-mode"
             value={dial.sslMode ?? ""}
             onChange={(e) => set("sslMode", e.target.value === "" ? null : e.target.value)}
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -87,6 +100,7 @@ export function OracleDialForm({
             value={dial.sslServerCertDn ?? ""}
             onChange={(e) => set("sslServerCertDn", e.target.value === "" ? null : e.target.value)}
             placeholder="CN=oracle.example.com,O=Example,C=US"
+            autoComplete="off"
           />
           <p className="text-xs text-muted-foreground">
             Type the certificate&apos;s real Distinguished Name — this is never derived from Host

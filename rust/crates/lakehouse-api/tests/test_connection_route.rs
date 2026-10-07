@@ -37,9 +37,11 @@ async fn test_connection_route_reports_unsupported_dial_not_unsupported_type_for
     // (connector_probe.rs's probe_mysql already implements this dial,
     // WS3 item 13).
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
-         ('conn-mysql-test', 'mysql test', 'MySQL', 'source', 'unused', 'env:CONNECTOR_MYSQL_PASSWORD', \
+         ('conn-mysql-test', '11111111-1111-4111-8111-000000000001', \
+         'mysql test', 'MySQL', 'source', 'unused', 'env:CONNECTOR_MYSQL_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"mysql\",\"host\":\"127.0.0.1\",\"port\":1,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
@@ -85,9 +87,11 @@ async fn test_connection_route_reports_unsupported_dial_not_unsupported_type_for
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
-         ('conn-mssql-test', 'mssql test', 'SQL Server', 'source', 'unused', 'env:CONNECTOR_MSSQL_PASSWORD', \
+         ('conn-mssql-test', '11111111-1111-4111-8111-000000000001', \
+         'mssql test', 'SQL Server', 'source', 'unused', 'env:CONNECTOR_MSSQL_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"mssql\",\"host\":\"127.0.0.1\",\"port\":1,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
@@ -140,9 +144,11 @@ async fn debezium_properties_route_names_the_mysql_connector_class_and_leaks_no_
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
-         ('conn-mysql-cdc-test', 'mysql cdc test', 'MySQL CDC', 'source', 'unused', \
+         ('conn-mysql-cdc-test', '11111111-1111-4111-8111-000000000001', \
+         'mysql cdc test', 'MySQL CDC', 'source', 'unused', \
          'env:CONNECTOR_MYSQL_CDC_PASSWORD', 'production', 'meridian', 'cdc', 'cdc', \
          '{\"driver\":\"mysql\",\"host\":\"mysql-src\",\"port\":3306,\"database\":\"oms\",\"user\":\"repl\",\
          \"slotName\":\"orders_slot\",\"publicationName\":\"orders_pub\"}'::jsonb)",

@@ -376,3 +376,99 @@ Why this cannot reach someone else's credential:
   `file:` credential can be replaced in place.
 - Seeded connectors keep their existing refs; the reserved-name check on
   them is unchanged.
+
+## Addendum 4: the user supplies the credential; the API stores it
+
+**Status:** Accepted
+**Date:** 2026-09-25
+
+### Context
+
+Addendum 3 made a user-created connector's credential nameable, but not
+settable: the server derives a name, and someone with shell access to the
+host must provision an env var or a file under it, then restart the API
+and Dagster (for `env:`). A console user has no such access. In practice a
+user who creates a PostgreSQL connector to their own database has no way
+to give the lakehouse its password, so "Test" and every ingest fail with
+"resolved to nothing" until an operator intervenes. The same gap made the
+connector wizard ask the user to choose between "Environment variable" and
+"Mounted file" — a server-provisioning decision a user cannot act on.
+
+### Decision
+
+**The user types the credential in the console; the API writes it to a
+file only the lakehouse reads.** A third credential source, `managed`,
+derives:
+
+- `file:/run/secrets/connector_managed_<id>_<suffix>`
+
+`POST /api/connectors` accepts write-only `credential.values` (only with
+`source: "managed"`) and writes them after the row exists; a write failure
+removes the row again. `PUT /api/connectors/{id}/credential` replaces
+credentials — probe-first, like `PUT .../secret`: the candidate values are
+tested against the source from memory and stored only if the source
+accepts them. It takes both slots in one request, because an S3 access key
+and secret key only work as a pair: replacing them one request at a time
+would probe the new access key against the old secret key and always
+fail. That route also switches an `env:`/`file:` connector to `managed`.
+Deleting a connector deletes its managed files.
+
+The store is a Docker volume (`lakehouse_connector_secrets`) mounted at
+`/run/secrets`: writable in `lakehouse-api`, read-only in
+`dagster-code-location`. Writes are owner-only (`0600`), atomic
+(write-temp, `fsync`, rename), and refuse any ref not shaped
+`connector_managed_[a-z0-9_]+` — so no operator file, seeded ref, or path
+segment is ever touched.
+
+Why the resolvers do not change: a managed ref is an ordinary `file:` ref
+matching the existing `file:/run/secrets/connector_*` pattern. The API's
+`FileSecretResolver` and Dagster's `resolve_secret_ref` read it exactly as
+they read an operator's file. The distinct `connector_managed_` prefix
+exists only so the API can tell its own files from an operator's — every
+id begins `conn-`, so an operator `file:` name begins `connector_conn_` and
+the two can never collide.
+
+Guarantees carried over: the ref is still derived from the connector's own
+id, never chosen by the caller; the value is never returned by any
+response, never in an audit row, never printed — request bodies carry it
+in a type whose `Debug` is redacted.
+
+### Deliberate limits
+
+- **Plaintext at rest.** The volume holds the value as a Docker/Compose
+  secret would. It is not part of a database backup; back the volume up
+  with `lakehouse_postgres_data`. Encrypting it, or moving it to Vault, is
+  the named follow-up and would replace `connector_secret_store` without
+  changing any route or resolver.
+- **Whitespace is refused, not trimmed.** Both resolvers read a file back
+  trimmed, so a value with leading/trailing whitespace would be saved and
+  then silently never match. It is refused with a message instead.
+- **Unprobeable types save unverified.** Unlike `PUT .../secret` — whose
+  candidate already exists somewhere and can be checked later — here the
+  user holds the only copy. Refusing a type this build cannot probe (Kafka,
+  SFTP, `MongoDB`, Oracle, …) would make its credential impossible to set,
+  so it is saved with `verified: false` and the response says so.
+- **Not through the copilot.** The `create_connector` tool keeps `env`/
+  `file` only. Accepting a password there would route it through the chat
+  transcript and the LLM provider; the console form is the one place a
+  credential value is entered.
+
+### Consequences
+
+- The console wizard asks for the credential directly and always creates a
+  `managed` connector; the "Provision these credentials" step is gone.
+  `env`/`file` remain available to API callers who want an operator-held
+  credential.
+- Credentials are replaced from the connector's edit page
+  (`/connectors/{id}/edit`), which walks the same steps as creation; the
+  drawer's rotation panel was removed. The edit page saves the connection
+  settings BEFORE the credential, because the credential route tests the
+  new value against the connector's saved settings.
+- Existing `env`/`file` connectors keep working unchanged, and can be moved
+  to `managed` by saving a credential from their edit page.
+- A managed credential is created and replaced only in the console. The
+  copilot's `create_connector` tool refuses a `managed` source or any
+  credential value server-side, whatever its schema offers.
+- Deleting a connector removes its managed credential files. A failed
+  credential swap removes the files it wrote, except any file the
+  connector names at that moment.

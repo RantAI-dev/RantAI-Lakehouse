@@ -3,6 +3,8 @@ import { cn } from "@/lib/utils"
 export type ReviewSection = {
   title: string
   items: { label: string; value: React.ReactNode }[]
+  /** Optional control beside the title, e.g. a link back to the step. */
+  action?: React.ReactNode
 }
 
 /** Read-only summary blocks for the final step of a create wizard. */
@@ -17,7 +19,10 @@ export function FormReviewSummary({
     <div className={cn("space-y-5", className)}>
       {sections.map((section) => (
         <section key={section.title} className="space-y-2">
-          <h3 className="text-sm font-medium text-foreground">{section.title}</h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-medium text-foreground">{section.title}</h3>
+            {section.action}
+          </div>
           <dl className="grid gap-x-6 gap-y-2 rounded-lg border border-border bg-muted/30 p-3 sm:grid-cols-2">
             {section.items.map((item) => (
               <div key={item.label} className="min-w-0">

@@ -1,24 +1,38 @@
 """dagster/dispar_orchestrate/ingest_factory.py -- ONE static `ingest_job`
-(config: `connector_id`) plus one `ScheduleDefinition` per ingestible,
-cron-scheduled connector -- the SAME shape `agent_runs.py`'s
-`agent_run_job`/`build_agent_run_schedules` establish (read in full:
-`run_agent_employee`'s `config_schema` op, `agent_run_job`'s static `@job`,
-`_employee_run_config`/`build_agent_run_schedules`'s per-entity run_config
-+ schedules), NOT a job per connector: a per-connector `@job`/`@op` pair
-built by capturing loop variables as Python default arguments is exactly
-the anti-pattern this factory mirrors away from -- Dagster inspects a
-decorated function's PARAMETERS as op/job inputs, so a loop-captured
-default argument is fragile in ways a real Dagster op config is not.
+(config: `connector_id`) plus ONE sensor, `ingest_schedule_sensor`, that
+launches it for every connector whose `scheduleCron` came due. The job
+shape is `agent_runs.py`'s `agent_run_job` (a static `@job` wrapping a
+`config_schema`-driven `@op`), NOT a job per connector: a per-connector
+`@job`/`@op` pair built by capturing loop variables as Python default
+arguments is exactly the anti-pattern this factory mirrors away from --
+Dagster inspects a decorated function's PARAMETERS as op/job inputs, so a
+loop-captured default argument is fragile in ways a real Dagster op config
+is not.
 
-Read from `GET /api/connectors/ingestible`
-(`rust/crates/lakehouse-store/src/connectors.rs::list_ingestible_connectors`)
-at Dagster CODE-LOAD time for SCHEDULES ONLY -- the job itself re-fetches
-its OWN connector's spec at RUN time (`run_ingest`'s op body), so a
-connector created after this process's last code-load still runs
-correctly when launched directly (a future `POST .../ingest/run`), which
-schedules alone cannot do. Same degrade-to-nothing-on-any-failure shape as
-`agent_runs.py`'s own schedule factory: must never crash this code
-location.
+# Schedules
+
+Connector schedules are NOT Dagster `ScheduleDefinition`s. Those are fixed
+at code-load time, so a schedule saved in the console only took effect
+after the code location reloaded. Instead `ingest_schedule_sensor` asks
+`GET /api/connectors/ingestible?dueAfter=...&dueUntil=...` every 30
+seconds which connectors came due since its last evaluation (its cursor).
+The API evaluates each cron with `croner`, the same library that computes
+the "next run" the console shows, so the two cannot disagree; crons are
+UTC, as Dagster schedules here always were. A saved, changed or removed
+schedule therefore applies within about a minute, with no reload.
+
+A sensor rather than one every-minute schedule: every schedule of a job is
+read by `lakehouse-api` as that job's schedule -- the Pipelines list shows
+its cron, and the Overview counts a schedule whose last run predates its
+previous fire time as delayed, which an every-minute dispatcher would be
+almost always.
+
+A connector whose previous ingest is still queued or running is skipped
+for that fire time (Bronze is append-only; two overlapping loads would
+double its rows), the same rule `POST .../ingest/run` enforces with 409.
+
+`run_ingest` re-fetches its OWN connector's spec at RUN time, so a run
+always uses the connector's current settings, whoever launched it.
 
 # SSRF and the one-connector-per-run invariant
 
@@ -97,27 +111,32 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 from dagster import (
     AssetMaterialization,
-    DefaultScheduleStatus,
+    DagsterRunStatus,
+    DefaultSensorStatus,
     DynamicOut,
     DynamicOutput,
     Failure,
     Field,
-    ScheduleDefinition,
+    RunRequest,
+    RunsFilter,
+    SensorEvaluationContext,
+    SensorResult,
     job,
     op,
+    sensor,
 )
 
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from dispar_orchestrate import dlt_pipeline, secret_resolver, ssrf_guard
+from dispar_orchestrate import connector_catalog, dlt_pipeline, secret_resolver, ssrf_guard
 from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
 from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import files as files_adapter
@@ -129,7 +148,7 @@ from dispar_orchestrate.adapters import sheets as sheets_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters import sql as sql_adapter
 from dispar_orchestrate.adapters.kafka import consume_one_batch
-from dispar_orchestrate.adapters.sink import load_via_sink
+from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
@@ -181,32 +200,6 @@ def _headers(cfg: IngestFactoryConfig) -> dict[str, str]:
     return {} if not cfg.service_token else {"Authorization": f"Bearer {cfg.service_token}"}
 
 
-def _fetch_ingestible_connectors(cfg: IngestFactoryConfig) -> list[dict[str, Any]]:
-    """`GET /api/connectors/ingestible` -- degrades to `[]` on ANY
-    failure, mirroring `agent_runs.py::_fetch_schedulable_employees`
-    exactly (unreachable API, non-2xx, non-JSON/non-list body all become a
-    warning plus an empty list, never an exception -- this runs at
-    Dagster code-load time, alongside every other job/schedule in this
-    code location)."""
-    if not cfg.service_token:
-        print("dispar_orchestrate.ingest_factory: INGEST_SERVICE_TOKEN is unset; loading with zero ingest schedules")
-        return []
-    try:
-        resp = requests.get(f"{cfg.api_url}/api/connectors/ingestible", headers=_headers(cfg), timeout=10)
-        resp.raise_for_status()
-        connectors = resp.json()
-    except requests.RequestException as exc:
-        print(f"WARNING: dispar_orchestrate.ingest_factory: unreachable ({exc}); loading with zero ingest schedules")
-        return []
-    except ValueError as exc:
-        print(f"WARNING: dispar_orchestrate.ingest_factory: non-JSON body ({exc}); loading with zero ingest schedules")
-        return []
-    if not isinstance(connectors, list):
-        print("WARNING: dispar_orchestrate.ingest_factory: /ingestible did not return a list; loading with zero ingest schedules")
-        return []
-    return connectors
-
-
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:
     """Used at RUN time by `run_ingest` (below) -- a connector launched
     directly (a future `POST .../ingest/run`) may not have existed at this
@@ -219,8 +212,7 @@ def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[st
     API is unreachable or answers non-2xx, and `StopIteration` (as a
     `RuntimeError`-shaped failure Dagster surfaces) if `connector_id`
     names no ingestible connector -- both are legitimate run failures at
-    RUN time, unlike the code-load-time degrade-to-empty posture
-    `_fetch_ingestible_connectors` uses for schedules.
+    RUN time.
     """
     resp = requests.get(f"{cfg.api_url}/api/connectors/ingestible", headers=_headers(cfg), timeout=10)
     resp.raise_for_status()
@@ -312,6 +304,43 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
     return dict(zip(fields, values))
 
 
+def _register_in_catalog(connector_id: str, obj: dict) -> None:
+    """Put a table that just loaded into the console catalog
+    (`connector_catalog.py`). The load itself already succeeded and is
+    recorded, so a registration failure is reported, never raised: the data
+    is in Bronze either way, and only its Catalog entry is missing."""
+    try:
+        connector_catalog.register_connector_table(connector_id, obj)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        print(
+            f"WARNING: dispar_orchestrate.ingest_factory: {obj.get('target')!r} loaded, but could not be "
+            f"registered in the catalog: {exc}"
+        )
+
+
+def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
+    """How this source object's rows meet its Bronze table
+    (`adapters/sink.py`'s "Load modes"). A source object saved before load
+    modes existed replaces: every run used to add the whole source again.
+
+    `incremental` is offered for the `sql` adapter only. dlt can filter any
+    resource by a cursor, but only the `sql_database` source's path (the
+    filter pushed into the query, the cursor kept across runs) has been
+    exercised; the others are refused rather than assumed to work.
+
+    # Errors
+
+    Raises `UnsupportedLoadMode`, which `_run_one_object` records as a
+    rejection.
+    """
+    plan = LoadPlan.from_source_object(obj)
+    if plan.mode == "incremental" and adapter_name != "sql":
+        raise UnsupportedLoadMode(
+            f"load mode 'incremental' is only available for SQL connectors, not adapter {adapter_name!r}"
+        )
+    return plan
+
+
 def _run_one_object(connector: dict, obj: dict) -> int | None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
@@ -322,7 +351,8 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
     # Errors
 
     Re-raises whatever it catches (`SecretRefRejected`,
-    `ssrf_guard.SsrfBlocked`, `UnsupportedColumnType`, or any other
+    `ssrf_guard.SsrfBlocked`, `UnsupportedColumnType`,
+    `UnsupportedLoadMode`, or any other
     exception a driver/HTTP call/sink raises) after recording it -- this
     function's own run (the Dagster op) must still fail visibly, not just
     the governance-surface row.
@@ -351,6 +381,7 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
+        plan = _load_plan(adapter_name, obj)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned
@@ -358,9 +389,10 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
             # ssrf_guard.pinned_resolution (psycopg2/libpq does not
             # resolve through socket.getaddrinfo).
             outcome = dlt_pipeline.run_bronze_ingest(
-                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj])
+                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]), plan
             )
             _record(rows=outcome["rows"], status="succeeded")
+            _register_in_catalog(connector_id, obj)
             return outcome["rows"]
 
         if adapter_name == "sql" and dial.get("driver") == "oracle":
@@ -382,8 +414,10 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
                 result.source,
                 obj["target"],
                 sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                plan,
             )
             _record(rows=outcome.rows, status="succeeded")
+            _register_in_catalog(connector_id, obj)
             return outcome.rows
 
         adapter = _ADAPTERS.get(adapter_name)
@@ -427,7 +461,7 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
 
         def _load():
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
-            return sink_adapter.load_via_sink(source, obj["target"], sink_config)
+            return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan)
 
         host = _host_of(dial)
         if resolved is not None and host is not None:
@@ -436,8 +470,9 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
         else:
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
+        _register_in_catalog(connector_id, obj)
         return outcome.rows
-    except (ssrf_guard.SsrfBlocked, UnsupportedColumnType) as exc:
+    except (ssrf_guard.SsrfBlocked, UnsupportedColumnType, UnsupportedLoadMode) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise
     except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)
@@ -507,6 +542,10 @@ def run_kafka_stream_batch(
     call re-delivers the same batch on the next scheduled run -- a
     deliberate, documented at-least-once gap (`adapters/sink.py`'s Iceberg
     append path is not deduplicated), never a silent skip.
+
+    A micro-batch that loaded also registers (or refreshes) its Bronze
+    table in the console catalog (`_register_in_catalog`), like every batch
+    adapter's table; a registration failure is reported, never raised.
 
     An empty batch (`not batch.rows`) returns without writing or
     committing anything -- there is nothing to commit an offset FOR, and
@@ -587,6 +626,14 @@ def run_kafka_stream_batch(
             for partition, offset in batch.offsets_to_commit.items():
                 record_ingest_offset(connector_id, topic, partition, offset)
             _record(rows=outcome.rows, status="succeeded")
+            # The same Catalog entry every batch adapter's table gets
+            # (`_run_one_object`): without it a topic's Bronze table held
+            # rows but never showed in the Catalog. An empty poll and a
+            # failed batch wrote nothing, so they register nothing.
+            _register_in_catalog(
+                connector_id,
+                {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
+            )
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
             raise
@@ -811,35 +858,134 @@ def _ingest_run_config(connector_id: str) -> dict[str, Any]:
     return {"ops": {"run_ingest": {"config": {"connector_id": connector_id}}}}
 
 
-def build_ingest_schedules(cfg: IngestFactoryConfig) -> list[ScheduleDefinition]:
-    """One `ScheduleDefinition` PER cron-scheduled, non-cdc ingestible
-    connector, all targeting the SAME static `ingest_job` with a
-    DIFFERENT `run_config` -- mirrors
-    `agent_runs.py::build_agent_run_schedules` exactly. Never raises (see
-    `_fetch_ingestible_connectors`)."""
-    schedules: list[ScheduleDefinition] = []
-    for connector in _fetch_ingestible_connectors(cfg):
+# How far back a gap in evaluations (the daemon down, the API unreachable)
+# is caught up: a connector that came due within the last hour still runs,
+# once; anything older is skipped rather than launched late in a burst.
+_MAX_CATCH_UP = timedelta(hours=1)
+
+_IN_PROGRESS = [
+    DagsterRunStatus.QUEUED,
+    DagsterRunStatus.NOT_STARTED,
+    DagsterRunStatus.STARTING,
+    DagsterRunStatus.STARTED,
+]
+
+
+def _minute(moment: datetime) -> datetime:
+    """`moment` in UTC, cut to the start of its minute: cron fire times."""
+    return moment.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _fetch_due_connectors(cfg: IngestFactoryConfig, after: datetime, until: datetime) -> list[dict[str, Any]]:
+    """`GET /api/connectors/ingestible?dueAfter=&dueUntil=`: the connectors
+    whose schedule fires in `(after, until]`.
+
+    # Errors
+
+    Propagates any request failure, a non-2xx answer and a body that is
+    not a list. The sensor tick then fails visibly in Dagster, and its
+    cursor does not move, so the same window is asked again next tick.
+    """
+    resp = requests.get(
+        f"{cfg.api_url}/api/connectors/ingestible",
+        params={"dueAfter": after.isoformat(), "dueUntil": until.isoformat()},
+        headers=_headers(cfg),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    connectors = resp.json()
+    if not isinstance(connectors, list):
+        raise RuntimeError("GET /api/connectors/ingestible?dueAfter= did not return a list")
+    return connectors
+
+
+def _busy_connector_ids(instance: Any) -> set[str]:
+    """Every connector with an `ingest_job` run still queued or going,
+    read from each run's own `connector_id` config (a run launched by
+    `POST .../ingest/run` carries no tag, only that config)."""
+    busy: set[str] = set()
+    for run in instance.get_runs(filters=RunsFilter(job_name=ingest_job.name, statuses=_IN_PROGRESS)):
+        config = (run.run_config or {}).get("ops", {}).get("run_ingest", {}).get("config", {})
+        connector_id = config.get("connector_id")
+        if isinstance(connector_id, str):
+            busy.add(connector_id)
+    return busy
+
+
+def due_run_requests(
+    connectors: list[dict[str, Any]], until: datetime, busy: set[str]
+) -> tuple[list[RunRequest], list[str]]:
+    """One `RunRequest` per due connector, and the ids skipped because an
+    ingest of theirs is still going. `cdc` never runs here: its Debezium
+    service streams on its own (ADR 0008), so there is no batch to launch.
+
+    The run key names the connector and the window's end, so a tick that
+    is evaluated twice (a daemon restart mid-tick) never launches twice."""
+    run_requests: list[RunRequest] = []
+    skipped: list[str] = []
+    for connector in connectors:
+        connector_id = connector["id"]
         if connector.get("adapter") == "cdc":
-            # No schedule for cdc -- a Debezium compose service brings a
-            # CDC connector's ingestion online, and ADR 0008's own
-            # snapshot.mode=initial does the rest; there is no batch job
-            # to schedule for it at all.
             continue
-        cron = connector.get("scheduleCron")
-        if not cron:
+        if connector_id in busy:
+            skipped.append(connector_id)
             continue
-        schedules.append(
-            ScheduleDefinition(
-                name=f"ingest_schedule__{_sanitize_name(connector['id'])}",
-                cron_schedule=cron,
-                job=ingest_job,
-                run_config=_ingest_run_config(connector["id"]),
-                default_status=DefaultScheduleStatus.RUNNING,
+        run_requests.append(
+            RunRequest(
+                run_key=f"{connector_id}@{until.isoformat()}",
+                run_config=_ingest_run_config(connector_id),
+                tags={"lakehouse/connector_id": connector_id, "lakehouse/trigger": "schedule"},
             )
         )
-    return schedules
+    return run_requests, skipped
 
 
-# Built once, at code-load time -- see build_ingest_schedules/
-# _fetch_ingestible_connectors for why this expression can never raise.
-ingest_schedules = build_ingest_schedules(IngestFactoryConfig.from_env())
+def _window_start(cursor: str | None, until: datetime) -> tuple[datetime, bool]:
+    """Where this evaluation's window starts: the previous window's end,
+    kept within `_MAX_CATCH_UP` (the flag says it had to be). With no, or
+    an unreadable, cursor -- the sensor's first evaluation -- only the
+    current minute is checked."""
+    first = until - timedelta(minutes=1)
+    if not cursor:
+        return first, False
+    try:
+        previous = datetime.fromisoformat(cursor)
+    except ValueError:
+        return first, False
+    earliest = until - _MAX_CATCH_UP
+    return (previous, False) if previous >= earliest else (earliest, True)
+
+
+@sensor(
+    name="ingest_schedule_sensor",
+    job=ingest_job,
+    minimum_interval_seconds=30,
+    default_status=DefaultSensorStatus.RUNNING,
+    description=(
+        "Runs ingest_job for every connector whose schedule came due. Schedules are read from "
+        "lakehouse-api on every evaluation, so one saved in the console applies within a minute."
+    ),
+)
+def ingest_schedule_sensor(context: SensorEvaluationContext) -> SensorResult:
+    """See this module's "Schedules" section."""
+    cfg = IngestFactoryConfig.from_env()
+    if not cfg.service_token:
+        return SensorResult(skip_reason="INGEST_SERVICE_TOKEN is unset, so connector schedules cannot be read")
+    until = _minute(datetime.now(timezone.utc))
+    after, clipped = _window_start(context.cursor, until)
+    if after >= until:
+        return SensorResult(skip_reason=f"{until:%H:%M} UTC was already checked")
+    if clipped:
+        context.log.warning(
+            f"Schedules were last checked up to {context.cursor}; only those due after {after.isoformat()} "
+            "are caught up, older ones are skipped"
+        )
+    connectors = _fetch_due_connectors(cfg, after, until)
+    run_requests, skipped = due_run_requests(connectors, until, _busy_connector_ids(context.instance))
+    for connector_id in skipped:
+        context.log.info(f"{connector_id} is due but its previous ingest is still going; skipped this time")
+    if not run_requests:
+        return SensorResult(
+            skip_reason=f"No connector due between {after:%H:%M} and {until:%H:%M} UTC", cursor=until.isoformat()
+        )
+    return SensorResult(run_requests=run_requests, cursor=until.isoformat())

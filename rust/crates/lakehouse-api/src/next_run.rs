@@ -43,6 +43,32 @@ pub fn next_run_at(cron_expr: &str, now: OffsetDateTime) -> Option<OffsetDateTim
     OffsetDateTime::from_unix_timestamp(next.timestamp()).ok()
 }
 
+/// Why `cron_expr` cannot be a connector's ingest schedule, or `None`
+/// when it can. Five fields only: `ingest_schedule_sensor`
+/// (`dagster/dispar_orchestrate/ingest_factory.py`) checks schedules a
+/// minute at a time, so a seconds field could never fire as written.
+#[must_use]
+pub fn ingest_cron_problem(cron_expr: &str) -> Option<String> {
+    if cron_expr.split_whitespace().count() != 5 {
+        return Some(format!(
+            "scheduleCron {cron_expr:?} must have five fields: minute hour day-of-month month day-of-week"
+        ));
+    }
+    Cron::new(cron_expr)
+        .parse()
+        .err()
+        .map(|err| format!("scheduleCron {cron_expr:?} is not a valid cron expression: {err}"))
+}
+
+/// Whether `cron_expr` fires in `(after, until]`, evaluated in UTC like
+/// [`next_run_at`] — the same `croner` evaluation, so the connector the
+/// schedule sensor launches is the one the console said would run then.
+/// `false` for an expression that does not parse.
+#[must_use]
+pub fn fires_between(cron_expr: &str, after: OffsetDateTime, until: OffsetDateTime) -> bool {
+    next_run_at(cron_expr, after).is_some_and(|next| next <= until)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -61,6 +87,34 @@ mod tests {
     fn next_run_at_none_for_manual_or_malformed_cron() {
         assert!(next_run_at("manual", time::OffsetDateTime::now_utc()).is_none());
         assert!(next_run_at("not a cron", time::OffsetDateTime::now_utc()).is_none());
+    }
+
+    #[test]
+    fn ingest_cron_problem_accepts_five_fields_only() {
+        assert_eq!(ingest_cron_problem("0 2 * * *"), None);
+        assert_eq!(ingest_cron_problem("*/15 8-17 * * 1-5"), None);
+        // A seconds field, a nickname and garbage are all refused.
+        assert!(ingest_cron_problem("0 0 2 * * *").is_some());
+        assert!(ingest_cron_problem("@daily").is_some());
+        assert!(ingest_cron_problem("0 25 * * *").is_some());
+        assert!(ingest_cron_problem("a b c d e").is_some());
+    }
+
+    #[test]
+    fn fires_between_includes_the_window_end_but_not_its_start() {
+        let at_two = time::macros::datetime!(2026 - 09 - 30 02:00:00 UTC);
+        let minute = time::Duration::minutes(1);
+        assert!(fires_between("0 2 * * *", at_two - minute, at_two));
+        // The window before already had it: never twice.
+        assert!(!fires_between("0 2 * * *", at_two, at_two + minute));
+        // A wide window (a caught-up gap) still finds it.
+        assert!(fires_between(
+            "0 2 * * *",
+            at_two - time::Duration::hours(1),
+            at_two + minute
+        ));
+        assert!(!fires_between("0 3 * * *", at_two - minute, at_two));
+        assert!(!fires_between("not a cron", at_two - minute, at_two));
     }
 
     #[test]

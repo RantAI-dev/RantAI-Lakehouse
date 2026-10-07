@@ -249,7 +249,7 @@ export function DataExplorerPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title="Data Explorer"
-        description="Browse governed assets by data layer (Raw → Gold)."
+        description="Browse governed assets by data layer (Bronze → Gold)."
       />
 
       {error ? (

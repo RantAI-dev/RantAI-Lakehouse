@@ -282,6 +282,39 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
     get_user(pool, &id.to_string()).await
 }
 
+/// Add an existing user to a tenant: one `app_user_tenant` row, the same
+/// insert [`create_user`] makes for each tenant named at invite time.
+/// Idempotent: a user already in the tenant is left as it was.
+///
+/// Returns `true` when a row was added and `false` when the membership
+/// already existed, so a caller can record the change only when there was
+/// one. Membership is read from `app_user_tenant` on every request
+/// (`lakehouse_auth::repository`), so the user's next request, on a session
+/// they already hold, sees the tenant.
+///
+/// # Errors
+///
+/// Returns [`StoreError::ForeignKeyViolation`] if the user or the tenant
+/// does not exist (callers check both first so a client sees a 404; this
+/// is the answer when one is deleted between the check and the insert),
+/// or [`StoreError::Database`] on any other failure.
+pub async fn add_user_to_tenant(
+    pool: &PgPool,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, StoreError> {
+    let added = sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(added > 0)
+}
+
 /// Delete a user; its membership rows cascade away with it.
 ///
 /// # Errors

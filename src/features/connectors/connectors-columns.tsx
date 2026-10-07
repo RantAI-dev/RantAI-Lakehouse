@@ -37,11 +37,13 @@ const HEALTH_OPTIONS = (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
   label: HEALTH_LABEL[h],
 }))
 
-export function getConnectorColumns({
-  onSelect,
-}: {
-  onSelect: (connector: Connector) => void
-}): ColumnDef<Connector>[] {
+/**
+ * The Sources list's columns. A connector opens at `/connectors/<id>`: the
+ * name and the row menu's "View details" are links, and a press on the rest of
+ * the row opens it too (`onRowClick` in `connectors-page.tsx`), so the row's
+ * own controls stop their clicks from reaching the row.
+ */
+export function getConnectorColumns(): ColumnDef<Connector>[] {
   return [
     {
       accessorKey: "name",
@@ -52,13 +54,16 @@ export function getConnectorColumns({
         const r = row.original
         return (
           <div>
-            <button
-              type="button"
-              onClick={() => onSelect(r)}
-              className="text-left font-medium hover:underline focus:outline-none"
+            <Link
+              href={`/connectors/${r.id}`}
+              // Without this a press on the name also reaches the row's own
+              // press, which would push the page a second time, and a
+              // "new tab" click would open it in this tab as well.
+              onClick={(event) => event.stopPropagation()}
+              className="text-left font-medium hover:underline focus-visible:underline focus:outline-none"
             >
               {r.name}
-            </button>
+            </Link>
             <p className="text-xs text-muted-foreground">{r.type}</p>
           </div>
         )
@@ -166,14 +171,23 @@ export function getConnectorColumns({
                   size="icon"
                   className="size-8 p-0"
                   aria-label="Connector actions"
+                  // The row opens the connector on a press, so without this
+                  // the click that opens this menu also leaves the page.
+                  onClick={(event) => event.stopPropagation()}
                 >
                   <MoreHorizontal className="size-4" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuContent
+                align="end"
+                className="w-44"
+                // Same reason as the trigger: a click in the (portaled) menu
+                // still bubbles to the row through the React tree.
+                onClick={(event) => event.stopPropagation()}
+              >
                 <DropdownMenuLabel>Connector</DropdownMenuLabel>
-                <DropdownMenuItem onClick={() => onSelect(item)}>
-                  View details
+                <DropdownMenuItem asChild>
+                  <Link href={`/connectors/${item.id}`}>View details</Link>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem asChild>

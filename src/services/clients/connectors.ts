@@ -9,6 +9,7 @@ import type {
   DebeziumProperties,
   DiscoverResult,
   IngestibleConnector,
+  IngestJobRun,
   IngestRun,
   IngestRunResult,
   IngestSpec,
@@ -16,6 +17,9 @@ import type {
   ProbeHistoryResponse,
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
+  SetConnectorCredentialRequest,
+  SetConnectorCredentialResponse,
+  UpdateConnectorInput,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -26,11 +30,11 @@ import { ServiceError } from "../errors";
  *
  * CREDENTIAL NOTE: `CreateConnectorInput.credential` (ADR 0002 Addendum 3)
  * chooses a source/kind, never a reference NAME — the server derives the
- * actual reference (where a credential is stored: an env var name, a
- * secret-manager path) from the id it generates, and returns it once in
- * `CreateConnectorResponse.credential`. The backend never stores, returns,
- * logs, or displays a credential VALUE; `Connector`/`ConnectorDetail` do not
- * even have a field for one.
+ * actual reference from the id it generates. With `source: "managed"`
+ * (Addendum 4) the user's value travels in `credential.values` (or later
+ * through `setCredential`) and the server stores it; it is WRITE-ONLY —
+ * never returned, logged, or displayed. `Connector`/`ConnectorDetail` carry
+ * no field for a value, only whether it is managed and its kind.
  *
  * `testConnection` here NOW performs a real network probe — but only for
  * PostgreSQL and S3-compatible object storage, the only two types this build
@@ -66,19 +70,29 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   return json as T;
 }
 
-async function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+async function sendJson<T>(
+  method: "PUT" | "PATCH",
+  url: string,
+  body: unknown,
+  signal?: AbortSignal
+): Promise<T> {
   const res = await apiFetch(url, {
-    method: "PUT",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal,
   });
-  const json = await res.json();
+  // `PUT .../tenant` answers 204 with no body.
+  const json = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
   return json as T;
+}
+
+function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return sendJson<T>("PUT", url, body, signal);
 }
 
 export const postgresConnectorService: ConnectorService = {
@@ -106,8 +120,12 @@ export const postgresConnectorService: ConnectorService = {
   listIngestible(signal) {
     return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });
   },
-  discoverConnector(id, signal) {
-    return postJson<DiscoverResult>(`/api/connectors/${encodeURIComponent(id)}/discover`, undefined, signal);
+  discoverConnector(id, schema, signal) {
+    return postJson<DiscoverResult>(
+      `/api/connectors/${encodeURIComponent(id)}/discover?schema=${encodeURIComponent(schema)}`,
+      undefined,
+      signal
+    );
   },
   runIngest(id, signal) {
     return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, undefined, signal);
@@ -117,6 +135,9 @@ export const postgresConnectorService: ConnectorService = {
       `/api/governance/ingest-runs?connectorId=${encodeURIComponent(connectorId)}`,
       { signal }
     );
+  },
+  listIngestJobRuns(connectorId, signal) {
+    return getJson<IngestJobRun[]>(`/api/connectors/${encodeURIComponent(connectorId)}/ingest/runs`, { signal });
   },
   getDebeziumProperties(id, table, signal) {
     return getJson<DebeziumProperties>(
@@ -137,5 +158,39 @@ export const postgresConnectorService: ConnectorService = {
       body,
       signal
     );
+  },
+  setCredential(id, body: SetConnectorCredentialRequest, signal) {
+    return putJson<SetConnectorCredentialResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/credential`,
+      body,
+      signal
+    );
+  },
+  updateConnector(id, input: UpdateConnectorInput, signal) {
+    return sendJson<Connector>("PATCH", `/api/connectors/${encodeURIComponent(id)}`, input, signal);
+  },
+  async deleteConnector(id, options, signal) {
+    const query = options?.force ? "?force=true" : "";
+    const res = await apiFetch(`/api/connectors/${encodeURIComponent(id)}${query}`, {
+      method: "DELETE",
+      signal,
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      // A 409 (pipelines still depend on it, or a CDC slot could not be
+      // dropped) keeps its status on the error; the message says which.
+      const kind =
+        res.status === 404
+          ? "not_found"
+          : res.status === 401 || res.status === 403
+            ? "permission_denied"
+            : res.status >= 500
+              ? "unavailable"
+              : "invalid_request";
+      throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
+    }
+  },
+  async assignTenant(id, tenantId, signal) {
+    await putJson<null>(`/api/connectors/${encodeURIComponent(id)}/tenant`, { tenantId }, signal);
   },
 };

@@ -268,7 +268,7 @@ async fn system_prompt(
     } else {
         format!("{base}\n\nDATA MAP\n{schema}")
     } + &ctx_line
-        + &prompt::closing(latest_user))
+        + &prompt::closing(latest_user, state.config.ai_default_reply_language))
 }
 
 /// Validates the body and assembles the system prompt, history and the tool

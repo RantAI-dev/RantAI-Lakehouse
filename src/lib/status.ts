@@ -97,9 +97,15 @@ export const STORAGE_TIER_DESCRIPTION: Record<StorageTier, string> = {
 /** Logical modeling layers, retained as a secondary filter dimension. */
 export type DataLayer = "raw" | "bronze" | "silver" | "gold" | "semantic"
 
+/**
+ * `raw` and `bronze` are one layer physically: both are Iceberg tables in
+ * the `bronze` namespace, and every other part of the console calls them
+ * Bronze. `bronze` only marks the datasets a deployment lists as curated,
+ * so the labels say that, rather than naming two layers.
+ */
 export const DATA_LAYER_LABEL: Record<DataLayer, string> = {
-  raw: "Raw",
-  bronze: "Bronze",
+  raw: "Bronze (raw)",
+  bronze: "Bronze (curated)",
   silver: "Silver",
   gold: "Gold",
   semantic: "Semantic",

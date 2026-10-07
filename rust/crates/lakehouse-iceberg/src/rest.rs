@@ -220,6 +220,35 @@ pub struct FieldDetail {
     pub required: bool,
 }
 
+/// One schema the table has had: its columns, and when it first held data.
+#[derive(Debug)]
+pub struct SchemaVersionDetail {
+    /// The schema's id within the table. Ids rise as the schema changes.
+    pub schema_id: i32,
+    /// The schema's columns, in order.
+    pub fields: Vec<FieldDetail>,
+    /// The commit time of the first snapshot written with this schema, in
+    /// epoch milliseconds. `None` when no snapshot the table still keeps
+    /// was written with it — expired, or a schema changed before any load.
+    pub since_ms: Option<i64>,
+    /// Whether this is the table's current schema.
+    pub current: bool,
+}
+
+fn field_details(schema: &iceberg::spec::Schema) -> Vec<FieldDetail> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| FieldDetail {
+            id: f.id,
+            name: f.name.clone(),
+            r#type: f.field_type.to_string(),
+            required: f.required,
+        })
+        .collect()
+}
+
 /// One field of the table's default partition spec.
 #[derive(Debug)]
 pub struct PartitionFieldDetail {
@@ -274,6 +303,9 @@ pub struct TableDetail {
     /// snapshot id, not commit order, so [`load_table_detail`] sorts the
     /// collected vector explicitly rather than trusting iteration order.
     pub snapshots: Vec<SnapshotDetail>,
+    /// Every schema the table's metadata records, oldest first (by schema
+    /// id) — the table's schema history. Always holds the current schema.
+    pub schema_versions: Vec<SchemaVersionDetail>,
     /// `snapshots.len()` — kept as a separate field so a caller does not
     /// need to materialize the full snapshot list just to know its size.
     pub snapshot_count: usize,
@@ -299,19 +331,26 @@ pub async fn load_table_detail(
         .await
         .map_err(|err| map_catalog_error(err, ErrorKind::TableNotFound))?;
     let metadata = table.metadata();
+    let current_schema_id = metadata.current_schema_id();
+    let mut schema_versions: Vec<SchemaVersionDetail> = metadata
+        .schemas_iter()
+        .map(|schema| {
+            let schema_id = schema.schema_id();
+            SchemaVersionDetail {
+                schema_id,
+                fields: field_details(schema),
+                since_ms: metadata
+                    .snapshots()
+                    .filter(|s| s.schema_id() == Some(schema_id))
+                    .map(|s| s.timestamp_ms())
+                    .min(),
+                current: schema_id == current_schema_id,
+            }
+        })
+        .collect();
+    schema_versions.sort_by_key(|v| v.schema_id);
     Ok(TableDetail {
-        schema: metadata
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|f| FieldDetail {
-                id: f.id,
-                name: f.name.clone(),
-                r#type: f.field_type.to_string(),
-                required: f.required,
-            })
-            .collect(),
+        schema: field_details(metadata.current_schema()),
         partition_fields: metadata
             .default_partition_spec()
             .fields()
@@ -344,6 +383,7 @@ pub async fn load_table_detail(
             snapshots.sort_by(|a, b| a.timestamp_ms.cmp(&b.timestamp_ms).then(a.id.cmp(&b.id)));
             snapshots
         },
+        schema_versions,
         snapshot_count: metadata.snapshots().len(),
         metadata_log_count: metadata.metadata_log().len(),
         stats: metadata

@@ -33,6 +33,8 @@
 //! question sees about a dozen tools. It narrows only what is offered:
 //! [`super::gate`] still decides what may run.
 
+use crate::config::ReplyLanguage;
+
 /// The system prompt shared by both modes.
 pub(super) const SYSTEM_BASE: &str = "\
 You are the AI Copilot of RantAI Lakehouse, a data lakehouse console. You help people find, understand and analyse the data in the lakehouse, and operate the platform.
@@ -70,7 +72,14 @@ RULES
 /// questions in Indonesian with that rule placed last. Naming the language
 /// outright, from [`reply_language`], leaves nothing for the model to
 /// infer, which matters most for small models.
-pub(super) fn closing(latest_user_message: &str) -> String {
+///
+/// `default` is the deployment's `AI_DEFAULT_REPLY_LANGUAGE`. It only fills
+/// the two cases where the message gives the model too little to go on: a
+/// Latin-script message nothing could classify, and a message with no
+/// letters. It never overrides a language [`reply_language`] detected, and
+/// a message in another script keeps the plain line, since the script
+/// already shows the language.
+pub(super) fn closing(latest_user_message: &str, default: Option<ReplyLanguage>) -> String {
     match reply_language(latest_user_message) {
         Some(lang) => format!(
             "\n\nLANGUAGE: the user's latest message is in {lang}. Reply in {lang}, even though \
@@ -82,16 +91,34 @@ pub(super) fn closing(latest_user_message: &str) -> String {
         // \"Main\"" in Chinese (QA, DeepSeek). Naming the script rules
         // that out without guessing which Latin-script language it is.
         None if is_latin_script(latest_user_message) => {
-            "\n\nLANGUAGE: reply in the language of the user's latest message. It is written in \
-             Latin script, so reply in that same language and script (English if you cannot \
-             tell), never in Chinese or any other script. The language of the data, table \
-             names or DATA MAP does not change this."
-                .to_owned()
+            let fallback = default.map_or("English", ReplyLanguage::name);
+            format!(
+                "\n\nLANGUAGE: reply in the language of the user's latest message. It is written in \
+                 Latin script, so reply in that same language and script ({fallback} if you cannot \
+                 tell), never in Chinese or any other script. The language of the data, table \
+                 names or DATA MAP does not change this."
+            )
         }
-        None => "\n\nLANGUAGE: reply in the language of the user's latest message. The language \
-                 of the data, table names or DATA MAP does not change this."
-            .to_owned(),
+        None => {
+            let too_short = match default {
+                Some(lang) if !has_letters(latest_user_message) => {
+                    format!(" If it is too short to tell, reply in {}.", lang.name())
+                }
+                _ => String::new(),
+            };
+            format!(
+                "\n\nLANGUAGE: reply in the language of the user's latest message.{too_short} The \
+                 language of the data, table names or DATA MAP does not change this."
+            )
+        }
     }
+}
+
+/// Whether `text` holds any letter at all. [`is_latin_script`] is `false`
+/// both for a message with no letters (`2024?`) and for one in another
+/// script, and only the first of those has nothing to show its language.
+fn has_letters(text: &str) -> bool {
+    text.chars().any(char::is_alphabetic)
 }
 
 /// Whether every letter in `text` is a Latin one (ASCII or accented), with
@@ -586,8 +613,8 @@ mod tests {
             Some("Indonesian")
         );
         assert_eq!(reply_language("mart_wisman"), None);
-        assert!(closing("How many rows are there?").contains("Reply in English"));
-        assert!(closing("ok").contains("language of the user's latest message"));
+        assert!(closing("How many rows are there?", None).contains("Reply in English"));
+        assert!(closing("ok", None).contains("language of the user's latest message"));
     }
 
     #[test]
@@ -609,14 +636,14 @@ mod tests {
     #[test]
     fn an_undecided_latin_script_message_is_never_answered_in_another_script() {
         for text in ["ok", "Jelaskan chart ini", "mart_wisman"] {
-            let line = closing(text);
+            let line = closing(text, None);
             assert!(line.contains("Latin script"), "{text}: {line}");
             assert!(line.contains("never in Chinese"), "{text}: {line}");
         }
         // A message in another script keeps the plain rule: the user's
         // language is the one to reply in.
         for text in ["这个图表是什么", "что это"] {
-            let line = closing(text);
+            let line = closing(text, None);
             assert!(!line.contains("Latin script"), "{text}: {line}");
             assert!(
                 line.contains("language of the user's latest message"),
@@ -624,6 +651,71 @@ mod tests {
             );
         }
         // No letters at all is not "Latin".
-        assert!(!closing("123 ?").contains("Latin script"));
+        assert!(!closing("123 ?", None).contains("Latin script"));
+    }
+
+    // The two `None` lines of `closing` as they were before the default
+    // reply language existed. Copied from the code, not recomputed, so
+    // "unchanged" is checked against the old text.
+    const LATIN_SCRIPT_LINE: &str = "\n\nLANGUAGE: reply in the language of the user's latest message. It is written in Latin script, so reply in that same language and script (English if you cannot tell), never in Chinese or any other script. The language of the data, table names or DATA MAP does not change this.";
+    const PLAIN_LINE: &str = "\n\nLANGUAGE: reply in the language of the user's latest message. The language of the data, table names or DATA MAP does not change this.";
+
+    #[test]
+    fn without_a_default_the_undecided_lines_are_unchanged() {
+        assert_eq!(closing("Jelaskan chart ini", None), LATIN_SCRIPT_LINE);
+        assert_eq!(closing("123 ?", None), PLAIN_LINE);
+        assert_eq!(closing("这个图表是什么", None), PLAIN_LINE);
+    }
+
+    #[test]
+    fn an_indonesian_default_replaces_english_as_the_latin_script_fallback() {
+        let line = closing("Jelaskan chart ini", Some(ReplyLanguage::Indonesian));
+        assert!(line.contains("Indonesian if you cannot tell"), "{line}");
+        assert!(line.contains("Latin script"), "{line}");
+        assert!(line.contains("never in Chinese"), "{line}");
+        assert!(!line.contains("English"), "{line}");
+    }
+
+    #[test]
+    fn an_english_default_leaves_the_latin_script_line_as_it_was() {
+        assert_eq!(
+            closing("Jelaskan chart ini", Some(ReplyLanguage::English)),
+            LATIN_SCRIPT_LINE
+        );
+    }
+
+    #[test]
+    fn a_detected_language_wins_over_the_default() {
+        let line = closing("How many rows are there?", Some(ReplyLanguage::Indonesian));
+        assert!(line.contains("Reply in English"), "{line}");
+        assert!(!line.contains("Indonesian"), "{line}");
+        let line = closing(
+            "Berapa jumlah data di tabel ini?",
+            Some(ReplyLanguage::English),
+        );
+        assert!(line.contains("Reply in Indonesian"), "{line}");
+        assert!(!line.contains("English"), "{line}");
+    }
+
+    #[test]
+    fn a_message_with_no_letters_is_answered_in_the_default() {
+        let line = closing("123 ?", Some(ReplyLanguage::Indonesian));
+        assert!(
+            line.contains("If it is too short to tell, reply in Indonesian."),
+            "{line}"
+        );
+        assert!(!line.contains("Latin script"), "{line}");
+        assert_eq!(
+            line,
+            "\n\nLANGUAGE: reply in the language of the user's latest message. If it is too short to tell, reply in Indonesian. The language of the data, table names or DATA MAP does not change this."
+        );
+    }
+
+    #[test]
+    fn a_message_in_another_script_ignores_the_default() {
+        assert_eq!(
+            closing("这个图表是什么", Some(ReplyLanguage::Indonesian)),
+            PLAIN_LINE
+        );
     }
 }

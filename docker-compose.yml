@@ -166,6 +166,10 @@ services:
       # 30..1800). Raise it only for a slow self-hosted model, e.g. a
       # small model on CPU; see routes/mod.rs `AI_CHAT_TIMEOUT`.
       AI_CHAT_TIMEOUT_SECS: ${AI_CHAT_TIMEOUT_SECS:-}
+      # Reply language for a chat message too short to detect: `id`
+      # (Indonesian) or `en` (English). Empty means unset; any other value
+      # stops the API at start (see config.rs).
+      AI_DEFAULT_REPLY_LANGUAGE: ${AI_DEFAULT_REPLY_LANGUAGE:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -302,6 +306,11 @@ services:
       # the exception visible here is the point — do NOT carry this into a
       # deployment that accepts connector definitions from untrusted callers.
       CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
+      # The narrow alternative: only these networks (e.g. `192.168.18.0/24`,
+      # comma-separated; a bare address is one host) pass the guard. Takes
+      # effect when the flag above is not `true`. Never opens loopback,
+      # link-local or multicast (`lakehouse-api::internal_hosts`).
+      CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
@@ -314,6 +323,13 @@ services:
       #    ALERTS_RUN_TOKEN). ──
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      # The `DataLakeCatalog` database `clickhouse-iceberg-init` creates:
+      # how policy enforcement resolves an Iceberg table's columns and how
+      # the catalog reads Iceberg-only assets (`Config::iceberg_query_db`).
+      # Not a boot dependency, same posture as `lakekeeper-authz-init`
+      # above: until the database exists those reads degrade to "not
+      # available", and a governed Iceberg table is refused, never read raw.
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
       LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       # WS2 amendment A0 — the `lakehouse-api-reader` principal
       # (`ops/oidc-mock/server.py`'s `PRINCIPALS`), read-only metadata
@@ -372,6 +388,35 @@ services:
       TENANT_WAREHOUSE_STS_ROLE_ARN: ${TENANT_WAREHOUSE_STS_ROLE_ARN:-arn:aws:iam::000000000000:role/lakekeeper}
       TENANT_WAREHOUSE_S3_ACCESS_KEY: ${TENANT_WAREHOUSE_S3_ACCESS_KEY:-}
       TENANT_WAREHOUSE_S3_SECRET_KEY: ${TENANT_WAREHOUSE_S3_SECRET_KEY:-}
+      # ── Object storage for uploaded files and the RustFS health probe
+      #    (ADR 0014, decision 1; plan T13, finding `D1`). `lakehouse-api`
+      #    read these three settings (`config.rs`, `rustfs_client.rs`) but
+      #    this service passed none of them, so on this stack every upload
+      #    answered "Upload storage is not configured." ──
+      # The endpoint is not a secret. The container gets the name `config.rs`
+      # reads, interpolated from the IN-NETWORK `CH_RUSTFS_S3_ENDPOINT` the
+      # Dagster services use, never from the host-facing `RUSTFS_S3_ENDPOINT`
+      # of `.env` (a localhost address, which inside a container is the
+      # container): the split `LAKEKEEPER_BASE_URI` above makes too (`D2`).
+      RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # The two refs are ADR 0002 `secretRef`s, not secrets, so a default is
+      # safe. They name DEDICATED variables below, never
+      # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (RustFS's own root key): the
+      # ADR 0002 Addendum 2 rule that a name the API's own process resolves
+      # must not alias a secret it depends on, which
+      # `TENANT_WAREHOUSE_S3_*` above and `CONNECTOR_S3_*` also follow.
+      RUSTFS_ACCESS_KEY_SECRET_REF: ${RUSTFS_ACCESS_KEY_SECRET_REF:-env:UPLOAD_S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY_SECRET_REF: ${RUSTFS_SECRET_KEY_SECRET_REF:-env:UPLOAD_S3_SECRET_KEY}
+      # No default credential (`AGENTS.md` rule 5). Left empty, the store
+      # reads them as "not configured" (`rustfs_client.rs`): uploads answer
+      # 503 "Upload storage is not configured." and the RustFS health tile
+      # stays "unknown", rather than dialling with empty keys. A deployment
+      # should give them a credential limited to the warehouse bucket, and
+      # to its `uploads/` prefix where the store supports per-prefix
+      # policies. Whether the pinned RustFS can mint such an identity is
+      # the open question the `CONNECTOR_S3_*` note in .env.example records.
+      UPLOAD_S3_ACCESS_KEY: ${UPLOAD_S3_ACCESS_KEY:-}
+      UPLOAD_S3_SECRET_KEY: ${UPLOAD_S3_SECRET_KEY:-}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
       # Passed through explicitly because otherwise a non-Dispar deployment
       # cannot override them at all. Each resolves to its historical Dispar
@@ -384,6 +429,16 @@ services:
       TENANT_SITE: ${TENANT_SITE:-}
       BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
       CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
+      # README.md "Environment variables" + docs/OPERATIONS.md "Upgrade
+      # note": UUID of the tenant owning this deployment's single shared
+      # catalog and its Dagster-job list. Both are no-tenant-column
+      # surfaces, so with >1 seeded tenant and this unset they are refused
+      # (fail closed) for every principal without the unrestricted grant —
+      # i.e. setting the value in .env alone does nothing, this service's
+      # block must forward it to the process (config.rs reads it from env
+      # only). Empty default: an unset value degrades to the documented
+      # refusal, not a boot failure.
+      CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}
       # Built-in "Main" dashboard tile catalog (Task 6, lakehouse-bi::specs):
       # this compose file's default tenant has the Dispar marts, so it points
       # at the shipped default the Dockerfile bakes into the image. Not a
@@ -423,6 +478,13 @@ services:
         volume:
           subpath: admin.jwt
         read_only: true
+      # ADR 0002 Addendum 4 — user-supplied connector credentials. WRITABLE
+      # here: `connector_secret_store` writes `connector_managed_*` files
+      # when a user saves a connector's password in the console, and the
+      # `file:` resolver reads every `file:/run/secrets/connector_*` ref
+      # (managed or operator-dropped) from the same directory. Mounted
+      # read-only into `dagster-code-location`, which only ever reads.
+      - lakehouse_connector_secrets:/run/secrets
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -1109,6 +1171,40 @@ services:
   #        -e CH_RUSTFS_S3_ENDPOINT=http://seaweedfs:8333 \
   #        g1-test-runner
   # This is what `.github/workflows/ci.yml`'s `g2-seaweedfs` job does.
+  # The API's own `DataLakeCatalog` database (`ICEBERG_QUERY_DB` on
+  # `lakehouse-api`): read access to Lakekeeper's Iceberg tables through
+  # ClickHouse, for Query Studio, policy enforcement, and the catalog's
+  # sample/profile. Same settings as the `icecat_*` databases the Dagster
+  # jobs create for themselves (`maintenance.py::_ensure_catalog_database`),
+  # authenticated as the same `clickhouse-reader` principal, but owned by
+  # none of those jobs, so the API never reads through another job's
+  # database. `IF NOT EXISTS`: safe to re-run on every `up`.
+  clickhouse-iceberg-init:
+    image: clickhouse/clickhouse-server:26.8
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    environment:
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        set -eu &&
+        clickhouse-client --host clickhouse --user "$$CH_USER" --password "$$CH_PASSWORD"
+        --query "CREATE DATABASE IF NOT EXISTS $$ICEBERG_QUERY_DB
+        ENGINE = DataLakeCatalog('http://lakekeeper:8181/catalog')
+        SETTINGS catalog_type = 'rest', warehouse = '$$LAKEKEEPER_WAREHOUSE',
+        storage_endpoint = 'http://rustfs:9000',
+        catalog_credential = 'clickhouse-reader:unused',
+        oauth_server_uri = 'http://oidc-mock:8090/token'
+        SETTINGS allow_database_iceberg = 1"
+    restart: "no"
+
   g1-test-runner:
     profiles: ["test"]
     image: rust:1.96.1-slim
@@ -1581,6 +1677,14 @@ services:
         volume:
           subpath: dlt.jwt
         read_only: true
+      # ADR 0002 Addendum 4 — connector credentials the API stored for a
+      # user (`connector_managed_*`), plus any operator-dropped
+      # `connector_*` file. Read-only: `secret_resolver.resolve_secret_ref`
+      # only reads; `lakehouse-api` is the one writer.
+      - type: volume
+        source: lakehouse_connector_secrets
+        target: /run/secrets
+        read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
@@ -1595,6 +1699,11 @@ services:
       # way `ops/g6/docker-compose.g6.override.yml`'s gate-only override
       # already does for its own fixtures — never a default here.
       INGEST_ALLOW_INTERNAL_HOSTS: ${INGEST_ALLOW_INTERNAL_HOSTS:-}
+      # The narrow alternative for ingest: only these networks (e.g. a
+      # customer LAN, `192.168.18.0/24`) pass the dial-time guard, while
+      # this compose network and the host stay refused. Empty by default
+      # (`ssrf_guard.py`'s module docstring).
+      INGEST_ALLOWED_CIDRS: ${INGEST_ALLOWED_CIDRS:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
@@ -1976,6 +2085,13 @@ services:
       # OAuth2 client-credentials against `ops/oidc-mock`'s `/token`.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # Latent, same shape as `g3-maintenance-test-runner`: this runner
+      # also binds `./ops/g3a` READ-WRITE as root, so any local import
+      # added to `g3a_test.py` later would drop a root-owned
+      # `__pycache__/` that a self-hosted runner's next
+      # `actions/checkout` cannot `git clean` (EACCES). No local import
+      # exists today; this keeps the failure mode from ever arming.
+      PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3a_test.py"
@@ -2015,6 +2131,19 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # This runner binds `./ops/g3` READ-WRITE and runs as root
+      # (python:3.12-slim's default user). `g3_test.py`'s lazy `import
+      # bronze_catalog` (line ~188 — the file is mounted alongside it)
+      # compiles bytecode into `ops/g3/__pycache__/` as root:root; a
+      # self-hosted runner's NEXT `actions/checkout` then fails inside
+      # `git clean -ffdx` (EACCES on that directory), so the deploy
+      # breaks one run AFTER the one that wrote it — the failing step
+      # looks innocent because the write happened in the previous run.
+      # Bytecode caching inside a read-write bind mount buys nothing;
+      # skip it and the failure mode never arms. See the pre-checkout
+      # reclaim step in .github/workflows/deploy-staging.yml for the
+      # defense that catches writers this file does not know about.
+      PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3_test.py"
@@ -3029,6 +3158,11 @@ volumes:
   # has something genuine to verify against instead of being relaxed.
   mssql_g6_tls:
   lakehouse_postgres_data:
+  # ADR 0002 Addendum 4 — user-supplied connector credentials, plaintext at
+  # rest (Docker-secret posture). NOT part of a database backup: back this
+  # volume up alongside `lakehouse_postgres_data`, or restored connectors
+  # will have no credential until one is saved again.
+  lakehouse_connector_secrets:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:
