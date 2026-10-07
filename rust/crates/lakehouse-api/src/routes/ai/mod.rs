@@ -25,6 +25,7 @@ mod data_map;
 mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
+pub(crate) mod semantic;
 pub(in crate::routes) mod tools;
 
 use axum::body::Bytes;

@@ -132,13 +132,13 @@ pub(crate) fn masked_columns(conditions: &[String]) -> HashSet<(String, String)>
 /// Longest table text, in characters: the `CHECK` on `semantic_entry` for a
 /// table. Applied again here so a row written around the `CHECK` cannot
 /// crowd the prompt.
-const TABLE_TEXT_CHARS: usize = 400;
+pub(crate) const TABLE_TEXT_CHARS: usize = 400;
 /// Longest column description, in characters (the `CHECK` for a column).
-const COLUMN_TEXT_CHARS: usize = 200;
+pub(crate) const COLUMN_TEXT_CHARS: usize = 200;
 /// Most synonyms listed for one table or column.
-const MAX_SYNONYMS: usize = 6;
+pub(crate) const MAX_SYNONYMS: usize = 6;
 /// Longest single synonym, in characters.
-const SYNONYM_CHARS: usize = 40;
+pub(crate) const SYNONYM_CHARS: usize = 40;
 
 /// What people and the drafting pass wrote about tables and columns, to be
 /// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
@@ -163,7 +163,7 @@ struct Note {
 /// One line of prompt text: control characters (line breaks above all) turn
 /// into spaces so a stored description cannot start a line of the map, then
 /// the text is cut to `max` characters, never inside one.
-fn one_line(raw: &str, max: usize) -> String {
+pub(crate) fn one_line(raw: &str, max: usize) -> String {
     let flat: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -602,17 +602,106 @@ fn render_table(
     }
 }
 
+/// The live tables and the catalog facts the DATA MAP renders from, read
+/// from `ClickHouse` once. [`build`] renders all of them; the semantic
+/// layer's drafting pass asks for one table's facts through [`Live::facts`],
+/// which runs the same stats query and the same [`render_table`], so what
+/// the model reads about a table is what the chat reads about it, masked
+/// columns included.
+pub(crate) struct Live {
+    tables: Vec<Table>,
+    datasets: HashMap<String, Dataset>,
+    descriptions: HashMap<(String, String), String>,
+}
+
+/// One live table, as the drafting pass needs to know it.
+pub(crate) struct LiveTable {
+    /// `serving.<table>` or `silver.<table>`.
+    pub(crate) asset: String,
+    /// Whether the table is in `serving` (Gold), which the pass drafts first.
+    pub(crate) serving: bool,
+    /// The table's column names, in table order.
+    pub(crate) columns: Vec<String>,
+}
+
+impl Live {
+    /// Read the tables and, when there are any, the catalog. Empty when
+    /// `ClickHouse` did not answer.
+    pub(crate) async fn load(ch: &ChClient) -> Self {
+        let tables = load_tables(ch).await;
+        let (datasets, descriptions) = if tables.is_empty() {
+            (HashMap::new(), HashMap::new())
+        } else {
+            load_catalog(ch).await
+        };
+        Self {
+            tables,
+            datasets,
+            descriptions,
+        }
+    }
+
+    /// The catalog dataset a Gold table is served from, if any.
+    fn dataset(&self, table: &Table) -> Option<&Dataset> {
+        if table.db == "serving" {
+            self.datasets.get(&table.name)
+        } else {
+            None
+        }
+    }
+
+    /// Every live table, in the order the map lists them.
+    pub(crate) fn tables(&self) -> Vec<LiveTable> {
+        self.tables
+            .iter()
+            .map(|t| LiveTable {
+                asset: format!("{}.{}", t.db, t.name),
+                serving: t.db == "serving",
+                columns: t.columns.iter().map(|c| c.name.clone()).collect(),
+            })
+            .collect()
+    }
+
+    /// The text the map prints for one table, without any entry or
+    /// annotation: name, row count, source description, every column with
+    /// its type and stats. `masked` is read as [`data_map`] reads it, so a
+    /// masked column, or any text column while `masked` is `None`, carries
+    /// no sample values. `None` when `asset` is not a live table.
+    pub(crate) async fn facts(
+        &self,
+        ch: &ChClient,
+        asset: &str,
+        masked: Option<&HashSet<(String, String)>>,
+    ) -> Option<String> {
+        let table = self
+            .tables
+            .iter()
+            .find(|t| format!("{}.{}", t.db, t.name) == asset)?;
+        let stats = column_stats(ch, table, masked).await;
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            table,
+            self.dataset(table),
+            &self.descriptions,
+            &stats,
+            &Notes::default(),
+        );
+        Some(out)
+    }
+}
+
 async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>, notes: &Notes) -> String {
-    let tables = load_tables(ch).await;
+    let live = Live::load(ch).await;
+    let (tables, datasets, descriptions) = (&live.tables, &live.datasets, &live.descriptions);
     if tables.is_empty() {
         return String::new();
     }
-    let (datasets, descriptions) = load_catalog(ch).await;
 
     let mut out = String::new();
     let mut section = "";
     let mut skipped: Vec<String> = Vec::new();
-    for table in &tables {
+    for table in tables {
         let qualified = format!("{}.{}", table.db, table.name);
         if out.len() > MAX_CHARS {
             skipped.push(qualified);
@@ -631,13 +720,15 @@ async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>, notes:
             out.push('\n');
             section = heading;
         }
-        let dataset = if table.db == "serving" {
-            datasets.get(&table.name)
-        } else {
-            None
-        };
         let stats = column_stats(ch, table, masked).await;
-        render_table(&mut out, table, dataset, &descriptions, &stats, notes);
+        render_table(
+            &mut out,
+            table,
+            live.dataset(table),
+            descriptions,
+            &stats,
+            notes,
+        );
     }
     if !skipped.is_empty() {
         let _ = write!(

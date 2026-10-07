@@ -516,12 +516,13 @@ static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Holds a "pass running" flag and clears it when dropped, however the pass
 /// ends — a pass that panicked must not stop every later one from
-/// starting.
-struct PassGuard(&'static AtomicBool);
+/// starting. Shared with the semantic layer's drafting pass
+/// (`ai::semantic`), which runs under the same single-flight rule.
+pub(crate) struct PassGuard(&'static AtomicBool);
 
 impl PassGuard {
     /// Takes `flag`; `None` while someone else holds it.
-    fn claim(flag: &'static AtomicBool) -> Option<Self> {
+    pub(crate) fn claim(flag: &'static AtomicBool) -> Option<Self> {
         // The guard is built only on the claimed path: one built and dropped
         // on the refused path would clear the flag the running pass holds.
         if flag.swap(true, Ordering::SeqCst) {
