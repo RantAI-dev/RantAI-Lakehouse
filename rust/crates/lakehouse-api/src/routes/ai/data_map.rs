@@ -42,7 +42,9 @@
 //! `routes::query::run` and its masking/row-filter enforcement. Sample
 //! values are read unmasked from `ClickHouse` here, so a column that a
 //! masking policy covers is listed without samples
-//! ([`masked_columns`]).
+//! ([`masked_columns`]). The stats queries also read every row, so a table
+//! that a row-filter policy covers is listed with no stats at all
+//! ([`row_filtered_tables`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -73,35 +75,68 @@ const SAMPLE_VALUE_CHARS: usize = 40;
 /// A table with more rows than this is described without stats.
 const STATS_ROW_CEILING: u64 = 50_000_000;
 
-static CACHE: LazyLock<Mutex<Option<(Instant, String)>>> = LazyLock::new(|| Mutex::new(None));
+/// The cached map, with the row-filtered tables it was built without
+/// stats for. A map is reused only while that set is the current one, so a
+/// row-filter policy added after the map was built is honoured on the next
+/// chat and not after [`TTL`].
+type CacheEntry = (Instant, HashSet<String>, String);
+
+static CACHE: LazyLock<Mutex<Option<CacheEntry>>> = LazyLock::new(|| Mutex::new(None));
+
+/// What the authored policies say the map must not read from the data: the
+/// masked columns and the row-filtered tables. Both are read once per chat
+/// from the same policies, so they travel together.
+#[derive(Debug, Default)]
+pub(crate) struct Withheld {
+    masked: HashSet<(String, String)>,
+    row_filtered: HashSet<String>,
+}
+
+impl Withheld {
+    /// Read both sets from the policies' `conditions`.
+    pub(crate) fn from_conditions(conditions: &[String]) -> Self {
+        Self {
+            masked: masked_columns(conditions),
+            row_filtered: row_filtered_tables(conditions),
+        }
+    }
+}
+
+/// The map in `slot`, when it is younger than [`TTL`] and was built without
+/// stats for exactly the tables in `row_filtered`.
+fn reusable<'a>(slot: Option<&'a CacheEntry>, row_filtered: &HashSet<String>) -> Option<&'a str> {
+    let (built, built_without, map) = slot?;
+    (built.elapsed() < TTL && built_without == row_filtered).then_some(map.as_str())
+}
 
 /// The rendered DATA MAP, from cache when it is younger than [`TTL`].
 ///
-/// `masked` is the set [`masked_columns`] read from the authored policies,
-/// or `None` when the policies could not be read: then no text samples are
-/// listed at all, since which columns are masked is unknown. Only a map
-/// built with no masked column is cached, so a map carrying samples is
-/// never reused after a masking policy appears.
+/// `withheld` is what [`Withheld::from_conditions`] read from the authored
+/// policies, or `None` when the policies could not be read: then no table
+/// is listed with stats, since which columns are masked and which tables are
+/// row-filtered is unknown. Only a map built with no masked column is
+/// cached, so a map carrying samples is never reused after a masking policy
+/// appears. The row-filtered tables are the same for every chat, so a map
+/// built without their stats is shared like any other.
 ///
 /// The lock is held while a stale map is rebuilt, so concurrent chats wait
 /// for one rebuild instead of each running the stats queries. An empty
 /// result (`ClickHouse` unreachable) is never cached.
-pub(crate) async fn data_map(
-    ch: &ChClient,
-    masked: Option<&HashSet<(String, String)>>,
-    notes: &Notes,
-) -> String {
-    let cacheable = masked.is_some_and(HashSet::is_empty);
+pub(crate) async fn data_map(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> String {
+    let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
     let mut guard = CACHE.lock().await;
     if cacheable
-        && let Some((built, map)) = guard.as_ref()
-        && built.elapsed() < TTL
+        && let Some(w) = withheld
+        && let Some(map) = reusable(guard.as_ref(), &w.row_filtered)
     {
-        return map.clone();
+        return map.to_owned();
     }
-    let map = build(ch, masked, notes).await;
-    if cacheable && !map.is_empty() {
-        *guard = Some((Instant::now(), map.clone()));
+    let map = build(ch, withheld, notes).await;
+    if cacheable
+        && !map.is_empty()
+        && let Some(w) = withheld
+    {
+        *guard = Some((Instant::now(), w.row_filtered.clone(), map.clone()));
     }
     map
 }
@@ -121,7 +156,7 @@ pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 /// Put a built map into [`CACHE`], as a chat turn would.
 #[cfg(test)]
 pub(crate) async fn seed_cache_for_test() {
-    *CACHE.lock().await = Some((Instant::now(), "DATA MAP text".to_owned()));
+    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), "DATA MAP text".to_owned()));
 }
 
 /// Whether [`CACHE`] holds no map.
@@ -148,6 +183,33 @@ pub(crate) fn masked_columns(conditions: &[String]) -> HashSet<(String, String)>
             for col in cols.iter().filter_map(Value::as_str) {
                 out.insert((table.to_owned(), col.to_owned()));
             }
+        }
+    }
+    out
+}
+
+/// The tables (lower-cased `database.table`) that any condition gives a
+/// non-blank `rowFilter`. The stats queries read every row of a table, so
+/// a row filter that hides rows from a query would not hide them from a
+/// range or a sample; PR #79 review, SEC-16. Lower-cased because the policy
+/// engine matches a condition's table case-insensitively
+/// (`policy_engine.rs`, `eq_ignore_ascii_case`). Like [`masked_columns`],
+/// not narrowed to a role: the map is shared across principals.
+pub(crate) fn row_filtered_tables(conditions: &[String]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for raw in conditions {
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        let Some(table) = obj.get("table").and_then(Value::as_str) else {
+            continue;
+        };
+        let filtered = obj
+            .get("rowFilter")
+            .and_then(Value::as_str)
+            .is_some_and(|f| !f.trim().is_empty());
+        if filtered {
+            out.insert(table.to_ascii_lowercase());
         }
     }
     out
@@ -452,22 +514,29 @@ fn is_range_type(ty: &str) -> bool {
     is_numeric_type(ty) || ty.contains("Date")
 }
 
-/// One line of facts per column: `min..max` for numbers and dates, the
-/// distinct count and up to [`SAMPLE_VALUES`] values for text. Empty for a
-/// table that is too big, has no summarisable columns, or fails to answer.
-async fn column_stats(
-    ch: &ChClient,
-    table: &Table,
-    masked: Option<&HashSet<(String, String)>>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+/// The stats query for one table and which of its columns it summarises
+/// (`true` for a text column). `None` when the table gets no stats: it is
+/// too big, a row-filter policy covers it, the policies are unreadable
+/// (`withheld` is `None`, so which tables are row-filtered is unknown), or
+/// it has no summarisable column.
+///
+/// A row-filtered table gets no query at all, range or sample: both read
+/// every row, including the ones the filter hides from a query.
+fn stats_plan(table: &Table, withheld: Option<&Withheld>) -> Option<(String, Vec<(usize, bool)>)> {
+    let withheld = withheld?;
     if table.rows.is_some_and(|n| n > STATS_ROW_CEILING) {
-        return out;
+        return None;
     }
     let (Ok(db), Ok(name)) = (Ident::new(table.db.clone()), Ident::new(table.name.clone())) else {
-        return out;
+        return None;
     };
     let qualified = format!("{}.{}", table.db, table.name);
+    if withheld
+        .row_filtered
+        .contains(&qualified.to_ascii_lowercase())
+    {
+        return None;
+    }
     let mut exprs = Vec::new();
     let mut plan = Vec::new();
     for (i, col) in table.columns.iter().enumerate() {
@@ -480,7 +549,10 @@ async fn column_stats(
             ));
             plan.push((i, false));
         } else if is_text_type(&col.ty) {
-            if masked.is_none_or(|m| m.contains(&(qualified.clone(), col.name.clone()))) {
+            if withheld
+                .masked
+                .contains(&(qualified.clone(), col.name.clone()))
+            {
                 continue;
             }
             exprs.push(format!(
@@ -491,12 +563,27 @@ async fn column_stats(
         }
     }
     if exprs.is_empty() {
-        return out;
+        return None;
     }
     let sql = format!(
         "SELECT {} FROM `{db}`.`{name}` SETTINGS max_execution_time = 5",
         exprs.join(", ")
     );
+    Some((sql, plan))
+}
+
+/// One line of facts per column: `min..max` for numbers and dates, the
+/// distinct count and up to [`SAMPLE_VALUES`] values for text. Empty for a
+/// table [`stats_plan`] gives no query, or that fails to answer.
+async fn column_stats(
+    ch: &ChClient,
+    table: &Table,
+    withheld: Option<&Withheld>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some((sql, plan)) = stats_plan(table, withheld) else {
+        return out;
+    };
     let Ok(rows) = ch.rows(&sql, None).await else {
         return out;
     };
@@ -696,20 +783,21 @@ impl Live {
 
     /// The text the map prints for one table, without any entry or
     /// annotation: name, row count, source description, every column with
-    /// its type and stats. `masked` is read as [`data_map`] reads it, so a
-    /// masked column, or any text column while `masked` is `None`, carries
-    /// no sample values. `None` when `asset` is not a live table.
+    /// its type and stats. `withheld` is read as [`data_map`] reads it, so a
+    /// masked column carries no sample values and a row-filtered table, or
+    /// any table while `withheld` is `None`, carries no stats at all.
+    /// `None` when `asset` is not a live table.
     pub(crate) async fn facts(
         &self,
         ch: &ChClient,
         asset: &str,
-        masked: Option<&HashSet<(String, String)>>,
+        withheld: Option<&Withheld>,
     ) -> Option<String> {
         let table = self
             .tables
             .iter()
             .find(|t| format!("{}.{}", t.db, t.name) == asset)?;
-        let stats = column_stats(ch, table, masked).await;
+        let stats = column_stats(ch, table, withheld).await;
         let mut out = String::new();
         render_table(
             &mut out,
@@ -723,7 +811,7 @@ impl Live {
     }
 }
 
-async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>, notes: &Notes) -> String {
+async fn build(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> String {
     let live = Live::load(ch).await;
     let (tables, datasets, descriptions) = (&live.tables, &live.datasets, &live.descriptions);
     if tables.is_empty() {
@@ -752,7 +840,7 @@ async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>, notes:
             out.push('\n');
             section = heading;
         }
-        let stats = column_stats(ch, table, masked).await;
+        let stats = column_stats(ch, table, withheld).await;
         render_table(
             &mut out,
             table,
@@ -821,6 +909,121 @@ mod tests {
         assert!(masked.contains(&("serving.mart_x".to_owned(), "email".to_owned())));
         assert!(masked.contains(&("serving.mart_x".to_owned(), "phone".to_owned())));
         assert_eq!(masked.len(), 2);
+    }
+
+    #[test]
+    fn row_filtered_tables_lists_a_table_whose_only_obligation_is_a_row_filter() {
+        let tables = row_filtered_tables(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_y","rowFilter":"region = 'x'"}"#
+                .to_owned(),
+        ]);
+        assert_eq!(tables, HashSet::from(["serving.mart_y".to_owned()]));
+    }
+
+    #[test]
+    fn row_filtered_tables_skips_a_blank_or_missing_filter_and_prose() {
+        let tables = row_filtered_tables(&[
+            r#"{"roles":["Analyst"],"table":"serving.mask_only","mask":["email"]}"#.to_owned(),
+            r#"{"roles":["Analyst"],"table":"serving.empty","rowFilter":""}"#.to_owned(),
+            r#"{"roles":["Analyst"],"table":"serving.blank","rowFilter":"  \n "}"#.to_owned(),
+            r#"{"roles":["Analyst"],"table":"serving.null","rowFilter":null}"#.to_owned(),
+            "Analysts may not see rows of another region".to_owned(),
+        ]);
+        assert!(tables.is_empty(), "{tables:?}");
+    }
+
+    #[test]
+    fn row_filtered_tables_lists_a_table_that_has_both_a_mask_and_a_filter_in_lower_case() {
+        let tables = row_filtered_tables(&[
+            r#"{"roles":["Analyst"],"table":"Serving.Mart_Z","mask":["email"],"rowFilter":"a = 1"}"#
+                .to_owned(),
+        ]);
+        assert_eq!(tables, HashSet::from(["serving.mart_z".to_owned()]));
+    }
+
+    fn visits_table() -> Table {
+        let col = |name: &str, ty: &str| Column {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+        };
+        Table {
+            db: "serving".to_owned(),
+            name: "mart_visits".to_owned(),
+            rows: Some(720),
+            columns: vec![col("tahun", "UInt16"), col("negara", "String")],
+        }
+    }
+
+    fn withheld_for(conditions: &[&str]) -> Withheld {
+        let owned: Vec<String> = conditions.iter().map(|c| (*c).to_owned()).collect();
+        Withheld::from_conditions(&owned)
+    }
+
+    #[test]
+    fn a_table_with_no_policy_gets_a_stats_query_over_its_columns() {
+        let withheld = withheld_for(&[]);
+        let Some((sql, plan)) = stats_plan(&visits_table(), Some(&withheld)) else {
+            panic!("a table with no row filter must get a stats query");
+        };
+        assert!(sql.contains("FROM `serving`.`mart_visits`"), "{sql}");
+        assert_eq!(plan, vec![(0, false), (1, true)]);
+    }
+
+    #[test]
+    fn a_row_filtered_table_gets_no_stats_query_at_all() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","rowFilter":"negara = 'x'"}"#,
+        ]);
+        assert!(stats_plan(&visits_table(), Some(&withheld)).is_none());
+    }
+
+    #[test]
+    fn unreadable_policies_get_no_stats_query_for_any_table() {
+        assert!(stats_plan(&visits_table(), None).is_none());
+    }
+
+    #[test]
+    fn a_masked_text_column_stays_out_of_the_stats_query_and_the_other_columns_stay_in() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["negara"]}"#,
+        ]);
+        let Some((sql, plan)) = stats_plan(&visits_table(), Some(&withheld)) else {
+            panic!("a table with no row filter must get a stats query");
+        };
+        assert_eq!(plan, vec![(0, false)]);
+        assert!(!sql.contains("negara"), "{sql}");
+    }
+
+    fn cached_without(without: &[&str], age: Duration) -> CacheEntry {
+        let Some(built) = Instant::now().checked_sub(age) else {
+            panic!("the clock must be older than the test's cache age");
+        };
+        (
+            built,
+            without.iter().map(|t| (*t).to_owned()).collect(),
+            "map".to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_cached_map_is_reused_only_for_the_same_row_filtered_tables_and_within_the_ttl() {
+        let fresh = cached_without(&["serving.a"], Duration::ZERO);
+        let same = HashSet::from(["serving.a".to_owned()]);
+        assert_eq!(reusable(Some(&fresh), &same), Some("map"));
+        assert_eq!(
+            reusable(Some(&fresh), &HashSet::new()),
+            None,
+            "a policy dropped since the build: rebuild"
+        );
+        let built_before_the_policy = cached_without(&[], Duration::ZERO);
+        assert_eq!(
+            reusable(Some(&built_before_the_policy), &same),
+            None,
+            "a row filter added since the build must not be served the old map"
+        );
+        let stale = cached_without(&["serving.a"], TTL + Duration::from_secs(1));
+        assert_eq!(reusable(Some(&stale), &same), None);
+        assert_eq!(reusable(None, &same), None);
     }
 
     #[test]

@@ -222,15 +222,16 @@ fn page_context_line(raw: &str) -> String {
     )
 }
 
-/// The columns any masking policy covers, for [`data_map::data_map`]:
-/// sample values in the DATA MAP are read unmasked, so those columns are
-/// listed without samples. `None` when the policies cannot be read (no
-/// Postgres, or an error), in which case every text sample is withheld.
-async fn masked_columns(state: &AppState) -> Option<std::collections::HashSet<(String, String)>> {
+/// What any policy withholds from the DATA MAP, for [`data_map::data_map`]:
+/// sample values are read unmasked and every stats query reads every row,
+/// so a masked column is listed without samples and a row-filtered table
+/// without stats. `None` when the policies cannot be read (no Postgres, or
+/// an error), in which case no table is listed with stats.
+async fn withheld_by_policy(state: &AppState) -> Option<data_map::Withheld> {
     let pg = state.pg.as_deref()?;
     let policies = lakehouse_store::governance::list_policies(pg).await.ok()?;
     let conditions: Vec<String> = policies.into_iter().filter_map(|p| p.conditions).collect();
-    Some(data_map::masked_columns(&conditions))
+    Some(data_map::Withheld::from_conditions(&conditions))
 }
 
 /// What people wrote about tables and columns, for [`data_map::data_map`]:
@@ -271,7 +272,7 @@ async fn system_prompt(
     context: &str,
     latest_user: &str,
 ) -> String {
-    let masked = masked_columns(state).await;
+    let withheld = withheld_by_policy(state).await;
     // The DATA MAP describes the shared, one-per-deployment catalog and
     // carries sample values, so it follows the catalog route's own rule
     // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
@@ -285,7 +286,7 @@ async fn system_prompt(
     let schema = match refusal {
         None => {
             let notes = semantic_notes(state).await;
-            data_map::data_map(&state.clickhouse, masked.as_ref(), &notes).await
+            data_map::data_map(&state.clickhouse, withheld.as_ref(), &notes).await
         }
         Some(reason) => format!("(withheld: {reason})"),
     };
