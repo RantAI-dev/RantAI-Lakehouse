@@ -24,9 +24,8 @@ The one list of known work. Look at it weekly; pick what is next.
 | `REL-1` | Protect the main branch | Delivery | `docs/CI.md` |
 | `DOC-1` | Archive or rewrite the old product documents that contradict the build | Docs | PRODUCT §6 |
 | `GOV-2` | Decide which role may publish a table in open format | Governance | PRODUCT §6 |
-| `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in. **Shared with the AI team: their code** | Security | `routes/agent.rs`, `policy.rs` |
 | `SEC-10` | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver | Security | `lakehouse-notify` |
-| `SEC-11` | Dashboard tiles (also on public and embed links) and the agent endpoints return raw database error text. Same rule as `SEC-6`. **Shared with the AI team for the agent endpoints** | Security | `routes/support.rs`, `routes/agent.rs` |
+| `SEC-11` | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Security | `routes/support.rs` |
 | `SEC-14` | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server | Security | `routes/connectors.rs`, `connector_probe.rs` |
 | `SEC-15` | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Security | `docker-compose.yml`, `connector_probe.rs` |
 | `SEC-13` | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Security | commit `7ec3a81` |
@@ -108,7 +107,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `QS-3` | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-4` | Query history page with filters, and a query profile | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `AI-16` | Hand-off to the AI team: AI features for the Data module (AI-written descriptions, plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building). The AI team plans these | Ask AI | `reference/competitive-comparison.md` (Data matrix) (AI table) |
+| `AI-16` | Hand-off to the AI team: AI features for the Data module. **First line (AI-written descriptions of tables and columns) built.** Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | Ask AI | `docs/core/features/semantic-layer.md` |
 | `SEC-6` | Stop older API handlers from returning internal error text | Security | `AGENTS.md` |
 | `SEC-16` | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Security | Data module code audit |
 | `SEC-17` | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Security | Data module code audit |
@@ -177,6 +176,8 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | `DATA-7` | Query a table as of an earlier time | Superseded: the picker was built in PR #71; proving it safe is `DATA-16` | 2026-10-07 |
 | `BI-21` | Where charts read data | Decided: only data in the lakehouse, for now | 2026-10-06 |
 | `SEC-8` | Dependency security checks green on `main` | Done: PR #62. Three TLS-library vulnerabilities cleared by updating the SQL Server client; licence check fixed | 2026-10-02 |
+| `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter | 2026-10-07 |
+| `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
 
 ## Specs
 
@@ -191,9 +192,7 @@ builds it (`AGENTS.md`).
 
 | ID | Spec | When | Size |
 | --- | --- | --- | --- |
-| [`SEC-9`](specs/sec-9.md) | Plain-language queries respect masking | Now | S |
 | [`SEC-10`](specs/sec-10.md) | Alert webhooks cannot reach internal addresses | Now | S |
-| [`SEC-11`](specs/sec-11.md) | No raw database errors on screen | Now | S |
 | [`SEC-12`](specs/sec-12.md) | Safer embed tokens | Next | M |
 | [`SEC-13`](specs/sec-13.md) | Check the staging file pushed to main | Now | S |
 | [`SEC-14`](specs/sec-14.md) | Connector passwords cannot be stolen by re-pointing a connector | Now | M |
