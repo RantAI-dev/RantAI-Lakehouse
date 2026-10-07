@@ -179,6 +179,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
+    // Column profile: aggregates over the asset's rows (a `max` IS a value),
+    // so it needs the same `query:read` as running that SELECT yourself —
+    // and goes through the same policy rewrite (`routes::catalog_profile`).
+    ("GET", "/api/catalog/{id}/profile", Policy::RequiresPermission("query:read")),
+    // More sample rows than the detail body carries: rows are data.
+    ("GET", "/api/catalog/{id}/sample", Policy::RequiresPermission("query:read")),
 
     // ── Catalog annotations (WS2 §13): console-only owner/steward/tags/
     //    description. PUT reuses the already-seeded `catalog:write`
@@ -186,6 +192,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    permission string, no grant migration (WS2 plan review W8). ─────
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
+
+    // ── Semantic layer (AI-16): plain-words descriptions of tables and
+    //    columns, read by the Copilot's DATA MAP. The same two permissions
+    //    as the annotations above. ───────────────────────────────────────
+    ("GET", "/api/semantic", Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:read")),
+    ("PUT", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:write")),
 
     // ── Access requests (WS7 item E2/E3): anyone who can see a catalog
     //    entry may request more access to it; `access:approve` (minted by
@@ -242,12 +255,26 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // WS7 item A5: only someone who could actually save the policy may
     // preview its effect.
     ("POST", "/api/governance/policies/preview", Policy::RequiresPermission("policy:write")),
+    // Enforcing, stopping or removing a policy is as much authoring it as
+    // creating it is.
+    ("PUT", "/api/governance/policies/{id}/status", Policy::RequiresPermission("policy:write")),
+    ("DELETE", "/api/governance/policies/{id}", Policy::RequiresPermission("policy:write")),
     // WS5 item E1 (Y6): per-table freshness SLA. `governance:write` is the
     // existing grant `0030_table_maintenance_policy.sql` already gives the
     // `Governance Admin` role (not re-granted here) — same permission the
     // Iceberg maintenance write above uses.
     ("GET",  "/api/governance/sla",       Policy::RequiresPermission("policy:read")),
     ("PUT",  "/api/governance/sla",       Policy::RequiresPermission("governance:write")),
+    // Taking a target or a classification back is the same decision as
+    // setting one.
+    ("DELETE", "/api/governance/sla/{table}", Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/classification/{id}", Policy::RequiresPermission("governance:write")),
+    // Running a rule reads the table it names, so it takes what reading
+    // that table takes — the same grant as the column profile.
+    ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
+    // Rewriting or removing a rule is a governance decision, like setting an SLA.
+    ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
     ("POST", "/api/governance/{kind}",    Policy::RequiresAuth),
 
@@ -419,9 +446,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
-    ("POST", "/api/agent/ask",           Policy::RequiresAuth),
-    ("POST", "/api/agent/query",         Policy::RequiresAuth),
-    ("POST", "/api/agent/text-to-sql",   Policy::RequiresAuth),
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
     ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
@@ -452,6 +476,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    Admin's `*:*` grants either today; see the module doc comment. ───
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
+    ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
@@ -489,6 +514,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // on a route that was simply never added here. See
     // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
     ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
+    // The console's edit page: name/direction/environment/residency/host.
+    // Type, tenant, credential and dial each keep their own route.
+    ("PATCH", "/api/connectors/{id}",       Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
     // Same tier as `GET /api/connectors/{id}`: probe history is read-only
     // and carries nothing more sensitive than the `/test` route's own
@@ -500,6 +528,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // surface `/test`/`/discover` already gate on `connector:manage`,
     // not a new, narrower permission.
     ("PUT",  "/api/connectors/{id}/secret", Policy::RequiresPermission("connector:manage")),
+    // ADR 0002 Addendum 4: the user-supplied credential write path — same
+    // permission as every other connector mutation (probe-first too, see
+    // `routes::connectors::set_credential`'s doc comment).
+    ("PUT",  "/api/connectors/{id}/credential", Policy::RequiresPermission("connector:manage")),
     // Reads a connector's live schema (tables/columns), same sensitivity
     // class as `/test` (opens a real, credentialed connection to the
     // connector's own target) — not a new permission, matching every
@@ -526,6 +558,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // a READER of `/ingestible`/`ingest-spec`, it never calls this route
     // itself (WS3 item 29).
     ("POST", "/api/connectors/{id}/ingest/run", Policy::RequiresPermission("connector:manage")),
+    // The connector's own ingest runs, read from Dagster: the same
+    // audience as the per-table results (`/api/governance/ingest-runs`)
+    // and the probe history above.
+    ("GET",  "/api/connectors/{id}/ingest/runs", Policy::RequiresPermission("connector:manage")),
     // The tenant-assignment route. `identity:
     // write`, not `connector:manage` — this is a governance decision about
     // WHO may see the row, the same permission every other tenant-
@@ -533,6 +569,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // above), not the broader "operate this connector" grant. Held today
     // only by Platform Admin's `*:*` (`0002_seed_identity.sql`).
     ("PUT", "/api/connectors/{id}/tenant", Policy::RequiresPermission("identity:write")),
+
+    // ── Uploaded files (ADR 0014, decision 6): the existing
+    //    `connector:manage`, no new permission and no role grant — bringing a
+    //    file in is the same authority as defining a source. Every
+    //    `/api/uploads/{id}*` route additionally answers 404 for an upload
+    //    outside the caller's tenants (`routes::uploads::
+    //    require_upload_in_tenants`, mounted in `routes::uploads_router`), so
+    //    this permission alone never reaches another tenant's files. ───────
+    ("GET",  "/api/uploads",                 Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads",                 Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}",            Policy::RequiresPermission("connector:manage")),
+    ("DELETE", "/api/uploads/{id}",          Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}/preview",    Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/ingest",     Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),

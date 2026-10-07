@@ -2,14 +2,11 @@
 static `ingest_job`/`run_ingest` op pair (mirrors `agent_runs.py`'s
 `agent_run_job`/`run_agent_employee` shape exactly: a static `@job`
 wrapping a `config_schema`-driven `@op`, never a job built per connector)
-plus `build_ingest_schedules`, which reads `GET /api/connectors/ingestible`
-at Dagster code-load time and builds one `ScheduleDefinition` per
-cron-scheduled, non-`cdc` connector -- all targeting the SAME static job
-with a DIFFERENT `run_config`, mirroring `agent_runs.py::build_agent_run_schedules`.
+plus `ingest_schedule_sensor`, which asks `GET /api/connectors/ingestible`
+which connectors came due since its last evaluation and launches the SAME
+static job for each, with a DIFFERENT `run_config`.
 
-No real network: `requests.get` is always monkeypatched (the real
-`_fetch_ingestible_connectors` degrades to `[]` on any failure -- see
-`test_agent_runs.py`'s equivalent tests for the same resilience shape).
+No real network: `requests.get` is always monkeypatched.
 No real SSRF/adapter/sink call: `_ADAPTERS`/`secret_resolver`/`sink_adapter`
 are monkeypatched per test, matching `test_adapters_sql.py`'s style of
 injecting fakes rather than touching a real driver.
@@ -25,70 +22,125 @@ import requests
 
 from dispar_orchestrate.adapters.kafka import BatchResult
 from dispar_orchestrate.adapters.sink import SinkResult
+from datetime import datetime, timedelta, timezone
+
+from dagster import DagsterInstance, build_sensor_context
+
 from dispar_orchestrate.ingest_factory import (
     IngestFactoryConfig,
     UnknownAdapter,
-    build_ingest_schedules,
+    _fetch_due_connectors,
+    _window_start,
+    due_run_requests,
+    ingest_schedule_sensor,
     run_kafka_stream_batch,
 )
 
 
-def test_build_ingest_schedules_returns_empty_when_api_is_unreachable(monkeypatch) -> None:
-    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
+@pytest.fixture(autouse=True)
+def _no_catalog_registration(monkeypatch):
+    """A successful load registers its table in the catalog through
+    ClickHouse (`connector_catalog.py`); no test here reaches a real one."""
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f.connector_catalog, "register_connector_table", lambda *a, **k: 0)
+
+
+UNTIL = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
+
+
+def _due(connector_id: str, adapter: str = "sql") -> dict:
+    return {"id": connector_id, "adapter": adapter, "scheduleCron": "0 2 * * *"}
+
+
+class _Resp:
+    def __init__(self, body) -> None:
+        self.body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self.body
+
+
+def test_due_run_requests_launch_the_one_static_job_per_due_connector() -> None:
+    requests_, skipped = due_run_requests([_due("conn-a"), _due("conn-b", "cdc"), _due("conn-c")], UNTIL, {"conn-c"})
+    # cdc streams through its own Debezium service: never launched here.
+    # conn-c's previous ingest is still going: skipped, not stacked.
+    assert [r.run_config for r in requests_] == [{"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}}]
+    assert skipped == ["conn-c"]
+    # The run key names the connector and the fire window, so evaluating
+    # the same window twice never launches twice.
+    assert requests_[0].run_key == "conn-a@2026-09-30T02:00:00+00:00"
+    assert requests_[0].tags["lakehouse/trigger"] == "schedule"
+
+
+def test_window_start_continues_from_the_cursor_within_the_catch_up_limit() -> None:
+    # First evaluation: only the current minute.
+    assert _window_start(None, UNTIL) == (UNTIL - timedelta(minutes=1), False)
+    assert _window_start("not a time", UNTIL) == (UNTIL - timedelta(minutes=1), False)
+    # A normal tick picks up exactly where the last one stopped.
+    previous = UNTIL - timedelta(minutes=3)
+    assert _window_start(previous.isoformat(), UNTIL) == (previous, False)
+    # After a long gap, only the last hour is caught up.
+    assert _window_start((UNTIL - timedelta(days=1)).isoformat(), UNTIL) == (UNTIL - timedelta(hours=1), True)
+
+
+def test_fetch_due_connectors_asks_for_the_window_and_refuses_a_non_list(monkeypatch) -> None:
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append((url, params, headers))
+        return _Resp([_due("conn-a")])
+
+    monkeypatch.setattr(requests, "get", fake_get)
     cfg = IngestFactoryConfig(api_url="http://x", service_token="t")
-    assert build_ingest_schedules(cfg) == []
-
-
-def test_build_ingest_schedules_returns_empty_when_token_is_unset() -> None:
-    cfg = IngestFactoryConfig(api_url="http://x", service_token="")
-    assert build_ingest_schedules(cfg) == []
-
-
-def test_build_ingest_schedules_skips_cdc_and_connectors_with_no_cron(monkeypatch) -> None:
-    connectors = [
-        {
-            "id": "conn-a",
-            "adapter": "sql",
-            "scheduleCron": "0 * * * *",
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_MYSQL_PASSWORD",
-            "secretRefSecondary": None,
-        },
-        {
-            "id": "conn-b",
-            "adapter": "cdc",
-            "scheduleCron": "0 * * * *",
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_PG_PASSWORD",
-            "secretRefSecondary": None,
-        },
-        {
-            "id": "conn-c",
-            "adapter": "sql",
-            "scheduleCron": None,
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_PG_PASSWORD",
-            "secretRefSecondary": None,
-        },
+    after = UNTIL - timedelta(minutes=1)
+    assert _fetch_due_connectors(cfg, after, UNTIL) == [_due("conn-a")]
+    assert calls == [
+        (
+            "http://x/api/connectors/ingestible",
+            {"dueAfter": "2026-09-30T01:59:00+00:00", "dueUntil": "2026-09-30T02:00:00+00:00"},
+            {"Authorization": "Bearer t"},
+        )
     ]
 
-    class _Resp:
-        def raise_for_status(self) -> None:
-            return None
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp({"error": "nope"}))
+    with pytest.raises(RuntimeError):
+        _fetch_due_connectors(cfg, after, UNTIL)
 
-        def json(self):
-            return connectors
 
-    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp())
-    cfg = IngestFactoryConfig(api_url="http://x", service_token="t")
-    schedules = build_ingest_schedules(cfg)
-    assert [s.name for s in schedules] == ["ingest_schedule__conn_a"]
-    # Every schedule targets the SAME static job, with a DIFFERENT
-    # run_config -- never a per-connector job (mirrors `agent_runs.py`).
-    assert schedules[0].job.name == "ingest_job"
+def test_sensor_skips_with_a_reason_when_the_token_is_unset(monkeypatch) -> None:
+    monkeypatch.delenv("INGEST_SERVICE_TOKEN", raising=False)
+    with DagsterInstance.ephemeral() as instance:
+        result = ingest_schedule_sensor(build_sensor_context(instance=instance))
+    assert "INGEST_SERVICE_TOKEN" in (result.skip_reason.skip_message or "")
+
+
+def test_sensor_launches_due_connectors_and_moves_its_cursor(monkeypatch) -> None:
+    monkeypatch.setenv("INGEST_SERVICE_TOKEN", "t")
+    asked = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        asked.append(params)
+        return _Resp([_due("conn-a")])
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with DagsterInstance.ephemeral() as instance:
+        result = ingest_schedule_sensor(build_sensor_context(instance=instance))
+    assert [r.run_config["ops"]["run_ingest"]["config"]["connector_id"] for r in result.run_requests] == ["conn-a"]
+    # The cursor is the window's end: the next tick starts there.
+    assert result.cursor == asked[0]["dueUntil"]
+
+
+def test_sensor_fails_the_tick_when_the_api_cannot_answer(monkeypatch) -> None:
+    # A failed tick is visible in Dagster and keeps the cursor, so the
+    # same window is asked again -- a schedule is never silently lost.
+    monkeypatch.setenv("INGEST_SERVICE_TOKEN", "t")
+    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
+    with DagsterInstance.ephemeral() as instance, pytest.raises(requests.ConnectionError):
+        ingest_schedule_sensor(build_sensor_context(instance=instance))
 
 
 def test_run_one_object_resolves_secrets_via_the_allowlisted_resolver(monkeypatch) -> None:
@@ -224,8 +276,11 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
         from_dial_calls.append((dial, secrets, source_objects))
         return _StubCfg()
 
-    def fake_run_bronze_ingest(cfg):
+    plans = []
+
+    def fake_run_bronze_ingest(cfg, plan):
         assert isinstance(cfg, _StubCfg)
+        plans.append(plan)
         return {"rows": 42, "bronze_table_name": "orders", "source_schema": "public", "source_table": "orders"}
 
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(fake_from_dial))
@@ -265,6 +320,49 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     assert from_dial_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
     assert recorded[0]["status"] == "succeeded"
     assert recorded[0]["rows"] == 42
+    # A source object saved before load modes existed replaces: its next
+    # run leaves one copy of the table, not one more.
+    assert plans == [f.LoadPlan(mode="replace")]
+
+    f._run_one_object(connector, {**obj, "loadMode": "incremental", "incrementalKey": "order_id"})
+    assert plans[1] == f.LoadPlan(mode="incremental", cursor="order_id")
+
+
+def test_load_plan_offers_incremental_to_sql_connectors_only() -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    obj = {"name": "orders", "target": "orders", "loadMode": "incremental", "incrementalKey": "updated_at"}
+    assert f._load_plan("sql", obj) == f.LoadPlan(mode="incremental", cursor="updated_at")
+    assert f._load_plan("rest", {"name": "orders", "target": "orders", "loadMode": "append"}) == f.LoadPlan(mode="append")
+    with pytest.raises(f.UnsupportedLoadMode):
+        f._load_plan("rest", obj)
+
+
+def test_run_one_object_records_an_unrunnable_load_mode_as_rejected(monkeypatch) -> None:
+    """A mode this build cannot run as written is a rejection the run
+    history shows with its reason, and nothing is dialed or loaded."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(
+        f.dlt_pipeline,
+        "run_bronze_ingest",
+        lambda cfg, plan: (_ for _ in ()).throw(AssertionError("must not load")),
+    )
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "db.internal", "port": 5432, "database": "d", "user": "u"},
+        "secretRef": "env:CONNECTOR_PG_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    with pytest.raises(f.UnsupportedLoadMode):
+        # Incremental with no cursor column.
+        f._run_one_object(connector, {"name": "public.orders", "target": "orders", "loadMode": "incremental"})
+    assert recorded[0]["status"] == "rejected"
+    assert "incrementalKey" in recorded[0]["error"]
 
 
 def test_run_one_object_routes_an_oracle_driver_sql_connector_through_the_oracle_adapter(monkeypatch) -> None:
@@ -600,6 +698,103 @@ def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monke
     assert recorded[0]["rows"] == 1  # the real SinkResult.rows count, never fabricated
 
 
+def _stub_stream_batch(monkeypatch, *, rows, sink) -> list:
+    """A micro-batch of `rows` whose sink write is `sink`; returns the list
+    the catalog registrations are collected in."""
+    import dispar_orchestrate.ingest_factory as f
+
+    registered: list = []
+    monkeypatch.setattr(f, "consume_one_batch", lambda *a, **k: BatchResult(rows=rows, offsets_to_commit={0: 5}))
+    monkeypatch.setattr(f, "load_via_sink", sink)
+    monkeypatch.setattr(f, "record_ingest_offset", lambda *a, **k: None)
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
+    monkeypatch.setattr(
+        f.connector_catalog, "register_connector_table", lambda connector_id, obj: registered.append((connector_id, obj))
+    )
+    return registered
+
+
+def test_stream_batch_registers_its_bronze_table_in_the_catalog(monkeypatch) -> None:
+    """A topic's Bronze table gets the Catalog entry every batch adapter's
+    table gets. The source object's own name is used when it has one, the
+    topic otherwise."""
+    registered = _stub_stream_batch(
+        monkeypatch,
+        rows=[{"id": 1}],
+        sink=lambda *a, **k: SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok"),
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders.v1", "target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    assert registered == [
+        ("conn-x", {"name": "orders", "target": "kafka_orders"}),
+        ("conn-x", {"name": "orders.v1", "target": "kafka_orders"}),
+    ]
+
+
+def test_stream_batch_registers_nothing_when_nothing_was_loaded(monkeypatch) -> None:
+    # An empty poll wrote nothing; a failed sink write wrote nothing.
+    registered = _stub_stream_batch(
+        monkeypatch, rows=[], sink=lambda *a, **k: SinkResult(rows=0, has_failed_jobs=False, load_info_str="ok")
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    registered = _stub_stream_batch(
+        monkeypatch, rows=[{"id": 1}], sink=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sink unavailable"))
+    )
+    with pytest.raises(RuntimeError):
+        run_kafka_stream_batch(
+            connector_id="conn-x",
+            spec={"topic": "orders"},
+            secrets={},
+            source_objects=[{"target": "kafka_orders"}],
+            consumer=_FakeStreamConsumer(),
+        )
+    assert registered == []
+
+
+def test_stream_batch_still_succeeds_when_the_catalog_cannot_be_reached(monkeypatch) -> None:
+    # The rows are in Bronze and the offsets are committed either way: a
+    # Catalog failure is reported, never raised into a failed run.
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_stream_batch(
+        monkeypatch,
+        rows=[{"id": 1}],
+        sink=lambda *a, **k: SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok"),
+    )
+    monkeypatch.setattr(
+        f.connector_catalog,
+        "register_connector_table",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("clickhouse down")),
+    )
+    consumer = _FakeStreamConsumer()
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=consumer,
+    )
+    assert len(consumer.commits) == 1
+
+
 def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monkeypatch) -> None:
     committed = []
     recorded = []
@@ -752,6 +947,59 @@ def test_an_unknown_kafka_auth_type_is_refused_by_name_without_echoing_secrets()
     assert "not-a-real-secret" not in str(exc.value)
 
 
+def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+    registered = []
+    monkeypatch.setattr(
+        f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
+    )
+
+    connector = {
+        "id": "conn-northwind",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "192.168.18.205", "port": 55432, "database": "northwind", "user": "u"},
+        "secretRef": "file:/run/secrets/connector_managed_conn_northwind_password",
+        "secretRefSecondary": None,
+    }
+    obj = {"name": "public.orders", "target": "northwind_orders"}
+    f._run_one_object(connector, obj)
+
+    assert registered == [("conn-northwind", obj)]
+
+
+def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkeypatch, capsys) -> None:
+    """The data is already in Bronze and recorded as succeeded; only its
+    Catalog entry is missing, and that is reported, not raised."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+
+    def _broken(*a, **k):
+        raise RuntimeError("clickhouse is down")
+
+    monkeypatch.setattr(f.connector_catalog, "register_connector_table", _broken)
+
+    connector = {
+        "id": "conn-northwind",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "192.168.18.205", "port": 55432, "database": "northwind", "user": "u"},
+        "secretRef": "file:/run/secrets/connector_managed_conn_northwind_password",
+        "secretRefSecondary": None,
+    }
+    f._run_one_object(connector, {"name": "public.orders", "target": "northwind_orders"})
+
+    assert [r["status"] for r in recorded] == ["succeeded"]
+    assert "could not be registered in the catalog: clickhouse is down" in capsys.readouterr().out
+
 
 def test_run_ingest_reports_each_objects_measured_rows_as_a_materialization(monkeypatch) -> None:
     # PART B of `parts/1b-dagster-one-op-per-unit-and-retries.md`: the
@@ -891,7 +1139,7 @@ def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monk
     monkeypatch.setitem(f._ADAPTERS, "sql", _FakeAdapter())
     monkeypatch.setattr(f, "_host_of", lambda dial: None)
 
-    def fake_load(source, target, sink_config):
+    def fake_load(source, target, sink_config, plan):
         return _FakeOutcome(rows=42)
 
     # `load_via_sink` is referenced inside `_run_one_object` as

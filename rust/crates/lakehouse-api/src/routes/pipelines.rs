@@ -31,7 +31,7 @@ use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
-use crate::routes::support::js_error;
+use crate::routes::support::{extract_json_object, js_error};
 use crate::state::AppState;
 
 use crate::tenant::TENANT_OWNER;
@@ -2637,6 +2637,11 @@ pub async fn run_finished_event(
         )
         .into());
     }
+    // ADR 0015: a finished run may have changed a table's columns; look, whatever job it was.
+    crate::routes::schema_versions::spawn_pass(&state);
+    // AI-16: a run that loaded a new table is the moment its description is
+    // missing; the pass skips tables that already have one.
+    crate::routes::ai::semantic::spawn_pass(&state);
     let req: RunFailedBody = parse_body(&body)?;
     let pool = pool(&state)?;
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
@@ -2860,6 +2865,11 @@ pub struct CreatePipelineBody {
     /// write happens — same posture as `transforms` above.
     #[serde(default)]
     depends_on: Vec<String>,
+    /// The connector this pipeline reads from (the console sends it from
+    /// the connector drawer's "Create pipeline" and the create form's
+    /// connector picker). Must be a connector in the creator's tenant.
+    #[serde(default)]
+    connector_id: Option<String>,
 }
 
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
@@ -2935,6 +2945,13 @@ pub async fn create(
         &others,
         &dagster_jobs,
     )?;
+    let connector_id = body
+        .connector_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    if let Some(connector_id) = connector_id.as_deref() {
+        require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
+    }
     let input = CreatePipelineInput {
         name: body.name,
         kind: body.kind,
@@ -2951,6 +2968,7 @@ pub async fn create(
         max_retries: body.max_retries,
         tenant_id,
         depends_on: body.depends_on,
+        connector_id,
         id: Some(id),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
@@ -2968,6 +2986,25 @@ pub async fn create(
     )
     .await;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// A pipeline may only read from a connector its own tenant owns. An
+/// unknown id, another tenant's connector and an unassigned one get the
+/// same answer, so this is no oracle for which connector ids exist. A
+/// creator in no tenant owns no connector, so it cannot name one.
+async fn require_connector_in_tenant(
+    pool: &PgPool,
+    connector_id: &str,
+    tenant_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let connector = lakehouse_store::connectors::get_connector(pool, connector_id).await?;
+    let tenant = tenant_id.map(|t| t.to_string());
+    match (connector, tenant) {
+        (Some(c), Some(tenant)) if c.tenant_id.as_deref() == Some(tenant.as_str()) => Ok(()),
+        _ => Err(ApiError::BadRequest(format!(
+            "connector {connector_id} is not a connector in your tenant"
+        ))),
+    }
 }
 
 /// Create a pipeline, turning a name collision into a sentence that says
@@ -3120,6 +3157,7 @@ pub async fn generate(
         // table schema, never the chain semantics — those are an
         // author's deliberate call, not an LLM's. R3 plan 2a.
         depends_on: Vec::new(),
+        connector_id: None,
         // `generate` never ran `validate_depends_on` (the comment above)
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
@@ -3223,14 +3261,6 @@ async fn llm_pipeline_draft(
         .map(|n| derive_pipeline_name(&n))
         .filter(|n| n != "agentic_pipeline");
     Some(draft)
-}
-
-/// The outermost `{...}` in a reply, so a model that wraps its JSON in
-/// prose or a code fence is still understood.
-fn extract_json_object(reply: &str) -> Option<&str> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    (end > start).then(|| &reply[start..=end])
 }
 
 /// The transitions `POST /api/pipelines/{id}/status` permits, checked
@@ -4166,6 +4196,20 @@ mod tests {
         }
     }
 
+    /// `0002_seed_identity.sql`'s first tenant, present in every
+    /// `#[sqlx::test]` database (the full migrations directory runs).
+    pub(super) const SEED_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+    /// [`fixture_user_principal`], as a member of [`SEED_TENANT`] — what
+    /// `create` needs: a pipeline is always created inside its author's
+    /// tenant.
+    pub(super) fn fixture_member_principal() -> Principal {
+        Principal {
+            tenant_ids: vec![SEED_TENANT.parse().unwrap()],
+            ..fixture_user_principal()
+        }
+    }
+
     /// A service-token principal — `PrincipalId::Service`.
     fn fixture_service_principal() -> Principal {
         Principal {
@@ -5093,6 +5137,97 @@ mod tests {
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
+        }
+
+        fn create_body(extra: &Value) -> Bytes {
+            let mut body = json!({
+                "name": format!("tenant-route-test-{}", uuid::Uuid::new_v4()),
+                "kind": "batch",
+                "sourceZone": "bronze",
+                "sourceTable": "t",
+                "transforms": [],
+                "targetZone": "silver",
+                "targetTable": "t",
+                "schedule": "manual",
+            });
+            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                body.extend(extra.clone());
+            }
+            Bytes::from(serde_json::to_vec(&body).expect("serialize"))
+        }
+
+        /// A console-created pipeline lands in its author's tenant and
+        /// keeps the connector it was created from. Before, both were
+        /// dropped: the pipeline was saved (the toast said so) but `list`,
+        /// which shows only the caller's tenant, never returned it, and the
+        /// connector could be deleted from under it.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_stores_the_authors_tenant_and_the_connector(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let (_, ApiJson(created)) = create(
+                State(state.clone()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({ "connectorId": "conn-pg-lakehouse" })),
+            )
+            .await
+            .expect("create should succeed");
+
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                    all_tenants: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed.iter().any(|p| p.id == created.id),
+                "must be listed for its tenant"
+            );
+            let dependents =
+                lakehouse_store::connectors::dependent_pipelines(&pool, "conn-pg-lakehouse")
+                    .await
+                    .unwrap();
+            assert!(
+                dependents.iter().any(|d| d.id == created.id),
+                "must depend on its connector"
+            );
+        }
+
+        /// A connector outside the author's tenant (here: one that does not
+        /// exist) is refused, and nothing is stored.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_connector_outside_the_tenant(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({ "connectorId": "conn-does-not-exist" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), 400);
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                    all_tenants: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|p| !p.name.starts_with("tenant-route-test-"))
+            );
         }
 
         #[sqlx::test(migrations = "../../migrations")]

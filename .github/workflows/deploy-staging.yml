@@ -20,6 +20,20 @@ jobs:
       url: http://localhost:3000
 
     steps:
+      # Self-hosted runner defense: compose services that bind-mount
+      # this repo (the `ops/*` test runners) execute as container root,
+      # and a single root-owned file `git clean -ffdx` cannot unlink
+      # fails THIS step with EACCES — even though the write happened
+      # during the PREVIOUS deploy, so the named step looks innocent.
+      # Reclaim ownership before checkout; the runner has no
+      # passwordless sudo, but its docker access is equivalent power
+      # for a chown. Compose-side prevention (PYTHONDONTWRITEBYTECODE
+      # on the ops/* runners) stops the known writer; this catches any
+      # future one. Fails loudly on purpose — a docker daemon that is
+      # down would kill the compose step later anyway.
+      - name: Reclaim root-owned workspace leftovers
+        run: docker run --rm -v "${{ github.workspace }}:/ws" alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -30,6 +44,21 @@ jobs:
         run: |
           cp .env.example .env
           cat .env.staging >> .env
+          # Paid provider credential, kept OUT of the repo (this repo is
+          # public): inject it as the ONLY LLM_KEY= line in the file.
+          # .env.example ships an empty `LLM_KEY=` too; compose resolves
+          # a duplicated .env key last-wins, but the line must actually
+          # START a line — .env.staging historically ended without a
+          # trailing newline, so a naive append glued LLM_KEY= onto its
+          # final comment line and compose never saw the key (container
+          # booted with LLM_KEY empty while the file held the real one;
+          # that silent 503 cost a full deploy run to notice). Delete
+          # existing LLM_KEY= lines, then force a leading newline:
+          # exactly one line, always its own line. Unset secret -> that
+          # single line is empty -> AI chat / agent / text-to-SQL keep
+          # degrading to 503, never a broken deploy.
+          sed -i '/^LLM_KEY=/d' .env
+          printf '\nLLM_KEY=%s\n' "${{ secrets.LLM_KEY }}" >> .env
           echo "=== staging .env ready ==="
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
@@ -63,6 +92,16 @@ jobs:
           done
           echo "::error::lakehouse-api did not become healthy"
           exit 1
+
+      # Postgres gets its 20 migrations from the API entrypoint, but
+      # ClickHouse has no equivalent - without this step every analytics
+      # page (and the builtin BI dashboards) query tables that don't
+      # exist yet, e.g. `serving.mart_wisman` -> UNKNOWN_TABLE.
+      # Idempotent: all objects are IF NOT EXISTS + TRUNCATE (demo data
+      # is refreshed on each deploy by design).
+      - name: Seed ClickHouse demo data
+        working-directory: ${{ github.workspace }}
+        run: scripts/seed-clickhouse.sh
 
       - name: Build frontend image
         working-directory: ${{ github.workspace }}

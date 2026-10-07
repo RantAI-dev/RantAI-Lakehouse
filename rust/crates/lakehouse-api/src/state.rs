@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
 use crate::config::Config;
+use crate::connector_secret_store::ConnectorSecretStore;
 use crate::gold_lock::MartLocks;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
@@ -108,6 +109,12 @@ pub struct AppState {
     /// external-provider implementation swaps in (still allowlisted)
     /// without changing this field's type or any reader of it.
     pub connector_secret_resolver: Arc<dyn DynSecretResolver>,
+    /// Writes the credential files behind `managed` connector refs (ADR
+    /// 0002 Addendum 4) — see [`crate::connector_secret_store`]. Rooted at
+    /// [`CONNECTOR_SECRETS_DIR`], the same directory
+    /// [`Self::connector_secret_resolver`]'s `file:` half reads, so a value
+    /// written here is the value the next probe or ingest resolves.
+    pub connector_secret_store: Arc<ConnectorSecretStore>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
     /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
@@ -296,6 +303,13 @@ impl PolicyDecisionLatencies {
     }
 }
 
+/// The fixed Docker/Compose secrets mount connector credentials live
+/// under: read by the `file:` resolver, written by
+/// [`crate::connector_secret_store`] for `managed` refs. `docker-compose.yml`
+/// mounts the `connector_secrets` volume here (writable for this service,
+/// read-only for `dagster-code-location`).
+pub const CONNECTOR_SECRETS_DIR: &str = "/run/secrets";
+
 /// The credential-suffix `secretRef` PATTERNS (see
 /// [`lakehouse_core::secret::pattern_matches`])
 /// [`AppState::connector_secret_resolver`] may resolve — see that field's
@@ -366,16 +380,37 @@ pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 7] = [
 struct ConnectorSecretResolver {
     env: EnvSecretResolver,
     file: FileSecretResolver,
+    /// Where `file:/run/secrets/...` refs are read from
+    /// (`Config::connector_secrets_dir`).
+    dir: std::path::PathBuf,
 }
 
 impl ConnectorSecretResolver {
-    fn new(env: EnvSecretResolver) -> Self {
+    fn new(env: EnvSecretResolver, dir: &std::path::Path) -> Self {
         Self {
             env,
-            // `/run/secrets` is the fixed Docker/Compose secrets mount this
-            // deployment uses — see `FileSecretResolver`'s doc comment for
-            // why a fixed base directory (not caller-supplied) matters.
-            file: FileSecretResolver::new("/run/secrets"),
+            // A fixed base directory, never caller-supplied — see
+            // `FileSecretResolver`'s doc comment for why that matters.
+            file: FileSecretResolver::new(dir),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// `secret_ref` with its `/run/secrets/` path moved to [`Self::dir`]
+    /// when the two differ. Refs name `/run/secrets` because that is where
+    /// Dagster reads them; the API may keep the same files elsewhere.
+    fn located(&self, secret_ref: &str) -> String {
+        let logical = format!(
+            "{}{CONNECTOR_SECRETS_DIR}/",
+            lakehouse_core::secret::FILE_SECRET_REF_PREFIX
+        );
+        match secret_ref.strip_prefix(&logical) {
+            Some(name) if self.dir != std::path::Path::new(CONNECTOR_SECRETS_DIR) => format!(
+                "{}{}",
+                lakehouse_core::secret::FILE_SECRET_REF_PREFIX,
+                self.dir.join(name).display()
+            ),
+            _ => secret_ref.to_owned(),
         }
     }
 }
@@ -385,7 +420,7 @@ impl SecretResolver for ConnectorSecretResolver {
         if secret_ref.starts_with(lakehouse_core::secret::ENV_SECRET_REF_PREFIX) {
             self.env.resolve(secret_ref).await
         } else if secret_ref.starts_with(lakehouse_core::secret::FILE_SECRET_REF_PREFIX) {
-            self.file.resolve(secret_ref).await
+            self.file.resolve(&self.located(secret_ref)).await
         } else {
             Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -396,16 +431,20 @@ impl SecretResolver for ConnectorSecretResolver {
 }
 
 /// The allowlisted connector secret resolver [`AppState::new`] installs,
-/// over `env` (the real process environment in production).
+/// over `env` (the real process environment in production) and the
+/// connector secrets directory `dir`.
 ///
 /// A function of its own so the allowlist test can pass an explicit, empty
 /// environment: `sqlx::test`'s harness calls `dotenvy::var`, which loads
 /// the nearest `.env` into the process environment, so on a developer
 /// machine whose `.env` sets `CONNECTOR_*` the real environment made that
 /// test fail whenever a database test had run first in the same process.
-fn connector_secret_resolver(env: EnvSecretResolver) -> Arc<dyn DynSecretResolver> {
+fn connector_secret_resolver(
+    env: EnvSecretResolver,
+    dir: &std::path::Path,
+) -> Arc<dyn DynSecretResolver> {
     Arc::new(AllowlistedSecretResolver::new(
-        ConnectorSecretResolver::new(env),
+        ConnectorSecretResolver::new(env, dir),
         CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
             .iter()
             .map(|s| (*s).to_owned()),
@@ -530,6 +569,7 @@ impl AppState {
             &config.lakekeeper_base_url,
         )
         .map(Arc::new);
+        let secrets_dir = config.connector_secrets_dir.clone();
         let throttle_policy = ThrottlePolicy {
             max_failures: config.login_max_failures,
             window: Duration::seconds(i64::from(config.login_failure_window_secs)),
@@ -542,7 +582,11 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
-            connector_secret_resolver: connector_secret_resolver(EnvSecretResolver::new()),
+            connector_secret_resolver: connector_secret_resolver(
+                EnvSecretResolver::new(),
+                &secrets_dir,
+            ),
+            connector_secret_store: Arc::new(ConnectorSecretStore::new(secrets_dir)),
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
@@ -565,6 +609,32 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// `CONNECTOR_SECRETS_DIR`: a `file:/run/secrets/...` ref is read from
+    /// wherever the API keeps the files, while the ref itself (what Dagster
+    /// reads, inside its container) keeps naming `/run/secrets`.
+    #[tokio::test]
+    async fn connector_secrets_are_read_from_the_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("connector_managed_conn_x_password"), "pw\n").unwrap();
+        let resolver = ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path());
+        let value = resolver
+            .resolve("file:/run/secrets/connector_managed_conn_x_password")
+            .await
+            .unwrap();
+        assert_eq!(value.expose_secret(), "pw");
+    }
+
+    /// The default directory leaves every ref exactly as written.
+    #[test]
+    fn the_default_secrets_directory_leaves_refs_unchanged() {
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            std::path::Path::new(CONNECTOR_SECRETS_DIR),
+        );
+        let secret_ref = "file:/run/secrets/connector_managed_conn_x_password";
+        assert_eq!(resolver.located(secret_ref), secret_ref);
+    }
 
     // ── WS7 item C2: `policyDecisionP95Ms` is a real measurement ────────
 
@@ -649,6 +719,7 @@ mod tests {
         // resolver chain `AppState::new` installs.
         let resolver = super::connector_secret_resolver(
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::new()),
+            std::path::Path::new(CONNECTOR_SECRETS_DIR),
         );
 
         for admitted in [

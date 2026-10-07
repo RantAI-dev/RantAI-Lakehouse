@@ -474,6 +474,132 @@ erasing every author-wired upstream in one round trip. The route-level
 pair (`routes::authored_pipelines::update`) proves both directions
 against a real `sqlx::test` Postgres.
 
+### Uploaded files (DATA-9, ADR 0014)
+
+A person uploads a CSV or TSV file from the console (`/connectors/upload`);
+the API stores it, and a Dagster run (`file_ingest_job`) loads it into a raw
+Iceberg table. What that asks of the operator:
+
+- **The files are kept and they grow the bucket.** Each original file is
+  stored in the warehouse bucket (`LAKEHOUSE_WAREHOUSE_BUCKET`, default
+  `lakehouse-warehouse`) under `uploads/<tenant id>/<upload id>`, with a short
+  extension when the file name had one. It stays until someone deletes the
+  upload from "Uploaded files"; deleting an upload removes the file and its
+  entry, never the table it became. Nothing else removes them: there is no
+  expiry and no quota, so storage grows with every upload (up to 50 MB each).
+- **The API needs a storage credential, and nothing else.** On the compose
+  stack the `lakehouse-api` service passes the three settings the upload
+  store and the RustFS health probe read. You set two: `UPLOAD_S3_ACCESS_KEY`
+  and `UPLOAD_S3_SECRET_KEY`, dedicated names that are never RustFS's own
+  `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (ADR 0002 Addendum 2) and have no
+  default. `CH_RUSTFS_S3_ENDPOINT` (default `http://rustfs:9000`),
+  `RUSTFS_ACCESS_KEY_SECRET_REF` (default `env:UPLOAD_S3_ACCESS_KEY`) and
+  `RUSTFS_SECRET_KEY_SECRET_REF` (default `env:UPLOAD_S3_SECRET_KEY`) only
+  need setting to override those defaults. Left empty, `POST /api/uploads`
+  answers 503 "Upload storage is not configured.", nothing is stored, and
+  the RustFS health tile reads "unknown". The API container takes its
+  endpoint from `CH_RUSTFS_S3_ENDPOINT`, not from the host-facing
+  `RUSTFS_S3_ENDPOINT` of `.env`.
+  Least privilege: the credential needs read, write and delete on the
+  warehouse bucket's `uploads/` prefix and nothing else of the API's; where
+  your store supports per-prefix policies, restrict it to that prefix, and
+  otherwise to the warehouse bucket. The RustFS health probe lists the
+  bucket root (`client.list_with_delimiter(None)`), so a credential limited
+  to `uploads/` can store files but would show that tile as failing; that is
+  the cost of the narrower grant, not a fault. Whether the pinned RustFS can mint
+  such an identity is the open question the `CONNECTOR_S3_*` note in
+  `.env.example` records; for a throwaway local stack you may set the two
+  to the same value as `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`. A
+  `docker compose up` with these settings was not run for this document.
+- **`ICEBERG_QUERY_DB` must be set**, because a load into a table name that
+  does not exist yet first asks ClickHouse whether the name is free. Compose
+  defaults it to `icecat_api`. Unset, the load is refused with 503 "Uploads
+  need ICEBERG_QUERY_DB to be set, so the API can check that a table name is
+  free. Nothing was loaded."
+- **The load needs the orchestrator.** `file_ingest_job` is registered in
+  the code location (`dispar_orchestrate.definitions`), which runs under the
+  `dagster` compose profile (see "Dagster (opt-in, P3)"). With the orchestrator
+  down, "Load" answers 503 "The orchestrator could not be reached, so the load
+  was not started." The job reads the stored file and writes the table
+  with the settings the code location already has for Bronze ingest; uploads
+  add no setting to `docker-compose.yml`, `.env.example` or `config.rs`
+  (`git diff 98aaa64 -- docker-compose.yml .env.example
+  rust/crates/lakehouse-api/src/config.rs` is empty on this branch).
+- **A reverse proxy in front of the console must allow a request body of at
+  least 51 MB** (the 50 MB file plus the multipart form around it; the API
+  accepts 50 MiB + 1 MiB on this one route and keeps axum's 2 MB default on
+  every other). `POST /api/uploads` has a five-minute request deadline, a
+  bound for a slow link and not a measurement. A 50 MB upload through the
+  console's `/api` rewrite and through a proxy was **not verified**.
+- **Who can use it.** `connector:manage` on every upload route (Data Engineer,
+  Platform Admin). No role was added or changed. In an install with several
+  tenants, an upload and its table name belong to the uploader's tenant; the
+  table appears in the shared catalog, which only the tenant that owns the
+  catalog sees.
+
+### Schema versions of Silver and Gold tables (ADR 0015)
+
+A raw table's page shows its schema versions from its Iceberg metadata. The
+analytics engine keeps only a table's current columns, so for a table in
+`silver` or `serving` (the two databases the catalog serves) the API records
+the versions itself, in a `ClickHouse` table it creates on first use:
+
+- **`console.table_schema_version`** holds `table_key` (`<database>.<table>`),
+  `version` (from 1), `columns` (a JSON array of `[name, type]` pairs in the
+  table's column order) and `observed_at` (`DateTime64(3, 'UTC')`), as a
+  `MergeTree` ordered by `(table_key, version)`. The DDL is owned by
+  `rust/crates/lakehouse-api/src/routes/schema_versions.rs`, like
+  `console.quality_run`; there is no `PostgreSQL` migration, and nothing
+  prunes it. A row is added only when a table's ordered `(name, type)` list
+  differs from the last one recorded for it.
+- **When it is recorded.** One pass reads every table's columns in `silver`
+  and in `serving` and compares them with the newest recorded list of each;
+  it is two reads and, when something changed, one `INSERT`. A pass runs when the API starts, on `POST /api/alerts/run`
+  (the orchestrator's `alerts_run_schedule`, every 15 minutes; the answer
+  carries `schemaPassStarted`), and when the orchestrator reports a finished
+  run (`POST /api/pipelines/events/run-finished`, from Dagster's
+  `pipeline_run_finished_sensor`, which needs `PIPELINE_RUN_TOKEN`). **An
+  install without the orchestrator records versions only at start-up**: a
+  table that changes later is not noticed until the API restarts. One pass
+  runs at a time; a start while one runs is refused, not queued.
+- **A failed pass changes nothing.** If the engine is not reachable (it may
+  not be yet when the API starts) the log line `schema versions: pass failed`
+  says so and the next trigger tries again. An answer from the engine that is
+  not a result (a `200` whose body is not `FORMAT JSON`, which `ClickHouse`
+  can send before failing mid-stream) counts as a failed read, never as an
+  empty store. The asset page reads the store only: a store that does not
+  exist yet, or any failed read, shows as "No schema version recorded yet".
+- **One API per engine is assumed.** One pass runs at a time within an API
+  process, not across processes: two APIs against one engine could each
+  record the same number for a table. The page folds two equal consecutive
+  versions into one.
+- **The page reads every version of a table, with no cap.** A table whose
+  columns differ at every look adds one row per look. It is not capped on
+  purpose: a cut list would label its oldest shown version "First recorded".
+- **At most 2,000 tables are looked at per pass**, the first by name; when
+  there are more, `schema versions: more tables than a pass looks at` is
+  logged with how many were left out.
+- **Limits to tell a customer.** Versions start the day this is deployed and
+  the first one is dated by the console's first look at the table, not by
+  the table's creation. A version's time is when the console saw the change,
+  up to one trigger after it; two changes between two looks are recorded as
+  one, and a change undone before the next look is not recorded. A renamed
+  column reads as one dropped and one added. Only the definition is kept,
+  not the rows. A table that is dropped records nothing, and its rows stay.
+- **Who can see it.** The versions are a field of the asset detail
+  (`GET /api/catalog/{id}`), behind that route's permission and tenant gate;
+  no route was added.
+- **What was run.** On the dev stack on 2026-10-05 (`ClickHouse` 26.8): the
+  pass at start-up recorded one version for each of the seven tables in
+  `silver` and `serving`; on a demo table an added column, a retyped plus a
+  dropped column and a moved column each gave the next version, a look with
+  nothing changed recorded nothing, and a column added before the
+  orchestrator's 15-minute schedule was recorded at that schedule. Before
+  that, the engine refused one statement the unit tests' fake engine had
+  accepted (the aliases of the newest-version read, `Code: 184`), which is
+  why that statement carries a test on its text. Not run: more than 2,000
+  tables, two APIs against one engine, an install without the orchestrator.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
@@ -491,9 +617,8 @@ against a real `sqlx::test` Postgres.
   opt-in `dagster` compose profile** (mirroring how P2 gated `seaweedfs`
   behind its own profile) — see "Dagster (opt-in, P3)" below and
   `docs/adr/0005-dagster-code-location-ownership-and-packaging.md`.
-- **A real LLM.** Needs a paid API key. AI chat / agent / text-to-SQL
-  routes return `503` without `LLM_KEY` (or `MINIMAX_API_KEY`) set to a
-  working key.
+- **A real LLM.** Needs a paid API key. AI chat routes return `503` without
+  `LLM_KEY` (or `MINIMAX_API_KEY`) set to a working key.
 
 See "Features unavailable locally," below, for the full list and how to
 turn each one on.
@@ -581,7 +706,7 @@ check.
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
-| AI chat / agent / text-to-SQL | LLM API key | `503` from `/api/ai/*`, `/api/agent/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
+| AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |

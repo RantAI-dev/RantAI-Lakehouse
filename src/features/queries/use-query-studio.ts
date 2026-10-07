@@ -7,8 +7,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { readDraft, writeDraft } from "@/lib/query-draft"
 import { hasStatement } from "@/lib/sql-text"
 import { assetService, queryService } from "@/services"
-import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-client"
-import type { QueryEngine, SaveQueryInput } from "@/services/contracts/queries"
+import type { NlAnswer, QueryEngine, SaveQueryInput } from "@/services/contracts/queries"
 
 /** What the editor holds before anyone types. */
 export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
@@ -79,6 +78,21 @@ export function useQueryStudio() {
   React.useEffect(() => {
     if (hydratedRef.current) return
     hydratedRef.current = true
+    // A `?sql=` link (e.g. an asset's "Open in Query Studio") names the
+    // query the user came here to run, so it wins over any stored draft.
+    // `?engine=` rides along because the SQL is only valid on the engine it
+    // was written for (e.g. `iceberg.bronze.*` names exist only on Trino).
+    // Read from `window.location`, like the `?saved=` handoff below, to
+    // avoid a `useSearchParams` Suspense boundary.
+    const params = new URLSearchParams(window.location.search)
+    const linkedSql = params.get("sql")
+    if (linkedSql && hasStatement(linkedSql)) {
+      setSql(linkedSql)
+      setTab("sql")
+      const linkedEngine = params.get("engine")
+      if (linkedEngine === "clickhouse" || linkedEngine === "trino") setEngine(linkedEngine)
+      return
+    }
     const draft = readDraft()
     if (!draft) return
     if (draft.sql) setSql(draft.sql)
@@ -139,22 +153,23 @@ export function useQueryStudio() {
     [saveAct, savedState]
   )
 
-  // Agentic ask: NL → generate SQL → run it → correct itself on error →
-  // explain the result. One button, the whole loop on the server
-  // (`/api/agent/query`).
+  // Agentic ask: one call to the chat's engine, which writes the SQL, runs
+  // it as the caller (masking and row filters apply), corrects itself on
+  // error and explains the result (`/api/ai/chat`).
   const [agentBusy, setAgentBusy] = React.useState(false)
-  const [agentResult, setAgentResult] = React.useState<AgentQueryResult | null>(null)
+  const [agentResult, setAgentResult] = React.useState<NlAnswer | null>(null)
   const [agentError, setAgentError] = React.useState<string | null>(null)
   const ask = React.useCallback(async () => {
     setAgentBusy(true)
     setAgentError(null)
     setAgentResult(null)
     try {
-      const out = await askAgentSql(question)
+      const out = await queryService.askQuestion(question)
       setAgentResult(out)
       // The final SQL goes into the editor so it can be reviewed and
-      // tweaked rather than taken on trust.
-      setSql(out.sql)
+      // tweaked rather than taken on trust. A reply with no SQL (the
+      // model ran none) leaves the editor as it was.
+      if (out.sql !== undefined) setSql(out.sql)
     } catch (e) {
       setAgentError(e instanceof Error ? e.message : String(e))
     } finally {

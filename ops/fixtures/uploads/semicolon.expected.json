@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "headerRow": 0,
+  "columns": ["sku", "price", "qty", "comment"],
+  "rows": [
+    ["A-1", "1,50", "10", "plain"],
+    ["A-2", "12,00", "3", "semi;colon inside"]
+  ]
+}

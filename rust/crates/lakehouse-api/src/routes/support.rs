@@ -104,6 +104,17 @@ pub(crate) fn js_error(err: impl Display) -> String {
     format!("Error: {err}")
 }
 
+/// The outermost `{...}` in a model's reply, so a model that wraps its JSON
+/// in prose or a code fence is still understood. Shared by every caller that
+/// asks the model for one JSON object (`pipelines::llm_pipeline_draft`, the
+/// semantic layer's drafting pass).
+#[must_use]
+pub(crate) fn extract_json_object(reply: &str) -> Option<&str> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    (end > start).then(|| &reply[start..=end])
+}
+
 /// `ClickHouse` type-name substrings treated as numeric, matching
 /// `/Int|Float|Decimal/` in `dashboard/fields/route.ts` (and reused,
 /// identically, by `ai-tools.ts`'s `describe_mart`/`suggest_dashboard`
@@ -341,6 +352,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn extract_json_object_returns_the_outermost_braces() {
+        assert_eq!(
+            extract_json_object("Sure!\n```json\n{\"a\": {\"b\": 1}}\n```\nDone."),
+            Some("{\"a\": {\"b\": 1}}")
+        );
+    }
+
+    #[test]
+    fn extract_json_object_is_none_without_a_pair_of_braces() {
+        assert_eq!(extract_json_object("no json here"), None);
+        assert_eq!(extract_json_object("} backwards {"), None);
+        assert_eq!(extract_json_object(""), None);
+    }
 
     fn point_spec(map: Option<&str>) -> store::ChartSpec {
         store::ChartSpec {

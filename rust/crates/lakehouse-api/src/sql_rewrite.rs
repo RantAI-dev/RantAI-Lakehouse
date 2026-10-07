@@ -216,10 +216,21 @@ fn collect_table_factor_name(
 /// are given (`lake.serving.mart_x` / Trino's `iceberg.serving.mart_x`
 /// both canonicalize to `serving.mart_x`) and leaving a bare one-part
 /// name as-is.
+///
+/// A quoted part containing a dot is split first. `ClickHouse`'s
+/// `DataLakeCatalog` engine exposes an Iceberg table as ONE identifier
+/// named `namespace.table` inside a catalog database —
+/// ``icecat_x.`bronze.orders` `` — which must reach the same key as the
+/// same table read through Trino (`iceberg.bronze.orders`), or a policy
+/// authored for `bronze.orders` would bind on one engine and silently not
+/// on the other. Splitting can only ever make a name MORE likely to match
+/// a governed key, never less: a governed table whose real columns then
+/// cannot be resolved is refused (`UnprovableSubstitution`), not passed.
 fn canonicalize(parts: &[String]) -> String {
+    let parts: Vec<&str> = parts.iter().flat_map(|p| p.split('.')).collect();
     match parts.len() {
         0 => String::new(),
-        1 => parts[0].clone(),
+        1 => parts[0].to_owned(),
         2 => parts.join("."),
         _ => parts[parts.len() - 2..].join("."),
     }
@@ -253,6 +264,22 @@ mod table_resolution {
                 tables.contains(&"serving.mart_x".to_owned()),
                 "sql={sql} tables={tables:?}"
             );
+        }
+    }
+
+    /// A `DataLakeCatalog` read and a Trino read of the same Iceberg
+    /// table must bind the same policy key.
+    #[test]
+    fn a_data_lake_catalog_table_canonicalizes_like_its_trino_name() {
+        for sql in [
+            "SELECT * FROM iceberg.bronze.orders",      // Trino
+            "SELECT * FROM icecat_api.`bronze.orders`", // ClickHouse DataLakeCatalog
+            "SELECT * FROM `icecat_api`.`bronze.orders`",
+            "SELECT * FROM `bronze.orders`", // unqualified, current database
+            "SELECT * FROM icecat_api.`Bronze.Orders`",
+        ] {
+            let tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+            assert_eq!(tables, vec!["bronze.orders".to_owned()], "sql={sql}");
         }
     }
 
@@ -2556,6 +2583,83 @@ mod enforce_tests {
         assert!(out.contains("replaceRegexpOne(toString(`email`)"));
     }
 
+    /// The bypass this closes: a policy on `silver.customers` must bind a
+    /// read of the same table through a `DataLakeCatalog` database.
+    #[test]
+    fn a_governed_table_read_through_a_data_lake_catalog_database_is_substituted() {
+        let src = FakeObligations { any: true };
+        let out = enforce(
+            "SELECT email FROM icecat_silver.`silver.customers`",
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &src,
+            &NoViews,
+        )
+        .unwrap();
+        assert!(
+            out.contains("replaceRegexpOne(toString(`email`)"),
+            "out={out}"
+        );
+        // The derived table still reads the physical DataLakeCatalog name.
+        assert!(
+            out.contains("icecat_silver.`silver.customers`"),
+            "out={out}"
+        );
+    }
+
+    /// Governed, but the real columns cannot be resolved (the usual case
+    /// for a `DataLakeCatalog` table today, which `system.columns` does not
+    /// list): refused, never passed through unmasked.
+    #[test]
+    fn a_governed_data_lake_catalog_table_with_unknown_columns_is_refused() {
+        struct NoColumns;
+        impl ObligationsSource for NoColumns {
+            fn obligations_for(&self, table: &str, _roles: &[String]) -> Option<TableObligations> {
+                (table == "bronze.orders").then(|| TableObligations {
+                    mask: vec!["email".to_owned()],
+                    row_filter: None,
+                    real_columns: None,
+                })
+            }
+
+            fn has_any_obligation(&self, _roles: &[String]) -> bool {
+                true
+            }
+        }
+        let err = enforce(
+            "SELECT * FROM icecat_maintenance.`bronze.orders`",
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &NoColumns,
+            &NoViews,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RewriteError::UnprovableSubstitution { ref table } if table == "bronze.orders"),
+            "err={err:?}"
+        );
+    }
+
+    /// An ungoverned Iceberg table stays queryable.
+    #[test]
+    fn an_ungoverned_data_lake_catalog_table_passes_through() {
+        let src = FakeObligations { any: true };
+        let sql = "SELECT * FROM icecat_maintenance.`bronze.orders`";
+        let out = enforce(
+            sql,
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &src,
+            &NoViews,
+        )
+        .unwrap();
+        assert!(out.contains("`bronze.orders`"), "out={out}");
+        assert!(!out.contains("replaceRegexpOne"), "out={out}");
+    }
+
     #[test]
     fn a_table_function_is_refused_even_with_no_governed_table_involved() {
         let src = FakeObligations { any: false };
@@ -2637,7 +2741,8 @@ mod parses_real_repository_query_shapes {
         // routes/ai/tools/data.rs, the dataset catalog UNION view.
         "SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
          UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`",
-        // routes/agent.rs schema_context's DESCRIBE call shape mirrored as a query.
+        // A column lookup in the shape the removed text-to-SQL schema
+        // context used for its DESCRIBE call, mirrored as a query.
         "SELECT name, type FROM system.columns WHERE database='serving'",
         // lakehouse-bi specs.rs's kpi_gci (backtick-qualified, two aggregates).
         "SELECT sum(data_tersedia) AS v, count() AS total FROM serving.mart_gci_readiness",

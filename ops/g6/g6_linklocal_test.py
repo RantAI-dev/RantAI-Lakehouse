@@ -45,6 +45,15 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 API = requests.Session()
+# The tenant this run's connectors are created in; set by `_ensure_tenant`.
+TENANT_ID = ""
+# The tenant that owns the seeded connectors this gate drives
+# (`conn-pg-lakehouse`; `rust/migrations/0042_tenant_provisioning.sql`
+# backfills the seeded connectors to the seed tenant `meridian-group`,
+# `0002_seed_identity.sql`). Per-connector routes answer only for a
+# connector in one of the caller's tenants, so the account must be a member
+# of this one, and the gate's own connectors are created in it too.
+GATE_TENANT_SLUG = "meridian-group"
 
 GATE_SECRETS_DIR = "/gate-secrets"
 FILE_REF_PREFIX = "file:/run/secrets/connector_"
@@ -70,6 +79,44 @@ def _login() -> None:
     if login.json().get("mustChangePassword"):
         API.post(f"{API_URL}/api/auth/change-password", json={"newPassword": AUTH_PASSWORD}, timeout=10)
         API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
+
+
+def _me_tenant_ids() -> list[str]:
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise SystemExit(f"[g6-linklocal] GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def _ensure_tenant() -> None:
+    """Make sure the logged-in account belongs to `GATE_TENANT_SLUG` and
+    remember its id for creating this run's connectors. A connector created
+    by an account with no tenant is stored with no tenant id and every
+    `/api/connectors/{id}/*` route then answers 404 for it. This gate uses
+    no seeded connector, but it joins the same tenant as
+    g6_ingest_matrix_test.py (`step_ensure_tenant`, whose docstring has the
+    reason) so the two agree; duplicated because they share no module.
+    Membership is read per request, so no new login."""
+    global TENANT_ID
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise SystemExit(f"[g6-linklocal] GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise SystemExit(f"[g6-linklocal] list tenants failed: {listed.status_code} {listed.text[:300]}")
+    gate_tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if gate_tenant is None:
+        raise SystemExit(f"[g6-linklocal] tenant {GATE_TENANT_SLUG!r} does not exist")
+    if gate_tenant["id"] not in _me_tenant_ids():
+        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{gate_tenant['id']}", timeout=10)
+        if not added.ok:
+            raise SystemExit(
+                f"[g6-linklocal] add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}"
+            )
+        if gate_tenant["id"] not in _me_tenant_ids():
+            raise SystemExit(f"[g6-linklocal] the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it")
+    TENANT_ID = gate_tenant["id"]
 
 
 def _assert_rejected(*, connector_id: str, label: str) -> None:
@@ -103,7 +150,7 @@ def step_rest_link_local() -> None:
         f"{API_URL}/api/connectors",
         json={"name": "g6-linklocal", "type": "REST API", "direction": "source", "host": "169.254.169.254",
               "credential": {"source": "file", "primary": "token"},
-              "environment": "production", "tenant": "g6", "residency": "", "capabilities": []},
+              "environment": "production", "tenant": "g6", "tenantId": TENANT_ID, "residency": "", "capabilities": []},
         timeout=10,
     )
     if not created.ok:
@@ -168,7 +215,7 @@ def step_kafka_spoofed_advertised_broker() -> None:
         f"{API_URL}/api/connectors",
         json={"name": "g6-kafka-spoofed", "type": "Kafka", "direction": "source", "host": "kafka-g6-spoofed:9092",
               "credential": {"source": "file", "primary": "token"},
-              "environment": "production", "tenant": "g6", "residency": "", "capabilities": []},
+              "environment": "production", "tenant": "g6", "tenantId": TENANT_ID, "residency": "", "capabilities": []},
         timeout=10,
     )
     if not created.ok:
@@ -226,6 +273,7 @@ def _wait_for_ingest_job(timeout_s: int = 120) -> None:
 
 def main() -> int:
     _login()
+    _ensure_tenant()
     try:
         _wait_for_ingest_job()
     except SystemExit as exc:

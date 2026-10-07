@@ -8,6 +8,7 @@ import {
   formatLagSeconds,
   formatPercent,
   formatRelativeTime,
+  formatTimeUntil,
   isPast,
   parseTimestamp,
 } from "./format"
@@ -28,6 +29,8 @@ test("formatCost / percent / lag / compact", () => {
   assert.equal(formatPercent(0.634), "63.4%")
   assert.equal(formatLagSeconds(8), "8 s")
   assert.equal(formatLagSeconds(125), "2m")
+  assert.equal(formatLagSeconds(36 * 3600), "36h 00m")
+  assert.equal(formatLagSeconds(194 * 3600 + 240), "8d 2h")
   assert.match(formatCompactNumber(1_234_567), /M|1\.2/)
 })
 
@@ -49,4 +52,14 @@ test("isPast membedakan jadwal yang sudah lewat dari yang akan datang", () => {
   // Tidak ada jadwal bukan berarti terlambat.
   assert.equal(isPast(null, now), false)
   assert.equal(isPast("bukan tanggal", now), false)
+})
+
+test("formatTimeUntil untuk jadwal ingest berikutnya", () => {
+  const now = Date.parse("2026-09-30T01:30:00Z")
+  assert.equal(formatTimeUntil("2026-09-30T01:34:10Z", now), "in 5m")
+  assert.equal(formatTimeUntil("2026-09-30T04:00:00Z", now), "in 2h")
+  assert.equal(formatTimeUntil("2026-10-02T02:00:00Z", now), "in 2d")
+  // Sudah lewat: run-nya sedang dimulai.
+  assert.equal(formatTimeUntil("2026-09-30T01:00:00Z", now), "now")
+  assert.equal(formatTimeUntil(null, now), "—")
 })

@@ -1,0 +1,9 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["name", "city"],
+  "rows": [
+    ["Ren\ufffd", "Z\ufffdrich"]
+  ]
+}

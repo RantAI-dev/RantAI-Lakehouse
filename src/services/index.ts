@@ -17,6 +17,7 @@ import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
+import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
 import * as authClient from "./clients/auth"
 
@@ -31,7 +32,8 @@ void mockAssetService
 // real Dagster mutations. mock/pipelines.ts has been deleted.
 export const pipelineService = dagsterPipelineService
 // Query Studio is now fully real — SQL execution, saved/history, and
-// generateSql all go through the Rust backend (ClickHouse + Postgres + LLM).
+// askQuestion/generateSql (the chat's engine, `/api/ai/chat`) all go through
+// the Rust backend (ClickHouse + Postgres + LLM).
 // mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
 // Agents is now fully real — employees/tools/workflows/runs/approvals
@@ -77,6 +79,12 @@ export const goldService = goldClientService
 // Postgres, honest `supported: false` when no pool is configured. No mock
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
+// Uploaded files (DATA-9, ADR 0014) — a delimited text file is stored in the
+// warehouse bucket, previewed, and loaded into a raw table by
+// `file_ingest_job`; rows live in Postgres, and the outcome of a load is read
+// back from `bronze_meta.ingest_run` by the API. Real from the start: no mock
+// ever existed for this domain.
+export const uploadService = uploadClientService
 // Home's per-user layout (cards and shortcuts, in order) over
 // `/api/home/layout`; honest `supported: false` when no Postgres pool is
 // configured. No mock ever existed for this domain.

@@ -34,8 +34,14 @@ from datetime import datetime, timezone
 import dlt
 from dlt.extract.resource import DltResource
 
+import pytest
+
+from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.adapters.sink import (
+    LoadPlan,
     SinkConfig,
+    UnsupportedLoadMode,
+    _apply_cursor,
     _extract_rows,
     _stamp_for_load,
     _stamp_ingested_at,
@@ -187,9 +193,17 @@ class _FakePipeline:
         self.materialized_rows: list[dict] = []
         self.last_trace = None
         self.run_source = None
+        self.write_disposition = None
+        # What an earlier incremental run would have left behind.
+        self.state: dict = {}
+        self.synced = False
 
-    def run(self, source, table_name, table_format):
+    def sync_destination(self) -> None:
+        self.synced = True
+
+    def run(self, source, table_name, table_format, write_disposition):
         self.run_source = source
+        self.write_disposition = write_disposition
         self.materialized_rows = list(source)
         return _FakeLoadInfo()
 
@@ -270,3 +284,162 @@ def test_load_via_sink_stamps_a_single_dlt_resource(monkeypatch) -> None:
     assert len(materialized) == 2
     for row in materialized:
         assert row["_ingested_at"].tzinfo == timezone.utc
+
+
+# ── Load modes ────────────────────────────────────────────────────────────
+#
+# What each mode does to a real Iceberg table (replace keeps one copy, an
+# incremental run adds only newer rows, the cursor survives a recreated
+# container) was verified against dlt 1.30.0 itself; see the module's
+# "Load modes" section. These tests pin what `load_via_sink` asks dlt for.
+
+
+def _one_fake_pipeline(monkeypatch, state: dict | None = None) -> list[_FakePipeline]:
+    pipelines: list[_FakePipeline] = []
+
+    def factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        pipeline.state = state or {}
+        pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", factory)
+    return pipelines
+
+
+def _cursor_state(resource: str, cursor: str) -> dict:
+    return {"sources": {"sql_database": {"resources": {resource: {"incremental": {cursor: {"last_value": 7}}}}}}}
+
+
+def _orders_resource() -> DltResource:
+    return dlt.resource([{"id": 1}, {"id": 2}], name="orders")
+
+
+def _orders_table() -> DltResource:
+    """A resource that takes its cursor itself, the way a `sql_database`
+    table does: the only kind an incremental load accepts."""
+
+    @dlt.resource(name="orders")
+    def orders(cursor=dlt.sources.incremental("created")):  # noqa: B008 -- dlt's own declaration form
+        yield from [{"id": 1, "created": 1}, {"id": 2, "created": 2}]
+
+    return orders
+
+
+def test_load_plan_reads_a_source_object_and_refuses_what_cannot_run() -> None:
+    # Saved before load modes existed: replace, not one more copy.
+    assert LoadPlan.from_source_object({"name": "o", "target": "t"}) == LoadPlan(mode="replace")
+    assert LoadPlan.from_source_object({"loadMode": "append", "incrementalKey": "id"}) == LoadPlan(mode="append")
+    assert LoadPlan.from_source_object({"loadMode": "incremental", "incrementalKey": " id "}) == LoadPlan(
+        mode="incremental", cursor="id"
+    )
+    with pytest.raises(UnsupportedLoadMode):
+        LoadPlan.from_source_object({"loadMode": "merge"})
+    with pytest.raises(UnsupportedLoadMode):
+        LoadPlan.from_source_object({"loadMode": "incremental", "incrementalKey": "  "})
+
+
+def test_load_via_sink_appends_by_default_and_replaces_when_asked(monkeypatch) -> None:
+    pipelines = _one_fake_pipeline(monkeypatch)
+    load_via_sink([{"id": 1}], "orders", _sink_config())
+    load_via_sink(_orders_resource(), "orders", _sink_config(), LoadPlan(mode="replace"))
+    assert [p.write_disposition for p in pipelines] == ["append", "replace"]
+    # Neither looks for a cursor to continue from.
+    assert [p.synced for p in pipelines] == [False, False]
+
+
+def test_first_incremental_run_replaces_and_later_ones_append(monkeypatch) -> None:
+    plan = LoadPlan(mode="incremental", cursor="id")
+
+    # No cursor from an earlier run: load everything, replacing what an
+    # earlier mode left in the table.
+    first = _one_fake_pipeline(monkeypatch)
+    resource = _orders_table()
+    result = load_via_sink(resource, "orders", _sink_config(), plan)
+    assert first[0].synced is True  # the state kept with the data is read first
+    assert first[0].write_disposition == "replace"
+    # The plan's cursor column replaces the one the resource declared.
+    assert resource.incremental.incremental.cursor_path == "id"
+    # The fake pipeline has no trace, so no count was measured.
+    assert result.rows is None
+
+    # A cursor to continue from: only add what is newer.
+    later = _one_fake_pipeline(monkeypatch, _cursor_state("orders", "id"))
+    load_via_sink(_orders_table(), "orders", _sink_config(), plan)
+    assert later[0].write_disposition == "append"
+
+    # A cursor for a different column is not this plan's: start over.
+    other = _one_fake_pipeline(monkeypatch, _cursor_state("orders", "updated_at"))
+    load_via_sink(_orders_table(), "orders", _sink_config(), plan)
+    assert other[0].write_disposition == "replace"
+
+
+def test_incremental_run_that_finds_nothing_new_reports_zero_rows(monkeypatch) -> None:
+    class _Trace:
+        class last_normalize_info:  # noqa: N801 -- mirrors dlt's attribute name
+            row_counts: dict = {}
+
+    def factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        pipeline.state = _cursor_state("orders", "id")
+        # A run that completed, with no rows counted for the table.
+        pipeline.last_trace = _Trace()
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", factory)
+    result = load_via_sink(_orders_table(), "orders", _sink_config(), LoadPlan(mode="incremental", cursor="id"))
+    assert result.rows == 0
+    # The same absent count stays unknown for any other mode.
+    assert load_via_sink(_orders_resource(), "orders", _sink_config(), LoadPlan(mode="replace")).rows is None
+
+
+def test_an_append_run_forgets_incremental_cursors(monkeypatch) -> None:
+    dropped: list = []
+
+    class _Drop:
+        def __init__(self, pipeline, resources, schema_name, state_only):
+            dropped.append((schema_name, resources, state_only))
+
+        def __call__(self) -> None:
+            dropped.append("ran")
+
+    monkeypatch.setattr(sink_module, "pipeline_drop", _Drop)
+
+    # It added the whole source again, so a kept cursor would no longer
+    # describe the table. The drop names the schema the cursor lives in:
+    # dlt would otherwise look only in the pipeline's first schema.
+    state = _cursor_state("orders", "id")
+    state["sources"]["bronze_ingest_orders"] = {"resources": {"orders": {}}}
+    _one_fake_pipeline(monkeypatch, state)
+    load_via_sink(_orders_resource(), "orders", _sink_config(), LoadPlan(mode="append"))
+    assert dropped == [("sql_database", ["orders"], True), "ran"]
+
+    # Nothing to forget (every Kafka micro-batch): no extra state load.
+    dropped.clear()
+    _one_fake_pipeline(monkeypatch)
+    load_via_sink([{"id": 1}], "orders", _sink_config())
+    assert dropped == []
+
+
+def test_a_cursor_is_only_attached_to_a_resource_that_takes_one_itself(monkeypatch) -> None:
+    """Plain rows have no resource to carry a cursor. A resource that does
+    not take the cursor itself would get dlt's cursor filter placed BEHIND
+    the `_ingested_at` stamp, where the row at the cursor's last value
+    hashes differently on every run and is added again each time. Both are
+    refused before anything runs, rather than loading with that flaw."""
+    with pytest.raises(UnsupportedLoadMode):
+        _apply_cursor([{"id": 1}], "id")
+    with pytest.raises(UnsupportedLoadMode):
+        _apply_cursor(_orders_resource(), "id")
+
+    pipelines = _one_fake_pipeline(monkeypatch)
+    plan = LoadPlan(mode="incremental", cursor="id")
+    for unsupported in ([{"id": 1}], _orders_resource()):
+        with pytest.raises(UnsupportedLoadMode):
+            load_via_sink(unsupported, "orders", _sink_config(), plan)
+    assert pipelines == []
+
+    # One that takes it itself keeps its filter ahead of the stamp.
+    table = _orders_table()
+    load_via_sink(table, "orders", _sink_config(), plan)
+    assert [type(step).__name__ for step in table._pipe.steps][1:] == ["IncrementalResourceWrapper", "MapItem"]

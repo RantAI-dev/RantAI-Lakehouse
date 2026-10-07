@@ -50,8 +50,10 @@ pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;
 pub mod queries;
+pub mod semantic;
 pub mod sessions;
 pub mod storage;
+pub mod uploads;
 
 pub use error::StoreError;
 

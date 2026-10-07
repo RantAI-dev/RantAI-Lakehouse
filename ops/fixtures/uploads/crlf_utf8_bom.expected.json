@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["Plant", "Material", "Description"],
+  "rows": [
+    ["8250", "0000100", "ADHESIVE\r\nTAPE"],
+    ["8250", "0000200", "PP BAND"]
+  ]
+}

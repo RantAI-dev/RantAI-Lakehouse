@@ -25,6 +25,16 @@ COPY . .
 ARG NEXT_PUBLIC_SSO_ENABLED=${NEXT_PUBLIC_SSO_ENABLED:-}
 ENV NEXT_PUBLIC_SSO_ENABLED=${NEXT_PUBLIC_SSO_ENABLED}
 
+# next.config.ts rewrites() reads RUST_API_URL WHEN `next build` RUNS, and
+# Next serialises the result into .next/standalone/server.js — a runtime
+# `-e RUST_API_URL=...` does NOT change the /api proxy target.  Staging
+# proved it: the container had the right runtime value yet server.js still
+# proxied http://localhost:8080 → ECONNREFUSED → "Login failed." on the
+# sign-in form.  Override with `--build-arg RUST_API_URL=...` if the
+# frontend ever runs on a differently-named network/host.
+ARG RUST_API_URL=http://lakehouse-api:8080
+ENV RUST_API_URL=${RUST_API_URL}
+
 # Produce .next/standalone (see next.config.ts — output: "standalone")
 RUN bun run build
 
@@ -41,7 +51,9 @@ COPY --from=builder /app/.next/static ./.next/static
 
 EXPOSE 3000
 
-# RUST_API_URL can be changed at runtime — Next.js rewrites use it per-request
+# The /api rewrite target was BAKED at build time (builder stage above);
+# this runtime value only serves code that reads process.env directly —
+# deploy overrides it with -e RUST_API_URL=http://lakehouse-api:8080.
 ENV RUST_API_URL=http://localhost:8080
 
 CMD ["node", "server.js"]

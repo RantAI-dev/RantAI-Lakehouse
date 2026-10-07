@@ -138,6 +138,23 @@ calling the Rust route over HTTP — Dagster has no `iceberg-rust` binding
 of its own) or directly via the route. See ADR 0010 for the full record,
 including the principal/grant and the namespace-naming decision.
 
+**A file a person uploads is a third writer into Bronze** (ADR 0014,
+`routes::uploads`). `POST /api/uploads` stores the original bytes under an
+`uploads/<tenant>/<id>` key in the same warehouse bucket (`upload_store.rs`,
+over the `object_store` client that the RustFS health probe also builds,
+`rustfs_client.rs`) and records the upload in Postgres (`file_upload`, with
+`upload_table_claim` holding which tenant may load into a table name). The
+preview reads the first bytes only. `POST /api/uploads/{id}/ingest` claims the
+name, then launches `file_ingest_job` in Dagster with the settings the person
+confirmed; the job reads the stored file and writes the rows through the shared
+sink (`adapters/sink.py`, as every Bronze writer does), registers the table, and
+records one row in `lake.bronze_meta.ingest_run` (`connector_id =
+"upload:<id>"`). The API never hears from the job directly: a `GET` of the
+upload settles a loading one by reading that row, so the job needs no
+credential for Postgres. Every column is stored as text, and the load replaces
+a table's rows or adds to them; a connector cannot load into a name an upload
+has claimed.
+
 A parallel Bronze *metadata registry* — `lake.bronze_meta.*` and
 `lake.bronze_meta_sec.*` (dataset catalog, column, sync, plus P4/P5's
 `maintenance_run`/`replication_slot` tables) — lives in ClickHouse

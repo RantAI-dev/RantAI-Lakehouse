@@ -39,20 +39,21 @@ import { fmtMeasured } from "@/lib/measured"
 import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
+import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
 import { AssetDetailTabs } from "./asset-detail-tabs"
-import { OpenFormatCard } from "./open-format-card"
 
 /**
  * Candidate permissions the "Request access" dialog offers. Not every
- * governed permission — narrowed to the two a catalog viewer would
+ * governed permission — narrowed to the three a catalog viewer would
  * plausibly need: `catalog:write` (the Phase E acceptance criterion the
- * WS7 plan names) and `lineage:read` (gates this same page's lineage
- * tab). `requestableAccessPermissions` (`@/lib/access-requests`) further
+ * WS7 plan names), `lineage:read` (gates this same page's lineage
+ * tab), and `query:read` (gates this page's sample rows and column
+ * profile). `requestableAccessPermissions` (`@/lib/access-requests`) further
  * excludes whichever of these the signed-in principal already holds — a
  * permission already granted is never offered, since requesting it 400s
  * server-side (`routes::catalog::access_request`'s own check).
  */
-const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read"] as const
+const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read", "query:read"] as const
 
 /** Asset detail with schema, freshness, lineage hops, policies, and snapshots. */
 export function AssetDetailPage() {
@@ -115,9 +116,12 @@ export function AssetDetailPage() {
         title={a.name}
         titleAccessory={
           <>
-            <TierBadge tier={a.tier} />
-            <ClassificationBadge classification={a.classification} />
-            <HealthBadge health={a.health} />
+            <TierBadge tier={a.tier} title={tierTitle(a)} />
+            <ClassificationBadge
+              classification={a.classification}
+              title={classificationTitle(a)}
+            />
+            <HealthBadge health={a.health} title={healthTitle(a)} />
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
                 Request access
@@ -133,7 +137,10 @@ export function AssetDetailPage() {
         items={[
           { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
           { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
-          { label: "Layer", value: DATA_LAYER_LABEL[a.layer] },
+          {
+            label: "Layer",
+            value: <span title={layerTitle(a)}>{DATA_LAYER_LABEL[a.layer]}</span>,
+          },
           { label: "Format", value: a.format },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
           { label: "Rows", value: fmtMeasured(a.rows, formatCompactNumber) },
@@ -142,7 +149,13 @@ export function AssetDetailPage() {
           { label: "Residency", value: a.residency },
           {
             label: "Freshness",
-            value: <FreshnessIndicator lagSeconds={a.freshnessLagSeconds} />,
+            value: (
+              <FreshnessIndicator
+                lagSeconds={a.freshnessLagSeconds}
+                targetSeconds={a.freshnessTargetSeconds ?? null}
+                targetSource={a.freshnessTargetSource}
+              />
+            ),
           },
           {
             label: "Updated",
@@ -150,8 +163,7 @@ export function AssetDetailPage() {
           },
         ]}
       />
-      {a.layer === "gold" && <OpenFormatCard assetId={a.id} />}
-      <AssetDetailTabs asset={a} />
+      <AssetDetailTabs asset={a} onAssetChanged={state.reload} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>
         <DialogContent className="sm:max-w-md">

@@ -44,7 +44,7 @@
 //! auth, use a test-only header, or rely on any `AUTH_DISABLED`-style
 //! escape hatch (there is no such flag in this codebase). The service
 //! identity's scopes are `["*:*"]`: this harness's job is to prove
-//! response-shape parity across ~70 corpus entries spanning almost every
+//! response-shape parity across ~65 corpus entries spanning almost every
 //! permission in `POLICY_TABLE`, not to test authorization decisions
 //! themselves (that's `routes::route_policy_tests` and the task's curl
 //! transcripts), so a narrower scope set would just be extra bookkeeping
@@ -103,12 +103,7 @@ struct RequestSpec {
 /// only — never by value or array length/content, since a different model
 /// run can legitimately call different tools or return a different number
 /// of results.
-const STRUCTURE_ONLY: &[&str] = &[
-    "ai-chat-ok",
-    "agent-ask-ok",
-    "agent-query-ok",
-    "agent-text-to-sql-ok",
-];
+const STRUCTURE_ONLY: &[&str] = &["ai-chat-ok"];
 
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/corpus")

@@ -218,6 +218,24 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     }
 }
 
+/// A seeded Analyst (no `identity:write`) is denied
+/// `PUT /api/identity/users/{id}/tenants/{tenant_id}`, the route that gives
+/// an existing user a tenant. The two loops above walk this entry through
+/// `POLICY_TABLE`; this one names it, with a real principal.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp =
+        request_with_cookie(&router, "PUT", "/api/identity/users/x/tenants/x", &cookie).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied identity:write"
+    );
+}
+
 /// A seeded Analyst (no `governance:write`) is denied
 /// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4),
 /// a fifth `Policy::RequiresPermission` route added after the four-family
@@ -366,6 +384,65 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
         &cookie,
     )
     .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer holding catalog:write must not be denied"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
+/// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
+/// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
+/// reuse the catalog's read permission.
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_the_semantic_reads() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    for path in ["/api/semantic", "/api/semantic/serving.orders"] {
+        let resp = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a seeded Analyst holding catalog:read must not be denied {path}"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a valid session must never be treated as unauthenticated"
+        );
+    }
+}
+
+/// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied
+/// `PUT /api/semantic/{asset}` (AI-16): confirming a description reuses the
+/// catalog's write permission, which the Analyst role does not hold.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_the_semantic_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "PUT", "/api/semantic/serving.orders", &cookie).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied catalog:write"
+    );
+}
+
+/// A seeded Data Engineer (`catalog:write`) is not denied
+/// `PUT /api/semantic/{asset}`: the allowed half of the test above.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_not_denied_the_semantic_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "PUT", "/api/semantic/serving.orders", &cookie).await;
     assert_ne!(
         resp.status(),
         StatusCode::FORBIDDEN,
@@ -551,6 +628,52 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
     assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// The six upload routes (ADR 0014, decision 6) are gated by the existing
+/// `connector:manage`, with no new permission: a seeded Data Engineer
+/// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst
+/// (`sari@meridian.example`, no `connector:manage`) always is. The two
+/// table-driven loops above prove the zero-permission and Platform-Admin
+/// directions for these entries by construction; this pins the real roles,
+/// and `POST /api/uploads` by name.
+///
+/// What a Data Engineer's request then does is not asserted here: with no
+/// storage credentials in `spin_up`, `POST /api/uploads` answers 503, and the
+/// per-id routes answer 404 for an upload that does not exist.
+/// `tests/upload_routes.rs` covers those.
+#[tokio::test]
+async fn a_data_engineer_is_not_refused_and_an_analyst_is_on_every_upload_route() {
+    let TestApp { router, pool } = spin_up().await;
+
+    for (method, path) in [
+        ("POST", "/api/uploads"),
+        ("GET", "/api/uploads"),
+        ("GET", "/api/uploads/x"),
+        ("DELETE", "/api/uploads/x"),
+        ("GET", "/api/uploads/x/preview"),
+        ("POST", "/api/uploads/x/ingest"),
+    ] {
+        let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+        let resp = request_with_cookie(&router, method, path, &engineer).await;
+        assert!(
+            !matches!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a seeded Data Engineer holds connector:manage and must pass the \
+             gate, got {}",
+            resp.status()
+        );
+
+        let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a seeded Analyst lacks connector:manage and must be refused"
+        );
+    }
+}
+
 /// # SSRF: `PUT .../ingest-spec` refuses an obviously-internal dial host at
 /// save time
 ///
@@ -564,6 +687,16 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
     let TestApp { router, pool } = spin_up().await;
     let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+    // Meridian Group, `conn-pg-lakehouse`'s tenant: the per-connector
+    // routes answer only for a connector in the caller's tenant.
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) \
+         VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("join the connector's tenant");
     let cookie = session_cookie_for_user(&pool, user_id).await;
 
     let body = serde_json::json!({

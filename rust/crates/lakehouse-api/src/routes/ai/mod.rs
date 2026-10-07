@@ -25,6 +25,8 @@ mod data_map;
 mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
+pub(crate) mod semantic;
+pub(crate) mod semantic_api;
 pub(in crate::routes) mod tools;
 
 use axum::body::Bytes;
@@ -231,6 +233,33 @@ async fn masked_columns(state: &AppState) -> Option<std::collections::HashSet<(S
     Some(data_map::masked_columns(&conditions))
 }
 
+/// What people wrote about tables and columns, for [`data_map::data_map`]:
+/// the Catalog's annotation descriptions and the semantic layer's entries.
+/// Empty when the switch is off, when there is no Postgres, and for a part
+/// whose read fails, so the map then reads as it did before the layer
+/// existed. The failure is logged without the database's own text.
+async fn semantic_notes(state: &AppState) -> data_map::Notes {
+    if !state.config.ai_semantic_layer {
+        return data_map::Notes::default();
+    }
+    let Some(pg) = state.pg.as_deref() else {
+        return data_map::Notes::default();
+    };
+    let (annotations, entries) = tokio::join!(
+        lakehouse_store::annotation::list_all(pg),
+        lakehouse_store::semantic::list_all(pg)
+    );
+    let annotations = annotations.unwrap_or_else(|_| {
+        tracing::warn!("could not read annotations for the data map");
+        Vec::new()
+    });
+    let entries = entries.unwrap_or_else(|_| {
+        tracing::warn!("could not read semantic entries for the data map");
+        Vec::new()
+    });
+    data_map::Notes::from_rows(annotations, entries)
+}
+
 /// The system prompt: the rules for the mode, the DATA MAP (when the
 /// caller may read the shared catalog), the page the user is on, and the
 /// reply-language line last.
@@ -254,7 +283,10 @@ async fn system_prompt(
         None => Some("no signed-in user"),
     };
     let schema = match refusal {
-        None => data_map::data_map(&state.clickhouse, masked.as_ref()).await,
+        None => {
+            let notes = semantic_notes(state).await;
+            data_map::data_map(&state.clickhouse, masked.as_ref(), &notes).await
+        }
         Some(reason) => format!("(withheld: {reason})"),
     };
     let base = if is_build {
@@ -268,7 +300,7 @@ async fn system_prompt(
     } else {
         format!("{base}\n\nDATA MAP\n{schema}")
     } + &ctx_line
-        + &prompt::closing(latest_user))
+        + &prompt::closing(latest_user, state.config.ai_default_reply_language))
 }
 
 /// Validates the body and assembles the system prompt, history and the tool
@@ -1041,14 +1073,14 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
         .into_response()
 }
 
-/// Caller-facing text for an LLM failure, shared by the Copilot and the
-/// text-to-SQL agent. It used to be `err.to_string()` — the provider's own
-/// response text (e.g. Cloudflare's `error code: 1016` page, seen in QA when
-/// the configured tunnel was down), shown verbatim (AGENTS.md principle 4).
+/// Caller-facing text for an LLM failure. It used to be `err.to_string()` —
+/// the provider's own response text (e.g. Cloudflare's `error code: 1016`
+/// page, seen in QA when the configured tunnel was down), shown verbatim
+/// (AGENTS.md principle 4).
 /// It is now fixed text; the only thing carried over is the HTTP status,
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
-pub(crate) fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
+fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
     tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
@@ -1713,6 +1745,72 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A state over the test database, with the semantic-layer switch set.
+    fn state_with_switch(pool: &lakehouse_store::PgPool, switch: &str) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let env = std::collections::HashMap::from([
+            ("DATABASE_URL".to_owned(), url),
+            ("AI_SEMANTIC_LAYER".to_owned(), switch.to_owned()),
+        ]);
+        AppState::new(crate::config::Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// One confirmed semantic entry and one annotation.
+    async fn write_notes(pool: &lakehouse_store::PgPool) {
+        lakehouse_store::semantic::confirm(
+            pool,
+            &lakehouse_store::semantic::SemanticInput {
+                asset: "serving.orders".to_owned(),
+                column_name: String::new(),
+                description: "Orders placed online.".to_owned(),
+                synonyms: Vec::new(),
+                role: None,
+            },
+            uuid::Uuid::nil(),
+        )
+        .await
+        .expect("a confirmed entry");
+        lakehouse_store::annotation::upsert_annotation(
+            pool,
+            &lakehouse_store::annotation::AnnotationInput {
+                asset_id: "serving.orders".to_owned(),
+                owner: None,
+                steward: None,
+                tags: Vec::new(),
+                description: Some("From the catalog.".to_owned()),
+            },
+        )
+        .await
+        .expect("an annotation");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_chat_reads_no_notes_when_the_semantic_layer_is_switched_off(
+        pool: lakehouse_store::PgPool,
+    ) {
+        write_notes(&pool).await;
+        let notes = semantic_notes(&state_with_switch(&pool, "false")).await;
+        assert!(notes.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_chat_reads_the_notes_when_the_semantic_layer_is_switched_on(
+        pool: lakehouse_store::PgPool,
+    ) {
+        write_notes(&pool).await;
+        let notes = semantic_notes(&state_with_switch(&pool, "true")).await;
+        assert!(!notes.is_empty());
+    }
 
     #[test]
     fn an_llm_error_body_never_carries_the_providers_text() {

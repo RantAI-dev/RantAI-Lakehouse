@@ -167,14 +167,36 @@ export function formatRelativeTime(
   return `${months}mo ago`
 }
 
-/** Freshness lag in seconds → "8 s", "4m", "3h 20m". */
+/** ISO timestamp in the future → "in 4m", "in 3h", "in 2d"; "now" once
+ * it has passed (a next run that is due is about to start). */
+export function formatTimeUntil(
+  iso: string | null | undefined,
+  now = Date.now()
+): string {
+  if (!iso) return "—"
+  const t = parseTimestamp(iso).getTime()
+  if (Number.isNaN(t)) return "—"
+  const mins = Math.ceil((t - now) / 60_000)
+  if (mins <= 0) return "now"
+  if (mins < 60) return `in ${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `in ${hours}h`
+  return `in ${Math.floor(hours / 24)}d`
+}
+
+/**
+ * Freshness lag in seconds → "8 s", "4m", "3h 20m", and from two days up
+ * "8d 2h": past that the minutes are noise and "194h" is arithmetic left
+ * to the reader.
+ */
 export function formatLagSeconds(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "—"
   if (seconds < 60) return `${Math.round(seconds)} s`
   const m = Math.floor(seconds / 60)
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
-  return `${h}h ${String(m % 60).padStart(2, "0")}m`
+  if (h < 48) return `${h}h ${String(m % 60).padStart(2, "0")}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
 }
 
 /** Events/records per second, e.g. 15400 → "15.4K rec/s". */

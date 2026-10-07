@@ -68,7 +68,7 @@ pub async fn get(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = PolicyEngineObligations::from_state(&state);
     match get_body(
         &state.clickhouse,
         &q,
@@ -333,7 +333,7 @@ pub async fn specs_preview(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = PolicyEngineObligations::from_state(&state);
     let (_, result) = run_spec_sql(
         &state.clickhouse,
         &spec.spec.id,

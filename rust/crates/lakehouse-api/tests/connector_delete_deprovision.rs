@@ -47,7 +47,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lakehouse_store::connectors::{
     CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
-    create_connector, set_ingest_spec,
+    assign_tenant, create_connector, set_ingest_spec,
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -111,7 +111,17 @@ async fn create_connector_with_undeprovisionable_slot(pool: &PgPool, name: &str)
     )
     .await
     .expect("create connector");
+    in_bayus_tenant(pool, &created.id).await;
     created.id
+}
+
+/// Meridian Group (`0002_seed_identity.sql`), one of Bayu's tenants: the
+/// per-connector routes answer only for a connector in the caller's tenant.
+async fn in_bayus_tenant(pool: &PgPool, id: &str) {
+    let meridian_group = uuid::Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_0000_0001);
+    assign_tenant(pool, id, meridian_group)
+        .await
+        .expect("assign tenant");
 }
 
 async fn connector_row_exists(pool: &PgPool, id: &str) -> bool {
@@ -293,6 +303,7 @@ async fn deprovision_never_attempted_for_a_batch_sql_connector() {
     )
     .await
     .expect("create connector");
+    in_bayus_tenant(&app.pool, &created.id).await;
     let spec = IngestSpecInput {
         adapter: "sql".to_owned(),
         ingest_mode: "batch".to_owned(),

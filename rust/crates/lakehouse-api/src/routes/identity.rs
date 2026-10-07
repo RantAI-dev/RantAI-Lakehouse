@@ -186,6 +186,96 @@ pub async fn create_user(
     Ok((StatusCode::CREATED, ApiJson(user)))
 }
 
+/// `PUT /api/identity/users/{id}/tenants/{tenant_id}` — add an existing
+/// user to a tenant. No body. Returns 200 with the updated [`User`], whose
+/// `tenants` now lists the tenant; adding a member again is the same 200
+/// and changes nothing.
+///
+/// Before this route a user could be given a tenant only at invite time
+/// (`POST /api/identity/users`), so an account created without one (the
+/// bootstrap admin) could never get one through the API.
+///
+/// # Who may add to which tenant
+///
+/// The caller must hold the unrestricted `*:*` grant
+/// ([`crate::routes::catalog::is_unrestricted`]) or already be a member of
+/// the tenant. Anyone else gets the same 404 as for a tenant that does not
+/// exist, so the answer says nothing about which tenants exist (the rule
+/// `tenant_scope::resolve` follows). `POST /api/identity/users` is looser:
+/// it accepts any tenant name from any `identity:write` caller. This route
+/// is not loosened to match.
+///
+/// # Errors
+///
+/// 400 on a `{id}` or `{tenant_id}` that is not a UUID; 404 for a tenant
+/// that does not exist or that the caller may not add to (one body for
+/// both) and for a user that does not exist; 503 if no pool is
+/// configured; 500 (classified) on a storage failure. One
+/// `identity.user.tenant.add` audit event is written when a row was added,
+/// none when the membership already existed.
+pub async fn add_user_to_tenant(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((id, tenant_id)): Path<(String, String)>,
+) -> ApiResult<ApiJson<User>> {
+    let user_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let tenant_id = Uuid::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("tenant id must be a UUID".to_owned()))?;
+    let pool = pool(&state)?;
+
+    // The caller's own right to the tenant is checked before anything is
+    // read, and fails with the unknown-tenant answer below.
+    let tenant_not_found = || ApiError::NotFound("tenant not found".to_owned());
+    if !crate::routes::catalog::is_unrestricted(&principal) && !principal.in_tenant(tenant_id) {
+        return Err(tenant_not_found().into());
+    }
+    if !identity::tenant_exists(pool, tenant_id).await? {
+        return Err(tenant_not_found().into());
+    }
+    // `get_user` answers `StoreError::NotFound` (404) for an unknown user.
+    identity::get_user(pool, &user_id.to_string()).await?;
+
+    let added = identity::add_user_to_tenant(pool, user_id, tenant_id).await?;
+    if added {
+        let audit_event = user_tenant_add_audit_event(&principal, user_id, tenant_id);
+        if let Err(err) = store_audit::insert(pool, audit_event).await {
+            tracing::warn!(
+                %err,
+                action = "identity.user.tenant.add",
+                user_id = %user_id,
+                tenant_id = %tenant_id,
+                "failed to record user-tenant-add audit event"
+            );
+        }
+    }
+
+    Ok(ApiJson(
+        identity::get_user(pool, &user_id.to_string()).await?,
+    ))
+}
+
+/// Build the `NewAuditEvent` for a membership that was added — the same
+/// shape as [`tenant_create_audit_event`]. The resource is the user whose
+/// access changed; the tenant id is in `args`.
+fn user_tenant_add_audit_event(
+    principal: &Principal,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.tenant.add".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({ "tenantId": tenant_id.to_string() })),
+        ..Default::default()
+    }
+}
+
 // ── Roles ───────────────────────────────────────────────────────────────
 
 /// `GET /api/identity/roles` — every role, with its derived member count.

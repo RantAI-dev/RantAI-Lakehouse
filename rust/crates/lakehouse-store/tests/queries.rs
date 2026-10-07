@@ -21,7 +21,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
-    RecordHistoryInput, get_history_item, list_history, list_saved, record_history,
+    RecordHistoryInput, get_history_item, history_mentioning, list_history, list_saved,
+    record_history,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -346,5 +347,77 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
 async fn get_history_item_returns_none_for_an_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     let item = get_history_item(&pool, "q-does-not-exist").await.unwrap();
     assert_eq!(item, None);
+    Ok(())
+}
+
+/// `history_mentioning` finds every recent query whose text names the
+/// table, whoever ran it — and treats `_` in a table name as a literal,
+/// not as the "any one character" wildcard it is in `LIKE`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_mentioning_finds_queries_by_substring_across_users(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (rina, budi) = (Uuid::new_v4(), Uuid::new_v4());
+    let run = |id: &'static str, sql: &'static str, owner: Uuid, status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            record_history(
+                &pool,
+                &RecordHistoryInput {
+                    id,
+                    sql,
+                    user: "someone",
+                    owner_id: Some(owner),
+                    status,
+                    duration_ms: 100,
+                    scanned_bytes: 1,
+                    cost_units: 0.1,
+                    workload_class: "hot-analytics",
+                    engine: "hot-store",
+                    cache_assisted: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    };
+    run(
+        "q-a",
+        "SELECT * FROM silver.orders_clean",
+        rina,
+        "completed",
+    )
+    .await;
+    run(
+        "q-b",
+        "select count() from SILVER.ORDERS_CLEAN",
+        budi,
+        "failed",
+    )
+    .await;
+    run(
+        "q-c",
+        "SELECT * FROM silver.ordersXclean",
+        budi,
+        "completed",
+    )
+    .await;
+    run("q-d", "SELECT 1", rina, "completed").await;
+
+    let found = history_mentioning(&pool, 7, &["orders_clean".to_owned()])
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["q-a", "q-b"]);
+    assert!(found.iter().all(|m| m.at.ends_with('Z')));
+    assert!(
+        found
+            .iter()
+            .any(|m| m.owner_id == Some(budi) && m.status == "failed")
+    );
+
+    // Nothing to look for is nothing found, not everything.
+    assert!(history_mentioning(&pool, 7, &[]).await.unwrap().is_empty());
     Ok(())
 }

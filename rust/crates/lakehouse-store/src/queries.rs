@@ -5,8 +5,8 @@
 //!
 //! `src/services/clients/queries.ts` splits `QueryService` into a real half
 //! (`run`/`estimate`, `ClickHouse`-backed, ported in Phase 1;
-//! `generateSql`, LLM-backed, also ported in Phase 1 as
-//! `/api/agent/text-to-sql`) and a mock half (`listSaved`, `listHistory`).
+//! `generateSql`, LLM-backed, which asks the copilot's `/api/ai/chat`) and a
+//! mock half (`listSaved`, `listHistory`).
 //! This module is the Postgres backing for that mock half, plus one
 //! addition: `routes::query::run` calls [`record_history`] after a
 //! successful `ClickHouse` execution, so [`list_history`] returns *real*
@@ -100,6 +100,85 @@ pub async fn list_saved(pool: &PgPool) -> Result<Vec<SavedQuery>, StoreError> {
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(SavedQuery::from).collect())
+}
+
+/// One `query_history` row whose text mentions a table name, for working
+/// out who queried a catalog asset ([`history_mentioning`]).
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct HistoryMention {
+    /// `query_history.id`.
+    pub id: String,
+    /// The SQL that was run.
+    pub sql: String,
+    /// Who ran it, as displayed.
+    pub user_name: String,
+    /// The user who ran it, when recorded.
+    pub owner_id: Option<Uuid>,
+    /// When it ran, ISO 8601.
+    pub at: String,
+    /// `completed | failed | cancelled | blocked`.
+    pub status: String,
+    /// How long it took, in milliseconds.
+    pub duration_ms: i64,
+    /// The audit event recorded for the run, if any.
+    pub audit_event_id: Option<String>,
+}
+
+/// The most [`history_mentioning`] reads in one call. A table queried more
+/// often than this inside the window is under-counted, not mis-reported
+/// per row.
+const HISTORY_MENTION_LIMIT: i64 = 5000;
+
+/// Every query run in the last `days` days, by anyone, whose SQL contains
+/// one of `needles` (case-insensitively), newest first.
+///
+/// A substring match is only a first cut: `orders` also finds
+/// `orders_archive` and a string literal. The caller parses each row's SQL
+/// to decide which really read the table — `query_history` has no column
+/// saying which tables a query touched, and this needs none.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn history_mentioning(
+    pool: &PgPool,
+    days: i32,
+    needles: &[String],
+) -> Result<Vec<HistoryMention>, StoreError> {
+    if needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `%`, `_` and `\` in a table name are literals, not wildcards.
+    let patterns: Vec<String> = needles
+        .iter()
+        .map(|n| {
+            let escaped = n
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        })
+        .collect();
+    let rows: Vec<HistoryMention> = sqlx::query_as(
+        "SELECT q.id, q.sql, q.user_name, q.owner_id, \
+                to_char(q.at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS at, \
+                q.status, q.duration_ms, ae.id AS audit_event_id \
+         FROM query_history q \
+         LEFT JOIN LATERAL ( \
+             SELECT ae.id FROM audit_event ae \
+              WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
+              ORDER BY ae.at DESC LIMIT 1 \
+         ) ae ON true \
+         WHERE q.at >= now() - make_interval(days => $1) \
+           AND q.sql ILIKE ANY($2) \
+         ORDER BY q.at DESC LIMIT $3",
+    )
+    .bind(days)
+    .bind(&patterns)
+    .bind(HISTORY_MENTION_LIMIT)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Insert a new saved query. New for the AI Copilot's `save_query` tool

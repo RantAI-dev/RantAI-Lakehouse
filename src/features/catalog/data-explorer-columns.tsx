@@ -177,7 +177,11 @@ export function getDataExplorerColumns({
         <DataTableColumnHeader column={column} label="Freshness" />
       ),
       cell: ({ row }) => (
-        <FreshnessIndicator lagSeconds={row.original.freshnessLagSeconds} />
+        <FreshnessIndicator
+          lagSeconds={row.original.freshnessLagSeconds}
+          targetSeconds={row.original.freshnessTargetSeconds ?? null}
+          targetSource={row.original.freshnessTargetSource}
+        />
       ),
       enableColumnFilter: true,
       meta: {

@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-16",
+  "delimiter": "\t",
+  "headerRow": 4,
+  "columns": ["Plnt", "Material", "Description", "Qty"],
+  "rows": [
+    ["8250", "0000100", "ADHESIVE", "10"],
+    ["8250", "0000200", "PP BAND", "4"]
+  ]
+}

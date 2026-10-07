@@ -99,8 +99,7 @@ pub(super) async fn export_gold_mart(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations =
-        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = crate::policy_engine::PolicyEngineObligations::from_state(state);
     match crate::gold_export::export_mart(
         &state.clickhouse,
         &iceberg_config,

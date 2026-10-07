@@ -34,11 +34,12 @@ use serde_json::Value;
 use sqlparser::dialect::Dialect;
 
 use lakehouse_clickhouse::ChClient;
-use lakehouse_core::ident::SqlLiteral;
+use lakehouse_core::ident::{Ident, SqlLiteral};
 use lakehouse_store::PgPool;
 use lakehouse_store::governance;
 
 use crate::sql_rewrite::{self, ObligationsSource, SystemTablesCatalog, TableObligations};
+use crate::state::AppState;
 
 /// A parsed, structurally valid enforcement clause. Never constructed
 /// directly outside [`PolicyCondition::parse`] — that constructor is the
@@ -334,6 +335,10 @@ fn transitive_mask_closure(
 pub struct PolicyEngineObligations<'a> {
     pg: Option<&'a PgPool>,
     ch: &'a ChClient,
+    /// `Config::iceberg_query_db`: where an Iceberg table's columns are
+    /// resolved when `system.columns` does not list it (see
+    /// [`Self::iceberg_columns`]).
+    iceberg_db: Option<&'a Ident>,
 }
 
 impl<'a> PolicyEngineObligations<'a> {
@@ -343,7 +348,56 @@ impl<'a> PolicyEngineObligations<'a> {
     /// a deployment running with no Postgres pool configured.
     #[must_use]
     pub fn new(pg: Option<&'a PgPool>, ch: &'a ChClient) -> Self {
-        Self { pg, ch }
+        Self {
+            pg,
+            ch,
+            iceberg_db: None,
+        }
+    }
+
+    /// The engine every request path should use: this deployment's
+    /// Postgres, `ClickHouse`, and Iceberg query database. Built in ONE
+    /// place so no ad hoc SQL surface resolves governed tables differently
+    /// from another.
+    #[must_use]
+    pub fn from_state(state: &'a AppState) -> Self {
+        Self::new(state.pg.as_deref(), &state.clickhouse)
+            .with_iceberg_db(state.config.iceberg_query_db.as_ref())
+    }
+
+    /// Resolve Iceberg tables' columns through `db` (a `DataLakeCatalog`
+    /// database); `None` keeps the fail-closed default.
+    #[must_use]
+    pub fn with_iceberg_db(mut self, db: Option<&'a Ident>) -> Self {
+        self.iceberg_db = db;
+        self
+    }
+
+    /// `(name, "", "")` for every column of the Iceberg table
+    /// `namespace.table`, via `DESCRIBE` on the configured `DataLakeCatalog`
+    /// database — `system.columns` does not list such tables. Iceberg has
+    /// no `ClickHouse` computed columns, hence the empty
+    /// `default_kind`/`default_expression`. `None` (fail closed) with no
+    /// database configured, a name that is not a plain identifier, or any
+    /// error, including "no such table".
+    async fn iceberg_columns(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Option<Vec<(String, String, String)>> {
+        let db = self.iceberg_db?;
+        let (namespace, table) = (Ident::new(namespace).ok()?, Ident::new(table).ok()?);
+        let sql = format!("DESCRIBE TABLE {db}.`{namespace}.{table}`");
+        let rows = self.ch.rows(&sql, None).await.ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            rows.iter()
+                .filter_map(|r| r.get("name").and_then(Value::as_str))
+                .map(|name| (name.to_owned(), String::new(), String::new()))
+                .collect(),
+        )
     }
 
     /// `(name, default_kind, default_expression)` for every real column of
@@ -445,7 +499,12 @@ impl<'a> PolicyEngineObligations<'a> {
                 real_columns: None,
             }));
         };
-        let columns = self.real_columns_with_defaults(schema, table_name).await;
+        // A `ClickHouse` table first; an Iceberg table (canonicalized from
+        // a `DataLakeCatalog` read, see `sql_rewrite::canonicalize`) second.
+        let columns = match self.real_columns_with_defaults(schema, table_name).await {
+            Some(cols) => Some(cols),
+            None => self.iceberg_columns(schema, table_name).await,
+        };
         let real_columns = columns
             .as_ref()
             .map(|cols| cols.iter().map(|(name, ..)| name.clone()).collect());
@@ -500,26 +559,61 @@ impl<'a> PolicyEngineObligations<'a> {
             .map(|(db, name)| format!("({}, {})", SqlLiteral::from(*db), SqlLiteral::from(*name)))
             .collect::<Vec<_>>()
             .join(", ");
+        // A key may also name a table whose OWN name holds the dot
+        // (``lake.`a.b` `` canonicalizes to `a.b`, see
+        // `sql_rewrite::canonicalize`), in whichever database — so match
+        // the whole key as a table name too. Over-matching only means more
+        // views get checked, never fewer.
+        // Never render `IN ()`: a malformed lookup would fail as a whole
+        // and leave every view unchecked.
+        let dotted: Vec<String> = tables
+            .iter()
+            .filter(|t| t.contains('.'))
+            .map(|t| SqlLiteral::from(t.as_str()).to_string())
+            .collect();
+        let by_name = if dotted.is_empty() {
+            String::new()
+        } else {
+            format!(" OR name IN ({})", dotted.join(", "))
+        };
         let sql = format!(
             "SELECT database, name, engine, create_table_query FROM system.tables \
-             WHERE (database, name) IN ({list})"
+             WHERE (database, name) IN ({list}){by_name}"
         );
         let Ok(rows) = self.ch.rows(&sql, None).await else {
             return std::collections::HashMap::new();
         };
-        rows.iter()
-            .filter_map(|r| {
-                let db = r.get("database").and_then(Value::as_str)?;
-                let name = r.get("name").and_then(Value::as_str)?;
-                let engine = r.get("engine").and_then(Value::as_str)?.to_owned();
-                let create = r
-                    .get("create_table_query")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-                Some((format!("{db}.{name}"), (engine, create)))
-            })
-            .collect()
+        let mut out: std::collections::HashMap<String, (String, Option<String>)> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            let (Some(db), Some(name), Some(engine)) = (
+                r.get("database").and_then(Value::as_str),
+                r.get("name").and_then(Value::as_str),
+                r.get("engine").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let create = r
+                .get("create_table_query")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let key = if name.contains('.') {
+                name.to_ascii_lowercase()
+            } else {
+                format!("{db}.{name}")
+            };
+            // Several databases may hold the same dotted name; a view
+            // among them must win over a plain table, or it goes unchecked.
+            let is_view = engine == "View" || engine == "MaterializedView";
+            let keep_existing = out
+                .get(&key)
+                .is_some_and(|(e, _)| e == "View" || e == "MaterializedView");
+            if is_view || !keep_existing {
+                out.insert(key, (engine.to_owned(), create));
+            }
+        }
+        out
     }
 
     /// Resolves everything [`sql_rewrite::enforce`] needs for `tables`
@@ -649,5 +743,182 @@ mod tests {
     fn rejects_an_empty_table() {
         let raw = r#"{"roles":["Analyst"],"table":"","mask":["email"]}"#;
         assert!(PolicyCondition::parse(raw).is_none());
+    }
+
+    /// A key whose table name itself holds the dot (``lake.`v.x` ``
+    /// canonicalizes to `v.x`) must still find that table in
+    /// `system.tables`, and a view must win over a same-named plain table
+    /// in another database — otherwise a view over a governed table could
+    /// go unchecked.
+    #[tokio::test]
+    async fn engine_and_definitions_finds_dotted_names_and_prefers_views() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("OR name IN ('v.x', 'serving.mart_x')"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "database", "type": "String"},
+                    {"name": "name", "type": "String"},
+                    {"name": "engine", "type": "String"},
+                    {"name": "create_table_query", "type": "String"},
+                ],
+                "data": [
+                    {"database": "lake", "name": "v.x", "engine": "View",
+                     "create_table_query": "CREATE VIEW lake.`v.x` AS SELECT * FROM silver.customers"},
+                    {"database": "other", "name": "v.x", "engine": "MergeTree", "create_table_query": ""},
+                    {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
+                ],
+                "rows": 3,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let engine = PolicyEngineObligations::new(None, &ch);
+
+        let found = engine
+            .engine_and_definitions(&["v.x".to_owned(), "serving.mart_x".to_owned()])
+            .await;
+
+        assert_eq!(found.get("v.x").map(|(e, _)| e.as_str()), Some("View"));
+        assert_eq!(
+            found.get("serving.mart_x").map(|(e, _)| e.as_str()),
+            Some("MergeTree")
+        );
+    }
+
+    /// A policy on an Iceberg table (`bronze.orders`, its Trino-equal key)
+    /// resolves real columns through the configured `DataLakeCatalog`
+    /// database, so a `ClickHouse` read of it is masked instead of refused
+    /// — and without that database it stays refused (`real_columns: None`).
+    mod iceberg_columns {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_store::governance::CreatePolicyInput;
+        use lakehouse_test_support as _;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+
+        fn rows(meta: &[&str], data: &Value) -> ResponseTemplate {
+            let meta: Vec<Value> = meta
+                .iter()
+                .map(|n| serde_json::json!({ "name": n, "type": "String" }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": meta,
+                "data": data,
+                "rows": data.as_array().map_or(0, Vec::len),
+            }))
+        }
+
+        async fn seed(pool: &PgPool) {
+            governance::create_policy(
+                pool,
+                &CreatePolicyInput {
+                    name: "iceberg-mask-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "bronze.orders".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"bronze.orders","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+        }
+
+        async fn clickhouse() -> MockServer {
+            let server = MockServer::start().await;
+            // Not a ClickHouse table: `system.columns` knows nothing.
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .respond_with(rows(
+                    &["name", "default_kind", "default_expression"],
+                    &serde_json::json!([]),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains(
+                    "DESCRIBE TABLE icecat_api.`bronze.orders`",
+                ))
+                .respond_with(rows(
+                    &["name", "type"],
+                    &serde_json::json!([
+                        {"name": "id", "type": "Int64"},
+                        {"name": "email", "type": "String"},
+                    ]),
+                ))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn resolves_iceberg_columns_through_the_query_database(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            seed(&pool).await;
+            let server = clickhouse().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let db = Ident::new("icecat_api").unwrap();
+            let roles = ["Analyst".to_owned()];
+
+            let obl = PolicyEngineObligations::new(Some(&pool), &ch)
+                .with_iceberg_db(Some(&db))
+                .obligations_for_async("bronze.orders", &roles)
+                .await
+                .unwrap()
+                .expect("governed");
+            assert_eq!(
+                obl.real_columns,
+                Some(vec!["id".to_owned(), "email".to_owned()])
+            );
+            assert_eq!(obl.mask, vec!["email".to_owned()]);
+
+            let without = PolicyEngineObligations::new(Some(&pool), &ch)
+                .obligations_for_async("bronze.orders", &roles)
+                .await
+                .unwrap()
+                .expect("governed");
+            assert_eq!(without.real_columns, None, "no query database: fail closed");
+            Ok(())
+        }
+
+        /// End to end through the rewrite every ad hoc surface uses.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn masks_a_governed_iceberg_read_through_clickhouse(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            seed(&pool).await;
+            let server = clickhouse().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let db = Ident::new("icecat_api").unwrap();
+            let source = PolicyEngineObligations::new(Some(&pool), &ch).with_iceberg_db(Some(&db));
+
+            let sql = rewrite_sql_for_roles(
+                "SELECT * FROM icecat_api.`bronze.orders`",
+                &sqlparser::dialect::ClickHouseDialect {},
+                &["Analyst".to_owned()],
+                &sql_rewrite::PlaceholderValues::none(),
+                &source,
+            )
+            .await
+            .unwrap();
+            assert!(
+                sql.contains("replaceRegexpOne(toString(`email`)"),
+                "sql={sql}"
+            );
+            Ok(())
+        }
     }
 }
