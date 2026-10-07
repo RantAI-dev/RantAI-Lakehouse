@@ -20,6 +20,20 @@ jobs:
       url: http://localhost:3000
 
     steps:
+      # Self-hosted runner defense: compose services that bind-mount
+      # this repo (the `ops/*` test runners) execute as container root,
+      # and a single root-owned file `git clean -ffdx` cannot unlink
+      # fails THIS step with EACCES — even though the write happened
+      # during the PREVIOUS deploy, so the named step looks innocent.
+      # Reclaim ownership before checkout; the runner has no
+      # passwordless sudo, but its docker access is equivalent power
+      # for a chown. Compose-side prevention (PYTHONDONTWRITEBYTECODE
+      # on the ops/* runners) stops the known writer; this catches any
+      # future one. Fails loudly on purpose — a docker daemon that is
+      # down would kill the compose step later anyway.
+      - name: Reclaim root-owned workspace leftovers
+        run: docker run --rm -v "${{ github.workspace }}:/ws" alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
