@@ -1204,7 +1204,7 @@ async fn launch(
             if let Some(run_id) = launched.run_id {
                 return Ok(run_id);
             }
-            tracing::warn!(error = ?launched.error, upload_id = %claimed.id, "the orchestrator refused to launch a file load");
+            tracing::warn!(error = ?launched.failure, upload_id = %claimed.id, "the orchestrator refused to launch a file load");
             ApiError::Unprocessable(LAUNCH_REFUSED.to_owned())
         }
         Err(err) => {

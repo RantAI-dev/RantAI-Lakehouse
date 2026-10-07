@@ -5675,6 +5675,7 @@ mod tests {
                     max_retries: None,
                     tenant_id: None,
                     depends_on: Vec::new(),
+                    connector_id: None,
                     id: None,
                 },
                 None,
@@ -8191,6 +8192,7 @@ mod tests {
                     max_retries: None,
                     tenant_id: None,
                     depends_on: Vec::new(),
+                    connector_id: None,
                     id: Some(id.clone()),
                 },
                 None,
@@ -9111,6 +9113,7 @@ mod tests {
                 max_retries: None,
                 tenant_id: None,
                 depends_on: Vec::new(),
+                connector_id: None,
                 id: None,
             }
         }
@@ -10177,6 +10180,7 @@ mod tests {
                 max_retries: None,
                 tenant_id,
                 depends_on,
+                connector_id: None,
                 id: None,
             }
         }
