@@ -116,11 +116,8 @@ const REDACT_TEXT_IN = new Set([
  *
  * Deliberately NOT included:
  *  - `sql` — LLM-generated, but it is public business SQL over tourism marts,
- *    carrying no credential or personal data. Redacting it while the identical
- *    text sits in `steps[].detail` produced the inconsistency this comment
- *    exists to prevent. Non-determinism here is the harness's job.
- *  - `detail` — only `steps[1].detail` is model-generated; the rest are
- *    hardcoded literals the Rust port must reproduce byte-for-byte.
+ *    carrying no credential or personal data. Non-determinism here is the
+ *    harness's job.
  */
 const REDACT_TEXT_KEYS = new Set([
   "content",

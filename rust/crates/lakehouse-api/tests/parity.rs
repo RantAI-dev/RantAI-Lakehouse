@@ -44,7 +44,7 @@
 //! auth, use a test-only header, or rely on any `AUTH_DISABLED`-style
 //! escape hatch (there is no such flag in this codebase). The service
 //! identity's scopes are `["*:*"]`: this harness's job is to prove
-//! response-shape parity across ~70 corpus entries spanning almost every
+//! response-shape parity across ~65 corpus entries spanning almost every
 //! permission in `POLICY_TABLE`, not to test authorization decisions
 //! themselves (that's `routes::route_policy_tests` and the task's curl
 //! transcripts), so a narrower scope set would just be extra bookkeeping

@@ -617,8 +617,8 @@ the versions itself, in a `ClickHouse` table it creates on first use:
   opt-in `dagster` compose profile** (mirroring how P2 gated `seaweedfs`
   behind its own profile) — see "Dagster (opt-in, P3)" below and
   `docs/adr/0005-dagster-code-location-ownership-and-packaging.md`.
-- **A real LLM.** Needs a paid API key. AI chat routes return `503` without `LLM_KEY` (or `MINIMAX_API_KEY`) set to a
-  working key.
+- **A real LLM.** Needs a paid API key. AI chat routes return `503` without
+  `LLM_KEY` (or `MINIMAX_API_KEY`) set to a working key.
 
 See "Features unavailable locally," below, for the full list and how to
 turn each one on.

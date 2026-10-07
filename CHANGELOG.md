@@ -290,7 +290,7 @@ once a first release is tagged.
   "completed" before they had run.
 - Seeded pipeline and alert rows that were indistinguishable from real
   activity are pruned by migration.
-- `POST /api/agent/ask`, `POST /api/agent/query` and `POST /api/agent/text-to-sql`, with their parity captures. The console no longer calls them, since the box asks `/api/ai/chat`, and a request to one of them now answers 404.
+- `POST /api/agent/ask`, `POST /api/agent/query` and `POST /api/agent/text-to-sql`, with their parity captures. The console no longer calls them, since the box asks `/api/ai/chat`, and a request to one of them now answers like a path that never existed (500 from the auth gate).
 
 ### Fixed
 
