@@ -77,7 +77,9 @@ complete until the assistant can use it. Every BI feature's plan names the
 assistant change that goes with it: the tool and its schema (regenerate
 `tests/fixtures/tool_schemas.json`), what the dashboard page sends as
 context, and the standard request set (`AI-15`). The AI team reviews that
-part of the plan and of the diff.
+part of the plan and of the diff. This covers the assistant's work for
+dashboards only (backlog `AI-1` to `AI-15`); the AI team plans the
+assistant's other work itself.
 
 **Waits for.** A backlog item that cannot start until another merges says
 so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
