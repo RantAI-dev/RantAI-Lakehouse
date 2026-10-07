@@ -705,6 +705,14 @@ pub fn router(state: AppState) -> Router {
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
         )
+        // The semantic layer: a table's and a column's plain-words
+        // description. `{asset}` is `serving.<table>` or `silver.<table>`;
+        // the dot stays inside one path segment.
+        .route("/api/semantic", get(ai::semantic_api::list))
+        .route(
+            "/api/semantic/{asset}",
+            get(ai::semantic_api::get_asset).put(ai::semantic_api::put_entry),
+        )
         .merge(catalog_access_router())
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())

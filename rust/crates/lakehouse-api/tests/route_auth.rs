@@ -396,6 +396,65 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     );
 }
 
+/// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
+/// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
+/// reuse the catalog's read permission.
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_the_semantic_reads() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    for path in ["/api/semantic", "/api/semantic/serving.orders"] {
+        let resp = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a seeded Analyst holding catalog:read must not be denied {path}"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a valid session must never be treated as unauthenticated"
+        );
+    }
+}
+
+/// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied
+/// `PUT /api/semantic/{asset}` (AI-16): confirming a description reuses the
+/// catalog's write permission, which the Analyst role does not hold.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_the_semantic_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "PUT", "/api/semantic/serving.orders", &cookie).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied catalog:write"
+    );
+}
+
+/// A seeded Data Engineer (`catalog:write`) is not denied
+/// `PUT /api/semantic/{asset}`: the allowed half of the test above.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_not_denied_the_semantic_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "PUT", "/api/semantic/serving.orders", &cookie).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer holding catalog:write must not be denied"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
 /// A principal holding ONLY `ingest:read` (not `connector:manage`) may
 /// `GET /api/connectors/ingestible` but is refused the base
 /// `GET /api/connectors` — the whole reason `/ingestible` exists as a

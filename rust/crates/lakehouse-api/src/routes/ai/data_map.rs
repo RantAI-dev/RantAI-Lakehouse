@@ -106,6 +106,13 @@ pub(crate) async fn data_map(
     map
 }
 
+/// Drop the cached map, so the next chat rebuilds it. A person's
+/// confirmation calls this to show their text at once and not after
+/// [`TTL`].
+pub(crate) async fn clear_cache() {
+    *CACHE.lock().await = None;
+}
+
 /// `(database.table, column)` pairs a masking policy covers for anyone,
 /// read from the authored policies' structured `conditions`. Samples are
 /// withheld for these columns so the prompt never carries a value the
@@ -1159,5 +1166,14 @@ mod tests {
             vec![entry("silver.raw_visits", "origin", "first\nsecond", true)],
         );
         assert!(render_silver(&n).contains("\n    origin String — first second\n"));
+    }
+
+    /// No other test in this crate's lib binary builds the map, so nothing
+    /// refills the cache between the call and the check.
+    #[tokio::test]
+    async fn clearing_the_cache_drops_the_built_map() {
+        *CACHE.lock().await = Some((Instant::now(), "DATA MAP text".to_owned()));
+        clear_cache().await;
+        assert!(CACHE.lock().await.is_none());
     }
 }

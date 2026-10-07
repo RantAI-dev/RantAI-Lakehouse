@@ -26,6 +26,7 @@ mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
 pub(crate) mod semantic;
+pub(crate) mod semantic_api;
 pub(in crate::routes) mod tools;
 
 use axum::body::Bytes;

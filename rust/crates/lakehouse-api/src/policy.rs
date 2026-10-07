@@ -193,6 +193,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
 
+    // ── Semantic layer (AI-16): plain-words descriptions of tables and
+    //    columns, read by the Copilot's DATA MAP. The same two permissions
+    //    as the annotations above. ───────────────────────────────────────
+    ("GET", "/api/semantic", Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:read")),
+    ("PUT", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:write")),
+
     // ── Access requests (WS7 item E2/E3): anyone who can see a catalog
     //    entry may request more access to it; `access:approve` (minted by
     //    migration 0040, held only by Governance Admin) is a distinct
