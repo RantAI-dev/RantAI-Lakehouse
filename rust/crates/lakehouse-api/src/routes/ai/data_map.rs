@@ -51,6 +51,8 @@ use std::time::{Duration, Instant};
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::Ident;
+use lakehouse_store::annotation::AnnotationRow;
+use lakehouse_store::semantic::SemanticEntry;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
@@ -84,7 +86,11 @@ static CACHE: LazyLock<Mutex<Option<(Instant, String)>>> = LazyLock::new(|| Mute
 /// The lock is held while a stale map is rebuilt, so concurrent chats wait
 /// for one rebuild instead of each running the stats queries. An empty
 /// result (`ClickHouse` unreachable) is never cached.
-pub(crate) async fn data_map(ch: &ChClient, masked: Option<&HashSet<(String, String)>>) -> String {
+pub(crate) async fn data_map(
+    ch: &ChClient,
+    masked: Option<&HashSet<(String, String)>>,
+    notes: &Notes,
+) -> String {
     let cacheable = masked.is_some_and(HashSet::is_empty);
     let mut guard = CACHE.lock().await;
     if cacheable
@@ -93,7 +99,7 @@ pub(crate) async fn data_map(ch: &ChClient, masked: Option<&HashSet<(String, Str
     {
         return map.clone();
     }
-    let map = build(ch, masked).await;
+    let map = build(ch, masked, notes).await;
     if cacheable && !map.is_empty() {
         *guard = Some((Instant::now(), map.clone()));
     }
@@ -121,6 +127,125 @@ pub(crate) fn masked_columns(conditions: &[String]) -> HashSet<(String, String)>
         }
     }
     out
+}
+
+/// Longest table text, in characters: the `CHECK` on `semantic_entry` for a
+/// table. Applied again here so a row written around the `CHECK` cannot
+/// crowd the prompt.
+const TABLE_TEXT_CHARS: usize = 400;
+/// Longest column description, in characters (the `CHECK` for a column).
+const COLUMN_TEXT_CHARS: usize = 200;
+/// Most synonyms listed for one table or column.
+const MAX_SYNONYMS: usize = 6;
+/// Longest single synonym, in characters.
+const SYNONYM_CHARS: usize = 40;
+
+/// What people and the drafting pass wrote about tables and columns, to be
+/// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
+/// Catalog's annotation descriptions and the semantic layer's entries.
+///
+/// An empty `Notes` (the default) renders nothing, so the map is the text
+/// it was before the layer existed.
+#[derive(Default)]
+pub(crate) struct Notes {
+    /// `serving.<table>` or `silver.<table>` to its annotation description.
+    annotations: HashMap<String, String>,
+    /// `(asset, column)` to its entry; `column` is `""` for the table.
+    entries: HashMap<(String, String), Note>,
+}
+
+struct Note {
+    description: String,
+    synonyms: Vec<String>,
+    confirmed: bool,
+}
+
+/// One line of prompt text: control characters (line breaks above all) turn
+/// into spaces so a stored description cannot start a line of the map, then
+/// the text is cut to `max` characters, never inside one.
+fn one_line(raw: &str, max: usize) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    flat.trim().chars().take(max).collect()
+}
+
+impl Notes {
+    /// Index the rows [`lakehouse_store`] returned. A row's table is its
+    /// `asset`; an annotation's `asset_id` is the same qualified name for
+    /// Silver and Gold tables.
+    pub(crate) fn from_rows(annotations: Vec<AnnotationRow>, entries: Vec<SemanticEntry>) -> Self {
+        Self {
+            annotations: annotations
+                .into_iter()
+                .filter_map(|a| Some((a.asset_id, a.description?)))
+                .collect(),
+            entries: entries
+                .into_iter()
+                .map(|e| {
+                    (
+                        (e.asset, e.column_name),
+                        Note {
+                            description: e.description,
+                            synonyms: e.synonyms,
+                            confirmed: e.status == "confirmed",
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The text after a table's line: the annotation's, else a confirmed
+    /// entry's, else a draft's. A draft is skipped when the catalog dataset
+    /// already described the table (`dataset_described`): only a person's
+    /// text is added to a description that exists.
+    fn table_text(&self, asset: &str, dataset_described: bool) -> Option<String> {
+        let annotation = self.annotations.get(asset).map(String::as_str);
+        let entry = self.entries.get(&(asset.to_owned(), String::new()));
+        let confirmed = entry
+            .filter(|n| n.confirmed)
+            .map(|n| n.description.as_str());
+        let draft = entry
+            .filter(|n| !n.confirmed && !dataset_described)
+            .map(|n| n.description.as_str());
+        [annotation, confirmed, draft]
+            .into_iter()
+            .flatten()
+            .map(|t| one_line(t, TABLE_TEXT_CHARS))
+            .find(|t| !t.is_empty())
+    }
+
+    /// A column's description: a confirmed entry, else the source
+    /// registry's (`source`, today's text, left uncut), else a draft.
+    fn column_text(&self, asset: &str, column: &str, source: Option<&str>) -> Option<String> {
+        let entry = self.entries.get(&(asset.to_owned(), column.to_owned()));
+        let confirmed = entry
+            .filter(|n| n.confirmed)
+            .map(|n| one_line(&n.description, COLUMN_TEXT_CHARS))
+            .filter(|t| !t.is_empty());
+        let source = source.filter(|t| !t.is_empty()).map(str::to_owned);
+        let draft = entry
+            .filter(|n| !n.confirmed)
+            .map(|n| one_line(&n.description, COLUMN_TEXT_CHARS))
+            .filter(|t| !t.is_empty());
+        confirmed.or(source).or(draft)
+    }
+
+    /// ` (also called: a, b)` for a table (`column` is `""`) or a column,
+    /// whatever the entry's status, or `None` when it has none.
+    fn synonyms(&self, asset: &str, column: &str) -> Option<String> {
+        let entry = self.entries.get(&(asset.to_owned(), column.to_owned()))?;
+        let names: Vec<String> = entry
+            .synonyms
+            .iter()
+            .map(|s| one_line(s, SYNONYM_CHARS))
+            .filter(|s| !s.is_empty())
+            .take(MAX_SYNONYMS)
+            .collect();
+        (!names.is_empty()).then(|| format!(" (also called: {})", names.join(", ")))
+    }
 }
 
 struct Column {
@@ -421,6 +546,7 @@ fn render_table(
     dataset: Option<&Dataset>,
     descriptions: &HashMap<(String, String), String>,
     stats: &HashMap<String, String>,
+    notes: &Notes,
 ) {
     let rows = table
         .rows
@@ -446,17 +572,28 @@ fn render_table(
             let _ = write!(out, ": {}", d.description);
         }
     }
+    let asset = format!("{}.{}", table.db, table.name);
+    let dataset_described = dataset.is_some_and(|d| !d.description.is_empty());
+    if let Some(text) = notes.table_text(&asset, dataset_described) {
+        let _ = write!(out, ": {text}");
+    }
+    if let Some(synonyms) = notes.synonyms(&asset, "") {
+        out.push_str(&synonyms);
+    }
     out.push('\n');
     if let Some(grain) = grain_line(table) {
         out.push_str(&grain);
     }
     for col in &table.columns {
         let _ = write!(out, "    {} {}", col.name, col.ty);
-        if let Some(d) = dataset
-            && let Some(desc) = descriptions.get(&(d.slug.clone(), col.name.clone()))
-            && !desc.is_empty()
-        {
+        let source = dataset
+            .and_then(|d| descriptions.get(&(d.slug.clone(), col.name.clone())))
+            .map(String::as_str);
+        if let Some(desc) = notes.column_text(&asset, &col.name, source) {
             let _ = write!(out, " — {desc}");
+        }
+        if let Some(synonyms) = notes.synonyms(&asset, &col.name) {
+            out.push_str(&synonyms);
         }
         if let Some(fact) = stats.get(&col.name) {
             let _ = write!(out, "; {fact}");
@@ -465,7 +602,7 @@ fn render_table(
     }
 }
 
-async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>) -> String {
+async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>, notes: &Notes) -> String {
     let tables = load_tables(ch).await;
     if tables.is_empty() {
         return String::new();
@@ -500,7 +637,7 @@ async fn build(ch: &ChClient, masked: Option<&HashSet<(String, String)>>) -> Str
             None
         };
         let stats = column_stats(ch, table, masked).await;
-        render_table(&mut out, table, dataset, &descriptions, &stats);
+        render_table(&mut out, table, dataset, &descriptions, &stats, notes);
     }
     if !skipped.is_empty() {
         let _ = write!(
@@ -608,5 +745,328 @@ mod tests {
             ..table
         };
         assert_eq!(grain_line(&only_labels), None);
+    }
+
+    fn col(name: &str, ty: &str) -> Column {
+        Column {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+        }
+    }
+
+    /// A Gold table that a catalog dataset serves, with a source description
+    /// on `tahun` only.
+    fn served_table() -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "visits".to_owned(),
+            rows: Some(720),
+            columns: vec![
+                col("tahun", "UInt16"),
+                col("negara", "String"),
+                col("jumlah", "UInt32"),
+            ],
+        }
+    }
+
+    fn served_dataset() -> Dataset {
+        Dataset {
+            slug: "visits-by-country".to_owned(),
+            title: "Visits by country".to_owned(),
+            description: "Monthly visits.".to_owned(),
+            source_kind: "primary source",
+            publisher: "Agency".to_owned(),
+            frequency: String::new(),
+            unit: "visits".to_owned(),
+        }
+    }
+
+    fn served_descriptions() -> HashMap<(String, String), String> {
+        HashMap::from([(
+            ("visits-by-country".to_owned(), "tahun".to_owned()),
+            "Calendar year".to_owned(),
+        )])
+    }
+
+    fn served_stats() -> HashMap<String, String> {
+        HashMap::from([
+            ("tahun".to_owned(), "range 2019..2024".to_owned()),
+            ("negara".to_owned(), "values: Japan | Korea".to_owned()),
+        ])
+    }
+
+    /// A Silver table: no dataset, so no description and no source text.
+    fn silver_table() -> Table {
+        Table {
+            db: "silver".to_owned(),
+            name: "raw_visits".to_owned(),
+            rows: None,
+            columns: vec![col("origin", "String"), col("count", "UInt32")],
+        }
+    }
+
+    fn render_served(notes: &Notes) -> String {
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &served_table(),
+            Some(&served_dataset()),
+            &served_descriptions(),
+            &served_stats(),
+            notes,
+        );
+        out
+    }
+
+    fn render_silver(notes: &Notes) -> String {
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &silver_table(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            notes,
+        );
+        out
+    }
+
+    // The two strings below are what the renderer wrote before the semantic
+    // layer existed, copied before `render_table` was changed.
+    const SERVED_TODAY: &str = "\
+- serving.visits (720 rows) — dataset \"Visits by country\" (slug visits-by-country, primary source, publisher: Agency, unit: visits): Monthly visits.
+    grain: one row per tahun x negara; measures: jumlah (SUM them over rows for any total)
+    tahun UInt16 — Calendar year; range 2019..2024
+    negara String; values: Japan | Korea
+    jumlah UInt32
+";
+    const SILVER_TODAY: &str = "\
+- silver.raw_visits (row count unknown)
+    grain: one row per origin; measures: count (SUM them over rows for any total)
+    origin String
+    count UInt32
+";
+
+    #[test]
+    fn with_no_notes_a_table_with_a_dataset_renders_as_it_did_before() {
+        assert_eq!(render_served(&Notes::default()), SERVED_TODAY);
+    }
+
+    #[test]
+    fn with_no_notes_a_table_without_a_dataset_renders_as_it_did_before() {
+        assert_eq!(render_silver(&Notes::default()), SILVER_TODAY);
+    }
+
+    fn entry(asset: &str, column: &str, description: &str, confirmed: bool) -> SemanticEntry {
+        SemanticEntry {
+            asset: asset.to_owned(),
+            column_name: column.to_owned(),
+            description: description.to_owned(),
+            synonyms: Vec::new(),
+            role: None,
+            status: if confirmed { "confirmed" } else { "draft" }.to_owned(),
+            written_by: None,
+            model: None,
+            updated_at: "2026-10-07T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    fn with_synonyms(mut e: SemanticEntry, synonyms: &[&str]) -> SemanticEntry {
+        e.synonyms = synonyms.iter().map(|s| (*s).to_owned()).collect();
+        e
+    }
+
+    fn annotation(asset: &str, description: &str) -> AnnotationRow {
+        AnnotationRow {
+            asset_id: asset.to_owned(),
+            owner: None,
+            steward: None,
+            tags: Vec::new(),
+            description: Some(description.to_owned()),
+        }
+    }
+
+    fn notes(annotations: Vec<AnnotationRow>, entries: Vec<SemanticEntry>) -> Notes {
+        Notes::from_rows(annotations, entries)
+    }
+
+    #[test]
+    fn a_draft_fills_a_column_the_source_does_not_describe() {
+        let n = notes(
+            vec![],
+            vec![entry(
+                "serving.visits",
+                "negara",
+                "Country of origin",
+                false,
+            )],
+        );
+        assert!(
+            render_served(&n)
+                .contains("\n    negara String — Country of origin; values: Japan | Korea\n")
+        );
+    }
+
+    #[test]
+    fn the_source_description_wins_over_a_draft() {
+        let n = notes(
+            vec![],
+            vec![entry("serving.visits", "tahun", "Model guess", false)],
+        );
+        assert_eq!(render_served(&n), SERVED_TODAY);
+    }
+
+    #[test]
+    fn a_confirmed_entry_wins_over_the_source_description() {
+        let n = notes(
+            vec![],
+            vec![entry("serving.visits", "tahun", "Fiscal year", true)],
+        );
+        let text = render_served(&n);
+        assert!(text.contains("\n    tahun UInt16 — Fiscal year; range 2019..2024\n"));
+        assert!(!text.contains("Calendar year"));
+    }
+
+    #[test]
+    fn column_synonyms_follow_the_description_and_precede_the_stats() {
+        let n = notes(
+            vec![],
+            vec![with_synonyms(
+                entry("serving.visits", "negara", "Country of origin", true),
+                &["nation", "origin country"],
+            )],
+        );
+        assert!(render_served(&n).contains(
+            "\n    negara String — Country of origin (also called: nation, origin country); values: Japan | Korea\n"
+        ));
+    }
+
+    #[test]
+    fn table_synonyms_follow_the_table_text() {
+        let n = notes(
+            vec![annotation("silver.raw_visits", "Raw visit sheet")],
+            vec![with_synonyms(
+                entry("silver.raw_visits", "", "Model text", false),
+                &["arrivals", "tourists"],
+            )],
+        );
+        assert!(render_silver(&n).starts_with(
+            "- silver.raw_visits (row count unknown): Raw visit sheet (also called: arrivals, tourists)\n"
+        ));
+    }
+
+    #[test]
+    fn an_annotation_wins_over_a_draft_for_the_table() {
+        let n = notes(
+            vec![annotation("silver.raw_visits", "Raw visit sheet")],
+            vec![entry("silver.raw_visits", "", "Model text", false)],
+        );
+        let text = render_silver(&n);
+        assert!(text.starts_with("- silver.raw_visits (row count unknown): Raw visit sheet\n"));
+        assert!(!text.contains("Model text"));
+    }
+
+    #[test]
+    fn a_draft_describes_a_table_that_has_no_other_text() {
+        let n = notes(
+            vec![],
+            vec![entry("silver.raw_visits", "", "Model text", false)],
+        );
+        assert!(
+            render_silver(&n).starts_with("- silver.raw_visits (row count unknown): Model text\n")
+        );
+    }
+
+    #[test]
+    fn a_confirmed_entry_wins_over_a_draft_for_the_table() {
+        let n = notes(
+            vec![],
+            vec![entry("silver.raw_visits", "", "Person text", true)],
+        );
+        assert!(
+            render_silver(&n).starts_with("- silver.raw_visits (row count unknown): Person text\n")
+        );
+    }
+
+    #[test]
+    fn a_draft_is_not_added_to_a_table_whose_dataset_has_a_description() {
+        let n = notes(
+            vec![],
+            vec![entry("serving.visits", "", "Model text", false)],
+        );
+        assert_eq!(render_served(&n), SERVED_TODAY);
+    }
+
+    #[test]
+    fn a_confirmed_entry_is_added_to_a_table_whose_dataset_has_a_description() {
+        let n = notes(
+            vec![],
+            vec![entry("serving.visits", "", "Person text", true)],
+        );
+        assert!(render_served(&n).contains("unit: visits): Monthly visits.: Person text\n"));
+    }
+
+    #[test]
+    fn an_entry_for_a_column_the_table_no_longer_has_is_not_rendered() {
+        let n = notes(
+            vec![],
+            vec![entry("silver.raw_visits", "dropped_col", "Gone", true)],
+        );
+        assert_eq!(render_silver(&n), SILVER_TODAY);
+    }
+
+    #[test]
+    fn an_entry_for_another_table_is_not_rendered() {
+        let n = notes(
+            vec![annotation("silver.other", "Other table")],
+            vec![entry("silver.other", "origin", "Other column", true)],
+        );
+        assert_eq!(render_silver(&n), SILVER_TODAY);
+    }
+
+    #[test]
+    fn text_written_around_the_check_is_cut_to_the_rule() {
+        let n = notes(
+            vec![],
+            vec![
+                entry("silver.raw_visits", "", &"t".repeat(500), true),
+                entry("silver.raw_visits", "origin", &"c".repeat(500), true),
+                with_synonyms(
+                    entry("silver.raw_visits", "count", "Amount", true),
+                    &[&"s".repeat(60), "a", "b", "c", "d", "e", "seventh"],
+                ),
+            ],
+        );
+        let text = render_silver(&n);
+        let expected = format!(
+            "- silver.raw_visits (row count unknown): {}\n",
+            "t".repeat(400)
+        );
+        assert!(text.starts_with(&expected));
+        assert!(text.contains(&format!("\n    origin String — {}\n", "c".repeat(200))));
+        assert!(text.contains(&format!(
+            "\n    count UInt32 — Amount (also called: {}, a, b, c, d, e)\n",
+            "s".repeat(40)
+        )));
+    }
+
+    #[test]
+    fn a_cut_lands_on_a_character_boundary() {
+        let n = notes(
+            vec![],
+            vec![entry("silver.raw_visits", "origin", &"é".repeat(300), true)],
+        );
+        assert!(
+            render_silver(&n).contains(&format!("\n    origin String — {}\n", "é".repeat(200)))
+        );
+    }
+
+    #[test]
+    fn a_line_break_in_a_description_cannot_start_a_new_line_of_the_map() {
+        let n = notes(
+            vec![],
+            vec![entry("silver.raw_visits", "origin", "first\nsecond", true)],
+        );
+        assert!(render_silver(&n).contains("\n    origin String — first second\n"));
     }
 }

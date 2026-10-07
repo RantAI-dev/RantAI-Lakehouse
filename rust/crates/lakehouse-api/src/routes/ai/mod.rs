@@ -231,6 +231,33 @@ async fn masked_columns(state: &AppState) -> Option<std::collections::HashSet<(S
     Some(data_map::masked_columns(&conditions))
 }
 
+/// What people wrote about tables and columns, for [`data_map::data_map`]:
+/// the Catalog's annotation descriptions and the semantic layer's entries.
+/// Empty when the switch is off, when there is no Postgres, and for a part
+/// whose read fails, so the map then reads as it did before the layer
+/// existed. The failure is logged without the database's own text.
+async fn semantic_notes(state: &AppState) -> data_map::Notes {
+    if !state.config.ai_semantic_layer {
+        return data_map::Notes::default();
+    }
+    let Some(pg) = state.pg.as_deref() else {
+        return data_map::Notes::default();
+    };
+    let (annotations, entries) = tokio::join!(
+        lakehouse_store::annotation::list_all(pg),
+        lakehouse_store::semantic::list_all(pg)
+    );
+    let annotations = annotations.unwrap_or_else(|_| {
+        tracing::warn!("could not read annotations for the data map");
+        Vec::new()
+    });
+    let entries = entries.unwrap_or_else(|_| {
+        tracing::warn!("could not read semantic entries for the data map");
+        Vec::new()
+    });
+    data_map::Notes::from_rows(annotations, entries)
+}
+
 /// The system prompt: the rules for the mode, the DATA MAP (when the
 /// caller may read the shared catalog), the page the user is on, and the
 /// reply-language line last.
@@ -254,7 +281,10 @@ async fn system_prompt(
         None => Some("no signed-in user"),
     };
     let schema = match refusal {
-        None => data_map::data_map(&state.clickhouse, masked.as_ref()).await,
+        None => {
+            let notes = semantic_notes(state).await;
+            data_map::data_map(&state.clickhouse, masked.as_ref(), &notes).await
+        }
         Some(reason) => format!("(withheld: {reason})"),
     };
     let base = if is_build {
