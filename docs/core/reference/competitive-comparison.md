@@ -354,3 +354,174 @@ less is **Partial** (product owner, 2026-10-07).
 | BI and lakehouse in one product | **Have** | **Partial**. Tableau Next with Salesforce Data 360 | **Missing** |
 | Pipelines in the same product | **Have**. Build module | **Partial**. Tableau Prep | **Partial**. Transforms |
 | Price | **Not verified**. Not set | **n/a**. Standard: Creator $75, Explorer $42, Viewer $15 per user per month; Enterprise $115 / $70 / $35 | **n/a**. Open source free; Starter $100/mo (5 users); Pro $575/mo (10 users); Enterprise from $20,000/yr |
+
+## Data module matrix: Databricks, Snowflake and Airbyte
+
+Compiled 2026-10-07. Our side is a code reading of `main` at `f3a3196` (after
+PR #71), not a test run. Competitors come from docs.databricks.com (AWS),
+docs.snowflake.com and docs.airbyte.com with Airbyte's live connector
+registry, October 2026. Airbyte is compared for Sources only. **Have** means we
+match or beat the best competitor that offers it; anything less is
+**Partial**. The product owner has not yet decided this module area by area;
+the task list is backlog `SEC-14` to `SEC-18`, `SRC-3`, `SRC-6` to `SRC-13`
+and `DATA-11` to `DATA-19`, with edge cases in `DEC-10`.
+
+Summary: 69 capabilities. We have 25, have 23 partly and lack 19.
+
+#### Catalog
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
+| --- | --- | --- | --- | --- |
+| Browse by namespace and layer | **Have**. Namespaces page; Raw, Bronze, Silver and Gold quick filters | **Have**. Catalog, schema, table tree | **Have**. Horizon Catalog Explorer | **n/a** |
+| Search | **Partial**. Substring match over name, namespace, description, owner and id; no column or tag search | **Have**. Names, comments, column names, tags; filters and search syntax | **Have**. Universal Search over metadata, fuzzy | **n/a** |
+| Filter, sort and group assets | **Have**. 14 operators, and/or, group-by with summaries | **Have** | **Have** | **n/a** |
+| Asset page with tabs | **Have**. Seven tabs: Overview, Schema, Sample, Quality, Access, Lineage, Activity | **Have**. Columns, Sample, Details, Permissions, Policies, History, Lineage, Insights, Quality | **Have**. Details, Columns, Data Preview, Copy History, Lineage, Data Quality | **n/a** |
+| Edit description, owner, steward, tags | **Have**. Audited as catalog.annotate | **Have** | **Have**. Contacts with purposes (steward, approver) | **n/a** |
+| Governed tags (allowed values, policies) | **Missing**. Free-text tags only | **Have**. Governed tags with tag policies | **Have**. Tag propagation and tag-based masking (Ent+) | **n/a** |
+| Data preview | **Partial**. 25–100 rows, masked and row-filtered; Databricks shows about 1,000 and answers questions over them | **Have**. About 1,000 rows, plus plain-language questions over the sample | **Have**. 100 rows | **n/a** |
+| Column profiling | **Have**. Nulls, distinct count, range, top values over up to 100,000 rows | **Partial**. Statistics in the results grid; profiling as a separate monitor | **Have**. Data Profile tab (Ent+) | **n/a** |
+| Schema versions over time | **Have**. Iceberg metadata, plus Silver and Gold versions recorded every 15 minutes | **Partial**. History tab; no schema-change view | **Partial**. Schema evolution in SQL; no UI | **n/a** |
+| Table-level lineage | **Partial**. Recorded edges only (pipelines, builds, exports, views); nothing inferred | **Have**. Automatic, across workspaces | **Have**. Automatic (Ent+) | **n/a** |
+| Column-level lineage | **Missing**. Always empty | **Have** | **Have**. Ent+ | **n/a** |
+| Lineage from outside systems | **Missing** | **Have**. External lineage | **Have**. OpenLineage ingest | **n/a** |
+| What uses this table | **Have**. Saved queries and dashboards whose SQL reads it | **Have**. Insights: frequent queries, users, dashboards | **Partial**. Lineage only | **n/a** |
+| Usage and popularity | **Partial**. Queries, users and latency over 7 days; Databricks shows 30 days, frequent users and column popularity | **Have**. 30-day usage, column popularity | **Missing**. Not documented | **n/a** |
+| Quality rules on an asset | **Partial**. Create, run and delete rules, health badge; no built-in metric library or anomaly checks like Snowflake's | **Have**. Anomaly detection and data profiling | **Have**. Data metric functions and expectations (Ent+) | **n/a** |
+| Automatic freshness and volume anomaly checks | **Partial**. Freshness against an SLA target; no anomaly detection | **Have**. Per schema (PP) | **Have**. Ent+ | **n/a** |
+| Quality dashboard with incidents | **Missing** | **Have** | **Have**. Preview | **n/a** |
+| Classification and masking on the asset | **Have**. Badges, rule add/remove, inline masking and row-filter policy creator | **Have**. Policies tab (ABAC) | **Have**. Masking policy per column (Ent+) | **n/a** |
+| Automatic sensitive-data scanning | **Not verified**. Classification rules exist in Governance; automatic scanning not checked | **Have**. About 90 classes, auto-tagging | **Have**. Classification profiles (Ent+) | **n/a** |
+| Change history and activity | **Have**. Audit events plus schema versions | **Have**. History tab | **Partial**. Copy history; access history in SQL | **n/a** |
+| Freshness and SLA | **Have**. Lag against target; set from the Activity tab | **Have** | **Have**. Freshness metric | **n/a** |
+| Snapshot history | **Have**. Iceberg snapshots with a row-count chart | **Have** | **Partial**. SQL only | **n/a** |
+| Query a past version (time travel) | **Partial**. Opens Query Studio with version syntax; not proven to pass the masking rewrite | **Have**. VERSION and TIMESTAMP AS OF, RESTORE | **Have**. 1 day on all editions, up to 90 days on Ent+ | **n/a** |
+| Undrop a table | **Missing** | **Have** | **Partial**. SQL only | **n/a** |
+| Storage details | **Have**. Iceberg files and partitions; ClickHouse engine and parts | **Have** | **Have** | **n/a** |
+| Request access | **Have**. Decided in Approvals | **Have**. PP | **Have**. Preview | **n/a** |
+| Grant and revoke from the asset | **Partial**. Access tab shows classification and policies; no grants | **Have**. Permissions tab | **Have**. Privileges section | **n/a** |
+| Certification and deprecation marks | **Missing** | **Have** | **Have**. Certification-status tag | **n/a** |
+| Business glossary or domains | **Missing** | **Partial**. Domains (PP), Pages (Beta) | **Partial**. Semantic views | **n/a** |
+| Entity relationship diagram | **Missing** | **Have**. From declared keys | **Missing** | **n/a** |
+| Favourites | **Missing** | **Missing**. Not documented for tables | **Missing**. Not documented | **n/a** |
+| Open table format readable by other engines | **Partial**. Raw data in Iceberg; Gold only as a published copy for tables switched on (merged, not accepted) | **Have**. Delta and Iceberg | **Have**. Iceberg, Horizon REST catalog | **n/a** |
+| Browse other systems' catalogs (federation) | **Missing**. Backlog QRY-1 | **Have**. Foreign catalogs | **Have**. Catalog-linked databases | **n/a** |
+
+#### Data Explorer
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
+| --- | --- | --- | --- | --- |
+| Asset table with filters, grouping and CSV export | **Have**. Server-side paging, layer quick filters, row menu | **Partial**. Search results page | **Partial**. Explorer lists per schema | **n/a** |
+
+#### Sources
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
+| --- | --- | --- | --- | --- |
+| Working connector types | **Partial**. PostgreSQL, MySQL/MariaDB, SQL Server, S3 files, REST, Kafka (batch), MongoDB, PostgreSQL CDC; Oracle, SFTP and MySQL/SQL Server CDC never gate-tested; Sheets does not work | **Have**. About 60 managed connectors, 10 SaaS ones generally available | **Have**. Openflow, about 25 connectors | **Have**. 602 sources, 66 certified |
+| Database change capture (CDC) | **Partial**. PostgreSQL gate-tested; MySQL and SQL Server untested; Debezium added by an operator | **Have**. SQL Server GA; MySQL and PostgreSQL in preview | **Have**. PostgreSQL, MySQL, SQL Server, Oracle | **Have**. PostgreSQL, MySQL, SQL Server, MongoDB |
+| SaaS connectors | **Missing**. Backlog SRC-3 | **Have** | **Have** | **Have** |
+| Files from object storage | **Partial**. S3 csv/json/parquet; testing is broken for wizard-made connectors | **Have** | **Have** | **Have**. Compression and glob patterns |
+| Streaming sources | **Partial**. Kafka batch poll | **Have** | **Have** | **Partial**. Community connector |
+| Create wizard | **Have**. Type, connection, tenant, review, then a real test | **Have** | **Have** | **Have**. Form generated from the connector spec, docs alongside |
+| Test connection | **Partial**. Real for five types; broken for object storage; Oracle always reads as failed | **Have** | **Partial** | **Have**. With suggested fixes |
+| Write-only credentials | **Partial**. Write-only and never returned, but stored as plain files at rest; no secret manager | **Have**. Connection objects | **Have**. Secret objects | **Have** |
+| External secret managers | **Missing** | **Have**. Beta | **Have**. Preview | **Have**. AWS, GCP, Azure, Vault |
+| OAuth sign-in to a source | **Missing**. REST OAuth2 answers unsupported | **Have** | **Have** | **Have**. One-click on cloud; own app on Core |
+| Change credentials | **Partial**. Works, except Oracle and object storage | **Have** | **Have** | **Have** |
+| Discover the source's tables | **Partial**. SQL and CDC sources only | **Have** | **Have** | **Have**. Asynchronous for large schemas |
+| Choose tables and columns | **Partial**. Tables; column choice not checked | **Have**. Plus row filtering | **Have** | **Have**. Top-level fields |
+| Load modes | **Partial**. Replace, append, incremental by cursor; no deduplication or history (SCD) modes | **Have**. SCD type 1 and 2, full refresh | **Have** | **Have**. Five sync modes |
+| Deduplicate on a key | **Missing** | **Have** | **Have** | **Have**. Append + deduped |
+| Schema changes at the source | **Partial**. Default schema evolution; nobody is told | **Have**. New columns added, removed ones marked inactive | **Have** | **Have**. Propagate, approve or pause; breaking changes pause |
+| Schedules | **Have**. Cron per connector | **Have** | **Have**. Tasks | **Have**. Interval or cron |
+| Run history with per-table results | **Partial**. Per-table results and test history; no log view found | **Have**. Event logs | **Have**. Copy history | **Have**. Timeline with logs |
+| Alert when a load fails | **Missing**. Failures raise nothing; health changes only on a manual test | **Have** | **Have** | **Have**. Email (cloud) and webhook |
+| Automatic retries | **Not verified**. Not checked for ingest jobs | **Have** | **Not verified** | **Have**. Backoff and attempt limits |
+| Connector page | **Have**. Overview, Ingest and Tests tabs | **Have** | **Have** | **Have** |
+| Delete and clean up | **Have**. Blocked while pipelines depend on it; CDC slot dropped | **Have** | **Have** | **Have** |
+| Build your own connector | **Missing** | **Partial**. Custom connectors | **Partial**. NiFi flows | **Have**. No-code builder and SDKs |
+
+#### File upload
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
+| --- | --- | --- | --- | --- |
+| Upload a file from the console | **Have**. Merged in #71, not accepted | **Have** | **Have** | **n/a** |
+| Formats | **Partial**. Delimited text only (CSV, TSV and similar) | **Have**. CSV, TSV, JSON, Avro, Parquet, text | **Have**. CSV, TSV, JSON, Avro, ORC, Parquet, XML | **n/a** |
+| Size | **Partial**. 50 MB and 2,000,000 rows per file | **Have**. Up to 2 GB | **Have**. 250 MB per file | **n/a** |
+| Several files at once | **Missing** | **Have**. Up to 10 | **Have**. Up to 250 | **n/a** |
+| Preview with detection | **Have**. 20 rows; encoding, delimiter and header detected, each overridable | **Have**. 50 rows | **Have** | **n/a** |
+| Set column names and types before loading | **Missing**. Every column stored as text; names cleaned automatically | **Have** | **Have** | **n/a** |
+| Append or replace | **Have** | **Partial**. Create or overwrite only | **Have** | **n/a** |
+| Duplicate-file notice | **Have**. Same file uploaded twice is flagged | **Missing** | **Missing** | **n/a** |
+| Protection against overwriting another table | **Have**. Table claims refuse connector and other-tenant tables | **Missing** | **Missing** | **n/a** |
+| Load progress and failure reasons | **Have**. Live run view; a fixed set of seven reasons | **Have** | **Have**. Copy history with errors | **n/a** |
+| Delete an upload | **Have**. File only; the loaded table stays | **Have** | **Have** | **n/a** |
+| Use uploaded tables in pipelines and dashboards | **Missing** | **Have** | **Have** | **n/a** |
+
+#### AI in the Data module (input for the AI team)
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
+| --- | --- | --- | --- | --- |
+| AI-written descriptions | **Missing** | **Have**. Per object and bulk for all columns, language choice | **Have**. Generate with Cortex, bulk up to 50 columns | **n/a** |
+| Plain-language search for tables | **Missing** | **Have**. Semantic search (PP) | **Have**. Natural-language queries in Universal Search | **n/a** |
+| Ask questions about a table's sample | **Missing** | **Have**. Sample Data Explorer turns a question into SQL over the sample | **Missing**. Not on the catalog page | **n/a** |
+| Assistant answers questions about catalog, lineage and quality | **Have**. describe_dataset, get_lineage and get_quality tools | **Have**. Genie Code in Catalog Explorer | **Have**. Cortex Code answers catalog and governance questions | **n/a** |
+| Assistant drafts classification, quality and masking rules | **Have**. draft_classification_rule, draft_quality_rule and draft_policy tools | **Partial**. Classification review pre-fills a mask policy | **Partial**. Suggests quality checks (preview) | **n/a** |
+| AI-suggested quality checks | **Partial**. Only when asked, through the assistant | **Partial**. Anomaly detection, not AI suggestions | **Have**. Suggested checks from Cortex (preview) | **n/a** |
+| AI investigates quality incidents | **Missing** | **Partial**. Root cause from lineage, not AI | **Have**. 'Investigate' opens Cortex Code with the incident (preview) | **n/a** |
+| AI sensitive-data classification | **Missing**. Classification rules are written by hand or drafted by the assistant | **Have**. Agentic model plus patterns, about 90 classes | **Have**. AI mode (preview) | **n/a** |
+| Assistant creates, tests and changes connectors | **Have**. list, create, test, delete, discover, ingest spec, rotate credentials | **Missing**. Not documented | **Missing**. Not documented | **Partial**. Connector Setup Assistant (cloud, beta, certified connectors) |
+| AI builds a connector from API docs | **Missing** | **Missing** | **Missing** | **Partial**. AI Assist in the Connector Builder (cloud, beta) |
+| Assistant runs and watches ingestion | **Have**. run_ingest, list_ingest_runs and get_cdc_health tools | **Missing** | **Missing** | **Partial**. Remote MCP server (private beta) |
+
+## Query Studio matrix: Databricks, Snowflake and Metabase
+
+Compiled 2026-10-07, same method. Query Studio is a main feature of its own,
+shared by BI and the lakehouse (product owner, 2026-10-07), so it is compared
+with the lakehouse platforms' SQL workspaces and with Metabase's SQL editor.
+The task list is backlog `QS-1` to `QS-5` and `SEC-9`, `SEC-19` to `SEC-21`.
+
+Summary: 29 capabilities. We have 4, have 11 partly and lack 11.
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Metabase |
+| --- | --- | --- | --- | --- |
+| Editor basics | **Partial**. Highlighting, line numbers, folding, run shortcut; no tabs, themes or command palette | **Have**. Themes, command palette, folding | **Have**. Split panes, folding | **Have** |
+| Schema browser beside the editor | **Not verified**. Not checked | **Have**. Search, type filter, insert names | **Have**. Database Explorer pane | **Have**. Data reference sidebar |
+| Autocomplete | **Partial**. Table names only | **Have**. Keywords, tables, columns, aliases | **Have**. Objects, columns, functions | **Have**. Tables, fields, snippets |
+| Format SQL | **Partial**. A small built-in formatter; no formatting rules | **Have**. With custom rules | **Have** | **Have**. Not for every database |
+| Several statements and run selection | **Not verified**. Not checked | **Have**. Result per statement | **Have**. Run selected or all | **Partial**. Run selection; one statement per question |
+| Several query tabs | **Not verified**. Not checked | **Have** | **Have** | **Missing** |
+| Draft kept across reloads and shareable links | **Have**. Draft in the browser; links open a query or a saved query | **Have**. Autosave | **Have** | **Partial**. Saved questions only |
+| Choice of engine | **Have**. ClickHouse or Trino | **Have**. SQL warehouses | **Have**. Warehouses | **Have**. Any connected database |
+| Masking and row filters on queries | **Have**. Rewritten before either engine | **Have** | **Have**. Ent+ | **Have**. Row and column security, Pro+ |
+| Parameters / variables | **Missing** | **Have**. Named parameters with widgets | **Missing**. Not supported in Workspaces | **Have**. Text, number, date, field filters, optional clauses |
+| Reuse another saved query inside SQL | **Missing** | **Missing** | **Missing** | **Have**. Reference a question as a CTE |
+| Snippets | **Missing** | **Have** | **Missing** | **Have**. Folder permissions on Pro+ |
+| Results grid | **Partial**. Sortable and typed, with run statistics; no filters, column statistics or cell inspector | **Have**. Filters and column profiling | **Have**. Column stats, inspector, selection stats | **Have**. Conditional formatting, mini bars |
+| Result size | **Partial**. 2,000 rows; the full result is still computed and buffered | **Have**. Up to 64,000 rows or 10 MB | **Have** | **Partial**. 2,000 by default, configurable |
+| Download results | **Partial**. Browser CSV of the 2,000 rows; a server CSV/Parquet route exists with no button | **Have**. CSV, TSV, Excel up to about 5 GB | **Have**. Full CSV export | **Have**. CSV, Excel, JSON |
+| Chart from results | **Partial**. Through 'save as SQL source' or the assistant | **Have**. About 20 chart types, add to dashboard | **Missing**. Retired with worksheets | **Have**. Any chart type |
+| Explore a SQL result without SQL | **Missing** | **Missing** | **Missing** | **Have**. Explore results in the query builder |
+| Stop a running query | **Partial**. Browser only; the server query keeps running | **Have**. Admins can also cancel others' queries | **Not verified** | **Not verified** |
+| Query history | **Partial**. Own last 200 in a side panel | **Have**. History page with filters | **Have**. 14 days with filters | **Partial**. Query log in usage analytics, Pro+ |
+| Query profile / plan | **Missing**. Plan always 'Not measured' | **Have**. Operator graph with insights | **Have**. Operator graph with insights | **Missing** |
+| Cost estimate and freshness before running | **Have**. EXPLAIN ESTIMATE with cost range and data age | **Missing** | **Missing** | **Missing** |
+| Saved queries | **Partial**. Create and list only; no edit or delete; listed for everyone | **Have**. Folders and sharing levels | **Have**. Shared workspaces with publish history | **Have**. Saved questions in collections with permissions |
+| Version history of a query | **Missing** | **Have** | **Have**. Shared workspaces | **Have**. Last 15 versions with revert |
+| Real-time co-editing | **Missing** | **Have** | **Missing** | **Missing** |
+| Git integration | **Missing** | **Have** | **Have** | **Partial**. Remote sync, Pro+ |
+| Configurable timeouts | **Missing**. Fixed 60 s | **Have**. Up to 2 days | **Have** | **Have**. 20 minutes by default |
+| Result caching | **Missing** | **Partial**. Warehouse result cache | **Partial**. Result cache | **Have**. Adaptive caching on all plans |
+| Time-travel picker | **Partial**. In the UI; not proven through the masking rewrite | **Partial**. SQL only | **Partial**. SQL only | **Missing** |
+| Alerts on a query result | **Missing**. Alerts exist only on dashboard metrics | **Have**. SQL alerts with schedules | **Have**. Alerts on a schedule or new data | **Have**. Alerts on saved questions |
+
+#### AI in Query Studio
+
+| Capability | RantAI Lakehouse | Databricks | Snowflake | Metabase |
+| --- | --- | --- | --- | --- |
+| Write SQL from plain language | **Partial**. Exists, but skips masking and permissions (finding 1) | **Have**. Genie Code | **Have**. Cortex Code | **Have**. Metabot, bring your own key on OSS |
+| Ask a question; the AI writes, runs, corrects and summarises | **Partial**. Agentic Ask exists, ungoverned | **Partial**. Genie agents are a separate product | **Partial**. Cortex Code in Workspaces | **Have**. Metabot answers with a chart |
+| Fix a failing query | **Missing** | **Have**. Quick Fix, Diagnose Error | **Have**. Fix failed SQL | **Have**. 'Have Metabot fix it' |
+| Inline AI completion while typing | **Missing** | **Have** | **Have**. Accept with Tab | **Partial**. Inline edit shortcut |
+| Explain or optimise a query | **Missing** | **Have**. /optimize | **Have**. Explain and optimise | **Missing** |
+| Filter results by describing the filter | **Missing** | **Have** | **Missing** | **Missing** |
+| Assistant knows the current query and results | **Have**. Query Studio sends its context to the assistant | **Have** | **Have**. @-mention tables | **Have** |
