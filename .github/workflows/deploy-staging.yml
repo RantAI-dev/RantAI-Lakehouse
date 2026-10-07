@@ -30,6 +30,11 @@ jobs:
         run: |
           cp .env.example .env
           cat .env.staging >> .env
+          # Paid provider credential, kept OUT of the repo (this repo is
+          # public): appended last so it wins over .env.example's empty
+          # `LLM_KEY=`. Unset secret -> empty value -> AI chat / agent /
+          # text-to-SQL keep degrading to 503, never a broken deploy.
+          echo "LLM_KEY=${{ secrets.LLM_KEY }}" >> .env
           echo "=== staging .env ready ==="
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
