@@ -1168,8 +1168,8 @@ pub(crate) fn question_words(user_messages: &[&str], terms: &[ChatTerm]) -> Hash
 ///
 /// 1. Every word of the term (same tokeniser and filters as the question's
 ///    words) is among `question`, in any order. A term left with no word
-///    after the filters never matches, so a term of only function words
-///    cannot bring its meaning into every question.
+///    after the filters never matches by this rule, so a term of only
+///    function words cannot bring its meaning into every question.
 /// 2. The lower-cased term stands as a phrase in one of the `messages`,
 ///    with no letter, digit or `_` next to it. This is for the terms the
 ///    tokeniser cannot hold whole: `q3` or `vip_user`, whose digits and `_`
@@ -2237,10 +2237,20 @@ mod tests {
     }
 
     #[test]
-    fn a_term_made_only_of_function_words_never_brings_a_meaning() {
+    fn a_term_of_only_function_words_does_not_match_a_question_without_the_phrase() {
         let terms = [term_meaning("the of", "everything at all")];
         let words = question_words(&["How many of the orders were there?"], &terms);
         assert_eq!(words, query(&["orders"]));
+    }
+
+    #[test]
+    fn a_term_of_only_function_words_matches_when_it_stands_as_a_phrase() {
+        let terms = [term_meaning("of the", "everything at all")];
+        let words = question_words(&["How many of the orders"], &terms);
+        assert!(
+            words.contains("everything") && words.contains("orders"),
+            "{words:?}"
+        );
     }
 
     #[test]

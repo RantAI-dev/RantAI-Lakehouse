@@ -2409,7 +2409,11 @@ pub async fn get_annotation(
 /// Postgres pool the gate refuses every caller except an unrestricted one,
 /// so [`ApiError::Unavailable`] for a missing pool reaches only that caller;
 /// the gate itself also answers `Unavailable` when it cannot read the tenant
-/// count. A caller the gate admits then gets `400` if the body is not JSON,
+/// count. When the deployment has more than one tenant and sets
+/// `CATALOG_TENANT_ID`, the gate also passes through the
+/// [`ApiError::NotFound`] (`404`) that `tenant_scope::resolve` returns for an
+/// `X-Tenant` header that is malformed or names a tenant the caller does not
+/// belong to, again before the body is read. A caller the gate admits then gets `400` if the body is not JSON,
 /// or if `id`/`owner`/`steward`/`description`/any `tags` entry exceeds its
 /// bound (see the module doc above), or a classified
 /// [`lakehouse_store::StoreError`] on any database failure (including a
