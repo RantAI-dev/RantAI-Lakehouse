@@ -1881,7 +1881,7 @@ mod tests {
         /// production `DAGSTER_URL` reachability check used to give
         /// the route "for free", minus the network dial. F2.10 NIT 6
         /// is the reason this helper exists: tests in this module
-        /// share state across the DAGSTER_URL boundary, and a sync
+        /// share state across the `DAGSTER_URL` boundary, and a sync
         /// helper cannot start a wiremock without blocking the
         /// runtime.
         async fn state_with_dagster(pool: &sqlx::PgPool, server_uri: &str) -> AppState {
@@ -2028,6 +2028,11 @@ mod tests {
         /// The wiremock-backed [`state_with_dagster`] gives the route
         /// its Dagster probe without dialing a real host (F2.10
         /// NIT 6).
+        ///
+        /// The belt-and-braces persisted-state check reads back
+        /// through `pipelines::get_definition` — the live row's
+        /// `transforms` column (`Pipeline` carries no `transforms`
+        /// field).
         #[sqlx::test(migrations = "../../migrations")]
         async fn restore_rejects_a_snapshot_whose_transform_the_grammar_fails(pool: sqlx::PgPool) {
             // 1. Create a pipeline the store will accept (any
@@ -2113,15 +2118,19 @@ mod tests {
             // Belt-and-braces: the live row's transform is the
             // good one (the original empty list), NOT the bad one
             // from the v=2 snapshot — the validator refused before
-            // any write happened, just like `update`'s case.
-            let pl_after = pipelines::get_pipeline(&pool, &pl.id)
+            // any write happened, just like `update`'s case. Read
+            // back through `pipelines::get_definition`, the
+            // live-row `transforms` column read `authored_detail`
+            // builds the `definition` payload from (`Pipeline`
+            // itself carries no `transforms` field).
+            let def_after = pipelines::get_definition(&pool, &pl.id)
                 .await
-                .expect("get_pipeline")
+                .expect("get_definition")
                 .expect("pl-a still exists");
             assert!(
-                pl_after.transforms.is_empty(),
+                def_after.transforms.is_empty(),
                 "the refused restore must not have written the v=2 transforms: got {:?}",
-                pl_after.transforms,
+                def_after.transforms,
             );
         }
 
@@ -2141,6 +2150,11 @@ mod tests {
         /// would return `Ok(None)` (the store's "no live row"
         /// sentinel) and the route would map that to a different
         /// 500-level failure, NOT a clean 404.
+        ///
+        /// The belt-and-braces persisted-state check reads back
+        /// through `pipelines::get_definition` — the live row's
+        /// `transforms` column (`Pipeline` carries no `transforms`
+        /// field).
         #[sqlx::test(migrations = "../../migrations")]
         async fn restore_404s_a_missing_version_on_a_live_pipeline(pool: sqlx::PgPool) {
             let pl = pipelines::create_pipeline(&pool, &create_input("pl-a", Vec::new()), None)
@@ -2169,15 +2183,18 @@ mod tests {
                 "the missing-version 404 must name the version: {message:?}"
             );
             // Belt-and-braces: the live row still exists and is
-            // unchanged — a 404 must not have touched it.
-            let pl_after = pipelines::get_pipeline(&pool, &pl.id)
+            // unchanged — a 404 must not have touched it. Read
+            // back through `pipelines::get_definition`, the
+            // live-row `transforms` column read (`Pipeline` itself
+            // carries no `transforms` field).
+            let def_after = pipelines::get_definition(&pool, &pl.id)
                 .await
-                .expect("get_pipeline")
+                .expect("get_definition")
                 .expect("pl-a still exists");
             assert!(
-                pl_after.transforms.is_empty(),
+                def_after.transforms.is_empty(),
                 "a 404 must not have written anything: got transforms {:?}",
-                pl_after.transforms,
+                def_after.transforms,
             );
         }
 

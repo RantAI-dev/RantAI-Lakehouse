@@ -343,7 +343,7 @@ pub(super) async fn retry_pipeline_run(
             // survive the JSON encode and produce an invalid body
             // downstream. Reject now so the failure shape is the
             // same one the type-level mismatch above gives.
-            if !step_keys.iter().all(|v| v.is_string()) {
+            if !step_keys.iter().all(Value::is_string) {
                 return json!({
                     "error": "stepKeys must be an array of strings (e.g. [\"step_a\", \"step_b\"])"
                 });
@@ -579,24 +579,31 @@ mod t1_3_tests {
         const SENTINEL: &str = "TOOL_TRIGGER_BUILD_PY_SENTINEL_444000";
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_string_contains("listJobs"))
+            .and(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            // Production `list_jobs` makes ONE GraphQL call whose
+            // root field is `repositoriesOrError`; the response carries
+            // `nodes[].jobs[].name` (see `lakehouse-dagster::list_jobs`).
+            // Returning the `DEMO_BUILD_JOB` ("refresh_lakehouse") here
+            // makes `trigger_build` take the demo launch path and call
+            // `launchRun(DEMO_BUILD_JOB)`, whose mock below answers
+            // `PythonError` so the FIXED refusal body is the assertion.
+            // Earlier revisions of this test matched the queries
+            // `listJobs` / `listJobsForRepository` from the console
+            // client, but `list_jobs` does NOT emit either query — the
+            // mock never matched, the response shape was missing
+            // `nodes[].jobs[].name`, and `list_jobs` failed to
+            // deserialize so `trigger_build` returned the early
+            // "could not be reached" error instead of the launch
+            // failure this test pins.
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "repositoriesOrError": {
                     "__typename": "RepositoryConnection",
                     "nodes": [{
-                            "name": "demo_repo",
-                            "locationNames": ["demo_loc"],
-                        }]
+                        "jobs": [{ "name": "refresh_lakehouse" }],
+                    }]
                 } }
-            })))
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_string_contains(
-                "listJobsForRepository",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{ "name": "demo_build_job" }]
             })))
             .mount(&server)
             .await;
@@ -645,24 +652,24 @@ mod t1_3_tests {
         const SENTINEL: &str = "TOOL_TRIGGER_AUTHORED_PY_SENTINEL_555111";
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_string_contains("listJobs"))
+            .and(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            // Production `list_jobs` returns the named jobs in this code
+            // location; `trigger_build` only takes the demo launch path
+            // when `DEMO_BUILD_JOB` (`refresh_lakehouse`) is present,
+            // so the mock here returns the `authored__*` jobs the test
+            // asserts on (the per-pipeline `launchRun` mock below
+            // answers `PythonError`, and each errored pipeline is
+            // recorded as a `skipped` entry). See the demo-path test
+            // above for the same production-vs-test query mismatch.
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "repositoriesOrError": {
                     "__typename": "RepositoryConnection",
                     "nodes": [{
-                            "name": "demo_repo",
-                            "locationNames": ["demo_loc"],
-                        }]
+                        "jobs": [{ "name": "authored__orders" }],
+                    }]
                 } }
-            })))
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_string_contains(
-                "listJobsForRepository",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{ "name": "authored__orders" }]
             })))
             .mount(&server)
             .await;

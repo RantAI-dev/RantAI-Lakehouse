@@ -1751,7 +1751,7 @@ const RUN_CONFIG_MAX_BYTES: usize = 64 * 1024;
 ///     `transform_grammar` config is validated client-side by the
 ///     form and never reaches Dagster as `runConfig`. F2.5 step 3.
 ///   - CRON jobs (no Dagster config) are refused by absence — they
-///     have no config_schema to gate.
+///     have no `config_schema` to gate.
 ///
 /// Each entry is `(job_name, &[ops.<op>.config.<key> paths])`. Any
 /// subset of the listed paths is allowed; anything else at any depth
@@ -1885,15 +1885,17 @@ pub async fn trigger(
     // site relies on.
     let run_config = body.and_then(|Json(b)| b.run_config);
     // F2.5: when the caller sent a run_config, check its shape FIRST
-    // (object, size, allowlist match) before we ever talk to Dagster.
-    // A non-object, oversized, or non-allowlisted payload is a 400/413
-    // we can answer locally — no need to round-trip to Dagster just to
-    // refuse. Dagster would accept any of these shapes, so this is the
-    // route layer's only chance to apply the bound.
-    if let Some(cfg) = run_config.as_ref() {
-        if let Err(response) = check_run_config_shape(&id, cfg) {
-            return response;
-        }
+    // (object, size, `pl-` refusal, REFUSED hint) before we ever talk
+    // to Dagster. These are refusals the route can resolve locally
+    // without contact with the orchestrator — a non-object or oversized
+    // body is a 400/413; a `pl-…` id or a job in
+    // [`REFUSED_RUN_CONFIG_HINT`] is a 400 naming the dedicated route.
+    // The ALLOWLIST check is NOT here — see the comment on
+    // [`check_run_config_shape`] for why it runs after validation.
+    if let Some(cfg) = run_config.as_ref()
+        && let Err(response) = check_run_config_shape(&id, cfg)
+    {
+        return *response;
     }
     // F2.6 (PR #59 review): resolve the job name BEFORE validation.
     // Before F2.6, `validate_run_config(&id, cfg)` was called with the
@@ -1917,42 +1919,28 @@ pub async fn trigger(
     // 400 the route's contract already defines. See
     // [`ConfigValidationOutcome::CannotValidate`] for why the old
     // fall-through on `NotFound` was a bug.
-    if let Some(cfg) = run_config.as_ref() {
-        match state.dagster.validate_run_config(&job, cfg).await {
-            Ok(ConfigValidationOutcome::Valid) => {}
-            Ok(ConfigValidationOutcome::Invalid { errors }) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    ApiJson(build_config_error_body(errors)),
-                )
-                    .into_response();
-            }
-            // F2.6 (PR #59 review): fail closed. `NotFound`
-            // (PipelineNotFoundError against the RESOLVED job name)
-            // and `CannotValidate` (InvalidSubsetError / PythonError /
-            // unknown typename) BOTH refuse the launch — neither
-            // outcome means "Dagster verified the config," so a
-            // launch on either would run a job whose config we could
-            // not match against the schema. The 503 body is a fixed
-            // string; the structured 400 path is reserved for the
-            // `Invalid` variant only.
-            Ok(ConfigValidationOutcome::NotFound | ConfigValidationOutcome::CannotValidate) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({
-                        "error": "orchestrator refused the launch: could not validate run config"
-                    })),
-                )
-                    .into_response();
-            }
-            Err(err) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({ "error": js_error(err) })),
-                )
-                    .into_response();
-            }
-        }
+    if let Some(cfg) = run_config.as_ref()
+        && let Some(response) = validate_run_config_response(&state, &job, cfg).await
+    {
+        return response;
+    }
+    // F2.5: the ALLOWLIST check runs AFTER `Valid`, not before. The
+    // route refused an unknown job (e.g. `not_a_job`) with a 400 "no
+    // runConfig is allowed for this job" before F2.6 — the check
+    // ran first and answered locally, so `validate_run_config` was
+    // never called and the route never saw the orchestrator's
+    // `NotFound`. After F2.6 the allowlist check is the LAST gate
+    // before `launch_run` — Dagster has confirmed the config is
+    // valid against the resolved job's schema, and now the route
+    // decides whether THIS caller is allowed to send THIS shape to
+    // that job. A `not_a_job` now reaches Dagster, gets `NotFound`,
+    // and returns the 503 above; an allowlisted job with an unknown
+    // top-level key still 400s, and a job NOT in the allowlist
+    // still 400s with the same "no runConfig is allowed" body.
+    if let Some(cfg) = run_config.as_ref()
+        && let Err(response) = check_run_config_allowlist(&id, cfg)
+    {
+        return *response;
     }
     // `configKeys` for the audit column are the TOP-LEVEL keys of the
     // supplied config — never the values. The audit column carries a
@@ -2015,8 +2003,9 @@ pub async fn trigger(
     }
 }
 
-/// F2.5 (PR #59 review): the route-side check on `runConfig` BEFORE
-/// `validate_run_config` is called. Three layers, in order:
+/// F2.5 (PR #59 review): the route-side shape-and-refusal check on
+/// `runConfig` BEFORE `validate_run_config` is called. Three layers,
+/// in order:
 ///
 /// 1. The body MUST be a JSON object — string, array, number, bool
 ///    and null are all refused with 400. Dagster's `RunConfigData`
@@ -2026,74 +2015,151 @@ pub async fn trigger(
 /// 2. The serialized size MUST be `<= RUN_CONFIG_MAX_BYTES` (64 KiB).
 ///    Larger bodies are a 413 — distinct from the 400 above so a
 ///    client can tell "shrink the body" from "fix the body."
-/// 3. The job's allowlist:
-///    - `pl-…` ids: refused with a 400 naming that authored
-///      pipelines take no runConfig at all.
-///    - jobs in [`REFUSED_RUN_CONFIG_JOBS`]: refused with a 400
-///      naming the dedicated route (see [`REFUSED_RUN_CONFIG_HINT`]).
-///      These jobs HAVE config schemas in Dagster, but the per-run
-///      input names a resource the caller needs another permission
-///      for (`connector:manage` for ingest, `agent:manage` for the
-///      LLM-loop agent run) — sending the config through this route
-///      would let a `pipeline:write` holder start an ingest for any
-///      `connector_id` without holding the matching permission, the
-///      exact bug PR #59 identifies.
-///    - jobs in [`ALLOWED_RUN_CONFIG`]: every top-level key in the
-///      config must match an allowlisted path's prefix; an unknown
-///      top-level key names the offending key in the 400 body.
-///    - jobs NOT in either table: refused with a 400 — "no runConfig
-///      is allowed for this job," same posture as the wrong-path
-///      refusal above.
+/// 3. Refusals the route can resolve locally without talking to
+///    Dagster — authored (`pl-…`) ids refuse a `runConfig` outright
+///    (their transforms are validated by the form, never reaching
+///    Dagster as `runConfig`); jobs in [`REFUSED_RUN_CONFIG_HINT`]
+///    (e.g. `ingest_job` / `agent_run_job`) refuse with a 400 that
+///    names the dedicated route the caller must use. These are
+///    checked BEFORE `validate_run_config` so a job whose config
+///    names a resource the caller lacks permission for (`connector
+///    :manage` for ingest, `agent:manage` for the LLM-loop run)
+///    never reaches Dagster at all.
 ///
+/// The allowlist check itself is a separate step,
+/// [`check_run_config_allowlist`], called AFTER `validate_run_config`
+/// returns `Valid` — F2.6: validation must run against the RESOLVED
+/// job name and a `NotFound` from validation is a 503, NOT a fall-
+/// through to `launch_run`. Putting the allowlist check after
+/// validation means the route never refuses an unknown job with a
+/// "no runConfig is allowed for this job" 400; the route refuses it
+/// with the orchestrator's own "we could not validate this config
+/// against a job we don't know" 503. AGENTS.md principle 3, fail
+/// closed.
+///
+/// F2.6 (PR #59 review): translate a [`ConfigValidationOutcome`] into
+/// the route layer's response. Split out from [`trigger`] so the route
+/// stays under `clippy::too_many_lines` without changing behavior —
+/// `None` means "validated, proceed to launch" and `Some(response)` is
+/// the refusal body the route returns verbatim.
+///
+/// `Invalid` keeps the structured 400 body the contract defines;
+/// `NotFound` (`PipelineNotFoundError` against the RESOLVED job name)
+/// and `CannotValidate` (`InvalidSubsetError` / `PythonError` / unknown
+/// `__typename`) BOTH refuse the launch — neither outcome means
+/// "Dagster verified the config," so a launch on either would run a
+/// job whose config we could not match against the schema. The 503
+/// body is a fixed string (AGENTS.md principle 4 — upstream detail is
+/// logged at the dagster crate boundary, never carried into a
+/// response); the structured 400 path is reserved for the `Invalid`
+/// variant only.
+async fn validate_run_config_response(
+    state: &AppState,
+    job: &str,
+    cfg: &Value,
+) -> Option<Response> {
+    match state.dagster.validate_run_config(job, cfg).await {
+        Ok(ConfigValidationOutcome::Valid) => None,
+        Ok(ConfigValidationOutcome::Invalid { errors }) => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                ApiJson(build_config_error_body(errors)),
+            )
+                .into_response(),
+        ),
+        Ok(ConfigValidationOutcome::NotFound | ConfigValidationOutcome::CannotValidate) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({
+                    "error": "orchestrator refused the launch: could not validate run config"
+                })),
+            )
+                .into_response(),
+        ),
+        Err(err) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// Returns `Ok(())` when the config passes, `Err(response)` with the
 /// ready-to-return [`Response`] otherwise. Lives as a free function so
 /// the in-file tests can call it without going through the route
 /// extraction (the route still drives it through [`trigger`]).
-fn check_run_config_shape(id: &str, cfg: &Value) -> Result<(), Response> {
+fn check_run_config_shape(id: &str, cfg: &Value) -> Result<(), Box<Response>> {
     // (1) Must be an object.
     if !cfg.is_object() {
-        return Err(bad_request_run_config("runConfig must be a JSON object"));
+        return Err(Box::new(bad_request_run_config(
+            "runConfig must be a JSON object",
+        )));
     }
     // (2) Size cap (serialized). `serde_json::to_vec` round-trips the
     //     Value the body parser already built; a failure here is a
     //     Value the body produced that is not serializable, which is
     //     the route layer's defense to err on the safe side (413) so
     //     the orchestrator is never asked about it.
-    let serialized_len = serde_json::to_vec(cfg)
-        .map(|v| v.len())
-        .unwrap_or(usize::MAX);
+    let serialized_len = serde_json::to_vec(cfg).map_or(usize::MAX, |v| v.len());
     if serialized_len > RUN_CONFIG_MAX_BYTES {
-        return Err(payload_too_large_run_config());
+        return Err(Box::new(payload_too_large_run_config()));
     }
     // (3a) Authored pipelines take no runConfig at all.
     if id.starts_with("pl-") {
-        return Err(bad_request_run_config(
+        return Err(Box::new(bad_request_run_config(
             "authored pipelines take no runConfig",
-        ));
+        )));
     }
     // (3b) Refused-by-name jobs: name the dedicated route in the body.
+    //      These are the ones whose config names a resource the caller
+    //      needs another permission for; refuse BEFORE talking to
+    //      Dagster so the orchestrator never sees them.
     if let Some((_, hint)) = REFUSED_RUN_CONFIG_HINT.iter().find(|(name, _)| *name == id) {
-        return Err(bad_request_run_config(hint));
+        return Err(Box::new(bad_request_run_config(hint)));
     }
-    // (3c) Allowlisted job entries.
+    Ok(())
+}
+
+/// F2.5 (PR #59 review): the allowlist half of the runConfig shape
+/// check, called AFTER `validate_run_config` returns `Valid` (see
+/// [`check_run_config_shape`] for the rationale). Two outcomes:
+///
+/// - A job in [`ALLOWED_RUN_CONFIG`]: every top-level key in the
+///   config must match an allowlisted path's prefix; an unknown
+///   top-level key names the offending key in the 400 body.
+/// - A job NOT in either table: refused with a 400 — "no runConfig
+///   is allowed for this job," same posture as the wrong-path refusal
+///   above.
+fn check_run_config_allowlist(id: &str, cfg: &Value) -> Result<(), Box<Response>> {
     match ALLOWED_RUN_CONFIG
         .iter()
         .find(|(name, _)| *name == id)
         .map(|(_, paths)| *paths)
     {
-        None => Err(bad_request_run_config(
+        None => Err(Box::new(bad_request_run_config(
             "no runConfig is allowed for this job",
-        )),
+        ))),
         Some(allowed_paths) => {
-            let obj = cfg.as_object().expect("checked is_object above");
+            // The route calls [`check_run_config_shape`] first, so `cfg`
+            // is always an object here; the `let … else` (AGENTS.md —
+            // no `expect` outside tests) keeps a caller that skips the
+            // shape check failing closed with the SAME 400 text
+            // [`check_run_config_shape`] uses, never a panic.
+            let Some(obj) = cfg.as_object() else {
+                return Err(Box::new(bad_request_run_config(
+                    "runConfig must be a JSON object",
+                )));
+            };
             for top_key in obj.keys() {
                 if !allowed_paths
                     .iter()
                     .any(|p| p.starts_with(&format!("{top_key}.")))
                 {
-                    return Err(bad_request_run_config(&format!(
+                    return Err(Box::new(bad_request_run_config(&format!(
                         "unknown top-level key {top_key:?} in runConfig"
-                    )));
+                    ))));
                 }
             }
             Ok(())
@@ -3537,27 +3603,24 @@ pub async fn cancel_run(
         .and_then(|info| info.start_time)
         .map(iso_from_unix_seconds);
     match state.dagster.terminate_run(&run_id).await {
-        Ok(outcome) if outcome.failure.is_none() => (
-            StatusCode::OK,
-            ApiJson(run_mutation_body(
-                &run_id,
-                "cancelled",
-                started_at.as_deref(),
-            )),
-        )
-            .into_response(),
-        // F2.7: `outcome.failure` is a typed `LaunchFailure`. The
-        // upstream detail (Dagster's `message` / `errors[].message` /
-        // `__typename`) was logged at the dagster crate boundary —
-        // see `lakehouse_dagster::DgClient::terminate_run`. The
-        // response body is fixed; the body's status comes from the
-        // variant.
-        Ok(outcome) => dagster_mutation_failure(
-            outcome
-                .failure
-                .expect("checked above: failure.is_none() is the success arm"),
-            MutationKind::Cancel,
-        ),
+        Ok(outcome) => match outcome.failure {
+            None => (
+                StatusCode::OK,
+                ApiJson(run_mutation_body(
+                    &run_id,
+                    "cancelled",
+                    started_at.as_deref(),
+                )),
+            )
+                .into_response(),
+            // F2.7: `outcome.failure` is a typed `LaunchFailure`. The
+            // upstream detail (Dagster's `message` / `errors[].message` /
+            // `__typename`) was logged at the dagster crate boundary —
+            // see `lakehouse_dagster::DgClient::terminate_run`. The
+            // response body is fixed; the body's status comes from the
+            // variant.
+            Some(failure) => dagster_mutation_failure(failure, MutationKind::Cancel),
+        },
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "error": js_error(err) })),
@@ -3703,8 +3766,8 @@ pub async fn retry_run(
                 .into_response();
         }
     };
-    match outcome {
-        outcome if outcome.failure.is_none() => {
+    match outcome.failure {
+        None => {
             let new_id = outcome.run_id.unwrap_or(run_id);
             // The NEW run's id, just launched: `Dagster` has not populated
             // its `startTime` yet at the instant this handler returns, so
@@ -3719,12 +3782,7 @@ pub async fn retry_run(
         // F2.7: `outcome.failure` is a typed `LaunchFailure`; the
         // response body is the FIXED re-execution refusal message.
         // Dagster's own text was logged at the dagster crate boundary.
-        outcome => dagster_mutation_failure(
-            outcome
-                .failure
-                .expect("checked above: failure.is_none() is the success arm"),
-            MutationKind::Retry,
-        ),
+        Some(failure) => dagster_mutation_failure(failure, MutationKind::Retry),
     }
 }
 
@@ -3859,6 +3917,11 @@ fn dagster_mutation_failure(
 /// most accurate of the two fixed verbs (F2.7 — there is no upstream text
 /// to match against). Both bodies are still classified text, no
 /// orchestrator detail.
+///
+/// `Copy` because it is a fieldless tag: deriving it (rather than taking
+/// `&MutationKind` in [`dagster_mutation_failure`]) satisfies
+/// `clippy::needless_pass_by_value` without changing any call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationKind {
     Cancel,
     Retry,
@@ -6147,7 +6210,7 @@ mod tests {
                 Some(Extension(fixture_unrestricted_principal())),
                 HeaderMap::new(),
                 Path("r1".to_owned()),
-                Bytes::from_static(br#"{}"#),
+                Bytes::from_static(br"{}"),
             )
             .await;
             assert_eq!(
@@ -6212,7 +6275,7 @@ mod tests {
                 Some(Extension(fixture_unrestricted_principal())),
                 HeaderMap::new(),
                 Path("r1".to_owned()),
-                Bytes::from_static(br#"{}"#),
+                Bytes::from_static(br"{}"),
             )
             .await;
             assert_eq!(
@@ -6318,6 +6381,22 @@ mod tests {
         async fn cancel_returns_404_with_fixed_body_when_dagster_reports_run_not_found() {
             const SENTINEL: &str = "CANCEL_NOT_FOUND_SENTINEL_777";
             let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError",
+                ))
+                // The `pipeline_run_pipeline_name` precondition: returns a
+                // `Run` so the cancel path proceeds past the scope check
+                // (matching the 409 case above — the precondition mock
+                // has to be present for `terminateRun` to fire).
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "pipelineName": "ingest_job"
+                    } }
+                })))
+                .mount(&server)
+                .await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains("terminateRun"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -7508,7 +7587,7 @@ mod tests {
                     "data": { "isPipelineConfigValid": {
                         "__typename": "RunConfigValidationInvalid",
                         "errors": [
-                            { "path": ["ops", "run_x", "config", "k"],
+                            { "path": ["ops", "silver_rebuild_op", "config", "target_table"],
                               "reason": "RUNTIME_TYPE_MISMATCH",
                               "message": format!("value '1' is not a String {SENTINEL}") }
                         ] }
@@ -7524,13 +7603,15 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
-                run_config: Some(json!({ "ops": { "run_x": { "config": { "k": 1 } } } })),
+                run_config: Some(json!({
+                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
+                })),
             });
             let response = trigger(
                 State(state),
                 Some(Extension(fixture_user_principal())),
                 HeaderMap::new(),
-                Path("ingest_job".to_owned()),
+                Path("silver_rebuild".to_owned()),
                 Some(body),
             )
             .await;
@@ -7549,7 +7630,10 @@ mod tests {
             // The whole response shape.
             let errors = v["errors"].as_array().expect("errors array");
             assert_eq!(errors.len(), 1);
-            assert_eq!(errors[0]["path"], json!(["ops", "run_x", "config", "k"]));
+            assert_eq!(
+                errors[0]["path"],
+                json!(["ops", "silver_rebuild_op", "config", "target_table"])
+            );
             assert_eq!(errors[0]["reason"], "RUNTIME_TYPE_MISMATCH");
             assert!(
                 errors[0].get("message").is_none(),
@@ -7573,7 +7657,7 @@ mod tests {
                     "data": { "isPipelineConfigValid": {
                         "__typename": "RunConfigValidationInvalid",
                         "errors": [
-                            { "path": ["ops", "run_x", "config", "k"],
+                            { "path": ["ops", "silver_rebuild_op", "config", "target_table"],
                               "reason": UPSTREAM_REASON,
                               "message": "upstream text" }
                         ] }
@@ -7589,13 +7673,15 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
-                run_config: Some(json!({ "ops": { "run_x": { "config": { "k": 1 } } } })),
+                run_config: Some(json!({
+                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
+                })),
             });
             let response = trigger(
                 State(state),
                 Some(Extension(fixture_user_principal())),
                 HeaderMap::new(),
-                Path("ingest_job".to_owned()),
+                Path("silver_rebuild".to_owned()),
                 Some(body),
             )
             .await;
@@ -7784,8 +7870,7 @@ mod tests {
                     .as_str()
                     .unwrap_or("")
                     .contains("POST /api/connectors/{id}/ingest/run"),
-                "400 body must name the dedicated connector route: got {}",
-                v
+                "400 body must name the dedicated connector route: got {v}",
             );
         }
 
@@ -7841,8 +7926,7 @@ mod tests {
                     .as_str()
                     .unwrap_or("")
                     .contains("POST /api/agents/employees/{id}/run"),
-                "400 body must name the dedicated agent route: got {}",
-                v
+                "400 body must name the dedicated agent route: got {v}",
             );
             // Mirror the `CannotValidate` / unknown-job refusal tests:
             // a refused job MUST NOT reach `launchRun`. The 500 mount
@@ -7962,8 +8046,7 @@ mod tests {
                     .as_str()
                     .unwrap_or("")
                     .contains("authored pipelines take no runConfig"),
-                "400 body must name the policy: got {}",
-                v
+                "400 body must name the policy: got {v}",
             );
         }
 
@@ -8072,8 +8155,7 @@ mod tests {
                     .as_str()
                     .unwrap_or("")
                     .contains("exceeds 65536 bytes"),
-                "413 body must name the cap: got {}",
-                v
+                "413 body must name the cap: got {v}",
             );
         }
 
@@ -8083,10 +8165,29 @@ mod tests {
         /// `silver_rebuild`, only `ops.silver_rebuild_op.target_table`
         /// is allowed — `resources` (a typical Dagster top-level key
         /// the user might think they can set) is not.
+        ///
+        /// F2.6: validation runs BEFORE the allowlist check, so the
+        /// wiremock has to return `Valid` for the `ops` path on
+        /// `silver_rebuild` (otherwise the route returns 503 first) and
+        /// the `launchRun` mock returns 500 because the allowlist
+        /// check 400s before launch. The mutation evidence: removing
+        /// `check_run_config_allowlist` from the `trigger` flow makes
+        /// this test fall through to the launchRun mock and the
+        /// assertion below catches the wrong status.
         #[tokio::test]
         async fn trigger_with_run_config_unknown_top_level_key_returns_400() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "isPipelineConfigValid": {
+                        "__typename": "PipelineConfigValidationValid",
+                        "pipelineName": "silver_rebuild" } }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
                 .respond_with(ResponseTemplate::new(500))
                 .mount(&server)
                 .await;
@@ -8094,6 +8195,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
                 run_config: Some(json!({
+                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } },
                     "resources": { "io_manager": { "config": { "path": "x" } } }
                 })),
             });
@@ -8115,8 +8217,7 @@ mod tests {
                     .as_str()
                     .unwrap_or("")
                     .contains("unknown top-level key \"resources\""),
-                "400 body must name the offending top-level key: got {}",
-                v
+                "400 body must name the offending top-level key: got {v}",
             );
         }
 
@@ -8189,7 +8290,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "data": { "isPipelineConfigValid": {
                         "__typename": "PipelineConfigValidationValid",
-                        "pipelineName": "ingest_job" } }
+                        "pipelineName": "silver_rebuild" } }
                 })))
                 .mount(&server)
                 .await;
@@ -8207,14 +8308,14 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
                 run_config: Some(json!({
-                    "ops": { "run_ingest": { "config": { "connector_id": "c1" } } }
+                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
             });
             let response = trigger(
                 State(state),
                 Some(Extension(fixture_user_principal())),
                 HeaderMap::new(),
-                Path("ingest_job".to_owned()),
+                Path("silver_rebuild".to_owned()),
                 Some(body),
             )
             .await;
@@ -8331,6 +8432,10 @@ mod tests {
         use lakehouse_store::audit::{AuditFilter, list};
 
         use super::super::*;
+        // The shared `tests`-level fixture, reached through `super`
+        // because this module's glob targets `super::super` (the
+        // production module), which does not carry `tests`'s items.
+        use super::fixture_user_principal;
         use crate::config::Config;
         use crate::routes::pipelines::TriggerBody;
 
@@ -8382,8 +8487,7 @@ mod tests {
             let state = state_for(&pool, &server.uri());
             let body = Json(TriggerBody {
                 run_config: Some(json!({
-                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } },
-                    "resources": { "io_manager": { "config": { "dir": "/tmp/x" } } }
+                    "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
             });
             let response = trigger(
@@ -8422,10 +8526,10 @@ mod tests {
                 .expect("audit args has configKeys array");
             let mut keys: Vec<String> = config_keys
                 .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                .filter_map(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
                 .collect();
             keys.sort();
-            assert_eq!(keys, vec!["ops".to_owned(), "resources".to_owned()]);
+            assert_eq!(keys, vec!["ops".to_owned()]);
             // The values themselves MUST NOT be present — the audit
             // row is a structured side-channel of "what was sent", not a
             // copy of the payload.

@@ -713,6 +713,7 @@ pub enum LaunchFailure {
 impl LaunchFailure {
     /// Lower-case single-word label for tests, logs, and structured
     /// JSON. NEVER carries upstream text.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotFound => "not_found",

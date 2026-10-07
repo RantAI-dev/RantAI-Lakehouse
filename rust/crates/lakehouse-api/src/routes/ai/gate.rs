@@ -631,7 +631,7 @@ mod tests {
     /// when one is supplied — a model that did not see the id or the
     /// config keys in its confirmation was confirming in the dark. The
     /// arm follows the existing Indonesian one-liner shape
-    /// ([`summary_for`]'s other WriteLow arms) so a UI rendering one
+    /// ([`summary_for`]'s other `WriteLow` arms) so a UI rendering one
     /// arm renders the other the same way.
     ///
     /// **Planned**: removing the `trigger_pipeline` arm from
