@@ -2085,6 +2085,13 @@ services:
       # OAuth2 client-credentials against `ops/oidc-mock`'s `/token`.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # Latent, same shape as `g3-maintenance-test-runner`: this runner
+      # also binds `./ops/g3a` READ-WRITE as root, so any local import
+      # added to `g3a_test.py` later would drop a root-owned
+      # `__pycache__/` that a self-hosted runner's next
+      # `actions/checkout` cannot `git clean` (EACCES). No local import
+      # exists today; this keeps the failure mode from ever arming.
+      PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3a_test.py"
@@ -2124,6 +2131,19 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # This runner binds `./ops/g3` READ-WRITE and runs as root
+      # (python:3.12-slim's default user). `g3_test.py`'s lazy `import
+      # bronze_catalog` (line ~188 — the file is mounted alongside it)
+      # compiles bytecode into `ops/g3/__pycache__/` as root:root; a
+      # self-hosted runner's NEXT `actions/checkout` then fails inside
+      # `git clean -ffdx` (EACCES on that directory), so the deploy
+      # breaks one run AFTER the one that wrote it — the failing step
+      # looks innocent because the write happened in the previous run.
+      # Bytecode caching inside a read-write bind mount buys nothing;
+      # skip it and the failure mode never arms. See the pre-checkout
+      # reclaim step in .github/workflows/deploy-staging.yml for the
+      # defense that catches writers this file does not know about.
+      PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3_test.py"
