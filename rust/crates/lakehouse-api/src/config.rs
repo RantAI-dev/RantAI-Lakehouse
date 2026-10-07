@@ -25,10 +25,11 @@ use uuid::Uuid;
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
-/// Only `PORT` can fail resolution: it is load-bearing and Rust-only (the
-/// TypeScript backend runs under Next.js and never binds a port itself), so
-/// an unparseable value refusing to boot is the correct, Rust-specific
-/// failure mode. `SMTP_PORT` deliberately has no equivalent error variant —
+/// Only `PORT`, `CATALOG_TENANT_ID` and `AI_DEFAULT_REPLY_LANGUAGE` can
+/// fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// backend runs under Next.js and never binds a port itself), so an
+/// unparseable value refusing to boot is the correct, Rust-specific failure
+/// mode. `SMTP_PORT` deliberately has no equivalent error variant —
 /// see the doc comment on [`Config::smtp_port`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -46,6 +47,36 @@ pub enum ConfigError {
     /// request-time surprise.
     #[error("CATALOG_TENANT_ID must be a valid UUID, got {0:?}")]
     InvalidCatalogTenantId(String),
+    /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
+    /// `"en"`.
+    ///
+    /// Fails config resolution rather than being ignored: a mistyped value
+    /// would leave every message too short to detect answered in the wrong
+    /// language, with nothing in the logs to explain it.
+    #[error("AI_DEFAULT_REPLY_LANGUAGE must be \"id\" or \"en\", got {0:?}")]
+    UnsupportedAiDefaultReplyLanguage(String),
+}
+
+/// The language the copilot answers in when the user's message is too short
+/// to tell (`AI_DEFAULT_REPLY_LANGUAGE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyLanguage {
+    /// `AI_DEFAULT_REPLY_LANGUAGE=id`.
+    Indonesian,
+    /// `AI_DEFAULT_REPLY_LANGUAGE=en`.
+    English,
+}
+
+impl ReplyLanguage {
+    /// The name the system prompt uses for this language, the same two names
+    /// `routes::ai::prompt::reply_language` returns for a detected one.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Indonesian => "Indonesian",
+            Self::English => "English",
+        }
+    }
 }
 
 /// Resolved application configuration.
@@ -594,6 +625,14 @@ pub struct Config {
     /// seeded `0002_seed_identity.sql` group tenant) — see the
     /// `docs/OPERATIONS.md` upgrade note.
     pub catalog_tenant_id: Option<Uuid>,
+    /// Language the copilot replies in when the latest chat message is too
+    /// short for `routes::ai::prompt::reply_language` to detect one
+    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// prompt's wording is then unchanged from before the setting existed
+    /// (the Latin-script line keeps its English fallback, a message with no
+    /// letters gets none). A detected language always wins over this
+    /// default.
+    pub ai_default_reply_language: Option<ReplyLanguage>,
     /// The commit this image was built from — `rust/Dockerfile`'s `ARG
     /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
     /// same convention `dagster/Dockerfile` already uses for the code
@@ -796,6 +835,7 @@ impl std::fmt::Debug for Config {
             .field("trino_health_url", &self.trino_health_url)
             .field("openfga_url", &self.openfga_url)
             .field("catalog_tenant_id", &self.catalog_tenant_id)
+            .field("ai_default_reply_language", &self.ai_default_reply_language)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
             .field("login_failure_window_secs", &self.login_failure_window_secs)
@@ -867,9 +907,17 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if `PORT` is set to a value that does not
-    /// parse as a `u16`. An unparseable `SMTP_PORT` does NOT error — see
-    /// [`Config::smtp_port`].
+    /// Returns [`ConfigError`] in three cases:
+    ///
+    /// - [`ConfigError::InvalidPort`], if `PORT` is set to a value that does
+    ///   not parse as a `u16`.
+    /// - [`ConfigError::InvalidCatalogTenantId`], if `CATALOG_TENANT_ID` is
+    ///   set and non-empty but is not a valid UUID.
+    /// - [`ConfigError::UnsupportedAiDefaultReplyLanguage`], if
+    ///   `AI_DEFAULT_REPLY_LANGUAGE` is set and non-empty but is neither
+    ///   `id` nor `en`.
+    ///
+    /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
         clippy::too_many_lines,
         reason = "one flat env->field mapping, one line per Config field; \
@@ -1042,6 +1090,16 @@ impl Config {
                 .map(|raw| {
                     raw.parse::<Uuid>()
                         .map_err(|_err| ConfigError::InvalidCatalogTenantId(raw))
+                })
+                .transpose()?,
+            // `truthy`, not a direct read: docker-compose.yml passes an empty
+            // string on every deployment that sets nothing, and that must
+            // mean unset, not a startup failure.
+            ai_default_reply_language: truthy(env, "AI_DEFAULT_REPLY_LANGUAGE")
+                .map(|raw| match raw.as_str() {
+                    "id" => Ok(ReplyLanguage::Indonesian),
+                    "en" => Ok(ReplyLanguage::English),
+                    _ => Err(ConfigError::UnsupportedAiDefaultReplyLanguage(raw)),
                 })
                 .transpose()?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
@@ -1733,5 +1791,65 @@ mod tests {
             err,
             ConfigError::InvalidCatalogTenantId("not-a-uuid".to_owned())
         );
+    }
+
+    fn env_with_default_reply_language(value: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AI_DEFAULT_REPLY_LANGUAGE".to_owned(), value.to_owned());
+        env
+    }
+
+    #[test]
+    fn the_default_reply_language_is_none_when_the_setting_is_absent() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, None);
+    }
+
+    #[test]
+    fn an_empty_default_reply_language_means_unset_not_an_error() {
+        // docker-compose.yml passes `${AI_DEFAULT_REPLY_LANGUAGE:-}`, an
+        // empty string on every deployment that sets nothing.
+        let cfg = Config::from_map(&env_with_default_reply_language("")).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, None);
+    }
+
+    #[test]
+    fn the_default_reply_language_id_parses_to_indonesian() {
+        let cfg = Config::from_map(&env_with_default_reply_language("id")).unwrap();
+        assert_eq!(
+            cfg.ai_default_reply_language,
+            Some(ReplyLanguage::Indonesian)
+        );
+        assert_eq!(ReplyLanguage::Indonesian.name(), "Indonesian");
+    }
+
+    #[test]
+    fn the_default_reply_language_en_parses_to_english() {
+        let cfg = Config::from_map(&env_with_default_reply_language("en")).unwrap();
+        assert_eq!(cfg.ai_default_reply_language, Some(ReplyLanguage::English));
+        assert_eq!(ReplyLanguage::English.name(), "English");
+    }
+
+    #[test]
+    fn an_upper_case_default_reply_language_is_refused() {
+        let err = Config::from_map(&env_with_default_reply_language("ID"))
+            .expect_err("only the lower-case values id and en are accepted");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiDefaultReplyLanguage("ID".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unknown_default_reply_language_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with_default_reply_language("fr"))
+            .expect_err("a language other than id or en must fail config resolution");
+        assert_eq!(
+            err,
+            ConfigError::UnsupportedAiDefaultReplyLanguage("fr".to_owned())
+        );
+        let message = err.to_string();
+        assert!(message.contains("\"id\""), "{message}");
+        assert!(message.contains("\"en\""), "{message}");
     }
 }
