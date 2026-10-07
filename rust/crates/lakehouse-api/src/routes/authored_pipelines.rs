@@ -142,10 +142,10 @@ pub enum CallerScope {
 ///    exists, scope by its `tenant_id`; (b) if the live row is gone
 ///    (deleted pipeline; the `pipeline_definition_version` table
 ///    retains the history), consult the version rows' `tenant_id`
-///    column (migration `0057`). Any version with a tenant that
+///    column (migration `0060`). Any version with a tenant that
 ///    matches the caller's scope makes the row in scope; NULL-tenant
 ///    versions are visible only to an `Unrestricted` caller (same
-///    rule migration `0057` documents in its header). This is the
+///    rule migration `0060` documents in its header). This is the
 ///    no-existence-oracle rule extended to deleted pipelines — a
 ///    tenant A caller gets 404 whether tenant B's pipeline exists
 ///    today, was deleted yesterday, or never existed.

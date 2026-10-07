@@ -297,8 +297,8 @@ pub struct PipelineVersionMeta {
     /// `pipeline_id`).
     pub version: i32,
     /// `"created" | "updated" | "restored" | "deleted" | "baseline"` —
-    /// fixed vocabulary from migration `0057`'s CHECK constraint. The
-    /// fifth value, `"baseline"`, is the migration-`0057` backfill's own
+    /// fixed vocabulary from migration `0060`'s CHECK constraint. The
+    /// fifth value, `"baseline"`, is the migration-`0060` backfill's own
     /// marker; a row's `baseline` event is by construction a synthetic
     /// insert (no real create/update/restore/delete path writes it).
     pub event: String,

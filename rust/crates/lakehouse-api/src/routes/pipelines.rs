@@ -10368,7 +10368,7 @@ mod tests {
         }
 
         /// A version row whose `tenant_id` was never stamped (the
-        /// `tenant_id IS NULL` branch of migration `0057`'s CHECK
+        /// `tenant_id IS NULL` branch of migration `0060`'s CHECK
         /// widening) is visible to the unrestricted caller only — a
         /// restricted caller gets the standard 404.
         #[sqlx::test(migrations = "../../migrations")]
