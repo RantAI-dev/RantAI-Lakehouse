@@ -81,6 +81,11 @@ async function askQuestion(question: string, signal?: AbortSignal): Promise<NlAn
       json?.detail ?? json?.error ?? "The assistant could not answer. Try again."
     );
   }
+  // A 200 whose body is not a JSON object (a proxy's HTML page, say) would
+  // otherwise read as an empty answer and show the user nothing, with no error.
+  if (json === null || typeof json !== "object" || Array.isArray(json)) {
+    throw new ServiceError("unavailable", "The assistant could not answer. Try again.");
+  }
   return chatAnswerFromBody(json);
 }
 
