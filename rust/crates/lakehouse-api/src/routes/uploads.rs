@@ -50,10 +50,24 @@
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
+//! # Excel workbooks
+//!
+//! An `.xls` or `.xlsx` is accepted (ADR 0014, amendment of 2026-10-07): the
+//! workbook is stored as it arrived, the preview converts the chosen sheet to
+//! delimited text in memory ([`crate::upload_workbook`]) and shows it through
+//! the same preview as a CSV, and an ingest stores that text as a CSV object
+//! beside the original ([`converted_key`]) and launches the unchanged
+//! `file_ingest_job` on it with a fixed dialect (UTF-8, comma). Whether an
+//! upload IS a workbook is decided by its stored name AND its first bytes
+//! ([`is_workbook`]): a text export named `.xls` (the file that motivated
+//! the feature) is still text. The chosen sheet cannot go in the job's run
+//! configuration (its schema is closed and the job does not change), so it is
+//! recorded in the upload's `parse_options` and in the audit event.
+//!
 //! # Statuses
 //!
 //! Every refusal of the upload itself (no part, empty, too large, a workbook
-//! or another binary) is a 400 with a fixed sentence; `lakehouse_core::
+//! that is not an `.xls` or `.xlsx` or does not open, or another binary) is a 400 with a fixed sentence; `lakehouse_core::
 //! ApiError` has no 413 and this change does not add one.
 
 use std::collections::HashMap;
@@ -91,6 +105,7 @@ use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
+use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
 /// Largest file this endpoint accepts, in bytes.
 ///
@@ -113,6 +128,16 @@ const PREVIEW_BYTES: usize = 256 * 1024;
 
 /// Rows the preview returns.
 const PREVIEW_ROWS: usize = 20;
+
+/// How many records of a converted sheet the preview reads. A workbook is read
+/// whole to be converted, but the preview runs on text, and a header-row
+/// change re-runs it: a prefix keeps that cheap. A header row chosen past this
+/// shows no columns, as for a text file whose head is shorter than the row.
+const WORKBOOK_PREVIEW_RECORDS: usize = 2000;
+
+/// How many leading bytes tell a workbook from text for an upload that is
+/// named like one (the magic numbers are four bytes).
+const SNIFF_PROBE_BYTES: usize = 8;
 
 /// Uploads one `GET /api/uploads` returns, newest first. There is no paging:
 /// an older upload is not listed.
@@ -162,11 +187,12 @@ const NO_FILE_PART: &str = "The form has no part named file.";
 const UNREADABLE: &str = "The upload could not be read.";
 const EMPTY_FILE: &str = "The file is empty.";
 const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
-const WORKBOOK: &str = "This looks like an Excel workbook or a zip archive. Only delimited text files (CSV, TSV) can be uploaded; save the sheet as CSV first.";
-const PARQUET: &str =
-    "This looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded.";
-const OTHER_BINARY: &str =
-    "This is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.";
+const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+const PARQUET: &str = "This looks like a Parquet file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.";
+const OTHER_BINARY: &str = "This is not a delimited text file or an Excel workbook. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.";
+const EMPTY_SHEET: &str = "That sheet is empty, so there is nothing to load.";
+const SHEET_RULE: &str = "sheet must be text.";
+const CONVERSION_FAILED: &str = "The workbook could not be converted.";
 const BODY_NOT_AN_OBJECT: &str = "The request body must be a JSON object.";
 /// The sentence for a table name [`table_name_problem`] refuses, in words a
 /// person can follow (review finding C1). T10's `tableNameProblem` in the
@@ -344,6 +370,10 @@ pub struct CreateResponse {
     /// that loading it again with "add" doubles its rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     duplicate_of: Option<UploadView>,
+    /// For a workbook: its sheets and the one a preview reads when none is
+    /// asked for. Absent for a text file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workbook: Option<WorkbookInfo>,
 }
 
 /// `POST /api/uploads/{id}/ingest`'s response.
@@ -396,6 +426,53 @@ fn storage_key(tenant: &str, id: &str, filename: &str) -> String {
         format!("{PREFIX}/{tenant}/{id}")
     } else {
         format!("{PREFIX}/{tenant}/{id}.{ext}")
+    }
+}
+
+/// Whether a name (or a storage key, which ends in the stored extension) is
+/// one an Excel workbook may have: `.xls` or `.xlsx`. Necessary, not
+/// sufficient: a text file can carry either ([`is_workbook`]).
+fn has_workbook_name(name: &str) -> bool {
+    matches!(extension_of(name).as_str(), "xls" | "xlsx")
+}
+
+/// The key a workbook's converted sheet is stored under, beside the original:
+/// server-made like [`storage_key`], inside the same prefix.
+fn converted_key(storage_key: &str) -> String {
+    format!("{storage_key}.converted.csv")
+}
+
+/// Whether a stored upload is a workbook: named like one AND starting like
+/// one. A text export called `.xls` (ADR 0014's motivating file) is text. An
+/// upload that is not named like a workbook costs no storage read.
+///
+/// # Errors
+///
+/// 503 when the object store is unavailable.
+async fn is_workbook(state: &AppState, row: &Upload) -> Result<bool, ApiError> {
+    if !has_workbook_name(&row.storage_key) {
+        return Ok(false);
+    }
+    let store = UploadStore::connect(&state.config).await?;
+    let head = store
+        .head_bytes(&row.storage_key, SNIFF_PROBE_BYTES)
+        .await?;
+    Ok(upload_parse::sniff(&head) == Kind::Workbook)
+}
+
+/// Run a workbook read on a blocking thread (parsing is CPU work on up to
+/// 50 MB) and turn its refusal into a 400 with the refusal's own sentence. A
+/// task that did not finish is logged and answered with a fixed sentence.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, WorkbookError> + Send + 'static,
+) -> Result<T, ApiError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(done)) => Ok(done),
+        Ok(Err(refusal)) => Err(ApiError::BadRequest(refusal.to_string())),
+        Err(err) => {
+            tracing::warn!(%err, "a workbook conversion task did not finish");
+            Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
+        }
     }
 }
 
@@ -474,10 +551,21 @@ async fn read_file_part(mut form: Multipart) -> Result<FilePart, ApiError> {
     Err(ApiError::BadRequest(NO_FILE_PART.to_owned()))
 }
 
+/// What an acceptable upload is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Accepted {
+    Text,
+    /// Starts like a workbook and is named `.xls` or `.xlsx`; whether it
+    /// really opens is for `upload_workbook` to say.
+    Workbook,
+}
+
 /// Whether the bytes of an upload are acceptable: not empty, within the cap,
-/// and delimited text by their first bytes (never by the name or the type the
-/// browser claimed: the file that motivated this was called `.xls`).
-fn check_file(bytes: &[u8]) -> Result<(), ApiError> {
+/// and delimited text or a workbook by their first bytes (never by the type
+/// the browser claimed, and the name only to refuse a zip or OLE file that is
+/// not named `.xls` or `.xlsx`: the file that motivated this was called `.xls`
+/// and was text).
+fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
     if bytes.is_empty() {
         return Err(ApiError::BadRequest(EMPTY_FILE.to_owned()));
     }
@@ -485,7 +573,8 @@ fn check_file(bytes: &[u8]) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest(TOO_LARGE.to_owned()));
     }
     let message = match upload_parse::sniff(bytes) {
-        Kind::DelimitedText => return Ok(()),
+        Kind::DelimitedText => return Ok(Accepted::Text),
+        Kind::Workbook if has_workbook_name(filename) => return Ok(Accepted::Workbook),
         Kind::Workbook => WORKBOOK,
         Kind::Parquet => PARQUET,
         Kind::OtherBinary => OTHER_BINARY,
@@ -505,9 +594,10 @@ fn check_file(bytes: &[u8]) -> Result<(), ApiError> {
 /// # Errors
 ///
 /// 400 for a caller in no tenant, a request that is not a multipart form, no
-/// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], and a
-/// workbook, Parquet file or other binary (each with its own fixed
-/// sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
+/// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], a workbook
+/// that is not an `.xls` or `.xlsx` or does not open (damaged, password
+/// protected, no sheet), a Parquet file or another binary (each with its own
+/// fixed sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
 /// 503 when Postgres or the object store is unavailable.
 pub async fn create(
     State(state): State<AppState>,
@@ -528,7 +618,15 @@ pub async fn create(
         ApiError::BadRequest(NOT_MULTIPART.to_owned())
     })?;
     let part = read_file_part(form).await?;
-    check_file(&part.bytes)?;
+    let accepted = check_file(&part.bytes, &part.filename)?;
+    // A workbook is opened before anything is stored: only what opens is kept.
+    let workbook = match accepted {
+        Accepted::Text => None,
+        Accepted::Workbook => {
+            let bytes = part.bytes.clone();
+            Some(blocking(move || upload_workbook::list_sheets(&bytes)).await?)
+        }
+    };
 
     let id = format!("up-{}", Uuid::new_v4());
     let key = storage_key(&tenant_id.to_string(), &id, &part.filename);
@@ -586,6 +684,7 @@ pub async fn create(
         ApiJson(CreateResponse {
             upload: row.into(),
             duplicate_of: duplicate.map(Into::into),
+            workbook,
         }),
     ))
 }
@@ -888,6 +987,28 @@ pub struct PreviewQuery {
     /// Zero-based index of the record that holds the column names.
     #[serde(rename = "headerRow")]
     header_row: Option<String>,
+    /// For a workbook: the sheet to read (its default when absent). Ignored
+    /// for a text file.
+    sheet: Option<String>,
+}
+
+/// `GET /api/uploads/{id}/preview`'s response: the [`Preview`] and, for a
+/// workbook, which sheet it shows and which sheets there are.
+#[derive(Debug, Serialize)]
+pub struct PreviewResponse {
+    #[serde(flatten)]
+    preview: Preview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workbook: Option<WorkbookView>,
+}
+
+/// What a workbook preview adds to a [`Preview`].
+#[derive(Debug, Serialize)]
+pub struct WorkbookView {
+    /// The sheet the preview was read from.
+    sheet: String,
+    #[serde(flatten)]
+    info: WorkbookInfo,
 }
 
 /// The overrides a preview request asks for. A parameter that is given must
@@ -913,24 +1034,33 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
     })
 }
 
-/// `GET /api/uploads/{id}/preview?encoding=&delimiter=&headerRow=` — what the
-/// file appears to contain: `detected`, `using`, `columns`, at most 20
-/// `rows`, and `truncated`.
+/// `GET /api/uploads/{id}/preview?encoding=&delimiter=&headerRow=&sheet=` —
+/// what the file appears to contain: `detected`, `using`, `columns`, at most
+/// 20 `rows`, and `truncated`.
 ///
-/// Reads only the first [`PREVIEW_BYTES`] of the object (a range read), so
+/// Reads only the first [`PREVIEW_BYTES`] of a text object (a range read), so
 /// the cost does not grow with the file. Every detected value can be
 /// overridden; whatever the user settles on is what [`ingest`] is handed.
 ///
+/// A workbook is read whole, converted on a blocking thread, and its first
+/// [`WORKBOOK_PREVIEW_RECORDS`] records go through the same preview as a CSV,
+/// under the fixed dialect the load will use. `encoding` and `delimiter` are
+/// validated and then ignored for a workbook (they have no meaning there; the
+/// answer says `utf-8` and `,`), `headerRow` applies, and `sheet` picks the
+/// sheet. The answer adds `workbook`: the sheet read and the sheets there are.
+///
 /// # Errors
 ///
-/// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid; 404
+/// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid, and
+/// for a workbook that cannot be read, a `sheet` it does not have or a sheet
+/// over the cell limit (each with its own fixed sentence); 404
 /// for an unknown upload or another tenant's; 503 when Postgres or the object
 /// store is unavailable.
 pub async fn preview(
     State(state): State<AppState>,
     Path(id): Path<String>,
     query: Result<Query<PreviewQuery>, axum::extract::rejection::QueryRejection>,
-) -> ApiResult<ApiJson<Preview>> {
+) -> ApiResult<ApiJson<PreviewResponse>> {
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a preview query string could not be read");
         ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
@@ -941,15 +1071,44 @@ pub async fn preview(
         .ok_or_else(not_found)?;
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
+    if has_workbook_name(&row.storage_key) && upload_parse::sniff(&head) == Kind::Workbook {
+        let response = workbook_preview(&store, &row, query.sheet, overrides.header_row).await?;
+        return Ok(ApiJson(response));
+    }
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
-    Ok(ApiJson(upload_parse::preview(
-        &head,
-        head_is_truncated,
-        overrides,
-        PREVIEW_ROWS,
-    )))
+    Ok(ApiJson(PreviewResponse {
+        preview: upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS),
+        workbook: None,
+    }))
+}
+
+/// The preview of a workbook: its sheet as text, read the way the load reads
+/// it (UTF-8, comma).
+async fn workbook_preview(
+    store: &UploadStore,
+    row: &Upload,
+    sheet: Option<String>,
+    header_row: Option<usize>,
+) -> Result<PreviewResponse, ApiError> {
+    let bytes = store.get_all(&row.storage_key).await?;
+    let (info, name, csv, cut) = blocking(move || {
+        let read = upload_workbook::read_sheet(&bytes, sheet.as_deref())?;
+        let cut = read.data.rows() > WORKBOOK_PREVIEW_RECORDS;
+        let csv = read.data.to_csv(Some(WORKBOOK_PREVIEW_RECORDS));
+        Ok((read.info, read.data.name().to_owned(), csv, cut))
+    })
+    .await?;
+    let overrides = Overrides {
+        encoding: Some(Encoding::Utf8),
+        delimiter: Some(','),
+        header_row,
+    };
+    Ok(PreviewResponse {
+        preview: upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS),
+        workbook: Some(WorkbookView { sheet: name, info }),
+    })
 }
 
 // ── Ingest ───────────────────────────────────────────────────────────────
@@ -962,6 +1121,8 @@ struct IngestRequest {
     encoding: Encoding,
     delimiter: char,
     header_row: u64,
+    /// The sheet to load, for a workbook (`None`: its default sheet).
+    sheet: Option<String>,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -1016,10 +1177,16 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 }
 
 /// Validate the body of `POST /api/uploads/{id}/ingest`: `bronzeTable`,
-/// `mode` (optional, `replace` by default), `encoding`, `delimiter` and
-/// `headerRow`. All five are checked; the load uses exactly what was
-/// confirmed and nothing is guessed (ADR 0014, decision 3).
-fn parse_ingest_request(body: &[u8]) -> Result<IngestRequest, ApiError> {
+/// `mode` (optional, `replace` by default), `encoding`, `delimiter`,
+/// `headerRow` and, optional, `sheet`. All are checked; the load uses exactly
+/// what was confirmed and nothing is guessed (ADR 0014, decision 3).
+///
+/// For a `workbook` the dialect is not the user's to choose: the converted
+/// text is always UTF-8 with commas, `encoding` and `delimiter` are not read
+/// (a retry sends back what the upload recorded, which may carry them), and
+/// `sheet` picks the sheet. For a text file `sheet` has no meaning and is
+/// only checked to be text.
+fn parse_ingest_request(body: &[u8], workbook: bool) -> Result<IngestRequest, ApiError> {
     let bad = |message: &str| ApiError::BadRequest(message.to_owned());
     let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad(BODY_NOT_AN_OBJECT));
@@ -1033,13 +1200,23 @@ fn parse_ingest_request(body: &[u8]) -> Result<IngestRequest, ApiError> {
         Some(Value::String(text)) => LoadMode::parse(text).ok_or_else(|| bad(MODE_RULE))?,
         Some(_) => return Err(bad(MODE_RULE)),
     };
-    let encoding =
-        Encoding::parse(text_field(&fields, "encoding")?).ok_or_else(|| bad(ENCODING_RULE))?;
-    let delimiter = upload_parse::parse_delimiter(text_field(&fields, "delimiter")?)
-        .ok_or_else(|| bad(DELIMITER_RULE))?;
+    let (encoding, delimiter) = if workbook {
+        (Encoding::Utf8, ',')
+    } else {
+        (
+            Encoding::parse(text_field(&fields, "encoding")?).ok_or_else(|| bad(ENCODING_RULE))?,
+            upload_parse::parse_delimiter(text_field(&fields, "delimiter")?)
+                .ok_or_else(|| bad(DELIMITER_RULE))?,
+        )
+    };
     let header_row = match fields.get("headerRow") {
         None | Some(Value::Null) => return Err(bad("headerRow is required.")),
         Some(value) => value.as_u64().ok_or_else(|| bad(HEADER_ROW_RULE))?,
+    };
+    let sheet = match fields.get("sheet") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.clone()),
+        Some(_) => return Err(bad(SHEET_RULE)),
     };
     Ok(IngestRequest {
         table: table.to_owned(),
@@ -1047,6 +1224,7 @@ fn parse_ingest_request(body: &[u8]) -> Result<IngestRequest, ApiError> {
         encoding,
         delimiter,
         header_row,
+        sheet,
     })
 }
 
@@ -1166,14 +1344,16 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 }
 
 /// The run config `file_ingest_job` takes: `ops.ingest_uploaded_file.config`
-/// (plan T7).
-fn run_config(row: &Upload, request: &IngestRequest) -> Value {
+/// (plan T7). `load_key` is the object the job reads: the upload's own, or the
+/// converted sheet of a workbook ([`converted_key`]). The config schema is
+/// closed, so nothing about the sheet can be added here.
+fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str) -> Value {
     json!({
         "ops": {
             "ingest_uploaded_file": {
                 "config": {
-                    "upload_id": row.id,
-                    "storage_key": row.storage_key,
+                    "upload_id": upload_id,
+                    "storage_key": load_key,
                     "bronze_table_name": request.table,
                     "load_mode": request.mode.as_str(),
                     "encoding": request.encoding.as_str(),
@@ -1194,10 +1374,11 @@ async fn launch(
     pool: &PgPool,
     claimed: &Upload,
     request: &IngestRequest,
+    load_key: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
-        .launch_run_with_config(FILE_INGEST_JOB, &run_config(claimed, request))
+        .launch_run_with_config(FILE_INGEST_JOB, &run_config(&claimed.id, request, load_key))
         .await
     {
         Ok(launched) => {
@@ -1220,10 +1401,53 @@ async fn launch(
     Err(failure)
 }
 
+/// A workbook's sheet, converted and stored.
+struct Converted {
+    /// The object the job reads.
+    key: String,
+    /// The sheet's name, as the workbook spells it.
+    sheet: String,
+}
+
+/// Convert the chosen sheet of a workbook upload and store it as a CSV beside
+/// the original. The object is written again by the next load of the same
+/// upload, and removed with the upload ([`delete`]).
+async fn convert_workbook(
+    state: &AppState,
+    row: &Upload,
+    sheet: Option<&str>,
+) -> Result<Converted, ApiError> {
+    let store = UploadStore::connect(&state.config).await?;
+    let bytes = store.get_all(&row.storage_key).await?;
+    let asked = sheet.map(str::to_owned);
+    let (name, empty, csv) = blocking(move || {
+        let read = upload_workbook::read_sheet(&bytes, asked.as_deref())?;
+        Ok((
+            read.data.name().to_owned(),
+            read.data.is_empty(),
+            read.data.to_csv(None),
+        ))
+    })
+    .await?;
+    if empty {
+        return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
+    }
+    let key = converted_key(&row.storage_key);
+    store.put(&key, Bytes::from(csv)).await?;
+    Ok(Converted { key, sheet: name })
+}
+
 /// `POST /api/uploads/{id}/ingest` — load this file into a raw table, with
 /// the encoding, delimiter and header row the user confirmed. Body
-/// `{ bronzeTable, mode?, encoding, delimiter, headerRow }`; `mode` is
+/// `{ bronzeTable, mode?, encoding, delimiter, headerRow, sheet? }`; `mode` is
 /// `replace` (default) or `append`. Returns `{ upload, runId }`.
+///
+/// For a workbook, `encoding` and `delimiter` are not read and `sheet` picks
+/// the sheet (the default one when absent): the sheet is converted, stored as
+/// a CSV beside the original ([`converted_key`]) after the table checks and
+/// before the table is claimed, so a sheet that cannot be read claims
+/// nothing, and the job is launched on that object. The sheet is recorded in
+/// the upload's `parse_options` and in the audit event.
 ///
 /// # The order, and why
 ///
@@ -1247,7 +1471,9 @@ async fn launch(
 ///
 /// # Errors
 ///
-/// 400 for a body that is not valid (each field has its own sentence); 404
+/// 400 for a body that is not valid (each field has its own sentence), and
+/// for a workbook that cannot be read, a sheet it does not have, a sheet over
+/// the cell limit or an empty sheet; 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
 /// loading, another is loading into that table, a connector loads it, or the
 /// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
@@ -1265,9 +1491,11 @@ pub async fn ingest(
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
-    let request = parse_ingest_request(&body)?;
     let pool = pool(&state)?;
     let row = uploads::get(pool, &id).await?.ok_or_else(not_found)?;
+    // The row first: what the body must carry depends on what the upload is.
+    let workbook = is_workbook(&state, &row).await?;
+    let request = parse_ingest_request(&body, workbook)?;
     let row = Settler::new(&state, pool).settle(row).await;
     if row.status == "ingesting" {
         return Err(ApiError::Conflict(ALREADY_LOADING.to_owned()).into());
@@ -1279,6 +1507,14 @@ pub async fn ingest(
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
     }
+    let converted = if workbook {
+        Some(convert_workbook(&state, &row, request.sheet.as_deref()).await?)
+    } else {
+        None
+    };
+    let load_key = converted
+        .as_ref()
+        .map_or(row.storage_key.as_str(), |done| done.key.as_str());
     // Review finding B4: the name is claimed here, in one statement the
     // database arbitrates, and not before. `false` is a tenant that took the
     // name between the checks above and now, or one whose claim was always
@@ -1288,11 +1524,14 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
-    let parse_options = json!({
+    let mut parse_options = json!({
         "encoding": request.encoding.as_str(),
         "delimiter": request.delimiter.to_string(),
         "headerRow": request.header_row,
     });
+    if let (Value::Object(map), Some(done)) = (&mut parse_options, &converted) {
+        map.insert("sheet".to_owned(), json!(done.sheet));
+    }
     let Some(claimed) = uploads::mark_ingesting(
         pool,
         &row.id,
@@ -1311,7 +1550,7 @@ pub async fn ingest(
         .into());
     };
 
-    let run_id = launch(&state, pool, &claimed, &request).await?;
+    let run_id = launch(&state, pool, &claimed, &request, load_key).await?;
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -1320,18 +1559,16 @@ pub async fn ingest(
         return Err(ApiError::Internal(NOT_RECORDED.to_owned()).into());
     };
 
-    let event = upload_audit_event(
-        &principal,
-        "upload.ingest",
-        &attached.id,
-        json!({
-            "fileName": attached.original_filename,
-            "sizeBytes": attached.size_bytes,
-            "table": request.table,
-            "mode": request.mode.as_str(),
-        }),
-        "executed",
-    );
+    let mut args = json!({
+        "fileName": attached.original_filename,
+        "sizeBytes": attached.size_bytes,
+        "table": request.table,
+        "mode": request.mode.as_str(),
+    });
+    if let (Value::Object(map), Some(done)) = (&mut args, &converted) {
+        map.insert("sheet".to_owned(), json!(done.sheet));
+    }
+    let event = upload_audit_event(&principal, "upload.ingest", &attached.id, args, "executed");
     record_audit(pool, event).await;
     Ok(ApiJson(IngestResponse {
         upload: attached.into(),
@@ -1341,7 +1578,8 @@ pub async fn ingest(
 
 // ── Delete ───────────────────────────────────────────────────────────────
 
-/// `DELETE /api/uploads/{id}` — remove the object, then the row. 204. The
+/// `DELETE /api/uploads/{id}` — remove the object (and a workbook's converted
+/// sheet), then the row. 204. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -1371,6 +1609,12 @@ pub async fn delete(
         return Err(ApiError::Conflict(DELETE_WHILE_LOADING.to_owned()).into());
     }
     let store = UploadStore::connect(&state.config).await?;
+    if has_workbook_name(&row.storage_key) {
+        // The converted sheet of a workbook, if a load wrote one: derived data
+        // goes first, and a key that is not there is success. A text file
+        // named `.xls` has none, and deleting a missing key is a no-op.
+        store.delete(&converted_key(&row.storage_key)).await?;
+    }
     store.delete(&row.storage_key).await?;
     if !uploads::delete(pool, &row.id).await? {
         // Refused because a load was claimed after the check above, or the
@@ -1464,28 +1708,73 @@ mod tests {
 
     #[test]
     fn a_file_must_not_be_empty_over_the_cap_a_workbook_or_binary() {
-        let refusal = |bytes: &[u8]| check_file(bytes).unwrap_err().to_string();
+        let refusal = |bytes: &[u8]| check_file(bytes, "x.csv").unwrap_err().to_string();
         assert_eq!(refusal(b""), "The file is empty.");
-        assert!(check_file(b"id,name\n1,a\n").is_ok());
-        assert!(check_file(&[b'a'; 1024]).is_ok());
+        assert_eq!(
+            check_file(b"id,name\n1,a\n", "x.csv").unwrap(),
+            Accepted::Text
+        );
+        assert!(check_file(&[b'a'; 1024], "x.csv").is_ok());
+        // X2 of the Excel plan: the sentence changed with what is accepted.
         assert_eq!(
             refusal(b"PK\x03\x04rest of a zip"),
-            "This looks like an Excel workbook or a zip archive. Only delimited text files (CSV, TSV) can be uploaded; save the sheet as CSV first."
+            "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
         );
-        assert!(refusal(&[0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]).contains("Excel workbook"));
+        assert!(refusal(&[0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]).contains("workbook"));
         assert!(refusal(b"PAR1\x15\x04rest").contains("Parquet"));
         assert!(refusal(b"%PDF-1.7 ...").contains("not a delimited text file"));
         assert!(refusal(b"a,b\0c,d").contains("not a delimited text file"));
+    }
+
+    /// A workbook is accepted by its first bytes AND an `.xls` or `.xlsx`
+    /// name; text keeps its name's freedom (the motivating export was text
+    /// called `.xls`); a zip or OLE file with any other name is refused.
+    #[test]
+    fn a_workbook_needs_both_its_first_bytes_and_a_workbook_name() {
+        let zip = b"PK\x03\x04rest of a zip";
+        let ole = [0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4];
+        for name in ["a.xlsx", "A.XLSX", "dir/a.xls", "a.b.xlsx"] {
+            assert_eq!(check_file(zip, name).unwrap(), Accepted::Workbook, "{name}");
+            assert_eq!(
+                check_file(&ole, name).unwrap(),
+                Accepted::Workbook,
+                "{name}"
+            );
+        }
+        for name in [
+            "a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.csv", "a", "a.docx", "",
+        ] {
+            assert!(check_file(zip, name).is_err(), "{name}");
+            assert!(check_file(&ole, name).is_err(), "{name}");
+        }
+        for name in ["a.xls", "a.xlsx", "a.csv", "a"] {
+            assert_eq!(check_file(b"id,name\n1,a\n", name).unwrap(), Accepted::Text);
+        }
+    }
+
+    #[test]
+    fn a_converted_sheet_is_stored_beside_the_original_inside_the_prefix() {
+        let key = storage_key(TENANT, "up-9", "Stock.XLSX");
+        assert_eq!(key, format!("uploads/{TENANT}/up-9.xlsx"));
+        assert_eq!(
+            converted_key(&key),
+            format!("uploads/{TENANT}/up-9.xlsx.converted.csv")
+        );
+        assert!(converted_key(&key).starts_with(&format!("{PREFIX}/")));
+        assert!(has_workbook_name(&key));
+        assert!(!has_workbook_name(&converted_key(&key)));
+        assert!(!has_workbook_name("uploads/t/up-1.csv"));
+        assert!(!has_workbook_name("uploads/t/up-1"));
     }
 
     #[test]
     fn a_file_over_the_cap_is_refused_with_the_fixed_text() {
         let over = vec![b'a'; MAX_UPLOAD_BYTES + 1];
         assert_eq!(
-            check_file(&over).unwrap_err().to_string(),
+            check_file(&over, "x.csv").unwrap_err().to_string(),
             "The file is larger than the 50 MB limit."
         );
-        assert!(check_file(&over[..MAX_UPLOAD_BYTES]).is_ok());
+        assert!(check_file(&over[..MAX_UPLOAD_BYTES], "x.csv").is_ok());
     }
 
     #[test]
@@ -1584,12 +1873,14 @@ mod tests {
     }
 
     fn refusal_of(value: &Value) -> String {
-        parse_ingest_request(&body(value)).unwrap_err().to_string()
+        parse_ingest_request(&body(value), false)
+            .unwrap_err()
+            .to_string()
     }
 
     #[test]
     fn a_complete_body_is_accepted_and_mode_defaults_to_replace() {
-        let request = parse_ingest_request(&body(&valid())).unwrap();
+        let request = parse_ingest_request(&body(&valid()), false).unwrap();
         assert_eq!(
             request,
             IngestRequest {
@@ -1598,6 +1889,7 @@ mod tests {
                 encoding: Encoding::Utf8,
                 delimiter: ',',
                 header_row: 0,
+                sheet: None,
             }
         );
         let mut full = valid();
@@ -1605,7 +1897,7 @@ mod tests {
         full["encoding"] = json!("utf-16");
         full["delimiter"] = json!("\t");
         full["headerRow"] = json!(4);
-        let request = parse_ingest_request(&body(&full)).unwrap();
+        let request = parse_ingest_request(&body(&full), false).unwrap();
         assert_eq!(request.mode, LoadMode::Append);
         assert_eq!(request.encoding, Encoding::Utf16);
         assert_eq!(request.delimiter, '\t');
@@ -1613,7 +1905,7 @@ mod tests {
         let mut null_mode = valid();
         null_mode["mode"] = Value::Null;
         assert_eq!(
-            parse_ingest_request(&body(&null_mode)).unwrap().mode,
+            parse_ingest_request(&body(&null_mode), false).unwrap().mode,
             LoadMode::Replace
         );
     }
@@ -1673,7 +1965,7 @@ mod tests {
         };
         let longest = "a".repeat(128);
         for ok in ["a", "a1", "a_1", "sap_material_master", longest.as_str()] {
-            let request = parse_ingest_request(&body(&with_table(ok))).unwrap();
+            let request = parse_ingest_request(&body(&with_table(ok)), false).unwrap();
             assert_eq!(request.table, ok);
         }
         let too_long = "a".repeat(129);
@@ -1705,7 +1997,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_a_json_object_is_refused_without_serde_text() {
         for raw in [&b""[..], b"not json", b"[1]", b"\"x\"", b"null", b"{"] {
-            let err = parse_ingest_request(raw).unwrap_err();
+            let err = parse_ingest_request(raw, false).unwrap_err();
             assert_eq!(err.status(), 400);
             assert_eq!(err.to_string(), "The request body must be a JSON object.");
         }
@@ -1722,7 +2014,73 @@ mod tests {
             encoding: encoding.map(str::to_owned),
             delimiter: delimiter.map(str::to_owned),
             header_row: header_row.map(str::to_owned),
+            sheet: None,
         }
+    }
+
+    // ── a workbook's ingest body ────────────────────────────────────────
+
+    #[test]
+    fn a_workbook_load_is_always_utf8_and_comma_and_names_its_sheet() {
+        let mut v = valid();
+        v["encoding"] = json!("utf-16");
+        v["delimiter"] = json!(";");
+        v["sheet"] = json!("Quirks");
+        let request = parse_ingest_request(&body(&v), true).unwrap();
+        assert_eq!(request.encoding, Encoding::Utf8);
+        assert_eq!(request.delimiter, ',');
+        assert_eq!(request.sheet.as_deref(), Some("Quirks"));
+        // Not read at all, so not required either.
+        let bare = json!({ "bronzeTable": "stock_raw", "headerRow": 2 });
+        let request = parse_ingest_request(&body(&bare), true).unwrap();
+        assert_eq!(request.header_row, 2);
+        assert_eq!(request.sheet, None);
+        // Still required and checked for a text file.
+        assert_eq!(
+            parse_ingest_request(&body(&bare), false)
+                .unwrap_err()
+                .to_string(),
+            "encoding is required."
+        );
+        // The rest of the body is checked for a workbook as for text.
+        let mut bad_table = bare.clone();
+        bad_table["bronzeTable"] = json!("Orders");
+        assert_eq!(
+            parse_ingest_request(&body(&bad_table), true)
+                .unwrap_err()
+                .to_string(),
+            TABLE_NAME_RULE
+        );
+        let mut bad_sheet = bare;
+        bad_sheet["sheet"] = json!(3);
+        for workbook in [true, false] {
+            assert_eq!(
+                parse_ingest_request(&body(&bad_sheet), workbook)
+                    .unwrap_err()
+                    .to_string(),
+                "sheet must be text."
+            );
+        }
+    }
+
+    #[test]
+    fn the_job_is_told_the_converted_object_and_the_fixed_dialect() {
+        let request = parse_ingest_request(
+            &body(&json!({ "bronzeTable": "stock_raw", "headerRow": 1, "sheet": "Stock" })),
+            true,
+        )
+        .unwrap();
+        let config = run_config("up-1", &request, "uploads/t/up-1.xlsx.converted.csv");
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["upload_id"], "up-1");
+        assert_eq!(job["storage_key"], "uploads/t/up-1.xlsx.converted.csv");
+        assert_eq!(job["encoding"], "utf-8");
+        assert_eq!(job["delimiter"], ",");
+        assert_eq!(job["header_row"], 1);
+        assert!(
+            job.get("sheet").is_none(),
+            "the job's config schema is closed"
+        );
     }
 
     #[test]

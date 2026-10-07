@@ -81,6 +81,15 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
+/// A workbook fixture of `ops/fixtures/workbooks/`.
+fn workbook(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../../../ops/fixtures/workbooks/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -927,6 +936,9 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
         }
     };
 
+    // X2 of the Excel plan: a zip or OLE file is refused with the sentence of
+    // the workbook kinds that are not accepted unless it is named `.xls` or
+    // `.xlsx` (then it must open: see the workbook tests below).
     let workbook = refuse(
         "data.csv",
         b"PK\x03\x04\x14\x00\x06\x00rest of a zip".to_vec(),
@@ -934,15 +946,15 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
     .await;
     assert_eq!(
         workbook,
-        "This looks like an Excel workbook or a zip archive. Only delimited text files (CSV, TSV) can be uploaded; save the sheet as CSV first."
+        "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
     );
     assert!(
         refuse(
-            "old.xls",
+            "old.dat",
             vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
         )
         .await
-        .contains("Excel workbook")
+        .contains("not an .xls or .xlsx file")
     );
     assert!(
         refuse("t.parquet", b"PAR1\x15\x04\x15\x30rest".to_vec())
@@ -3374,4 +3386,446 @@ async fn no_response_of_a_whole_session_carries_the_key_the_tenant_the_checksum_
             assert!(!response.contains(leaked), "{leaked} in {response}");
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Excel workbooks (X2 of docs/superpowers/plans/2026-10-07-upload-excel.md)
+// ════════════════════════════════════════════════════════════════════════
+
+const UNREADABLE_WORKBOOK: &str =
+    "This file could not be opened as an Excel workbook (.xls or .xlsx).";
+const UNKNOWN_SHEET: &str = "The workbook has no sheet with that name.";
+const EMPTY_SHEET: &str = "That sheet is empty, so there is nothing to load.";
+
+/// The sheets `stock.xlsx` and `stock.xls` hold, as the API lists them.
+fn stock_sheets() -> Value {
+    json!([
+        { "name": "Stock", "visible": true },
+        { "name": "Quirks", "visible": true },
+        { "name": "Offset", "visible": true },
+        { "name": "Hidden notes", "visible": false },
+        { "name": "Empty", "visible": true },
+    ])
+}
+
+async fn refused_upload(stack: &Stack, who: &Caller, name: &str, bytes: &[u8]) -> String {
+    let reply = stack
+        .send(
+            who,
+            "POST",
+            "/api/uploads",
+            file_form(name, "application/octet-stream", bytes),
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "{name}: {}",
+        reply.text
+    );
+    reply.json["error"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_workbook_is_stored_as_it_arrived_and_the_answer_lists_its_sheets() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    for (name, bytes) in [
+        ("stock.xlsx", workbook("stock.xlsx")),
+        ("old stock.xls", workbook("stock.xls")),
+    ] {
+        let upload = stack.upload(&bayu, name, &bytes).await;
+        let id = id_of(&upload);
+        assert_eq!(upload["status"], "uploaded", "{name}");
+        assert_eq!(upload["workbook"]["sheets"], stock_sheets(), "{name}");
+        assert_eq!(upload["workbook"]["defaultSheet"], "Stock", "{name}");
+        let extension = name.rsplit('.').next().unwrap();
+        let key = format!("uploads/{GROUP}/{id}.{extension}");
+        assert_eq!(
+            stack.bucket.get(&key).unwrap(),
+            bytes,
+            "{name}: byte for byte"
+        );
+    }
+    let text = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert!(text.get("workbook").is_none(), "a text file has no sheets");
+}
+
+#[tokio::test]
+async fn a_workbook_that_cannot_be_read_or_is_not_named_like_one_is_refused_with_its_reason() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let xlsx = workbook("stock.xlsx");
+    let not_accepted = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+    // A workbook-shaped file under a name that is not `.xls` or `.xlsx`.
+    for name in [
+        "macros.xlsm",
+        "binary.xlsb",
+        "sheet.ods",
+        "archive.zip",
+        "noext",
+    ] {
+        assert_eq!(
+            refused_upload(&stack, &bayu, name, &xlsx).await,
+            not_accepted,
+            "{name}"
+        );
+    }
+    // Named like a workbook, and not one.
+    let mut encrypted = vec![0xD0, 0xCF, 0x11, 0xE0];
+    encrypted.extend_from_slice(&[0_u8; 600]);
+    encrypted.extend("EncryptedPackage".encode_utf16().flat_map(u16::to_le_bytes));
+    encrypted.extend_from_slice(&[0_u8; 600]);
+    let stock_xls = workbook("stock.xls");
+    for (name, bytes) in [
+        ("plain.xlsx", workbook("plain.zip")),
+        ("cut.xlsx", xlsx[..xlsx.len() / 2].to_vec()),
+        ("cut.xls", stock_xls[..600].to_vec()),
+        ("garbage.xls", vec![0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]),
+    ] {
+        assert_eq!(
+            refused_upload(&stack, &bayu, name, &bytes).await,
+            UNREADABLE_WORKBOOK,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        refused_upload(&stack, &bayu, "locked.xlsx", &encrypted).await,
+        "This workbook is password protected, so it cannot be read. Remove the password and upload it again."
+    );
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "nothing was stored for a refused file"
+    );
+    assert!(stack.audit_actions().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_workbook_preview_shows_the_default_sheet_as_text_under_the_fixed_dialect() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let expected_rows = json!([
+        ["A-100", "Bolt, hex M6", "10", "1.5", "2025-09-24"],
+        ["A-200", "Washer", "250", "0.05", "2025-09-25"],
+        [
+            "A-300",
+            "Flange DN50 \u{2013} steel",
+            "4",
+            "12",
+            "2025-10-01"
+        ]
+    ]);
+    for (name, bytes) in [
+        ("stock.xlsx", workbook("stock.xlsx")),
+        ("stock.xls", workbook("stock.xls")),
+    ] {
+        let upload = stack.upload(&bayu, name, &bytes).await;
+        let uri = format!("/api/uploads/{}/preview", id_of(&upload));
+        let reply = stack.get(&bayu, &uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.text);
+        assert_eq!(
+            reply.json["columns"],
+            json!(["sku", "name", "qty", "price", "received"]),
+            "{name}"
+        );
+        assert_eq!(reply.json["rows"], expected_rows, "{name}");
+        assert_eq!(reply.json["truncated"], false, "{name}");
+        let reading = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+        assert_eq!(reply.json["using"], reading, "{name}");
+        assert_eq!(reply.json["workbook"]["sheet"], "Stock", "{name}");
+        assert_eq!(reply.json["workbook"]["sheets"], stock_sheets(), "{name}");
+        assert_eq!(reply.json["workbook"]["defaultSheet"], "Stock", "{name}");
+
+        // A header row of the user's choosing, counted in the sheet's records.
+        let moved = stack.get(&bayu, &format!("{uri}?headerRow=1")).await;
+        assert_eq!(moved.status, StatusCode::OK, "{name}: {}", moved.text);
+        assert_eq!(
+            moved.json["columns"],
+            json!(["A-100", "Bolt, hex M6", "10", "1.5", "2025-09-24"]),
+            "{name}"
+        );
+        assert_eq!(moved.json["rows"].as_array().unwrap().len(), 2, "{name}");
+        assert_eq!(moved.json["using"]["headerRow"], 1, "{name}");
+
+        // The encoding and the delimiter mean nothing for a workbook: a valid
+        // value is ignored, an invalid one is refused as it is for text.
+        let ignored = stack
+            .get(&bayu, &format!("{uri}?encoding=utf-16&delimiter=%3B"))
+            .await;
+        assert_eq!(ignored.status, StatusCode::OK, "{name}: {}", ignored.text);
+        assert_eq!(ignored.json["using"], reading, "{name}");
+        assert_eq!(ignored.json["columns"], reply.json["columns"], "{name}");
+        let refused = stack.get(&bayu, &format!("{uri}?encoding=latin-1")).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(
+            refused.json["error"], "encoding must be utf-8 or utf-16.",
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_workbook_preview_reads_the_sheet_that_was_asked_for_hidden_and_empty_ones_included() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let uri = format!("/api/uploads/{}/preview", id_of(&upload));
+
+    let quirks = stack.get(&bayu, &format!("{uri}?sheet=Quirks")).await;
+    assert_eq!(quirks.status, StatusCode::OK, "{}", quirks.text);
+    assert_eq!(quirks.json["workbook"]["sheet"], "Quirks");
+    assert_eq!(quirks.json["columns"], json!(["case", "value"]));
+    assert_eq!(quirks.json["rows"][0], json!(["whole number", "1"]));
+    assert_eq!(quirks.json["rows"][8], json!(["date", "2025-09-24"]));
+    assert_eq!(
+        quirks.json["rows"].as_array().unwrap().len(),
+        20,
+        "the preview returns 20 rows"
+    );
+    assert_eq!(quirks.json["truncated"], true, "the sheet has 27");
+
+    let hidden = stack
+        .get(&bayu, &format!("{uri}?sheet=Hidden%20notes"))
+        .await;
+    assert_eq!(hidden.status, StatusCode::OK, "{}", hidden.text);
+    assert_eq!(hidden.json["columns"], json!(["note"]));
+    assert_eq!(hidden.json["rows"], json!([["internal"]]));
+
+    let empty = stack.get(&bayu, &format!("{uri}?sheet=Empty")).await;
+    assert_eq!(empty.status, StatusCode::OK, "{}", empty.text);
+    assert_eq!(empty.json["columns"], json!([]));
+    assert_eq!(empty.json["rows"], json!([]));
+    assert_eq!(empty.json["workbook"]["sheet"], "Empty");
+
+    for name in ["stock", "", "Quirks%20"] {
+        let unknown = stack.get(&bayu, &format!("{uri}?sheet={name}")).await;
+        assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "{name:?}");
+        assert_eq!(unknown.json["error"], UNKNOWN_SHEET, "{name:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_text_file_named_like_a_workbook_previews_as_text_and_a_csv_preview_has_no_workbook() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let text = stack.upload(&bayu, "stock.xlsx", b"id,name\n1,a\n").await;
+    let reply = stack
+        .get(
+            &bayu,
+            &format!("/api/uploads/{}/preview?sheet=Nope", id_of(&text)),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["columns"], json!(["id", "name"]));
+    assert!(reply.json.get("workbook").is_none());
+}
+
+/// The ingest body of a workbook: no encoding, no delimiter.
+fn workbook_ingest_body(table: &str, sheet: Option<&str>) -> Value {
+    let mut body = json!({ "bronzeTable": table, "headerRow": 0 });
+    if let Some(sheet) = sheet {
+        body["sheet"] = json!(sheet);
+    }
+    body
+}
+
+#[tokio::test]
+async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_launches_on_it() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let bytes = workbook("stock.xlsx");
+    let upload = stack.upload(&bayu, "stock.xlsx", &bytes).await;
+    let id = id_of(&upload);
+
+    let reply = stack
+        .ingest(
+            &bayu,
+            &id,
+            workbook_ingest_body("quirks_raw", Some("Quirks")),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["runId"], "run-1");
+    assert_eq!(
+        reply.json["upload"]["parseOptions"],
+        json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0, "sheet": "Quirks" })
+    );
+    let original = format!("uploads/{GROUP}/{id}.xlsx");
+    let converted = format!("{original}.converted.csv");
+    assert_eq!(stack.bucket.keys(), [original.clone(), converted.clone()]);
+    assert_eq!(
+        stack.bucket.get(&original).unwrap(),
+        bytes,
+        "the original is untouched"
+    );
+    assert_eq!(
+        stack.bucket.get(&converted).unwrap(),
+        fixture("converted_sheet.csv"),
+        "the pinned conversion of the Quirks sheet"
+    );
+
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    assert_eq!(launches.len(), 1);
+    assert_eq!(
+        launches[0]["variables"]["cfg"],
+        json!({ "ops": { "ingest_uploaded_file": { "config": {
+            "upload_id": id,
+            "storage_key": converted,
+            "bronze_table_name": "quirks_raw",
+            "load_mode": "replace",
+            "encoding": "utf-8",
+            "delimiter": ",",
+            "header_row": 0,
+        } } } }),
+        "the job's own configuration, the converted object and the fixed dialect"
+    );
+    let audit = stack.audit_actions().await;
+    let ingest = audit.iter().find(|a| a.0 == "upload.ingest").unwrap();
+    assert_eq!(
+        ingest.3,
+        json!({
+            "fileName": "stock.xlsx", "sizeBytes": bytes.len(),
+            "table": "quirks_raw", "mode": "replace", "sheet": "Quirks"
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_workbook_ingest_without_a_sheet_loads_the_default_sheet_of_an_xls_too() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack
+        .upload(&bayu, "stock.xls", &workbook("stock.xls"))
+        .await;
+    let id = id_of(&upload);
+
+    let reply = stack
+        .ingest(&bayu, &id, workbook_ingest_body("stock_raw", None))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["upload"]["parseOptions"]["sheet"], "Stock");
+    let converted = stack
+        .bucket
+        .get(&format!("uploads/{GROUP}/{id}.xls.converted.csv"))
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(converted).unwrap(),
+        "sku,name,qty,price,received\n\
+         A-100,\"Bolt, hex M6\",10,1.5,2025-09-24\n\
+         A-200,Washer,250,0.05,2025-09-25\n\
+         A-300,Flange DN50 \u{2013} steel,4,12,2025-10-01\n"
+    );
+}
+
+#[tokio::test]
+async fn a_workbook_ingest_that_cannot_convert_claims_nothing_and_launches_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+
+    for (body, sentence) in [
+        (workbook_ingest_body("t_raw", Some("Nope")), UNKNOWN_SHEET),
+        (workbook_ingest_body("t_raw", Some("Empty")), EMPTY_SHEET),
+        (
+            json!({ "bronzeTable": "t_raw", "headerRow": 0, "sheet": 3 }),
+            "sheet must be text.",
+        ),
+    ] {
+        let reply = stack.ingest(&bayu, &id, body.clone()).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            reply.text
+        );
+        assert_eq!(reply.json["error"], sentence, "{body}");
+    }
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert_eq!(stack.status_of(&id).await.0, "uploaded");
+    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.bucket.keys(),
+        [format!("uploads/{GROUP}/{id}.xlsx")],
+        "no converted object for a sheet that could not be converted"
+    );
+}
+
+#[tokio::test]
+async fn a_text_file_named_like_a_workbook_is_loaded_as_text() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "stock.xlsx", b"id,name\n1,a\n").await;
+    let id = id_of(&upload);
+
+    let reply = stack.ingest(&bayu, &id, ingest_body("stock_raw")).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.json["upload"]["parseOptions"],
+        json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 }),
+        "no sheet"
+    );
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    assert_eq!(
+        launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"]["storage_key"],
+        format!("uploads/{GROUP}/{id}.xlsx")
+    );
+    assert_eq!(stack.bucket.keys().len(), 1, "nothing was converted");
+    // And a text upload still needs its dialect.
+    let missing = stack
+        .ingest(&bayu, &id, workbook_ingest_body("stock_raw", None))
+        .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json["error"], "encoding is required.");
+}
+
+#[tokio::test]
+async fn deleting_a_workbook_upload_removes_the_original_and_the_converted_sheet() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    // The launch is refused, which settles the claim as failed and leaves the
+    // converted object in place: the state a delete must clean up.
+    mount_launch_refused(&stack.dagster).await;
+    let upload = stack
+        .upload(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    let id = id_of(&upload);
+    let reply = stack
+        .ingest(&bayu, &id, workbook_ingest_body("stock_raw", None))
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.text
+    );
+    assert_eq!(stack.bucket.keys().len(), 2);
+
+    let gone = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+
+    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
+    assert!(stack.bucket.keys().is_empty(), "{:?}", stack.bucket.keys());
 }

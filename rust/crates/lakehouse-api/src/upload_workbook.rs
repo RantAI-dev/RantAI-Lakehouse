@@ -454,7 +454,9 @@ impl SheetData {
     }
 
     /// The records of the used range, each as wide as the range, at most
-    /// `max_records` of them. The same records [`Self::to_csv`] writes.
+    /// `max_records` of them. The same records `to_csv` writes. Tests only: the
+    /// routes never need the records, only the text.
+    #[cfg(test)]
     #[must_use]
     pub fn records(&self, max_records: Option<usize>) -> Vec<Vec<String>> {
         let mut out = Vec::new();
@@ -468,7 +470,7 @@ impl SheetData {
     /// feed after every record, at most `max_records` records (all when
     /// `None`). One writer, [`write_record`], for every caller; what it writes
     /// reads back through `upload_parse::split_records` to exactly
-    /// [`Self::records`].
+    /// `records`.
     #[must_use]
     pub fn to_csv(&self, max_records: Option<usize>) -> Vec<u8> {
         let mut out = Vec::new();
@@ -612,8 +614,9 @@ fn finish_text(mut out: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Write `records` as [`SheetData::to_csv`] does. For tests and tools that
-/// hold records and not a sheet.
+/// Write `records` as `SheetData::to_csv` does, for tests that hold records and
+/// not a sheet.
+#[cfg(test)]
 #[must_use]
 pub fn encode_csv(records: &[Vec<String>]) -> Vec<u8> {
     let mut out = Vec::new();

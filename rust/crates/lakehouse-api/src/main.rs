@@ -38,6 +38,7 @@ mod tenant_scope;
 mod transform_grammar;
 mod upload_parse;
 mod upload_store;
+mod upload_workbook;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
