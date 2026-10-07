@@ -1557,6 +1557,55 @@ async fn get_definition_version_returns_err_when_snapshot_does_not_decode(
     Ok(())
 }
 
+/// The baseline-backfill `INSERT` of migration `0057`, read out of the
+/// migration file itself and returned as executable SQL.
+///
+/// The extraction, not a copy, is the point: the previous version of
+/// these tests pasted a hand-maintained duplicate of the statement into
+/// the test body and claimed the test would stop compiling if the
+/// migration changed shape, which was false — the test never read the
+/// file, so editing `rust/migrations/0057_pipeline_definition_version_
+/// tenant.sql` left every test green (measured). Here the statement is
+/// taken from `include_str!`, so editing the migration's semantics
+/// changes what these tests execute and makes them fail;
+/// `include_str!` additionally pins the file at compile time, so a
+/// rename breaks the build.
+///
+/// The migration holds exactly one `INSERT INTO
+/// pipeline_definition_version` (its other statements are `ALTER`s and
+/// an `UPDATE`); the scan still filters on `WHERE NOT EXISTS` so that a
+/// future second `INSERT` in the same file cannot silently change which
+/// statement this returns.
+///
+/// # Panics
+///
+/// Panics when the migration no longer holds exactly one backfill
+/// `INSERT … WHERE NOT EXISTS`, or when that statement is not
+/// `;`-terminated — either is a shape change a human has to look at,
+/// not something to fall back from.
+fn migration_0057_backfill() -> &'static str {
+    const MIGRATION: &str =
+        include_str!("../../../migrations/0057_pipeline_definition_version_tenant.sql");
+    const PREFIX: &str = "INSERT INTO pipeline_definition_version";
+    let mut found = MIGRATION
+        .match_indices(PREFIX)
+        .map(|(start, _)| {
+            let tail = &MIGRATION[start..];
+            let end = tail
+                .find(';')
+                .expect("the migration's backfill INSERT is `;`-terminated");
+            &tail[..end]
+        })
+        .filter(|statement| statement.contains("WHERE NOT EXISTS"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found.len(),
+        1,
+        "migration 0057 must hold exactly one backfill INSERT … WHERE NOT EXISTS"
+    );
+    found.remove(0)
+}
+
 /// F2.4 (PR #59 review, `plans/pipelines/day-1-fixes/
 /// f2-tenant-scope-and-run-config.md`): every pre-`0053`
 /// `pipeline_definition` row had no version row at all — `0053` *made*
@@ -1567,9 +1616,10 @@ async fn get_definition_version_returns_err_when_snapshot_does_not_decode(
 /// backfill — attributing it to the migration runner would be a
 /// fabricated attribution), `tenant_id` copied from the live row, and a
 /// snapshot that round-trips through `PipelineDefinitionSnapshot`. This
-/// test inserts a legacy row, deletes any version rows it has, re-runs
-/// the migration's `INSERT INTO … SELECT … WHERE NOT EXISTS` verbatim,
-/// and verifies the resulting row through the store's own read paths.
+/// test inserts a legacy row, deletes any version rows it has, extracts
+/// and re-runs the migration file's own `INSERT INTO … SELECT … WHERE
+/// NOT EXISTS` statement (see [`migration_0057_backfill`]), and
+/// verifies the resulting row through the store's own read paths.
 #[sqlx::test(migrations = "../../migrations")]
 async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
     pool: PgPool,
@@ -1618,48 +1668,14 @@ async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
         "the pre-backfill version count must be 0"
     );
 
-    // Re-run the migration's `INSERT … SELECT … WHERE NOT EXISTS`
-    // backfill verbatim (the SQL lives in `rust/migrations/0057_
-    // pipeline_definition_version_tenant.sql`). Keeping the test SQL in
-    // lock-step with the migration is the whole point — if the
-    // migration changes shape, this test stops compiling.
-    sqlx::query(
-        "INSERT INTO pipeline_definition_version \
-            (pipeline_id, version, snapshot, event, changed_by, changed_at, tenant_id) \
-         SELECT \
-             p.id, 1, jsonb_build_object( \
-                 'kind',         p.kind, \
-                 'sourceZone',   CASE WHEN strpos(p.source, '.') > 0 \
-                                      THEN substr(p.source, 1, strpos(p.source, '.') - 1) \
-                                      ELSE '' END, \
-                 'sourceTable',  CASE WHEN strpos(p.source, '.') > 0 \
-                                      THEN substr(p.source, strpos(p.source, '.') + 1) \
-                                      ELSE p.source END, \
-                 'incrementalColumn', p.incremental_column, \
-                 'transforms',   to_jsonb(p.transforms), \
-                 'fbicEnabled',  p.fbic_enabled, \
-                 'targetZone',   CASE WHEN strpos(p.target, '.') > 0 \
-                                      THEN substr(p.target, 1, strpos(p.target, '.') - 1) \
-                                      ELSE '' END, \
-                 'targetTable',  CASE WHEN strpos(p.target, '.') > 0 \
-                                      THEN substr(p.target, strpos(p.target, '.') + 1) \
-                                      ELSE p.target END, \
-                 'schedule',     p.schedule, \
-                 'owner',        p.owner, \
-                 'description',  p.description, \
-                 'maxRetries',   p.max_retries, \
-                 'dependsOn',    to_jsonb(p.depends_on), \
-                 'name',         p.name, \
-                 'status',       p.status \
-             ), \
-             'baseline', NULL, COALESCE(p.created_at, now()), p.tenant_id \
-         FROM pipeline_definition p \
-         WHERE NOT EXISTS ( \
-             SELECT 1 FROM pipeline_definition_version v WHERE v.pipeline_id = p.id \
-         )",
-    )
-    .execute(&pool)
-    .await?;
+    // Execute the migration's own `INSERT … SELECT … WHERE NOT EXISTS`
+    // backfill, read out of `rust/migrations/0057_pipeline_definition_
+    // tenant.sql` by `migration_0057_backfill`. Editing that statement's
+    // semantics in the migration file changes what runs here, so this
+    // test fails on a mutated migration instead of drifting away from it.
+    sqlx::query(migration_0057_backfill())
+        .execute(&pool)
+        .await?;
 
     // Exactly one version row, version = 1, event = 'baseline',
     // changed_by = NULL, tenant_id copied.
@@ -1726,19 +1742,13 @@ async fn baseline_backfill_is_idempotent_under_rerun(pool: PgPool) -> sqlx::Resu
         .expect("create pipeline");
     // `create_pipeline` already wrote a `created` version row; the
     // backfill's `WHERE NOT EXISTS` clause must skip this pipeline
-    // because a version row exists, regardless of its `event`.
-    sqlx::query(
-        "INSERT INTO pipeline_definition_version \
-            (pipeline_id, version, snapshot, event, changed_by, changed_at, tenant_id) \
-         SELECT p.id, 1, jsonb_build_object('kind', p.kind), 'baseline', NULL, \
-                COALESCE(p.created_at, now()), p.tenant_id \
-           FROM pipeline_definition p \
-          WHERE NOT EXISTS ( \
-              SELECT 1 FROM pipeline_definition_version v WHERE v.pipeline_id = p.id \
-          )",
-    )
-    .execute(&pool)
-    .await?;
+    // because a version row exists, regardless of its `event`. The
+    // statement is the migration file's own (same extraction as the
+    // synthesises test), so editing 0057's predicate changes what runs
+    // here and this assertion fails.
+    sqlx::query(migration_0057_backfill())
+        .execute(&pool)
+        .await?;
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM pipeline_definition_version WHERE pipeline_id = $1",
     )

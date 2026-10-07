@@ -1753,9 +1753,13 @@ const RUN_CONFIG_MAX_BYTES: usize = 64 * 1024;
 ///   - CRON jobs (no Dagster config) are refused by absence — they
 ///     have no `config_schema` to gate.
 ///
-/// Each entry is `(job_name, &[ops.<op>.config.<key> paths])`. Any
-/// subset of the listed paths is allowed; anything else at any depth
-/// is not.
+/// Each entry is `(job_name, &[ops.<op>.config.<key> paths])` — each
+/// path is the FULL dot-joined chain of object keys from the config
+/// root down to one leaf value, not a prefix. Any subset of the
+/// listed paths is allowed; every other leaf path at any depth is a
+/// 400 naming that leaf (the top-level-key prefix check only decides
+/// whether a whole top-level branch may exist at all — see
+/// [`check_run_config_allowlist`]).
 ///
 /// The `silver_rebuild` fixture entry exists only under `#[cfg(test)]`
 /// (see below) so the allow path is exercised end-to-end in
@@ -1768,8 +1772,11 @@ const ALLOWED_RUN_CONFIG: &[(&str, &[&str])] = &[];
 /// for the production posture (the production arm is literally `&[]`).
 #[cfg(test)]
 const ALLOWED_RUN_CONFIG: &[(&str, &[&str])] = &[
-    // (job_name, &[ops.<op>.config.<key> paths allowed])
-    ("silver_rebuild", &["ops.silver_rebuild_op.target_table"]),
+    // (job_name, &[full leaf paths ops.<op>.config.<key> allowed])
+    (
+        "silver_rebuild",
+        &["ops.silver_rebuild_op.config.target_table"],
+    ),
 ];
 
 /// F2.5 (PR #59 review): jobs whose runConfig references a resource
@@ -1832,8 +1839,9 @@ const REFUSED_RUN_CONFIG_HINT: &[(&str, &str)] = &[
 /// non-object to the orchestrator), must fit under
 /// [`RUN_CONFIG_MAX_BYTES`] (64 KiB; overshoot is a 413), and must
 /// match an entry in [`ALLOWED_RUN_CONFIG`] (a job not in that table
-/// is refused; a job in the table is checked against its allowed
-/// paths and a violation names which top-level key was unknown).
+/// is refused; a job in the table is checked leaf by leaf against its
+/// allowed paths and a violation names the offending leaf path — an
+/// unknown top-level key names the key itself).
 /// [`ingest_job`] / [`agent_run_job`] (see [`REFUSED_RUN_CONFIG_JOBS`])
 /// are refused by name with a 400 that names the dedicated route the
 /// caller must use — see [`REFUSED_RUN_CONFIG_HINT`].
@@ -2122,13 +2130,51 @@ fn check_run_config_shape(id: &str, cfg: &Value) -> Result<(), Box<Response>> {
     Ok(())
 }
 
+/// Dot-joined leaf paths of a `runConfig` value: the chain of object
+/// keys from the root down to each terminal value. Scalars and ARRAYS
+/// are terminals — the allowlist gates WHICH keys a caller may set,
+/// while the value under an allowed key is `validate_run_config`'s
+/// job — and an empty object is its own leaf, so a keyless subtree
+/// cannot smuggle a non-allowlisted path past the check. The empty
+/// root prefix (`{}`) contributes no leaf: there is no key to
+/// allowlist.
+fn collect_run_config_leaf_paths(value: &Value, prefix: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) if map.is_empty() => {
+            if !prefix.is_empty() {
+                out.push(prefix.to_owned());
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_run_config_leaf_paths(child, &child_path, out);
+            }
+        }
+        _ => {
+            if !prefix.is_empty() {
+                out.push(prefix.to_owned());
+            }
+        }
+    }
+}
+
 /// F2.5 (PR #59 review): the allowlist half of the runConfig shape
 /// check, called AFTER `validate_run_config` returns `Valid` (see
-/// [`check_run_config_shape`] for the rationale). Two outcomes:
+/// [`check_run_config_shape`] for the rationale). Two gates, in order:
 ///
-/// - A job in [`ALLOWED_RUN_CONFIG`]: every top-level key in the
-///   config must match an allowlisted path's prefix; an unknown
-///   top-level key names the offending key in the 400 body.
+/// - A job in [`ALLOWED_RUN_CONFIG`]: first every top-level key must
+///   prefix-match at least one allowlisted path (an unknown
+///   top-level key names the key in the 400 body), then EVERY leaf
+///   path — the dot-joined chain of object keys down to each terminal
+///   value — must exactly equal an allowlisted path; a violation
+///   names the offending leaf path. The pre-fix comparison stopped at
+///   the top-level prefix, so `{"ops":{"<op>":{"config":{"anyKey":…}}}}`
+///   passed as long as ONE `ops.<op>…` path was allowlisted.
 /// - A job NOT in either table: refused with a 400 — "no runConfig
 ///   is allowed for this job," same posture as the wrong-path refusal
 ///   above.
@@ -2152,6 +2198,11 @@ fn check_run_config_allowlist(id: &str, cfg: &Value) -> Result<(), Box<Response>
                     "runConfig must be a JSON object",
                 )));
             };
+            // Gate 1: a top-level key with no allowlisted path under
+            // it is refused by name — this is what pins the whole
+            // `resources` / `execution` / `loggers` branches, and it
+            // keeps the historical `unknown top-level key …` body the
+            // existing test asserts.
             for top_key in obj.keys() {
                 if !allowed_paths
                     .iter()
@@ -2162,6 +2213,18 @@ fn check_run_config_allowlist(id: &str, cfg: &Value) -> Result<(), Box<Response>
                     ))));
                 }
             }
+            // Gate 2: every leaf path must be exactly one of the
+            // allowlisted full paths — the top-level prefix alone is
+            // not enough (F2.5 path-depth finding).
+            let mut leaves = Vec::new();
+            collect_run_config_leaf_paths(cfg, "", &mut leaves);
+            for leaf in &leaves {
+                if !allowed_paths.contains(&leaf.as_str()) {
+                    return Err(Box::new(bad_request_run_config(&format!(
+                        "unknown runConfig path {leaf:?} not allowed for this job"
+                    ))));
+                }
+            }
             Ok(())
         }
     }
@@ -2169,12 +2232,12 @@ fn check_run_config_allowlist(id: &str, cfg: &Value) -> Result<(), Box<Response>
 
 /// 400 body for `runConfig` shape refusals. A single fixed-shape
 /// envelope so every shape-refusal client renders the same way:
-/// `{"error": "<human message>", "path": "<optional key>"}`. The
-/// `path` field is `Value::Null` for shape-level refusals (object,
-/// size, allowlist) and the offending key for unknown top-level
-/// keys. The error text never carries a payload value — it is built
-/// only from the route's constants and the user's key, AGENTS.md
-/// principle 4.
+/// `{"error": "<human message>", "path": null}`. The `path` field is
+/// always `Value::Null` here — an unknown top-level key or a
+/// disallowed leaf path is named inside `error` instead (verified
+/// against this function's body: no arm ever sets `path`). The error
+/// text never carries a payload VALUE — it is built only from the
+/// route's constants and the caller's key/path, AGENTS.md principle 4.
 fn bad_request_run_config(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -6071,10 +6134,11 @@ mod tests {
         /// for the scope check FIRST and the wiremock fixture does not
         /// name a `Run`. Pre-fix the same body returned 400 from the
         /// parser (no Dagster call at all). The parser-level 400 is
-        /// still pinned by [`parse_retry_request`]'s own unit test in
-        /// `lakehouse-api/src/retry_request.rs`.
+        /// still pinned by [`parse_retry_request`]'s own unit tests
+        /// in this file at `routes/pipelines.rs:4341` and `:4345`
+        /// (the parser itself is defined at `routes/pipelines.rs:3808`).
         #[tokio::test]
-        async fn selected_retry_without_step_keys_returns_400_before_calling_dagster() {
+        async fn selected_retry_without_step_keys_returns_404_before_calling_dagster() {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -8162,9 +8226,10 @@ mod tests {
         /// F2.5 (PR #59 review): an allowlisted job receiving a
         /// `runConfig` whose top-level key is not in the allowlist is
         /// refused with a 400 that names the offending key. For
-        /// `silver_rebuild`, only `ops.silver_rebuild_op.target_table`
-        /// is allowed — `resources` (a typical Dagster top-level key
-        /// the user might think they can set) is not.
+        /// `silver_rebuild`, only
+        /// `ops.silver_rebuild_op.config.target_table` is allowed —
+        /// `resources` (a typical Dagster top-level key the user
+        /// might think they can set) is not.
         ///
         /// F2.6: validation runs BEFORE the allowlist check, so the
         /// wiremock has to return `Valid` for the `ops` path on
@@ -8221,15 +8286,89 @@ mod tests {
             );
         }
 
+        /// F2.5 path-depth follow-up (PR #59 review): the allowlist
+        /// comparison used to check only TOP-LEVEL-key prefixes
+        /// (`p.starts_with(&format!("{top_key}."))`), so every nested
+        /// key under an allowed top-level key passed —
+        /// `{"ops":{"silver_rebuild_op":{"config":{"evil":1}}}}`
+        /// sailed through the cfg(test) `silver_rebuild` entry even
+        /// though the const's doc promises per-LEAF paths
+        /// (`ops.<op>.config.<key>`). The contract the plan and the
+        /// const's doc state: every leaf path not in the allowlist is
+        /// a 400 naming that leaf path.
+        ///
+        /// F2.6 ordering still applies: validation runs first (the
+        /// wiremock answers `Valid`), then the allowlist, then launch
+        /// — the `launchRun` mock below answers 200 with a run id, so
+        /// a fall-through to launch would return 200 and the status
+        /// assertion would fail. The error assertion pins the LEAF
+        /// path in the body, which the prefix-only comparison could
+        /// never produce (it only ever named top-level keys).
+        #[tokio::test]
+        async fn trigger_with_run_config_disallowed_leaf_path_returns_400_naming_the_leaf() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "isPipelineConfigValid": {
+                        "__typename": "PipelineConfigValidationValid",
+                        "pipelineName": "silver_rebuild" } }
+                })))
+                .mount(&server)
+                .await;
+            // A fall-through to launch would answer 200 here and the
+            // status assertion below would read 200, not 400.
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                        "run": { "runId": "r-must-not-launch" } } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let body = Json(TriggerBody {
+                run_config: Some(json!({
+                    "ops": { "silver_rebuild_op": { "config": { "evil": 1 } } }
+                })),
+            });
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                HeaderMap::new(),
+                Path("silver_rebuild".to_owned()),
+                Some(body),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "a leaf path outside the allowlist must be refused before launch"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("ops.silver_rebuild_op.config.evil"),
+                "400 body must name the offending LEAF path: got {v}",
+            );
+        }
+
         /// F2.5 (PR #59 review): the positive case — an allowlisted job
         /// with a config that matches an allowlisted path proceeds to
         /// launch (status 200, body has the run id). The job name
         /// `silver_rebuild` and the path
-        /// `ops.silver_rebuild_op.target_table` are the production
-        /// test fixture in [`ALLOWED_RUN_CONFIG`] (the production
-        /// Dagster code location does not register `silver_rebuild` —
-        /// the entry exists to exercise the allowlist mechanism end
-        /// to end through the handler). Mutation: removing the
+        /// `ops.silver_rebuild_op.config.target_table` are the
+        /// production test fixture in [`ALLOWED_RUN_CONFIG`] (the
+        /// production Dagster code location does not register
+        /// `silver_rebuild` — the entry exists to exercise the
+        /// allowlist mechanism end to end through the handler).
+        /// Mutation: removing the
         /// allowlist's positive check (`Some(allowed_paths) => ...`)
         /// makes this test fail with status 400.
         #[tokio::test]
@@ -9243,7 +9382,10 @@ mod tests {
             // `(state, principal, id)` and returns a `Response`.
             // The helper compares statuses and reads the 404 body
             // to assert it names the id (no existence oracle).
-            #[allow(clippy::items_after_statements)]
+            #[allow(
+                clippy::items_after_statements,
+                reason = "nested next to its 18 invocations in this test, so the test reads top-down (wiremock setup -> helper -> calls) without a forward pointer to module scope; the helper captures nothing from the outer scope (every input is a parameter) and could be lifted, but the local placement matches this test's single-caller shape"
+            )]
             async fn assert_route_404_then_owner_then_unrestricted<F, Fut>(
                 name: &'static str,
                 state: AppState,

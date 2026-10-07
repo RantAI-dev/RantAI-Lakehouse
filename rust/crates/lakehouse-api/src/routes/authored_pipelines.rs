@@ -156,6 +156,20 @@ pub enum CallerScope {
 ///    Platform Admin who picked "all tenants") — in scope (this is the
 ///    same "Platform Admin sees every row" rule `list` uses).
 /// 7. Otherwise — 404, same body as case 3.
+///
+/// # Errors
+///
+/// Returns `ApiError::NotFound` with the `Pipeline {id} not found` body
+/// for every out-of-scope case (rules 2, 3, 7 above, plus the
+/// found-but-unassigned branches of rule 1 and rule 5). The body is
+/// identical to the route's genuine "unknown id" 404, so the error is a
+/// classification, not an existence oracle. A transport-level `sqlx` failure
+/// on either query maps through [`lakehouse_store::StoreError`] to
+/// `ApiError::Unavailable` (connection gone) or `ApiError::Internal`
+/// (database error) — AGENTS.md rule 4, never upstream text in a
+/// response. The `?` on [`resolve_caller_scope`] propagates its own
+/// `ApiError::NotFound` when `X-Tenant` is malformed or names a foreign
+/// tenant.
 pub async fn in_scope(
     pool: Option<&PgPool>,
     principal: &Principal,
@@ -222,9 +236,17 @@ pub async fn in_scope(
 /// (impossible — the `authored__pl_foo_bar_baz` → `pl_foo_bar_baz` map
 /// collapses every `pl-foo-bar` and `pl_foo_bar` to the same suffix),
 /// look up the row whose id's safe form matches `suffix` and apply the
-/// same `matches_scope` rule [`in_scope`] uses. The safe form is unique
-/// (id is unique; each id's safe form is a deterministic function of
-/// it), so at most one row matches.
+/// same `matches_scope` rule [`in_scope`] uses. The match is unique in
+/// practice because the row's id is generated as
+/// `pl-<slug>-<base36 millis>`, the shape
+/// [`lakehouse_store::pipelines::slug_id`]'s doc documents (the store
+/// function that mints the id): the
+/// `<base36 millis>` suffix is what stops two human-typed ids that
+/// collapse to the same safe form from colliding, and a base36
+/// millisecond suffix is collision-free for any realistic pipeline
+/// creation rate. Plain human-typed ids would NOT be unique here — a
+/// route that let a caller name `pl-foo` and `pl_foo` would match both,
+/// because the safe-form map is many-to-one by construction.
 ///
 /// # Errors
 ///
@@ -239,11 +261,18 @@ pub async fn in_scope_by_safe_name(
     headers: &HeaderMap,
     suffix: &str,
 ) -> ApiResult<()> {
-    // The pipeline id is `pl-<slug>-<base36-millis>` (migration 0053's
-    // comment); its safe form is `pl_<slug>_<base36_millis>`. Match the
+    // The pipeline id is `pl-<slug>-<base36-millis>`, the shape
+    // `lakehouse_store::pipelines::slug_id`'s doc documents (the store
+    // function that mints the id); its safe form is
+    // `pl_<slug>_<base36_millis>`. Match the
     // suffix against the safe form of every candidate id with a SQL
-    // `translate(id, '-', '_') = $1`. The match is exact and
-    // index-friendly (the column is the PK).
+    // `translate(id, '-', '_') = $1`. The `translate` is a function on
+    // the LHS, so the query is a sequential scan and cannot use the PK
+    // index — acceptable here because the `pipeline_definition` table
+    // is small (one row per authored pipeline, hundreds in practice) and
+    // a partial index on the safe form would only help if the id
+    // generation rule were lossy enough for collisions to matter, which
+    // the `<base36 millis>` suffix already prevents.
     let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, tenant_id FROM pipeline_definition \
          WHERE translate(id, '-', '_') = $1",
@@ -269,6 +298,15 @@ pub async fn in_scope_by_safe_name(
 /// `catalog::is_unrestricted` helpers [`crate::routes::pipelines::list`]
 /// uses so the two per-id and list responses agree on what "in scope"
 /// means.
+///
+/// # Errors
+///
+/// Propagates `ApiError::NotFound` from [`crate::tenant_scope::resolve`]
+/// when `X-Tenant` is malformed (not valid UTF-8, not a UUID) or names a
+/// tenant the principal does not belong to. The body is identical in
+/// both cases so a caller cannot tell a well-formed UUID that exists
+/// from a well-formed UUID that does not — the same no-existence-oracle
+/// rule [`in_scope`]'s 404 already applies to a wrapped id.
 pub fn resolve_caller_scope(principal: &Principal, headers: &HeaderMap) -> ApiResult<CallerScope> {
     // `Unrestricted` only when BOTH conditions hold: caller is a Platform
     // Admin (`*:*`) AND they have NOT picked a specific tenant via
@@ -725,8 +763,9 @@ pub fn validate_pipeline_input(
     // `invalid transform at transforms[{i}]: {err}` message, so the
     // existing assertion `transforms: ["filter(1=1; DROP TABLE x)"]`
     // 400-still-fires (see
-    // `an_edit_with_a_transform_outside_the_grammar_is_refused` and
-    // F2.8's restore-side regression test).
+    // `update_transform_grammar_on_a_real_pool::
+    // an_in_scope_edit_with_a_transform_outside_the_grammar_is_400`
+    // and F2.8's restore-side regression test).
     for (index, transform) in transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
@@ -1775,13 +1814,20 @@ mod tests {
     }
 
     /// F2.1 (PR #59 review): `in_scope` runs BEFORE the transform
-    /// validator, so an edit against a pipeline id that the caller
-    /// cannot see now 404s at the scope check. The transform grammar
-    /// is still pinned by [`create_pipeline_rejects_an_unparseable_
-    /// transform_with_400`] in `routes/pipelines.rs` against a real
-    /// pool, which is the strongest form of that assertion.
+    /// validator, so an edit against a pipeline id whose scope cannot
+    /// be resolved (pool-less state => `in_scope` 404s for a `pl-`
+    /// id) never reaches the grammar. Renamed from
+    /// `an_edit_with_a_transform_outside_the_grammar_is_refused` —
+    /// that name claimed the grammar refusal, but since F2.1 the
+    /// response here is produced by the scope gate, not the grammar,
+    /// and this test pins exactly that ordering. The grammar half of
+    /// `update` itself is pinned against a real pool by
+    /// `update_transform_grammar_on_a_real_pool::
+    /// an_in_scope_edit_with_a_transform_outside_the_grammar_is_400`
+    /// in this file (and by `routes::pipelines::tests::
+    /// create_route::create_pipeline_rejects_an_unparseable_transform_with_400`).
     #[tokio::test]
-    async fn an_edit_with_a_transform_outside_the_grammar_is_refused() {
+    async fn update_checks_scope_before_the_transform_validator() {
         let body = Bytes::from_static(br#"{"kind":"batch","sourceZone":"a","sourceTable":"b","targetZone":"c","targetTable":"d","schedule":"manual","transforms":["filter(1=1; DROP TABLE x)"]}"#);
         let err = update(
             State(state_without_pool()),
@@ -1884,7 +1930,7 @@ mod tests {
         /// share state across the `DAGSTER_URL` boundary, and a sync
         /// helper cannot start a wiremock without blocking the
         /// runtime.
-        async fn state_with_dagster(pool: &sqlx::PgPool, server_uri: &str) -> AppState {
+        async fn state_with_dagster(pool: &sqlx::PgPool) -> AppState {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains(
@@ -1897,13 +1943,6 @@ mod tests {
                 .await;
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
-            // The `server_uri` arg is intentionally unused at the
-            // moment — the wiremock helper does not need its address
-            // (the env's `DAGSTER_URL` is the one the route dials) —
-            // but it stays in the signature so a future test in this
-            // module can pass its OWN wiremock with a custom response
-            // (e.g. for `restore_pipeline`'s `runConfig` path).
-            let _ = server_uri;
             // Build the AppState against the wiremock, not the
             // production DAGSTER_URL.
             let mut env_with_dagster = env.clone();
@@ -1983,7 +2022,7 @@ mod tests {
             //    400 `update` returns for a fresh edit against the
             //    same graph, naming `pl-b` verbatim.
             let err = restore_version(
-                State(state_with_dagster(&pool, "").await),
+                State(state_with_dagster(&pool).await),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl_a.id.clone(), 1)),
@@ -2055,8 +2094,9 @@ mod tests {
             // 2. Write a v=2 version row whose `transforms` array
             //    contains a string the grammar refuses — a SQL
             //    statement the filter rule would reject at parse
-            //    time, the same shape `update`'s existing test
-            //    (`an_edit_with_a_transform_outside_the_grammar_is_refused`)
+            //    time, the same shape `update`'s real-pool test
+            //    (`update_transform_grammar_on_a_real_pool::
+            //    an_in_scope_edit_with_a_transform_outside_the_grammar_is_400`)
             //    uses against the live row.
             sqlx::query(
                 "INSERT INTO pipeline_definition_version \
@@ -2092,7 +2132,7 @@ mod tests {
             //    produces — the canonical
             //    `"invalid transform at transforms[0]: ..."` shape.
             let err = restore_version(
-                State(state_with_dagster(&pool, "").await),
+                State(state_with_dagster(&pool).await),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl.id.clone(), 2)),
@@ -2402,6 +2442,206 @@ mod tests {
                 pl_a_after.depends_on,
                 vec![pl_b.id.clone()],
                 "A's stored chain must not have changed"
+            );
+        }
+    }
+
+    /// F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
+    /// f2-tenant-scope-and-run-config.md` Part D): pin the transform
+    /// grammar INSIDE `update`, against a real pool, with the scope
+    /// check PASSED. The pre-existing test
+    /// (`update_checks_scope_before_the_transform_validator` above)
+    /// 404s at `in_scope` before the validator ever runs (pool-less
+    /// state), so it cannot pin `validate_pipeline_input(...)`: for a
+    /// while after F2.1/F2.8, commenting that call out of `update`
+    /// left every test green. Here the principal and the seeded row
+    /// share one tenant, the body's only defect is a transform the
+    /// grammar refuses, and the response must be the SAME 400
+    /// `create` produces for that shape
+    /// (`routes::pipelines::tests::create_route::
+    /// create_pipeline_rejects_an_unparseable_transform_with_400`):
+    /// status 400, `invalid transform at transforms[0]` named, the
+    /// untrusted payload text NOT echoed, and nothing written.
+    mod update_transform_grammar_on_a_real_pool {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        /// `DATABASE_URL` dialing the SAME per-test Postgres
+        /// `#[sqlx::test]` already handed us via `pool` — the
+        /// extraction every route-level `sqlx::test` in this file
+        /// uses.
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        /// `AppState` on the test pool with `DAGSTER_URL` pointed at
+        /// a per-test wiremock. `update` calls
+        /// `state.dagster.list_jobs()` BEFORE the validator, and the
+        /// wiremock server is returned alongside the state (kept alive
+        /// by the binding in the test) so the probe is answered in
+        /// process — F2.10's "no real network in unit tests" rule.
+        /// The exact `list_jobs` reply shape does not matter here:
+        /// any outcome degrades to the "no Dagster upstreams
+        /// accepted" fallback, and this body sends no `dependsOn`.
+        async fn state_with_dagster(pool: &sqlx::PgPool) -> (AppState, wiremock::MockServer) {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": []
+                })))
+                .mount(&server)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert(
+                "DAGSTER_URL".to_owned(),
+                format!("{}/graphql", server.uri()),
+            );
+            (
+                AppState::new(Config::from_map(&env).expect("a valid test Config")),
+                server,
+            )
+        }
+
+        fn create_input(name: &str, tenant_id: uuid::Uuid) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "src".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "tgt".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                id: None,
+            }
+        }
+
+        /// Create a tenant via the store and return its uuid — the
+        /// `route_walk::provision_tenant_for` shape duplicated here so
+        /// this module stays self-contained (same as the `f2_2_*`
+        /// module above).
+        async fn provision_tenant(pool: &sqlx::PgPool, slug: &str) -> uuid::Uuid {
+            let t = lakehouse_store::identity::create_tenant(
+                pool,
+                &lakehouse_store::identity::CreateTenantInput {
+                    name: slug.to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "starter".to_owned(),
+                    residency: "in-region".to_owned(),
+                },
+            )
+            .await
+            .expect("create tenant");
+            uuid::Uuid::parse_str(&t.id).expect("tenant id is a uuid")
+        }
+
+        /// A member of `tenant_id` holding `pipeline:write` — the
+        /// permission the `PUT /api/pipelines/{id}` policy names, so
+        /// the scope gate is passed by membership and not by the
+        /// `*:*` shortcut.
+        fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
+            Principal {
+                tenant_ids: vec![tenant_id],
+                ..principal(PrincipalId::User(uuid::Uuid::from_u128(3)))
+            }
+        }
+
+        /// An IN-SCOPE edit whose only defect is a transform outside
+        /// the grammar: 400 with `create`'s body shape, and the live
+        /// row untouched. Mutation: commenting out the
+        /// `validate_pipeline_input(...)` call in `update` makes this
+        /// test fail — the store does not validate transforms, so the
+        /// route would answer 200 (or a non-400 store error), never
+        /// the asserted 400.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_in_scope_edit_with_a_transform_outside_the_grammar_is_400(pool: sqlx::PgPool) {
+            // 1. Scope precondition: the row belongs to a real tenant
+            //    and the principal is a member of THAT tenant — so
+            //    `in_scope` passes and the handler reaches the
+            //    validator (the 404 path is the other test's job).
+            let tenant = provision_tenant(&pool, "f2-8-grammar").await;
+            let pl = pipelines::create_pipeline(&pool, &create_input("pl-a", tenant), None)
+                .await
+                .expect("create pl-a in the tenant");
+            let (state, _server) = state_with_dagster(&pool).await;
+
+            // 2. The same body `create`'s grammar test sends — the
+            //    filter statement the grammar rejects at parse time.
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "src",
+                    "targetZone": "silver",
+                    "targetTable": "tgt",
+                    "schedule": "manual",
+                    "transforms": ["filter(1=1; DROP TABLE x)"],
+                }))
+                .expect("a fixed-shape JSON body serializes"),
+            );
+            let err = update(
+                State(state),
+                Extension(tenant_principal(tenant)),
+                HeaderMap::new(),
+                Path(pl.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("an unparseable transform must be refused at update");
+
+            // 3. `create`'s body shape: 400, the failing index named,
+            //    the untrusted payload text never echoed.
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "an in-scope edit with a grammar-violating transform must be a 400"
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&response_body);
+            assert!(
+                message.contains("invalid transform at transforms[0]"),
+                "the 400 must carry `create`'s per-index message shape: {message:?}",
+            );
+            assert!(
+                !message.contains("DROP TABLE"),
+                "the 400 must not echo the untrusted payload text: {message:?}",
+            );
+
+            // 4. Belt-and-braces: the validator refused before any
+            //    write — the live row still carries its original
+            //    (empty) transforms, read back through
+            //    `pipelines::get_definition` the same way the
+            //    restore-side test does.
+            let def_after = pipelines::get_definition(&pool, &pl.id)
+                .await
+                .expect("get_definition")
+                .expect("pl-a still exists");
+            assert!(
+                def_after.transforms.is_empty(),
+                "the refused edit must not have written the bad transforms: got {:?}",
+                def_after.transforms,
             );
         }
     }

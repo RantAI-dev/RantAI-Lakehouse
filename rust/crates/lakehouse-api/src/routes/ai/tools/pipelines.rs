@@ -518,7 +518,9 @@ mod t1_3_tests {
 
     use std::collections::HashMap;
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
     use lakehouse_dagster::LaunchFailure;
+    use uuid::Uuid;
 
     use super::*;
     use crate::config::Config;
@@ -531,6 +533,23 @@ mod t1_3_tests {
         let mut env = HashMap::new();
         env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
         AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// A logged-in principal holding `pipeline:write` — the permission
+    /// `POST /api/pipelines/{id}/trigger` is gated on, so
+    /// `trigger_pipeline` tests exercise the tool with the identity
+    /// the copilot dispatcher would actually pass (same fixture shape
+    /// as `routes::ai::tools::connectors::fixture_user_principal`).
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "fixture".to_owned(),
+            permissions: PermissionSet::parse("pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -753,8 +772,11 @@ mod t1_3_tests {
     //    Part D) — the tool body's `stepKeys` validation and
     //    `runConfig` forwarding contracts. The route-level handler
     //    keeps its existing `{"error": "..."}` shape for argument
-    //    validation, so the tests below mirror the `runId is required`
-    //    pattern from `run_id_required` above.
+    //    validation, so the `stepKeys` tests below mirror the
+    //    `runId is required` pattern from `run_id_required` above;
+    //    the `runConfig` test pins tool → route with a wiremock
+    //    `launchRun` matcher on `variables.cfg` instead, because the
+    //    contract there is forwarding, not validation.
 
     /// F2.9 (PR #59 review): a `stepKeys` that is NOT a JSON array of
     /// strings must surface as an `{"error": "..."}` tool result,
@@ -872,6 +894,68 @@ mod t1_3_tests {
                     .is_some_and(|e| e.contains("stepKeys"))
             }),
             "valid string-array stepKeys must NOT surface as the validation error: got {body}"
+        );
+    }
+
+    /// F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    /// f2-tenant-scope-and-run-config.md` Part D): `trigger_pipeline`
+    /// MUST forward `args["runConfig"]` into the `TriggerBody` it
+    /// hands to `routes::pipelines::trigger` — that tool → route seam
+    /// is the only place the copilot's config can be dropped before
+    /// it reaches Dagster. The route-level test
+    /// `routes::pipelines::tests::trigger_with_config::
+    /// trigger_with_valid_run_config_calls_launch_run_with_config`
+    /// pins route → Dagster; this one pins tool → route: the
+    /// wiremock's `body_partial_json` matcher on `variables.cfg` only
+    /// matches when the caller's config arrives inside the
+    /// `launchRun` mutation, so dropping the forwarding line in
+    /// [`trigger_pipeline`] leaves the mock unmatched (wiremock
+    /// answers 404), the launch errors, and the run-id assertion
+    /// below fails.
+    #[tokio::test]
+    async fn trigger_pipeline_forwards_run_config_to_the_trigger_route() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "isPipelineConfigValid",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": {
+                    "__typename": "PipelineConfigValidationValid",
+                    "pipelineName": "silver_rebuild" } }
+            })))
+            .mount(&server)
+            .await;
+        // The forwarding pin: `variables.cfg` must carry the exact
+        // config the tool was handed, or this mock never matches.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRun"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "variables": {
+                    "cfg": { "ops": { "silver_rebuild_op": {
+                        "config": { "target_table": "x" } } } },
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "r-tool-config" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with_dagster(&server.uri());
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("silver_rebuild"));
+        args.insert(
+            "runConfig".to_owned(),
+            json!({ "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } } }),
+        );
+        let body = trigger_pipeline(&state, Some(&principal), &args).await;
+        assert_eq!(
+            body["id"],
+            json!("r-tool-config"),
+            "args[\"runConfig\"] must reach the trigger route's launch body unchanged: got {body}",
         );
     }
 }
