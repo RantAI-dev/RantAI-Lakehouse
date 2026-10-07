@@ -96,6 +96,13 @@ sqlparser = { workspace = true, features = ["visitor"] }
 # dependency of something else in the tree, but this is the first direct
 # use of it in this crate (WS4 item G2).
 chrono = "0.4"
+# Reads `.xls` and `.xlsx` for the file upload (`upload_workbook`, ADR 0014,
+# amendment of 2026-10-07). MIT; it adds `atoi_simd`, `codepage`,
+# `debug_unsafe`, `fast-float2`, `typed-path`, `zip` and `zopfli` to the
+# lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
+# features: dates are rendered from its date components, so its `chrono`
+# feature is not needed.
+calamine = "0.36"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,

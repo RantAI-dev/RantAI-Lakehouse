@@ -1263,6 +1263,9 @@ mod tests {
         fixture!("cr_only", "csv"),
         fixture!("latin1_bytes_in_utf8", "csv"),
         fixture!("malformed_quotes", "csv"),
+        // What `upload_workbook` writes for the `Quirks` sheet of the
+        // workbooks in `ops/fixtures/workbooks/` (X1 of the Excel plan).
+        fixture!("converted_sheet", "csv"),
     ];
 
     struct Expected {

@@ -88,3 +88,12 @@ text = ("Stock overview\r\n\r\nGenerated 24.09.2025\r\n\r\n"
         "8250\t0000100\tADHESIVE\t10\r\n8250\t0000200\tPP BAND\t4\r\n")
 open("sap_report_utf16.xls", "wb").write(b"\xff\xfe" + text.encode("utf-16-le"))
 ```
+
+`converted_sheet.csv` is not an export: it is what the API writes for the
+`Quirks` sheet of `ops/fixtures/workbooks/stock.xlsx` and `stock.xls`
+(`upload_workbook.rs`, where a test requires the output to equal this file byte
+for byte). It is here so that the two readers of the dialect also read the
+converter's output: quotes, an embedded line break, padding, empty cells. Its
+`.expected.json` was written by hand from the conversion rules in that
+module's doc. The workbooks and how to regenerate them are described in
+`ops/fixtures/workbooks/make_workbooks.py`.

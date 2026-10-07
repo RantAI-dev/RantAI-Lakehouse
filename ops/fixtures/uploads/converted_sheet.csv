@@ -1,0 +1,29 @@
+case,value
+whole number,1
+fraction,0.1
+one third,0.3333333333333333
+large,1e21
+tiny,1e-7
+negative,-42.5
+thousands display,1234.5
+percent,0.25
+date,2025-09-24
+date us display,2025-09-24
+date time,2025-09-24 13:30:05
+time,13:30:00
+duration,36:00:00
+bool true,true
+bool false,false
+error div0,#DIV/0!
+error na,#N/A
+text with comma,"Bolt, hex M6"
+text with quote,"She said ""ok"""
+multi-line,"line one
+line two"
+padded,  padded  
+empty,
+text number,007
+unicode,Käse 日本
+leading quote,"""quoted"" start"
+merged top,M
+merged bottom,
