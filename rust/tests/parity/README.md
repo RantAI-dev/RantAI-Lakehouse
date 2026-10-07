@@ -54,9 +54,8 @@ should be run locally before committing any re-capture.
 
 The harness must normalize these rather than compare them by value:
 
-- **Model output** — `ai-chat-ok`, `agent-ask-ok`, `agent-query-ok`,
-  `agent-text-to-sql-ok`. Redacted, but even the lengths vary per call.
-  `tests/parity.rs` compares these four by top-level key presence + JSON
+- **Model output** — `ai-chat-ok`. Redacted, but even the lengths vary per call.
+  `tests/parity.rs` compares it by top-level key presence + JSON
   *type* only (`STRUCTURE_ONLY`) — not even normalized leaf-by-leaf — because
   a different model run can legitimately call a different number of tools or
   return a different number of results, which a fixed-shape leaf normalizer
@@ -93,11 +92,10 @@ The harness must normalize these rather than compare them by value:
   (`REDACT_TEXT_IN` × `REDACT_TEXT_KEYS` in `capture.ts`). Note: `sql` here
   genuinely is redacted in this specific capture, even though the "sensitive
   free text" section above says `sql` is not redacted in general (that
-  statement is about the top-level `sql` field on `query-run-ok` /
-  `agent-query-ok` / `agent-text-to-sql-ok`, which is real, intentionally
-  unredacted business SQL — the tool-call SQL nested inside a stored chat
-  session is a different field entirely and was swept up by the same-name
-  free-text pass).
+  statement is about the top-level `sql` field on `query-run-ok`, which is
+  real, intentionally unredacted business SQL — the tool-call SQL nested
+  inside a stored chat session is a different field entirely and was swept
+  up by the same-name free-text pass).
 - **Runtime error text** — `alerts-create-bad-body` and
   `dashboard-boards-create-bad-body` record Bun's JSON parser message
   (`JSON Parse error: Unexpected identifier "not"`), which a Rust service

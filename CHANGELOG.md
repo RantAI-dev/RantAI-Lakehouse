@@ -227,6 +227,7 @@ once a first release is tagged.
   the model is intentionally left unchanged.
 - The alerts table now distinguishes an API failure from having no alerts,
   instead of showing an empty state for both.
+- Query Studio's "Natural language" box asks the copilot's engine (`POST /api/ai/chat`) for both "Ask (agentic)" and "Generate SQL only", so masking, row filters and `query:read` apply to the SQL it runs. "Generate SQL only" runs the query once on the server on its way to loading the SQL into the editor, and its `assumptions` list is gone because the chat has no such list.
 
 ### Fixed
 
@@ -289,6 +290,7 @@ once a first release is tagged.
   "completed" before they had run.
 - Seeded pipeline and alert rows that were indistinguishable from real
   activity are pruned by migration.
+- `POST /api/agent/ask`, `POST /api/agent/query` and `POST /api/agent/text-to-sql`, with their parity captures. The console no longer calls them, since the box asks `/api/ai/chat`, and a request to one of them now answers like a path that never existed (500 from the auth gate).
 
 ### Fixed
 
@@ -299,6 +301,10 @@ once a first release is tagged.
   discarded the sort it had just written. Restoring a filter from table
   memory failed the same way. Affects every table page, not only the
   dashboard list.
+
+### Security
+
+- The three `/api/agent/*` endpoints sent a model's SQL straight to `ClickHouse` with no masking and no row filter, asked only for a sign-in, and returned upstream error text. Removing them closes backlog `SEC-9` and the agent-endpoint row of `SEC-11`.
 
 ## [0.1.0] - 2026-08-30
 

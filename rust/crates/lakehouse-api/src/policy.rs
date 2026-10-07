@@ -439,9 +439,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
-    ("POST", "/api/agent/ask",           Policy::RequiresAuth),
-    ("POST", "/api/agent/query",         Policy::RequiresAuth),
-    ("POST", "/api/agent/text-to-sql",   Policy::RequiresAuth),
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
     ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),

@@ -617,9 +617,8 @@ the versions itself, in a `ClickHouse` table it creates on first use:
   opt-in `dagster` compose profile** (mirroring how P2 gated `seaweedfs`
   behind its own profile) — see "Dagster (opt-in, P3)" below and
   `docs/adr/0005-dagster-code-location-ownership-and-packaging.md`.
-- **A real LLM.** Needs a paid API key. AI chat / agent / text-to-SQL
-  routes return `503` without `LLM_KEY` (or `MINIMAX_API_KEY`) set to a
-  working key.
+- **A real LLM.** Needs a paid API key. AI chat routes return `503` without
+  `LLM_KEY` (or `MINIMAX_API_KEY`) set to a working key.
 
 See "Features unavailable locally," below, for the full list and how to
 turn each one on.
@@ -707,7 +706,7 @@ check.
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
-| AI chat / agent / text-to-SQL | LLM API key | `503` from `/api/ai/*`, `/api/agent/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
+| AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |

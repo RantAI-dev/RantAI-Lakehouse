@@ -1041,14 +1041,14 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
         .into_response()
 }
 
-/// Caller-facing text for an LLM failure, shared by the Copilot and the
-/// text-to-SQL agent. It used to be `err.to_string()` — the provider's own
-/// response text (e.g. Cloudflare's `error code: 1016` page, seen in QA when
-/// the configured tunnel was down), shown verbatim (AGENTS.md principle 4).
+/// Caller-facing text for an LLM failure. It used to be `err.to_string()` —
+/// the provider's own response text (e.g. Cloudflare's `error code: 1016`
+/// page, seen in QA when the configured tunnel was down), shown verbatim
+/// (AGENTS.md principle 4).
 /// It is now fixed text; the only thing carried over is the HTTP status,
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
-pub(crate) fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
+fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
     tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
