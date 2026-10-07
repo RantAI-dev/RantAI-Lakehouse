@@ -1,7 +1,8 @@
 # Handoff — planner and reviewer
 
 For the Claude agent taking over the planner and reviewer role. Written
-2026-10-03 by the outgoing planner. Everything here was checked against the
+2026-10-03 by the outgoing planner; sections 3 to 6 and 10 updated
+2026-10-07 by the planner that took over. Everything here was checked against the
 repository and GitHub at the time of writing; re-check before relying on it,
 because other people and agents are working in this repo.
 
@@ -41,11 +42,17 @@ Version 0.1, heavy development. Full picture: `docs/core/PRODUCT.md`.
 | Rules for agents | `AGENTS.md` |
 | The product, coverage against competitors, blockers, roadmap | `docs/core/PRODUCT.md` |
 | The one list of work | `docs/core/BACKLOG.md` |
+| One spec per backlog task: target numbers against the best competitor, acceptance checklist | `docs/core/specs/` |
 | One page per feature, with its acceptance checklist | `docs/core/features/` |
+| Competitor matrices (BI, Data, Query Studio) and the owner's BI decisions | `docs/core/reference/competitive-comparison.md` |
 | Parked reference material (security, support, release, competitors) | `docs/core/reference/` |
 | Engineering plans, with developer handoffs and your reviews | `docs/superpowers/plans/` |
 
 The owner asked for this to stay small. Do not add new document types.
+`specs/` is the one exception, added at the owner's request on 2026-10-07:
+one file per task, generated together so they share a format. A number a
+spec marks *(proposed)* is the planner's, not a competitor's; the owner
+signs it on the feature page before a plan uses it.
 Several older documents contradict the build (`PRODUCT_SPECS.md`,
 `docs/FEATURE_COVERAGE.md`, `docs/UX_FLOWS.md`, parts of `README.md`, the
 sales playbook). Where they differ from `docs/core/PRODUCT.md` and the code,
@@ -55,81 +62,64 @@ trust the code. Fixing them is backlog `DOC-1`.
 
 | PR | What |
 | --- | --- |
-| #60 | Gold publishing slice A: the scheduled export can authenticate. Also the workflow rules and `docs/core/` |
+| #60, #63, #64 | Gold publishing (`DATA-1`), slices A to D |
 | #61 | Merge rule: a PR may merge when it adds no failing check |
 | #62 | `SEC-8`: dependency security checks green |
-| #63 | Gold publishing slice B: per-mart setting, routes, skip-if-unchanged, scheduler |
-| #64 | Gold publishing slices C and D: publish after pipeline success, the console switch, Exports removed from the Build menu |
-| #65 | This handoff, plus the login-throttling plan and feature page |
+| #65 | The first version of this handoff |
+| #66 | Pipelines: chains load, cycles are refused |
+| #67 | Login throttling and session cleanup (`SEC-2`, `SEC-5`), reviewed over three rounds |
+| #68 | Dashboards: conversational Home, map charts, custom SQL in the chart builder |
+| #70 | Assistant answers a very short message in the deployment's language |
+| #71 | Connectors work, file upload (`DATA-9`), the time-travel picker |
 
-`main` was at `0277ebd` before #65.
+Merged but **not accepted**, each waiting for the owner's checklist on its
+feature page: `DATA-1`, `SEC-2` and `SEC-5` (with four unsigned defaults),
+`DATA-9`. Do not mark any Done until the owner has run it.
 
-**Gold publishing (`DATA-1`) is merged but not accepted.** Nobody has seen
-the card in a running console or watched the sensor launch an export. The
-owner still has to run the 18-step checklist in
-`docs/core/features/gold-publish-per-mart.md` and sign its four decisions.
-Do not mark it Done until they have.
+Thirteen staging and CI commits (`7ec3a81` on 2026-10-05 to `ee0251e` on
+2026-10-07) went straight to `main` without a pull request. One of them
+added `.env.staging`, which nobody has checked (`SEC-13`). Section 10.
 
 ## 5. What is in flight
 
-**Login throttling and session cleanup (`SEC-2`, `SEC-5`).**
-
-- Plan: `docs/superpowers/plans/2026-10-02-login-throttle-session-cleanup.md`.
-  Feature page: `docs/core/features/login-protection-and-session-cleanup.md`.
-- Developer branch: `feat/login-throttle-session-cleanup`, **local only**.
-- State when this was written: one commit (the docs commit). Uncommitted
-  work for roughly T1–T4 (error variant, config, app state, login route,
-  migration `0055_login_throttle.sql`, `throttle.rs`, `cleanup.rs`, a
-  throttle test). No sign of T5 (login page) or T6 (docs). Nothing pushed,
-  no handoff entry, no pull request.
-- The developer agent reported all of T1–T6 pushed and "PR #65 open". None
-  of that was true. See section 8. (PR #65 is now the pull request that
-  added this handoff file; it has nothing to do with the login work.)
-
-When it is really ready, review it against the plan. The things most likely
-to be wrong, because they are the subtle parts:
-
-- The `429` must be identical for an existing and a non-existing email, and
-  the `401` for a wrong password must be unchanged.
-- A locked key must not reach password verification.
-- `record_failure` must be one atomic SQL statement; the plan asks for a
-  concurrent test.
-- No email, password or full hash in any log line or audit row.
-- A throttle storage error must not fall through to an unthrottled login.
-- The cleanup must never delete a live session or an active service
-  credential.
-
-Four decisions on the feature page are on defaults the owner has not signed
-(5 failures in 15 minutes, 5-minute lock, 30-day retention, no off switch).
+- **The product plan.** On 2026-10-05 to 10-07 the BI, Data and Query
+  Studio modules were compared against their competitors under the owner's
+  strict rule (Have = match or beat the best competitor). The owner decided
+  BI area by area; Data is not yet decided area by area (`DEC-9`, `DEC-10`).
+  Result: the matrices in `reference/competitive-comparison.md`, the task
+  lists in `BACKLOG.md`, one spec per task in `specs/`, and roadmap pages
+  published as private artifacts for the owner.
+- **Assistant parity.** Every BI item has an assistant item (`AI-1` to
+  `AI-15`) that ships with it (`AGENTS.md`). AI for other modules belongs to
+  the AI team, which plans it; `AI-16` is the hand-off list.
+- **Managed environments plan** (`docs/superpowers/plans/2026-10-07-managed-environments.md`):
+  on hold by the owner; nothing of it is committed.
+- No developer branch is open in our lane.
 
 ## 6. What comes after
 
-The owner assigned this session the security, governance, monitoring and
-platform lane. Other streams, which you do not plan or review unless asked:
+Streams, which you do not plan or review unless asked:
 
 | Stream | Who |
 | --- | --- |
 | Dashboards | The owner's friend |
 | Pipelines | Another agent |
-| Data module UI and file upload | Another friend |
+| Data module and file upload | Another friend |
+| AI outside dashboards | The AI team |
 
-Next in our lane, in the order proposed to the owner (not yet confirmed):
+Our lane is security, governance, monitoring and platform. Next, in order:
 
-1. `SEC-3` — test single sign-on against a real identity provider; fix
-   `README.md`, which says the provider endpoint is unbuilt (it exists).
-2. `VER-1` — prove row filters end to end, as masking is by gate `ops/g8`;
-   verify SFTP, Sheets and Oracle sources.
-3. `GOV-1` — audit trail for every console change. Cuts across everyone's
-   routes; do it after the other streams' branches merge, or split by area.
-4. `SEC-6` — fourteen older handlers return internal error text. Same
-   caution.
-5. `OPS-8` usage view, `OPS-1` trimming raw table history, `DATA-2` and
-   `DATA-6` for published Gold copies, `OPS-7` a timed restore test.
-
-Open questions for the owner are in `docs/core/PRODUCT.md` section 6. The
-ones that block planning: which competitor features we say no to
-(notebooks, dbt, AI functions in SQL, model training, mobile app, data
-sharing), and exactly which pages the Data-module stream covers.
+1. **Security plan.** Write one plan for the Now security items: `SEC-14`
+   and `SEC-15` (high severity, connector code owned with the Data stream),
+   `SEC-9` and `SEC-11` (shared with the AI team), `SEC-10`, and chase
+   `SEC-13`. Their specs say what done looks like.
+2. The owner's open decisions: `DEC-8`, `DEC-9`, `DEC-10`, the four login
+   defaults, and the *(proposed)* numbers in each spec as its feature comes
+   up (`PRODUCT.md` section 6).
+3. Acceptance checklists with the owner: `DATA-1`, `SEC-2`/`SEC-5`,
+   `DATA-9`.
+4. Then `SEC-12`, `SEC-16` to `SEC-21`, `SEC-3` (single sign-on), `VER-1`
+   (row filters), `GOV-1`, `SEC-6`, `OPS-8`, `OPS-1`, `OPS-7`.
 
 ## 7. How to review and merge
 
@@ -239,9 +229,10 @@ skip) and omitted handoffs. So:
 | Item | State |
 | --- | --- |
 | `.claude/settings.json` in the main folder | The owner's permission file, untracked. Leave it; do not commit it |
-| Branch protection on `main` | Not applied (backlog `REL-1`). The PR-only rule is held by agreement |
+| Branch protection on `main` | Not applied (backlog `REL-1`). The PR-only rule is held by agreement, and was broken by the thirteen direct pushes in section 4 |
+| `.env.staging` on `main` | Added in `7ec3a81` without review (earlier notes said `df14b78`, which is not on `main`); contents not checked (`SEC-13`). The planner's attempt to read it was blocked as a credentials file |
 | Leaked key in git history | Open (backlog `SEC-1`); the history scan is red on purpose |
+| GitHub Dependabot | Reports many open alerts on the default branch; not triaged |
 | SQL Server connection test after the client update in #62 | Not verified against a real server |
 | Background merges causing extra published copies | Backlog `DATA-10` |
 | `docs/core/reference/` | Still carries the old on-premises framing |
-| Worktree `../wt-handoff` and branch `docs/planner-reviewer-handoff` | Used to write this file; safe to remove once merged |
