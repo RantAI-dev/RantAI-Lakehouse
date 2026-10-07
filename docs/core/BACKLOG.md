@@ -18,9 +18,9 @@ The one list of known work. Look at it weekly; pick what is next.
 | `REL-1` | Protect the main branch | Delivery | `docs/CI.md` |
 | `DOC-1` | Archive or rewrite the old product documents that contradict the build | Docs | PRODUCT §6 |
 | `GOV-2` | Decide which role may publish a table in open format | Governance | PRODUCT §6 |
-| `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Security | `routes/agent.rs`, `policy.rs` |
+| `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in. **Shared with the AI team: their code** | Security | `routes/agent.rs`, `policy.rs` |
 | `SEC-10` | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver | Security | `lakehouse-notify` |
-| `SEC-11` | Dashboard tiles (also on public and embed links) and the agent endpoints return raw database error text. Same rule as `SEC-6` | Security | `routes/support.rs`, `routes/agent.rs` |
+| `SEC-11` | Dashboard tiles (also on public and embed links) and the agent endpoints return raw database error text. Same rule as `SEC-6`. **Shared with the AI team for the agent endpoints** | Security | `routes/support.rs`, `routes/agent.rs` |
 | `SEC-13` | Check `.env.staging`, pushed straight to `main` in `df14b78`, for real credentials or hostnames; rotate anything real | Security | commit `df14b78` |
 
 ## Next
@@ -43,6 +43,21 @@ The one list of known work. Look at it weekly; pick what is next.
 | `BI-16` | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-17` | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-18` | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; favourites; version history; trash; personal space | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
+| `AI-1` | **Ready now**. The assistant manages the dashboards that exist today: rename boards, delete them (with approval), arrange and resize tiles, move charts between boards | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-2` | **Waits for `BI-18`**. The assistant adds and changes dashboard filters ("only 2025, only Bali") | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-3` | **Waits for `BI-9`**. The assistant picks the time grain ("monthly") | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-4` | **Waits for `BI-8`**. The assistant writes calculated fields in the product's formula language, not raw SQL | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-5` | **Waits for `BI-16`**, per chart type as it lands. The assistant creates every new chart type: raw and pivot tables, KPI with comparison, histogram, Gantt and the rest | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-6` | **Waits for `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13`**, each part with its BI item. The assistant builds charts with several dimensions and filters, joins tables, uses bins, groups, hierarchies and parameters, and combines two sources | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-7` | **Waits for `BI-2`**. The assistant uses named metrics before it writes SQL, so the same question gives the same number | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-8` | **Waits for `BI-17`**. The assistant changes number formats, colours, axes and labels, and adds trend and forecast lines | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-9` | **Waits for `BI-18`** (layout part). The assistant adds tabs and uses templates | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-10` | **Waits for `RPT-1`, `BI-1`**. The assistant schedules reports ("send this to me every Monday as PDF") and produces a PDF or Excel file on request | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-11` | **Waits for `BI-19`, `BI-26`, `DEC-8`**. The assistant creates share and embed links only with approval, respects dashboard permissions, and never grants permissions | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-12` | **Ready now** for fixing and explaining SQL inside the editor; variables **Waits for `BI-15`** | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-13` | **Waits for `BI-14`**. The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today) | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-14` | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats | Ask AI | `AGENTS.md` (assistant parity) |
+| `AI-15` | **Ready now**. A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | Ask AI | `AGENTS.md` (assistant parity) |
 | `BI-26` | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-19` | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
 | `BLD-1` | Joins and aggregations in the pipeline builder | Build | PRODUCT §2 |
@@ -107,6 +122,7 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | `DEC-4` | Train and serve models | No |
 | `DEC-5` | Mobile app | No |
 | `DEC-6` | Share data with another organisation | Defer |
+| `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Also: making a dashboard public or creating an embed link, changing who can see a dashboard, scheduling email to addresses outside the company, deleting a dashboard |
 | `INT-1` | Digital employees | Parked by the product owner, 2026-10-02 |
 
 ## Done and rejected

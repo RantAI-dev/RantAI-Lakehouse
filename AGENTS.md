@@ -71,6 +71,18 @@ The loop, per feature:
    checklist on the feature page, and the planner updates
    `docs/core/PRODUCT.md` and `docs/core/BACKLOG.md`.
 
+**Assistant parity (product owner, 2026-10-07).** Dashboards are built
+through the assistant, not by drag and drop, so a BI feature is not
+complete until the assistant can use it. Every BI feature's plan names the
+assistant change that goes with it: the tool and its schema (regenerate
+`tests/fixtures/tool_schemas.json`), what the dashboard page sends as
+context, and the standard request set (`AI-15`). The AI team reviews that
+part of the plan and of the diff.
+
+**Waits for.** A backlog item that cannot start until another merges says
+so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
+merged; the planner checks this before writing its plan.
+
 ## Five principles
 
 1. **Say why, at the code.** Module docs, migration headers, compose blocks
