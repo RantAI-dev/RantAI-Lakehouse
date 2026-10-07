@@ -32,6 +32,15 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
    `succeeded`, with the rows loaded and no error.
 7. It deletes the upload: the answer is 204, the upload is gone from the list
    and from `GET /api/uploads/{id}`, and the table keeps all its rows.
+8. An Excel workbook (X4 of `docs/superpowers/plans/2026-10-07-upload-excel.md`):
+   it uploads `ops/fixtures/workbooks/stock.xlsx`, expects the answer to list
+   its five sheets with `Stock` as the default, previews that sheet (the
+   fixed dialect, the sheet's columns and rows, dates as ISO text), loads it
+   with `replace` into `<table>_xlsx`, expects the upload's record to name the
+   sheet in `parseOptions`, the table to hold the sheet's three rows as text
+   (a date as `2025-09-24`, a price as `1.5`), one succeeded `ingest_run`, and
+   deletes the upload. The API converts the sheet and stores it beside the
+   workbook; the load job is the one step 3 runs, unchanged.
 
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
@@ -50,14 +59,15 @@ Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 - `G9_TENANT_ID`: a tenant the account belongs to, sent as `X-Tenant`.
   Optional: without it the API uses the account's first tenant.
 
-It reads the fixtures from `ops/fixtures/uploads/` beside this directory, so a
-container that runs it needs `ops/` and not only `ops/g9/`.
+It reads the fixtures from `ops/fixtures/uploads/` and `ops/fixtures/workbooks/`
+beside this directory, so a container that runs it needs `ops/` and not only
+`ops/g9/`.
 
 # What it leaves behind
 
-The raw table `g9_upload_<suffix>` with its four rows, its Iceberg files and
-its catalog entry; the claim on its name, which is never released; two
-`ingest_run` rows; audit events and query history entries. A raw table and
+The raw tables `g9_upload_<suffix>` (four rows) and `g9_upload_<suffix>_xlsx`
+(three) with their Iceberg files and catalog entries; the claims on their
+names, which are never released; three `ingest_run` rows; audit events and query history entries. A raw table and
 its claim cannot be removed through the API (deleting a raw table is outside
 the plan, section 5), so an operator who wants them gone removes them by hand.
 The upload itself is deleted at the end, and also when a step fails, as far as
@@ -76,6 +86,18 @@ from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "uploads"
 FIXTURE = "sap_report_utf16"
+WORKBOOKS = Path(__file__).resolve().parents[1] / "fixtures" / "workbooks"
+WORKBOOK = "stock.xlsx"
+# What the `Stock` sheet of `stock.xlsx` holds, as text (see
+# `ops/fixtures/workbooks/make_workbooks.py`), and the columns the job names
+# from its header row.
+WORKBOOK_SHEETS = ["Stock", "Quirks", "Offset", "Hidden notes", "Empty"]
+WORKBOOK_COLUMNS = ["sku", "name", "qty", "price", "received"]
+WORKBOOK_ROWS = [
+    ["A-100", "Bolt, hex M6", "10", "1.5", "2025-09-24"],
+    ["A-200", "Washer", "250", "0.05", "2025-09-25"],
+    ["A-300", "Flange DN50 \u2013 steel", "4", "12", "2025-10-01"],
+]
 
 # `ops/g6/g6_ingest_matrix_test.py` waits 150 s for a connector run to
 # succeed. A two-row load does the same work (read, one Iceberg commit, one
@@ -241,6 +263,9 @@ def step_load(api, upload_id: str, table: str, mode: str, using: dict, file_rows
             "encoding": using["encoding"],
             "delimiter": using["delimiter"],
             "headerRow": using["headerRow"],
+            # A workbook is loaded one sheet at a time; the API reads UTF-8 and
+            # commas for it whatever `encoding` and `delimiter` say.
+            **({"sheet": using["sheet"]} if using.get("sheet") else {}),
         },
         timeout=60,
     )
@@ -336,6 +361,67 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
     print(f"[g9] the upload is gone and the table keeps its {left} rows")
 
 
+def step_workbook(api, base_table: str, state: dict) -> None:
+    path = WORKBOOKS / WORKBOOK
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/workbooks/ beside it)")
+    raw = path.read_bytes()
+    state["upload_id"], state["deleted"] = None, False
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (WORKBOOK, raw, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        timeout=60,
+    )
+    upload = _expect(resp, 201, "POST /api/uploads (workbook)").json()
+    upload_id = upload["id"]
+    state["upload_id"] = upload_id
+    workbook = upload.get("workbook") or {}
+    if [sheet.get("name") for sheet in workbook.get("sheets", [])] != WORKBOOK_SHEETS or workbook.get("defaultSheet") != "Stock":
+        raise G9Failure(f"the workbook's sheets should be {WORKBOOK_SHEETS} with Stock the default, got {workbook}")
+    print(f"[g9] workbook: uploaded {WORKBOOK} as {upload_id}, sheets {WORKBOOK_SHEETS}")
+
+    preview = _expect(
+        api.get(f"{API_URL}/api/uploads/{upload_id}/preview", params={"sheet": "Stock"}, timeout=60), 200, "workbook preview"
+    ).json()
+    if preview.get("columns") != WORKBOOK_COLUMNS or preview.get("rows") != WORKBOOK_ROWS:
+        raise G9Failure(f"the workbook preview shows {preview.get('columns')} and {preview.get('rows')}")
+    if (preview.get("workbook") or {}).get("sheet") != "Stock":
+        raise G9Failure(f"the preview should say it read the Stock sheet, got {preview.get('workbook')}")
+    using = {**preview["using"], "sheet": "Stock"}
+
+    table = f"{base_table}_xlsx"
+    step_load(api, upload_id, table, "replace", using, len(WORKBOOK_ROWS), table_rows=len(WORKBOOK_ROWS))
+    loaded = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+    if (loaded.get("parseOptions") or {}).get("sheet") != "Stock":
+        raise G9Failure(f"the load should record the sheet it read, parseOptions is {loaded.get('parseOptions')}")
+
+    body = run_query(
+        api, f"SELECT {', '.join(WORKBOOK_COLUMNS)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY sku"
+    )
+    got = [[row[c] for c in WORKBOOK_COLUMNS] for row in body["rows"]]
+    if got != WORKBOOK_ROWS:
+        raise G9Failure(f"the table holds {got}, the sheet says {WORKBOOK_ROWS}")
+    types = run_query(
+        api,
+        "SELECT " + ", ".join(f"toTypeName({c}) AS t_{c}" for c in WORKBOOK_COLUMNS)
+        + f" FROM {QUERY_DB}.`bronze.{table}` WHERE 1 LIMIT 1",
+    )["rows"][0]
+    not_text = {c: types[f"t_{c}"] for c in WORKBOOK_COLUMNS if "String" not in types[f"t_{c}"]}
+    if not_text:
+        raise G9Failure(f"every column of a workbook load should be text, these are not: {not_text}")
+    print("[g9] workbook: the sheet's rows are in the table, dates and numbers as text")
+
+    resp = api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{upload_id}"}, timeout=30)
+    runs = _expect(resp, 200, "GET /api/governance/ingest-runs (workbook)").json()
+    if len(runs) != 1 or runs[0].get("status") != "succeeded" or runs[0].get("rows") != len(WORKBOOK_ROWS):
+        raise G9Failure(f"the workbook load should have left one succeeded ingest_run row, found {runs}")
+
+    _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE the workbook upload")
+    state["deleted"] = True
+    _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 404, "GET of the deleted workbook upload")
+    print("[g9] workbook: PASS (the upload is gone, the table stays)")
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -359,6 +445,7 @@ def main() -> int:
         step_rows_and_types(api, table, expected)
         step_one_ingest_run_per_load(api, upload_id, table, file_rows)
         step_delete_keeps_the_table(api, upload_id, table, 2 * file_rows, state)
+        step_workbook(api, table, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
         print(f"[g9] FAILED: {reason}", file=sys.stderr)

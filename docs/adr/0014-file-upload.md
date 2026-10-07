@@ -1,6 +1,6 @@
 # ADR 0014 — Files uploaded from the console
 
-- **Status:** Accepted (product owner, 2026-10-02); implementation in progress
+- **Status:** Accepted (product owner, 2026-10-02); implementation in progress. Amended 2026-10-07: Excel workbooks (see "Amendment" below)
 - **Phase:** `DATA-9`, plan `docs/superpowers/plans/2026-10-02-upload-file.md`
 - **Date:** 2026-10-02
 
@@ -138,6 +138,39 @@ shows layers.
   code (`silver_transform.py`, `gold_transform.py`, `sap_models.py`) leave
   the branch, and `ch_models.py` with them: the three helpers
   `connector_catalog.py` used moved into it.
+
+## Amendment, 2026-10-07 — Excel workbooks
+
+The product owner asked for `.xls` and `.xlsx` (plan
+`docs/superpowers/plans/2026-10-07-upload-excel.md`). Decision 4's first
+paragraph no longer holds for those two kinds: a workbook is accepted by
+converting ONE sheet to delimited text in the API.
+
+- The workbook is stored as it arrived (decision 1). Preview converts the
+  chosen sheet in memory and runs the existing preview on it. A load converts
+  it, stores the text beside the original (`<key>.converted.csv`, deleted with
+  the upload) and launches the unchanged `file_ingest_job` on that object with
+  a fixed dialect, UTF-8 and comma. The job does not change.
+- Decision 3's invariant (two readers, one dialect) is unchanged, because the
+  load job still reads delimited text and nothing else. The conversion is a
+  third component, a writer of that dialect, and its output is pinned by
+  `ops/fixtures/uploads/converted_sheet.csv`, which both readers' fixture
+  tests read, and by a test that converts the `Quirks` sheet of the workbooks
+  in `ops/fixtures/workbooks/` to exactly those bytes.
+- Decision 4's second paragraph holds: every column is text. A date is
+  written ISO 8601 and a number as the cell holds it, never through its display
+  format; the full rules are in `upload_workbook.rs` and on the feature page.
+- A workbook is recognised by its first bytes AND an `.xls` or `.xlsx` name:
+  the name alone cannot decide, because the file that motivated this ADR is
+  UTF-16 text called `.xls`. `.xlsm`, `.xlsb`, `.ods` and other zip files stay
+  refused, with the reason.
+- A sheet over 5,000,000 cells (used range) is refused: a workbook is
+  compressed, and the API converts it in memory. A cap, not a measurement.
+- The chosen sheet is not in the job's run configuration (its schema is
+  closed and the job does not change); it is recorded in the upload's
+  `parse_options` and in the `upload.ingest` audit event. No migration.
+- New dependency: `calamine` (MIT), with seven transitive crates, all MIT or
+  Apache-2.0 and in `deny.toml`'s allow list.
 
 ## Verification
 
