@@ -1,5 +1,12 @@
 # Environments as a managed list — Implementation Plan
 
+**On hold since 2026-10-07.** The product owner stopped the work the same
+day to ask the team that recommended it what they meant (section 9). The
+developer had reached the store and part of the routes; that unfinished
+work was removed from the tree and nothing of it was committed or applied
+to a database. What follows is the plan as it stood, not work in
+progress.
+
 **Status:** proposed on 2026-10-07 at the product owner's request ("write
 the plan first"); the same day the product owner asked for it to be run
 and implemented as written, which is taken as signing section 3. Work
