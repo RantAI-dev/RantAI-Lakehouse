@@ -10,6 +10,20 @@ export type AskAnswer = {
   question: string
 }
 
+/** The store refuses a longer question (`MAX_QUESTION_CHARS` in `chat_term.rs`). */
+const MAX_QUESTION_CHARS = 500
+
+/**
+ * The question as the store accepts it: trimmed, then cut to
+ * `MAX_QUESTION_CHARS` characters. The store counts characters and not
+ * UTF-16 units, so the cut goes through `Array.from` to keep an emoji whole.
+ * PR review fix (SHOULD-FIX): the click sent the whole message, so a long
+ * question got a 400 and the answer showed as not remembered.
+ */
+function questionForStore(question: string): string {
+  return Array.from(question.trim()).slice(0, MAX_QUESTION_CHARS).join("")
+}
+
 /**
  * Stores the picked option as the user's meaning for the term, then sends
  * it as the next message. The store comes first so the reply to this
@@ -27,7 +41,7 @@ export async function answerAsk(
 ): Promise<boolean> {
   let remembered = true
   try {
-    await deps.saveTerm({ term, meaning: option, question })
+    await deps.saveTerm({ term, meaning: option, question: questionForStore(question) })
   } catch {
     remembered = false
   }

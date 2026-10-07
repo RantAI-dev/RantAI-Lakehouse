@@ -102,6 +102,13 @@ pub(in crate::routes) async fn run_tool(
     if registry::find(name).is_none() {
         return json!({ "error": format!("unknown tool: {name}") });
     }
+    // The switch hides `ask_user` from the chat's tool list, but a model can
+    // name a tool it was not given and the gate does not know the switch, so
+    // the refusal sits here, where `/api/ai/tool` and the chat both run tools.
+    // PR review fix (SHOULD-FIX): with `AI_ASK_BACK=false` the call still ran.
+    if name == registry::ASK_USER && !state.config.ai_ask_back {
+        return json!({ "error": "asking the user is switched off" });
+    }
     let ch = &state.clickhouse;
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
@@ -226,6 +233,29 @@ mod tests {
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
+    }
+
+    // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from
+    // the tool list, so a model that named it anyway still ran it.
+    #[tokio::test]
+    async fn ask_user_runs_with_the_switch_on_and_is_refused_with_it_off() {
+        let mut args = Map::new();
+        args.insert("term".to_owned(), json!("hotel"));
+        args.insert("question".to_owned(), json!("Which one?"));
+        args.insert("options".to_owned(), json!(["hotel_a", "hotel_b"]));
+        let state_with = |switch: &str| {
+            let env = HashMap::from([("AI_ASK_BACK".to_owned(), switch.to_owned())]);
+            AppState::new(Config::from_map(&env).unwrap())
+        };
+
+        let on = run_tool(&state_with("true"), None, "ask_user", &args).await;
+        assert_eq!(on["asked"], json!(true), "{on}");
+
+        let off = run_tool(&state_with("false"), None, "ask_user", &args).await;
+        assert_eq!(off, json!({ "error": "asking the user is switched off" }));
+        // Only `ask_user` is behind the switch.
+        let other = run_tool(&state_with("false"), None, "list_datasets", &Map::new()).await;
+        assert_ne!(other["error"], json!("asking the user is switched off"));
     }
 
     #[test]

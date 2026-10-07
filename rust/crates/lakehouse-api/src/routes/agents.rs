@@ -984,6 +984,15 @@ fn headless_tools(perms: &PermissionSet, is_build: bool) -> Vec<Value> {
         .collect()
 }
 
+/// Why a headless run refuses the tool call `name` before running it, or
+/// `None` when this check lets it through. Today that is `ask_user` alone: a
+/// run has nobody to answer. PR review fix (SHOULD-FIX): the decision sat
+/// inline in the loop, where no test could reach it without a model.
+fn headless_refusal(name: &str) -> Option<String> {
+    (name == ai_registry::ASK_USER)
+        .then(|| format!("refused: a headless run has nobody to answer ({name})"))
+}
+
 /// The headless tool-calling loop shared by every `POST
 /// /api/agents/employees/{id}/run` call — see [`run_employee`]'s doc
 /// comment for the full picture. Never panics: an LLM failure, a refused
@@ -1201,12 +1210,8 @@ async fn run_headless_loop(
             // A run is not offered `ask_user` ([`headless_tools`]), but a model
             // can name a tool it was not given, and `run_tool` would run it:
             // refuse it here, since nobody is there to answer.
-            if call.function.name == ai_registry::ASK_USER {
+            if let Some(detail) = headless_refusal(&call.function.name) {
                 step_no += 1;
-                let detail = format!(
-                    "refused: a headless run has nobody to answer ({})",
-                    call.function.name
-                );
                 append_step(
                     pg,
                     run_id,
@@ -1938,6 +1943,18 @@ mod tests {
         }
         let none = headless_tools(&PermissionSet::default(), true);
         assert!(!names_of(&none).contains(&ai_registry::ASK_USER));
+    }
+
+    // PR review fix (SHOULD-FIX): the in-loop refusal had no test; only the
+    // tool list was covered.
+    #[test]
+    fn a_headless_run_refuses_a_call_to_ask_user_and_lets_a_read_tool_through() {
+        let refusal = headless_refusal(ai_registry::ASK_USER);
+        assert_eq!(
+            refusal.as_deref(),
+            Some("refused: a headless run has nobody to answer (ask_user)")
+        );
+        assert_eq!(headless_refusal("run_sql"), None);
     }
 
     fn platform_admin_principal() -> Principal {

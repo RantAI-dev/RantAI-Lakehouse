@@ -204,7 +204,7 @@ pub(crate) async fn data_map(
     {
         Arc::clone(pieces)
     } else {
-        let built = Arc::new(collect(ch, withheld, notes).await);
+        let built = Arc::new(collect(ch, withheld, notes, relevant_enabled).await);
         if cacheable
             && !built.tables.is_empty()
             && let Some(w) = withheld
@@ -919,16 +919,71 @@ impl Live {
 }
 
 /// Read every table's facts from `ClickHouse`: the expensive part of the
-/// map, and the part the cache keeps. Every table gets its stats, as every
-/// table may be the one a question names; [`assemble`] decides how much of
-/// each is written.
-async fn collect(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> Pieces {
+/// map, and the part the cache keeps.
+///
+/// With `relevant_enabled` every table gets its stats, as every table may be
+/// the one a question names and a named table past the budget is written in
+/// full; [`assemble`] decides how much of each is written. With it off the
+/// map is the one that was before tables were matched to a question
+/// ([`in_order`]), which never writes a table past the budget, so only the
+/// tables inside the budget are queried: the cost this build had then.
+///
+/// PR review fix (SHOULD-FIX): the stats of every table were read whatever
+/// the switch said. The switch is static config, so it does not change
+/// during the life of the cache and the pieces built under one value are
+/// never read under the other.
+async fn collect(
+    ch: &ChClient,
+    withheld: Option<&Withheld>,
+    notes: &Notes,
+    relevant_enabled: bool,
+) -> Pieces {
     let live = Live::load(ch).await;
+    collect_with(
+        &live,
+        withheld,
+        notes,
+        relevant_enabled,
+        MAX_CHARS,
+        |table| Box::pin(column_stats(ch, table, withheld)),
+    )
+    .await
+}
+
+/// What reads one table's stats. Boxed because a closure that returns a
+/// future borrowing its argument cannot be written for a generic `Fut`, and
+/// an `async` closure here makes the chat handler's future not `Send`.
+/// `'a` is the borrow of the loaded tables, which the stats reader's own
+/// borrows (the `ClickHouse` client, the policies) must outlive.
+type StatsFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Stats> + Send + 'a>>;
+
+/// [`collect`] over tables already loaded, with `stats_of` as the one call
+/// that reads a table's stats. `budget` is the length [`in_order`] stops at.
+async fn collect_with<'a>(
+    live: &'a Live,
+    withheld: Option<&Withheld>,
+    notes: &Notes,
+    relevant_enabled: bool,
+    budget: usize,
+    mut stats_of: impl FnMut(&'a Table) -> StatsFuture<'a>,
+) -> Pieces {
     let mut stats = Vec::with_capacity(live.tables.len());
+    let mut past_budget = false;
     for table in &live.tables {
-        stats.push(column_stats(ch, table, withheld).await);
+        if !relevant_enabled && !past_budget {
+            // The same walk `assemble` makes over the tables done so far
+            // (`pieces_from` pairs only as many tables as there are stats),
+            // so the tables skipped here are the ones it skips.
+            let done = pieces_from(live, &stats, notes, withheld);
+            past_budget = in_order(&done, budget).0.len() > budget;
+        }
+        stats.push(if past_budget {
+            Stats::default()
+        } else {
+            stats_of(table).await
+        });
     }
-    pieces_from(&live, &stats, notes, withheld)
+    pieces_from(live, &stats, notes, withheld)
 }
 
 /// The group heading of a table.
@@ -1076,9 +1131,9 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
 /// The words of a question: the user's last [`QUESTION_MESSAGES`] messages
 /// (`user_messages` holds every user message, oldest first), lower-cased, without
 /// words shorter than [`MIN_QUESTION_WORD_CHARS`] and without the function
-/// words of [`super::prompt::reply_language`]'s two lists. A word that is one
-/// of the caller's `terms` also brings the words of that term's meaning, with
-/// the same filters.
+/// words of [`super::prompt::reply_language`]'s two lists. A stored term of
+/// the caller's `terms` that the question uses (see [`term_is_used`]) also
+/// brings the words of its meaning, with the same filters.
 ///
 /// The terms are the caller's own, read for this request. This runs per
 /// request and its result is never stored in the shared cache.
@@ -1088,21 +1143,61 @@ pub(crate) fn question_words(user_messages: &[&str], terms: &[ChatTerm]) -> Hash
             && !INDONESIAN_WORDS.contains(&word.as_str())
             && !ENGLISH_WORDS.contains(&word.as_str())
     };
-    let mut words: HashSet<String> = user_messages
+    let recent: Vec<&str> = user_messages
         .iter()
         .rev()
         .take(QUESTION_MESSAGES)
+        .copied()
+        .collect();
+    let mut words: HashSet<String> = recent
+        .iter()
         .flat_map(|message| tokens(message))
         .filter(keep)
         .collect();
     let from_terms: Vec<String> = terms
         .iter()
-        .filter(|t| words.contains(&t.term.to_lowercase()))
+        .filter(|t| term_is_used(&t.term, &recent, &words, keep))
         .flat_map(|t| tokens(&t.meaning))
         .filter(keep)
         .collect();
     words.extend(from_terms);
     words
+}
+
+/// Whether the question uses the stored `term`, by either rule.
+///
+/// 1. Every word of the term (same tokeniser and filters as the question's
+///    words) is among `question`, in any order. A term left with no word
+///    after the filters never matches, so a term of only function words
+///    cannot bring its meaning into every question.
+/// 2. The lower-cased term stands as a phrase in one of the `messages`,
+///    with no letter, digit or `_` next to it. This is for the terms the
+///    tokeniser cannot hold whole: `q3` or `vip_user`, whose digits and `_`
+///    it splits or drops.
+///
+/// PR review fix (SHOULD-FIX): a term was compared to one question word, so
+/// a term of several words, or with `_` or a digit, never matched.
+fn term_is_used(
+    term: &str,
+    messages: &[&str],
+    question: &HashSet<String>,
+    keep: impl Fn(&String) -> bool,
+) -> bool {
+    let term_words: Vec<String> = tokens(term).filter(|w| keep(w)).collect();
+    if !term_words.is_empty() && term_words.iter().all(|w| question.contains(w)) {
+        return true;
+    }
+    let term = term.trim().to_lowercase();
+    let part_of_word = |c: char| c.is_alphanumeric() || c == '_';
+    !term.is_empty()
+        && messages.iter().any(|message| {
+            let message = message.to_lowercase();
+            message.match_indices(&term).any(|(start, found)| {
+                let before = message[..start].chars().next_back();
+                let after = message[start + found.len()..].chars().next();
+                !before.is_some_and(part_of_word) && !after.is_some_and(part_of_word)
+            })
+        })
 }
 
 /// Whether a question word finds `piece`: it equals one of the table's
@@ -2099,6 +2194,55 @@ mod tests {
         assert_eq!(without, query(&["clients"]));
     }
 
+    fn term_meaning(term: &str, meaning: &str) -> ChatTerm {
+        ChatTerm {
+            term: term.to_owned(),
+            meaning: meaning.to_owned(),
+            question: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    // PR review fix (SHOULD-FIX): a term was compared to one question word, so a
+    // term of several words never matched.
+    #[test]
+    fn a_term_of_two_words_brings_its_meaning_only_when_both_are_in_the_question() {
+        let terms = [term_meaning("active customer", "ordered in the past month")];
+        let both = question_words(&["Show me every customer that is active"], &terms);
+        assert!(both.contains("month"), "{both:?}");
+        let one = question_words(&["Show me every customer"], &terms);
+        assert!(!one.contains("month"), "{one:?}");
+        // The two words may be in two of the last messages.
+        let split = question_words(&["Who is active?", "And each customer?"], &terms);
+        assert!(split.contains("month"), "{split:?}");
+    }
+
+    #[test]
+    fn a_term_with_an_underscore_or_a_digit_is_found_as_the_phrase_in_the_question() {
+        let terms = [
+            term_meaning("vip_user", "paying clients"),
+            term_meaning("q3", "july to september"),
+        ];
+        let words = question_words(&["List the vip_user rows for q3"], &terms);
+        assert!(
+            words.contains("paying") && words.contains("september"),
+            "{words:?}"
+        );
+        // Inside a longer word the phrase is not the term.
+        let other = question_words(&["List the vip_users for q30"], &terms);
+        assert!(
+            !other.contains("paying") && !other.contains("september"),
+            "{other:?}"
+        );
+    }
+
+    #[test]
+    fn a_term_made_only_of_function_words_never_brings_a_meaning() {
+        let terms = [term_meaning("the of", "everything at all")];
+        let words = question_words(&["How many of the orders were there?"], &terms);
+        assert_eq!(words, query(&["orders"]));
+    }
+
     #[test]
     fn function_words_and_short_words_are_not_part_of_a_question() {
         assert_eq!(
@@ -2178,6 +2322,56 @@ mod tests {
             !assemble(&unknown, &query(&["swiftpost"]), true, MAX_CHARS)
                 .contains("shown on one line")
         );
+    }
+
+    /// Build the four tables' pieces through [`collect_with`] with a stats
+    /// reader that never touches `ClickHouse`, and return the names of the
+    /// tables it was asked about.
+    async fn collect_four(relevant_enabled: bool, budget: usize) -> (Pieces, Vec<String>) {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let live = four_tables();
+        let pieces = collect_with(
+            &live,
+            Some(&Withheld::default()),
+            &four_tables_notes(),
+            relevant_enabled,
+            budget,
+            |table| {
+                Box::pin(async {
+                    if let Ok(mut asked) = asked.lock() {
+                        asked.push(table.name.clone());
+                    }
+                    let at = live.tables.iter().position(|t| t.name == table.name);
+                    at.and_then(|i| four_tables_stats().into_iter().nth(i))
+                        .unwrap_or_default()
+                })
+            },
+        )
+        .await;
+        (pieces, asked.into_inner().unwrap_or_default())
+    }
+
+    // PR review fix (SHOULD-FIX): the build read the stats of every table even
+    // with `AI_RELEVANT_TABLES` off, where origin/main read only the tables
+    // inside the budget.
+    #[tokio::test]
+    async fn with_the_switch_off_a_table_past_the_budget_is_not_queried() {
+        // A budget of one character is spent by the first table.
+        let (off, asked_off) = collect_four(false, 1).await;
+        assert_eq!(asked_off, ["orders"]);
+        let (on, asked_on) = collect_four(true, 1).await;
+        assert_eq!(asked_on, ["orders", "customers", "shipments", "raw_events"]);
+        // The map the switch off writes is the same text either way.
+        assert_eq!(
+            assemble(&off, &query(&[]), false, 1),
+            assemble(&on, &query(&[]), false, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_and_room_in_the_budget_every_table_is_queried() {
+        let (_, asked) = collect_four(false, MAX_CHARS).await;
+        assert_eq!(asked, ["orders", "customers", "shipments", "raw_events"]);
     }
 
     /// The cache is one for every chat: two questions over the same cached
