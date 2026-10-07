@@ -98,7 +98,7 @@ RUN apt-get update \
 WORKDIR /opt/dagster/app
 COPY pyproject.toml ./
 COPY dispar_orchestrate ./dispar_orchestrate
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --timeout 120 --retries 10 .
 
 ENV DAGSTER_HOME=/opt/dagster/dagster_home
 RUN mkdir -p "$DAGSTER_HOME"
