@@ -87,6 +87,7 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`DATA-17`](data-17.md) | More formats, more files, bigger files | Next | M |
 | [`DATA-18`](data-18.md) | Column types on upload | Next | M |
 | [`DATA-19`](data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
+| [`SRC-4`](src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](src-3.md) | Connectors for business apps | Later | L |
 
 ### Query Studio

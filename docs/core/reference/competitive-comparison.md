@@ -372,8 +372,10 @@ docs.snowflake.com and docs.airbyte.com with Airbyte's live connector
 registry, October 2026. Airbyte is compared for Sources only. **Have** means we
 match or beat the best competitor that offers it; anything less is
 **Partial**. The product owner has not yet decided this module area by area;
-the task list is backlog `SEC-14` to `SEC-18`, `SRC-3`, `SRC-6` to `SRC-13`
-and `DATA-11` to `DATA-19`, with edge cases in `DEC-10`. Each task has a
+the task list is backlog `SEC-14` to `SEC-18`, `SRC-3`, `SRC-4`, `SRC-6` to `SRC-13`
+and `DATA-11` to `DATA-19`, with edge cases in `DEC-10`. Cloud warehouses
+and enterprise databases as sources are excluded (product owner,
+2026-10-07). Each task has a
 spec with target numbers in [`../specs/`](../specs/).
 
 Summary: 69 capabilities. We have 25, have 23 partly and lack 19.

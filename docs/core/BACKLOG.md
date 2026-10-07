@@ -93,6 +93,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SRC-11` | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-12` | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-13` | Table discovery for every source type, not only databases | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-4` | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07) | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-11` | Catalog search that finds columns and tags, with tolerant matching | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-12` | Certified and deprecated marks; governed tags with allowed values | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-13` | Column-level lineage | Data | `reference/competitive-comparison.md` (Data matrix) |
@@ -123,7 +124,6 @@ The one list of known work. Look at it weekly; pick what is next.
 | --- | --- | --- | --- |
 | `OPS-3` | Run on several servers; high availability | Platform | PRODUCT §1, §2 |
 | `SRC-3` | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | PRODUCT §2 |
-| `SRC-4` | Live change capture for databases other than PostgreSQL | Data | PRODUCT §2 |
 | `DATA-8` | Instant copies of a table for testing | Data | PRODUCT §2 |
 | `BLD-2` | Tables that refresh themselves when their inputs change | Build | PRODUCT §2 |
 | `SRC-5` | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | `connector_probe.rs` |
@@ -270,6 +270,7 @@ builds it (`AGENTS.md`).
 | [`DATA-17`](specs/data-17.md) | More formats, more files, bigger files | Next | M |
 | [`DATA-18`](specs/data-18.md) | Column types on upload | Next | M |
 | [`DATA-19`](specs/data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
+| [`SRC-4`](specs/src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](specs/src-3.md) | Connectors for business apps | Later | L |
 
 ### Query Studio
