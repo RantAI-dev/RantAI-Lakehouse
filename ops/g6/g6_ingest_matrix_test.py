@@ -102,9 +102,13 @@ API = requests.Session()
 # The tenant every connector of this run is created in; set by
 # `step_ensure_tenant` right after login.
 TENANT_ID = ""
-# Seeded sandbox tenant (`0002_seed_identity.sql`): preferred when the
-# account has none, so a gate never joins a production-like tenant.
-SANDBOX_TENANT_SLUG = "meridian-labs"
+# The tenant that owns the seeded connectors this gate drives
+# (`conn-pg-lakehouse`; `rust/migrations/0042_tenant_provisioning.sql`
+# backfills the seeded connectors to the seed tenant `meridian-group`,
+# `0002_seed_identity.sql`). Per-connector routes answer only for a
+# connector in one of the caller's tenants, so the account must be a member
+# of this one, and the gate's own connectors are created in it too.
+GATE_TENANT_SLUG = "meridian-group"
 
 
 class G6Failure(Exception):
@@ -189,42 +193,45 @@ def _me_tenant_ids() -> list[str]:
 
 
 def step_ensure_tenant() -> None:
-    """Make sure the logged-in account belongs to a tenant, and remember it.
+    """Make sure the logged-in account belongs to `GATE_TENANT_SLUG`, and
+    remember that tenant's id for creating the gate's connectors.
 
     The bootstrap admin of a fresh database belongs to no tenant, and a
     connector created by an account with no tenant is stored with no tenant
     id, so every `/api/connectors/{id}/*` route answers 404 for it (per-
-    connector routes are tenant-scoped, `ensure_connector_in_tenants`). An
-    account that already has a tenant (a developer's stack) is left alone
-    and its first tenant is used. Otherwise the gate adds the account to the
-    seeded sandbox tenant (`meridian-labs`), or to the first tenant by slug
-    when that one is absent, with `PUT /api/identity/users/{id}/tenants/
-    {tenant_id}`, and reads `/api/auth/me` again to confirm: membership is
-    read per request, so the session needs no new login.
+    connector routes are tenant-scoped, `ensure_connector_in_tenants`: the
+    connector's tenant must be one of the caller's). The seeded
+    `conn-pg-lakehouse` the matrix also runs belongs to `meridian-group`
+    (0042), so that is the tenant the account joins, even when it already
+    has others: with `PUT /api/identity/users/{id}/tenants/{tenant_id}`
+    (the unrestricted admin may add itself to any tenant), then
+    `/api/auth/me` is read again to confirm. Membership is read per
+    request, so no new login. An account already in it changes nothing.
 
     Duplicated, not shared, in ops/g6/g6_linklocal_test.py: the two gates
     share no module (see the module docstring)."""
     global TENANT_ID
-    ids = _me_tenant_ids()
-    if ids:
-        TENANT_ID = ids[0]
-        print(f"[g6] account already belongs to tenant {TENANT_ID}")
-        return
-    me = API.get(f"{API_URL}/api/auth/me", timeout=10).json()
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G6Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
     listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
     if not listed.ok:
         raise G6Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
-    tenants = sorted(listed.json(), key=lambda t: t["slug"])
-    if not tenants:
-        raise G6Failure("the account belongs to no tenant and the platform has none to join")
-    chosen = next((t for t in tenants if t["slug"] == SANDBOX_TENANT_SLUG), tenants[0])
-    added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{chosen['id']}", timeout=10)
-    if not added.ok:
-        raise G6Failure(f"add the account to tenant {chosen['slug']!r} failed: {added.status_code} {added.text[:300]}")
-    if chosen["id"] not in _me_tenant_ids():
-        raise G6Failure(f"the account was added to tenant {chosen['slug']!r} but /api/auth/me does not list it")
-    TENANT_ID = chosen["id"]
-    print(f"[g6] added the account to tenant {chosen['slug']!r}")
+    gate_tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if gate_tenant is None:
+        raise G6Failure(
+            f"tenant {GATE_TENANT_SLUG!r} does not exist: it owns the seeded connector "
+            "conn-pg-lakehouse (0042_tenant_provisioning.sql) this gate runs"
+        )
+    if gate_tenant["id"] not in _me_tenant_ids():
+        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{gate_tenant['id']}", timeout=10)
+        if not added.ok:
+            raise G6Failure(f"add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}")
+        if gate_tenant["id"] not in _me_tenant_ids():
+            raise G6Failure(f"the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it")
+        print(f"[g6] added the account to tenant {GATE_TENANT_SLUG!r}")
+    TENANT_ID = gate_tenant["id"]
 
 
 def _seed_mysql_fixture() -> None:

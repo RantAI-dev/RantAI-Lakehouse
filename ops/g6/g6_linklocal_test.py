@@ -47,9 +47,13 @@ DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graph
 API = requests.Session()
 # The tenant this run's connectors are created in; set by `_ensure_tenant`.
 TENANT_ID = ""
-# Seeded sandbox tenant (`0002_seed_identity.sql`), preferred when the
-# account has none.
-SANDBOX_TENANT_SLUG = "meridian-labs"
+# The tenant that owns the seeded connectors this gate drives
+# (`conn-pg-lakehouse`; `rust/migrations/0042_tenant_provisioning.sql`
+# backfills the seeded connectors to the seed tenant `meridian-group`,
+# `0002_seed_identity.sql`). Per-connector routes answer only for a
+# connector in one of the caller's tenants, so the account must be a member
+# of this one, and the gate's own connectors are created in it too.
+GATE_TENANT_SLUG = "meridian-group"
 
 GATE_SECRETS_DIR = "/gate-secrets"
 FILE_REF_PREFIX = "file:/run/secrets/connector_"
@@ -85,37 +89,34 @@ def _me_tenant_ids() -> list[str]:
 
 
 def _ensure_tenant() -> None:
-    """Make sure the logged-in account belongs to a tenant, and remember it.
-    A connector created by an account with no tenant is stored with no
-    tenant id and every `/api/connectors/{id}/*` route then answers 404 for
-    it, so a fresh database's bootstrap admin joins one first: its own first
-    tenant if it has any, else the seeded `meridian-labs`, else the first by
-    slug, through `PUT /api/identity/users/{id}/tenants/{tenant_id}`, and
-    `/api/auth/me` is read again to confirm (membership is read per request,
-    so no new login). Same as `step_ensure_tenant` in
-    g6_ingest_matrix_test.py, duplicated because the two gates share no
-    module."""
+    """Make sure the logged-in account belongs to `GATE_TENANT_SLUG` and
+    remember its id for creating this run's connectors. A connector created
+    by an account with no tenant is stored with no tenant id and every
+    `/api/connectors/{id}/*` route then answers 404 for it. This gate uses
+    no seeded connector, but it joins the same tenant as
+    g6_ingest_matrix_test.py (`step_ensure_tenant`, whose docstring has the
+    reason) so the two agree; duplicated because they share no module.
+    Membership is read per request, so no new login."""
     global TENANT_ID
-    ids = _me_tenant_ids()
-    if ids:
-        TENANT_ID = ids[0]
-        return
-    me = API.get(f"{API_URL}/api/auth/me", timeout=10).json()
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise SystemExit(f"[g6-linklocal] GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
     listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
     if not listed.ok:
         raise SystemExit(f"[g6-linklocal] list tenants failed: {listed.status_code} {listed.text[:300]}")
-    tenants = sorted(listed.json(), key=lambda t: t["slug"])
-    if not tenants:
-        raise SystemExit("[g6-linklocal] the account belongs to no tenant and the platform has none to join")
-    chosen = next((t for t in tenants if t["slug"] == SANDBOX_TENANT_SLUG), tenants[0])
-    added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{chosen['id']}", timeout=10)
-    if not added.ok:
-        raise SystemExit(
-            f"[g6-linklocal] add the account to tenant {chosen['slug']!r} failed: {added.status_code} {added.text[:300]}"
-        )
-    if chosen["id"] not in _me_tenant_ids():
-        raise SystemExit(f"[g6-linklocal] the account was added to tenant {chosen['slug']!r} but /api/auth/me does not list it")
-    TENANT_ID = chosen["id"]
+    gate_tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if gate_tenant is None:
+        raise SystemExit(f"[g6-linklocal] tenant {GATE_TENANT_SLUG!r} does not exist")
+    if gate_tenant["id"] not in _me_tenant_ids():
+        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{gate_tenant['id']}", timeout=10)
+        if not added.ok:
+            raise SystemExit(
+                f"[g6-linklocal] add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}"
+            )
+        if gate_tenant["id"] not in _me_tenant_ids():
+            raise SystemExit(f"[g6-linklocal] the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it")
+    TENANT_ID = gate_tenant["id"]
 
 
 def _assert_rejected(*, connector_id: str, label: str) -> None:
