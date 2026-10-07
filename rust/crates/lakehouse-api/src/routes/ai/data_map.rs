@@ -48,16 +48,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::Ident;
 use lakehouse_store::annotation::AnnotationRow;
+use lakehouse_store::chat_term::ChatTerm;
 use lakehouse_store::semantic::SemanticEntry;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
+use super::prompt::{ENGLISH_WORDS, INDONESIAN_WORDS, tokens};
 use crate::routes::support::is_numeric_type;
 
 /// How long one built map is reused. Two minutes keeps a newly loaded
@@ -75,11 +77,66 @@ const SAMPLE_VALUE_CHARS: usize = 40;
 /// A table with more rows than this is described without stats.
 const STATS_ROW_CEILING: u64 = 50_000_000;
 
-/// The cached map, with the row-filtered tables it was built without
-/// stats for. A map is reused only while that set is the current one, so a
-/// row-filter policy added after the map was built is honoured on the next
-/// chat and not after [`TTL`].
-type CacheEntry = (Instant, HashSet<String>, String);
+/// How many of the user's latest messages a question is read from: the
+/// message that names a table is often the one before a short follow-up.
+const QUESTION_MESSAGES: usize = 2;
+/// A question word shorter than this is dropped: it is more often a stray
+/// fragment than the name of a table.
+const MIN_QUESTION_WORD_CHARS: usize = 3;
+/// A question word must be at least this long to match a longer table word
+/// by its beginning. Shorter, it must equal the table word: "ord" would
+/// otherwise bring in every table that has a word starting so.
+const MIN_PREFIX_CHARS: usize = 4;
+/// Longest description on a table's one-line form, in characters.
+const LINE_TEXT_CHARS: usize = 120;
+
+/// The way to see a table's columns, which the budget line and the closing
+/// sentence of a map with one-line tables both give.
+const SEE_COLUMNS: &str = "Use describe_mart or `SELECT name, type FROM system.columns WHERE database = '…' AND table = '…'` to see their columns.";
+
+const GOLD_HEADING: &str =
+    "GOLD (database `serving`, aggregated marts; use these first for numbers):";
+const SILVER_HEADING: &str = "SILVER (database `silver`, cleaned detail rows):";
+
+/// One table as the cache holds it. Nothing here depends on the question or
+/// on who asks: the cache is shared by every chat, so which tables a
+/// question names is decided afterwards, per request, by [`assemble`].
+struct TablePiece {
+    /// `database.table`.
+    qualified: String,
+    /// The group heading the table is listed under.
+    heading: &'static str,
+    /// The table's whole entry: what [`render_table`] writes.
+    full: String,
+    /// The short form: the table, its row count and, when it has one, its
+    /// description.
+    line: String,
+    /// The lower-cased words a question can find the table by: parts of its
+    /// name and its column names, its sample values, its synonyms and the
+    /// words of its descriptions.
+    ///
+    /// Built only from facts the full entry prints. A masked column's
+    /// samples, and every sample of a row-filtered table, are not in the
+    /// entry, so they are not in this set either: a word in a question must
+    /// never bring in a table because of a value the policies keep out of
+    /// the map.
+    words: HashSet<String>,
+}
+
+/// Every table, in the order the map lists them, plus the closing line about
+/// catalog datasets with no table. The cached part of the map.
+#[derive(Default)]
+pub(crate) struct Pieces {
+    tables: Vec<TablePiece>,
+    /// `"\nCatalog datasets with no Gold table: …\n"`, or `""`.
+    unserved: String,
+}
+
+/// The cached pieces, with the row-filtered tables they were built without
+/// stats for. They are reused only while that set is the current one, so a
+/// row-filter policy added after the build is honoured on the next chat and
+/// not after [`TTL`].
+type CacheEntry = (Instant, HashSet<String>, Arc<Pieces>);
 
 static CACHE: LazyLock<Mutex<Option<CacheEntry>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -102,14 +159,24 @@ impl Withheld {
     }
 }
 
-/// The map in `slot`, when it is younger than [`TTL`] and was built without
-/// stats for exactly the tables in `row_filtered`.
-fn reusable<'a>(slot: Option<&'a CacheEntry>, row_filtered: &HashSet<String>) -> Option<&'a str> {
-    let (built, built_without, map) = slot?;
-    (built.elapsed() < TTL && built_without == row_filtered).then_some(map.as_str())
+/// The pieces in `slot`, when they are younger than [`TTL`] and were built
+/// without stats for exactly the tables in `row_filtered`.
+fn reusable<'a>(
+    slot: Option<&'a CacheEntry>,
+    row_filtered: &HashSet<String>,
+) -> Option<&'a Arc<Pieces>> {
+    let (built, built_without, pieces) = slot?;
+    (built.elapsed() < TTL && built_without == row_filtered).then_some(pieces)
 }
 
 /// The rendered DATA MAP, from cache when it is younger than [`TTL`].
+///
+/// The cache holds each table's pieces ([`Pieces`]) and never a rendered
+/// map: [`assemble`] runs on every call, over the cached pieces or over
+/// freshly built ones, with this request's `query_words` (see
+/// [`question_words`]) and `relevant_enabled` (`AI_RELEVANT_TABLES`). The
+/// question and the caller's words differ per chat, and the cache is one
+/// for everybody.
 ///
 /// `withheld` is what [`Withheld::from_conditions`] read from the authored
 /// policies, or `None` when the policies could not be read: then no table
@@ -122,23 +189,32 @@ fn reusable<'a>(slot: Option<&'a CacheEntry>, row_filtered: &HashSet<String>) ->
 /// The lock is held while a stale map is rebuilt, so concurrent chats wait
 /// for one rebuild instead of each running the stats queries. An empty
 /// result (`ClickHouse` unreachable) is never cached.
-pub(crate) async fn data_map(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> String {
+pub(crate) async fn data_map(
+    ch: &ChClient,
+    withheld: Option<&Withheld>,
+    notes: &Notes,
+    query_words: &HashSet<String>,
+    relevant_enabled: bool,
+) -> String {
     let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
     let mut guard = CACHE.lock().await;
-    if cacheable
+    let pieces = if cacheable
         && let Some(w) = withheld
-        && let Some(map) = reusable(guard.as_ref(), &w.row_filtered)
+        && let Some(pieces) = reusable(guard.as_ref(), &w.row_filtered)
     {
-        return map.to_owned();
-    }
-    let map = build(ch, withheld, notes).await;
-    if cacheable
-        && !map.is_empty()
-        && let Some(w) = withheld
-    {
-        *guard = Some((Instant::now(), w.row_filtered.clone(), map.clone()));
-    }
-    map
+        Arc::clone(pieces)
+    } else {
+        let built = Arc::new(collect(ch, withheld, notes).await);
+        if cacheable
+            && !built.tables.is_empty()
+            && let Some(w) = withheld
+        {
+            *guard = Some((Instant::now(), w.row_filtered.clone(), Arc::clone(&built)));
+        }
+        built
+    };
+    drop(guard);
+    assemble(&pieces, query_words, relevant_enabled, MAX_CHARS)
 }
 
 /// Drop the cached map, so the next chat rebuilds it. A person's
@@ -156,7 +232,17 @@ pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 /// Put a built map into [`CACHE`], as a chat turn would.
 #[cfg(test)]
 pub(crate) async fn seed_cache_for_test() {
-    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), "DATA MAP text".to_owned()));
+    let pieces = Pieces {
+        tables: Vec::new(),
+        unserved: "DATA MAP text".to_owned(),
+    };
+    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
+}
+
+/// Put ready pieces into [`CACHE`] as a build with no row-filtered table.
+#[cfg(test)]
+async fn seed_pieces_for_test(pieces: Pieces) {
+    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
 }
 
 /// Whether [`CACHE`] holds no map.
@@ -327,17 +413,25 @@ impl Notes {
         confirmed.or(source).or(draft)
     }
 
-    /// ` (also called: a, b)` for a table (`column` is `""`) or a column,
-    /// whatever the entry's status, or `None` when it has none.
-    fn synonyms(&self, asset: &str, column: &str) -> Option<String> {
-        let entry = self.entries.get(&(asset.to_owned(), column.to_owned()))?;
-        let names: Vec<String> = entry
+    /// The synonyms of a table (`column` is `""`) or a column that
+    /// [`Notes::synonyms`] prints, whatever the entry's status.
+    fn synonym_names(&self, asset: &str, column: &str) -> Vec<String> {
+        let Some(entry) = self.entries.get(&(asset.to_owned(), column.to_owned())) else {
+            return Vec::new();
+        };
+        entry
             .synonyms
             .iter()
             .map(|s| one_line(s, SYNONYM_CHARS))
             .filter(|s| !s.is_empty())
             .take(MAX_SYNONYMS)
-            .collect();
+            .collect()
+    }
+
+    /// ` (also called: a, b)` for a table (`column` is `""`) or a column,
+    /// whatever the entry's status, or `None` when it has none.
+    fn synonyms(&self, asset: &str, column: &str) -> Option<String> {
+        let names = self.synonym_names(asset, column);
         (!names.is_empty()).then(|| format!(" (also called: {})", names.join(", ")))
     }
 }
@@ -572,15 +666,21 @@ fn stats_plan(table: &Table, withheld: Option<&Withheld>) -> Option<(String, Vec
     Some((sql, plan))
 }
 
+/// What the stats query told about one table's columns.
+#[derive(Default)]
+struct Stats {
+    /// One line of facts per column, as [`render_table`] prints it.
+    facts: HashMap<String, String>,
+    /// The sample values behind the text columns' facts, for the words a
+    /// question can find the table by.
+    samples: HashMap<String, Vec<String>>,
+}
+
 /// One line of facts per column: `min..max` for numbers and dates, the
 /// distinct count and up to [`SAMPLE_VALUES`] values for text. Empty for a
 /// table [`stats_plan`] gives no query, or that fails to answer.
-async fn column_stats(
-    ch: &ChClient,
-    table: &Table,
-    withheld: Option<&Withheld>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+async fn column_stats(ch: &ChClient, table: &Table, withheld: Option<&Withheld>) -> Stats {
+    let mut out = Stats::default();
     let Some((sql, plan)) = stats_plan(table, withheld) else {
         return out;
     };
@@ -604,11 +704,13 @@ async fn column_stats(
             if values.is_empty() {
                 continue;
             }
-            if distinct <= u64::try_from(values.len()).unwrap_or(u64::MAX) {
+            let fact = if distinct <= u64::try_from(values.len()).unwrap_or(u64::MAX) {
                 format!("values: {}", values.join(" | "))
             } else {
                 format!("{distinct} distinct, e.g. {}", values.join(" | "))
-            }
+            };
+            out.samples.insert(col.name.clone(), values);
+            fact
         } else {
             let (lo, hi) = (text(row, &format!("lo{i}")), text(row, &format!("hi{i}")));
             if lo.is_empty() {
@@ -616,7 +718,7 @@ async fn column_stats(
             }
             format!("range {lo}..{hi}")
         };
-        out.insert(col.name.clone(), fact);
+        out.facts.insert(col.name.clone(), fact);
     }
     out
 }
@@ -656,6 +758,13 @@ fn grain_line(table: &Table) -> Option<String> {
     ))
 }
 
+/// `720 rows`, or `row count unknown`.
+fn rows_text(table: &Table) -> String {
+    table
+        .rows
+        .map_or_else(|| "row count unknown".to_owned(), |n| format!("{n} rows"))
+}
+
 /// One table's entry: its line (row count, and the catalog dataset it
 /// serves, if any) and one line per column with its description and
 /// stats.
@@ -667,9 +776,7 @@ fn render_table(
     stats: &HashMap<String, String>,
     notes: &Notes,
 ) {
-    let rows = table
-        .rows
-        .map_or_else(|| "row count unknown".to_owned(), |n| format!("{n} rows"));
+    let rows = rows_text(table);
     let _ = write!(out, "- {}.{} ({rows})", table.db, table.name);
     if let Some(d) = dataset {
         let _ = write!(
@@ -804,70 +911,145 @@ impl Live {
             table,
             self.dataset(table),
             &self.descriptions,
-            &stats,
+            &stats.facts,
             &Notes::default(),
         );
         Some(out)
     }
 }
 
-async fn build(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> String {
+/// Read every table's facts from `ClickHouse`: the expensive part of the
+/// map, and the part the cache keeps. Every table gets its stats, as every
+/// table may be the one a question names; [`assemble`] decides how much of
+/// each is written.
+async fn collect(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> Pieces {
     let live = Live::load(ch).await;
-    let (tables, datasets, descriptions) = (&live.tables, &live.datasets, &live.descriptions);
-    if tables.is_empty() {
-        return String::new();
+    let mut stats = Vec::with_capacity(live.tables.len());
+    for table in &live.tables {
+        stats.push(column_stats(ch, table, withheld).await);
     }
+    pieces_from(&live, &stats, notes, withheld)
+}
 
-    let mut out = String::new();
-    let mut section = "";
-    let mut skipped: Vec<String> = Vec::new();
-    for table in tables {
-        let qualified = format!("{}.{}", table.db, table.name);
-        if out.len() > MAX_CHARS {
-            skipped.push(qualified);
-            continue;
+/// The group heading of a table.
+fn heading_of(table: &Table) -> &'static str {
+    if table.db == "serving" {
+        GOLD_HEADING
+    } else {
+        SILVER_HEADING
+    }
+}
+
+/// Add the words of `text` to `into`.
+fn add_words(into: &mut HashSet<String>, text: &str) {
+    into.extend(tokens(text));
+}
+
+/// The words a question can find `table` by, from the facts its entry
+/// prints and no others (see [`TablePiece::words`]).
+///
+/// `stats` holds no sample of a masked column or of a row-filtered table to
+/// begin with ([`stats_plan`]). The check on `withheld` below repeats that
+/// rule at the point where the words are made, so a change to the stats path
+/// cannot put a withheld value into a word that every user's question can
+/// match.
+fn table_words(
+    table: &Table,
+    dataset: Option<&Dataset>,
+    descriptions: &HashMap<(String, String), String>,
+    stats: &Stats,
+    notes: &Notes,
+    withheld: Option<&Withheld>,
+) -> HashSet<String> {
+    let asset = format!("{}.{}", table.db, table.name);
+    let mut words = HashSet::new();
+    add_words(&mut words, &table.name);
+    let dataset_described = dataset.is_some_and(|d| !d.description.is_empty());
+    if let Some(d) = dataset {
+        add_words(&mut words, &d.description);
+    }
+    if let Some(text) = notes.table_text(&asset, dataset_described) {
+        add_words(&mut words, &text);
+    }
+    for synonym in notes.synonym_names(&asset, "") {
+        add_words(&mut words, &synonym);
+    }
+    let samples_allowed =
+        withheld.is_some_and(|w| !w.row_filtered.contains(&asset.to_ascii_lowercase()));
+    for col in &table.columns {
+        add_words(&mut words, &col.name);
+        let source = dataset
+            .and_then(|d| descriptions.get(&(d.slug.clone(), col.name.clone())))
+            .map(String::as_str);
+        if let Some(text) = notes.column_text(&asset, &col.name, source) {
+            add_words(&mut words, &text);
         }
-        let heading = if table.db == "serving" {
-            "GOLD (database `serving`, aggregated marts; use these first for numbers):"
-        } else {
-            "SILVER (database `silver`, cleaned detail rows):"
-        };
-        if heading != section {
-            if !out.is_empty() {
-                out.push('\n');
+        for synonym in notes.synonym_names(&asset, &col.name) {
+            add_words(&mut words, &synonym);
+        }
+        let masked =
+            withheld.is_some_and(|w| w.masked.contains(&(asset.clone(), col.name.clone())));
+        if samples_allowed
+            && !masked
+            && let Some(values) = stats.samples.get(&col.name)
+        {
+            for value in values {
+                add_words(&mut words, value);
             }
-            out.push_str(heading);
-            out.push('\n');
-            section = heading;
         }
-        let stats = column_stats(ch, table, withheld).await;
+    }
+    words
+}
+
+/// A table's short form: `- db.table (N rows)` and, when the table has a
+/// description, `: <description>` cut to [`LINE_TEXT_CHARS`].
+fn table_line(table: &Table, dataset: Option<&Dataset>, notes: &Notes) -> String {
+    let mut line = format!("- {}.{} ({})", table.db, table.name, rows_text(table));
+    let asset = format!("{}.{}", table.db, table.name);
+    let dataset_description = dataset
+        .map(|d| one_line(&d.description, LINE_TEXT_CHARS))
+        .filter(|t| !t.is_empty());
+    let dataset_described = dataset.is_some_and(|d| !d.description.is_empty());
+    let described = dataset_description.or_else(|| {
+        notes
+            .table_text(&asset, dataset_described)
+            .map(|t| one_line(&t, LINE_TEXT_CHARS))
+    });
+    if let Some(text) = described {
+        let _ = write!(line, ": {text}");
+    }
+    line
+}
+
+/// Turn the live tables and their stats into pieces, with no `ClickHouse`
+/// call: the same inputs always give the same pieces.
+fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Withheld>) -> Pieces {
+    let mut tables = Vec::with_capacity(live.tables.len());
+    for (table, stats) in live.tables.iter().zip(stats) {
+        let dataset = live.dataset(table);
+        let mut full = String::new();
         render_table(
-            &mut out,
+            &mut full,
             table,
-            live.dataset(table),
-            descriptions,
-            &stats,
+            dataset,
+            &live.descriptions,
+            &stats.facts,
             notes,
         );
+        tables.push(TablePiece {
+            qualified: format!("{}.{}", table.db, table.name),
+            heading: heading_of(table),
+            full,
+            line: table_line(table, dataset, notes),
+            words: table_words(table, dataset, &live.descriptions, stats, notes, withheld),
+        });
     }
-    if !skipped.is_empty() {
-        let _ = write!(
-            out,
-            "\n{} more tables not described here (budget): {}. Use describe_mart or \
-             `SELECT name, type FROM system.columns WHERE database = '…' AND table = '…'` to see their columns.\n",
-            skipped.len(),
-            skipped
-                .iter()
-                .take(60)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let unserved: Vec<String> = datasets
+    let unserved: Vec<String> = live
+        .datasets
         .iter()
         .filter(|(table, _)| {
-            !tables
+            !live
+                .tables
                 .iter()
                 .any(|t| t.db == "serving" && &t.name == *table)
         })
@@ -878,14 +1060,199 @@ async fn build(ch: &ChClient, withheld: Option<&Withheld>, notes: &Notes) -> Str
             )
         })
         .collect();
-    if !unserved.is_empty() {
+    Pieces {
+        tables,
+        unserved: if unserved.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nCatalog datasets with no Gold table: {}.\n",
+                unserved.join(", ")
+            )
+        },
+    }
+}
+
+/// The words of a question: the user's last [`QUESTION_MESSAGES`] messages
+/// (`user_messages` holds every user message, oldest first), lower-cased, without
+/// words shorter than [`MIN_QUESTION_WORD_CHARS`] and without the function
+/// words of [`super::prompt::reply_language`]'s two lists. A word that is one
+/// of the caller's `terms` also brings the words of that term's meaning, with
+/// the same filters.
+///
+/// The terms are the caller's own, read for this request. This runs per
+/// request and its result is never stored in the shared cache.
+pub(crate) fn question_words(user_messages: &[&str], terms: &[ChatTerm]) -> HashSet<String> {
+    let keep = |word: &String| {
+        word.chars().count() >= MIN_QUESTION_WORD_CHARS
+            && !INDONESIAN_WORDS.contains(&word.as_str())
+            && !ENGLISH_WORDS.contains(&word.as_str())
+    };
+    let mut words: HashSet<String> = user_messages
+        .iter()
+        .rev()
+        .take(QUESTION_MESSAGES)
+        .flat_map(|message| tokens(message))
+        .filter(keep)
+        .collect();
+    let from_terms: Vec<String> = terms
+        .iter()
+        .filter(|t| words.contains(&t.term.to_lowercase()))
+        .flat_map(|t| tokens(&t.meaning))
+        .filter(keep)
+        .collect();
+    words.extend(from_terms);
+    words
+}
+
+/// Whether a question word finds `piece`: it equals one of the table's
+/// words, or it is at least [`MIN_PREFIX_CHARS`] long and begins one.
+fn is_named(piece: &TablePiece, query: &HashSet<String>) -> bool {
+    query.iter().any(|word| {
+        piece.words.contains(word)
+            || (word.chars().count() >= MIN_PREFIX_CHARS
+                && piece.words.iter().any(|w| w.starts_with(word.as_str())))
+    })
+}
+
+/// The map's text from the cached pieces and this request's question.
+///
+/// With `relevant_enabled` off, or when no table is named by `query_words`,
+/// every table is written in full, in order: the map this was before tables
+/// were matched to the question. Otherwise, under each heading, the tables
+/// the question names come first in full and the others follow on one line
+/// each, then one closing sentence says so.
+///
+/// `budget` is the length after which no more tables are started (the map
+/// lists the rest in one line): [`MAX_CHARS`] in a chat.
+fn assemble(
+    pieces: &Pieces,
+    query_words: &HashSet<String>,
+    relevant_enabled: bool,
+    budget: usize,
+) -> String {
+    if pieces.tables.is_empty() {
+        return String::new();
+    }
+    let named: Vec<bool> = pieces
+        .tables
+        .iter()
+        .map(|t| relevant_enabled && is_named(t, query_words))
+        .collect();
+    let (mut out, skipped) = if named.contains(&true) {
+        named_first(pieces, &named, budget)
+    } else {
+        in_order(pieces, budget)
+    };
+    if !skipped.is_empty() {
         let _ = write!(
             out,
-            "\nCatalog datasets with no Gold table: {}.\n",
-            unserved.join(", ")
+            "\n{} more tables not described here (budget): {}. {SEE_COLUMNS}\n",
+            skipped.len(),
+            skipped
+                .iter()
+                .take(60)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
+    out.push_str(&pieces.unserved);
     out
+}
+
+/// Every table in full, in order, until the map is past `budget`; the tables
+/// left are returned by name.
+fn in_order(pieces: &Pieces, budget: usize) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut section = "";
+    let mut skipped: Vec<String> = Vec::new();
+    for table in &pieces.tables {
+        if out.len() > budget {
+            skipped.push(table.qualified.clone());
+            continue;
+        }
+        if table.heading != section {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(table.heading);
+            out.push('\n');
+            section = table.heading;
+        }
+        out.push_str(&table.full);
+    }
+    (out, skipped)
+}
+
+/// The tables `named` marks in full and the others on one line each, under
+/// their headings. The named tables are placed first, so when `budget` runs
+/// out it is the one-line tables that are left out.
+fn named_first(pieces: &Pieces, named: &[bool], budget: usize) -> (String, Vec<String>) {
+    struct Group {
+        heading: &'static str,
+        full: String,
+        lines: String,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for table in &pieces.tables {
+        if !groups.iter().any(|g| g.heading == table.heading) {
+            groups.push(Group {
+                heading: table.heading,
+                full: String::new(),
+                lines: String::new(),
+            });
+        }
+    }
+    let mut used = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut any_line = false;
+    for want_named in [true, false] {
+        for (table, table_named) in pieces.tables.iter().zip(named) {
+            if *table_named != want_named {
+                continue;
+            }
+            if used > budget {
+                skipped.push(table.qualified.clone());
+                continue;
+            }
+            let Some(group) = groups.iter_mut().find(|g| g.heading == table.heading) else {
+                continue;
+            };
+            if group.full.is_empty() && group.lines.is_empty() {
+                used += group.heading.len() + 2;
+            }
+            if want_named {
+                group.full.push_str(&table.full);
+                used += table.full.len();
+            } else {
+                group.lines.push_str(&table.line);
+                group.lines.push('\n');
+                used += table.line.len() + 1;
+                any_line = true;
+            }
+        }
+    }
+    let mut out = String::new();
+    for group in groups
+        .iter()
+        .filter(|g| !g.full.is_empty() || !g.lines.is_empty())
+    {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(group.heading);
+        out.push('\n');
+        out.push_str(&group.full);
+        out.push_str(&group.lines);
+    }
+    if any_line {
+        let _ = write!(
+            out,
+            "\nA table shown on one line is described in full when a question names it. {SEE_COLUMNS}\n"
+        );
+    }
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -998,32 +1365,40 @@ mod tests {
         let Some(built) = Instant::now().checked_sub(age) else {
             panic!("the clock must be older than the test's cache age");
         };
+        let pieces = Pieces {
+            tables: Vec::new(),
+            unserved: "map".to_owned(),
+        };
         (
             built,
             without.iter().map(|t| (*t).to_owned()).collect(),
-            "map".to_owned(),
+            Arc::new(pieces),
         )
+    }
+
+    fn reused_marker(slot: Option<&CacheEntry>, row_filtered: &HashSet<String>) -> Option<String> {
+        reusable(slot, row_filtered).map(|p| p.unserved.clone())
     }
 
     #[test]
     fn a_cached_map_is_reused_only_for_the_same_row_filtered_tables_and_within_the_ttl() {
         let fresh = cached_without(&["serving.a"], Duration::ZERO);
         let same = HashSet::from(["serving.a".to_owned()]);
-        assert_eq!(reusable(Some(&fresh), &same), Some("map"));
+        assert_eq!(reused_marker(Some(&fresh), &same).as_deref(), Some("map"));
         assert_eq!(
-            reusable(Some(&fresh), &HashSet::new()),
+            reused_marker(Some(&fresh), &HashSet::new()),
             None,
             "a policy dropped since the build: rebuild"
         );
         let built_before_the_policy = cached_without(&[], Duration::ZERO);
         assert_eq!(
-            reusable(Some(&built_before_the_policy), &same),
+            reused_marker(Some(&built_before_the_policy), &same),
             None,
             "a row filter added since the build must not be served the old map"
         );
         let stale = cached_without(&["serving.a"], TTL + Duration::from_secs(1));
-        assert_eq!(reusable(Some(&stale), &same), None);
-        assert_eq!(reusable(None, &same), None);
+        assert_eq!(reused_marker(Some(&stale), &same), None);
+        assert_eq!(reused_marker(None, &same), None);
     }
 
     #[test]
@@ -1394,6 +1769,454 @@ mod tests {
             vec![entry("silver.raw_visits", "origin", "first\nsecond", true)],
         );
         assert!(render_silver(&n).contains("\n    origin String — first second\n"));
+    }
+
+    // ── the whole map, as it was before only the named tables were written in full ──
+
+    /// An orders table in `serving` with no catalog dataset.
+    fn orders_table() -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "orders".to_owned(),
+            rows: Some(10),
+            columns: vec![
+                col("order_id", "UInt32"),
+                col("status", "String"),
+                col("total", "UInt32"),
+            ],
+        }
+    }
+
+    fn orders_stats() -> HashMap<String, String> {
+        HashMap::from([("status".to_owned(), "values: open | paid".to_owned())])
+    }
+
+    /// Three live tables (two Gold, one Silver) and one catalog dataset
+    /// whose Gold table does not exist.
+    fn golden_live() -> Live {
+        let ghost = Dataset {
+            slug: "ghost-data".to_owned(),
+            title: "Ghost data".to_owned(),
+            description: String::new(),
+            source_kind: "secondary source",
+            publisher: String::new(),
+            frequency: String::new(),
+            unit: String::new(),
+        };
+        Live {
+            tables: vec![served_table(), orders_table(), silver_table()],
+            datasets: HashMap::from([
+                ("visits".to_owned(), served_dataset()),
+                ("ghost".to_owned(), ghost),
+            ]),
+            descriptions: served_descriptions(),
+        }
+    }
+
+    fn facts_only(facts: HashMap<String, String>) -> Stats {
+        Stats {
+            facts,
+            samples: HashMap::new(),
+        }
+    }
+
+    fn golden_stats() -> Vec<Stats> {
+        vec![
+            facts_only(served_stats()),
+            facts_only(orders_stats()),
+            Stats::default(),
+        ]
+    }
+
+    /// Pieces for the fixed tables, with policies that withhold nothing.
+    fn golden_pieces() -> Pieces {
+        pieces_from(
+            &golden_live(),
+            &golden_stats(),
+            &Notes::default(),
+            Some(&Withheld::default()),
+        )
+    }
+
+    const ORDERS_TODAY: &str = "\
+- serving.orders (10 rows)
+    grain: one row per order_id x status; measures: total (SUM them over rows for any total)
+    order_id UInt32
+    status String; values: open | paid
+    total UInt32
+";
+    const GHOST_LINE: &str = "\nCatalog datasets with no Gold table: ghost-data (\"Ghost data\", expected at serving.ghost, not found).\n";
+    const SEE_COLUMNS_TODAY: &str = "Use describe_mart or `SELECT name, type FROM system.columns WHERE database = '…' AND table = '…'` to see their columns.";
+
+    // Written by hand from the renderer's format before `build` was split
+    // into pieces and `assemble`, and run against the unsplit code first.
+    fn map_today() -> String {
+        format!(
+            "GOLD (database `serving`, aggregated marts; use these first for numbers):\n\
+             {SERVED_TODAY}{ORDERS_TODAY}\nSILVER (database `silver`, cleaned detail rows):\n{SILVER_TODAY}{GHOST_LINE}"
+        )
+    }
+
+    fn map_today_over_budget() -> String {
+        format!(
+            "GOLD (database `serving`, aggregated marts; use these first for numbers):\n\
+             {SERVED_TODAY}\n2 more tables not described here (budget): serving.orders, silver.raw_visits. {SEE_COLUMNS_TODAY}\n{GHOST_LINE}"
+        )
+    }
+
+    #[test]
+    fn the_whole_map_is_the_text_it_was() {
+        assert_eq!(
+            assemble(&golden_pieces(), &HashSet::new(), true, MAX_CHARS),
+            map_today()
+        );
+    }
+
+    #[test]
+    fn tables_past_the_budget_are_named_in_one_closing_line() {
+        assert_eq!(
+            assemble(&golden_pieces(), &HashSet::new(), true, 0),
+            map_today_over_budget()
+        );
+    }
+
+    // ── only the tables a question names are written in full ──
+
+    /// A text column's stats: the fact line and the samples behind it.
+    fn text_stats(column: &str, values: &[&str]) -> Stats {
+        Stats {
+            facts: HashMap::from([(column.to_owned(), format!("values: {}", values.join(" | ")))]),
+            samples: HashMap::from([(
+                column.to_owned(),
+                values.iter().map(|v| (*v).to_owned()).collect(),
+            )]),
+        }
+    }
+
+    fn table_of(db: &str, name: &str, rows: Option<u64>, columns: Vec<Column>) -> Table {
+        Table {
+            db: db.to_owned(),
+            name: name.to_owned(),
+            rows,
+            columns,
+        }
+    }
+
+    /// Four invented tables: three in Gold, one in Silver. The words that
+    /// find each one are its own: `swiftpost` (a sample value) only
+    /// `shipments`, `purchases` (a synonym) only `orders`, `sales` (a
+    /// description) only `customers`.
+    fn four_tables() -> Live {
+        Live {
+            tables: vec![
+                table_of(
+                    "serving",
+                    "orders",
+                    Some(10),
+                    vec![
+                        col("order_id", "UInt32"),
+                        col("status", "String"),
+                        col("total", "UInt32"),
+                    ],
+                ),
+                table_of(
+                    "serving",
+                    "customers",
+                    Some(5),
+                    vec![col("customer_id", "UInt32"), col("region", "String")],
+                ),
+                table_of(
+                    "serving",
+                    "shipments",
+                    Some(7),
+                    vec![
+                        col("shipment_id", "UInt32"),
+                        col("carrier", "String"),
+                        col("weight", "UInt32"),
+                    ],
+                ),
+                table_of(
+                    "silver",
+                    "raw_events",
+                    None,
+                    vec![col("event_name", "String"), col("count", "UInt32")],
+                ),
+            ],
+            datasets: HashMap::new(),
+            descriptions: HashMap::new(),
+        }
+    }
+
+    fn four_tables_stats() -> Vec<Stats> {
+        vec![
+            text_stats("status", &["open", "paid"]),
+            text_stats("region", &["northern", "southern"]),
+            text_stats("carrier", &["parcelco", "swiftpost"]),
+            text_stats("event_name", &["login", "logout"]),
+        ]
+    }
+
+    /// The stats of `four_tables` where the shipments' samples are known but
+    /// their fact line is not printed: what a masked column, or a
+    /// row-filtered table, must look like to the entry. The samples are the
+    /// leak a word must never be made from.
+    fn four_tables_stats_with_unprinted_carrier_samples() -> Vec<Stats> {
+        let mut stats = four_tables_stats();
+        stats[2] = Stats {
+            facts: HashMap::new(),
+            samples: HashMap::from([(
+                "carrier".to_owned(),
+                vec!["parcelco".to_owned(), "swiftpost".to_owned()],
+            )]),
+        };
+        stats
+    }
+
+    fn four_tables_notes() -> Notes {
+        notes(
+            vec![annotation(
+                "serving.orders",
+                "Customer orders placed online",
+            )],
+            vec![
+                with_synonyms(entry("serving.orders", "", "unused", false), &["purchases"]),
+                entry(
+                    "serving.customers",
+                    "region",
+                    "Sales area of the customer",
+                    true,
+                ),
+            ],
+        )
+    }
+
+    fn four_tables_pieces_with(withheld: &Withheld, stats: &[Stats]) -> Pieces {
+        pieces_from(&four_tables(), stats, &four_tables_notes(), Some(withheld))
+    }
+
+    fn four_tables_pieces() -> Pieces {
+        four_tables_pieces_with(&Withheld::default(), &four_tables_stats())
+    }
+
+    fn query(words: &[&str]) -> HashSet<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    const SHIPMENTS_FULL: &str = "\
+- serving.shipments (7 rows)
+    grain: one row per shipment_id x carrier; measures: weight (SUM them over rows for any total)
+    shipment_id UInt32
+    carrier String; values: parcelco | swiftpost
+    weight UInt32
+";
+
+    /// The text with every table in full, as it is when nothing is named.
+    fn all_in_full() -> String {
+        assemble(&four_tables_pieces(), &query(&[]), true, MAX_CHARS)
+    }
+
+    #[test]
+    fn a_question_that_names_no_table_gets_the_map_it_always_got() {
+        let text = assemble(&four_tables_pieces(), &query(&["zebra"]), true, MAX_CHARS);
+        assert_eq!(text, all_in_full());
+        assert!(text.contains("    order_id UInt32\n"), "{text}");
+        assert!(!text.contains("shown on one line"), "{text}");
+    }
+
+    #[test]
+    fn a_sample_value_puts_its_table_first_and_in_full_and_the_others_on_one_line() {
+        let text = assemble(
+            &four_tables_pieces(),
+            &query(&["swiftpost"]),
+            true,
+            MAX_CHARS,
+        );
+        let expected = format!(
+            "{GOLD_HEADING}\n{SHIPMENTS_FULL}\
+             - serving.orders (10 rows): Customer orders placed online\n\
+             - serving.customers (5 rows)\n\
+             \n{SILVER_HEADING}\n\
+             - silver.raw_events (row count unknown)\n\
+             \nA table shown on one line is described in full when a question names it. {SEE_COLUMNS_TODAY}\n"
+        );
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn a_synonym_names_its_table() {
+        let text = assemble(
+            &four_tables_pieces(),
+            &query(&["purchases"]),
+            true,
+            MAX_CHARS,
+        );
+        assert!(text.contains("    order_id UInt32\n"), "{text}");
+        assert!(!text.contains("    customer_id UInt32\n"), "{text}");
+        assert!(text.contains("- serving.customers (5 rows)\n"), "{text}");
+    }
+
+    #[test]
+    fn a_description_names_its_table() {
+        let text = assemble(&four_tables_pieces(), &query(&["sales"]), true, MAX_CHARS);
+        assert!(text.contains("    customer_id UInt32\n"), "{text}");
+        assert!(!text.contains("    order_id UInt32\n"), "{text}");
+    }
+
+    #[test]
+    fn a_word_of_three_characters_must_equal_a_table_word_and_four_may_begin_one() {
+        let pieces = four_tables_pieces();
+        let shown = |words: &[&str]| assemble(&pieces, &query(words), true, MAX_CHARS);
+        // "ord" begins "order" and "orders" but is too short to count.
+        assert_eq!(shown(&["ord"]), all_in_full());
+        // "orde" is four characters and begins "order".
+        assert!(
+            shown(&["orde"]).contains("    order_id UInt32\n"),
+            "a four-character beginning must name the table"
+        );
+        // "ders" is inside "orders" and begins nothing.
+        assert_eq!(shown(&["ders"]), all_in_full());
+        // A three-character word that equals a table word does name it.
+        assert!(
+            shown(&["raw"]).contains("    event_name String; values: login | logout\n"),
+            "an equal three-character word must name the table"
+        );
+    }
+
+    #[test]
+    fn a_stored_term_brings_the_words_of_its_meaning_and_other_words_do_not() {
+        let terms = [ChatTerm {
+            term: "buyers".to_owned(),
+            meaning: "customers by region".to_owned(),
+            question: String::new(),
+            updated_at: String::new(),
+        }];
+        let with_term = question_words(&["How many buyers are there?"], &terms);
+        assert_eq!(with_term, query(&["buyers", "customers", "region"]));
+        let text = assemble(&four_tables_pieces(), &with_term, true, MAX_CHARS);
+        assert!(text.contains("    customer_id UInt32\n"), "{text}");
+        assert!(!text.contains("    order_id UInt32\n"), "{text}");
+        let without = question_words(&["How many clients are there?"], &terms);
+        assert_eq!(without, query(&["clients"]));
+    }
+
+    #[test]
+    fn function_words_and_short_words_are_not_part_of_a_question() {
+        assert_eq!(
+            question_words(&["How many of the orders were there in 2024?"], &[]),
+            query(&["orders"])
+        );
+        assert_eq!(
+            question_words(&["Berapa jumlah pesanan dari ke di?"], &[]),
+            query(&["pesanan"])
+        );
+        assert_eq!(question_words(&["a bc def"], &[]), query(&["def"]));
+    }
+
+    #[test]
+    fn a_question_is_read_from_the_last_two_user_messages() {
+        let words = question_words(&["oldest", "middle", "newest"], &[]);
+        assert_eq!(words, query(&["middle", "newest"]));
+    }
+
+    #[test]
+    fn with_the_switch_off_the_map_is_the_text_it_was() {
+        assert_eq!(
+            assemble(
+                &four_tables_pieces(),
+                &query(&["swiftpost"]),
+                false,
+                MAX_CHARS
+            ),
+            all_in_full()
+        );
+    }
+
+    #[test]
+    fn with_a_budget_for_two_tables_the_named_one_is_kept() {
+        let pieces = four_tables_pieces();
+        let first = pieces.tables[0].full.len();
+        let budget = GOLD_HEADING.len() + 1 + first;
+        let in_order = assemble(&pieces, &query(&[]), true, budget);
+        assert!(!in_order.contains("    shipment_id UInt32\n"), "{in_order}");
+        assert!(in_order.contains("serving.shipments"), "{in_order}");
+        let named = assemble(&pieces, &query(&["swiftpost"]), true, budget);
+        assert!(named.contains(SHIPMENTS_FULL), "{named}");
+        assert!(!named.contains("    order_id UInt32\n"), "{named}");
+    }
+
+    #[test]
+    fn a_masked_columns_sample_does_not_name_its_table() {
+        let masked = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.shipments","mask":["carrier"]}"#,
+        ]);
+        let stats = four_tables_stats_with_unprinted_carrier_samples();
+        let leaked = four_tables_pieces_with(&masked, &stats);
+        let text = assemble(&leaked, &query(&["swiftpost"]), true, MAX_CHARS);
+        assert_eq!(text, assemble(&leaked, &query(&[]), true, MAX_CHARS));
+        assert!(!text.contains("shown on one line"), "{text}");
+        // The same samples with no policy do name the table, so the check
+        // above is about the policy and not about the fixture.
+        let open = four_tables_pieces_with(&Withheld::default(), &stats);
+        assert!(
+            assemble(&open, &query(&["swiftpost"]), true, MAX_CHARS).contains("shown on one line")
+        );
+    }
+
+    #[test]
+    fn a_row_filtered_tables_samples_and_unreadable_policies_name_nothing() {
+        let filtered = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.shipments","rowFilter":"carrier = 'x'"}"#,
+        ]);
+        let stats = four_tables_stats_with_unprinted_carrier_samples();
+        let pieces = four_tables_pieces_with(&filtered, &stats);
+        assert!(
+            !assemble(&pieces, &query(&["swiftpost"]), true, MAX_CHARS)
+                .contains("shown on one line")
+        );
+        let unknown = pieces_from(&four_tables(), &stats, &four_tables_notes(), None);
+        assert!(
+            !assemble(&unknown, &query(&["swiftpost"]), true, MAX_CHARS)
+                .contains("shown on one line")
+        );
+    }
+
+    /// The cache is one for every chat: two questions over the same cached
+    /// pieces each get their own text, and a third that names nothing gets
+    /// the whole map, whatever the first two named.
+    #[tokio::test]
+    async fn the_question_is_applied_per_request_and_never_stored_in_the_cache() {
+        let _serial = CACHE_TEST_LOCK.lock().await;
+        seed_pieces_for_test(four_tables_pieces()).await;
+        // Never asked: every call below finds the pieces in the cache.
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "user".to_owned(),
+            "password".to_owned(),
+        );
+        let withheld = Withheld::default();
+        let ask = async |words: &[&str]| {
+            data_map(&ch, Some(&withheld), &Notes::default(), &query(words), true).await
+        };
+        let shipments = ask(&["swiftpost"]).await;
+        let customers = ask(&["northern"]).await;
+        let nothing = ask(&["zebra"]).await;
+        clear_cache().await;
+        assert!(shipments.contains(SHIPMENTS_FULL), "{shipments}");
+        assert!(
+            !shipments.contains("    customer_id UInt32\n"),
+            "{shipments}"
+        );
+        assert!(
+            customers.contains("    customer_id UInt32\n"),
+            "{customers}"
+        );
+        assert!(
+            !customers.contains("    shipment_id UInt32\n"),
+            "{customers}"
+        );
+        assert!(nothing.contains("    shipment_id UInt32\n"), "{nothing}");
+        assert!(nothing.contains("    customer_id UInt32\n"), "{nothing}");
+        assert!(nothing.contains("    order_id UInt32\n"), "{nothing}");
     }
 
     /// No other test in this crate's lib binary builds the map, so nothing

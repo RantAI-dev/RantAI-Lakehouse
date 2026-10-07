@@ -194,7 +194,7 @@ fn is_latin_script(text: &str) -> bool {
 
 /// Everyday Indonesian function words: common in any Indonesian sentence,
 /// rare in English ones.
-const INDONESIAN_WORDS: &[&str] = &[
+pub(super) const INDONESIAN_WORDS: &[&str] = &[
     "yang",
     "dan",
     "dengan",
@@ -236,7 +236,7 @@ const INDONESIAN_WORDS: &[&str] = &[
 ];
 
 /// Common English function words, for the same test the other way.
-const ENGLISH_WORDS: &[&str] = &[
+pub(super) const ENGLISH_WORDS: &[&str] = &[
     "the",
     "and",
     "what",
@@ -291,16 +291,21 @@ const ENGLISH_WORDS: &[&str] = &[
     "about",
 ];
 
+/// The lower-cased runs of letters in `text`, in order. The one tokeniser
+/// for [`reply_language`] and for the DATA MAP's reading of a question
+/// (`data_map::question_words`), so both see the same words.
+pub(super) fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+}
+
 /// `"Indonesian"` or `"English"` for `text`, or `None` when neither clearly
 /// wins (a one-word message, a table name, another language). Words both
 /// languages use ("data") are in neither list; an English message needs
 /// two more English words than Indonesian ones to be read as English.
 pub(super) fn reply_language(text: &str) -> Option<&'static str> {
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
+    let words: Vec<String> = tokens(text).collect();
     let count = |list: &[&str]| words.iter().filter(|w| list.contains(&w.as_str())).count();
     let (id, en) = (count(INDONESIAN_WORDS), count(ENGLISH_WORDS));
     if id >= 2 && id > en {

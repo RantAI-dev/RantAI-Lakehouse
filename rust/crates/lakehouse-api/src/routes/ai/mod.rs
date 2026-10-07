@@ -262,8 +262,9 @@ async fn semantic_notes(state: &AppState) -> data_map::Notes {
     data_map::Notes::from_rows(annotations, entries)
 }
 
-/// The caller's remembered words as a prompt section
-/// ([`prompt::user_words_section`]), or `""`.
+/// The caller's remembered words, newest first, for the prompt section
+/// ([`prompt::user_words_section`]) and for the words of the question
+/// ([`data_map::question_words`]). Read once per chat turn.
 ///
 /// Empty when `AI_ASK_BACK` is off, for an anonymous caller, with no
 /// Postgres pool, with no term, and when the read fails: a store failure
@@ -271,19 +272,22 @@ async fn semantic_notes(state: &AppState) -> data_map::Notes {
 /// text. The words are the caller's own (`owner_key`), never another
 /// person's, and they are read here and not inside the shared DATA MAP, whose
 /// cached text is one for every user.
-async fn users_words(state: &AppState, principal: Option<&Principal>) -> String {
+async fn users_terms(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Vec<lakehouse_store::chat_term::ChatTerm> {
     if !state.config.ai_ask_back {
-        return String::new();
+        return Vec::new();
     }
     let (Some(pg), Some(principal)) = (state.pg.as_deref(), principal) else {
-        return String::new();
+        return Vec::new();
     };
-    if let Ok(terms) = lakehouse_store::chat_term::list_for_owner(pg, &owner_key(principal)).await {
-        prompt::user_words_section(&terms)
-    } else {
-        tracing::warn!("could not read the user's words for the prompt");
-        String::new()
-    }
+    lakehouse_store::chat_term::list_for_owner(pg, &owner_key(principal))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("could not read the user's words for the prompt");
+            Vec::new()
+        })
 }
 
 /// The system prompt: the rules for the mode, the rules for asking (when
@@ -291,6 +295,10 @@ async fn users_words(state: &AppState, principal: Option<&Principal>) -> String 
 /// tool list), the DATA MAP (when the caller may read the shared catalog),
 /// the caller's own words (when `AI_ASK_BACK` is on), the page the user is
 /// on, and the reply-language line last.
+///
+/// `user_messages` is every user message of the chat, oldest first. The
+/// last one sets the reply language; the last two are the question the DATA
+/// MAP is matched to (`AI_RELEVANT_TABLES`).
 ///
 /// With `AI_ASK_BACK` off the text is what it was before the switch
 /// existed.
@@ -300,10 +308,12 @@ async fn system_prompt(
     headers: &axum::http::HeaderMap,
     is_build: bool,
     context: &str,
-    latest_user: &str,
+    user_messages: &[&str],
     asking: bool,
 ) -> String {
+    let latest_user = user_messages.last().copied().unwrap_or_default();
     let withheld = withheld_by_policy(state).await;
+    let terms = users_terms(state, principal).await;
     // The DATA MAP describes the shared, one-per-deployment catalog and
     // carries sample values, so it follows the catalog route's own rule
     // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
@@ -317,7 +327,21 @@ async fn system_prompt(
     let schema = match refusal {
         None => {
             let notes = semantic_notes(state).await;
-            data_map::data_map(&state.clickhouse, withheld.as_ref(), &notes).await
+            // Read per request and kept out of the shared cache: the
+            // question and the caller's terms are this chat's own.
+            let query_words = if state.config.ai_relevant_tables {
+                data_map::question_words(user_messages, &terms)
+            } else {
+                std::collections::HashSet::new()
+            };
+            data_map::data_map(
+                &state.clickhouse,
+                withheld.as_ref(),
+                &notes,
+                &query_words,
+                state.config.ai_relevant_tables,
+            )
+            .await
         }
         Some(reason) => format!("(withheld: {reason})"),
     };
@@ -331,7 +355,7 @@ async fn system_prompt(
     } else {
         ""
     };
-    let words = users_words(state, principal).await;
+    let words = prompt::user_words_section(&terms);
     let ctx_line = page_context_line(context);
     (if schema.is_empty() {
         format!(
@@ -378,12 +402,6 @@ async fn prepare_chat(
     }
 
     let is_build = parsed.mode.as_deref() == Some("build");
-    let latest_user = parsed
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
     let recent_user: Vec<&str> = parsed
         .messages
         .iter()
@@ -431,7 +449,7 @@ async fn prepare_chat(
         headers,
         is_build,
         parsed.context.as_deref().unwrap_or_default(),
-        latest_user,
+        &recent_user,
         asking,
     )
     .await;
@@ -1326,7 +1344,7 @@ pub(super) fn session_owner(principal: Option<&Extension<Principal>>) -> Result<
 
 /// The key a person's own rows are stored under: their principal id as a
 /// UUID string. [`session_owner`] and the prompt's reading of the person's
-/// words (`users_words`) both use it, so the words the routes under
+/// words (`users_terms`) both use it, so the words the routes under
 /// `/api/ai/terms` write are the words the prompt reads back.
 fn owner_key(principal: &Principal) -> String {
     principal.id.uuid().to_string()
@@ -1932,7 +1950,7 @@ mod tests {
         let headers = axum::http::HeaderMap::new();
         for asking in [false, true] {
             let ask =
-                system_prompt(&state, None, &headers, false, "", FIXED_QUESTION, asking).await;
+                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], asking).await;
             assert_eq!(
                 ask,
                 format!(
@@ -1942,7 +1960,7 @@ mod tests {
                 )
             );
             let build =
-                system_prompt(&state, None, &headers, true, "", FIXED_QUESTION, asking).await;
+                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], asking).await;
             assert_eq!(
                 build,
                 format!(
@@ -1958,7 +1976,7 @@ mod tests {
     async fn with_ask_back_on_the_rules_come_after_the_mode_text_and_before_the_data_map() {
         let state = state_with_ask_back("true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", FIXED_QUESTION, true).await;
+        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
         assert_eq!(
             text,
             format!(
@@ -1977,7 +1995,7 @@ mod tests {
         // Studio's allowlist, for one) must not be told to call it.
         let state = state_with_ask_back("true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", FIXED_QUESTION, false).await;
+        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
         assert!(!text.contains("ask_user"), "{text}");
     }
 
@@ -2129,7 +2147,7 @@ mod tests {
             &headers,
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
@@ -2143,13 +2161,14 @@ mod tests {
             &headers,
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
         assert!(!his.contains("lodging"), "{his}");
         assert!(!his.contains(WORDS_HEADER), "{his}");
-        let nobody = system_prompt(&state, None, &headers, false, "", FIXED_QUESTION, true).await;
+        let nobody =
+            system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
         assert!(!nobody.contains("lodging"), "{nobody}");
     }
 
@@ -2166,7 +2185,7 @@ mod tests {
             &axum::http::HeaderMap::new(),
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
@@ -2187,7 +2206,7 @@ mod tests {
             &axum::http::HeaderMap::new(),
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
@@ -2214,7 +2233,7 @@ mod tests {
             &axum::http::HeaderMap::new(),
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
@@ -2243,7 +2262,7 @@ mod tests {
         for i in 0..35 {
             teach(&pool, &rina, &format!("term-{i:02}"), "m").await;
         }
-        let words = users_words(&state, Some(&rina)).await;
+        let words = prompt::user_words_section(&users_terms(&state, Some(&rina)).await);
         let lines: Vec<&str> = words.lines().filter(|l| l.starts_with("- ")).collect();
         assert_eq!(lines.len(), 30, "{words}");
         assert_eq!(lines[0], "- \"term-34\" means m");
@@ -2266,7 +2285,7 @@ mod tests {
             &axum::http::HeaderMap::new(),
             false,
             "",
-            FIXED_QUESTION,
+            &[FIXED_QUESTION],
             true,
         )
         .await;
