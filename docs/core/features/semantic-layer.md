@@ -51,28 +51,28 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 - Descriptions are at most 400 characters for a table, 200 for a column.
 - Synonyms are at most 6, each 1 to 40 characters.
 - A column can be marked as a `measure`, `dimension`, `time` or `key` role, or left unset.
-- When the switch is off, the three `/api/semantic` routes still answer, but no drafts are created.
+- When the switch is off, the chat reads neither the semantic entries nor the table descriptions saved in the Catalog, and the drafting pass does nothing. The three `/api/semantic` routes still answer.
 
 ## Acceptance checklist
 
-Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass.
+Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass. In rows 1 to 14, `<asset>` is a qualified table name, such as `silver.orders` or `serving.dashboard_users`, picked in row 1.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | `GET /api/semantic` and pick a `silver` or `serving` table that has no entry (missing from the list). | The table is not listed. | |
-| 2 | Wait for the next drafting pass at API start, or after fifteen minutes, or after a pipeline run. Then `GET /api/semantic/serving.<table>` or `GET /api/semantic/silver.<table>` for that table. | Response lists entries for the table and each column, each with `status: "draft"`, `model: "<name>"`, and `writtenBy: null`. | |
+| 1 | Run a pipeline that creates a new `silver` or `serving` table, or restart the API after a table has been created. Then `GET /api/semantic` and pick that table (it is not listed until a pass has run). | The table is in the list. | |
+| 2 | Restart the API, wait fifteen minutes, or finish a pipeline run to trigger the next drafting pass. Then `GET /api/semantic/<asset>` for that table. | Response lists entries for the table and each column, each with `status: "draft"`, `model: "<name>"`, and `writtenBy: null`. | |
 | 3 | Ask the Copilot about that table using a word that is a synonym from its draft and not a column name. | The assistant answers from the table. | |
 | 4 | In Query Studio's "Natural language" box, ask a question about the same table. | The answer shows formatted text (no literal `**` or `<span>` tags), with no row count when no query ran. | |
-| 5 | `PUT /api/semantic/serving.<table>` with body `{"description": "my text"}`. | Response is 200 with `{"ok": true}`. | |
-| 6 | `GET /api/semantic/serving.<table>` again. | Response shows the confirmed entry with the same description, `status: "confirmed"`, `writtenBy: <user>`, `model: null`. | |
+| 5 | `PUT /api/semantic/<asset>` with body `{"description": "my text"}`. | Response is 200 with `{"ok": true}`. | |
+| 6 | `GET /api/semantic/<asset>` again. | Response shows the confirmed entry with the same description, `status: "confirmed"`, `writtenBy: <user>`, `model: null`. | |
 | 7 | Set `AI_SEMANTIC_LAYER=false` and restart the API (operator). | The API starts. | |
-| 8 | `GET /api/semantic` and `GET /api/semantic/serving.<table>`. | Both routes answer with existing entries; no new drafts are created. | |
+| 8 | `GET /api/semantic` and `GET /api/semantic/<asset>`. | Both routes answer with existing entries; no new drafts are created. | |
 | 9 | Set `AI_SEMANTIC_LAYER=maybe` and restart the API (operator). | The API stops with a `ConfigError` naming the accepted values. | |
 | 10 | Call `PUT /api/semantic/serving.no_such_table` with a body. | Response is 404 with the table not found in `serving` or `silver`. | |
-| 11 | Call `PUT /api/semantic/serving.<table>` with body `{"description": "..."}` (401-character description). | Response is 400 naming `description`. | |
-| 12 | Call `PUT /api/semantic/serving.<table>` with body `{"column": "unknown", "description": "text"}`. | Response is 400 naming the unknown column. | |
-| 13 | Call `PUT /api/semantic/serving.<table>` with body `{"column": "<a real column>", "description": "x", "synonyms": ["a", "b", "c", "d", "e", "f", "g"]}` (seven synonyms) or `{"column": "<a real column>", "description": "x", "role": "bogus"}` (unknown role). | Response is 400 naming `synonyms` or `role`. | |
-| 14 | A user with `catalog:read` only calls `PUT /api/semantic/serving.<table>`. | Response is 403. | |
+| 11 | Call `PUT /api/semantic/<asset>` with body `{"description": "..."}` (401-character description). | Response is 400 naming `description`. | |
+| 12 | Call `PUT /api/semantic/<asset>` with body `{"column": "unknown", "description": "text"}`. | Response is 400 naming the unknown column. | |
+| 13 | Call `PUT /api/semantic/<asset>` with body `{"column": "<a real column>", "description": "x", "synonyms": ["a", "b", "c", "d", "e", "f", "g"]}` (seven synonyms) or `{"column": "<a real column>", "description": "x", "role": "bogus"}` (unknown role). | Response is 400 naming `synonyms` or `role`. | |
+| 14 | A user with `catalog:read` only calls `PUT /api/semantic/<asset>`. | Response is 403. | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
