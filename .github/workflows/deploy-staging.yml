@@ -64,6 +64,16 @@ jobs:
           echo "::error::lakehouse-api did not become healthy"
           exit 1
 
+      # Postgres gets its 20 migrations from the API entrypoint, but
+      # ClickHouse has no equivalent - without this step every analytics
+      # page (and the builtin BI dashboards) query tables that don't
+      # exist yet, e.g. `serving.mart_wisman` -> UNKNOWN_TABLE.
+      # Idempotent: all objects are IF NOT EXISTS + TRUNCATE (demo data
+      # is refreshed on each deploy by design).
+      - name: Seed ClickHouse demo data
+        working-directory: ${{ github.workspace }}
+        run: scripts/seed-clickhouse.sh
+
       - name: Build frontend image
         working-directory: ${{ github.workspace }}
         run: |
