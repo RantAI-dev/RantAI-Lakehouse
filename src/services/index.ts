@@ -32,7 +32,8 @@ void mockAssetService
 // real Dagster mutations. mock/pipelines.ts has been deleted.
 export const pipelineService = dagsterPipelineService
 // Query Studio is now fully real — SQL execution, saved/history, and
-// generateSql all go through the Rust backend (ClickHouse + Postgres + LLM).
+// askQuestion/generateSql (the chat's engine, `/api/ai/chat`) all go through
+// the Rust backend (ClickHouse + Postgres + LLM).
 // mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
 // Agents is now fully real — employees/tools/workflows/runs/approvals

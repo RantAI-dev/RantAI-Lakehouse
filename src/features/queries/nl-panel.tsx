@@ -70,13 +70,6 @@ export function NaturalLanguagePanel({
       {generateAct.data ? (
         <SectionCard title="Explanation">
           <p className="text-sm">{generateAct.data.explanation}</p>
-          {generateAct.data.assumptions.length ? (
-            <ul className="mt-2 list-disc pl-5 text-sm text-muted-foreground">
-              {generateAct.data.assumptions.map((a) => (
-                <li key={a}>{a}</li>
-              ))}
-            </ul>
-          ) : null}
         </SectionCard>
       ) : null}
     </div>
