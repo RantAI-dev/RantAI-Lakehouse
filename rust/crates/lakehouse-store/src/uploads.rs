@@ -4,13 +4,13 @@
 //!
 //! The file's BYTES are not here: they live in the warehouse bucket under
 //! an `uploads/` prefix, and [`Upload::storage_key`] points at them. See
-//! `migrations/0054_upload.sql`'s header for why, and for why
+//! `migrations/0057_upload.sql`'s header for why, and for why
 //! `storage_key` is always a server-generated name rather than the user's
 //! own filename.
 //!
 //! # Tenant scope (ADR 0014, decision 6)
 //!
-//! An upload belongs to a tenant (`tenant_id`, `0055_upload_tenant_mode
+//! An upload belongs to a tenant (`tenant_id`, `0058_upload_tenant_mode
 //! .sql`). [`list`] and [`find_by_sha256`] take the tenant and cannot be
 //! called without one: there is no "unscoped" variant, because no caller
 //! exists that has no tenant (`connectors::ConnectorFilter` keeps one for
@@ -111,7 +111,7 @@ fn ser_ts<S: serde::Serializer>(at: &OffsetDateTime, s: S) -> Result<S::Ok, S::E
 
 /// How a load treats the rows a table already holds (ADR 0014, decision 5).
 /// The wire form is the lowercase name, and matches the `CHECK` on
-/// `file_upload.load_mode` (`0055_upload_tenant_mode.sql`). Both are names
+/// `file_upload.load_mode` (`0058_upload_tenant_mode.sql`). Both are names
 /// the shared sink accepts (`LOAD_MODES` in
 /// `dagster/dispar_orchestrate/adapters/sink.py`).
 ///

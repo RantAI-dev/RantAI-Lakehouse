@@ -312,6 +312,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // /api/gold/export/{mart}.
     ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
 
+    // DATA-1 — per-mart publish-to-Iceberg switches. `publications` is
+    // what the scheduler reads (RequiresAuth floor PLUS
+    // `check_export_token` in the handler, same two-layer shape as the
+    // export routes above); the detail GET is read-only state for the
+    // asset page (RequiresAuth floor, `canEdit` reports — never implies —
+    // the permission); the PUT is the one WRITE, floored at the existing
+    // `gold:export` permission so whoever may trigger an export by hand
+    // is exactly who may switch automatic publishing on. Switching off
+    // flips a flag only; no route under /api/gold ever drops Iceberg
+    // data.
+    ("GET", "/api/gold/publications",              Policy::RequiresAuth),
+    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAuth),
+    ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
+
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),
     ("POST", "/api/query/estimate",       Policy::RequiresPermission("query:read")),
@@ -338,10 +352,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
     // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
     // matrix is "runs for this pipeline" + "steps for each run"
-    // composed into one round trip. The static path MUST be
-    // registered BEFORE `/runs/{runId}/steps` in
-    // `routes::pipelines_router` so axum does not match `{runId} =
-    // "steps"` and route the request to the wrong handler.
+    // composed into one round trip. axum's `matchit` router
+    // resolves static segments ahead of path parameters regardless
+    // of registration order (PR #57 review F1.10), so the literal
+    // `runs/steps` path reaches the matrix handler and a path with
+    // a real `runId` reaches the per-run handler — the route
+    // registration order in `routes::pipelines_router` is a
+    // readability aid, not a correctness requirement, and the
+    // matrix-vs-`run_steps` resolution is pinned by
+    // `tests/pipeline_routing.rs::both_paths_resolve_to_their_own_handler`.
     ("GET",  "/api/pipelines/{id}/runs/steps",        Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/logs",  Policy::RequiresPermission("pipeline:read")),
@@ -437,6 +456,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // principal sees their own deployment's open alerts/pending approvals,
     // not a permission-scoped subset.
     ("GET",  "/api/notifications",       Policy::RequiresAuth),
+
+    // The caller's own Home layout (`routes::home`): per-user display
+    // preference, keyed by the principal like Copilot sessions, so the
+    // `RequiresAuth` floor is the whole policy. A caller can only ever
+    // reach their own row.
+    ("GET",    "/api/home/layout",       Policy::RequiresAuth),
+    ("PUT",    "/api/home/layout",       Policy::RequiresAuth),
+    ("DELETE", "/api/home/layout",       Policy::RequiresAuth),
 
     // ── Identity (Phase 2 directory): permission-gated (D1 fix). Reads
     //    require `identity:read`, mutations (create user/role/tenant/

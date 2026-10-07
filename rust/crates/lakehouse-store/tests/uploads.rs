@@ -1,16 +1,16 @@
 //! Integration tests for `lakehouse_store::uploads` and the `file_upload`
-//! table (`0054_upload.sql`, `0055_upload_tenant_mode.sql`) against a real
+//! table (`0057_upload.sql`, `0058_upload_tenant_mode.sql`) against a real
 //! Postgres.
 //!
 //! # Postgres backing
 //!
 //! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
 //! one gets a freshly migrated, isolated database, which is also how
-//! `0055` is proven to apply on a fresh one. The Postgres *server* itself
+//! `0058` is proven to apply on a fresh one. The Postgres *server* itself
 //! is started once per test binary by the `lakehouse-test-support`
 //! dev-dependency (see `tests/connectors.rs`). The two migration tests
-//! below start from an EMPTY database and apply `0054` first, then the
-//! rest, to prove `0055` applies on a database that already has `0054`.
+//! below start from an EMPTY database and apply `0057` first, then the
+//! rest, to prove `0058` applies on a database that already has `0057`.
 //!
 //! `any_connector_targets` (the other store function T3 adds) is tested in
 //! `tests/connectors.rs`, beside the connector helpers it needs.
@@ -1500,21 +1500,21 @@ async fn the_database_refuses_a_load_mode_other_than_replace_or_append(
     Ok(())
 }
 
-/// The first half of "does 0055 apply on a database that has 0054": `0054`
+/// The first half of "does 0058 apply on a database that has 0057": `0057`
 /// applied, no rows, then everything after it. (The other half, a fresh
 /// database, is every `#[sqlx::test(migrations = ...)]` in this crate.)
 #[sqlx::test(migrations = false)]
-async fn migration_0055_applies_on_a_database_that_has_0054_and_no_rows(
+async fn migration_0058_applies_on_a_database_that_has_0057_and_no_rows(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    migrations_up_to(54).run(&pool).await.unwrap();
+    migrations_up_to(57).run(&pool).await.unwrap();
     let before = file_upload_columns(&pool).await;
     assert!(before.contains(&"tenant".to_owned()));
     assert!(!before.contains(&"tenant_id".to_owned()));
 
     MIGRATOR.run(&pool).await.unwrap();
 
-    // Exactly what `0055` adds to `file_upload` and exactly what it drops. T5a
+    // Exactly what `0058` adds to `file_upload` and exactly what it drops. T5a
     // added a column here that T6a took out again (review finding B4); asking
     // for the exact sets is what says it is not there.
     let after = file_upload_columns(&pool).await;
@@ -1617,14 +1617,14 @@ async fn the_claim_table_has_one_row_per_table_name_and_needs_an_upload_and_a_re
     Ok(())
 }
 
-/// What `0055` does to a row `0054` could in principle have held: it stays,
+/// What `0058` does to a row `0057` could in principle have held: it stays,
 /// with no tenant, and every tenant-scoped read ignores it. Nothing wrote
-/// such a row (the header of `0055` says why); this pins what would happen.
+/// such a row (the header of `0058` says why); this pins what would happen.
 #[sqlx::test(migrations = false)]
-async fn migration_0055_keeps_a_row_written_before_it_but_hides_it_from_every_tenant(
+async fn migration_0058_keeps_a_row_written_before_it_but_hides_it_from_every_tenant(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    migrations_up_to(54).run(&pool).await.unwrap();
+    migrations_up_to(57).run(&pool).await.unwrap();
     sqlx::query(
         "INSERT INTO file_upload (id, original_filename, storage_key, tenant) \
          VALUES ('up-legacy', 'old.csv', 'uploads/legacy/up-legacy.csv', 'some-deployment')",

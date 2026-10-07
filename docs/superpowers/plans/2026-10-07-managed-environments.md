@@ -249,6 +249,8 @@ wait; this is what that costs and where it is paid.
    this migration is renumbered with the branch's other two (to the three
    next free numbers, in their present order), and the dev database's
    record of applied migrations is corrected by hand for all three.
+   (Done 2026-10-07 at the merge of `main`: the upload migrations became
+   `0057` and `0058`; `0056_environment.sql` still has to move to `0059`.)
 4. Owed after the merge: a feature page under `docs/core/features/` and a
    backlog entry on `docs/core/BACKLOG.md`, proposed as "Environments as
    a managed list" under the area that holds Sources, with the ID that

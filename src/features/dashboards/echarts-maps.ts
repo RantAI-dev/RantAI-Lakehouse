@@ -1,45 +1,88 @@
 import * as echarts from "echarts";
+import type { RegionLevel } from "@/lib/geo-regions";
 
 /**
- * Registers ECharts maps from LOCAL GeoJSON (bundled under public/), with no
- * call to an external tile server — consistent with the self-host ethos and
- * safe for embed/offline use. Choropleths use this map name.
+ * The maps a chart can be drawn on, registered with ECharts from LOCAL
+ * GeoJSON (bundled under public/geo, see public/geo/README.md for where each
+ * file comes from), with no call to an external tile or boundary server —
+ * consistent with the self-host ethos and safe for embed/offline use.
+ *
+ * The console owns this catalogue. The API stores only a map id for a chart
+ * and checks its shape; an id that is not listed here renders an honest "map
+ * not available" state (GeoChart), so a new map needs no API change.
  */
-export const JAKARTA_MAP = "dki-jakarta";
-const JAKARTA_GEOJSON_URL = "/geo/dki-jakarta.geojson";
+export type MapEntry = {
+  id: string;
+  label: string;
+  url: string;
+  /** What one feature of the map is; picks the region-name matching rules. */
+  level: RegionLevel;
+};
 
-const loading = new Map<string, Promise<boolean>>();
+export const MAP_CATALOGUE: readonly MapEntry[] = [
+  { id: "dki-jakarta", label: "Jakarta — cities", url: "/geo/dki-jakarta.geojson", level: "city" },
+  { id: "id-provinces", label: "Indonesia — provinces", url: "/geo/id-provinces.geojson", level: "province" },
+  { id: "id-regencies", label: "Indonesia — kabupaten/kota", url: "/geo/id-regencies.geojson", level: "regency" },
+];
 
-/** Load + register the map once (idempotent). Resolves false if the GeoJSON is missing. */
-export function ensureMap(name = JAKARTA_MAP, url = JAKARTA_GEOJSON_URL): Promise<boolean> {
-  if (echarts.getMap(name)) return Promise.resolve(true);
-  let p = loading.get(name);
-  if (!p) {
-    // Deliberately NOT `apiFetch`: a static GeoJSON asset, not an `/api/*`
-    // call — there is no auth state to react to.
-    p = fetch(url, { cache: "force-cache" })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("geojson not found"))))
-      .then((gj) => { echarts.registerMap(name, gj as Parameters<typeof echarts.registerMap>[1]); return true; })
-      .catch(() => false);
-    loading.set(name, p);
-  }
-  return p;
+/** A `geomap` stored before maps were selectable has no `map`: it was Jakarta. */
+export const DEFAULT_CHOROPLETH_MAP = "dki-jakarta";
+/** The outline a point map starts with. */
+export const DEFAULT_POINT_MAP = "id-provinces";
+
+export function mapEntry(id: string): MapEntry | undefined {
+  return MAP_CATALOGUE.find((m) => m.id === id);
 }
 
 /**
- * Normalizes a region name so it matches the feature names in the Jakarta
- * GeoJSON (e.g. "KOTA JAKARTA PUSAT"/"Jakarta Pusat" → "Jakarta Pusat").
+ * The attribution the boundary licence (CC BY 3.0 IGO) requires, for the
+ * maps that carry it; the Jakarta file's origin was not recorded
+ * (public/geo/README.md), so it gets no credit rather than a made-up one.
  */
-export function normalizeJakartaArea(raw: string): string {
-  let s = String(raw ?? "").trim().replace(/\s+/g, " ");
-  s = s.replace(/^(kota\s+(administrasi\s+)?|kabupaten\s+(administrasi\s+)?|kab\.?\s+)/i, "");
-  const t = s.toLowerCase();
-  if (t.includes("seribu")) return "Kepulauan Seribu";
-  if (t.includes("pusat")) return "Jakarta Pusat";
-  if (t.includes("utara")) return "Jakarta Utara";
-  if (t.includes("barat")) return "Jakarta Barat";
-  if (t.includes("selatan")) return "Jakarta Selatan";
-  if (t.includes("timur")) return "Jakarta Timur";
-  // Title-case fallback.
-  return s.replace(/\b\w/g, (c) => c.toUpperCase());
+export function mapCredit(id: string): string | undefined {
+  return id === "id-provinces" || id === "id-regencies"
+    ? "Boundaries: BPS, OCHA via geoBoundaries (CC BY 3.0 IGO)"
+    : undefined;
+}
+
+/** Feature names of the maps registered so far, for matching region names. */
+const featureNames = new Map<string, string[]>();
+const loading = new Map<string, Promise<boolean>>();
+
+/** The `name` of every feature of a registered map (empty before `ensureMap` resolves true). */
+export function mapFeatureNames(id: string): string[] {
+  return featureNames.get(id) ?? [];
+}
+
+type FeatureCollection = { features?: { properties?: { name?: unknown } }[] };
+
+/**
+ * Load + register the map `id` once (idempotent). Resolves false for an id
+ * that is not in the catalogue, or when its GeoJSON is missing or malformed.
+ */
+export function ensureMap(id: string): Promise<boolean> {
+  const entry = mapEntry(id);
+  if (!entry) return Promise.resolve(false);
+  if (featureNames.has(id)) return Promise.resolve(true);
+  let p = loading.get(id);
+  if (!p) {
+    // Deliberately NOT `apiFetch`: a static GeoJSON asset, not an `/api/*`
+    // call — there is no auth state to react to.
+    p = fetch(entry.url, { cache: "force-cache" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("geojson not found"))))
+      .then((gj: FeatureCollection) => {
+        const names = (gj.features ?? []).map((f) => String(f.properties?.name ?? "")).filter(Boolean);
+        echarts.registerMap(id, gj as unknown as Parameters<typeof echarts.registerMap>[1]);
+        featureNames.set(id, names);
+        return true;
+      })
+      .catch(() => {
+        // Forget the failure so the next render can try again (a deploy
+        // that adds the file, a flaky first request).
+        loading.delete(id);
+        return false;
+      });
+    loading.set(id, p);
+  }
+  return p;
 }

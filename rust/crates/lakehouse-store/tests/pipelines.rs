@@ -48,8 +48,13 @@ fn input() -> CreatePipelineInput {
         // The per-row tests that need a specific count set it explicitly.
         max_retries: None,
         tenant_id: None,
-        depends_on: Vec::new(),
+        depends_on: vec!["pl-up-1".to_owned(), "ingest_job".to_owned()],
         connector_id: None,
+        // PR #57 review F1.7: callers that need to know the id before
+        // the row is committed pass `Some(...)`; the store fixtures
+        // here want the default `slug_id` derivation, which is exactly
+        // what `id: None` triggers in `create_pipeline`.
+        id: None,
     }
 }
 
@@ -163,7 +168,7 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
         &pool,
         &created.id,
         &pipelines::UpdatePipelineInput {
-            depends_on: vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()],
+            depends_on: Some(vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()]),
             ..pipelines::UpdatePipelineInput {
                 kind: input().kind,
                 source_zone: input().source_zone,
@@ -177,7 +182,7 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
                 owner: None,
                 description: None,
                 max_retries: None,
-                depends_on: Vec::new(),
+                depends_on: None,
             }
         },
         None,
@@ -195,7 +200,11 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
 /// edited.
 #[sqlx::test(migrations = "../../migrations")]
 async fn depends_on_defaults_to_empty_when_unset(pool: PgPool) -> sqlx::Result<()> {
-    let created = pipelines::create_pipeline(&pool, &input(), None)
+    let empty_deps = CreatePipelineInput {
+        depends_on: vec![],
+        ..input()
+    };
+    let created = pipelines::create_pipeline(&pool, &empty_deps, None)
         .await
         .expect("create should succeed");
     assert!(
@@ -498,7 +507,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             owner: None,
             description: Some("edited".to_owned()),
             max_retries: None,
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -534,7 +543,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             owner: None,
             description: None,
             max_retries: None,
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -742,7 +751,12 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
         owner: None,
         description: None,
         max_retries: None,
-        depends_on: Vec::new(),
+        // PR #57 review F1.8: `None` keeps the stored chain (the
+        // `COALESCE` write in `update_pipeline_with_event`); `Some(vec)`
+        // replaces it. Test fixtures that don't care about the chain
+        // pass `None` — the field is "unchanged" — to mirror the
+        // console's save-without-`dependsOn` shape.
+        depends_on: None,
     }
 }
 
@@ -979,7 +993,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
             owner: None,
             description: Some("edited".to_owned()),
             max_retries: Some(4),
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -1007,7 +1021,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
             owner: Some(created_snapshot.owner.clone()),
             description: created_snapshot.description.clone(),
             max_retries: Some(created_snapshot.max_retries),
-            depends_on: created_snapshot.depends_on.clone(),
+            depends_on: Some(created_snapshot.depends_on.clone()),
         },
         None,
     )
@@ -1081,7 +1095,7 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
             owner: None,
             description: Some("edited".to_owned()),
             max_retries: Some(4),
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -1117,7 +1131,12 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
             owner: Some(snap.owner),
             description: snap.description,
             max_retries: Some(snap.max_retries),
-            depends_on: snap.depends_on,
+            // PR #57 review F1.8: restore is an authoritative replay,
+            // so the stored snapshot's chain always replaces the
+            // current one. `Some(vec)` is what makes the `COALESCE`
+            // write land the restored chain rather than the stored one
+            // (which is what `None` would do).
+            depends_on: Some(snap.depends_on.clone()),
         },
         None,
     )
@@ -1177,7 +1196,7 @@ async fn update_pipeline_writes_one_updated_version_with_post_write_state(
             owner: Some("data-eng".to_owned()),
             description: Some("edited".to_owned()),
             max_retries: Some(4),
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         Some(actor),
     )
@@ -1274,7 +1293,7 @@ async fn failed_update_writes_no_version_row(pool: PgPool) -> sqlx::Result<()> {
             owner: None,
             description: None,
             max_retries: Some(99), // out of CHECK range; forces a 23514
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -1322,7 +1341,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
             owner: None,
             description: Some("second".to_owned()),
             max_retries: Some(created.max_retries),
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -1344,7 +1363,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
             owner: None,
             description: Some("third".to_owned()),
             max_retries: Some(created.max_retries),
-            depends_on: Vec::new(),
+            depends_on: None,
         },
         None,
     )
@@ -1467,7 +1486,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
             owner: Some("data-eng".to_owned()),
             description: Some("edit".to_owned()),
             max_retries: Some(4),
-            depends_on: vec!["pl-upstream".to_owned()],
+            depends_on: Some(vec!["pl-upstream".to_owned()]),
         },
         None,
     )
@@ -1496,7 +1515,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
             owner: Some(snap.owner.clone()),
             description: snap.description.clone(),
             max_retries: Some(snap.max_retries),
-            depends_on: snap.depends_on.clone(),
+            depends_on: Some(snap.depends_on.clone()),
         },
         None,
     )

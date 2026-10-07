@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
+use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_auth::{
     LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
     SessionAuthenticator,
@@ -20,6 +21,7 @@ use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 use lakehouse_trino::{TrinoClient, TrinoConfig};
+use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
@@ -191,6 +193,10 @@ pub struct AppState {
     /// field carried while nothing read it yet is removed now that a
     /// reader exists.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
+    /// Login-throttle policy resolved from config — shared (via
+    /// [`Arc`]) across every clone of [`AppState`] so the login
+    /// handler reads it without copying.
+    pub throttle_policy: Arc<ThrottlePolicy>,
 }
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
@@ -564,6 +570,11 @@ impl AppState {
         )
         .map(Arc::new);
         let secrets_dir = config.connector_secrets_dir.clone();
+        let throttle_policy = ThrottlePolicy {
+            max_failures: config.login_max_failures,
+            window: Duration::seconds(i64::from(config.login_failure_window_secs)),
+            lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
+        };
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -585,6 +596,7 @@ impl AppState {
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
+            throttle_policy: Arc::new(throttle_policy),
         }
     }
 }

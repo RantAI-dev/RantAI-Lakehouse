@@ -2819,5 +2819,10 @@ Open before this branch meets `main`: `main` now has its own `0054` and
 number is 0057 or later) and the development database's migration record
 corrected by hand, as was done for `0049`.
 
+Renumbered at the merge of `main` (2026-10-07): `0054_upload.sql` is now
+`0057_upload.sql` and `0055_upload_tenant_mode.sql` is now
+`0058_upload_tenant_mode.sql`, contents unchanged. Every `0054` and `0055`
+above names the upload migrations by their old numbers.
+
 Not verified: the acceptance checklist of the feature page. That is the
 product owner's.

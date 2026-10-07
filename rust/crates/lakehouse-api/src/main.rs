@@ -119,6 +119,19 @@ async fn main() -> anyhow::Result<()> {
     // warning in the log, and the alerts tick tries again.
     routes::schema_versions::spawn_pass(&state);
 
+    // Gold-publish-per-mart plan T1: same shape, for Dagster's nightly
+    // Gold export schedule (`dagster/dispar_orchestrate/gold_export.py`),
+    // from `GOLD_EXPORT_RUN_TOKEN` — see
+    // `bootstrap_gold_export_service`'s doc comment for what happens when
+    // it's unset, and why this identity carries no scopes at all.
+    bootstrap_gold_export_service(&state).await;
+
+    // SEC-5: spawn the auth-cleanup background task (purges expired
+    // sessions, revoked credentials, and stale throttle rows once an
+    // hour). Without a Postgres pool it logs once and spawns nothing —
+    // cleanup depends on the database being reachable.
+    spawn_auth_cleanup(&state);
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -244,6 +257,13 @@ const LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME: &str = "lakehouse-maintenance
 /// or `agent:manage`/`connector:manage` principal calls — not this
 /// identity).
 const INGEST_SERVICE_IDENTITY_NAME: &str = "ingest-run-service";
+
+/// Fixed name of the service identity [`bootstrap_gold_export_service`]
+/// provisions — same `<domain>-run-scheduler` shape as
+/// [`AGENT_RUN_SERVICE_IDENTITY_NAME`] (gold-publish-per-mart plan T1:
+/// `dagster/dispar_orchestrate/gold_export.py`'s nightly schedule could
+/// authenticate nowhere, so it got `401` at `auth_gate` every night).
+const GOLD_EXPORT_SERVICE_IDENTITY_NAME: &str = "gold-export-scheduler";
 
 /// Idempotently seed the ONE service identity + credential that lets
 /// Dagster's digital-employee schedule factory
@@ -498,6 +518,59 @@ async fn bootstrap_ingest_run_service(state: &AppState) {
     .await;
 }
 
+/// Lets `dagster/dispar_orchestrate/gold_export.py`'s nightly
+/// `gold_export_schedule` authenticate against `POST /api/gold/export/{mart}`'s
+/// `Policy::RequiresAuth` floor, from [`Config::gold_export_run_token`] —
+/// the exact same `auth_gate`-floor problem
+/// [`bootstrap_agent_run_service`]/[`bootstrap_alerts_run_service`]/
+/// [`bootstrap_lakehouse_maintenance_service`]/[`bootstrap_ingest_run_service`]
+/// solve for their own callers, reusing the identical mechanism rather
+/// than a fifth, near-duplicate implementation (gold-publish-per-mart
+/// plan T1: the schedule's nightly run reached the router and got `401`
+/// at `auth_gate`, every night, because no identity existed for it).
+///
+/// # Why this identity gets NO scopes
+///
+/// `POST /api/gold/export/{mart}` is `Policy::RequiresAuth`
+/// (`policy::POLICY_TABLE`) — a FLOOR, not a ceiling: `auth_gate` demands
+/// a real, authenticated [`lakehouse_auth::Principal`] before the handler
+/// (and `routes::gold::check_export_token`'s own gate) ever runs. The
+/// caller sends the ONE configured value two ways
+/// (`gold_export.py::_headers`, same shape as `alerts_run.py`):
+/// `Authorization: Bearer <GOLD_EXPORT_RUN_TOKEN>` clears the floor, and
+/// `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies
+/// `check_export_token`'s token branch — which is what actually gates the
+/// export. An empty [`lakehouse_auth::PermissionSet`] still authenticates
+/// (`verify_service_token` builds it from `service_identity.scopes`
+/// regardless of whether that array is empty) and satisfies
+/// `RequiresAuth`; it simply satisfies no `RequiresPermission` check.
+/// Granting this identity `gold:export` would be strictly more privilege
+/// than the route it authenticates for ever inspects — a leaked
+/// `GOLD_EXPORT_RUN_TOKEN` would then also pass every permission check
+/// keyed to `gold:export` (e.g. the per-mart publication toggle this
+/// same plan gates behind it, whose UI decision is "who may switch
+/// publishing on", not "may the scheduler flip it"), instead of only the
+/// token-matched export.
+///
+/// # What happens when `GOLD_EXPORT_RUN_TOKEN` is absent
+///
+/// Logs a `tracing::warn!` and returns, seeding NOTHING — no identity, no
+/// credential — same posture as every other `bootstrap_*_run_service`
+/// when its own token is unset. The schedule is still registered
+/// (`gold_export.py`, `DefaultScheduleStatus::RUNNING` posture) and its
+/// nightly run still fails loudly (`401`/`503`), which is the honest,
+/// visible failure mode, not a silent one.
+async fn bootstrap_gold_export_service(state: &AppState) {
+    bootstrap_service_run_identity(
+        state,
+        state.config.gold_export_run_token.clone(),
+        GOLD_EXPORT_SERVICE_IDENTITY_NAME,
+        Vec::new(),
+        "GOLD_EXPORT_RUN_TOKEN",
+    )
+    .await;
+}
+
 /// Idempotently seed ONE service identity + credential that lets a
 /// Dagster job authenticate against a token-guarded, `RequiresAuth`
 /// route — the shared core [`bootstrap_agent_run_service`],
@@ -622,6 +695,51 @@ async fn shutdown_signal() {
         tracing::error!(%err, "failed to install ctrl-c handler");
         std::future::pending::<()>().await;
     }
+}
+
+/// Spawn the background task that periodically purges expired sessions,
+/// revoked service credentials, and stale throttle rows (SEC-5). Runs
+/// once at start and then every hour via `tokio::time::interval` (missed
+/// ticks skipped). Logs counts at `info` and an error at `warn`; an error
+/// never takes the process down. Without a Postgres pool, logs once and
+/// spawns nothing.
+fn spawn_auth_cleanup(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; auth-cleanup background task will not run");
+        return;
+    };
+    let retention = time::Duration::days(i64::from(state.config.auth_retention_days));
+    let throttle_window =
+        time::Duration::seconds(i64::from(state.config.login_failure_window_secs));
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let run = || async {
+            match lakehouse_auth::cleanup::purge(&pool, retention, throttle_window).await {
+                Ok(counts) => {
+                    tracing::info!(
+                        session_rows = counts.sessions,
+                        service_credential_rows = counts.service_credentials,
+                        throttle_rows = counts.throttle_entries,
+                        "auth cleanup purge complete",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "auth cleanup purge failed");
+                }
+            }
+        };
+
+        // Run once at start before entering the hourly loop.
+        run().await;
+
+        loop {
+            interval.tick().await;
+            run().await;
+        }
+    });
 }
 
 /// Log ONCE at boot when this deployment refuses the shared catalog and
@@ -1475,6 +1593,120 @@ mod tests {
             let pool = state.pg.as_deref().expect("pg pool configured");
             assert_eq!(pipeline_run_identity_row_count(pool).await, 0);
             assert_eq!(pipeline_run_credential_row_count(pool).await, 0);
+        }
+
+        async fn gold_export_identity_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM service_identity WHERE name = $1")
+                    .bind(GOLD_EXPORT_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count service_identity rows");
+            count
+        }
+
+        async fn gold_export_credential_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM service_credential sc \
+                 JOIN service_identity si ON si.id = sc.service_identity_id \
+                 WHERE si.name = $1",
+            )
+            .bind(GOLD_EXPORT_SERVICE_IDENTITY_NAME)
+            .fetch_one(pool)
+            .await
+            .expect("count service_credential rows");
+            count
+        }
+
+        /// With `GOLD_EXPORT_RUN_TOKEN` set, boot seeds exactly one
+        /// identity (no scopes — see [`bootstrap_gold_export_service`]'s
+        /// doc comment for why) and one matching credential; the token
+        /// authenticates a real service principal that nonetheless does
+        /// NOT hold `gold:export` — the route it authenticates for is
+        /// gated by `check_export_token`'s token branch, not by that
+        /// permission (gold-publish-per-mart plan T1).
+        #[tokio::test]
+        async fn bootstrap_gold_export_service_seeds_identity_and_credential() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "GOLD_EXPORT_RUN_TOKEN".to_owned(),
+                "unit-test-gold-export-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_gold_export_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(gold_export_identity_row_count(pool).await, 1);
+            assert_eq!(gold_export_credential_row_count(pool).await, 1);
+
+            let (scopes,): (Vec<String>,) =
+                sqlx::query_as("SELECT scopes FROM service_identity WHERE name = $1")
+                    .bind(GOLD_EXPORT_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read the seeded identity's scopes");
+            assert_eq!(scopes, Vec::<String>::new());
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-gold-export-token".to_owned()),
+            )
+            .await
+            .expect("the configured token must authenticate a real service principal");
+            assert!(!principal.permissions.has("gold:export"));
+        }
+
+        /// Running the bootstrap twice (a process restart) does not
+        /// duplicate the identity or the credential, and the original
+        /// token still authenticates after the second boot — same
+        /// idempotency shape every other `bootstrap_*_run_service` proves
+        /// for itself.
+        #[tokio::test]
+        async fn bootstrap_gold_export_service_is_idempotent_across_two_runs() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "GOLD_EXPORT_RUN_TOKEN".to_owned(),
+                "unit-test-gold-export-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_gold_export_service(&state).await;
+            bootstrap_gold_export_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(
+                gold_export_identity_row_count(pool).await,
+                1,
+                "a second boot must not duplicate the service identity"
+            );
+            assert_eq!(
+                gold_export_credential_row_count(pool).await,
+                1,
+                "a second boot with the same token must not duplicate the credential"
+            );
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-gold-export-token".to_owned()),
+            )
+            .await
+            .expect("the original token must still authenticate after a second boot");
+            assert!(!principal.permissions.has("gold:export"));
+        }
+
+        /// With `GOLD_EXPORT_RUN_TOKEN` unset, bootstrap creates nothing
+        /// at all — no identity, no credential — same posture as
+        /// [`bootstrap_alerts_run_service`] when its own token is unset.
+        #[tokio::test]
+        async fn bootstrap_gold_export_service_creates_nothing_when_token_is_unset() {
+            let state = fresh_state(&HashMap::new()).await;
+
+            bootstrap_gold_export_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(gold_export_identity_row_count(pool).await, 0);
+            assert_eq!(gold_export_credential_row_count(pool).await, 0);
         }
     }
 }

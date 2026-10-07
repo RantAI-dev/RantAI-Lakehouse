@@ -33,6 +33,26 @@ in a mapped step (so each mart is its own failure unit, retryable by
 logs the count. The console now sees one mapped step per mart named
 `export_gold_mart[<key>]` where it previously saw the single
 `run_gold_export` step.
+
+# Which marts run (gold-publish-per-mart plan T5, DATA-1)
+
+Before this change the mart list came only from `GOLD_EXPORT_MARTS`
+(default `gold_export_smoke`) — a build-time constant no operator could
+change without redeploying, and one that ignored everything the console's
+per-mart switches said. Now `list_gold_marts` unions two sources, the
+API's enabled publications (`GET /api/gold/publications`, what the
+console's switches write — the database is the source of truth) and the
+env override (an operator's escape hatch, default empty), deduplicated
+by mart name; two DISTINCT marts that would collapse into one Dagster
+step key are still refused. Every scheduled POST sends `ifChanged=true`
+(T4), so a mart whose `max(modification_time)` last moved strictly
+before its last successful export comes back `{skipped: true}` —
+strictly before, not "not after" (PR slice B review B1: both sides are
+whole seconds, so equal timestamps export rather than risk a stale copy
+the console calls up to date) — recorded as
+`skipped_verbs=["unchanged"]` with no `AssetMaterialization`, since
+nothing was written — and the empty union runs a zero-step job that
+still succeeds, which is the honest shape of "nothing is published."
 """
 
 from __future__ import annotations
@@ -45,14 +65,20 @@ from typing import Any
 import requests
 from dagster import (
     AssetMaterialization,
+    DagsterRunStatus,
     DefaultScheduleStatus,
+    DefaultSensorStatus,
     Definitions,
     DynamicOut,
     DynamicOutput,
     Failure,
+    RunRequest,
+    RunStatusSensorContext,
     ScheduleDefinition,
+    SkipReason,
     job,
     op,
+    run_status_sensor,
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
@@ -65,7 +91,13 @@ def _env(name: str, default: str) -> str:
 
 
 def _marts_from_env() -> list[str]:
-    raw = os.environ.get("GOLD_EXPORT_MARTS", "gold_export_smoke")
+    """The operator's `GOLD_EXPORT_MARTS` override, default empty: the
+    scheduled mart list is owned by the per-mart publication setting
+    (`GET /api/gold/publications`, gold-publish-per-mart plan T5), and
+    this env is only a union-ed escape hatch for an operator who needs a
+    mart exported before anyone switched it on in the console. A fresh
+    deployment with nothing switched on exports nothing — on purpose."""
+    raw = os.environ.get("GOLD_EXPORT_MARTS", "")
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
@@ -79,9 +111,13 @@ class GoldExportConfig:
     # `GOLD_EXPORT_RUN_TOKEN` from the same compose `.env` — see
     # `docker-compose.yml`'s `gold-export-test-runner` usage comment for
     # why a one-off override here would not also reach the already-running
-    # `lakehouse-api` container). Empty means `lakehouse-api` requires a
-    # service-identity principal instead, which this job does not carry —
-    # operators wanting the schedule to actually succeed must set this.
+    # `lakehouse-api` container). The value authenticates twice:
+    # `lakehouse-api::main::bootstrap_gold_export_service` mints the
+    # `gold-export-scheduler` identity + credential from it at API boot
+    # (gold-publish-per-mart plan T1), `_headers` sends it as both the
+    # bearer credential and the `x-run-token` header. Empty means neither
+    # exists — the schedule then runs and fails loudly (`401`/`503`)
+    # instead of silently, which is the honest state to ship.
     run_token: str
 
     @classmethod
@@ -95,15 +131,66 @@ class GoldExportConfig:
 
 
 def _headers(cfg: GoldExportConfig) -> dict[str, str]:
-    return {"x-run-token": cfg.run_token} if cfg.run_token else {}
+    """Same two-header shape as `alerts_run.py::_headers` — see the
+    schedule comment below for why both are needed. Empty when no token
+    is configured, so a caller can tell "not configured" apart from
+    "configured, but Dagster forgot to send it" without inspecting the
+    response.
+    """
+    if not cfg.run_token:
+        return {}
+    return {
+        "x-run-token": cfg.run_token,
+        "Authorization": f"Bearer {cfg.run_token}",
+    }
 
 
 def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
+    """`ifChanged=true` (gold-publish-per-mart plan T4): the API skips
+    the export — 200 `{skipped: true, reason: ...}`, nothing written,
+    no history row — when the mart's `max(modification_time)` last moved
+    strictly before its last successful export (equal timestamps export,
+    PR slice B review B1). The manual console trigger sends no such
+    parameter; only the schedule measures before it writes."""
     resp = requests.post(
-        f"{cfg.api_url}/api/gold/export/{mart}", headers=_headers(cfg), timeout=60
+        f"{cfg.api_url}/api/gold/export/{mart}",
+        params={"ifChanged": "true"},
+        headers=_headers(cfg),
+        timeout=60,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _enabled_publication_marts(cfg: GoldExportConfig) -> list[str]:
+    """The marts switched on in the console, in the order the API lists
+    them. A failed fetch raises (bare `requests` exception ->
+    `DEFAULT_RETRY_POLICY`) — never swallowed into "zero marts", which
+    would silently skip every export; a malformed body raises a
+    non-retryable `Failure`, because a retry would read the same wrong
+    shape."""
+    resp = requests.get(
+        f"{cfg.api_url}/api/gold/publications", headers=_headers(cfg), timeout=30
+    )
+    resp.raise_for_status()
+    publications = resp.json().get("publications")
+    if not isinstance(publications, list):
+        raise Failure(
+            f"GET {cfg.api_url}/api/gold/publications returned no "
+            f"publications list -- expected {{\"publications\": [...]}}",
+            allow_retries=False,
+        )
+    marts: list[str] = []
+    for publication in publications:
+        mart = publication.get("mart") if isinstance(publication, dict) else None
+        if not isinstance(mart, str) or not mart:
+            raise Failure(
+                f"GET {cfg.api_url}/api/gold/publications returned a "
+                f"publication without a mart name: {publication!r}",
+                allow_retries=False,
+            )
+        marts.append(mart)
+    return marts
 
 
 # Dagster's `DynamicOutput.mapping_key` must match `^[A-Za-z0-9_]+$`
@@ -138,7 +225,10 @@ def _sanitize_mapping_key(name: str) -> str:
     retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/gold_export.py::list_gold_marts",
-        reads=["env GOLD_EXPORT_MARTS"],
+        reads=[
+            "GET /api/gold/publications (enabled marts, the source of truth)",
+            "env GOLD_EXPORT_MARTS (operator override, unioned in)",
+        ],
         # `writes` is the side-effect of this op: a `DynamicOutput` per
         # mart, which becomes a mapped `export_gold_mart[<key>]` step.
         # Declared here so the test that walks every op in this code
@@ -149,24 +239,38 @@ def _sanitize_mapping_key(name: str) -> str:
     ),
 )
 def list_gold_marts(context) -> Any:
-    """Yield one `DynamicOutput` per configured mart, sanitized to a
-    Dagster-legal mapping key. Two marts that sanitize to the same key
-    are refused with a non-retryable `Failure` -- they would otherwise
-    collapse into one mapped step doing two marts' work, which is a
-    failure mode that only the fan-out can detect."""
+    """Yield one `DynamicOutput` per mart to export this run: every
+    publication switched on in the console (`GET /api/gold/publications`)
+    unioned with the `GOLD_EXPORT_MARTS` override, deduplicated by exact
+    mart name — a mart listed in both places is one step, not two.
+
+    Two DISTINCT marts that sanitize to the same Dagster mapping key are
+    refused with a non-retryable `Failure` naming both and where each
+    came from -- they would otherwise collapse into one mapped step
+    doing two marts' work, which is a failure mode only the fan-out can
+    detect."""
     cfg = GoldExportConfig.from_env()
-    context.log.info(f"exporting {len(cfg.marts)} Gold mart(s): {cfg.marts}")
-    seen: dict[str, str] = {}
-    for mart in cfg.marts:
+    enabled = _enabled_publication_marts(cfg)
+    context.log.info(
+        f"enabled publications: {enabled}; GOLD_EXPORT_MARTS override: {cfg.marts}"
+    )
+    seen_names: set[str] = set()
+    seen_keys: dict[str, str] = {}
+    sources = [("publication setting", m) for m in enabled]
+    sources += [("GOLD_EXPORT_MARTS", m) for m in cfg.marts]
+    for source, mart in sources:
+        if mart in seen_names:
+            continue
         key = _sanitize_mapping_key(mart)
-        if key in seen:
+        if key in seen_keys:
             raise Failure(
-                f"GOLD_EXPORT_MARTS contains two marts that map to the same "
-                f"Dagster step key {key!r}: {seen[key]!r} and {mart!r} -- "
+                f"two Gold marts map to the same Dagster step key {key!r}: "
+                f"{seen_keys[key]!r} and {mart!r} ({source}) -- "
                 "rename one so each mart maps to a unique step",
                 allow_retries=False,
             )
-        seen[key] = mart
+        seen_names.add(mart)
+        seen_keys[key] = mart
         yield DynamicOutput(mart, mapping_key=key)
 
 
@@ -205,9 +309,23 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     try:
         body = export_one_mart(cfg, mart)
     except requests.HTTPError as exc:
+        # PR slice C review C-B1: HTTP 409 — the API's single-flight lock
+        # (an export of this mart is already running) — is a skip, not a
+        # failure. Record it and return without raising; no
+        # AssetMaterialization, because nothing was written in this run.
+        if exc.response is not None and exc.response.status_code == 409:
+            context.log.info(f"skipped {mart!r}: already running (HTTP 409)")
+            record_maintenance_run(
+                table_name=f"gold.{mart}",
+                dry_run_metrics={},
+                applied_metrics={},
+                skipped_verbs=["already_running"],
+                target=cfg.ch,
+            )
+            return {"skipped": True, "reason": "already_running"}
         # Bare re-raise of the HTTPError (no `Failure` wrap) -- lets
         # `DEFAULT_RETRY_POLICY` (max_retries=2, delay=30s, exponential
-        # backoff with ±jitter) retry a transient 5xx (busy ClickHouse
+        # backoff with +/- jitter) retry a transient 5xx (busy ClickHouse
         # on the `lakehouse-api` side). A persistent failure exhausts
         # those attempts and Dagster surfaces it as the mapped step's
         # own failed step. The failure row is written BEFORE the
@@ -223,6 +341,23 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
             target=cfg.ch,
         )
         raise
+    # A skip is a successful no-op, not an error: the API answered 200
+    # with `{skipped: true}` because the mart's `max(modification_time)`
+    # last moved strictly before its last successful export (plan T4,
+    # strict per PR slice B review B1). It gets
+    # its `maintenance_run` row -- `skipped_verbs=["unchanged"]`, the
+    # honest ledger of "looked, nothing to do" -- but no
+    # `AssetMaterialization`, because nothing was written to Iceberg.
+    if body.get("skipped") is True:
+        context.log.info(f"skipped {mart!r}: {body.get('reason')}")
+        record_maintenance_run(
+            table_name=f"gold.{mart}",
+            dry_run_metrics={},
+            applied_metrics={},
+            skipped_verbs=["unchanged"],
+            target=cfg.ch,
+        )
+        return body
     context.log.info(f"exported {mart!r}: {body}")
     # `dry_run_metrics`/`applied_metrics`' numeric fields are shaped for
     # `expire_snapshots` (data/manifest file deletion counts), which a
@@ -303,21 +438,73 @@ def gold_export_job() -> None:
 # (confirmed directly against this repo's `~/.cache/rantai-dagster-venv`;
 # a different task in this programme hit exactly this).
 #
-# WS0's `bootstrap_alerts_run_service`/`bootstrap_agent_run_service` shape
-# (`lakehouse-api::main`) is how `alerts_run_schedule` closed the same
-# `POST /api/gold/export/{mart}` `Policy::RequiresAuth` floor problem this
-# job still has: this job sends only `x-run-token`, and `check_export_token`
-# would accept it, but `auth_gate` enforces `RequiresAuth` — a real
-# authenticated principal — BEFORE the handler (and `check_export_token`)
-# ever runs. No `bootstrap_gold_export_service` exists in `main.rs` yet, so
-# this schedule's nightly run reaches the router and gets `401` there,
-# every night, until that Rust-side identity is provisioned. That gap is
-# real and not fixed by this change (it requires a `rust/` change outside
-# this change's scope), but per AGENTS.md rule 2 ("Never fabricate"), a
-# schedule that runs and visibly fails is the honest state to ship, not a
-# schedule withheld to hide the gap — the acceptance test for this reaches
-# the endpoint by logging in as the bootstrap admin first, which a
-# scheduled job must not do, so it does not exercise this floor.
+# Auth (gold-publish-per-mart plan T1): `POST /api/gold/export/{mart}`'s
+# `Policy::RequiresAuth` floor is enforced by `auth_gate` BEFORE the
+# handler (and `check_export_token`'s own `x-run-token` check) ever runs,
+# so a real credential is required — `_headers` sends the shared token two
+# ways, exactly like `alerts_run.py`: `Authorization: Bearer
+# <GOLD_EXPORT_RUN_TOKEN>` clears the floor via the `gold-export-scheduler`
+# identity that `lakehouse-api::main::bootstrap_gold_export_service`
+# idempotently mints from the same env value at API boot, and
+# `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies `check_export_token`'s
+# token branch, which is what actually gates the export. With the token
+# unset, no identity is seeded and `_headers` returns `{}` — the schedule
+# below is still registered and every run fails loudly (`401`/`503`),
+# which is the honest, visible failure mode, not a silent one.
+# PR slice C review C-S1: each authored pipeline SUCCESS launches one
+# all-marts `gold_export_job` run. With T4's `ifChanged=true` in place,
+# unchanged marts cost one cheap check each and are skipped (no duplicate
+# copy); a mart is skipped when its `max(modification_time)` last moved
+# strictly before its last successful export (PR slice B review B1).
+# Dagster's `run_key=<upstream run id>` prevents a single pipeline
+# success from launching two Gold runs. The nightly 04:00 schedule is
+# the safety net, not the only trigger; with all marts already published
+# by the sensor, the nightly run produces mainly skips.
+#
+# `monitored_jobs=None` (watch every job in this code location) with a
+# filter in the body: only `authored__<id>` jobs (the same prefix
+# `authored_factory.py` gives them at code-load time) trigger; all other
+# jobs — `gold_export_job` itself, maintenance, backup, alerts, capacity,
+# agent, ingest — yield `SkipReason` so the sensor tick stays green.
+#
+# `default_status=RUNNING`: a sensor that ships STOPPED silently never
+# fires, and from the outside, a stopped sensor looks identical to a
+# healthy one (the same reasoning every other schedule/sensor in this
+# code location documents). With `GOLD_EXPORT_RUN_TOKEN` unset the
+# scheduled POST would still fail — but that is a loud, visible failure
+# whose run entry in the Dagster UI is the signal, not a silent one.
+
+
+def evaluate_authored_success(context: RunStatusSensorContext):
+    """The sensor body, split out from the decorator so unit tests can
+    drive it with a `RunStatusSensorContext` stub — the same pattern
+    `pipeline_events.py::evaluate_finished_run` uses (plan 1f)."""
+    job_name = context.dagster_run.job_name
+    if not job_name.startswith("authored__"):
+        yield SkipReason(
+            f"skipped {job_name!r}: sensor only fires on authored-pipeline jobs"
+        )
+        return
+    yield RunRequest(run_key=context.dagster_run.run_id)
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    monitored_jobs=None,
+    request_job=gold_export_job,
+    default_status=DefaultSensorStatus.RUNNING,
+    name="gold_export_after_authored_sensor",
+)
+def gold_export_after_authored_sensor(
+    context: RunStatusSensorContext,
+):
+    """gold-publish-per-mart plan T6: after an authored pipeline succeeds,
+    triggers `gold_export_job` so the nightly cadence is the safety net,
+    not the only trigger. With T4's `ifChanged=true` in place, unchanged
+    marts cost one cheap check each."""
+    yield from evaluate_authored_success(context)
+
+
 gold_export_schedule = ScheduleDefinition(
     job=gold_export_job,
     cron_schedule="0 4 * * *",

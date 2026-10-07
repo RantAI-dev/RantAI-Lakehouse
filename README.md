@@ -236,6 +236,10 @@ guessed.
 | `NODE_ENV` | Fallback for `APP_ENV` | — | No |
 | `AUTH_BOOTSTRAP_EMAIL` | Email for the idempotent bootstrap admin account created at startup | unset (no bootstrap admin) | No, but recommended for first run |
 | `AUTH_BOOTSTRAP_PASSWORD` | Password for the bootstrap admin account | unset | No, but required alongside `AUTH_BOOTSTRAP_EMAIL` to actually create one |
+| `LOGIN_MAX_FAILURES` | Failed password login attempts tolerated per email within `LOGIN_FAILURE_WINDOW_SECS` before lockout. There is no off switch: `0`, negative, and unparseable values all fall back to the default, so an operator can never accidentally silence the throttle | `5` | No |
+| `LOGIN_FAILURE_WINDOW_SECS` | Rolling window (seconds) counted for login failures. Invalid values fall back to the default | `900` (15 min) | No |
+| `LOGIN_LOCKOUT_SECS` | Duration (seconds) a locked-out email stays locked. Invalid values fall back to the default | `300` (5 min) | No |
+| `AUTH_RETENTION_DAYS` | How many days to keep expired sessions and revoked credentials before the background cleanup job purges them. Throttle rows are not gated by this — an unlocked row with a lapsed window is purged as soon as its window lapses | `30` | No |
 | `OIDC_ISSUER` | OIDC provider issuer URL | unset | No — OIDC requires both this and `OIDC_CLIENT_ID` |
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above |
 | `OIDC_CLIENT_SECRET` | Reserved for a future authorization-code exchange; not currently read by `OidcAuthenticator` | unset | No |
@@ -360,8 +364,8 @@ their opt-in compose profiles:
 | `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No |
 | `BUILTIN_DASHBOARD_SPEC` | Path to a JSON file of built-in "Main" dashboard KPI/chart tiles for this tenant (shape: `{kpis:[...], charts:[...]}`, see `rust/crates/lakehouse-bi/specs/builtin-default.json`); unset, unreadable, or invalid means no built-in tiles at all | unset | No |
 | `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No |
-| `GOLD_EXPORT_MARTS` | Comma-separated marts the scheduled Gold export job exports | `gold_export_smoke` | No |
-| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Generate your own | unset | No |
+| `GOLD_EXPORT_MARTS` | Optional operator override, unioned with per-mart publications the console switches on; default empty — a fresh deployment publishes only what is switched on in the console | (empty) | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Seeds the `gold-export-scheduler` service identity at API boot, so the nightly schedule authenticates. Generate your own | unset | No |
 | `GOLD_MART_NAME` / `GOLD_EXPORT_ROW_COUNT` | Mart name and row count the Gold export acceptance test seeds | `gold_export_smoke` / `7` | No |
 
 Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
@@ -469,8 +473,12 @@ issue about any of the following — they're known, not bugs:
 - **`getWorkspaceSettings` returns a fixed response.** The contract has no
   setter; workspace settings are not actually persisted or configurable
   yet.
-- **No login rate limiting beyond logging.** Failed login attempts are
-  logged but not throttled or locked out.
+- **Login throttling covers password login only.** Failed `POST
+  /api/auth/login` attempts are throttled per email; after a configurable
+  number of failures within a window, the email is locked out for a
+  configurable duration. OIDC/SSO login is not throttled. See
+  `LOGIN_MAX_FAILURES`, `LOGIN_FAILURE_WINDOW_SECS`, and
+  `LOGIN_LOCKOUT_SECS` in the Configuration table.
 - **SSO is gated by a build-time flag, not a runtime one.** The frontend
   can't read the Rust process's environment variables directly, so whether
   the SSO login UI shows up is controlled by `NEXT_PUBLIC_SSO_ENABLED` at
@@ -485,9 +493,15 @@ issue about any of the following — they're known, not bugs:
   This is deliberate (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   but it means a misconfigured `DATABASE_URL` degrades quietly rather than
   loudly — watch logs and the 503 rate, not just process uptime.
-- **Sessions and service tokens have no rotation/cleanup job.** Nothing
-  today expires or garbage-collects them beyond whatever TTL logic exists
-  at issuance/verification time.
+- **Session/credential cleanup is best-effort, not guaranteed.** A
+  background job purges expired sessions, revoked credentials, and stale
+  throttle rows hourly. It runs in-band and may skip a tick under load;
+  nothing guarantees a session or credential is removed within a
+  particular bound. See `AUTH_RETENTION_DAYS` in the Configuration table.
+- **Active service tokens never expire.** The cleanup job deletes only
+  what is already expired or revoked; a non-revoked service token is
+  valid indefinitely no matter how old, so rotation is a manual,
+  operator-driven act (see `docs/OPERATIONS.md`).
 - **A previously-internal API key and internal LAN hostnames are present
   in git history** (2 and ~10 commits reachable from `main`,
   respectively), predating this repo going public. The key must be, and

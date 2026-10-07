@@ -22,7 +22,11 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_schedule,
 )
 from dispar_orchestrate.file_ingest import file_ingest_job
-from dispar_orchestrate.gold_export import gold_export_job, gold_export_schedule
+from dispar_orchestrate.gold_export import (
+    gold_export_after_authored_sensor,
+    gold_export_job,
+    gold_export_schedule,
+)
 from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -114,6 +118,7 @@ defs = Definitions(
         ingest_schedule_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
+        gold_export_after_authored_sensor,
         # R3 plan 2a: one `run_status_sensor` per authored pipeline with
         # non-empty `depends_on`, named `authored__<safe_id>_after` (the
         # same name the API layer fetches ticks for via

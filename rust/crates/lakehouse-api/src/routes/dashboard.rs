@@ -1237,6 +1237,17 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
             if let Some(breakdown) = &def.breakdown {
                 out.push(("breakdown", json!(breakdown)));
             }
+            // Map kinds only; `None` for every other chart, so the exported
+            // shape of existing charts does not change.
+            if let Some(map) = &def.map {
+                out.push(("map", json!(map)));
+            }
+            if let Some(lat) = &def.lat {
+                out.push(("lat", json!(lat)));
+            }
+            if let Some(lon) = &def.lon {
+                out.push(("lon", json!(lon)));
+            }
             if let Some(aggregate) = &def.aggregate {
                 out.push(("aggregate", json!(aggregate)));
             }

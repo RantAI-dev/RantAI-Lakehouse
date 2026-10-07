@@ -28,6 +28,7 @@ import {
   relatedTables,
   type AssetLineageState,
 } from "./asset-lineage"
+import { OpenFormatCard } from "./open-format-card"
 import {
   AssetStorage,
   ClickHouseStorage,
@@ -254,6 +255,9 @@ export function AssetOverview({
       ) : (
         <ClickHouseStorage asset={a} />
       )}
+
+      {/* ── Gold publish per mart (DATA-1): published as an open format ── */}
+      {a.layer === "gold" && <OpenFormatCard assetId={a.id} />}
 
       {/* ── How do I use it? ────────────────────────────────────────── */}
       <SectionCard

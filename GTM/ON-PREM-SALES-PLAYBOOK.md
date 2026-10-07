@@ -134,9 +134,9 @@ prospect's name.
 5. **Dashboards**: cross-filter, then create a public share link and a
    signed embed. Paste the iframe into a blank page.
 6. **Alerts**: create a threshold rule and fire it to a webhook.
-7. **Gold export**: `POST /api/gold/export/{mart}`, then read the same
-   table from pyiceberg or Trino in a terminal. This is the "no lock-in"
-   proof and no competitor demo does it.
+7. **Gold export**: switch publishing on from the Gold mart's asset detail
+    page in Data, then read the same table from pyiceberg or Trino in a
+    terminal. This is the "no lock-in" proof and no competitor demo does it.
 8. **Maintenance**: Governance → Maintenance, run a dry-run, show the
    measured file counts.
 

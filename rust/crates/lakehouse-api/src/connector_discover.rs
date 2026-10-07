@@ -371,7 +371,8 @@ async fn discover_dial(
                     .map_err(tiberius::error::Error::from)?;
                 tcp.set_nodelay(true)
                     .map_err(tiberius::error::Error::from)?;
-                let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+                let mut client =
+                    Box::pin(tiberius::Client::connect(config, tcp.compat_write())).await?;
                 discover_sql_mssql(&mut client, schema).await
             }
             SqlDriver::Oracle => {

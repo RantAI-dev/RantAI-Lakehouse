@@ -14,19 +14,18 @@ import {
   GitBranch,
   HeartPulse,
   History,
+  LayoutGrid,
   Home,
   KeyRound,
   Library,
   ListChecks,
   LogIn,
   MonitorSmartphone,
-  PackageCheck,
   Plug,
   SearchCode,
   Server,
   Settings,
   ShieldCheck,
-  Sparkles,
   Tags,
   Users,
   Waypoints,
@@ -38,6 +37,13 @@ export type NavItem = {
   title: string
   href: string
   icon: LucideIcon
+  /**
+   * A second destination for this entry, shown as an icon button at the
+   * right end of its row (where a section's chevron sits). The row itself
+   * still goes to `href`. Only rendered for a single-page entry in the
+   * expanded sidebar.
+   */
+  action?: { title: string; href: string; icon: LucideIcon }
   /**
    * `true` when the page still runs on mock data (not wired to a real
    * service yet). Hidden from the sidebar unless
@@ -83,9 +89,13 @@ export type NavGroup = {
  * To add a top-level page, add an entry to the appropriate group.
  *
  * Grouping rationale (the console is agentic-first, so it opens on the
- * AI-first Home and "Ask AI" sits right under it, not in a section):
- * - Home / Ask AI: where work starts — ask or instruct, see what needs you.
- * - Dashboards: always top level, right under Ask AI — it is where most
+ * AI-first Home and the conversations sit right under it, not in a section):
+ * - Home: where work starts — the Copilot composer, and what needs you.
+ *   It is the one place a conversation is started; there is no separate
+ *   "Ask AI" entry, which used to open a second, near-identical composer.
+ * - History: the conversations already had — find, reopen, rename, delete.
+ *   A conversation itself is `/copilot?id=…`, reached from Home or here.
+ * - Dashboards: always top level, right under History — it is where most
  *   people spend their time, not a sub-page of Data.
  * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
@@ -105,14 +115,24 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [{ title: "Home", href: "/", icon: Home }],
   },
   {
-    label: "Ask AI",
-    icon: Sparkles,
-    items: [{ title: "Ask AI", href: "/copilot", icon: Sparkles }],
+    label: "History",
+    icon: History,
+    items: [{ title: "History", href: "/copilot/history", icon: History }],
   },
   {
     label: "Dashboards",
     icon: BarChart3,
-    items: [{ title: "Dashboards", href: "/dashboards", icon: BarChart3 }],
+    items: [
+      {
+        title: "Dashboards",
+        href: "/dashboards",
+        icon: BarChart3,
+        // The row opens the dashboard you last had open (`/dashboards` is
+        // the resolver); the icon opens the list, where dashboards and
+        // their folders are managed.
+        action: { title: "Browse all dashboards", href: "/dashboards/browse", icon: LayoutGrid },
+      },
+    ],
   },
   {
     label: "Data",
@@ -130,7 +150,6 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: GitBranch,
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
-      { title: "Exports", href: "/gold-exports", icon: PackageCheck },
     ],
   },
   {
@@ -264,10 +283,22 @@ export function subNavItems(pathname: string): NavItem[] {
 const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
   { title: "All Dashboards", href: "/dashboards/browse" },
+  // One conversation with Copilot. Not a sidebar entry: it is opened from
+  // Home (a new one) or from History (an old one).
+  { title: "Conversation", href: "/copilot" },
   // Table detail pages, opened from Table Maintenance or an asset's
   // Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
   { title: "Iceberg Table", href: "/lakehouse/tables" },
+]
+
+/**
+ * Routes whose sidebar parent is not a prefix of their path. An open
+ * conversation (`/copilot`) belongs under History (`/copilot/history`),
+ * which the longest-prefix rule alone cannot see.
+ */
+const HIGHLIGHT_UNDER: { href: string; item: string }[] = [
+  { href: "/copilot", item: "/copilot/history" },
 ]
 
 function bestMatch<T extends { href: string }>(
@@ -288,7 +319,10 @@ function bestMatch<T extends { href: string }>(
  * Longest-match semantics so nested routes highlight their closest parent.
  */
 export function activeNavHref(pathname: string): string | undefined {
-  return bestMatch(pathname, ALL_NAV_ITEMS)?.href
+  return (
+    bestMatch(pathname, ALL_NAV_ITEMS)?.href ??
+    bestMatch(pathname, HIGHLIGHT_UNDER)?.item
+  )
 }
 
 /**

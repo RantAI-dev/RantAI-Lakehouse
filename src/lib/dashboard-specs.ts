@@ -16,8 +16,8 @@ export type ChartKind =
   | "pie" | "rose" | "funnel" | "treemap"
   // correlation & distribution
   | "scatter" | "bubble" | "heatmap" | "radar" | "waterfall"
-  // geographic
-  | "geomap"
+  // geographic: regions coloured by value, points on a map, point density
+  | "geomap" | "pointmap" | "geoheat"
   // flow, hierarchy, distribution, time grid (chart-transforms.ts)
   | "sankey" | "sunburst" | "boxplot" | "calendar"
   // single number
@@ -62,6 +62,16 @@ export type ChartSpec = {
    * long-format (x, series, value).
    */
   series?: string;
+  /**
+   * Bundled map a map kind is drawn on (`geomap`, `pointmap`, `geoheat`):
+   * an id from the console's catalogue (features/dashboards/echarts-maps.ts).
+   * Absent on a `geomap` stored before maps were selectable, which is
+   * `dki-jakarta`; absent on a point map is `id-provinces`.
+   */
+  map?: string;
+  /** Latitude / longitude columns of the rows, for `pointmap` and `geoheat`. */
+  lat?: string;
+  lon?: string;
   format?: NumFmt;
   /** 2 = full width in the grid. */
   span?: 1 | 2;

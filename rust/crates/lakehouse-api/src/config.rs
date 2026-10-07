@@ -634,6 +634,23 @@ pub struct Config {
     /// `check_commit` already treats the literal `"unknown"` as
     /// unverifiable on either side).
     pub git_sha: String,
+    /// Maximum failed password-login attempts within
+    /// [`Self::login_failure_window_secs`] before the key is locked.
+    /// Zero, negative, or unparseable values fall back to the default (5).
+    pub login_max_failures: u32,
+    /// Window (seconds) within which [`Self::login_max_failures`] failed
+    /// attempts lock the key. Zero, negative, or unparseable values fall
+    /// back to the default (900).
+    pub login_failure_window_secs: u32,
+    /// Lockout duration (seconds) applied when [`Self::login_max_failures`]
+    /// is reached within [`Self::login_failure_window_secs`]. Zero,
+    /// negative, or unparseable values fall back to the default (300).
+    pub login_lockout_secs: u32,
+    /// Days to retain expired/revoked sessions, revoked service
+    /// credentials, and stale throttle rows before the cleanup background
+    /// task deletes them. Zero, negative, or unparseable values fall back
+    /// to the default (30).
+    pub auth_retention_days: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -815,6 +832,10 @@ impl std::fmt::Debug for Config {
             .field("openfga_url", &self.openfga_url)
             .field("catalog_tenant_id", &self.catalog_tenant_id)
             .field("git_sha", &self.git_sha)
+            .field("login_max_failures", &self.login_max_failures)
+            .field("login_failure_window_secs", &self.login_failure_window_secs)
+            .field("login_lockout_secs", &self.login_lockout_secs)
+            .field("auth_retention_days", &self.auth_retention_days)
             .finish()
     }
 }
@@ -839,6 +860,18 @@ fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
 fn parse_u64_or_default(env: &HashMap<String, String>, key: &str, default: u64) -> u64 {
     env.get(key)
         .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Parses `key` as a positive `u32`, falling back to `default` when
+/// absent, zero, negative, or unparseable. Used by
+/// [`Config::login_max_failures`]/[`Config::login_failure_window_secs`]/[
+/// `Config::login_lockout_secs`]/[`Config::auth_retention_days`].
+fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    env.get(key)
+        .and_then(|v| v.parse::<i64>().ok()) // negative parses as i64, rejects as < 1
+        .filter(|v| *v > 0)
+        .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
 }
 
@@ -1057,6 +1090,14 @@ impl Config {
                 })
                 .transpose()?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
+            login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
+            login_failure_window_secs: parse_positive_u32_or_default(
+                env,
+                "LOGIN_FAILURE_WINDOW_SECS",
+                900,
+            ),
+            login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
+            auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
         })
     }
 

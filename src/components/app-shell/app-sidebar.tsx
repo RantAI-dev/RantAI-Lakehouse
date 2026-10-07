@@ -15,6 +15,7 @@ import {
   SidebarGroup,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -22,6 +23,7 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
 import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
@@ -202,6 +204,39 @@ export function AppSidebar() {
               </Link>
             }
           />
+          {/* A second destination at the row's right end, where a section's
+              chevron sits. `SidebarMenuAction` hides itself in icon mode. */}
+          {first.action ? (
+            // The app's tooltips open at once: the root `TooltipProvider`
+            // has delay 0, and in base-ui a provider's zero wins over a
+            // `delay` set on the trigger. This one sits on a navigation row
+            // the pointer crosses all the time, so it gets its own provider
+            // and waits for the pointer to rest.
+            <TooltipProvider delay={500}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <SidebarMenuAction
+                    aria-label={first.action.title}
+                    // Sits where a section's chevron sits: same size
+                    // (3.5) and the same 18px from the row's right edge
+                    // to its centre, measured against the Data chevron.
+                    className="right-2 text-sidebar-foreground/50 [&>svg]:size-3.5"
+                    render={
+                      <Link
+                        href={first.action.href}
+                        onClick={(e) => handleNavClick(e, first.action?.href ?? first.href)}
+                      />
+                    }
+                  />
+                }
+              >
+                <first.action.icon />
+              </TooltipTrigger>
+              <TooltipContent side="right">{first.action.title}</TooltipContent>
+            </Tooltip>
+            </TooltipProvider>
+          ) : null}
         </SidebarMenuItem>
       )
     }

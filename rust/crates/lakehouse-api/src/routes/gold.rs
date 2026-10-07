@@ -50,9 +50,11 @@
 //! duplicating every row). See [`export`]'s own doc comment for the
 //! design tradeoff (409, not queueing).
 
+use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::{Principal, PrincipalId};
+use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
 use lakehouse_core::secret::SecretValue;
@@ -64,6 +66,7 @@ use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
@@ -93,6 +96,70 @@ pub struct ExportQuery {
     /// Shared token, as a query-string fallback to the `x-run-token`
     /// header — same shape as `routes::alerts::RunQuery::token`.
     token: Option<String>,
+    /// DATA-1 task 4: `?ifChanged=true` skips the export when the mart
+    /// provably has not changed since its last successful export (see
+    /// [`if_changed_skip_reason`]). Any other value is treated as absent
+    /// (booleans are parsed with `== "true"`), so the console's manual
+    /// trigger — which sends nothing — can never accidentally skip.
+    #[serde(rename = "ifChanged")]
+    if_changed: Option<String>,
+}
+
+/// DATA-1 task 4: the skip decision for `?ifChanged=true`, as a pure
+/// function so the three outcomes are unit-tested without any server.
+///
+/// Returns `Some(reason)` — skip — only when BOTH facts are measured and
+/// the mart's last write is STRICTLY before its last successful export.
+/// Equal timestamps export (PR slice B review B1): both sides are whole
+/// seconds (`modification_time` is a `DateTime`, the history row stores
+/// `started_at` in unix ms), so a write landing in the same second an
+/// export started — after that export read the mart — compares equal;
+/// skipping it would leave the open copy stale while the console says
+/// "Up to date". The cost of the strict comparison is one extra export
+/// for that same-second case, which is the safe direction. Any unknown
+/// (`None` either side — no active parts yet, no successful export yet,
+/// or an unparseable timestamp) exports: a stale open-format copy is the
+/// worse outcome, so uncertainty fails toward publishing.
+fn if_changed_skip_reason(
+    last_changed_ms: Option<i64>,
+    last_exported_ms: Option<i64>,
+) -> Option<String> {
+    let changed_ms = last_changed_ms?;
+    let exported_ms = last_exported_ms?;
+    if changed_ms >= exported_ms {
+        return None;
+    }
+    // The exported timestamp is always a real epoch-millisecond from the
+    // history row; the epoch-ms fallback keeps the reason honest even for
+    // an out-of-range value instead of printing a fabricated date.
+    let since = millis_to_rfc3339(exported_ms).unwrap_or_else(|| format!("unix ms {exported_ms}"));
+    Some(format!("unchanged since {since}"))
+}
+
+/// The skipped-response body `POST` returns when `?ifChanged=true` found
+/// nothing to do: `200`, explicitly `skipped`, with the reason the
+/// decision produced. Deliberately NOT an export record — see
+/// [`export`]'s "Skip" doc section.
+fn skipped_body(reason: &str) -> Value {
+    json!({ "skipped": true, "reason": reason })
+}
+
+/// The two freshness reads behind `?ifChanged=true`, in one place for
+/// both call-shaped uses: `Some(reason)` to skip with, `None` to export.
+/// A failed read is a classified [`ApiError`], not a silent skip — a
+/// scheduler that cannot MEASURE must not treat the mart as quiet.
+async fn unchanged_since_last_export_reason(
+    state: &AppState,
+    mart: &str,
+) -> Result<Option<String>, ApiError> {
+    let last_changed_at =
+        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(ApiError::from)?;
+    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(if_changed_skip_reason(last_changed_at, last_exported_at))
 }
 
 /// See the module doc comment's "Auth" section. Two independent ways to
@@ -185,6 +252,21 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
+/// # Skip: `?ifChanged=true` (DATA-1 task 4)
+///
+/// With that parameter, a mart whose measured last write
+/// (`max(modification_time)` over active parts) is strictly before its
+/// last successful export is skipped: `200` with `{"skipped": true,
+/// "reason": "unchanged since <rfc3339>"}`, and NOTHING else happens —
+/// no export, no `console.gold_export_run` row, no Iceberg snapshot.
+/// Strictly before, not "not after" (PR slice B review B1): equal
+/// timestamps export, because both sides are whole seconds and a write
+/// in the same second its last export began may have landed after that
+/// export read the mart. This is what the scheduler (task 5/6) sends so
+/// a quiet mart costs two cheap `ClickHouse` reads. Unknown facts never
+/// skip (see [`if_changed_skip_reason`]); the console's manual trigger
+/// does not send the parameter at all.
+///
 /// # Single-flight: only one export of a given mart runs at a time
 ///
 /// A per-mart lock (`AppState::gold_export_locks` — see
@@ -221,6 +303,20 @@ pub async fn export(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
+    // skipped BEFORE the single-flight lock is taken (a skip holds
+    // nothing, writes no `console.gold_export_run` row, and commits no
+    // snapshot — the response is the only trace). The two facts cost two
+    // cheap `system.parts`/history reads and are computed only when the
+    // parameter is actually set, so the manual path gains nothing extra.
+    // Unknown facts export, per [`if_changed_skip_reason`].
+    if query.if_changed.as_deref() == Some("true")
+        && let Some(reason) =
+            unchanged_since_last_export_reason(&state, mart_ident.as_str()).await?
+    {
+        return Ok(ApiJson(skipped_body(&reason)));
+    }
 
     // Held for the rest of this handler (dropped at function return,
     // success or error alike) — see this function's "Single-flight" doc
@@ -297,34 +393,15 @@ pub async fn export(
             PrincipalId::User(_) => format!("user:{}", p.display_name),
         },
     );
-    let error_message = export_result.as_ref().err().map(ToString::to_string);
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
-                  never near u64::MAX"
-    )]
-    let history_row = gold_export_history::NewGoldExportRun {
-        mart: mart_ident.as_str(),
-        status: if export_result.is_ok() {
-            "success"
-        } else {
-            "failed"
-        },
-        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
-        format_version: export_result.as_ref().ok().map(|r| r.format_version),
-        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
-        error: error_message.as_deref(),
-        triggered_by: &triggered_by,
-        started_at_ms: started_at.unix_timestamp() * 1000,
-        finished_at_ms: finished_at.unix_timestamp() * 1000,
-    };
-    // Best-effort: a history-write failure must never turn an otherwise
-    // successful (or already-failed-for-a-different-reason) export into a
-    // 500 — see gold_export_history::record_export_run's doc comment.
-    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
-    {
-        tracing::error!(%err, mart = mart_ident.as_str(), "failed to record gold export history");
-    }
+    record_export_history(
+        &state,
+        mart_ident.as_str(),
+        &triggered_by,
+        started_at,
+        finished_at,
+        &export_result,
+    )
+    .await;
 
     let result = export_result.map_err(ApiError::from)?;
 
@@ -336,6 +413,46 @@ pub async fn export(
         "snapshotId": result.snapshot_id,
         "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
     })))
+}
+
+/// Best-effort history write for one finished export attempt: every
+/// `POST` records exactly one row, success or failure (the acceptance
+/// test counts on it), but a failed write is logged, never propagated —
+/// this table is a history view, not a correctness dependency of the
+/// export itself (`gold_export_history::record_export_run`'s doc comment).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
+              never near u64::MAX"
+)]
+async fn record_export_history(
+    state: &AppState,
+    mart: &str,
+    triggered_by: &str,
+    started_at: time::OffsetDateTime,
+    finished_at: time::OffsetDateTime,
+    export_result: &Result<gold_export::GoldExportResult, GoldExportError>,
+) {
+    let error_message = export_result.as_ref().err().map(ToString::to_string);
+    let history_row = gold_export_history::NewGoldExportRun {
+        mart,
+        status: if export_result.is_ok() {
+            "success"
+        } else {
+            "failed"
+        },
+        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
+        format_version: export_result.as_ref().ok().map(|r| r.format_version),
+        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
+        error: error_message.as_deref(),
+        triggered_by,
+        started_at_ms: started_at.unix_timestamp() * 1000,
+        finished_at_ms: finished_at.unix_timestamp() * 1000,
+    };
+    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
+    {
+        tracing::error!(%err, mart, "failed to record gold export history");
+    }
 }
 
 /// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
@@ -483,6 +600,310 @@ pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
     })))
 }
 
+// ── Per-mart publication switches (DATA-1) ──────────────────────────────
+//
+// Whether `serving.{mart}` is being kept fresh in the `gold` Iceberg
+// namespace is a per-mart setting (`gold_publication`, migration 0054)
+// instead of the Build-menu button ADR 0010 shipped first: the scheduler
+// reads the enabled set every night, an authored pipeline run re-exports
+// its own mart, and switching a mart off only flips the flag — the
+// Iceberg copy is never dropped by this feature (DATA-1 decision table).
+
+/// Whether `{schema}.{mart}` exists in `system.tables` — the PUT route's
+/// 404 gate. Same `system.tables` read `routes::catalog` builds its Gold
+/// asset list from; the identifier is `Ident`-validated before it is
+/// ever interpolated.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the query fails (a dead `ClickHouse` surfaces
+/// as its classified [`ApiError`], never raw text).
+async fn mart_exists(ch: &ChClient, schema: &str, mart: &str) -> Result<bool, ChError> {
+    let sql = format!(
+        "SELECT toString(count()) AS n FROM system.tables \
+         WHERE database = {schema} AND name = {mart}",
+        schema = lakehouse_core::ident::SqlLiteral::from(schema),
+        mart = lakehouse_core::ident::SqlLiteral::from(mart),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("n"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| n != "0"))
+}
+
+/// Unix-millisecond `max(modification_time)` over the active parts of
+/// `{schema}.{mart}`, or `None` when it has no active parts (a view, or
+/// an engine without parts) — "not measured", never a guessed time.
+///
+/// Measured, not assumed, on the compose file's own `ClickHouse` 26.8
+/// (plan §6): every INSERT creates a part whose `modification_time` is
+/// the write time, and a zero-row INSERT creates no part — so this value
+/// moves exactly when a pipeline actually rewrote the mart, which is the
+/// semantics `?ifChanged=true`'s skip needs. The count guard is what
+/// makes a parts-less table `None` rather than the epoch.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the query fails.
+async fn mart_last_changed_at(
+    ch: &ChClient,
+    schema: &str,
+    mart: &str,
+) -> Result<Option<i64>, ChError> {
+    let sql = format!(
+        "SELECT toString(count()) AS parts, \
+                toString(toUnixTimestamp(max(modification_time))) AS changed_s \
+         FROM system.parts \
+         WHERE database = {schema} AND table = {mart} AND active",
+        schema = lakehouse_core::ident::SqlLiteral::from(schema),
+        mart = lakehouse_core::ident::SqlLiteral::from(mart),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let parts = row.get("parts").and_then(Value::as_str).unwrap_or("0");
+    if parts == "0" {
+        return Ok(None);
+    }
+    Ok(row
+        .get("changed_s")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s * 1000))
+}
+
+/// The response body shared by the publication detail `GET` and `PUT`:
+/// the stored switch plus the two measured freshness facts the console's
+/// "Up to date"/"Out of date" line compares.
+async fn publication_body(
+    state: &AppState,
+    mart: &str,
+    enabled: bool,
+    updated_at: Option<String>,
+    can_edit: bool,
+) -> Result<Value, ApiError> {
+    let last_changed_at =
+        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(ApiError::from)?;
+    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(json!({
+        "mart": mart,
+        "enabled": enabled,
+        "updatedAt": updated_at,
+        "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
+        "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
+        "canEdit": can_edit,
+    }))
+}
+
+/// Borrow the Postgres pool, or fail with a 503. Mirrors
+/// `routes::identity::pool`/`routes::pipelines::pool`: an UNCONFIGURED
+/// Postgres is `Unavailable`, not `Internal` — the deployment is missing
+/// `DATABASE_URL`, which is a "this route cannot work here" state, the
+/// repo's documented 503 (PR slice B review S1).
+fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "gold publications unavailable: no Postgres pool is configured \
+             (DATABASE_URL is missing or not a valid Postgres connection string)"
+                .to_owned(),
+        )
+    })
+}
+
+/// `GET /api/gold/publications` — the enabled marts, and nothing else.
+/// This is the scheduler's source of truth (DATA-1 task 5): a fresh
+/// deployment publishes exactly this list, which is empty until a
+/// `gold:export` principal switches a mart on.
+///
+/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
+/// [`check_export_token`] in the handler, same two-layer shape as the
+/// export routes: the scheduler authenticates with its run token or
+/// service identity; a human session needs `gold:export`. A publication
+/// list is not secret the way row data is, but it does reveal what a
+/// deployment considers its "open format" copy — same posture as
+/// `GET /api/gold/exports`.
+///
+/// # Errors
+///
+/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// configured ([`pool`]; this feature is Postgres-backed, unlike the
+/// export routes), or 500 for a store failure (classified, never raw
+/// upstream text).
+pub async fn publications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
+    check_export_token(
+        state.config.gold_export_run_token.as_deref(),
+        header_token,
+        query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )?;
+
+    let pool = pool(&state)?;
+    let enabled = lakehouse_store::gold_publication::list_enabled(pool)
+        .await
+        .map_err(ApiError::from)?;
+    let publications: Vec<Value> = enabled
+        .iter()
+        .map(|p| json!({ "mart": p.mart, "enabled": p.enabled, "updatedAt": p.updated_at }))
+        .collect();
+    Ok(ApiJson(json!({ "publications": publications })))
+}
+
+/// `GET /api/gold/export/{mart}/publication` — one mart's publication
+/// state: the stored switch plus the two measured freshness facts.
+///
+/// A mart with no `gold_publication` row is OFF (the default), reported
+/// as `enabled: false, updatedAt: null` — a missing row is a state, not
+/// an error. `lastChangedAt`/`lastExportedAt` are honest `null`s when
+/// they cannot be measured (no active parts; no successful export yet) —
+/// the console renders "Not measured"/"Never published" from exactly
+/// these nulls, never a guessed time.
+///
+/// # Errors
+///
+/// Returns 400 for a mart that is not a valid identifier, 503 when
+/// Postgres is not configured ([`pool`]), or classified
+/// store/`ClickHouse` errors otherwise.
+pub async fn publication(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let pool = pool(&state)?;
+    let stored = lakehouse_store::gold_publication::get(pool, mart_ident.as_str())
+        .await
+        .map_err(ApiError::from)?;
+    let (enabled, updated_at) = stored.map_or((false, None), |p| (p.enabled, Some(p.updated_at)));
+    let can_edit = principal
+        .as_ref()
+        .is_some_and(|Extension(p)| p.has("gold:export"));
+    let body = publication_body(&state, mart_ident.as_str(), enabled, updated_at, can_edit).await?;
+    Ok(ApiJson(body))
+}
+
+/// Body of `PUT /api/gold/export/{mart}/publication`.
+#[derive(Debug, Deserialize)]
+pub struct PublicationBody {
+    /// Whether the scheduler should keep this mart's Iceberg copy fresh.
+    /// `false` only flips the flag — the existing Iceberg table is never
+    /// dropped by this feature (DATA-1 decision table).
+    enabled: bool,
+}
+
+/// Best-effort audit row for a successful toggle, following
+/// `routes::pipelines::record_pipeline_audit`'s posture: a failed audit
+/// write is logged, never propagated — it must not turn an already-
+/// succeeded configuration change into a 500.
+async fn record_publication_audit(
+    state: &AppState,
+    principal: &Principal,
+    mart: &str,
+    enabled: bool,
+) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "gold.publication_set".to_owned(),
+        resource_kind: Some("gold_mart".to_owned()),
+        resource_id: Some(mart.to_owned()),
+        args: Some(json!({ "enabled": enabled })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::error!(%err, mart, "failed to record gold publication audit");
+    }
+}
+
+/// `PUT /api/gold/export/{mart}/publication` — switch one mart's
+/// publishing on or off. `POLICY_TABLE` floors this route at
+/// `RequiresPermission("gold:export")`, so the handler never re-checks
+/// the permission (fail closed at the gate); it needs the principal only
+/// to record who flipped the switch.
+///
+/// Returns 404 when `serving.{mart}` does not exist — measured against
+/// `system.tables`, not assumed — so a typo cannot silently enable
+/// publishing for a mart nobody can build.
+///
+/// # Errors
+///
+/// Returns 400 for a mart that is not a valid identifier, 404 for an
+/// unknown mart, 503 when Postgres is not configured ([`pool`]), 401 if
+/// the gate somehow let a principal-less request through (never, through
+/// the router), or classified store/`ClickHouse` errors otherwise.
+pub async fn set_publication(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+    principal: Option<Extension<Principal>>,
+    // The body extractor is deliberately LAST: axum requires consuming
+    // extractors at the end of the argument list (every sibling handler
+    // here follows the same order).
+    Json(body): Json<PublicationBody>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let pool = pool(&state)?;
+    let exists = mart_exists(
+        &state.clickhouse,
+        &state.config.gold_source_schema,
+        mart_ident.as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !exists {
+        return Err(ApiError::NotFound(format!(
+            "mart {:?} does not exist in {}",
+            mart_ident.as_str(),
+            state.config.gold_source_schema
+        ))
+        .into());
+    }
+
+    let updated = lakehouse_store::gold_publication::upsert(
+        pool,
+        mart_ident.as_str(),
+        body.enabled,
+        principal.id.uuid(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    record_publication_audit(&state, &principal, mart_ident.as_str(), body.enabled).await;
+
+    let body = publication_body(
+        &state,
+        mart_ident.as_str(),
+        updated.enabled,
+        Some(updated.updated_at),
+        true,
+    )
+    .await?;
+    Ok(ApiJson(body))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -622,5 +1043,40 @@ mod tests {
         assert!(
             matches!(err, ApiError::Unauthorized(_)) || err.to_string().contains("unauthorized")
         );
+    }
+
+    // ── if_changed_skip_reason (DATA-1 task 4) ──────────────────────────
+
+    #[test]
+    fn unchanged_mart_since_the_last_export_is_skipped_with_a_reason() {
+        // Strictly older mart than the export: the copy is fresh.
+        // An export does not write the mart, so the comparison must be
+        // strict — see the equal case in
+        // `equal_timestamps_export_fail_toward_a_fresh_copy`.
+        let skip = if_changed_skip_reason(Some(1_699_999_000_000), Some(1_700_000_000_000))
+            .expect("unchanged must skip");
+        assert!(skip.starts_with("unchanged since "), "{skip}");
+    }
+
+    #[test]
+    fn equal_timestamps_export_fail_toward_a_fresh_copy() {
+        // PR slice B review B1: both sides are whole seconds, so a write
+        // landing in the same second its last export started — after
+        // that export read the mart — compares equal and must EXPORT;
+        // skipping it would leave the open copy stale while the console
+        // says "Up to date".
+        assert!(if_changed_skip_reason(Some(1_700_000_000_000), Some(1_700_000_000_000)).is_none());
+    }
+
+    #[test]
+    fn a_mart_newer_than_its_last_export_is_exported_not_skipped() {
+        assert!(if_changed_skip_reason(Some(1_700_000_500_000), Some(1_700_000_000_000)).is_none());
+    }
+
+    #[test]
+    fn an_unknown_fact_never_skips_fail_toward_publishing() {
+        assert!(if_changed_skip_reason(None, Some(1_700_000_000_000)).is_none());
+        assert!(if_changed_skip_reason(Some(1_700_000_000_000), None).is_none());
+        assert!(if_changed_skip_reason(None, None).is_none());
     }
 }

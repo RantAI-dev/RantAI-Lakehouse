@@ -16,11 +16,21 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("GoldExportsPage", () => {
-  it("renders a mart's last export and an honest consumers refusal, never a fabricated count", async () => {
+  it("renders a mart's enabled state and an honest consumers refusal, never a fabricated count", async () => {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/api/dashboard/fields")) {
         return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/api/gold/export/sales") && url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: false,
+          updatedAt: null,
+          lastChangedAt: "2026-10-02T03:30:00Z",
+          lastExportedAt: null,
+          canEdit: true,
+        })
       }
       if (url.includes("/consumers")) {
         return jsonResponse({
@@ -44,6 +54,7 @@ describe("GoldExportsPage", () => {
     render(<GoldExportsPage />)
 
     await waitFor(() => expect(screen.getByText("sales")).toBeDefined())
+    await waitFor(() => expect(screen.getByText("Off")).toBeDefined())
     await waitFor(() => expect(screen.getByText("Never exported")).toBeDefined())
     // A mart with no measured consumer count renders the honest refusal
     // text, never "0" (which would read as a real, measured zero).

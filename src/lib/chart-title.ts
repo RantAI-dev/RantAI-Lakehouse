@@ -17,6 +17,9 @@ export function suggestChartTitle({ kind, dimension, measures = [], breakdown }:
   if (kind === "text" || !m1) return "";
   if (kind === "kpi" || kind === "gauge") return m1;
   const metric = (kind === "scatter" || kind === "bubble") && m2 ? `${m1} vs ${m2}` : kind === "combo" && m2 ? `${m1} and ${m2}` : m1;
+  // A point map has no category: its dimension is only a tooltip label.
+  if (kind === "geoheat") return `${metric} density`;
+  if (kind === "pointmap") return dimension ? `${metric} by ${dimension}` : `${metric} by location`;
   if (!dimension) return metric;
   if (kind === "sankey" && breakdown) return `${metric}: ${dimension} → ${breakdown}`;
   if (kind === "calendar") return `${metric} per day`;

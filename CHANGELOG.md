@@ -15,7 +15,44 @@ once a first release is tagged.
 - Schema versions for Silver and Gold tables (ADR 0015; plan `docs/superpowers/plans/2026-10-05-schema-versions-silver-gold.md`): a raw table shows its schema versions from its Iceberg metadata, while a Silver or Gold table, whose engine keeps only the current columns, showed none. The console now records them itself. A pass reads the ordered `(column name, type)` list of every table in `silver` and `serving` (the two databases the catalog serves; not `GOLD_SOURCE_SCHEMA`, which only the export routes read) and, for each table whose list differs from the last one recorded, adds a version to `console.table_schema_version`, a `ClickHouse` table the API creates on first use (no migration, no new route). A pass runs when the API starts, on `POST /api/alerts/run` (the answer gains `schemaPassStarted`; not on a single-rule `?id=` run) and when the orchestrator reports a finished run (`POST /api/pipelines/events/run-finished`); one runs at a time, and a page view only reads. `schemaVersions` on the asset detail of such a table, always `[]` before, now lists its versions newest first as `{ version, at, change, current }`, `change` a sentence per change (`Added <name> (<type>)`, `Dropped <name> (<type>)`, `Changed <name> from <type> to <type>`, `Reordered columns`, and `First recorded with 4 columns` for the first); a failed read leaves it `[]`. The Schema tab lists them with a `current` pill and says since when they are recorded, the Overview's Schema row says "recorded", and the Activity tab's change history includes each one. Limits, stated on the page and in `docs/OPERATIONS.md`: versions start the day the console first looks (the first is dated by that look, not by the table's creation), a time is when the console saw the change, two changes between two looks show as one, a renamed column shows as one dropped and one added, and only the definition is kept, not the rows. Raw tables are unchanged. Verified on the dev stack on 2026-10-05 (plan section 9): the first pass at start-up recorded one version for each of the seven tables it found; on a demo table, an added column, a retyped plus a dropped column, and a moved column each gave the next version with its sentence, a look with nothing changed recorded nothing, and a column added before the orchestrator's 15-minute schedule was recorded at that schedule with no other trigger.
 - The Sample tab as a data preview (plan `docs/superpowers/plans/2026-10-05-sample-tab-data-preview.md`). It opens on 25 rows (50 and 100 on request) instead of five; the five the detail body carries show until the answer arrives. A header carries the type's glyph, the column name and its type, taken from the asset's schema (a column the schema does not list shows its name alone and is left-aligned). Numbers are right-aligned in tabular figures and every value is shown as stored, so an id like `0250161` is not reformatted; `NULL` reads `NULL` and an empty text `(empty)`, both in a quiet italic; a long value is cut at a fixed width with the whole value as the cell's title. A row-number gutter and the first column stay put on sideways scroll (the first column only where the grid is 32rem wide or more) and the header stays put on downward scroll, inside a frame of the grid's own. A sort control in each header orders the rows shown, ascending, descending, then the table's order; numbers compare as numbers only in a number column, `NULL` is last either way, and the card says the sort is of the rows shown. Pressing a cell opens an inspector beside the grid (under it below `xl`) with its row, column, whole value and a Copy button (offered for a value only, not for `NULL` or an empty text); pressing a header's name, or opening a cell, shows the same opened column as the Schema tab from the table's profile, which is requested the first time the inspector opens and not when the tab opens. The row count and "Open in Query Studio" sit in the card's body so the title keeps its width on a phone, and if the larger sample fails the rows the page already has stay, with a line above them and Retry. The grid is one tab stop with the arrow keys, Home and End moving the cell and Escape closing the inspector. API: a `NULL` cell of `GET /api/catalog/{id}/sample` and of the detail body's `sample` is now JSON `null` where it was `""`, so no value and an empty text can be told apart; every other cell is the string it was, and masking is unchanged. The console's Sample tab is the only reader. Not included: number formatting, filtering, resizing or hiding columns, download, anything past 100 rows.
 - A page for each connector, `/connectors/<id>` (FC-35; plan `docs/superpowers/plans/2026-10-05-connector-detail-page.md`): on Sources, pressing a connector's name, "View details" or anywhere on its row opens the page the side sheet used to be, so it can be bookmarked, reloaded and sent to someone. It carries what the sheet showed (health, direction and environment; Test connection, Edit, Create pipeline, Audit, Delete; the Overview, Ingest and Connection tests tabs, the open one in `?tab=`) under a header with a "Sources" link back; deleting the connector returns to Sources, and an unknown or other tenant's connector shows the API's message with a way back. The edit page's Cancel and "Back to connector", and a connector node in an asset's lineage map, now go to this page instead of the list or the edit form; a created connector gains "Open connector". Console only; no API change.
-- Upload a file into a raw table (`DATA-9`, ADR 0014): on Sources, "Upload file" and an "Uploaded files" tab; the flow is `/connectors/upload` (File, Check, Table, Review, then the result of the load), also reachable from the first step of "New Connector". A delimited text file (UTF-8 or UTF-16; comma, semicolon, tab or pipe) of up to 50 MB and 2,000,000 data rows is stored under `uploads/` in the warehouse bucket, previewed with the encoding, delimiter and header row the API detected (each can be changed and the preview reads again), and loaded as a raw Iceberg table by the new `file_ingest_job`, one Dagster run per file. Every column is text. A load may target a table that does not exist or one an earlier upload of the same tenant created (replace its rows, the default, or add to them); never a connector's table, and `PUT /api/connectors/{id}/ingest-spec` refuses a table name reserved for uploads (409). A file over either limit is refused with the reason, never cut short. Six routes, all `connector:manage`, tenant-scoped (another tenant's upload answers 404), audited: `GET`/`POST /api/uploads`, `GET`/`DELETE /api/uploads/{id}`, `GET /api/uploads/{id}/preview`, `POST /api/uploads/{id}/ingest`. The load's outcome is the one row the job records in `lake.bronze_meta.ingest_run`; a failure shows one of seven fixed reasons, never exception text. Migrations `0054` and `0055` (the upload table and the per-tenant claim on a table name). Not included: workbooks, JSON, Parquet, files over 50 MB, type inference, an assistant tool. See `docs/core/features/upload-file.md`.
+- Upload a file into a raw table (`DATA-9`, ADR 0014): on Sources, "Upload file" and an "Uploaded files" tab; the flow is `/connectors/upload` (File, Check, Table, Review, then the result of the load), also reachable from the first step of "New Connector". A delimited text file (UTF-8 or UTF-16; comma, semicolon, tab or pipe) of up to 50 MB and 2,000,000 data rows is stored under `uploads/` in the warehouse bucket, previewed with the encoding, delimiter and header row the API detected (each can be changed and the preview reads again), and loaded as a raw Iceberg table by the new `file_ingest_job`, one Dagster run per file. Every column is text. A load may target a table that does not exist or one an earlier upload of the same tenant created (replace its rows, the default, or add to them); never a connector's table, and `PUT /api/connectors/{id}/ingest-spec` refuses a table name reserved for uploads (409). A file over either limit is refused with the reason, never cut short. Six routes, all `connector:manage`, tenant-scoped (another tenant's upload answers 404), audited: `GET`/`POST /api/uploads`, `GET`/`DELETE /api/uploads/{id}`, `GET /api/uploads/{id}/preview`, `POST /api/uploads/{id}/ingest`. The load's outcome is the one row the job records in `lake.bronze_meta.ingest_run`; a failure shows one of seven fixed reasons, never exception text. Migrations `0057` and `0058` (the upload table and the per-tenant claim on a table name). Not included: workbooks, JSON, Parquet, files over 50 MB, type inference, an assistant tool. See `docs/core/features/upload-file.md`.
+- Login throttling and session cleanup (backlog `SEC-2`/`SEC-5`).
+  `POST /api/auth/login` now throttles failed password attempts per email
+  (SHA-256 of the trimmed lower-cased address, stored in a new
+  `login_throttle` table, migration `0055`): after `LOGIN_MAX_FAILURES`
+  (default 5) failures within `LOGIN_FAILURE_WINDOW_SECS` (default
+  900 s), the email is locked out for `LOGIN_LOCKOUT_SECS` (default
+  300 s) and every attempt gets an identical `429` with a `Retry-After`
+  header — same response whether or not the account exists. A successful
+  login clears the counter, and a failure after an expired lock starts
+  the count fresh. There is no off switch: `LOGIN_MAX_FAILURES=0`,
+  negative, and invalid values all fall back to the defaults instead of
+  disabling throttling or failing boot. The
+  console's login page surfaces the lockout with the wait time. A new
+  hourly background job purges expired/revoked sessions, revoked
+  credentials, and unlocked throttle rows whose failure window has
+  passed (throttle rows are not gated by `AUTH_RETENTION_DAYS`; sessions
+  and credentials are, default 30 days), logging purge counts; it is
+  best-effort and skips a tick if the previous run has not finished. This
+  replaces the previously-documented "no login rate limiting beyond
+  logging" and "no session cleanup job" limitations (README, SECURITY.md).
+
+- Gold publish as a per-mart option (backlog `DATA-1`). Publishing is off by
+  default for every mart. A Platform Admin switches it on from the mart's
+  asset detail page in Data; once on, the mart is published automatically
+  after every authored pipeline run and by the nightly 04:00 schedule.
+  The console shows whether each mart is up to date, plus last published
+  time, snapshot ID, and the last five publish runs. The Gold Exports page
+  (linked from the card) shows an Enabled column across all marts. Under
+  the hood: a new `run_status_sensor` triggers `gold_export_job` on
+  authored-pipeline SUCCESS, the schedule authenticates via a
+  `gold-export-scheduler` service identity bootstrapped from
+  `GOLD_EXPORT_RUN_TOKEN`, `POST /api/gold/export/{mart}?ifChanged=true`
+  skips unchanged marts (strictly before, equal timestamps export),
+  and `GOLD_EXPORT_MARTS` defaults to empty — the console now owns the
+  list through `GET /api/gold/publications`. See
+  `docs/OPERATIONS.md` for append-only growth and background-merges note.
+
 - Run-config schema and validated trigger (plan R4 2c): `GET /api/pipelines/{id}/config-schema` returns the job's default config YAML (`pipeline:read`), `defaultConfig: null` alongside `defaultConfigYaml` since the workspace has no YAML parser dep and Dagster emits the default as a string; `pl-…` ids return `hasConfig: false` without contacting Dagster. `POST /api/pipelines/{id}/trigger` now accepts an optional `{"runConfig": <object>}` body — when supplied, the route validates against the job's schema (`isPipelineConfigValid`) and, on `RunConfigValidationInvalid`, returns a structured 400 `{ errors: [{ path: string[], reason: <EvaluationErrorReason> }] }` built only from `path` and `reason` (Dagster's free-form `message` is never forwarded, AGENTS.md principle 4); on success the config goes through `launchRun(runConfigData:)`. The audit row for `pipeline.trigger` now carries `args.configKeys` — the TOP-LEVEL keys of the supplied config, never the values. The copilot's `trigger_pipeline` tool gained the same optional `runConfig`.
 - Definition version history for authored pipelines (plan R4 2b): a new `pipeline_definition_version` row per `create`/`update`/`delete` (migration `0053`), written inside the same transaction so a failed write leaves no orphan row. The list endpoint (`GET /api/pipelines/{id}/versions`) returns metadata only, newest-first, so the list scales to many versions without shipping every prior snapshot; the get endpoint (`GET /api/pipelines/{id}/versions/{version}`) returns the editable state captured at that version; restore (`POST /api/pipelines/{id}/versions/{version}/restore`) replays a snapshot back into the live row through the existing update path, leaving `name` and `status` alone. Reads are `pipeline:read`; restore is `pipeline:write`. 404 for non-`pl-` ids and for unknown `(id, version)` pairs.
 - Pipeline duration SLA: a new `pipeline_sla` row per pipeline (`maxDurationSeconds`, `lateAfterSeconds`) edited through `GET`/`PUT /api/pipelines/{id}/sla` (plan 1f, migration `0050`). When the SLA exists, the pipeline row's payload gains `slaOk` (true while the latest run's `durationSeconds` is at or under `maxDurationSeconds`, `null` while a run is in flight or no SLA is set) and each run gains `overDuration` (true when the run finished and was over `maxDurationSeconds`).
@@ -50,6 +87,19 @@ once a first release is tagged.
   category via `quantilesExact`), and calendar heatmap (daily values, up
   to the last year of data). Available in the builder, to the Copilot, and
   on SQL sources.
+- Maps: the map chart is no longer Jakarta only. A `map` id (bundled maps:
+  `dki-jakarta`, `id-provinces`, `id-regencies`; the console owns the list,
+  the API checks only the id's shape) picks the outline; region names are
+  matched case-insensitively with `Kabupaten`/`Kab.`/`Kota Administrasi`
+  and province aliases handled, and rows that match no region are counted
+  under the map instead of dropped silently. Two new kinds draw rows with a
+  latitude and a longitude column (`lat`, `lon`) on an outline: `pointmap`
+  (symbols sized and coloured by the first measure) and `geoheat` (density
+  heatmap), each capped at the top 5,000 rows by value (2,000 on a SQL
+  source). All three maps pan by dragging and zoom 1x-20x with buttons on
+  the tile; there is no wheel zoom. Stored specs need no
+  migration: `map`/`lat`/`lon` are optional and absent on every chart saved
+  before. Boundary files and their licence: `public/geo/README.md`.
 
 - Gold Exports console page: per-mart last export (`snapshotId`/
   `exportedAt`, read straight off the Iceberg table's own snapshot), an
@@ -90,18 +140,24 @@ once a first release is tagged.
 - `POST /api/dashboard/boards` accepts `description`, and records the
   signed-in caller's display name in `created_by`.
   `PUT /api/dashboard/boards` accepts `description`.
-- Pipeline recovery API (R2): `POST /api/pipelines/{id}/runs/{runId}/retry`
+- Pipeline recovery API (R2): `POST /api/pipelines/runs/{runId}/retry`
   now accepts `{"strategy":"selected","stepKeys":[...]}` to re-run a chosen
   subset of steps, with the step keys validated against the parent run's
   step history and the first unknown key named in the 400 response; the
   Copilot `retry_pipeline_run` tool gained a matching `stepKeys` array
-  argument. Steps now report their attempt count (`attempts`), and a new
-  `GET /api/pipelines/{id}/runs/steps` route returns every recent run of a
-  pipeline alongside per-step status, attempt count and duration (the
-  route is registered before the `/runs/{runId}/steps` catch-all so the
-  `runs/steps` path reaches it). On a Dagster transport failure the matrix
-  route reports `available: false` with the standard `unavailable` reason,
-  never a 5xx. (R2)
+  argument. A `selected` request against a run that `Dagster` does not
+  know returns 404 (the run is the missing resource). The per-run steps
+  view (`GET /api/pipelines/{id}/runs/{runId}/steps`) reports the
+  step's attempt count (`attempts`); the runs × steps matrix
+  (`GET /api/pipelines/{id}/runs/steps`) returns one row per recent
+  run and per-step `stepKey`, `status`, and `durationMs` (and no
+  attempt count — `attempts` is a per-step, per-run field, not a
+  matrix field). On a `Dagster` transport failure the matrix route
+  reports `unavailable: "<reason>"`, never a 5xx, and never an
+  `available` field. The matrix-vs-`run_steps` resolution is
+  handled by axum's `matchit` router (static segment ahead of
+  parameter), not by the registration order in
+  `routes::pipelines_router`. (R2)
 - `max_retries` per authored pipeline: `POST /api/pipelines` and
   `PUT /api/pipelines/{id}` accept `maxRetries` (0–5, rejected with a 400
   outside the band; defaults to 2) and persist it in `lakehouse-store` via
@@ -168,6 +224,18 @@ once a first release is tagged.
 
 ### Fixed
 
+- Cycle detection now fires on the row being edited (PR #57 review F1.7): the cycle walk's closing-edge check moved ahead of the "not an authored pipeline" skip, so a 2-cycle like `A → B; PUT B with dependsOn:[A]` (or any cycle that closes through the edited row) is refused with a 400 that names the edited pipeline — pre-fix the edited row was excluded from `others` by `collect_authored_depends_on(..., Some(&id))`, the skip treated it as unknown, and the cycle silently landed. The walk is also bounded by a visited set so a fan-in (diamond) graph doesn't blow up exponentially.
+- The create route mints the pipeline's id before running the `dependsOn` validator (PR #57 review F1.7): the validator's self-reference rule now compares against the real id (`pl-<slug>-<base36 millis>`), not `body.name`, which only equals the slug for snake_case names.
+- Editing an authored pipeline no longer wipes its `dependsOn` chain (PR #57 review F1.8): the field is `Option<Vec<String>>` joined by `COALESCE($N, depends_on)` in the write, so `None` keeps the stored chain (a console save that did not touch the field), `Some(vec)` replaces it, and an explicit `Some(vec![])` clears it.
+- `dependsOn` refuses entries in the orchestrator's reserved namespace (PR #57 review F1.9): a list starting with `authored__` is rejected with a 400 that names the offending entry, and duplicate entries in the same submission are rejected with a 400 that names the duplicated value.
+- `POST /api/pipelines/runs/{runId}/retry` with `selected` step keys returns 404 when the run does not exist (PR #57 review F1.10), not 400 — the precondition `pipeline_run_status` lookup distinguishes "this run exists but has no steps yet" (a 400 with the first unknown key) from "this run does not exist" (a 404).
+- The false "the matrix route is registered before `/runs/{runId}/steps`, order matters" comments in `routes/mod.rs` and `policy.rs` are removed (PR #57 review F1.10): axum's `matchit` router resolves static segments ahead of path parameters regardless of registration order, and the routing is pinned by an integration test in `tests/pipeline_routing.rs` that drives the real `routes::router` for both paths and asserts each reaches the correct handler.
+- Wiremock mocks in the runs × steps matrix tests (lakehouse-dagster, `list_runs_with_steps_for_job` at limit 30) and in the `selected_retry_without_step_keys_returns_400_before_calling_dagster` mock now carry `.expect(1)` / `.expect(0)` (PR #57 review F1.10), so a regression that adds a second round trip (or leaks the parser) surfaces as a mock-mismatch rather than a silent "well, the response looked right".
+
+- A pipeline with `dependsOn` no longer takes down the whole Dagster code location (PR #57 review F1.1): the dependency sensor re-fetched the runnable list and rebuilt the job, and Dagster refuses two job definitions with the same name at load time. One fetch now feeds both the jobs and the sensors.
+- Pausing a chained pipeline now also stops its dependency sensor, and resuming starts it again (PR #57 review F1.2): Dagster keeps a sensor's stored RUNNING state across code-location reloads, so removing the sensor alone left the chain firing; a paused pipeline also builds no sensor at all.
+- The dependency chain now holds "every upstream succeeded" (PR #57 review F1.3): the downstream launches only once every upstream has a SUCCESS run newer than the downstream's latest run, a queued or in-progress downstream never double-fires, and one round of upstream successes requests one downstream run instead of one per upstream tick.
+- An authored pipeline's write now replaces its target table atomically via a staging table and `EXCHANGE TABLES` (PR #56 review F1.4): the write was a plain `INSERT INTO … SELECT` into a `MergeTree ORDER BY tuple()` table, so a retry after the insert committed — or an ordinary second run — appended the whole result again. A run now always leaves exactly its SELECT's rows; append-per-run behaviour is gone.
 - A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list. A Platform Admin (`*:*`) with no tenant now sees every tenant's authored pipelines there, the rule that already showed them the Dagster jobs; before, they saw none. An authored pipeline's `authored__<id>` Dagster job is not listed a second time.
 - `PIPELINE_RUN_TOKEN` is now passed to `lakehouse-api` and `dagster-code-location`; it was passed to neither, so no authored pipeline could become a job.
 - The authored-pipeline schedule field offers cron presets and a validated custom cron; its old free-text default ("Every hour") never fired.

@@ -1231,7 +1231,9 @@ fn esc(s: &str) -> String {
 /// their owner: before `owner_id` existed, every user listed, opened and
 /// deleted everyone else's. Rows written before then have an empty owner
 /// and belong to nobody — they are hidden rather than guessed at.
-fn session_owner(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
+///
+/// Shared with `routes::home`, whose per-user layout is keyed the same way.
+pub(super) fn session_owner(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
     principal
         .map(|Extension(p)| p.id.uuid().to_string())
         .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))

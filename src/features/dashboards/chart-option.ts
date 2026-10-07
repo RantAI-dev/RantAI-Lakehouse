@@ -2,7 +2,10 @@ import type { EChartsOption } from "echarts";
 import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
-import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
+
+// The map kinds (`geomap`, `pointmap`, `geoheat`) are built in geo-option.ts:
+// they need the registered map's feature names and report what they leave
+// out, which a plain `(spec, rows, dark) => option` cannot.
 
 /** buildOption only needs how to render (not the SQL) — fits ChartSpec & ChartRenderSpec. */
 type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target">;
@@ -303,21 +306,6 @@ export function buildOption(
         dayLabel: { color: axis, fontSize: 9, firstDay: 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
       series: range ? [{ type: "heatmap", coordinateSystem: "calendar", data }] : [],
       title: range ? undefined : { text: "No dated rows to show", left: "center", top: "middle", textStyle: { color: axis, fontSize: 12, fontWeight: "normal" } },
-    } as EChartsOption;
-  }
-
-  if (spec.kind === "geomap") {
-    const data = rows.map((r) => ({ name: normalizeJakartaArea(str(r[spec.x])), value: num(r[y0]) }));
-    const maxV = Math.max(1, ...data.map((d) => d.value));
-    return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { name: string; value?: number }; return `${o.name}<br/><b>${o.value != null && !Number.isNaN(o.value) ? fmtInt(o.value) : "—"}</b>`; } },
-      visualMap: { min: 0, max: maxV, left: "left", bottom: 6, calculable: true, itemHeight: 70,
-        textStyle: { color: axis, fontSize: 10 },
-        inRange: { color: dark ? ["#1e1b4b", "#4f46e5", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#3730a3"] } },
-      series: [{ type: "map", map: JAKARTA_MAP, roam: false, aspectScale: 1,
-        itemStyle: { borderColor: dark ? "#09090b" : "#ffffff", borderWidth: 1, areaColor: dark ? "#27272a" : "#f4f4f5" },
-        emphasis: { label: { show: true, color: dark ? "#fff" : "#111", fontSize: 10 }, itemStyle: { areaColor: PALETTE[3] } },
-        select: { disabled: true }, label: { show: false }, data }],
     } as EChartsOption;
   }
 

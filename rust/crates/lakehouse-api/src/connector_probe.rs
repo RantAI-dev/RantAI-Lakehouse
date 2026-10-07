@@ -220,7 +220,7 @@ pub async fn probe(
 ) -> Outcome {
     match info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
-            probe_dial(adapter, info, resolver, internal_hosts).await
+            Box::pin(probe_dial(adapter, info, resolver, internal_hosts)).await
         }
         Some("rest") => probe_rest_info(info, resolver, internal_hosts).await,
         Some("sheets") => probe_sheets(),
@@ -346,7 +346,15 @@ async fn probe_dial(
             dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
         }
         SqlDriver::Mysql => probe_mysql(&target, &info.secret_ref, resolver, internal_hosts).await,
-        SqlDriver::Mssql => probe_mssql(&target, &info.secret_ref, resolver, internal_hosts).await,
+        SqlDriver::Mssql => {
+            Box::pin(probe_mssql(
+                &target,
+                &info.secret_ref,
+                resolver,
+                internal_hosts,
+            ))
+            .await
+        }
         SqlDriver::Oracle => Outcome::misconfigured(
             "Oracle probes run through the Dagster sql adapter, not through this Rust-side \
              probe; the connector's own health remains at whatever record_test_result has \
@@ -484,7 +492,7 @@ async fn probe_mssql(
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async move {
         let tcp = tokio::net::TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true)?;
-        let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+        let mut client = Box::pin(tiberius::Client::connect(config, tcp.compat_write())).await?;
         // A literal, constant query string -- never built from caller
         // input (tiberius's own `simple_query` doc comment: do not use
         // this with user-specified input).

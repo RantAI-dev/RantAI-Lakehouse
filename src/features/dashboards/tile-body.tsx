@@ -5,7 +5,7 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, fmtInt } from "./chart-option";
-import { ensureMap } from "./echarts-maps";
+import { GeoChart } from "./geo-chart";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<string, unknown>[] } {
@@ -14,7 +14,7 @@ function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<st
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, year, onDataClick,
+  spec, cell, dark, loading, year, onDataClick, hideLegend,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
@@ -23,6 +23,12 @@ export function TileBody({
   year: string;
   /** Click a data point (bar/slice/point) → drill/cross-filter. */
   onDataClick?: (name: string, pos: { x: number; y: number }) => void;
+  /**
+   * Draw the chart without its legend: for a small preview, where a legend
+   * of many entries takes the room and cannot be read. The tooltip still
+   * names each series.
+   */
+  hideLegend?: boolean;
 }) {
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
@@ -49,8 +55,8 @@ export function TileBody({
     return <TableView columns={cell.columns} rows={cell.rows} />;
   }
 
-  // geomap — needs the map registered first (local GeoJSON).
-  if (spec.kind === "geomap") {
+  // Map kinds — need the map registered first (local GeoJSON).
+  if (spec.kind === "geomap" || spec.kind === "pointmap" || spec.kind === "geoheat") {
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
     }
@@ -58,28 +64,11 @@ export function TileBody({
   }
 
   // chart
-  if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" onDataClick={onDataClick} />;
-  return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
-}
-
-/** Choropleth — ensure the map is registered before rendering; a friendly message if the GeoJSON is missing. */
-function GeoChart({ spec, rows, dark }: { spec: ChartRenderSpec; rows: Record<string, unknown>[]; dark: boolean }) {
-  const [state, setState] = React.useState<"loading" | "ready" | "missing">("loading");
-  React.useEffect(() => {
-    let alive = true;
-    void ensureMap().then((ok) => { if (alive) setState(ok ? "ready" : "missing"); });
-    return () => { alive = false; };
-  }, []);
-  if (state === "loading") return <div className="h-full animate-pulse rounded bg-muted/40" />;
-  if (state === "missing") {
-    return (
-      <div className="grid h-full place-content-center px-4 text-center text-xs text-muted-foreground">
-        <p className="font-medium text-foreground">Map data not loaded</p>
-        <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public/geo/dki-jakarta.geojson</code> to enable the map.</p>
-      </div>
-    );
+  if (hasRows(cell) && cell.rows.length) {
+    const option = buildOption(spec, cell.rows, dark);
+    return <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={onDataClick} />;
   }
-  return <EChart option={buildOption(spec, rows, dark)} height="100%" />;
+  return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
 }
 
 function TableView({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {

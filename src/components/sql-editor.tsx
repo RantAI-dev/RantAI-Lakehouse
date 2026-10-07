@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { useTheme } from "next-themes"
-import CodeMirror from "@uiw/react-codemirror"
+import CodeMirror, { EditorView } from "@uiw/react-codemirror"
 import { sql } from "@codemirror/lang-sql"
 import { cn } from "@/lib/utils"
 
@@ -28,6 +28,8 @@ export type SqlSchema = Record<string, string[]>
  * @param schema Tabel dan kolom untuk autocomplete
  * @param className Optional extra wrapper classes
  * @param minHeight Editor min-height (CSS string), default `220px`
+ * @param wrap Soft-wrap long lines instead of scrolling sideways; off by
+ *   default so Query Studio is unchanged
  */
 export function SqlEditor({
   value,
@@ -35,12 +37,14 @@ export function SqlEditor({
   schema,
   className,
   minHeight = "220px",
+  wrap = false,
 }: {
   value: string
   onChange: (v: string) => void
   schema?: SqlSchema
   className?: string
   minHeight?: string
+  wrap?: boolean
 }) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
@@ -49,8 +53,11 @@ export function SqlEditor({
   // render akan memaksa CodeMirror me-rekonfigurasi editor pada setiap
   // ketikan.
   const extensions = React.useMemo(
-    () => [sql(schema ? { schema, upperCaseKeywords: true } : undefined)],
-    [schema]
+    () => [
+      sql(schema ? { schema, upperCaseKeywords: true } : undefined),
+      ...(wrap ? [EditorView.lineWrapping] : []),
+    ],
+    [schema, wrap]
   )
 
   return (

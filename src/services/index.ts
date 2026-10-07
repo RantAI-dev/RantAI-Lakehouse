@@ -18,6 +18,7 @@ import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
+import { homeService as homeClientService } from "./clients/home"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -83,6 +84,10 @@ export const notificationsService = notificationsClientService
 // back from `bronze_meta.ingest_run` by the API. Real from the start: no mock
 // ever existed for this domain.
 export const uploadService = uploadClientService
+// Home's per-user layout (cards and shortcuts, in order) over
+// `/api/home/layout`; honest `supported: false` when no Postgres pool is
+// configured. No mock ever existed for this domain.
+export const homeService = homeClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
