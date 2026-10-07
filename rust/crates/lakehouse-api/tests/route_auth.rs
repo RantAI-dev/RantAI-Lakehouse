@@ -370,8 +370,18 @@ async fn a_seeded_analyst_is_denied_catalog_annotation_write() {
 }
 
 /// A seeded Data Engineer (`catalog:write`, among others) is not denied
-/// `PUT /api/catalog/{id}/annotation` (WS2 §13, WS2 plan review W8) — the
-/// matching allowed-with-the-permission half of the test above.
+/// `PUT /api/catalog/{id}/annotation` by the permission middleware (WS2 §13,
+/// WS2 plan review W8) — the matching allowed-with-the-permission half of
+/// the test above.
+///
+/// PR #79 review, SEC-16: the handler now also runs the catalog tenant gate,
+/// and the seeded app has several tenants and no `CATALOG_TENANT_ID`, so the
+/// write still answers 403. That is a different 403 from the middleware's:
+/// the middleware's body names the missing permission
+/// (`permission_denied: catalog:write`), the tenant gate's body carries its
+/// fixed `CATALOG_TENANT_REFUSAL_UNCONFIGURED` reason. The assertion
+/// therefore accepts a 403 only with that reason, so it still fails if the
+/// middleware denies the Data Engineer.
 #[tokio::test]
 async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     let TestApp { router, pool } = spin_up().await;
@@ -386,14 +396,25 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     .await;
     assert_ne!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "a seeded Data Engineer holding catalog:write must not be denied"
-    );
-    assert_ne!(
-        resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "a seeded Data Engineer holding catalog:write must not be denied by the permission \
+             middleware; the only 403 allowed here is the tenant gate's, got {error:?}"
+        );
+    }
 }
 
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
