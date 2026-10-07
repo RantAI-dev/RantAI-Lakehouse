@@ -6135,8 +6135,8 @@ mod tests {
         /// name a `Run`. Pre-fix the same body returned 400 from the
         /// parser (no Dagster call at all). The parser-level 400 is
         /// still pinned by [`parse_retry_request`]'s own unit tests
-        /// in this file at `routes/pipelines.rs:4341` and `:4345`
-        /// (the parser itself is defined at `routes/pipelines.rs:3808`).
+        /// in this file at `routes/pipelines.rs:4378` and `:4395`
+        /// (the parser itself is defined at `routes/pipelines.rs:3871`).
         #[tokio::test]
         async fn selected_retry_without_step_keys_returns_404_before_calling_dagster() {
             let server = wiremock::MockServer::start().await;
@@ -9384,7 +9384,7 @@ mod tests {
             // to assert it names the id (no existence oracle).
             #[allow(
                 clippy::items_after_statements,
-                reason = "nested next to its 18 invocations in this test, so the test reads top-down (wiremock setup -> helper -> calls) without a forward pointer to module scope; the helper captures nothing from the outer scope (every input is a parameter) and could be lifted, but the local placement matches this test's single-caller shape"
+                reason = "nested next to its 19 invocations in this test, so the test reads top-down (wiremock setup -> helper -> calls) without a forward pointer to module scope; the helper captures nothing from the outer scope (every input is a parameter) and could be lifted, but the local placement matches this test's single-caller shape"
             )]
             async fn assert_route_404_then_owner_then_unrestricted<F, Fut>(
                 name: &'static str,

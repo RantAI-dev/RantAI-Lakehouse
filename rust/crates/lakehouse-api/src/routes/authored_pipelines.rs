@@ -159,17 +159,23 @@ pub enum CallerScope {
 ///
 /// # Errors
 ///
-/// Returns `ApiError::NotFound` with the `Pipeline {id} not found` body
-/// for every out-of-scope case (rules 2, 3, 7 above, plus the
-/// found-but-unassigned branches of rule 1 and rule 5). The body is
-/// identical to the route's genuine "unknown id" 404, so the error is a
-/// classification, not an existence oracle. A transport-level `sqlx` failure
-/// on either query maps through [`lakehouse_store::StoreError`] to
-/// `ApiError::Unavailable` (connection gone) or `ApiError::Internal`
-/// (database error) — AGENTS.md rule 4, never upstream text in a
-/// response. The `?` on [`resolve_caller_scope`] propagates its own
-/// `ApiError::NotFound` when `X-Tenant` is malformed or names a foreign
-/// tenant.
+/// Returns `ApiError::NotFound` with the `Pipeline {id} not found`
+/// body for the three out-of-scope cases: rules 2, 3, and 7. Rule 1
+/// short-circuits with `Ok(())` for a non-`pl-` id (a Dagster-native
+/// job name, no DB row to check), and rule 5 also returns `Ok(())`
+/// when a `NULL`-tenant row is visible to an `Unrestricted` caller,
+/// so neither is an out-of-scope case. The body is identical to the
+/// route's genuine "unknown id" 404, so the error is a classification,
+/// not an existence oracle. The `?` on the two `sqlx` calls propagates
+/// [`StoreError::Database`] as `ApiError::Internal("database error")`
+/// — the fixed body the table in [`lakehouse_store::error`] maps
+/// `Database` to — never upstream driver text (AGENTS.md principle
+/// 4). [`StoreError::Unavailable`] ("no pool configured at all", a
+/// deployment problem) is unreachable through the `?` here: the
+/// `pool == None` branch returns the 404 directly above it, before
+/// any `sqlx` call runs. The `?` on [`resolve_caller_scope`]
+/// propagates its own `ApiError::NotFound` for a malformed or
+/// foreign `X-Tenant`.
 pub async fn in_scope(
     pool: Option<&PgPool>,
     principal: &Principal,
@@ -253,8 +259,17 @@ pub async fn in_scope(
 /// Same `ApiError::NotFound` body as [`in_scope`]: the error names the
 /// actual id (resolved from the DB) for a found-but-unassigned row, so
 /// a caller can correlate against other 404 bodies. A transport-level
-/// failure becomes `ApiError::ServiceUnavailable` via
-/// [`lakehouse_store::StoreError`].
+/// failure on the `sqlx::query_as` call maps via
+/// [`lakehouse_store::StoreError`] to `ApiError::Internal("database
+/// error")` — the [`StoreError::Database`] → [`ApiError::Internal`]
+/// row of the table in [`lakehouse_store::error`]. The body is the
+/// fixed string `"database error"`, never the `sqlx` driver's text
+/// (AGENTS.md principle 4). [`StoreError::Unavailable`] (which maps
+/// to the `ApiError::Unavailable(String)` variant in `lakehouse_core`)
+/// is unreachable here: that variant fires only when `AppState::pg`
+/// is `None` (a deployment problem, "no pool configured at all"),
+/// and this fn takes `&PgPool`, not `Option<&PgPool>` — a caller
+/// cannot reach this fn with no pool.
 pub async fn in_scope_by_safe_name(
     pool: &PgPool,
     principal: &Principal,
