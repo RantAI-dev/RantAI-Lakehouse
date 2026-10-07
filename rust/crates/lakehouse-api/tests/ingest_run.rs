@@ -207,8 +207,10 @@ async fn ingest_run_unknown_connector_is_404() {
 }
 
 /// A `Dagster`-reported launch failure (`RunConfigValidationInvalid`, a
-/// `PythonError`, ...) is a 422 naming the failure — never a 200 claiming
-/// success, and never the raw transport-error branch (Z9's trap).
+/// `PythonError`, ...) is a 422 with the FIXED classified body
+/// `"Dagster did not accept the ingest run"` (F2.7 — never the raw
+/// upstream `message` text, never a 200 claiming success, never the
+/// raw transport-error branch (Z9's trap)).
 #[tokio::test]
 async fn ingest_run_dagster_launch_failure_is_422_not_200() {
     let server = MockServer::start().await;
@@ -245,7 +247,7 @@ async fn ingest_run_dagster_launch_failure_is_422_not_200() {
         .await
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    assert_eq!(body["error"], "job not found");
+    assert_eq!(body["error"], "Dagster did not accept the ingest run");
 }
 
 /// A second run while this connector's run is still going is refused with
