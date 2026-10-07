@@ -45,6 +45,11 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 API = requests.Session()
+# The tenant this run's connectors are created in; set by `_ensure_tenant`.
+TENANT_ID = ""
+# Seeded sandbox tenant (`0002_seed_identity.sql`), preferred when the
+# account has none.
+SANDBOX_TENANT_SLUG = "meridian-labs"
 
 GATE_SECRETS_DIR = "/gate-secrets"
 FILE_REF_PREFIX = "file:/run/secrets/connector_"
@@ -70,6 +75,47 @@ def _login() -> None:
     if login.json().get("mustChangePassword"):
         API.post(f"{API_URL}/api/auth/change-password", json={"newPassword": AUTH_PASSWORD}, timeout=10)
         API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
+
+
+def _me_tenant_ids() -> list[str]:
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise SystemExit(f"[g6-linklocal] GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def _ensure_tenant() -> None:
+    """Make sure the logged-in account belongs to a tenant, and remember it.
+    A connector created by an account with no tenant is stored with no
+    tenant id and every `/api/connectors/{id}/*` route then answers 404 for
+    it, so a fresh database's bootstrap admin joins one first: its own first
+    tenant if it has any, else the seeded `meridian-labs`, else the first by
+    slug, through `PUT /api/identity/users/{id}/tenants/{tenant_id}`, and
+    `/api/auth/me` is read again to confirm (membership is read per request,
+    so no new login). Same as `step_ensure_tenant` in
+    g6_ingest_matrix_test.py, duplicated because the two gates share no
+    module."""
+    global TENANT_ID
+    ids = _me_tenant_ids()
+    if ids:
+        TENANT_ID = ids[0]
+        return
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10).json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise SystemExit(f"[g6-linklocal] list tenants failed: {listed.status_code} {listed.text[:300]}")
+    tenants = sorted(listed.json(), key=lambda t: t["slug"])
+    if not tenants:
+        raise SystemExit("[g6-linklocal] the account belongs to no tenant and the platform has none to join")
+    chosen = next((t for t in tenants if t["slug"] == SANDBOX_TENANT_SLUG), tenants[0])
+    added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{chosen['id']}", timeout=10)
+    if not added.ok:
+        raise SystemExit(
+            f"[g6-linklocal] add the account to tenant {chosen['slug']!r} failed: {added.status_code} {added.text[:300]}"
+        )
+    if chosen["id"] not in _me_tenant_ids():
+        raise SystemExit(f"[g6-linklocal] the account was added to tenant {chosen['slug']!r} but /api/auth/me does not list it")
+    TENANT_ID = chosen["id"]
 
 
 def _assert_rejected(*, connector_id: str, label: str) -> None:
@@ -103,7 +149,7 @@ def step_rest_link_local() -> None:
         f"{API_URL}/api/connectors",
         json={"name": "g6-linklocal", "type": "REST API", "direction": "source", "host": "169.254.169.254",
               "credential": {"source": "file", "primary": "token"},
-              "environment": "production", "tenant": "g6", "residency": "", "capabilities": []},
+              "environment": "production", "tenant": "g6", "tenantId": TENANT_ID, "residency": "", "capabilities": []},
         timeout=10,
     )
     if not created.ok:
@@ -168,7 +214,7 @@ def step_kafka_spoofed_advertised_broker() -> None:
         f"{API_URL}/api/connectors",
         json={"name": "g6-kafka-spoofed", "type": "Kafka", "direction": "source", "host": "kafka-g6-spoofed:9092",
               "credential": {"source": "file", "primary": "token"},
-              "environment": "production", "tenant": "g6", "residency": "", "capabilities": []},
+              "environment": "production", "tenant": "g6", "tenantId": TENANT_ID, "residency": "", "capabilities": []},
         timeout=10,
     )
     if not created.ok:
@@ -226,6 +272,7 @@ def _wait_for_ingest_job(timeout_s: int = 120) -> None:
 
 def main() -> int:
     _login()
+    _ensure_tenant()
     try:
         _wait_for_ingest_job()
     except SystemExit as exc:
