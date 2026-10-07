@@ -7,6 +7,7 @@ stays current.
 | --- | --- | --- |
 | [PRODUCT.md](PRODUCT.md) | The one product document: what it is, what is in it, what it lacks, what blocks production, what is next, open decisions | When a feature is accepted; before a release |
 | [BACKLOG.md](BACKLOG.md) | The one list of work | Weekly |
+| [specs/](specs/) | One spec per backlog task: target numbers against the best competitor, acceptance checklist, what is left out | When a task is added or its targets change |
 | [features/](features/) | One page per feature: what the user can do, decisions, limits, acceptance checklist. Written only when a feature is built | Starting and finishing a feature |
 | [HANDOFF.md](HANDOFF.md) | Current state for a planner or reviewer taking over: what is merged, what is in flight, how to review, what to watch for | When the planner role changes hands |
 | [reference/](reference/) | Parked material: security overview, support model, release policy, competitive comparison, user guide, glossary | When a customer or contract needs it |
@@ -25,7 +26,9 @@ Merged is not accepted. A feature counts as done at step 4.
 ## Rules
 
 - Nothing invented. A status is Have, Partial, Missing or *Not verified*. No
-  made-up numbers, dates or targets.
+  made-up numbers or dates. A target in `specs/` either cites a competitor's
+  documented number or is marked *(proposed)* until the product owner signs
+  it on the feature page.
 - Say where a claim comes from.
 - No customer names, hostnames or secrets.
 - Engineering detail stays in `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`,
