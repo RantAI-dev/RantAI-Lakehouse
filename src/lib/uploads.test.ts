@@ -289,30 +289,36 @@ test("retryInput repeats what the load was told, and replaces after a registrati
   assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
 })
 
-test("fileKindProblem refuses a workbook or an archive by its name, in the API's words, and says to save as CSV", () => {
-  for (const name of ["a.xls", "a.xlsx", "a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsx"]) {
+test("fileKindProblem refuses a workbook the API does not read, or an archive, by its name, in the API's words", () => {
+  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsm"]) {
     const problem = fileKindProblem(name)
-    assert.ok(problem?.startsWith(`${name} looks like an Excel workbook or a zip archive.`), name)
-    assert.ok(problem?.includes("save the sheet as CSV first"), name)
+    assert.ok(problem?.startsWith(`${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file.`), name)
+    assert.ok(problem?.includes("save the sheet as .xlsx or CSV first"), name)
+  }
+})
+
+test("fileKindProblem lets an .xls or .xlsx through: the API opens it, and refuses one that does not open", () => {
+  for (const name of ["a.xls", "a.xlsx", "DATA.XLS", "Data.XlsX", "report.final.xlsx", "a.csv.xlsx"]) {
+    assert.equal(fileKindProblem(name), null, name)
   }
 })
 
 test("fileKindProblem refuses Parquet and other binaries, each in its own sentence", () => {
   assert.equal(
     fileKindProblem("a.parquet"),
-    "a.parquet looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded."
+    "a.parquet looks like a Parquet file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded."
   )
   for (const name of ["a.pdf", "a.docx", "a.avro", "a.orc", "a.sqlite"]) {
     assert.equal(
       fileKindProblem(name),
-      `${name} is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.`
+      `${name} is not a delimited text file or an Excel workbook. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.`
     )
   }
 })
 
 test("fileKindProblem ignores the case of the extension", () => {
-  assert.ok(fileKindProblem("DATA.XLS")?.includes("Excel workbook"))
-  assert.ok(fileKindProblem("Data.XlsX")?.includes("Excel workbook"))
+  assert.ok(fileKindProblem("DATA.XLSM")?.includes("not an .xls or .xlsx file"))
+  assert.ok(fileKindProblem("Data.OdS")?.includes("not an .xls or .xlsx file"))
   assert.ok(fileKindProblem("DATA.PARQUET")?.includes("Parquet"))
 })
 
@@ -323,7 +329,9 @@ test("fileKindProblem lets through delimited text, unknown extensions and names 
 })
 
 test("fileProblem gives the kind first, then the size, and null for an acceptable file", () => {
-  assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("Excel workbook"))
+  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("not an .xls or .xlsx file"))
   assert.ok(fileProblem("a.csv", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
+  assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
+  assert.equal(fileProblem("a.xlsx", 1024), null)
 })

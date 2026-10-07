@@ -44,6 +44,30 @@ export type UploadParseOptions = {
   encoding: UploadEncoding
   delimiter: string
   headerRow: number
+  /**
+   * For an Excel workbook: the sheet read. Sent to the preview and the load
+   * to choose a sheet, and recorded by the API on a workbook's load (so a
+   * retry sends it back). Never set for a text file. A workbook is always read
+   * as UTF-8 with commas, so `encoding` and `delimiter` mean nothing for it.
+   */
+  sheet?: string
+}
+
+/** One sheet of an uploaded workbook. */
+export type UploadSheet = {
+  name: string
+  /** `false` for a hidden sheet; it can still be chosen. */
+  visible: boolean
+}
+
+/**
+ * The sheets of an uploaded Excel workbook (`.xls`, `.xlsx`), in workbook
+ * order. Mirrors Rust `WorkbookInfo` (`lakehouse-api/src/upload_workbook.rs`).
+ */
+export type UploadWorkbook = {
+  sheets: UploadSheet[]
+  /** The first visible sheet: the one read when none is chosen. */
+  defaultSheet: string
 }
 
 /**
@@ -102,6 +126,8 @@ export type Upload = {
  */
 export type CreateUploadResponse = Upload & {
   duplicateOf?: Upload
+  /** Present when the file is an Excel workbook: its sheets. */
+  workbook?: UploadWorkbook
 }
 
 /**
@@ -127,6 +153,13 @@ export type UploadPreview = {
   rows: string[][]
   /** The file holds more than `rows` shows. */
   truncated: boolean
+  /**
+   * Present when the file is an Excel workbook: the sheet this preview shows
+   * and the sheets there are. `detected` and `using` then read UTF-8 and a
+   * comma, the fixed dialect the API converts a sheet to; only `headerRow`
+   * is the person's to choose.
+   */
+  workbook?: UploadWorkbook & { sheet: string }
 }
 
 /**
@@ -154,12 +187,14 @@ export interface UploadService {
   /**
    * `POST /api/uploads`: sends the file as a multipart form with one part
    * named `file`. The API refuses an empty file, one over 50 MB and one that
-   * is not delimited text, each with its own sentence.
+   * is neither delimited text nor an `.xls` or `.xlsx` workbook that opens,
+   * each with its own sentence.
    */
   create(file: File, signal?: AbortSignal): Promise<CreateUploadResponse>
   /**
    * `GET /api/uploads/{id}/preview`. Each option given overrides detection;
-   * one left out is detected. `headerRow` is zero-based.
+   * one left out is detected. `headerRow` is zero-based. `sheet` chooses the
+   * sheet of a workbook (its first visible one when left out).
    */
   preview(
     id: string,

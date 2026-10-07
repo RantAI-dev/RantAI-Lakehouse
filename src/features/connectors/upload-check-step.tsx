@@ -40,11 +40,15 @@ type Settled = { key: string; preview: UploadPreview | null }
  *
  * The 1-based number a person types and the 0-based index the API takes
  * meet only in `headerRowFromDisplay` / `headerRowDisplay`.
+ *
+ * For an Excel workbook the preview carries `workbook`, the person chooses a
+ * sheet instead of an encoding and a delimiter, and a change of sheet drops
+ * the header row chosen for the previous one (another sheet has its own).
  */
 export function useUploadPreview(uploadId: string | null) {
   const [overrides, setOverrides] = React.useState<Partial<UploadParseOptions>>({})
   const [headerText, setHeaderText] = React.useState<string | null>(null)
-  const key = `${uploadId ?? ""}|${overrides.encoding ?? ""}|${JSON.stringify(overrides.delimiter ?? "")}|${overrides.headerRow ?? ""}`
+  const key = `${uploadId ?? ""}|${overrides.encoding ?? ""}|${JSON.stringify(overrides.delimiter ?? "")}|${overrides.headerRow ?? ""}|${JSON.stringify(overrides.sheet ?? "")}`
 
   const state = useRefreshable<Settled>(async (signal) => {
     if (uploadId === null) return { key, preview: null }
@@ -78,9 +82,14 @@ export function useUploadPreview(uploadId: string | null) {
     values: {
       encoding: overrides.encoding ?? shown?.using.encoding ?? "",
       delimiter: overrides.delimiter ?? shown?.using.delimiter ?? "",
+      sheet: overrides.sheet ?? shown?.workbook?.sheet ?? "",
     },
     setEncoding: (encoding: UploadParseOptions["encoding"]) => setOverrides((o) => ({ ...o, encoding })),
     setDelimiter: (delimiter: string) => setOverrides((o) => ({ ...o, delimiter })),
+    setSheet: (sheet: string) => {
+      setOverrides((o) => ({ ...o, sheet, headerRow: undefined }))
+      setHeaderText(null)
+    },
     setHeaderText: (text: string) => {
       setHeaderText(text)
       const row = headerRowFromDisplay(text)
@@ -113,6 +122,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
     return <LoadingSkeleton rows={3} />
   }
 
+  const workbook = shown.workbook
   const encodings = UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
     ? UPLOAD_ENCODINGS
     : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
@@ -122,39 +132,62 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 sm:grid-cols-3">
-        <div className="space-y-1.5">
-          <Label htmlFor="upload-encoding">Encoding</Label>
-          <select
-            id="upload-encoding"
-            className={SELECT_CLASS}
-            value={view.values.encoding}
-            onChange={(e) => view.setEncoding(e.target.value as UploadParseOptions["encoding"])}
-          >
-            {encodings.map((e) => (
-              <option key={e.value} value={e.value}>
-                {e.label}
-              </option>
-            ))}
-          </select>
-          <Detected text={encodingLabel(shown.detected.encoding)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="upload-delimiter">Delimiter</Label>
-          <select
-            id="upload-delimiter"
-            className={SELECT_CLASS}
-            value={view.values.delimiter}
-            onChange={(e) => view.setDelimiter(e.target.value)}
-          >
-            {delimiters.map((d) => (
-              <option key={d.value} value={d.value}>
-                {d.label}
-              </option>
-            ))}
-          </select>
-          <Detected text={delimiterLabel(shown.detected.delimiter)} />
-        </div>
+      <div className={workbook ? "grid gap-4 sm:grid-cols-2" : "grid gap-4 sm:grid-cols-3"}>
+        {workbook ? (
+          <div className="space-y-1.5">
+            <Label htmlFor="upload-sheet">Sheet</Label>
+            <select
+              id="upload-sheet"
+              className={SELECT_CLASS}
+              value={view.values.sheet}
+              onChange={(e) => view.setSheet(e.target.value)}
+            >
+              {workbook.sheets.map((sheet) => (
+                <option key={sheet.name} value={sheet.name}>
+                  {sheet.visible ? sheet.name : `${sheet.name} (hidden)`}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-muted-foreground">
+              The first visible sheet is chosen to begin with. Only the sheet chosen is loaded.
+            </p>
+          </div>
+        ) : (
+          <>
+          <div className="space-y-1.5">
+            <Label htmlFor="upload-encoding">Encoding</Label>
+            <select
+              id="upload-encoding"
+              className={SELECT_CLASS}
+              value={view.values.encoding}
+              onChange={(e) => view.setEncoding(e.target.value as UploadParseOptions["encoding"])}
+            >
+              {encodings.map((e) => (
+                <option key={e.value} value={e.value}>
+                  {e.label}
+                </option>
+              ))}
+            </select>
+            <Detected text={encodingLabel(shown.detected.encoding)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="upload-delimiter">Delimiter</Label>
+            <select
+              id="upload-delimiter"
+              className={SELECT_CLASS}
+              value={view.values.delimiter}
+              onChange={(e) => view.setDelimiter(e.target.value)}
+            >
+              {delimiters.map((d) => (
+                <option key={d.value} value={d.value}>
+                  {d.label}
+                </option>
+              ))}
+            </select>
+            <Detected text={delimiterLabel(shown.detected.delimiter)} />
+          </div>
+          </>
+        )}
         <div className="space-y-1.5">
           <Label htmlFor="upload-header-row">Header row</Label>
           <Input
@@ -170,10 +203,22 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             id="upload-header-row-note"
             className={view.headerProblem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
           >
-            {view.headerProblem ?? `Detected: ${headerRowDisplay(shown.detected.headerRow)}. Counts every row from the top of the file, blank ones included, starting at 1.`}
+            {view.headerProblem ??
+              `Detected: ${headerRowDisplay(shown.detected.headerRow)}. ${
+                workbook
+                  ? "Counts every row of the sheet from its first filled cell, blank ones in between included, starting at 1."
+                  : "Counts every row from the top of the file, blank ones included, starting at 1."
+              }`}
           </p>
         </div>
       </div>
+      {workbook ? (
+        <p className="text-xs text-muted-foreground">
+          Every column is loaded as text. Numbers are written as the cell holds them, without its display format
+          (1234.5, not 1,234.50). Dates are written as 2025-09-24, with the time (2025-09-24 13:30:00) when the
+          cell has one. A formula loads the result the file stored, and a merged cell only its top-left value.
+        </p>
+      ) : null}
 
       {settled === null && view.error === null ? (
         <p role="status" className="text-xs text-muted-foreground">

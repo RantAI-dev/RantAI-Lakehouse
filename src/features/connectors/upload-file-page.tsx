@@ -29,7 +29,7 @@ import { DuplicateNotice, LoadFailure, Refusal } from "./upload-parts"
 import { UploadRunView } from "./upload-run-view"
 
 const STEPS: FormStep[] = [
-  { id: "file", label: "File", description: "Choose a CSV or TSV file" },
+  { id: "file", label: "File", description: "Choose a CSV, TSV or Excel file" },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
   { id: "review", label: "Review", description: "Load the file" },
@@ -52,8 +52,8 @@ function setAddress(pathname: string, id: string | null) {
 /**
  * Step 1: a real, labelled file control (reachable by keyboard) and a drop
  * area that sets the same file. A file over 50 MB, or one whose name says it is
- * a workbook or another binary, is refused here with the reason, and nothing
- * is sent.
+ * a workbook the API does not read (not `.xls` or `.xlsx`) or another binary,
+ * is refused here with the reason, and nothing is sent.
  */
 function FileStep({
   file,
@@ -108,9 +108,9 @@ function FileStep({
         className={`space-y-3 rounded-lg border border-dashed p-6 ${dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"}`}
       >
         <p className="text-sm text-muted-foreground">
-          Drop a CSV or TSV file here, or choose one. Delimited text files (CSV, TSV) up to 50 MB are accepted.
-          Excel workbooks (.xls, .xlsx) are not: save the sheet as CSV first. Other kinds of file are refused
-          with the reason.
+          Drop a CSV, TSV or Excel file here, or choose one. Delimited text files (CSV, TSV) and Excel
+          workbooks (.xls, .xlsx) up to 50 MB are accepted. Of a workbook one sheet is loaded, chosen on the
+          next step. Other kinds of file (.xlsm, .xlsb, .ods, archives) are refused with the reason.
         </p>
         <div className="space-y-1.5">
           <Label htmlFor="upload-file-input">Choose a file</Label>
@@ -118,7 +118,7 @@ function FileStep({
           <Input
             id="upload-file-input"
             type="file"
-            accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain"
+            accept=".csv,.tsv,.txt,.xls,.xlsx,text/csv,text/tab-separated-values,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             onChange={(e) => take(e.target.files)}
           />
         </div>
@@ -211,10 +211,14 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   async function load() {
     if (upload === null || view.settled === null) return
     const { encoding, delimiter, headerRow } = view.settled.using
+    // For a workbook the sheet read by the preview on screen is the one
+    // loaded; the API reads UTF-8 and commas for it whatever is sent here.
+    const sheet = view.settled.workbook?.sheet
     const started = await ingest.run(upload.id, {
       encoding,
       delimiter,
       headerRow,
+      ...(sheet !== undefined ? { sheet } : {}),
       bronzeTable: tableName,
       mode: effectiveMode,
     })
@@ -348,8 +352,12 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
               {
                 title: "How it is read",
                 items: [
-                  { label: "Encoding", value: using ? encodingLabel(using.encoding) : "" },
-                  { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "" },
+                  ...(view.settled?.workbook
+                    ? [{ label: "Sheet", value: view.settled.workbook.sheet }]
+                    : [
+                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "" },
+                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "" },
+                      ]),
                   { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "" },
                   { label: "Columns", value: view.settled ? String(view.settled.columns.length) : "" },
                 ],

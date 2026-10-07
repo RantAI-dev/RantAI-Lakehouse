@@ -146,29 +146,45 @@ describe("UploadFilePage, first step", () => {
     expect(screen.getByLabelText("Choose a file")).toBeDefined()
   })
 
-  it("refuses an Excel workbook by its name before any request, saying to save it as CSV", async () => {
+  it("refuses a workbook the API does not read by its name before any request, saying what to save it as", async () => {
     const calls = stubFetch()
     render(<UploadFilePage />)
-    chooseFile(new File(["x"], "stock.XLSX"))
+    chooseFile(new File(["x"], "stock.XLSM"))
 
     const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("stock.XLSX")
-    expect(alert.textContent).toContain("Excel workbook")
-    expect(alert.textContent).toContain("save the sheet as CSV first")
+    expect(alert.textContent).toContain("stock.XLSM")
+    expect(alert.textContent).toContain("not an .xls or .xlsx file")
+    expect(alert.textContent).toContain("save the sheet as .xlsx or CSV first")
     expect(next().disabled).toBe(true)
     fireEvent.click(next())
     expect(calls.filter((c) => c.method === "POST")).toEqual([])
   })
 
-  it("states the accepted kinds, the workbook refusal and the 50 MB limit up front, and suggests text files in the picker", () => {
+  it("states the accepted kinds and the 50 MB limit up front, and suggests text and Excel files in the picker", () => {
     stubFetch()
     render(<UploadFilePage />)
-    const hint = screen.getByText(/Delimited text files \(CSV, TSV\) up to 50 MB are accepted/)
-    expect(hint.textContent).toContain("Excel workbooks (.xls, .xlsx) are not")
-    expect(hint.textContent).toContain("save the sheet as CSV first")
+    const hint = screen.getByText(/Delimited text files \(CSV, TSV\) and Excel/)
+    expect(hint.textContent).toContain("workbooks (.xls, .xlsx) up to 50 MB are accepted")
+    expect(hint.textContent).toContain("(.xlsm, .xlsb, .ods, archives) are refused")
     const input = screen.getByLabelText("Choose a file") as HTMLInputElement
     expect(input.accept).toContain(".csv")
     expect(input.accept).toContain(".tsv")
+    expect(input.accept).toContain(".xls")
+    expect(input.accept).toContain(".xlsx")
+  })
+
+  it("sends an .xlsx instead of refusing it by name, and lands on a Check step with a sheet picker", async () => {
+    const calls = stubFetch({
+      create: json({ ...upload({ originalFilename: "stock.xlsx" }), workbook: WORKBOOK }, 201),
+      preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
+    })
+    render(<UploadFilePage />)
+    chooseFile(new File(["x"], "stock.xlsx"))
+    expect(screen.queryByRole("alert")).toBeNull()
+    fireEvent.click(next())
+
+    await screen.findByLabelText("Sheet")
+    expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/uploads")
   })
 
   it("does not show a proxy's plain-text 500 or 413 as such: it says the upload did not reach the service and names the limit", async () => {
@@ -282,6 +298,89 @@ describe("UploadFilePage, Check step", () => {
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
     expect(screen.getByRole("button", { name: "Retry" })).toBeDefined()
+  })
+})
+
+const WORKBOOK = {
+  sheets: [
+    { name: "Stock", visible: true },
+    { name: "Quirks", visible: true },
+    { name: "Notes", visible: false },
+  ],
+  defaultSheet: "Stock",
+}
+
+/** What the API answers for a workbook's preview: the fixed dialect, and the sheet read. */
+function workbookPreview(sheet: string, over: Partial<UploadPreview> = {}): UploadPreview {
+  return preview({
+    columns: sheet === "Quirks" ? ["case", "value"] : ["sku", "qty"],
+    workbook: { ...WORKBOOK, sheet },
+    ...over,
+  })
+}
+
+describe("UploadFilePage, Check step for a workbook", () => {
+  async function openWorkbook(routes: Routes = {}) {
+    url.search = "?id=up-1"
+    const calls = stubFetch({
+      get: () => upload({ originalFilename: "stock.xlsx" }),
+      preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
+      ...routes,
+    })
+    render(<UploadFilePage />)
+    await screen.findByLabelText("Sheet")
+    return calls
+  }
+
+  it("shows a sheet picker with the default chosen and no encoding or delimiter, and says how cells are written", async () => {
+    await openWorkbook()
+    expect((screen.getByLabelText("Sheet") as HTMLSelectElement).value).toBe("Stock")
+    expect(screen.queryByLabelText("Encoding")).toBeNull()
+    expect(screen.queryByLabelText("Delimiter")).toBeNull()
+    expect(screen.getByLabelText("Header row")).toBeDefined()
+    expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
+    const note = screen.getByText(/Every column is loaded as text/)
+    expect(note.textContent).toContain("2025-09-24")
+    expect(screen.getByText("Notes (hidden)")).toBeDefined()
+  })
+
+  it("reads the chosen sheet and drops the header row chosen for the previous one", async () => {
+    const calls = await openWorkbook()
+    fireEvent.change(screen.getByLabelText("Header row"), { target: { value: "3" } })
+    await waitFor(() => expect(calls.some((c) => c.url.includes("headerRow=2"))).toBe(true))
+
+    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    await screen.findByRole("columnheader", { name: "case" })
+    const last = calls.filter((c) => c.url.includes("/preview")).at(-1)
+    expect(last?.url).toContain("sheet=Quirks")
+    expect(last?.url).not.toContain("headerRow")
+  })
+
+  it("sends the sheet shown when Load is pressed, and the review names it instead of an encoding", async () => {
+    const started = upload({ status: "ingesting", bronzeTable: "stock", loadMode: "replace" })
+    const calls = await openWorkbook({ ingest: json({ upload: started, runId: "run-1" }) })
+    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    await screen.findByRole("columnheader", { name: "case" })
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+    expect(screen.getByText("Sheet")).toBeDefined()
+    expect(screen.getByText("Quirks")).toBeDefined()
+    expect(screen.queryByText("Encoding")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
+    const post = calls.find((c) => c.url.endsWith("/ingest"))
+    expect(post?.body).toEqual({
+      encoding: "utf-8",
+      delimiter: ",",
+      headerRow: 0,
+      sheet: "Quirks",
+      bronzeTable: "stock",
+      mode: "replace",
+    })
   })
 })
 
