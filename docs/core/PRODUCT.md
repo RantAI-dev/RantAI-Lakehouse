@@ -290,7 +290,7 @@ run without the product owner fixing things by hand.
 | 3 | No human security review | Commission one |
 | 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`), raw database errors on dashboard tiles and embeds (`SEC-11`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table

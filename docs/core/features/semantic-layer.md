@@ -9,18 +9,19 @@
 
 ## Problem
 
-A table from a source that gives no descriptions, such as an uploaded file, has no description at all in the chat's data map, and the chat cannot tell what its columns mean. Tables from sources that do include descriptions carry them, but they may be outdated or not cover what the data means in this deployment.
+A `serving` or `silver` table built by a pipeline, or from any source that gives no column descriptions, has no description in the chat's data map, and the chat cannot tell what its columns mean. Tables from sources that do include descriptions carry them, but they may be outdated or not cover what the data means in this deployment.
 
 ## What the user can do when this is done
 
 1. Ask the copilot a question about a table using a column's synonym and get an answer.
-2. Upload a file and see the assistant's automatic descriptions of the new table within one drafting pass.
+2. Wait for a drafting pass and see a `silver` or `serving` table's automatic descriptions within that pass.
 3. See the table's automatic descriptions through `GET /api/semantic/{table}`.
 4. Write a description of a table or column and confirm it through `PUT /api/semantic/{asset}`, replacing any draft.
 5. The chat uses a confirmed text or a draft when it writes SQL; a person's text wins over a draft, and a draft never overwrites a person's text.
 
 ## Not included
 
+- Tables in the `raw` layer, such as an uploaded file, are not described because the chat does not read them.
 - A Catalog page to manage descriptions.
 - Choosing which tables get drafts; a table is drafted once and left alone after.
 - A draft for a column added to a table after the table's first draft.
@@ -58,11 +59,11 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Upload a CSV on Sources, "Upload file". Wait for its table to be created and one drafting pass. | The table appears in the Catalog. | |
-| 2 | `GET /api/semantic/serving.<table>` where `<table>` is the uploaded table. | Response lists entries for the table and each column, each with `status: "draft"`, `model: "<name>"`, and `writtenBy: null`. | |
-| 3 | Ask the Copilot about the uploaded table using a word that is a synonym from its draft and not a column name. | The assistant answers from the table. | |
+| 1 | `GET /api/semantic` and pick a `silver` or `serving` table that has no entry (missing from the list). | The table is not listed. | |
+| 2 | Wait for the next drafting pass at API start, or after fifteen minutes, or after a pipeline run. Then `GET /api/semantic/serving.<table>` or `GET /api/semantic/silver.<table>` for that table. | Response lists entries for the table and each column, each with `status: "draft"`, `model: "<name>"`, and `writtenBy: null`. | |
+| 3 | Ask the Copilot about that table using a word that is a synonym from its draft and not a column name. | The assistant answers from the table. | |
 | 4 | In Query Studio's "Natural language" box, ask a question about the same table. | The answer shows formatted text (no literal `**` or `<span>` tags), with no row count when no query ran. | |
-| 5 | `PUT /api/semantic/serving.<table>` with body `{"description": "my text"}`. | Response has `status: "confirmed"` and `writtenBy: <user>`. | |
+| 5 | `PUT /api/semantic/serving.<table>` with body `{"description": "my text"}`. | Response is 200 with `{"ok": true}`. | |
 | 6 | `GET /api/semantic/serving.<table>` again. | Response shows the confirmed entry with the same description, `status: "confirmed"`, `writtenBy: <user>`, `model: null`. | |
 | 7 | Set `AI_SEMANTIC_LAYER=false` and restart the API (operator). | The API starts. | |
 | 8 | `GET /api/semantic` and `GET /api/semantic/serving.<table>`. | Both routes answer with existing entries; no new drafts are created. | |
@@ -70,7 +71,7 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 | 10 | Call `PUT /api/semantic/serving.no_such_table` with a body. | Response is 404 with the table not found in `serving` or `silver`. | |
 | 11 | Call `PUT /api/semantic/serving.<table>` with body `{"description": "..."}` (401-character description). | Response is 400 naming `description`. | |
 | 12 | Call `PUT /api/semantic/serving.<table>` with body `{"column": "unknown", "description": "text"}`. | Response is 400 naming the unknown column. | |
-| 13 | Call `PUT /api/semantic/serving.<table>` with body `{"synonyms": ["a", "b", "c", "d", "e", "f", "g"]}` (seven synonyms) or `{"role": "unknown"}` (unknown role). | Response is 400 naming the field. | |
+| 13 | Call `PUT /api/semantic/serving.<table>` with body `{"column": "<a real column>", "description": "x", "synonyms": ["a", "b", "c", "d", "e", "f", "g"]}` (seven synonyms) or `{"column": "<a real column>", "description": "x", "role": "bogus"}` (unknown role). | Response is 400 naming `synonyms` or `role`. | |
 | 14 | A user with `catalog:read` only calls `PUT /api/semantic/serving.<table>`. | Response is 403. | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______

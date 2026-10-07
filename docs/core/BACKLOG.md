@@ -193,6 +193,7 @@ builds it (`AGENTS.md`).
 | ID | Spec | When | Size |
 | --- | --- | --- | --- |
 | [`SEC-10`](specs/sec-10.md) | Alert webhooks cannot reach internal addresses | Now | S |
+| [`SEC-11`](specs/sec-11.md) | No raw database errors on screen | Now | S |
 | [`SEC-12`](specs/sec-12.md) | Safer embed tokens | Next | M |
 | [`SEC-13`](specs/sec-13.md) | Check the staging file pushed to main | Now | S |
 | [`SEC-14`](specs/sec-14.md) | Connector passwords cannot be stolen by re-pointing a connector | Now | M |
