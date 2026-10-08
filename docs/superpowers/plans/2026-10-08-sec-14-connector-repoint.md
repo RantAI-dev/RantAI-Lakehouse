@@ -211,3 +211,120 @@ Rust tasks 1–7 sit together; no migration is needed.
   checked against a database.
 - `tiberius`' behaviour against a server that offers no encryption was read
   from its source, not observed.
+
+## Handoff: PR A (tasks 1, 2, 3, 4, 9, 10)
+
+Developer: Claude Sonnet 5.5. Branch `fix/sec-14-connector-repoint`, stacked
+on `fix/sec-15-probe-internal-addresses`. Not pushed. PR B (tasks 5 to 8 and
+11) is not started: `PgSslMode`, `MySqlSslMode` and `trust_cert` are
+untouched.
+
+### Commits (one per task, plan order except 10 before 9)
+
+| Task | Commit | What |
+| --- | --- | --- |
+| 1 | `a0e527a` | `Dial::target_identity`, `is_repoint`, unit tests in `ingest_spec.rs` |
+| 2 | `15f01de` | `set_ingest_spec` guard (`Conflict`), `repoint_ingest_spec`, shared `apply_swaps`, tests in `tests/connector_ingest_spec.rs` |
+| 3 | `1cbd22b` | `PUT .../ingest-spec` with `credential`, `publish_credentials` extracted from `replace_credentials`, `tests/connector_repoint.rs`, `route_auth.rs` SSRF test given a credential |
+| 4 | `b78ffa9` | `candidate_dial_info` 409, `PATCH` `host` refusal, unit and route tests |
+| 10 | `69307cb` | tool description, prompt line, `tool_schemas.json` by hand, schema pin test |
+| 9 | `1d709ac` | `target-identity.ts` + tests, `IngestSpecInput.credential`, edit page, edit-page tests |
+
+### Decisions taken where the plan was silent
+
+- **Target identity** is as section 3, plus: the adapter name is part of it;
+  `mongodb` hosts and `kafka` bootstrap servers compare as sets (order,
+  repeats and host case ignored); an absent `files.endpoint` differs from a
+  named one; a URL's absent port is the scheme's default (`http` 80,
+  `https` 443) and its userinfo is ignored; `sql`, `cdc`, `sftp`, `mongodb`
+  and `kafka` have no absent port (`Dial::parse` requires one), so there is
+  no default to apply. The same list is in the doc comment of
+  `Dial::target_identity`.
+- **First configuration** (`is_repoint`): stored `adapter` NULL and `dial`
+  `{}`/null is not a re-point. Anything that cannot be compared fails
+  closed: a stored `adapter` whose `dial` does not parse for it, or
+  `adapter` NULL with a non-empty `dial`.
+- **Which slots** (D3) are counted from `secret_field_names` for the NEW
+  adapter and auth type (the credentials the dial actually reads): one field
+  needs `primary`, two need `primary` and `secondary`, none (Kafka without
+  authentication) need nothing and a credential sent for it is a 400.
+- A `credential` sent with an **unchanged** target is accepted: probed and
+  written with the spec in the same way, audited as
+  `connector.credential_set`. Coverage is only required when the target
+  changes.
+- **`PATCH` `host`**: refused (409, fixed text) only for a connector with no
+  adapter or a `files` adapter, the two whose probe reads `connector.host`
+  (`connector_probe.rs`, `probe_by_kind` and `probe_s3`). For every other
+  adapter `host` is a label and still works. A value equal to the stored one
+  (ignoring case and padding) is accepted. The plan said "refused with a
+  pointer, in `reject_non_patchable_fields`' style" (a 400); it is a 409
+  with the same pointer, because D4 says it follows the same rule as D1.
+
+### Where the plan differed from the code after SEC-15
+
+- `check_dial_ssrf` ran right after `Dial::parse` in `ingest_spec_put`. It
+  now runs after the stored spec is read and the identities are compared, so
+  a re-point without credentials is refused before any DNS lookup.
+- `ingest_spec_put` had no principal. It now takes
+  `Option<Extension<Principal>>` (like `update`) for the audit event. The
+  assistant's tool passes `None`: it never carries a credential, so it never
+  reaches the part that needs one.
+- `tests/route_auth.rs::ingest_spec_put_rejects_a_dial_whose_host_resolves_internal`
+  moves `conn-pg-lakehouse` from `sql` to `rest`, a re-point, so it would now
+  get the 409 instead of the address check's 400. Its body gained a
+  throwaway bearer credential; the assertion (400) is unchanged. This is the
+  only existing Rust assertion touched.
+- The seeded `conn-pg-lakehouse` dial host is `postgres`, which does not
+  resolve outside the compose network, so route tests that need a save to
+  pass use their own rows dialling `127.0.0.1`.
+- `tool_schemas.json` is normally rewritten by the ignored test
+  `write_tool_schema_fixture`; that needs a test binary, which this machine
+  must not build, so the one changed `description` string was edited by hand
+  in the fixture and in `registry.rs` identically.
+
+### Existing assertions changed
+
+- `rust/crates/lakehouse-api/tests/route_auth.rs`: see above (credential added to the body).
+- `src/features/connectors/connector-edit-page.test.tsx`:
+  `keeps the ingested tables and schedule when the connection changes` used
+  to change the host and expect a separate credential call first. It now
+  changes the user (a save that keeps the target), asserts no credential call
+  and no `credential` key, and the host change has its own new test. No other
+  assertion was weakened.
+
+### Commands run (and results)
+
+- `cd rust && cargo fmt --check`: pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target`,
+  `CARGO_BUILD_JOBS=2`; `df -h /` showed 65 GB free before each run): pass,
+  no warnings.
+- `bun run typecheck`: pass. `bun run lint`: 0 errors, 6 warnings, none in
+  files this PR touches. `bun run test`: 883 pass, 1 skip, 0 fail
+  (includes 15 new tests in `target-identity.test.ts` and 3 new in
+  `connector-edit-page.test.tsx`).
+- `python3 ops/lint/check_intra_package_imports.py` and
+  `python3 ops/lint/check_bare_iceberg_count.py`: pass.
+
+### Not verified
+
+- **No Rust test was run.** `cargo test` builds test binaries, which this
+  machine must not do. The new Rust tests (`ingest_spec.rs`
+  `target_identity_tests`, `tests/connector_ingest_spec.rs`,
+  `tests/connector_repoint.rs`, the unit tests in `routes/connectors.rs`,
+  the schema pin in `registry.rs`) type-check under clippy but have never
+  executed; the first run is CI's. The snapshot test
+  `tool_schemas_snapshot_is_byte_identical` rests on the hand edit.
+- `tests/connector_repoint.rs::a_re_point_with_credentials_is_probed_and_saved_together`
+  dials the test Postgres container as a real new target and reads the
+  managed credential back from a temporary `CONNECTOR_SECRETS_DIR`; it has
+  not been seen to pass.
+- The compose stack, the Dagster side and a browser were not run.
+- For a `files` connector the candidate probe reads `connector.host`
+  (`probe_s3`), not the new `dial`, so the new endpoint is not tested before
+  the save; the credentials sent are not delivered to the old place by this
+  (the request's credentials only), but the check is weaker than for `sql`
+  and `rest`.
+- A connector with no adapter and an operator-provisioned credential takes
+  its first dial without credentials, by the boundary above. That is the
+  same row class that `PATCH` `host` now refuses to move.
