@@ -232,6 +232,67 @@ test_rename_rust_to_docs() {
 }
 test_rename_rust_to_docs
 
+# Failed git diff test
+test_failed_git_diff() {
+  local mock_bin="$REPO_DIR/mock_bin"
+  mkdir -p "$mock_bin"
+  cat <<\EOF > "$mock_bin/git"
+#!/usr/bin/env bash
+if [ "$1" = "diff" ]; then
+  exit 128
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$mock_bin/git"
+
+  local output="$REPO_DIR/github_output_faileddiff"
+  : > "$output"
+  (
+    cd "$REPO_DIR"
+    PATH="$mock_bin:$PATH" \
+    EVENT_NAME="pull_request" \
+    BASE_SHA="$BASE_SHA" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  )
+
+  local a
+  a="$(grep "^all=" "$output" | cut -d= -f2)"
+  if [ "$a" = "true" ]; then
+    log_pass "failed git diff forces all=true"
+  else
+    log_fail "failed git diff did not force all=true (all=$a)"
+  fi
+}
+test_failed_git_diff
+
+# Empty diff file list test
+test_empty_diff() {
+  local output="$REPO_DIR/github_output_empty"
+  : > "$output"
+  (
+    cd "$REPO_DIR"
+    git reset --hard "$BASE_SHA" >/dev/null 2>&1
+    git commit --allow-empty -q -m "empty commit"
+  )
+  (
+    cd "$REPO_DIR"
+    EVENT_NAME="pull_request" \
+    BASE_SHA="$BASE_SHA" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  )
+
+  local a
+  a="$(grep "^all=" "$output" | cut -d= -f2)"
+  if [ "$a" = "true" ]; then
+    log_pass "empty diff file list forces all=true"
+  else
+    log_fail "empty diff file list did not force all=true (all=$a)"
+  fi
+}
+test_empty_diff
+
 # Unreadable base commit test
 (
   output="$REPO_DIR/github_output_badbase"

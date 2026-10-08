@@ -48,17 +48,31 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
   exit 0
 fi
 
-CHANGED="$(git diff --no-renames --name-only "$BASE" HEAD || true)"
-if [ -z "$CHANGED" ]; then
-  echo "No changed files detected."
+if ! CHANGED="$(git diff --no-renames --name-only "$BASE" HEAD)"; then
+  echo "git diff failed: forcing all=true."
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
-      echo "rust=false"
-      echo "frontend=false"
-      echo "dagster=false"
-      echo "stack=false"
+      echo "rust=true"
+      echo "frontend=true"
+      echo "dagster=true"
+      echo "stack=true"
       echo "docs_only=false"
-      echo "all=false"
+      echo "all=true"
+    } >> "$GITHUB_OUTPUT"
+  fi
+  exit 0
+fi
+
+if [ -z "$CHANGED" ]; then
+  echo "No changed files detected (empty diff): forcing all=true."
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    {
+      echo "rust=true"
+      echo "frontend=true"
+      echo "dagster=true"
+      echo "stack=true"
+      echo "docs_only=false"
+      echo "all=true"
     } >> "$GITHUB_OUTPUT"
   fi
   exit 0
