@@ -140,7 +140,9 @@ export function ConnectorsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Connectors"
-        description="Sources and sinks for CDC, messaging, object storage, SaaS, and federation. Data enters the platform here before processing."
+        // SRC-6 F7: the old text promised SaaS and federation, which no
+        // connector type here delivers; list only what the picker offers.
+        description="Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
         actions={
           <>
             <Button variant="outline" size="sm" render={<Link href="/connectors/upload" />}>

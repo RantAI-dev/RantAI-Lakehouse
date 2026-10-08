@@ -92,6 +92,18 @@ function renderPage() {
 }
 
 describe("ConnectorsPage tabs", () => {
+  it("describes only what the picker offers, with no SaaS or federation promise (SRC-6 F7)", async () => {
+    stubFetch()
+    renderPage()
+    expect(
+      await screen.findByText(
+        "Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+      )
+    ).toBeDefined()
+    expect(screen.queryByText(/SaaS/)).toBeNull()
+    expect(screen.queryByText(/federation/)).toBeNull()
+  })
+
   it("opens on Connectors, offers Upload file before New Connector, and does not read the uploads", async () => {
     const urls = stubFetch()
     renderPage()
