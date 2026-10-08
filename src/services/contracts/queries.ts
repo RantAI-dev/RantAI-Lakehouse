@@ -132,12 +132,36 @@ export type SaveQueryInput = {
   tags: string[]
 }
 
+/** One tool call the chat made while answering a question typed in words. */
+export type NlAnswerStep = {
+  /** The tool's name, e.g. `run_sql`. */
+  step: string
+  /** For `run_sql` its SQL, or its error text when it failed; empty for the other tools. */
+  detail: string
+}
+
+/**
+ * What Query Studio's "Natural language" box shows: the chat's answer and
+ * the last query it ran successfully. `sql` is absent when the model ran
+ * none, so the editor keeps what it had.
+ */
+export type NlAnswer = {
+  answer: string
+  sql?: string
+  columns: string[]
+  rows: Record<string, QueryCell>[]
+  rowCount: number
+  steps: NlAnswerStep[]
+}
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>
-  generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string; assumptions: string[] }>
+  /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */
+  askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer>
+  generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string }>
   getSchedulingCapability(signal?: AbortSignal): Promise<QuerySchedulingCapability>
 }

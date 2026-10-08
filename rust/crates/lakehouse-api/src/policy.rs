@@ -193,6 +193,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
 
+    // ── Semantic layer (AI-16): plain-words descriptions of tables and
+    //    columns, read by the Copilot's DATA MAP. The same two permissions
+    //    as the annotations above. ───────────────────────────────────────
+    ("GET", "/api/semantic", Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:read")),
+    ("PUT", "/api/semantic/{asset}", Policy::RequiresPermission("catalog:write")),
+
     // ── Access requests (WS7 item E2/E3): anyone who can see a catalog
     //    entry may request more access to it; `access:approve` (minted by
     //    migration 0040, held only by Governance Admin) is a distinct
@@ -439,9 +446,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
-    ("POST", "/api/agent/ask",           Policy::RequiresAuth),
-    ("POST", "/api/agent/query",         Policy::RequiresAuth),
-    ("POST", "/api/agent/text-to-sql",   Policy::RequiresAuth),
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
     ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
@@ -449,6 +453,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PATCH",  "/api/ai/sessions",       Policy::RequiresAuth),
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
     ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
+    // The caller's own remembered words for the chat (`routes::ai::terms`):
+    // keyed by the principal like Copilot sessions, so the `RequiresAuth`
+    // floor is the whole policy. A caller can only ever reach their own rows.
+    ("GET",    "/api/ai/terms",          Policy::RequiresAuth),
+    ("PUT",    "/api/ai/terms",          Policy::RequiresAuth),
+    ("DELETE", "/api/ai/terms",          Policy::RequiresAuth),
 
     // WS5 item F1: navbar bell — same `RequiresAuth` floor as every other
     // authenticated-but-not-permission-scoped read in this table (e.g.

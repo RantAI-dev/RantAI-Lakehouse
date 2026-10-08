@@ -8,7 +8,9 @@ import { derivePageContext, type PageContext } from "./page-context";
 import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
+import { chatTermService } from "@/services";
 import { apiFetch } from "@/services/http";
+import { answerAsk, type AskAnswer } from "./answer-ask";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
@@ -107,6 +109,8 @@ function useCopilotState() {
   messagesRef.current = messages;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  /** A line about the last picked answer (not remembered); any later send, new chat or opened chat clears it. */
+  const [askNotice, setAskNotice] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
   const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
@@ -221,6 +225,7 @@ function useCopilotState() {
     const q = text.trim();
     if (!q || busy) return;
     setError(null);
+    setAskNotice(null);
     const next: Msg[] = [
       ...(history ?? messagesRef.current),
       { id: newMsgId(), role: "user", content: q, at: new Date().toISOString() },
@@ -331,6 +336,17 @@ function useCopilotState() {
     }
   }, [busy, mode, sessionId, persist, enabledCaps]);
 
+  /**
+   * The user picked an option of a question the chat asked: remember it,
+   * then send it. `send` clears `askNotice`, so the "not remembered" line is
+   * set after `answerAsk` has started the send.
+   */
+  const answerAskOption = React.useCallback(async (answer: AskAnswer) => {
+    if (busy) return;
+    const remembered = await answerAsk({ saveTerm: chatTermService.saveTerm, send }, answer);
+    if (!remembered) setAskNotice("Your answer was sent, but it was not remembered for next time.");
+  }, [busy, send]);
+
   /** Stop waiting for the answer in flight; the server stops before its next step. */
   const stop = React.useCallback(() => abortRef.current?.abort(), []);
 
@@ -435,12 +451,13 @@ function useCopilotState() {
 
   const newChat = React.useCallback(() => {
     discardInFlight();
-    setMessages([]); setSessionId(null); setError(null);
+    setMessages([]); setSessionId(null); setError(null); setAskNotice(null);
   }, [discardInFlight]);
 
   const loadSession = React.useCallback(async (id: string) => {
     discardInFlight();
     setError(null);
+    setAskNotice(null);
     try {
       const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
       const json = await res.json();
@@ -484,10 +501,10 @@ function useCopilotState() {
   }, [refreshSessions]);
 
   return {
-    mode, setMode, messages, busy, error, sessionId, sessions,
+    mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    progress, draft, liveReasoning, stop, retry, editAndResend, deleteMessage, clearError,
+    progress, draft, liveReasoning, stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
     confirmTool, cancelTool, completeToolStep, confirmingKey,
     dockPosition, setDockPosition, expanded, setExpanded,
     sidebarWidth, setSidebarWidth,

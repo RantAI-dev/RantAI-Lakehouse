@@ -72,11 +72,11 @@
 //!
 //! # SSRF: private/internal ranges are blocked before dialling
 //!
-//! [`probe_postgres`] and [`probe_s3`] resolve `host` via DNS
-//! ([`resolve_checked`]) and refuse to dial it if ANY resolved address
-//! falls in a private/internal range (RFC1918, loopback, link-local —
-//! which covers cloud metadata endpoints at `169.254.169.254` — or IPv6
-//! unique-local) — see [`is_blocked_ip`]. Checking is done against the
+//! Every dialer here resolves `host` via DNS ([`resolve_checked`]) and
+//! refuses to dial it if ANY resolved address falls in a private/internal
+//! range (RFC1918, loopback, link-local — which covers cloud metadata
+//! endpoints at `169.254.169.254` — carrier-grade NAT, multicast, IPv6
+//! unique-local, ...) — see [`is_blocked_ip`]. Checking is done against the
 //! resolved address, not the literal `host` string: a hostname that
 //! resolves to `10.0.0.5` is blocked exactly the same as a literal
 //! `10.0.0.5`, so the check cannot be bypassed by pointing DNS at an
@@ -84,12 +84,34 @@
 //! gated by [`InternalHosts`] (default: blocked — see
 //! `crate::config::Config::connector_probe_allow_internal_hosts` for every
 //! internal address and `connector_probe_allowed_cidrs` for listed
-//! networks only, and `crate::internal_hosts`) because
-//! this deployment's own seeded connectors
-//! (`rust/migrations/0022_prune_connector_seed.sql`) legitimately point at
-//! `postgres:5432` and `http://rustfs:9000`, both internal compose-network
-//! names; a demo/compose deployment opts out of the block explicitly
-//! rather than the block being off by default everywhere.
+//! networks only, and `crate::internal_hosts`). This deployment's own
+//! seeded connectors (`rust/migrations/0022_prune_connector_seed.sql`)
+//! point at `postgres:5432` and `http://rustfs:9000`, both internal
+//! compose-network names, so on a fresh install their tests are refused
+//! until the operator opts in (`SEC-15`; `.env.example`).
+//!
+//! # SEC-15: the dial goes to the address that was checked
+//!
+//! [`resolve_checked`] returns the [`Approved`] addresses, and each dialer
+//! connects to one of those instead of resolving the name a second time (a
+//! second resolution is a window in which the answer can change). How each
+//! client is pinned:
+//!
+//! - `sqlx` (`PostgreSQL`, `MySQL`): the approved IP is passed as the host.
+//! - `tiberius`: the `TcpStream` is connected to the approved socket
+//!   address; the configured name is kept for the TDS handshake.
+//! - `reqwest` (REST): `ClientBuilder::resolve_to_addrs` maps the URL's
+//!   host to the approved addresses, so `Host` and SNI keep the name.
+//!   Redirects are not followed and the system proxy is not used.
+//! - `object_store` (S3): an [`HttpConnector`] built on a pinned `reqwest`
+//!   client that follows no redirects and uses no proxy.
+//!
+//! `SEC-14` (TLS) must keep the NAME for certificate verification when it
+//! turns verification on; the pinned address replaces only where the socket
+//! connects.
+//!
+//! Refusals are fixed sentences: they may repeat the caller's own `host`,
+//! never the address it resolved to or the resolver's own text.
 //!
 //! # Timeouts
 //!
@@ -376,9 +398,10 @@ async fn probe_mysql(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -387,16 +410,12 @@ async fn probe_mysql(
             ));
         }
     };
-    let options = MySqlConnectOptions::new()
-        .host(target.host)
-        .port(target.port)
-        .username(target.user)
-        .password(password.expose_secret())
-        .database(target.database)
-        // Same explicit-not-implicit reasoning as probe_postgres's
-        // PgSslMode::Prefer: state the effective TLS posture rather than
-        // leaving it to sqlx's default.
-        .ssl_mode(MySqlSslMode::Preferred);
+    let options = mysql_connect_options(
+        &approved,
+        target.user,
+        password.expose_secret(),
+        target.database,
+    );
 
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
@@ -460,9 +479,10 @@ async fn probe_mssql(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -486,12 +506,12 @@ async fn probe_mssql(
     // "accept the presented certificate without verifying its chain"
     // knob.
     config.trust_cert();
-    let addr = config.get_addr();
-
+    // SEC-15: the socket goes to the approved address; `config.host` keeps
+    // the configured name for the TDS handshake, which is what `SEC-14`
+    // needs for certificate verification.
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async move {
-        let tcp = tokio::net::TcpStream::connect(&addr).await?;
-        tcp.set_nodelay(true)?;
+        let tcp = connect_pinned(&approved).await?;
         let mut client = Box::pin(tiberius::Client::connect(config, tcp.compat_write())).await?;
         // A literal, constant query string -- never built from caller
         // input (tiberius's own `simple_query` doc comment: do not use
@@ -585,11 +605,16 @@ async fn probe_rest(
             "connector is misconfigured: a rest adapter's baseUrl must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(host, port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(host, port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    let client = match pinned_http_client(&dial.base_url, host, port, &approved) {
+        Ok(client) => client,
+        Err(message) => return Outcome::misconfigured(message),
+    };
 
-    let request = reqwest::Client::new().get(&dial.base_url);
+    let request = client.get(&dial.base_url);
     let request = match &dial.auth {
         RestAuth::ApiKey { header } => {
             let key = match resolver.resolve_dyn(secret_ref).await {
@@ -663,6 +688,16 @@ async fn probe_rest(
     let elapsed = started.elapsed();
 
     match attempt {
+        // SEC-15: a redirect is reported, never followed; the `Location`
+        // is not echoed (it is the server's text, and may name an address).
+        Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
+            elapsed,
+            format!(
+                "REST request was answered with a redirect (HTTP {}); connection tests do \
+                 not follow redirects",
+                response.status().as_u16()
+            ),
+        ),
         Ok(Ok(response)) if response.status().is_success() => Outcome::success(
             elapsed,
             "Connected via REST and received a successful response.",
@@ -679,6 +714,86 @@ async fn probe_rest(
             elapsed,
             format!("REST request timed out after {}s", DIAL_TIMEOUT.as_secs()),
         ),
+    }
+}
+
+/// `SEC-15`: whether `url`, as the HTTP client will parse it, names exactly
+/// the `host`/`port` that [`resolve_checked`] approved. The check parses the
+/// URL with [`parse_endpoint_host_port`]'s hand-rolled splitter, the client
+/// with the `url` crate; a URL the two read differently could make the client
+/// dial a host the check never saw, so a mismatch is refused.
+fn url_names_target(url: &str, host: &str, port: u16) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|parsed| {
+        parsed
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case(host))
+            && parsed.port_or_known_default() == Some(port)
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    })
+}
+
+/// `SEC-15`: the `reqwest` client for the REST test. The URL's host is mapped
+/// to the [`Approved`] addresses (the `Host` header and SNI keep the name),
+/// redirects are not followed (a redirect would be a second target nobody
+/// checked) and the system proxy is not used (a proxy resolves the name
+/// itself, which defeats the pin).
+///
+/// # Errors
+///
+/// A fixed message when `url` does not name the checked host and port, or the
+/// client cannot be built.
+fn pinned_http_client(
+    url: &str,
+    host: &str,
+    port: u16,
+    approved: &Approved,
+) -> Result<reqwest::Client, String> {
+    if !url_names_target(url, host, port) {
+        return Err(
+            "connector is misconfigured: a rest adapter's baseUrl must be a plain http(s):// URL \
+             with a host and an optional port, and no user name or password"
+                .to_owned(),
+        );
+    }
+    reqwest::Client::builder()
+        .resolve_to_addrs(host, approved.all())
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|err| {
+            tracing::warn!(error = %err, "SEC-15: could not build the pinned REST client");
+            "could not build the HTTP client for this test".to_owned()
+        })
+}
+
+/// `SEC-15`: the HTTP client `object_store` uses for the S3 test, pinned like
+/// [`pinned_http_client`] (approved addresses, no redirects, no proxy).
+/// `object_store`'s own client follows redirects and cannot be told not to
+/// (a `ClientOptions` DNS resolver pins names, but a redirect to an address
+/// literal would not use it), so the connector supplies a `reqwest` 0.13
+/// client built here instead.
+#[derive(Debug)]
+struct PinnedHttpConnector {
+    host: String,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+impl object_store::client::HttpConnector for PinnedHttpConnector {
+    fn connect(
+        &self,
+        _options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let client = reqwest013::Client::builder()
+            .resolve_to_addrs(&self.host, &self.addrs)
+            .redirect(reqwest013::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|err| object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(err),
+            })?;
+        Ok(object_store::client::HttpClient::new(client))
     }
 }
 
@@ -716,42 +831,196 @@ fn probe_sheets() -> Outcome {
 /// - Loopback (`127/8`, `::1`).
 /// - Link-local (`169.254/16` — this is where cloud metadata services
 ///   (AWS/GCP/Azure instance metadata) live, `fe80::/10`).
-/// - The unspecified address (`0.0.0.0`, `::`), which several TCP stacks
-///   treat as "this host".
-/// - IPv6 unique-local (`fc00::/7`).
-/// - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) whose embedded IPv4
-///   address is itself any of the above — otherwise this whole check is
-///   bypassable by asking DNS for an AAAA record wrapping a blocked IPv4
-///   address.
+/// - The unspecified address (`0.0.0.0`, `::`), and the rest of `0/8`
+///   ("this network"), which Linux routes to the local host.
+/// - IPv6 unique-local (`fc00::/7`) and the deprecated site-local range
+///   (`fec0::/10`).
+/// - `SEC-15`: multicast (`224/4`, `ff00::/8`), carrier-grade NAT
+///   (`100.64/10`, RFC 6598: addresses an operator's provider network or an
+///   overlay such as Tailscale uses) and the reserved/broadcast block
+///   (`240/4`, which includes `255.255.255.255`). Multicast was already
+///   refused by the orchestrator's `ssrf_guard.py` and by the allow-list
+///   (`internal_hosts::never_listed`), but not by this check.
+/// - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), an IPv4-compatible one
+///   (`::a.b.c.d`) and the NAT64 well-known prefix (`64:ff9b::/96`) whose
+///   embedded IPv4 address is itself any of the above — otherwise this whole
+///   check is bypassable by asking DNS for an AAAA record wrapping a blocked
+///   IPv4 address.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-        }
+        IpAddr::V4(v4) => is_blocked_v4(*v4),
         IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return true;
             }
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return mapped.is_private()
-                    || mapped.is_loopback()
-                    || mapped.is_link_local()
-                    || mapped.is_unspecified();
+            let segments = v6.segments();
+            let octets = v6.octets();
+            let embedded_v4 =
+                std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+            let is_v4_mapped = v6.to_ipv4_mapped().is_some();
+            let is_v4_compatible = segments[..6].iter().all(|segment| *segment == 0);
+            let is_nat64 = segments[0] == 0x0064
+                && segments[1] == 0xff9b
+                && segments[2..6].iter().all(|segment| *segment == 0);
+            if (is_v4_mapped || is_v4_compatible || is_nat64) && is_blocked_v4(embedded_v4) {
+                return true;
             }
-            let first_segment = v6.segments()[0];
+            let first_segment = segments[0];
             let is_unique_local = first_segment & 0xfe00 == 0xfc00; // fc00::/7
             let is_link_local = first_segment & 0xffc0 == 0xfe80; // fe80::/10
-            is_unique_local || is_link_local
+            let is_site_local = first_segment & 0xffc0 == 0xfec0; // fec0::/10
+            is_unique_local || is_link_local || is_site_local
         }
     }
+}
+
+/// The IPv4 half of [`is_blocked_ip`].
+fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    let is_this_network = octets[0] == 0; // 0/8
+    let is_shared_address_space = octets[0] == 100 && octets[1] & 0xc0 == 64; // 100.64/10
+    let is_reserved = octets[0] >= 240; // 240/4, incl. 255.255.255.255
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        || is_this_network
+        || is_shared_address_space
+        || is_reserved
+}
+
+/// The addresses [`resolve_checked`] approved for one `host:port`: every
+/// address the name resolved to, all of which passed the check (a name that
+/// resolves to even one blocked address is refused as a whole).
+///
+/// `SEC-15`: a dialer connects to one of THESE, never to the name again. The
+/// name is resolved once, here; resolving it a second time at dial time would
+/// let the answer change in between, so the address that was checked would
+/// not be the address that was dialled (a DNS rebind). The type has no
+/// public constructor outside this module, so holding one is the proof that
+/// the check ran.
+#[derive(Debug, Clone)]
+pub(crate) struct Approved {
+    primary: std::net::SocketAddr,
+    all: Vec<std::net::SocketAddr>,
+}
+
+impl Approved {
+    /// The address a single-address client (a `sqlx` host string, a
+    /// `TcpStream`) connects to: the first one the resolver returned, i.e.
+    /// the one the operating system ranks first for this host. A client that
+    /// is pinned to one address does not fall back to the others.
+    pub(crate) fn primary(&self) -> std::net::SocketAddr {
+        self.primary
+    }
+
+    /// [`Self::primary`]'s IP as the text a client library takes as a
+    /// `host`. An IPv6 address is returned without brackets, which is what
+    /// `sqlx` and `tokio` expect for a host string.
+    pub(crate) fn primary_host(&self) -> String {
+        self.primary.ip().to_string()
+    }
+
+    /// Every approved address, for a client that can be given a list
+    /// (`reqwest`).
+    pub(crate) fn all(&self) -> &[std::net::SocketAddr] {
+        &self.all
+    }
+}
+
+/// `SEC-15`: `PostgreSQL` connect options that dial the [`Approved`] address
+/// (host and port), never the name. The TLS posture is pinned explicitly
+/// rather than left to `sqlx`'s default so it is a decision this module
+/// states: `Prefer` (attempt TLS, fall back to plaintext) matches this
+/// deployment's compose-network Postgres, which does not terminate TLS.
+/// `SEC-14` owns changing it, and must keep the name for certificate
+/// verification when it does.
+pub(crate) fn pg_connect_options(
+    approved: &Approved,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> PgConnectOptions {
+    pg_options_for_address(
+        &approved.primary_host(),
+        approved.primary().port(),
+        user,
+        password,
+        database,
+    )
+}
+
+/// The one place the `PostgreSQL` TLS mode is set for connector dials
+/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changes it here).
+/// `host` must already be an approved IP text, not a name:
+/// [`pg_connect_options`] passes [`Approved::primary_host`], and
+/// `connector_deprovision::PgTarget` carries the same text and port.
+pub(crate) fn pg_options_for_address(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> PgConnectOptions {
+    PgConnectOptions::new()
+        .host(host)
+        .port(port)
+        .username(user)
+        .password(password)
+        .database(database)
+        .ssl_mode(PgSslMode::Prefer)
+}
+
+/// `SEC-15`: `MySQL`/`MariaDB` connect options that dial the [`Approved`]
+/// address. Same TLS note as [`pg_connect_options`] (`Preferred`).
+pub(crate) fn mysql_connect_options(
+    approved: &Approved,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> MySqlConnectOptions {
+    MySqlConnectOptions::new()
+        .host(&approved.primary_host())
+        .port(approved.primary().port())
+        .username(user)
+        .password(password)
+        .database(database)
+        .ssl_mode(MySqlSslMode::Preferred)
+}
+
+/// `SEC-15`: open the TCP connection for a `tiberius` client to the
+/// [`Approved`] address, never the name. The client's own `host` setting
+/// stays the configured name for the TDS handshake.
+pub(crate) async fn connect_pinned(approved: &Approved) -> std::io::Result<tokio::net::TcpStream> {
+    let tcp = tokio::net::TcpStream::connect(approved.primary()).await?;
+    tcp.set_nodelay(true)?;
+    Ok(tcp)
+}
+
+/// The refusal text for a host that resolves to an address
+/// [`is_blocked_ip`] covers. Names the caller's own `host` string, never the
+/// address it resolved to (`SEC-15`, feature page decision 6).
+fn refused_internal_message(host: &str) -> String {
+    format!(
+        "refusing to dial {host:?}: it resolves to a private/internal address, which this          installation does not allow connection tests to reach (an operator can list its          network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a          trusted internal deployment)"
+    )
 }
 
 /// Resolve `host:port` via DNS and refuse it if any resolved address is
 /// private/internal and `internal_hosts` does not permit it — see the module doc
 /// comment's "SSRF" section for why this resolves rather than
-/// pattern-matching the literal `host` string. Returns `Err` with a message
-/// safe to surface directly (never includes upstream response data — there
-/// is none at this stage, only DNS resolution).
+/// pattern-matching the literal `host` string. On success returns the
+/// [`Approved`] addresses, and the caller must dial one of those (`SEC-15`:
+/// see [`Approved`]).
+///
+/// # Errors
+///
+/// Returns a fixed message safe to surface directly (`SEC-15`, feature page
+/// decision 6): it may repeat the caller's own `host` string, but never the
+/// address the name resolved to and never the resolver's error text. The
+/// detail goes to the server log. There is no upstream response data at
+/// this stage, only DNS resolution.
 ///
 /// `pub(crate)`, not private: `routes::connectors::ingest_spec_put` calls
 /// this directly to run the SAME check as a second, non-authoritative
@@ -762,29 +1031,45 @@ pub(crate) async fn resolve_checked(
     host: &str,
     port: u16,
     internal_hosts: &InternalHosts,
-) -> Result<(), String> {
+) -> Result<Approved, String> {
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(iter) => iter.collect(),
-        Err(err) => return Err(format!("could not resolve host {host:?}: {err}")),
+        Err(err) => {
+            tracing::warn!(%host, error = %err, "SEC-15: connector host did not resolve");
+            return Err(format!("could not resolve host {host:?}"));
+        }
     };
-    if addrs.is_empty() {
+    check_addrs(host, addrs, internal_hosts)
+}
+
+/// The decision half of [`resolve_checked`], on addresses already resolved:
+/// separate so the mixed-answer case (one public and one internal address)
+/// can be tested without a resolver.
+fn check_addrs(
+    host: &str,
+    addrs: Vec<std::net::SocketAddr>,
+    internal_hosts: &InternalHosts,
+) -> Result<Approved, String> {
+    let Some(&primary) = addrs.first() else {
+        tracing::warn!(%host, "SEC-15: connector host resolved to no address");
         return Err(format!("host {host:?} did not resolve to any address"));
-    }
-    if internal_hosts.allow_all {
-        return Ok(());
-    }
-    for addr in &addrs {
-        if is_blocked_ip(&addr.ip()) && !internal_hosts.permits(&addr.ip()) {
-            return Err(format!(
-                "refusing to dial {host:?}: it resolves to {}, a private/internal address this \
-                 build blocks by default (list its network in CONNECTOR_PROBE_ALLOWED_CIDRS, \
-                 e.g. 192.168.18.0/24, or set CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to \
-                 allow every internal address for a trusted internal deployment)",
-                addr.ip()
-            ));
+    };
+    if !internal_hosts.allow_all {
+        for addr in &addrs {
+            if is_blocked_ip(&addr.ip()) && !internal_hosts.permits(&addr.ip()) {
+                tracing::warn!(
+                    %host,
+                    resolved = %addr.ip(),
+                    "SEC-15: refused a connector host that resolves to an internal address"
+                );
+                return Err(refused_internal_message(host));
+            }
         }
     }
-    Ok(())
+    Ok(Approved {
+        primary,
+        all: addrs,
+    })
 }
 
 /// The pieces [`probe_postgres`] needs to build a [`PgConnectOptions`]
@@ -884,9 +1169,10 @@ async fn dial_postgres(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -895,18 +1181,12 @@ async fn dial_postgres(
             ));
         }
     };
-    let options = PgConnectOptions::new()
-        .host(target.host)
-        .port(target.port)
-        .username(target.user)
-        .password(password.expose_secret())
-        .database(target.database)
-        // Pinned explicitly rather than left to sqlx's default so the
-        // effective TLS posture is a decision this module states, not an
-        // artifact of whatever `sqlx` happens to default to. `Prefer`
-        // (attempt TLS, fall back to plaintext) matches this deployment's
-        // compose-network Postgres, which does not terminate TLS.
-        .ssl_mode(PgSslMode::Prefer);
+    let options = pg_connect_options(
+        &approved,
+        target.user,
+        password.expose_secret(),
+        target.database,
+    );
 
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
@@ -1018,6 +1298,36 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
     "connection failed"
 }
 
+/// The S3 client for [`probe_s3`], pinned to the [`Approved`] addresses of
+/// `endpoint_host` (see [`PinnedHttpConnector`]). Separate from `probe_s3` so
+/// a test can build the same client against a stand-in server.
+fn s3_client(
+    endpoint: &str,
+    bucket: &str,
+    endpoint_host: &str,
+    approved: &Approved,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> object_store::Result<object_store::aws::AmazonS3> {
+    AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_access_key_id(access_key_id)
+        .with_secret_access_key(secret_access_key)
+        // Self-hosted (RustFS), not real AWS S3: path-style addressing, and
+        // `object_store` must be told explicitly this is not talking to
+        // AWS or it refuses a plain-http/self-signed endpoint outright —
+        // same posture `lakehouse-iceberg::storage`'s client uses.
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        // SEC-15: the pinned, redirect-free HTTP client.
+        .with_http_connector(PinnedHttpConnector {
+            host: endpoint_host.to_owned(),
+            addrs: approved.all().to_vec(),
+        })
+        .build()
+}
+
 async fn probe_s3(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
@@ -1033,8 +1343,15 @@ async fn probe_s3(
             "connector is misconfigured: S3 endpoint must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(endpoint_host, endpoint_port, internal_hosts).await {
-        return Outcome::misconfigured(message);
+    let approved = match resolve_checked(endpoint_host, endpoint_port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    if !url_names_target(endpoint, endpoint_host, endpoint_port) {
+        return Outcome::misconfigured(
+            "connector is misconfigured: S3 endpoint must be a plain http(s):// URL with a host \
+             and an optional port, and no user name or password",
+        );
     }
     let Some(secret_ref_secondary) = info.secret_ref_secondary.as_deref() else {
         return Outcome::misconfigured(
@@ -1059,22 +1376,21 @@ async fn probe_s3(
         }
     };
 
-    let built = AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(bucket)
-        .with_access_key_id(access_key.expose_secret())
-        .with_secret_access_key(secret_key.expose_secret())
-        // Self-hosted (RustFS), not real AWS S3: path-style addressing, and
-        // `object_store` must be told explicitly this is not talking to
-        // AWS or it refuses a plain-http/self-signed endpoint outright —
-        // same posture `lakehouse-iceberg::storage`'s client uses.
-        .with_virtual_hosted_style_request(false)
-        .with_allow_http(true)
-        .build();
+    let built = s3_client(
+        endpoint,
+        bucket,
+        endpoint_host,
+        &approved,
+        access_key.expose_secret(),
+        secret_key.expose_secret(),
+    );
     let client = match built {
         Ok(client) => client,
         Err(err) => {
-            return Outcome::misconfigured(format!("failed to build the S3 client: {err}"));
+            // The error's own text is not the caller's to read (principle
+            // 4); it goes to the log.
+            tracing::warn!(error = %err, "SEC-15: could not build the S3 test client");
+            return Outcome::misconfigured("failed to build the S3 client for this connector");
         }
     };
 
@@ -1369,6 +1685,22 @@ mod tests {
             "fc00::1",         // IPv6 unique-local
             "fe80::1",         // IPv6 link-local
             "::ffff:10.0.0.1", // IPv4-mapped IPv6, private
+            // SEC-15 additions (see `is_blocked_ip`'s doc comment):
+            "0.1.2.3",                // rest of 0/8, "this network"
+            "100.64.0.1",             // carrier-grade NAT, low edge
+            "100.127.255.254",        // carrier-grade NAT, high edge
+            "224.0.0.1",              // IPv4 multicast
+            "239.255.255.250",        // IPv4 multicast, high end
+            "240.0.0.1",              // reserved
+            "255.255.255.255",        // broadcast
+            "ff02::1",                // IPv6 multicast
+            "fec0::1",                // IPv6 site-local
+            "::ffff:127.0.0.1",       // IPv4-mapped loopback
+            "::ffff:169.254.169.254", // IPv4-mapped metadata address
+            "::ffff:100.64.0.1",      // IPv4-mapped carrier-grade NAT
+            "::10.0.0.1",             // IPv4-compatible, private
+            "64:ff9b::a00:1",         // NAT64 well-known prefix wrapping 10.0.0.1
+            "64:ff9b::7f00:1",        // NAT64 wrapping 127.0.0.1
         ];
         for ip in blocked {
             let addr: IpAddr = ip.parse().unwrap();
@@ -1379,6 +1711,13 @@ mod tests {
             "8.8.8.8",
             "1.1.1.1",
             "2606:4700:4700::1111", // Cloudflare public IPv6
+            // Just outside the ranges added by SEC-15.
+            "100.63.255.255",
+            "100.128.0.1",
+            "223.255.255.255",
+            "1.0.0.1",
+            "64:ff9b::808:808", // NAT64 wrapping 8.8.8.8
+            "::ffff:8.8.8.8",
         ];
         for ip in allowed {
             let addr: IpAddr = ip.parse().unwrap();
@@ -1436,6 +1775,302 @@ mod tests {
             allowed: crate::internal_hosts::parse_cidrs("127.0.0.0/8").unwrap(),
         };
         assert!(resolve_checked("127.0.0.1", 1, &listed).await.is_err());
+    }
+
+    fn sock(ip: &str) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(ip.parse().unwrap(), 5432)
+    }
+
+    /// SEC-15 (K1): a name with one public and one internal address is
+    /// refused as a whole, whichever order the resolver returned them in.
+    #[test]
+    fn check_addrs_refuses_a_mixed_answer_in_either_order() {
+        for addrs in [
+            vec![sock("93.184.216.34"), sock("10.0.0.5")],
+            vec![sock("10.0.0.5"), sock("93.184.216.34")],
+        ] {
+            let err = check_addrs("db.example.com", addrs, &InternalHosts::NONE).unwrap_err();
+            assert!(err.contains("db.example.com"), "{err}");
+            assert!(!err.contains("10.0.0.5"), "no address in a refusal: {err}");
+            assert!(
+                !err.contains("93.184.216.34"),
+                "no address in a refusal: {err}"
+            );
+        }
+    }
+
+    /// SEC-15 (K1): an all-public answer is approved whole, in resolver
+    /// order, and `primary` is the first.
+    #[test]
+    fn check_addrs_approves_every_public_address_and_keeps_the_resolver_order() {
+        let approved = check_addrs(
+            "db.example.com",
+            vec![sock("93.184.216.34"), sock("2606:2800:220:1::1")],
+            &InternalHosts::NONE,
+        )
+        .unwrap();
+        assert_eq!(approved.primary(), sock("93.184.216.34"));
+        assert_eq!(approved.all().len(), 2);
+        assert_eq!(approved.primary_host(), "93.184.216.34");
+    }
+
+    /// SEC-15 (K1): an allow-listed network approves an internal address;
+    /// a mixed answer is still refused when ONE address is outside the list.
+    #[test]
+    fn check_addrs_honours_the_allow_list_and_allow_all() {
+        let lan = InternalHosts {
+            allow_all: false,
+            allowed: crate::internal_hosts::parse_cidrs("192.168.18.0/24").unwrap(),
+        };
+        assert!(check_addrs("db.lan", vec![sock("192.168.18.7")], &lan).is_ok());
+        assert!(
+            check_addrs(
+                "db.lan",
+                vec![sock("192.168.18.7"), sock("192.168.19.7")],
+                &lan
+            )
+            .is_err()
+        );
+        assert!(check_addrs("db.lan", vec![sock("127.0.0.1")], &InternalHosts::ALL).is_ok());
+    }
+
+    #[test]
+    fn check_addrs_refuses_an_empty_answer() {
+        let err = check_addrs("db.example.com", Vec::new(), &InternalHosts::ALL).unwrap_err();
+        assert!(err.contains("did not resolve to any address"), "{err}");
+    }
+
+    /// SEC-15 (K1): a name that does not resolve is refused with a fixed
+    /// sentence carrying the caller's own host and nothing from the
+    /// resolver. `.invalid` is reserved (RFC 6761) and never resolves.
+    #[tokio::test]
+    async fn resolve_checked_reports_an_unresolvable_name_without_resolver_text() {
+        let err = resolve_checked("no-such-host.invalid", 5432, &InternalHosts::NONE)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "could not resolve host \"no-such-host.invalid\"");
+    }
+
+    /// SEC-15 (K1): the refusal of a blocked literal names the caller's
+    /// host and no address (the host IS the literal here, so the check is
+    /// that nothing beyond the host string and the fixed advice appears).
+    #[tokio::test]
+    async fn resolve_checked_refusal_for_a_name_that_resolves_internally_contains_no_address() {
+        let err = resolve_checked("localhost", 1, &InternalHosts::NONE)
+            .await
+            .unwrap_err();
+        for resolved in ["127.0.0.1", "::1"] {
+            assert!(!err.contains(resolved), "{err}");
+        }
+    }
+
+    /// SEC-15 (K1): `resolve_checked` hands back the address it approved.
+    #[tokio::test]
+    async fn resolve_checked_returns_the_approved_address() {
+        let approved = resolve_checked("127.0.0.1", 4242, &InternalHosts::ALL)
+            .await
+            .unwrap();
+        assert_eq!(approved.primary(), sock_with_port("127.0.0.1", 4242));
+        assert_eq!(approved.primary_host(), "127.0.0.1");
+    }
+
+    fn sock_with_port(ip: &str, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(ip.parse().unwrap(), port)
+    }
+
+    // -- SEC-15 K2/K3: the dial goes to the approved address; no redirects --
+
+    fn approved_for(addr: std::net::SocketAddr, host: &str) -> Approved {
+        check_addrs(host, vec![addr], &InternalHosts::ALL).unwrap()
+    }
+
+    /// SEC-15 (K2): the `PostgreSQL` and `MySQL` options carry the approved
+    /// address and port, not the name the connector was configured with.
+    #[test]
+    fn sql_connect_options_dial_the_approved_address_not_the_name() {
+        let approved = approved_for(sock_with_port("192.0.2.9", 6543), "db.example.com");
+        let pg = pg_connect_options(&approved, "u", "p", "d");
+        assert_eq!(pg.get_host(), "192.0.2.9");
+        assert_eq!(pg.get_port(), 6543);
+        let mysql = mysql_connect_options(&approved, "u", "p", "d");
+        assert_eq!(mysql.get_host(), "192.0.2.9");
+        assert_eq!(mysql.get_port(), 6543);
+    }
+
+    /// SEC-15 (K2): the `tiberius` socket goes to the approved address. The
+    /// name given for the check does not resolve at all (`.invalid`), so a
+    /// connection can only arrive if the dial used the address.
+    #[tokio::test]
+    async fn connect_pinned_dials_the_approved_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let approved = approved_for(listener.local_addr().unwrap(), "mssql.invalid");
+        let (accepted, connected) = tokio::join!(listener.accept(), connect_pinned(&approved));
+        accepted.unwrap();
+        connected.unwrap();
+    }
+
+    /// SEC-15 (K2): the REST client reaches a server through a name that
+    /// resolves nowhere, because the name is pinned to the approved address;
+    /// an unpinned client cannot (the control).
+    #[tokio::test]
+    async fn pinned_http_client_dials_the_approved_address_not_the_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let url = format!("http://pinned-rest.invalid:{}/", addr.port());
+        assert!(
+            reqwest::Client::new().get(&url).send().await.is_err(),
+            "control: the name must not resolve without the pin"
+        );
+        let approved = approved_for(addr, "pinned-rest.invalid");
+        let client =
+            pinned_http_client(&url, "pinned-rest.invalid", addr.port(), &approved).unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        assert!(response.status().is_success());
+    }
+
+    /// SEC-15 (K2): a URL the client would read as another host than the
+    /// one that was checked is refused instead of dialled.
+    #[test]
+    fn pinned_http_client_refuses_a_url_that_names_another_host() {
+        let approved = approved_for(sock_with_port("93.184.216.34", 80), "example.com");
+        for url in [
+            "http://example.com@10.0.0.1/",
+            "http://other.example.org/",
+            "http://example.com:81/",
+            "not a url",
+        ] {
+            assert!(
+                pinned_http_client(url, "example.com", 80, &approved).is_err(),
+                "{url} must be refused"
+            );
+        }
+        assert!(
+            pinned_http_client("http://example.com/path?q=1", "example.com", 80, &approved).is_ok()
+        );
+    }
+
+    /// SEC-15 (K3): a redirect is reported as one and the second request is
+    /// never made; the message carries neither the `Location` nor its address.
+    #[tokio::test]
+    async fn probe_rest_reports_a_redirect_and_never_follows_it() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let dial = RestDial {
+            base_url: origin.uri(),
+            auth: RestAuth::Bearer,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest(
+            &dial,
+            "env:REST_TEST_TOKEN",
+            None,
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.message.contains("redirect"), "{}", outcome.message);
+        assert!(outcome.message.contains("302"), "{}", outcome.message);
+        assert!(
+            !outcome
+                .message
+                .contains(&target.address().port().to_string()),
+            "the Location must not be echoed: {}",
+            outcome.message
+        );
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            0,
+            "the redirect target must never be requested"
+        );
+    }
+
+    fn empty_bucket_listing() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/xml")
+            .set_body_string(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult><Name>bucket</Name><KeyCount>0</KeyCount>\
+                 <IsTruncated>false</IsTruncated></ListBucketResult>",
+            )
+    }
+
+    /// SEC-15 (K2): the S3 client reaches a server through a name that
+    /// resolves nowhere.
+    #[tokio::test]
+    async fn s3_client_dials_the_approved_address_not_the_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(empty_bucket_listing())
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let endpoint = format!("http://pinned-s3.invalid:{}", addr.port());
+        let approved = approved_for(addr, "pinned-s3.invalid");
+        let client = s3_client(
+            &endpoint,
+            "bucket",
+            "pinned-s3.invalid",
+            &approved,
+            "ak",
+            "sk",
+        )
+        .unwrap();
+        tokio::time::timeout(DIAL_TIMEOUT, client.list_with_delimiter(None))
+            .await
+            .expect("the listing must finish inside the dial bound")
+            .expect("the pinned client must reach the stand-in server");
+    }
+
+    /// SEC-15 (K3, S3): a redirect from the S3 endpoint is not followed.
+    #[tokio::test]
+    async fn s3_client_does_not_follow_a_redirect() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(empty_bucket_listing())
+            .mount(&target)
+            .await;
+        let origin = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let addr = *origin.address();
+        let approved = approved_for(addr, "127.0.0.1");
+        let client =
+            s3_client(&origin.uri(), "bucket", "127.0.0.1", &approved, "ak", "sk").unwrap();
+        let listed = tokio::time::timeout(DIAL_TIMEOUT, client.list_with_delimiter(None))
+            .await
+            .expect("the listing must finish inside the dial bound");
+        assert!(listed.is_err(), "a redirect is not a successful listing");
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            0,
+            "the redirect target must never be requested"
+        );
     }
 
     // -- WS3 item 13: probe_mysql/probe_mssql/probe_rest/probe_sheets --

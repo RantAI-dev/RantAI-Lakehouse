@@ -193,10 +193,12 @@ denied, `missing_docs` warned (`rust/Cargo.toml` `[workspace.lints]`).
 - `tests/route_auth.rs` sweeps `POLICY_TABLE` itself; a new entry is covered
   automatically, but a permission-gated route must be asserted in *both*
   directions: wrong principal → 403, right principal → never 401/403.
-- Caller-controlled network targets go through `connector_dial::resolve_checked`
-  (DNS-resolved, internal ranges blocked unless
-  `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`) and a bounded
-  `tokio::time::timeout`.
+- Caller-controlled network targets go through
+  `connector_probe::resolve_checked` (DNS-resolved, internal ranges blocked
+  unless `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` or the address is in
+  `CONNECTOR_PROBE_ALLOWED_CIDRS`), the dial uses the `Approved` address it
+  returns instead of resolving the name again, redirects are not followed, and
+  the dial has a bounded `tokio::time::timeout` (`SEC-15`).
 
 ### 3.5 Store layer (sqlx) and migrations
 

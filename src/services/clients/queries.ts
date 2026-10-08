@@ -6,15 +6,18 @@ import type {
   SavedQuery,
   QueryHistoryItem,
   QuerySchedulingCapability,
+  NlAnswer,
 } from "../contracts/queries";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
+import { chatAnswerFromBody } from "./chat-answer";
 
 /**
  * QueryService is real — `run`/`estimate` execute SQL against ClickHouse
- * (our lakehouse) via the server route `/api/query/*`; `generateSql` goes
- * through `/api/agent/text-to-sql` (an LLM grounded on the lakehouse schema,
- * Phase 1). `listSaved`/`listHistory` are now real too, stored in Postgres
+ * (our lakehouse) via the server route `/api/query/*`; `askQuestion` and
+ * `generateSql` go through `/api/ai/chat`, the copilot's engine, so the SQL
+ * they run is masked and row-filtered for the caller. `listSaved`/`listHistory`
+ * are now real too, stored in Postgres
  * via the `lakehouse-store` crate (Phase 2, Task 2.4) — replacing all of
  * `mock/queries.ts`.
  *
@@ -58,6 +61,34 @@ async function postJson<T>(
   return json as T;
 }
 
+async function askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer> {
+  const res = await apiFetch("/api/ai/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // No `stream` (one JSON object back) and no `mode` (no writing tool
+    // is offered); `tools` is an allowlist, so the box can read the
+    // lakehouse and nothing else.
+    body: JSON.stringify({
+      messages: [{ role: "user", content: question }],
+      tools: ["run_sql", "list_datasets", "describe_dataset", "lakehouse_overview"],
+    }),
+    signal,
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new ServiceError(
+      "unavailable",
+      json?.detail ?? json?.error ?? "The assistant could not answer. Try again."
+    );
+  }
+  // A 200 whose body is not a JSON object (a proxy's HTML page, say) would
+  // otherwise read as an empty answer and show the user nothing, with no error.
+  if (json === null || typeof json !== "object" || Array.isArray(json)) {
+    throw new ServiceError("unavailable", "The assistant could not answer. Try again.");
+  }
+  return chatAnswerFromBody(json);
+}
+
 export const clickhouseQueryService: QueryService = {
   // ── real (ClickHouse / Trino) ────────────────────────────────────────────
   run(sql, options, signal) {
@@ -67,19 +98,15 @@ export const clickhouseQueryService: QueryService = {
     return postJson<QueryEstimate>("/api/query/estimate", { sql }, signal);
   },
 
-  // ── real (agent text-to-SQL, LLM grounded on the lakehouse schema) ─────
+  // ── real (the copilot's chat engine) ───────────────────────────────────
+  askQuestion,
   async generateSql(question, signal) {
-    const res = await apiFetch("/api/agent/text-to-sql", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
-      signal,
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      throw new ServiceError("unavailable", json?.detail ?? json?.error ?? "Agent unavailable");
+    // Same call as `askQuestion`: the query runs once on the server on the way.
+    const out = await askQuestion(question, signal);
+    if (out.sql === undefined) {
+      throw new ServiceError("unavailable", out.answer || "The assistant ran no query.");
     }
-    return { sql: json.sql, explanation: json.explanation ?? "", assumptions: json.assumptions ?? [] };
+    return { sql: out.sql, explanation: out.answer };
   },
 
   // ── real (Postgres) ────────────────────────────────────────────────────

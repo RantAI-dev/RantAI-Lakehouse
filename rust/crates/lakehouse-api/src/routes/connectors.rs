@@ -367,6 +367,26 @@ fn reject_non_patchable_fields(body: &Bytes) -> Result<(), ApiError> {
     })
 }
 
+/// The refusal for a `host` change on a connector that connects using its
+/// `host` column (`SEC-14`, decision D4).
+const HOST_CHANGE_NEEDS_CREDENTIALS: &str = "This connector connects using its host, so changing \
+     the host would send its stored credential to a different server. Nothing was changed. Where \
+     a connector points is changed through PUT /api/connectors/{id}/ingest-spec, together with \
+     its credentials.";
+
+/// `SEC-14` (decision D4): the refusal for `PATCH` changing `host` on a
+/// connector that dials from that column — a row with no adapter (the
+/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from it)
+/// and a `files` row (the S3 probe reads `<endpoint>|<bucket>`). For every
+/// other adapter the column is a label: the dial comes from `dial`, which
+/// has its own guarded route. A `host` equal to the stored one (ignoring
+/// case and padding) changes nothing and is accepted.
+fn host_change_refusal(stored: &ConnectorDialInfo, new_host: &str) -> Option<ApiError> {
+    let dials_from_host = matches!(stored.adapter.as_deref(), None | Some("files"));
+    (dials_from_host && !stored.host.trim().eq_ignore_ascii_case(new_host.trim()))
+        .then(|| ApiError::Conflict(HOST_CHANGE_NEEDS_CREDENTIALS.to_owned()))
+}
+
 /// `PATCH /api/connectors/{id}` — edit a connector's name, direction,
 /// environment, residency and connection-target label. The console's edit
 /// page calls this alongside the ingest-spec, tenant and credential routes,
@@ -376,7 +396,9 @@ fn reject_non_patchable_fields(body: &Bytes) -> Result<(), ApiError> {
 ///
 /// 401 without a principal (see [`create`] on why it is `Option`); 400 per
 /// [`update_input`] / [`reject_non_patchable_fields`]; 404 if `id` is
-/// unknown; 409 if the new name is taken; 503/500 as every other route.
+/// unknown; 409 if the new name is taken, or if `host` changes on a
+/// connector that dials from it ([`host_change_refusal`], `SEC-14`);
+/// 503/500 as every other route.
 pub async fn update(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -398,6 +420,14 @@ pub async fn update(
     .into_iter()
     .filter_map(|(field, changed)| changed.then_some(field))
     .collect();
+    // SEC-14: before anything is written — a connector that dials from
+    // `host` would send its stored credential to the new one.
+    if let Some(new_host) = input.host.as_deref()
+        && let Some(stored) = connectors::get_connector_dial_info(pool(&state)?, &id).await?
+        && let Some(refusal) = host_change_refusal(&stored, new_host)
+    {
+        return Err(refusal.into());
+    }
     let updated = match connectors::update_connector(pool(&state)?, &id, &input).await {
         Ok(updated) => updated,
         Err(lakehouse_store::StoreError::NotFound) => {
@@ -1338,6 +1368,29 @@ struct SlotChange {
     old_ref: Option<String>,
 }
 
+/// The refusal for a change of where a connector points that does not
+/// carry the connector's credentials (`SEC-14`, decisions D2 and D3). One
+/// fixed text for every route that can re-point, so the console and the
+/// assistant show the same thing; it names no host, address or credential.
+const REPOINT_NEEDS_CREDENTIALS: &str = "This change points the connector at a different server, \
+     so every credential it signs in with must be sent again in the same request. Nothing was \
+     saved and no connection was made.";
+
+/// How many credential slots (0, 1 or 2) a connector of `adapter` with this
+/// `dial` reads: the length of its `secret_field_names` entry, which is what
+/// the ingest job resolves. `Kafka` without authentication reads none.
+fn credential_slots_read(adapter: &str, dial: &Dial) -> usize {
+    lakehouse_store::ingest_spec::secret_field_names(adapter, dial.secret_map_auth_type())
+        .map_or(0, <[&str]>::len)
+}
+
+/// Whether the credentials a request carries cover every slot a connector
+/// reads (`required` from [`credential_slots_read`]): the primary for one or
+/// two slots, the secondary for two.
+fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
+    (required == 0 || primary) && (required < 2 || secondary)
+}
+
 /// Whether a connector can have a second credential: an S3-shaped `files`
 /// connector (access key + secret key) or a `rest` one (basic auth's
 /// username + password, an `OAuth2` client id + secret). Every other adapter
@@ -1425,7 +1478,9 @@ fn slot_changes(
 /// # Errors
 ///
 /// 400 for settings sent to a connector that has none to replace, or that
-/// do not parse as its adapter's shape.
+/// do not parse as its adapter's shape; 409 ([`REPOINT_NEEDS_CREDENTIALS`])
+/// for settings that change the connector's target identity when `changes`
+/// does not carry every credential slot they read (`SEC-14`).
 fn candidate_dial_info(
     dial_info: &ConnectorDialInfo,
     changes: &[SlotChange],
@@ -1447,7 +1502,27 @@ fn candidate_dial_info(
                     .to_owned(),
             )
         })?;
-        Dial::parse(adapter, &dial).map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        let parsed = Dial::parse(adapter, &dial)
+            .map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        // SEC-14: settings that move the connector to another target are
+        // tested with the credentials of THIS request only. A slot left out
+        // would be resolved from the stored ref and sent to the new target,
+        // so every slot the new settings read must be in the request.
+        // Refused before the probe, hence before any lookup or connection.
+        if lakehouse_store::ingest_spec::is_repoint(
+            dial_info.adapter.as_deref(),
+            &dial_info.dial,
+            &parsed,
+        ) {
+            let has = |slot: connectors::SecretSlot| changes.iter().any(|c| c.slot == slot);
+            if !slots_cover(
+                credential_slots_read(adapter, &parsed),
+                has(connectors::SecretSlot::Primary),
+                has(connectors::SecretSlot::Secondary),
+            ) {
+                return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()));
+            }
+        }
         candidate.dial = dial;
     }
     Ok(candidate)
@@ -1480,6 +1555,46 @@ async fn replace_credentials(
     id: &str,
     changes: &[SlotChange],
 ) -> Result<(), ApiError> {
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    publish_credentials(state, id, changes, async {
+        if swaps.is_empty() {
+            return Ok(());
+        }
+        connectors::swap_secret_refs(pool(state)?, id, &swaps)
+            .await
+            .map_err(|err| swap_error(id, err))
+    })
+    .await
+}
+
+/// The part of [`replace_credentials`] every credential change shares
+/// (`SEC-14` extracts it so the ingest-spec re-point reuses it): write the
+/// new values aside, put them in place keeping the files they replace, then
+/// run `write` — the database write that makes the change real. If `write`
+/// fails the files go back exactly as they were; if it succeeds the backups
+/// are dropped and any managed file a slot no longer names is removed.
+///
+/// `write` is awaited only after the values are in place and while the
+/// store's change lock is held, so it must not itself take that lock.
+///
+/// # Errors
+///
+/// A store failure (400/503) staging or publishing the values, or whatever
+/// `write` returns; in every case nothing changed.
+async fn publish_credentials<T>(
+    state: &AppState,
+    id: &str,
+    changes: &[SlotChange],
+    write: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
     let store = &state.connector_secret_store;
     let _serialized = store.lock().await;
     let staged = store
@@ -1495,29 +1610,13 @@ async fn replace_credentials(
         .publish()
         .await
         .map_err(|err| secret_store_error(&err))?;
-    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
-        .iter()
-        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
-        .map(|c| connectors::SecretRefSwap {
-            slot: c.slot,
-            expected_old: c.old_ref.as_deref(),
-            new_ref: &c.new_ref,
-        })
-        .collect();
-    let swapped = if swaps.is_empty() {
-        Ok(())
-    } else {
-        match pool(state) {
-            Ok(pool) => connectors::swap_secret_refs(pool, id, &swaps)
-                .await
-                .map_err(|err| swap_error(id, err)),
-            Err(err) => Err(err),
+    let written = match write.await {
+        Ok(written) => written,
+        Err(err) => {
+            published.rollback().await;
+            return Err(err);
         }
     };
-    if let Err(err) = swapped {
-        published.rollback().await;
-        return Err(err);
-    }
     published.commit().await;
     // A slot whose kind changed no longer names its old managed file —
     // unless that file is now the OTHER slot's (the two swapped kinds).
@@ -1529,7 +1628,7 @@ async fn replace_credentials(
             remove_managed_credentials(state, id, Some(old_ref), None).await;
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// `PUT /api/connectors/{id}/credential` — the user supplies credential
@@ -1561,8 +1660,10 @@ async fn replace_credentials(
 /// 400 on a malformed body, no slot at all, or an unusable value; 404 if
 /// `id` is unknown; 422 if the probe dialed and the source rejected the
 /// credential; 409 if a slot's ref changed between this handler's read and
-/// its write; 503 if the credential store is not mounted; 500 as every
-/// other route.
+/// its write, or ([`REPOINT_NEEDS_CREDENTIALS`], `SEC-14`) if `dial` moves
+/// the connector to another target without every credential slot it reads
+/// in the same request; 503 if the credential store is not mounted; 500 as
+/// every other route.
 ///
 /// [`CandidateSecretResolver`]: crate::connector_secret_store::CandidateSecretResolver
 pub async fn set_credential(
@@ -2261,18 +2362,34 @@ async fn deprovision_with_names(
     slot_name: &str,
     publication_name: &str,
 ) -> Result<Deprovisioned, ApiError> {
+    // SEC-15: the clean-up dials the host a caller registered, so it gets the
+    // same address check as a connection test, BEFORE the credential is
+    // resolved, and dials the address the check approved. A refused target
+    // is never dialled (feature page decision 7); `delete` turns the refusal
+    // into a fixed 409, and `?force=true` removes the row without dialling.
+    let approved = connector_probe::resolve_checked(
+        &target.host,
+        target.port,
+        &state.config.connector_internal_hosts(),
+    )
+    .await
+    .map_err(|message| {
+        ApiError::Conflict(format!("the source database was not contacted: {message}"))
+    })?;
     let password = state
         .connector_secret_resolver
         .resolve_dyn(&dial_info.secret_ref)
         .await
         .map_err(|err| {
+            // The resolver's text is for the log, not the response.
+            tracing::warn!(connector_id = %id, error = %err, "could not resolve a connector's credential to deprovision its CDC slot");
             ApiError::Internal(format!(
-                "could not resolve connector {id}'s credential to deprovision its CDC slot: {err}"
+                "could not resolve connector {id}'s credential to deprovision its CDC slot"
             ))
         })?;
     let pg_target = PgTarget {
-        host: target.host.clone(),
-        port: target.port,
+        host: approved.primary_host(),
+        port: approved.primary().port(),
         user: target.user.clone(),
         password,
         database: target.database.clone(),
@@ -2280,6 +2397,9 @@ async fn deprovision_with_names(
     connector_deprovision::drop_slot_and_publication(&pg_target, slot_name, publication_name)
         .await
         .map_err(|err| {
+            // SEC-15: `sqlx`'s own text stays in the log; the response gets
+            // `DeprovisionError::summary`.
+            tracing::warn!(connector_id = %id, error = %err, "CDC deprovisioning failed");
             ApiError::Internal(deprovision_error_message(
                 id,
                 slot_name,
@@ -2291,9 +2411,9 @@ async fn deprovision_with_names(
 
 /// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
 /// a log line — never the credential [`deprovision_with_names`] resolved,
-/// only the slot/publication names and the error's own `Display` (which,
-/// per [`DeprovisionError`]'s doc comment, never includes connection
-/// credentials).
+/// and (`SEC-15`) never the error's own `Display`, which carries `sqlx`'s
+/// text: only the slot/publication names and
+/// [`DeprovisionError::summary`]'s fixed sentence.
 fn deprovision_error_message(
     id: &str,
     slot_name: &str,
@@ -2302,7 +2422,8 @@ fn deprovision_error_message(
 ) -> String {
     format!(
         "deprovisioning connector {id}'s CDC replication slot ({slot_name:?}) and publication \
-         ({publication_name:?}) failed: {err}"
+         ({publication_name:?}) failed: {}",
+        err.summary()
     )
 }
 
@@ -2338,6 +2459,16 @@ fn deprovision_error_message(
 ///   at a decommissioned or now-unreachable host — deprovisioning can
 ///   never succeed there, and an operator who already knows that needs a
 ///   way to remove the row anyway rather than being stuck forever.
+///
+/// # The clean-up goes through the address check (`SEC-15`)
+///
+/// The clean-up dials the host the connector was registered with, so it runs
+/// [`connector_probe::resolve_checked`] first and dials the address that
+/// approved (feature page decision 7). A target the check refuses (an
+/// internal address while the block is on, or a name that does not resolve)
+/// is never dialled: without `force` the delete is a 409 carrying the fixed
+/// refusal, with `?force=true` the row is removed and nothing is dialled.
+/// The 409 text is a fixed sentence either way, never driver text.
 ///
 /// # Pipelines that read from the connector block the delete
 ///
@@ -2402,11 +2533,13 @@ pub async fn delete(
                 |_| "its CDC slot/publication".to_owned(),
                 |s| format!("slot {s}_slot / publication {s}_pub"),
             );
+            // SEC-15: `err` is a fixed sentence (a refusal of the target by
+            // the address check, or a classified failure), never driver text.
             return Err(ApiError::Conflict(format!(
-                "connector {id} was NOT deleted: dropping {slug_hint} failed ({err}); the \
-                 registry row is kept deliberately so this orphaned slot stays visible instead \
-                 of silently pinning WAL on the source database forever. Retry once the source \
-                 is reachable, or pass ?force=true to delete the row anyway (the \
+                "connector {id} was NOT deleted: dropping {slug_hint} did not complete ({err}); \
+                 the registry row is kept deliberately so this orphaned slot stays visible \
+                 instead of silently pinning WAL on the source database forever. Retry once the \
+                 source is reachable, or pass ?force=true to delete the row anyway (the \
                  slot/publication will then have to be cleaned up manually)."
             ))
             .into());
@@ -2565,6 +2698,22 @@ pub struct IngestSpecBody {
     source_objects: serde_json::Value,
     #[serde(default)]
     schedule_cron: Option<String>,
+    /// The connector's credentials, sent again when this save changes where
+    /// it points (`SEC-14`). Absent for any other save.
+    #[serde(default)]
+    credential: Option<IngestCredentialBody>,
+}
+
+/// `credential` on the `PUT /api/connectors/{id}/ingest-spec` body: the
+/// same slots as `PUT .../credential` (without a `dial`, which is the spec
+/// itself). Write-only values, never echoed back.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngestCredentialBody {
+    #[serde(default)]
+    primary: Option<CredentialSlotBody>,
+    #[serde(default)]
+    secondary: Option<CredentialSlotBody>,
 }
 
 /// A second, non-authoritative SSRF check on `dial`'s host, run at
@@ -2583,10 +2732,11 @@ pub struct IngestSpecBody {
 ///
 /// # Errors
 ///
-/// Returns `ApiError::BadRequest` naming the offending resolved address
-/// (the same message [`connector_probe::resolve_checked`] already produces
-/// for `POST .../test`) if a checked host resolves to a private/internal
-/// address that `internal_hosts` does not permit.
+/// Returns `ApiError::BadRequest` with the fixed message
+/// [`connector_probe::resolve_checked`] produces for `POST .../test` (the
+/// caller's own host, never the address it resolved to: `SEC-15`) if a
+/// checked host resolves to a private/internal address that
+/// `internal_hosts` does not permit, or does not resolve.
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
@@ -2616,8 +2766,11 @@ async fn check_dial_ssrf(
     let Some((host, port)) = host_port else {
         return Ok(());
     };
+    // The approved address is dropped on purpose: this is the advisory
+    // save-time check, and nothing is dialled here.
     connector_probe::resolve_checked(host, port, internal_hosts)
         .await
+        .map(|_approved| ())
         .map_err(ApiError::BadRequest)
 }
 
@@ -2697,16 +2850,42 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// would let a scheduled connector replace or append to what a person
 /// uploaded.
 ///
+/// # Changing where the connector points needs its credentials (`SEC-14`)
+///
+/// The connector keeps its stored credential, and every later test,
+/// discovery, delete or scheduled ingest resolves it and sends it to
+/// whatever `dial` names. So a save that changes the connector's target
+/// identity ([`lakehouse_store::ingest_spec::is_repoint`]: adapter, host,
+/// port, database, endpoint, bucket, base URL, brokers…) must carry every
+/// credential slot the new `dial` reads, in `credential`. Without them it
+/// is refused with a fixed 409 ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
+/// save-time address check and before any connection: nothing is resolved,
+/// dialled or written. With them the new settings are probed with those
+/// credentials alone (a [`crate::connector_secret_store::CandidateSecretResolver`],
+/// as `PUT .../credential` does), a failed probe is a 422, and otherwise the
+/// credential files and the spec are written together
+/// ([`publish_credentials`] around
+/// [`lakehouse_store::connectors::repoint_ingest_spec`]): both or neither.
+/// The first dial of a connector that has none yet is not a re-point.
+///
+/// The assistant's `set_ingest_spec` tool calls this handler with no
+/// principal and never forwards a `credential`, so it reaches the 409 for a
+/// re-point and cannot carry a secret.
+///
 /// # Errors
 ///
 /// 404 if `id` is unknown; 400 if `dial` fails
 /// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
 /// refuses `dial`'s host (`StoreError::Validation` maps to
 /// `ApiError::BadRequest`, never `Internal` — both messages are safe to
-/// surface); 409 if a target is a table name uploads have reserved; 503/500 as
-/// above.
+/// surface), or a credential value is unusable; 409 if a target is a table
+/// name uploads have reserved, or the save re-points the connector without
+/// every credential slot ([`REPOINT_NEEDS_CREDENTIALS`]); 401 if
+/// credentials arrive without a principal; 422 if the probe dialled and the
+/// source rejected the credentials; 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
@@ -2731,7 +2910,29 @@ pub async fn ingest_spec_put(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+
+    // SEC-14: decide whether this save re-points the connector BEFORE the
+    // address check below, which resolves the new host. A re-point without
+    // the credentials is refused here, so nothing is looked up or dialled.
+    let stored = connectors::get_connector_dial_info(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, &dial);
+    let required = credential_slots_read(&body.adapter, &dial);
+    if repoint
+        && !body.credential.as_ref().is_some_and(|credential| {
+            slots_cover(
+                required,
+                credential.primary.is_some(),
+                credential.secondary.is_some(),
+            )
+        })
+    {
+        return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into());
+    }
+
+    let credential = body.credential;
     let input = connectors::IngestSpecInput {
         adapter: body.adapter,
         ingest_mode: body.ingest_mode,
@@ -2739,16 +2940,146 @@ pub async fn ingest_spec_put(
         source_objects: body.source_objects,
         schedule_cron: body.schedule_cron,
     };
-    match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
-        Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
-            spec,
-            time::OffsetDateTime::now_utc(),
-        ))),
-        Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
-        }
-        Err(err) => Err(ApiError::from(err).into()),
+    let Some(credential) = credential else {
+        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+            Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
+                spec,
+                time::OffsetDateTime::now_utc(),
+            ))),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+            }
+            // The stored target changed between the read above and the
+            // store's own locked comparison: this save is now a re-point
+            // without credentials.
+            Err(lakehouse_store::StoreError::Conflict) => {
+                Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into())
+            }
+            Err(err) => Err(ApiError::from(err).into()),
+        };
+    };
+    save_with_credentials(&state, principal, &id, stored, &dial, input, credential).await
+}
+
+/// The credential-carrying half of [`ingest_spec_put`]: probe the new
+/// settings with the request's credentials alone, then write the credential
+/// files and the spec together.
+///
+/// # Errors
+///
+/// 401 without a principal (the audit event needs one); 400 for an unusable
+/// credential value, a slot the connector does not read, or a refused
+/// address; 422 when the probe dialled and the source rejected the
+/// credentials; 409/404/503/500 from the write.
+async fn save_with_credentials(
+    state: &AppState,
+    principal: Option<Extension<Principal>>,
+    id: &str,
+    stored: ConnectorDialInfo,
+    dial: &Dial,
+    input: connectors::IngestSpecInput,
+    credential: IngestCredentialBody,
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    if credential_slots_read(&input.adapter, dial) == 0 {
+        return Err(ApiError::BadRequest(
+            "this connection signs in with no credential, so there is none to send".to_owned(),
+        )
+        .into());
     }
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, dial);
+
+    // The connector as it will be once saved, so the slot rules (which
+    // adapters have a second credential) are those of the NEW adapter.
+    let mut after = stored;
+    after.adapter = Some(input.adapter.clone());
+    after.dial = input.dial.clone();
+    let changes = slot_changes(
+        id,
+        &after,
+        SetCredentialBody {
+            primary: credential.primary,
+            secondary: credential.secondary,
+            dial: None,
+        },
+    )?;
+    let candidate = candidate_dial_info(&after, &changes, None)?;
+
+    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .map(|c| (c.new_ref.clone(), c.value.clone()))
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    );
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        &resolver,
+        &state.config.connector_internal_hosts(),
+    )
+    .await;
+    if outcome.supported && !outcome.ok {
+        return Err(ApiError::Unprocessable(format!(
+            "the change was NOT saved: {}",
+            outcome.message
+        ))
+        .into());
+    }
+
+    // Every slot sent is a swap, including one whose ref name stays the same
+    // (its file is replaced): the store counts the slots to know the
+    // credentials were supplied, and the swap still checks nobody changed
+    // the ref since it was read.
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    let spec = publish_credentials(state, id, &changes, async {
+        match connectors::repoint_ingest_spec(pool(state)?, id, &input, &swaps).await {
+            Ok(spec) => Ok(spec),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")))
+            }
+            Err(lakehouse_store::StoreError::Conflict) => Err(ApiError::Conflict(
+                "the connector changed since it was read; reload and retry".to_owned(),
+            )),
+            Err(err) => Err(ApiError::from(err)),
+        }
+    })
+    .await?;
+
+    // The slots and whether the probe really dialled — never a ref name,
+    // never a value (same convention as `connector.credential_set`).
+    let event = connector_audit_event(
+        &principal,
+        if repoint {
+            "connector.repoint"
+        } else {
+            "connector.credential_set"
+        },
+        id,
+        json!({
+            "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
+            "verified": outcome.supported,
+        }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record the connector credential audit event");
+    }
+    Ok(ApiJson(IngestSpecResponse::new(
+        spec,
+        time::OffsetDateTime::now_utc(),
+    )))
 }
 
 /// `POST /api/connectors/{id}/ingest/run`'s response for a `cdc`-adapter
@@ -3338,7 +3669,17 @@ mod tests {
     /// reaches the real dial attempt (and its slot/publication names),
     /// never a real database.
     fn state_with_stub_secret_resolver() -> AppState {
-        let mut state = state_without_pool();
+        // SEC-15: these tests are about which slot/publication names are
+        // attempted, so they aim at a loopback port nothing listens on and
+        // must be allowed to reach it; the refusal of an internal target is
+        // covered by `deprovision_refuses_an_internal_target_before_anything_else`.
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).unwrap());
         state.connector_secret_resolver = std::sync::Arc::new(
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::from([(
                 "TEST_CONNECTOR_PASSWORD".to_owned(),
@@ -3365,8 +3706,11 @@ mod tests {
             Some("cdc"),
             serde_json::json!({
                 "driver": "postgres",
-                "host": "source.example.internal",
-                "port": 5432,
+                // A loopback port nothing listens on (the connect fails
+                // fast), rather than a made-up name that no longer reaches
+                // the dial now that the target is resolved first (SEC-15).
+                "host": "127.0.0.1",
+                "port": 1,
                 "database": "oms",
                 "user": "replicator",
                 "slotName": "dial_supplied_slot",
@@ -3381,6 +3725,10 @@ mod tests {
             text.contains("dial_supplied_slot") && text.contains("dial_supplied_pub"),
             "expected the error to name dial's own slot/publication: {text}"
         );
+        // SEC-15: the failure is a fixed, classified sentence, never the
+        // driver's own text.
+        assert!(text.contains("connection refused"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
         // The slug this connector's `id` would derive to must never appear
         // -- proves `dial` won with NO fallback, not merely that it was
         // tried first.
@@ -3388,6 +3736,42 @@ mod tests {
             !text.contains("conn_cdc_dial_wins"),
             "the slug-derived name must never appear once adapter=cdc: {text}"
         );
+    }
+
+    /// `SEC-15` (K4): with the internal-address block on (the default), the
+    /// clean-up of a connector aimed at a loopback host is refused with the
+    /// fixed message BEFORE the credential is resolved (this state's
+    /// resolver resolves nothing, so a late check would answer with the
+    /// credential error instead) and BEFORE anything is dialled. `localhost`
+    /// is used so the test can also assert that the resolved address is not
+    /// in the message.
+    #[tokio::test]
+    async fn deprovision_refuses_an_internal_target_before_anything_else() {
+        let state = state_without_pool();
+        let info = dial_info(
+            "Custom CDC System",
+            Some("cdc"),
+            serde_json::json!({
+                "driver": "postgres",
+                "host": "localhost",
+                "port": 1,
+                "database": "oms",
+                "user": "replicator",
+                "slotName": "refused_slot",
+                "publicationName": "refused_pub",
+            }),
+        );
+        let err = deprovision_postgres_connector(&state, "conn-cdc-refused", &info)
+            .await
+            .expect_err("a loopback target must be refused");
+        let ApiError::Conflict(text) = err else {
+            panic!("expected the refusal as a Conflict, got {err:?}");
+        };
+        assert!(text.contains("private/internal"), "{text}");
+        assert!(text.contains("\"localhost\""), "{text}");
+        for resolved in ["127.0.0.1", "::1"] {
+            assert!(!text.contains(resolved), "no resolved address: {text}");
+        }
     }
 
     /// The exact defect this rule fixes: a `sql`-adapter connector must never
@@ -4229,6 +4613,125 @@ mod tests {
             .err()
             .expect("must be refused");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    fn rest_dial(base_url: &str, auth: &str) -> serde_json::Value {
+        json!({
+            "baseUrl": base_url,
+            "auth": { "type": auth },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        })
+    }
+
+    /// `SEC-14`: settings that move a two-credential connector to another
+    /// host, sent with only one of its credentials, are refused with the
+    /// fixed 409 before any probe — the stored other slot would otherwise be
+    /// resolved and sent to the new host.
+    #[test]
+    fn candidate_dial_info_refuses_a_re_pointing_dial_without_every_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let moved = rest_dial("https://elsewhere.example.com", "basic");
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        let err = candidate_dial_info(&info, &primary_only, Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        let ApiError::Conflict(message) = err else {
+            panic!("expected 409");
+        };
+        assert_eq!(message, REPOINT_NEEDS_CREDENTIALS);
+
+        let neither = candidate_dial_info(&info, &[], Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        assert!(matches!(neither, ApiError::Conflict(_)));
+
+        let both = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .unwrap();
+        let candidate = candidate_dial_info(&info, &both, Some(moved.clone())).unwrap();
+        assert_eq!(candidate.dial, moved);
+    }
+
+    /// Settings that keep the target (same host, default port written out,
+    /// other pagination) are tested with the stored credentials as before.
+    #[test]
+    fn candidate_dial_info_accepts_settings_that_keep_the_target_with_one_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let mut same = rest_dial("https://API.example.com:443/v2", "basic");
+        same["pagination"] = json!({ "type": "page", "param": "p" });
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        candidate_dial_info(&info, &primary_only, Some(same))
+            .expect("the target is the same, so one slot may change alone");
+    }
+
+    #[test]
+    fn slots_cover_names_what_each_slot_count_needs() {
+        assert!(slots_cover(0, false, false));
+        assert!(!slots_cover(1, false, false));
+        assert!(slots_cover(1, true, false));
+        assert!(!slots_cover(2, true, false));
+        assert!(!slots_cover(2, false, true));
+        assert!(slots_cover(2, true, true));
+    }
+
+    fn host_row(adapter: Option<&str>, host: &str) -> ConnectorDialInfo {
+        let mut info = credential_info(adapter, "env:X", None);
+        info.host = host.to_owned();
+        info
+    }
+
+    /// `SEC-14` (D4): a connector that dials from its `host` column cannot
+    /// have it changed through `PATCH`; one that dials from `dial` can (the
+    /// column is a label), and so can a `PATCH` that repeats the stored
+    /// value.
+    #[test]
+    fn host_change_refusal_covers_the_rows_that_dial_from_host() {
+        let legacy = host_row(None, "lakehouse@db:5432/lakehouse");
+        let files = host_row(Some("files"), "http://rustfs:9000|bucket");
+        let sql = host_row(Some("sql"), "label");
+
+        for stored in [&legacy, &files] {
+            let err = host_change_refusal(stored, "lakehouse@other:5432/lakehouse")
+                .expect("a changed host must be refused");
+            let ApiError::Conflict(message) = err else {
+                panic!("expected 409");
+            };
+            assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
+        }
+        assert!(host_change_refusal(&legacy, " LAKEHOUSE@db:5432/lakehouse ").is_none());
+        assert!(host_change_refusal(&sql, "another label").is_none());
+        for adapter in ["cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
+            assert!(host_change_refusal(&host_row(Some(adapter), "x"), "y").is_none());
+        }
     }
 
     /// Two slots trading kinds end up naming different files, so it is

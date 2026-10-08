@@ -576,6 +576,252 @@ impl Dial {
             .or_else(|| self.kafka_auth_type())
             .or_else(|| self.sftp_auth_type())
     }
+
+    /// Where this dial sends the connector's credential, as a comparable
+    /// value (`SEC-14`, decision D1). Two dials with equal identities send
+    /// a stored credential to the same place; unequal identities mean the
+    /// connector is being re-pointed, and the credential must be supplied
+    /// again (see [`is_repoint`]).
+    ///
+    /// | Adapter | Compared |
+    /// | --- | --- |
+    /// | `sql`, `cdc` | `driver`, `host`, `port`, `database` |
+    /// | `files` | `protocol`, `endpoint`, `bucket` |
+    /// | `rest` | scheme, host and port of `baseUrl` |
+    /// | `mongodb` | `hosts` (as a set), `database` |
+    /// | `kafka` | `bootstrapServers` (as a set) |
+    /// | `sftp` | `host`, `port`, `hostKeyFingerprint` |
+    /// | `sheets` | nothing (fixed Google hosts) |
+    ///
+    /// The adapter name is part of the identity, so `sql` to `cdc` on the
+    /// same host is a re-point. A change of `user`, `sourceObjects`, the
+    /// schedule, pagination, `sslMode` or any other field is not.
+    ///
+    /// # Normalisation
+    ///
+    /// - Host names compare case-insensitively.
+    /// - Ports: the `sql`, `cdc`, `sftp`, `mongodb` and `kafka` shapes have
+    ///   no absent port ([`Dial::parse`] refuses a dial without one), so
+    ///   there is no default to apply and `5432` versus `5433` differ. In
+    ///   a URL (`rest` `baseUrl`, `files` `endpoint`) an absent port means
+    ///   the scheme's default, so `https://h` and `https://h:443` are the
+    ///   same target and `https://h:8443` is another.
+    /// - A URL's userinfo (`user@`) is not part of the host: only what
+    ///   follows the last `@` is compared, so `https://good@evil/` is
+    ///   `evil`.
+    /// - A `files` dial with no `endpoint` (the provider's own default)
+    ///   differs from one that names an endpoint.
+    #[must_use]
+    pub fn target_identity(&self) -> TargetIdentity {
+        match self {
+            Dial::Sql(sql) => TargetIdentity::new(
+                "sql",
+                vec![
+                    ("driver", driver_key(sql.driver).to_owned()),
+                    ("host", host_key(&sql.host)),
+                    ("port", sql.port.to_string()),
+                    ("database", sql.database.clone()),
+                ],
+            ),
+            Dial::Cdc(cdc) => TargetIdentity::new(
+                "cdc",
+                vec![
+                    ("driver", driver_key(cdc.driver).to_owned()),
+                    ("host", host_key(&cdc.host)),
+                    ("port", cdc.port.to_string()),
+                    ("database", cdc.database.clone()),
+                ],
+            ),
+            Dial::Files(files) => TargetIdentity::new(
+                "files",
+                vec![
+                    (
+                        "protocol",
+                        match files.protocol {
+                            FilesProtocol::S3 => "s3",
+                            FilesProtocol::Sftp => "sftp",
+                        }
+                        .to_owned(),
+                    ),
+                    (
+                        "endpoint",
+                        files
+                            .endpoint
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|endpoint| !endpoint.is_empty())
+                            .map(origin_key)
+                            .unwrap_or_default(),
+                    ),
+                    ("bucket", files.bucket.clone()),
+                ],
+            ),
+            Dial::Rest(rest) => {
+                TargetIdentity::new("rest", vec![("baseUrl", origin_key(&rest.base_url))])
+            }
+            Dial::Mongo(mongo) => TargetIdentity::new(
+                "mongodb",
+                vec![
+                    ("hosts", host_port_set_key(&mongo.hosts)),
+                    ("database", mongo.database.clone()),
+                ],
+            ),
+            Dial::Kafka(kafka) => TargetIdentity::new(
+                "kafka",
+                vec![(
+                    "bootstrapServers",
+                    host_port_set_key(&kafka.bootstrap_servers),
+                )],
+            ),
+            Dial::Sftp(sftp) => TargetIdentity::new(
+                "sftp",
+                vec![
+                    ("host", host_key(&sftp.host)),
+                    ("port", sftp.port.to_string()),
+                    (
+                        "hostKeyFingerprint",
+                        sftp.host_key_fingerprint.trim().to_owned(),
+                    ),
+                ],
+            ),
+            Dial::Sheets(_) => TargetIdentity::new("sheets", Vec::new()),
+        }
+    }
+}
+
+/// What a [`Dial`] points at: the adapter plus the fields that decide where
+/// the connector's credential is sent. Built only by
+/// [`Dial::target_identity`]; compared with `==`.
+///
+/// Holds host names and ports, never a credential (a `dial` cannot carry
+/// one: [`Dial::parse`] refuses unknown fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetIdentity {
+    adapter: &'static str,
+    parts: Vec<(&'static str, String)>,
+}
+
+impl TargetIdentity {
+    fn new(adapter: &'static str, parts: Vec<(&'static str, String)>) -> Self {
+        Self { adapter, parts }
+    }
+
+    /// The adapter this identity belongs to.
+    #[must_use]
+    pub fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+}
+
+/// Whether saving `new` over the stored `(stored_adapter, stored_dial)`
+/// re-points the connector (`SEC-14`): its stored credential would go to a
+/// target other than the one it was stored for.
+///
+/// # The first-configuration boundary
+///
+/// A connector created through `POST /api/connectors` has `adapter = NULL`
+/// and `dial = {}` until its first ingest spec is saved (`0033`'s column
+/// defaults). Saving that first dial is not a re-point: there is no stored
+/// target to move away from, and the console's create flow does exactly
+/// this. Anything else that cannot be compared fails closed and counts as a
+/// re-point: a stored `adapter` whose `dial` no longer parses for it, or an
+/// `adapter = NULL` row whose `dial` is not empty.
+///
+/// A pre-`0033` row (`adapter = NULL`) dials from its legacy `host` column
+/// until it has an ingest spec; that column is guarded separately, by
+/// `PATCH /api/connectors/{id}` refusing a `host` change for such a row.
+#[must_use]
+pub fn is_repoint(
+    stored_adapter: Option<&str>,
+    stored_dial: &serde_json::Value,
+    new: &Dial,
+) -> bool {
+    let Some(adapter) = stored_adapter else {
+        let empty = match stored_dial {
+            serde_json::Value::Null => true,
+            serde_json::Value::Object(map) => map.is_empty(),
+            _ => false,
+        };
+        return !empty;
+    };
+    match Dial::parse(adapter, stored_dial) {
+        Ok(stored) => stored.target_identity() != new.target_identity(),
+        Err(_) => true,
+    }
+}
+
+fn driver_key(driver: SqlDriver) -> &'static str {
+    match driver {
+        SqlDriver::Mysql => "mysql",
+        SqlDriver::Postgres => "postgres",
+        SqlDriver::Mssql => "mssql",
+        SqlDriver::Oracle => "oracle",
+    }
+}
+
+/// A host name as compared: trimmed and lower-cased.
+fn host_key(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
+}
+
+/// Split `authority` (no userinfo) into a lower-cased host and an optional
+/// numeric port. An IPv6 literal keeps its brackets. A port that is not a
+/// number leaves the whole text as the host, so it still takes part in the
+/// comparison.
+fn split_authority(authority: &str) -> (String, Option<u16>) {
+    let authority = authority.trim().to_ascii_lowercase();
+    let port_split = if authority.starts_with('[') {
+        authority
+            .rfind("]:")
+            .map(|index| (&authority[..=index], &authority[index + 2..]))
+    } else {
+        authority.rsplit_once(':')
+    };
+    match port_split.and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?))) {
+        Some((host, port)) => (host.to_owned(), Some(port)),
+        None => (authority, None),
+    }
+}
+
+/// `scheme://host:port` of a URL, with the scheme's default port filled in
+/// and userinfo, path, query and fragment dropped. Text that is not a
+/// `scheme://` URL is compared as it is (lower-cased), so it can only ever
+/// match itself.
+fn origin_key(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return format!("raw:{}", raw.to_ascii_lowercase());
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host_port)| host_port);
+    let (host, port) = split_authority(host_port);
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    match port.or(default_port) {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+/// The `host:port` entries of a `mongodb` or `kafka` dial as one comparable
+/// string: order and repeats do not matter, host case does not matter.
+fn host_port_set_key(entries: &[String]) -> String {
+    let mut keys: Vec<String> = entries
+        .iter()
+        .map(|entry| match split_authority(entry) {
+            (host, Some(port)) => format!("{host}:{port}"),
+            (host, None) => host,
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys.join(",")
 }
 
 /// Deserialize `raw` into `T`, wrapping a failure as
@@ -1683,5 +1929,445 @@ mod tests {
         let dial: SqlDial = serde_json::from_value(json).expect("mysql parses");
         assert!(dial.ssl_server_cert_dn.is_none());
         assert_eq!(dial.driver, SqlDriver::Mysql);
+    }
+}
+
+/// `SEC-14` task 1: [`Dial::target_identity`] and [`is_repoint`].
+#[cfg(test)]
+mod target_identity_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::{Value, json};
+
+    use super::{Dial, is_repoint};
+
+    fn parse(adapter: &str, dial: &Value) -> Dial {
+        Dial::parse(adapter, dial).expect("a valid dial")
+    }
+
+    /// `base` with `field` set to `value`, parsed for `adapter`.
+    fn with(adapter: &str, base: &Value, field: &str, value: Value) -> Dial {
+        let mut changed = base.clone();
+        changed[field] = value;
+        parse(adapter, &changed)
+    }
+
+    fn same(adapter: &str, base: &Value, field: &str, value: Value) -> bool {
+        parse(adapter, base).target_identity()
+            == with(adapter, base, field, value).target_identity()
+    }
+
+    fn sql() -> Value {
+        json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader"
+        })
+    }
+
+    #[test]
+    fn a_sql_dial_is_re_pointed_by_driver_host_port_or_database() {
+        let base = sql();
+        assert!(!same("sql", &base, "driver", json!("mysql")));
+        assert!(!same("sql", &base, "host", json!("other.internal")));
+        assert!(!same("sql", &base, "port", json!(5433)));
+        assert!(!same("sql", &base, "database", json!("billing")));
+    }
+
+    #[test]
+    fn a_sql_dial_keeps_its_target_when_user_or_ssl_settings_change() {
+        let base = sql();
+        assert!(same("sql", &base, "user", json!("someone_else")));
+        assert!(same("sql", &base, "sslMode", json!("require")));
+        assert!(same("sql", &base, "sslServerCertDn", json!("CN=db")));
+    }
+
+    #[test]
+    fn host_names_compare_case_insensitively() {
+        assert!(same("sql", &sql(), "host", json!("DB.Internal")));
+    }
+
+    #[test]
+    fn a_sql_port_is_always_explicit_so_a_different_port_is_a_different_target() {
+        // The shape has no absent port: there is no default to compare
+        // against, and the usual port is not treated as one.
+        assert!(!same("sql", &sql(), "port", json!(5433)));
+        let missing = json!({
+            "driver": "postgres", "host": "db.internal",
+            "database": "orders", "user": "reader"
+        });
+        assert!(Dial::parse("sql", &missing).is_err());
+    }
+
+    #[test]
+    fn a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only() {
+        let base = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "slot_a", "publicationName": "pub_a"
+        });
+        assert!(!same("cdc", &base, "driver", json!("mysql")));
+        assert!(!same("cdc", &base, "host", json!("other.internal")));
+        assert!(!same("cdc", &base, "port", json!(5433)));
+        assert!(!same("cdc", &base, "database", json!("billing")));
+        assert!(same("cdc", &base, "user", json!("someone_else")));
+        assert!(same("cdc", &base, "slotName", json!("slot_b")));
+        assert!(same("cdc", &base, "publicationName", json!("pub_b")));
+        assert!(same("cdc", &base, "serverId", json!(7)));
+    }
+
+    #[test]
+    fn changing_the_adapter_is_a_re_point_even_on_the_same_host() {
+        let cdc = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert_ne!(
+            parse("sql", &sql()).target_identity(),
+            parse("cdc", &cdc).target_identity()
+        );
+    }
+
+    fn files() -> Value {
+        json!({
+            "protocol": "s3", "endpoint": "https://store.internal:9000",
+            "bucket": "landing", "format": "csv"
+        })
+    }
+
+    #[test]
+    fn a_files_dial_is_re_pointed_by_protocol_endpoint_or_bucket() {
+        let base = files();
+        assert!(!same("files", &base, "protocol", json!("sftp")));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://other.internal:9000")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("http://store.internal:9000")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:9001")
+        ));
+        assert!(!same("files", &base, "bucket", json!("other")));
+    }
+
+    #[test]
+    fn a_files_dial_keeps_its_target_when_prefix_format_or_region_change() {
+        let base = files();
+        assert!(same("files", &base, "prefix", json!("2026/")));
+        assert!(same("files", &base, "format", json!("parquet")));
+        assert!(same("files", &base, "region", json!("eu-west-1")));
+    }
+
+    #[test]
+    fn a_files_endpoint_is_compared_by_origin_with_the_default_port_applied() {
+        let base = json!({
+            "protocol": "s3", "endpoint": "https://store.internal",
+            "bucket": "landing", "format": "csv"
+        });
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:443")
+        ));
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("HTTPS://Store.Internal/")
+        ));
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal/some/path")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:80")
+        ));
+    }
+
+    #[test]
+    fn a_files_dial_with_no_endpoint_differs_from_one_that_names_an_endpoint() {
+        let none = json!({ "protocol": "s3", "bucket": "landing", "format": "csv" });
+        assert!(!same(
+            "files",
+            &none,
+            "endpoint",
+            json!("https://store.internal")
+        ));
+        // An empty endpoint is the same as none.
+        assert!(same("files", &none, "endpoint", json!("  ")));
+    }
+
+    fn rest() -> Value {
+        json!({
+            "baseUrl": "https://api.example.com/v1",
+            "auth": { "type": "bearer" },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        })
+    }
+
+    #[test]
+    fn a_rest_dial_is_re_pointed_by_scheme_host_or_port_of_the_base_url() {
+        let base = rest();
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("http://api.example.com/v1")
+        ));
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.other.com/v1")
+        ));
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com:8443/v1")
+        ));
+    }
+
+    #[test]
+    fn a_rest_base_url_default_port_is_the_same_target_and_other_paths_too() {
+        let base = rest();
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com:443/v1")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://API.example.com")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com/v2/orders?x=1")
+        ));
+        let http = json!({
+            "baseUrl": "http://api.example.com",
+            "auth": { "type": "bearer" },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        });
+        assert!(same(
+            "rest",
+            &http,
+            "baseUrl",
+            json!("http://api.example.com:80")
+        ));
+        assert!(!same(
+            "rest",
+            &http,
+            "baseUrl",
+            json!("http://api.example.com:443")
+        ));
+    }
+
+    #[test]
+    fn a_rest_base_url_userinfo_does_not_hide_the_host() {
+        let base = rest();
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com@evil.example/")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://someone@api.example.com/")
+        ));
+    }
+
+    #[test]
+    fn a_rest_dial_keeps_its_target_when_auth_pagination_or_endpoints_change() {
+        let base = rest();
+        assert!(same("rest", &base, "auth", json!({ "type": "basic" })));
+        assert!(same(
+            "rest",
+            &base,
+            "pagination",
+            json!({ "type": "page", "param": "p" })
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "endpoints",
+            json!([{ "path": "/orders", "recordsPath": null }])
+        ));
+    }
+
+    fn mongo() -> Value {
+        json!({
+            "hosts": ["m1.internal:27017", "m2.internal:27017"],
+            "database": "shop", "username": "reader", "directConnection": true
+        })
+    }
+
+    #[test]
+    fn a_mongodb_dial_is_re_pointed_by_its_host_set_or_database() {
+        let base = mongo();
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27017"])
+        ));
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27017", "m3.internal:27017"])
+        ));
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27018", "m2.internal:27017"])
+        ));
+        assert!(!same("mongodb", &base, "database", json!("billing")));
+    }
+
+    #[test]
+    fn a_mongodb_dial_keeps_its_target_for_order_case_and_username() {
+        let base = mongo();
+        assert!(same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["M2.internal:27017", "m1.internal:27017"])
+        ));
+        assert!(same("mongodb", &base, "username", json!("someone_else")));
+    }
+
+    fn kafka() -> Value {
+        json!({
+            "bootstrapServers": ["k1.internal:9092", "k2.internal:9092"],
+            "topic": "orders", "auth": { "type": "none" },
+            "groupId": "g", "microBatchSeconds": 30
+        })
+    }
+
+    #[test]
+    fn a_kafka_dial_is_re_pointed_by_its_bootstrap_servers_only() {
+        let base = kafka();
+        assert!(!same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["k1.internal:9092"])
+        ));
+        assert!(!same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["k1.internal:9093", "k2.internal:9092"])
+        ));
+        assert!(same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["K2.internal:9092", "k1.internal:9092"])
+        ));
+        assert!(same("kafka", &base, "topic", json!("other")));
+        assert!(same("kafka", &base, "groupId", json!("other")));
+        assert!(same("kafka", &base, "microBatchSeconds", json!(60)));
+        assert!(same(
+            "kafka",
+            &base,
+            "auth",
+            json!({ "type": "sasl_plain", "username": "u" })
+        ));
+    }
+
+    fn sftp() -> Value {
+        json!({
+            "host": "sftp.internal", "port": 22, "user": "reader",
+            "hostKeyFingerprint": "SHA256:abc", "path": "/inbox",
+            "fileFormat": "csv", "auth": { "type": "password" }
+        })
+    }
+
+    #[test]
+    fn an_sftp_dial_is_re_pointed_by_host_port_or_host_key() {
+        let base = sftp();
+        assert!(!same("sftp", &base, "host", json!("other.internal")));
+        assert!(!same("sftp", &base, "port", json!(2222)));
+        assert!(!same(
+            "sftp",
+            &base,
+            "hostKeyFingerprint",
+            json!("SHA256:xyz")
+        ));
+        assert!(same("sftp", &base, "host", json!("SFTP.internal")));
+        assert!(same("sftp", &base, "user", json!("someone_else")));
+        assert!(same("sftp", &base, "path", json!("/outbox")));
+        assert!(same("sftp", &base, "fileFormat", json!("json")));
+        assert!(same("sftp", &base, "auth", json!({ "type": "public_key" })));
+    }
+
+    #[test]
+    fn a_sheets_dial_has_no_target_to_change() {
+        let base = json!({ "spreadsheetId": "abc", "ranges": ["A1:B2"] });
+        assert!(same("sheets", &base, "spreadsheetId", json!("def")));
+        assert!(same("sheets", &base, "ranges", json!(["C1:D2"])));
+    }
+
+    #[test]
+    fn the_first_configuration_of_a_connector_is_not_a_re_point() {
+        let new = parse("sql", &sql());
+        assert!(!is_repoint(None, &json!({}), &new));
+        assert!(!is_repoint(None, &Value::Null, &new));
+    }
+
+    #[test]
+    fn a_stored_target_that_cannot_be_compared_counts_as_a_re_point() {
+        let new = parse("sql", &sql());
+        // No adapter, but a dial: unknown shape.
+        assert!(is_repoint(None, &sql(), &new));
+        // An adapter whose stored dial no longer parses for it.
+        assert!(is_repoint(Some("sql"), &json!({}), &new));
+        assert!(is_repoint(Some("rest"), &sql(), &new));
+    }
+
+    #[test]
+    fn a_stored_target_is_compared_with_the_new_one() {
+        let stored = sql();
+        assert!(!is_repoint(Some("sql"), &stored, &parse("sql", &stored)));
+        assert!(!is_repoint(
+            Some("sql"),
+            &stored,
+            &with("sql", &stored, "user", json!("someone_else"))
+        ));
+        assert!(is_repoint(
+            Some("sql"),
+            &stored,
+            &with("sql", &stored, "host", json!("other.internal"))
+        ));
+        assert!(is_repoint(Some("sql"), &stored, &parse("rest", &rest())));
     }
 }

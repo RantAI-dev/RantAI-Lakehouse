@@ -31,7 +31,7 @@ use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
-use crate::routes::support::js_error;
+use crate::routes::support::{extract_json_object, js_error};
 use crate::state::AppState;
 
 use crate::tenant::TENANT_OWNER;
@@ -1926,6 +1926,9 @@ pub async fn run_finished_event(
     }
     // ADR 0015: a finished run may have changed a table's columns; look, whatever job it was.
     crate::routes::schema_versions::spawn_pass(&state);
+    // AI-16: a run that loaded a new table is the moment its description is
+    // missing; the pass skips tables that already have one.
+    crate::routes::ai::semantic::spawn_pass(&state);
     let req: RunFailedBody = parse_body(&body)?;
     let pool = pool(&state)?;
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
@@ -2545,14 +2548,6 @@ async fn llm_pipeline_draft(
         .map(|n| derive_pipeline_name(&n))
         .filter(|n| n != "agentic_pipeline");
     Some(draft)
-}
-
-/// The outermost `{...}` in a reply, so a model that wraps its JSON in
-/// prose or a code fence is still understood.
-fn extract_json_object(reply: &str) -> Option<&str> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    (end > start).then(|| &reply[start..=end])
 }
 
 /// The transitions `POST /api/pipelines/{id}/status` permits, checked

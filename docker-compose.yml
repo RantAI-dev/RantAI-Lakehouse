@@ -170,6 +170,21 @@ services:
       # (Indonesian) or `en` (English). Empty means unset; any other value
       # stops the API at start (see config.rs).
       AI_DEFAULT_REPLY_LANGUAGE: ${AI_DEFAULT_REPLY_LANGUAGE:-}
+      # Semantic layer: the model drafts a description of each table and
+      # column in the background, and the chat reads them. `false` turns it
+      # off; `true`, empty or unset leaves it on; any other value stops the
+      # API at start (see config.rs).
+      AI_SEMANTIC_LAYER: ${AI_SEMANTIC_LAYER:-}
+      # Ask-back: the chat may ask once which reading of an unclear word the
+      # person means (the `ask_user` tool) and reads the words that person
+      # has answered before. `false` turns it off; `true`, empty or unset
+      # leaves it on; any other value stops the API at start (see config.rs).
+      AI_ASK_BACK: ${AI_ASK_BACK:-}
+      # Relevant tables: the chat's data map writes in full only the tables
+      # a question names and the others on one line. `false` turns it off;
+      # `true`, empty or unset leaves it on; any other value stops the API
+      # at start (see config.rs).
+      AI_RELEVANT_TABLES: ${AI_RELEVANT_TABLES:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -297,19 +312,22 @@ services:
       CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
-      # The connector connectivity probe blocks private/internal address
-      # ranges by DEFAULT (SSRF guard — otherwise a `connector:manage`
-      # principal gets an internal port scanner with output). This stack's own
-      # seeded connectors legitimately point at `postgres:5432` and
-      # `http://rustfs:9000`, which resolve inside those ranges, so the demo
-      # opts out EXPLICITLY. Keeping the safe posture as the default and making
-      # the exception visible here is the point — do NOT carry this into a
-      # deployment that accepts connector definitions from untrusted callers.
-      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
+      # The connector connection test, table discovery and the clean-up of
+      # a deleted change-capture connector block private/internal address
+      # ranges (SSRF guard — otherwise a `connector:manage` principal gets an
+      # internal port scanner with output). SEC-15: blocked BY DEFAULT here
+      # as in the code; this used to default to `true`. This stack's own
+      # seeded connectors point at `postgres:5432` and `http://rustfs:9000`,
+      # which resolve inside those ranges, so on a fresh install their tests
+      # are refused until the operator opts in — `true` here (every internal
+      # address; a trusted internal deployment only) or the narrower
+      # `CONNECTOR_PROBE_ALLOWED_CIDRS` below. Gates that need the compose
+      # network set it themselves, in their own override (`ops/g6/`).
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-}
       # The narrow alternative: only these networks (e.g. `192.168.18.0/24`,
       # comma-separated; a bare address is one host) pass the guard. Takes
       # effect when the flag above is not `true`. Never opens loopback,
-      # link-local or multicast (`lakehouse-api::internal_hosts`).
+      # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,

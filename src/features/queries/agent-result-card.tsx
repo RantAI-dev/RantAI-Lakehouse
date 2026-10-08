@@ -2,25 +2,31 @@
 
 import { SectionCard } from "@/components/patterns/section-card"
 import { RowsTable } from "@/components/patterns/rows-table"
+import { MiniMarkdown } from "@/features/copilot/mini-markdown"
 import { formatNumber } from "@/lib/format"
-import type { AgentQueryResult } from "@/services/clients/agent-client"
+import type { NlAnswer } from "@/services/contracts/queries"
 
 /** How many rows of the agent's answer are previewed inline. */
 const PREVIEW_ROWS = 10
 
 /**
  * The agent's answer: what it concluded, how it got there, and a peek at
- * the rows behind it. The full result is one click away — the final SQL is
- * already loaded in the editor, ready to run.
+ * the rows behind it. The full result is one click away — when the agent
+ * ran a query, its SQL is already loaded in the editor, ready to run.
  */
-export function AgentResultCard({ result }: { readonly result: AgentQueryResult }) {
+export function AgentResultCard({ result }: { readonly result: NlAnswer }) {
   return (
     <SectionCard title="Agent answer">
-      <p className="text-sm">{result.answer}</p>
-      <p className="mt-2 text-xs text-muted-foreground">
-        {formatNumber(result.rowCount)} rows · the final SQL is loaded in the
-        SQL tab.
-      </p>
+      {/* The chat writes Markdown and marks unverified numbers with a span; render both as the Copilot does. */}
+      <div className="text-sm">
+        <MiniMarkdown text={result.answer} />
+      </div>
+      {/* `sql` is absent when the model ran no query, and then "0 rows" would claim a result that never existed. */}
+      {result.sql !== undefined ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {formatNumber(result.rowCount)} rows · the final SQL is loaded in the SQL tab.
+        </p>
+      ) : null}
       <details className="mt-3">
         <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
           Agent steps ({result.steps.length})
@@ -28,8 +34,8 @@ export function AgentResultCard({ result }: { readonly result: AgentQueryResult 
         <ol className="mt-2 space-y-1 text-xs text-muted-foreground">
           {result.steps.map((step, i) => (
             <li key={`${step.step}-${i}`}>
-              <span className="font-mono text-foreground">{step.step}</span>:{" "}
-              {step.detail}
+              <span className="font-mono text-foreground">{step.step}</span>
+              {step.detail ? <>: {step.detail}</> : null}
             </li>
           ))}
         </ol>

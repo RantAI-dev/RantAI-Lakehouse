@@ -1,13 +1,12 @@
 //! Route mounting.
 //!
 //! Mounts the health check, the five read-only domains (catalog, overview,
-//! ops, governance, storage), the write-side domains (alerts, query, agent,
+//! ops, governance, storage), the write-side domains (alerts, query,
 //! dashboard, ...), and — new in Phase 2 — the Postgres-backed `identity`
 //! domain under `/api/identity/*`.
 
-mod agent;
 mod agents;
-mod ai;
+pub(crate) mod ai;
 mod alerts;
 pub mod auth;
 mod authored_pipelines;
@@ -116,9 +115,6 @@ const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// | route                          | TS `maxDuration` |
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
-/// | `/api/agent/query`              | 90               |
-/// | `/api/agent/ask`                | 60               |
-/// | `/api/agent/text-to-sql`        | 60               |
 /// | `/api/alerts/run`               | 60               |
 /// | `/api/query/run`                | 60               |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
@@ -126,16 +122,15 @@ const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// `/api/uploads` has no TypeScript handler to mirror and takes
 /// [`UPLOAD_REQUEST_TIMEOUT`] (300), for the reason given there.
 ///
-/// The timeout is NOT uniform in the TypeScript — `ai/chat`'s 120s and
-/// `agent/query`'s 90s cover legitimate multi-round LLM tool loops that a
-/// blanket 60s bound would 408 mid-flight. Matched on `req.uri().path()`
+/// The timeout is NOT uniform in the TypeScript — `ai/chat`'s 120s covers
+/// a legitimate multi-round LLM tool loop that a blanket 60s bound would
+/// 408 mid-flight. Matched on `req.uri().path()`
 /// before route dispatch, so path params (`/api/catalog/{id}`, ...) never
 /// need to appear here — none of the parameterized routes declare a
 /// non-default `maxDuration` today.
 fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
-        "/api/agent/query" => Duration::from_secs(90),
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
@@ -710,6 +705,14 @@ pub fn router(state: AppState) -> Router {
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
         )
+        // The semantic layer: a table's and a column's plain-words
+        // description. `{asset}` is `serving.<table>` or `silver.<table>`;
+        // the dot stays inside one path segment.
+        .route("/api/semantic", get(ai::semantic_api::list))
+        .route(
+            "/api/semantic/{asset}",
+            get(ai::semantic_api::get_asset).put(ai::semantic_api::put_entry),
+        )
         .merge(catalog_access_router())
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())
@@ -809,12 +812,6 @@ pub fn router(state: AppState) -> Router {
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
         )
-        .route("/api/agent/ask", axum::routing::post(agent::ask))
-        .route("/api/agent/query", axum::routing::post(agent::query))
-        .route(
-            "/api/agent/text-to-sql",
-            axum::routing::post(agent::text_to_sql),
-        )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(
@@ -825,6 +822,13 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
+        // The caller's own remembered words for the chat; see `routes::ai::terms`.
+        .route(
+            "/api/ai/terms",
+            get(ai::terms::list_terms)
+                .put(ai::terms::put_term)
+                .delete(ai::terms::delete_term),
+        )
         // WS5 item F1: navbar bell — real, honest open-alert/pending-approval
         // lists (never a fabricated `unreadCount`, never a zero that reads
         // as "genuinely nothing" without Postgres — see `routes::notifications`).
@@ -906,10 +910,10 @@ mod tests {
     use super::*;
 
     /// D2 regression: the timeout was a uniform 60s across every route,
-    /// but the TypeScript declares longer `maxDuration`s for `ai/chat`
-    /// (120s, an 8-round LLM tool loop) and `agent/query` (90s) — a
-    /// blanket 60s bound 408'd a legitimate in-flight request. Pins the
-    /// per-route table to the TS `export const maxDuration` grep.
+    /// but the TypeScript declares a longer `maxDuration` for `ai/chat`
+    /// (120s, an 8-round LLM tool loop) — a blanket 60s bound 408'd a
+    /// legitimate in-flight request. Pins the per-route table to the TS
+    /// `export const maxDuration` grep.
     #[test]
     fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
         assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
@@ -923,12 +927,6 @@ mod tests {
     #[test]
     fn route_timeout_matches_typescript_max_duration() {
         assert_eq!(route_timeout("/api/ai/chat"), Duration::from_secs(120));
-        assert_eq!(route_timeout("/api/agent/query"), Duration::from_secs(90));
-        assert_eq!(
-            route_timeout("/api/agent/ask"),
-            DEFAULT_REQUEST_TIMEOUT,
-            "TS declares maxDuration = 60, same as the default"
-        );
         assert_eq!(
             route_timeout("/api/query/run"),
             DEFAULT_REQUEST_TIMEOUT,
