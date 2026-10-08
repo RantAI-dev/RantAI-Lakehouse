@@ -92,3 +92,42 @@ keep `postgres://lakehouse:lakehouse@localhost` as a default and fixtures
 `TENANT_WAREHOUSE_S3_*` (empty means not configured).
 
 ## 5. Review (planner)
+
+Reviewed 2026-10-08 at `1dfe6d7`, the whole diff against `origin/main`.
+
+What I re-ran or read myself: every changed line of `docker-compose.yml`,
+`ops/init-env.sh`, `deploy-staging.yml` and the upgrade note in
+`docs/OPERATIONS.md`; a search of `docker-compose.yml` for a credential
+variable that still falls back to a literal (none: the two remaining
+`:-env:UPLOAD_S3_*` defaults are secret references, not secrets). CI on pull
+request 83: 25 checks pass, among them every job that starts the stack with
+`docker compose up` (G1, G2, G3, G3a, G4, G6, G8, the Gold export and the
+image smoke test). That is the first real start of the changed file and it
+is CI's, not mine: no `up` was run on the build machine (*not verified*
+locally). The two `gitleaks` jobs fail as they do on `main`; this change
+does not cause them and removes three of the literals they could flag. They
+need their own backlog item.
+
+No `BLOCKER` in the code.
+
+- **Merge precondition (not a code finding).** The staging deploy runs on a
+  push to `main` with `--profile seaweedfs` and now stops, before touching
+  the running stack, unless six repository secrets exist:
+  `STAGING_POSTGRES_PASSWORD`, `STAGING_RUSTFS_ACCESS_KEY`,
+  `STAGING_RUSTFS_SECRET_KEY`, `STAGING_LAKEKEEPER_ENCRYPTION_KEY`,
+  `STAGING_SEAWEEDFS_ACCESS_KEY`, `STAGING_SEAWEEDFS_SECRET_KEY`. They must
+  hold the values staging runs with today. Whoever merges adds them first;
+  otherwise the first deploy after the merge fails (closed, but it fails).
+- **Merge precondition.** Every existing install, the shared development
+  stack included, needs the four must-set variables in its `.env` before
+  it pulls this change (upgrade note, step 1). An install that never set
+  them runs on the old literals and must write those literals down first.
+- `SHOULD-FIX` (follow-up, not this pull request): the literals the
+  developer listed as left alone, `rustfsadmin` as a fallback in
+  `ops/g3/g3_loadgen.py` and the `dlt` pipeline, and
+  `postgres://lakehouse:lakehouse@localhost` as a default in `config.rs`.
+  Compose always sets the variables now, so none is reachable in a compose
+  start, but a default credential in code is still what `SEC-18` is about.
+  Backlog item needed.
+- Not in scope and still true: `ClickHouse`'s `default` user has no
+  password inside the compose network.
