@@ -999,7 +999,12 @@ describe("Sample tab: the data preview", () => {
 
   it("sorts the rows shown, ascending, descending, then back to the table's order, and says so", async () => {
     const fetchSpy = await openPreview()
-    const calls = fetchSpy.mock.calls.length
+    // The page's other loads (the signed-in user, the table, the lineage) are
+    // still settling when the rows arrive, so the total request count is not
+    // steady here. What a sort must not ask for is rows or the profile.
+    const dataRequests = () =>
+      fetchSpy.mock.calls.filter((c) => /\/sample\?limit=|\/profile$/.test(String(c[0]))).length
+    const calls = dataRequests()
     const idHeader = headerOf("id")
     expect(idHeader.getAttribute("aria-sort")).toBeNull()
 
@@ -1018,8 +1023,8 @@ describe("Sample tab: the data preview", () => {
     expect(columnOf("id")).toEqual(["10", "9", "0250161"])
     expect(idHeader.getAttribute("aria-sort")).toBeNull()
     expect(screen.queryByText(/Sorted by/)).toBeNull()
-    // Sorting orders what is on screen: it asks the API for nothing.
-    expect(fetchSpy.mock.calls.length).toBe(calls)
+    // Sorting orders what is on screen: it asks the API for no rows and no profile.
+    expect(dataRequests()).toBe(calls)
   })
 
   it("starts another column at ascending, and puts NULL last either way", async () => {

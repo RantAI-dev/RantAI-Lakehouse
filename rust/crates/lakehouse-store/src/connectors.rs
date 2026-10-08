@@ -1064,6 +1064,13 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// (`dagster/dispar_orchestrate/secret_resolver.py`) when a Dagster
 /// ingest job actually runs.
 ///
+/// Third (`SEC-14`): this never changes where the connector points. The
+/// connector keeps its stored credential, so a different target
+/// ([`crate::ingest_spec::is_repoint`]) would receive it on the next dial;
+/// that change is [`repoint_ingest_spec`]'s, which takes the credentials.
+/// The first dial of a connector that has none yet is not a change of
+/// target.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Validation`] if `spec.dial` fails
@@ -1071,13 +1078,64 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// connector's secret-ref count does not match
 /// [`crate::ingest_spec::secret_field_names`] for `spec.adapter`/the
 /// dial's auth type (`rest`, `kafka` or `sftp` — [`crate::ingest_spec::Dial::secret_map_auth_type`]).
-/// Returns [`StoreError::NotFound`] if `id` does not
-/// name a connector. Returns [`StoreError::Database`] on any other
-/// failure.
+/// Returns [`StoreError::Conflict`] if `spec` changes the connector's
+/// target identity (nothing is written). Returns [`StoreError::NotFound`]
+/// if `id` does not name a connector. Returns [`StoreError::Database`] on
+/// any other failure.
 pub async fn set_ingest_spec(
     pool: &PgPool,
     id: &str,
     spec: &IngestSpecInput,
+) -> Result<IngestSpec, StoreError> {
+    save_ingest_spec(pool, id, spec, None).await
+}
+
+/// Change where a connector points AND its credential refs, all or nothing
+/// (`SEC-14`): the spec write and the [`SecretRefSwap`]s commit in ONE
+/// transaction, or none of it does.
+///
+/// [`set_ingest_spec`] refuses a change of target identity
+/// ([`crate::ingest_spec::is_repoint`]) because the connector keeps its
+/// stored credential and the next dial would send it to the new place. This
+/// is the only write that can re-point: when the target changes, `swaps`
+/// must carry EVERY credential slot the new dial reads
+/// ([`crate::ingest_spec::secret_field_names`]: the primary slot for one
+/// field, both for two). A slot whose ref name does not change is passed as
+/// a swap with `new_ref == expected_old`, which still checks that nobody
+/// changed it since it was read. A re-point whose `swaps` leave a slot out
+/// is [`StoreError::Conflict`], so a caller that skips the route-level
+/// check still cannot re-point without credentials.
+///
+/// The connector row is locked (`FOR UPDATE`) while the stored target is
+/// compared, so a concurrent save cannot slip a different target in
+/// between the comparison and the write.
+///
+/// The credential VALUES are not this function's business: the caller puts
+/// them in place (and takes them back if this fails) around this call.
+///
+/// # Errors
+///
+/// As [`set_ingest_spec`] for validation and `NotFound`. Returns
+/// [`StoreError::Conflict`] when the target changes and `swaps` do not cover
+/// every credential slot the new dial reads, or when a swap's
+/// `expected_old` no longer matches the stored ref ([`swap_secret_refs`]).
+pub async fn repoint_ingest_spec(
+    pool: &PgPool,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<IngestSpec, StoreError> {
+    save_ingest_spec(pool, id, spec, Some(swaps)).await
+}
+
+/// The one write behind [`set_ingest_spec`] (`swaps` is `None`: a change of
+/// target is refused) and [`repoint_ingest_spec`] (`swaps` is `Some`: the
+/// change is allowed when the swaps carry the credentials).
+async fn save_ingest_spec(
+    pool: &PgPool,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: Option<&[SecretRefSwap<'_>]>,
 ) -> Result<IngestSpec, StoreError> {
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
@@ -1091,14 +1149,44 @@ pub async fn set_ingest_spec(
             ))
         })?;
 
+    let mut tx = pool.begin().await?;
+
+    // The stored target, read under a row lock so the comparison below and
+    // the write stay one decision (SEC-14).
+    let (stored_adapter, stored_dial): (Option<String>, serde_json::Value) =
+        sqlx::query_as("SELECT adapter, dial FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+
+    // SEC-14: a change of target needs the credentials in the same write.
+    // `set_ingest_spec` has none to offer, so it refuses; `repoint_ingest_spec`
+    // must cover every slot the new dial reads.
+    if crate::ingest_spec::is_repoint(stored_adapter.as_deref(), &stored_dial, &dial) {
+        let covered = swaps.is_some_and(|swaps| {
+            let has = |slot: SecretSlot| swaps.iter().any(|swap| swap.slot == slot);
+            (fields.is_empty() || has(SecretSlot::Primary))
+                && (fields.len() < 2 || has(SecretSlot::Secondary))
+        });
+        if !covered {
+            return Err(StoreError::Conflict);
+        }
+    }
+    if let Some(swaps) = swaps {
+        apply_swaps(&mut tx, id, swaps).await?;
+    }
+
     // Read the connector's OWN declared secret-ref count before writing —
     // never derived from `id` (the exact bug Z6 replaces on the Dagster
-    // side), only from the row this connector already carries.
+    // side), only from the row this connector already carries. After the
+    // swaps above, so a re-point that supplies the second slot is judged on
+    // the refs it leaves behind.
     let secret_ref_secondary = sqlx::query_scalar::<_, Option<String>>(
         "SELECT secret_ref_secondary FROM connector WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(StoreError::NotFound)?;
 
@@ -1123,11 +1211,12 @@ pub async fn set_ingest_spec(
     .bind(&spec.dial)
     .bind(&spec.source_objects)
     .bind(&spec.schedule_cron)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Err(StoreError::NotFound);
     };
+    tx.commit().await?;
     Ok(ingest_spec_from_row(row))
 }
 
@@ -1345,6 +1434,20 @@ pub async fn swap_secret_refs(
     swaps: &[SecretRefSwap<'_>],
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
+    apply_swaps(&mut tx, id, swaps).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The guarded `UPDATE`s of [`swap_secret_refs`], inside a transaction the
+/// caller owns: [`repoint_ingest_spec`] runs them in the same transaction as
+/// the spec write. Dropping the transaction without committing rolls back
+/// every swap that applied.
+async fn apply_swaps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<(), StoreError> {
     for swap in swaps {
         let sql = match swap.slot {
             SecretSlot::Primary => {
@@ -1360,15 +1463,14 @@ pub async fn swap_secret_refs(
             .bind(swap.new_ref)
             .bind(id)
             .bind(swap.expected_old)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         if result.rows_affected() == 0 {
             // Zero rows: figure out which of the two honest reasons
-            // applies -- see `swap_secret_ref`'s doc comment. Dropping
-            // `tx` without committing rolls back every earlier swap.
+            // applies -- see `swap_secret_ref`'s doc comment.
             let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
             return Err(match exists {
                 Some(_) => StoreError::Conflict,
@@ -1376,7 +1478,6 @@ pub async fn swap_secret_refs(
             });
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 
