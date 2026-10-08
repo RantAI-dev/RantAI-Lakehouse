@@ -66,10 +66,13 @@ const SLOT_INACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// string, matching `connector_probe::probe_postgres`'s exact reasoning
 /// for why that matters.
 pub struct PgTarget {
-    /// Source database hostname (already SSRF-checked by the caller if
-    /// that matters for this deployment — this module does not repeat
-    /// that check, since deprovisioning a connector's own registered host
-    /// is not the same trust boundary as a caller-chosen probe target).
+    /// The address to dial, as text: the IP that
+    /// `connector_probe::resolve_checked` approved for the connector's
+    /// registered host, never the host name itself. `SEC-15`: deleting a
+    /// connector dials the host a caller registered, so it goes through the
+    /// same address check as a connection test, and the caller
+    /// (`routes::connectors::delete`) is responsible for running it and
+    /// handing over the approved address.
     pub host: String,
     /// Source database port.
     pub port: u16,
@@ -196,6 +199,33 @@ pub enum DeprovisionError {
         #[source]
         source: lakehouse_store::cdc::CdcSpecError,
     },
+}
+
+impl DeprovisionError {
+    /// A fixed sentence for this failure that is safe to put in a response
+    /// (`SEC-15`, principle 4): it names the step that failed and, for a
+    /// connection, the generic class `connector_probe::classify_sqlx_error`
+    /// gives, but never `sqlx`'s own text (the `Display` above is for the
+    /// server log only).
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Connect { source } => format!(
+                "could not connect to the source database ({})",
+                crate::connector_probe::classify_sqlx_error(source)
+            ),
+            Self::DropPublication { .. } => "dropping the publication failed".to_owned(),
+            Self::TerminateBackend { .. } => {
+                "ending the session that holds the replication slot failed".to_owned()
+            }
+            Self::CheckSlot { .. } => "checking the replication slot failed".to_owned(),
+            Self::DropSlot { .. } => "dropping the replication slot failed".to_owned(),
+            Self::Timeout { timeout_secs, .. } => {
+                format!("the source database did not answer within {timeout_secs}s")
+            }
+            Self::InvalidName { field, .. } => format!("{field} is not a valid identifier"),
+        }
+    }
 }
 
 /// Bound a query future by [`QUERY_TIMEOUT`], collapsing "timed out" and
