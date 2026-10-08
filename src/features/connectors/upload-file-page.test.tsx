@@ -285,6 +285,96 @@ describe("UploadFilePage, Check step", () => {
   })
 })
 
+// SEC-17: the sentences the API answers with for a file with too many columns
+// and for too many uploads at once. The console shows them as they are.
+const TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+const TOO_MANY_UPLOADS = "Too many uploads are in progress. Try again in a moment."
+
+describe("UploadFilePage, limits", () => {
+  it("shows the column-cap sentence on the Check step and keeps the delimiter, encoding and header row usable", async () => {
+    url.search = "?id=up-1"
+    const calls = stubFetch({
+      get: () => upload(),
+      preview: (q) =>
+        q.get("delimiter") === ";"
+          ? preview({ using: { ...OPTIONS, delimiter: ";" }, columns: ["sku;qty"], rows: [["a1;3"]] })
+          : json({ error: TOO_MANY_COLUMNS }, 400),
+    })
+    render(<UploadFilePage />)
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
+    // Nothing was read, so the controls have no value yet, but they are there and not disabled.
+    const delimiter = screen.getByLabelText("Delimiter") as HTMLSelectElement
+    expect(delimiter.disabled).toBe(false)
+    expect((screen.getByLabelText("Encoding") as HTMLSelectElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Header row") as HTMLInputElement).disabled).toBe(false)
+    expect(next().disabled).toBe(true)
+
+    fireEvent.change(delimiter, { target: { value: ";" } })
+    await screen.findByRole("columnheader", { name: "sku;qty" })
+    expect(calls.some((c) => c.url.includes("delimiter=%3B"))).toBe(true)
+    expect(screen.queryByText(TOO_MANY_COLUMNS)).toBeNull()
+    expect(next().disabled).toBe(false)
+  })
+
+  it("keeps the shown preview and the controls when a later setting makes the file too wide", async () => {
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload(),
+      preview: (q) => (q.get("delimiter") === "|" ? json({ error: TOO_MANY_COLUMNS }, 400) : preview()),
+    })
+    render(<UploadFilePage />)
+    await screen.findByRole("columnheader", { name: "sku" })
+
+    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: "|" } })
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
+    expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).disabled).toBe(false)
+    expect(next().disabled).toBe(true)
+  })
+
+  it("shows the too-many-uploads sentence for a file that was not accepted and sends again on the next press", async () => {
+    const calls = stubFetch({ create: json({ error: TOO_MANY_UPLOADS }, 429) })
+    render(<UploadFilePage />)
+    chooseFile(CSV())
+    fireEvent.click(next())
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(TOO_MANY_UPLOADS)
+    // The form is as it was: the file control is there and Next is on.
+    expect(screen.getByLabelText("Choose a file")).toBeDefined()
+    expect(next().disabled).toBe(false)
+    fireEvent.click(next())
+    await waitFor(() => expect(calls.filter((c) => c.method === "POST").length).toBe(2))
+  })
+
+  it("shows the too-many-uploads sentence for a load that was not started and leaves Load available", async () => {
+    url.search = "?id=up-1"
+    const calls = stubFetch({
+      get: () => upload(),
+      preview: () => preview(),
+      ingest: json({ error: TOO_MANY_UPLOADS }, 429),
+    })
+    render(<UploadFilePage pollMs={20} />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    fireEvent.click(await screen.findByRole("button", { name: "Load" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(TOO_MANY_UPLOADS)
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await waitFor(() =>
+      expect(calls.filter((c) => c.method === "POST" && c.url.endsWith("/ingest")).length).toBe(2)
+    )
+  })
+})
+
 describe("UploadFilePage, Table step", () => {
   async function openTable(list: Upload[]) {
     url.search = "?id=up-1"

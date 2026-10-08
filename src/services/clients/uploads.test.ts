@@ -189,6 +189,27 @@ describe("uploadService errors", () => {
     }
   })
 
+  it("carries the sentence and status of a 429 on create and ingest, as it does any other refusal (SEC-17)", async () => {
+    const sentence = "Too many uploads are in progress. Try again in a moment."
+    stubFetch(() => json({ error: sentence }, 429))
+    const create = await rejection(uploadService.create(new File(["x"], "a.csv")))
+    expect(create.message).toBe(sentence)
+    expect(create.status).toBe(429)
+    const ingest = await rejection(
+      uploadService.ingest("up-1", { bronzeTable: "x", encoding: "utf-8", delimiter: ",", headerRow: 0 })
+    )
+    expect(ingest.message).toBe(sentence)
+    expect(ingest.status).toBe(429)
+  })
+
+  it("carries the column-cap sentence of a preview as it is (SEC-17)", async () => {
+    stubFetch(() => json({ error: "The file has more than 1,000 columns." }, 400))
+    const err = await rejection(uploadService.preview("up-1"))
+    expect(err.message).toBe("The file has more than 1,000 columns.")
+    expect(err.status).toBe(400)
+    expect(err.code).toBe("invalid_request")
+  })
+
   it("keeps a 409's status and a 403's own words", async () => {
     stubFetch(() => json({ error: "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it." }, 409))
     const conflict = await rejection(
