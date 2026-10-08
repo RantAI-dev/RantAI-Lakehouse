@@ -185,6 +185,13 @@ services:
       # `true`, empty or unset leaves it on; any other value stops the API
       # at start (see config.rs).
       AI_RELEVANT_TABLES: ${AI_RELEVANT_TABLES:-}
+      # SEC-17: uploads in progress at once, per user and in the whole
+      # installation (files being received and loads running, each counted
+      # against both). Empty or unset keeps the defaults, 4 and 16; a value
+      # that is not a whole number of 1 or more stops the API at start (see
+      # config.rs).
+      UPLOAD_MAX_CONCURRENT_PER_USER: ${UPLOAD_MAX_CONCURRENT_PER_USER:-}
+      UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}

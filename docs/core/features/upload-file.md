@@ -78,7 +78,15 @@ table once it is loaded.
 
 - Only delimited text files are accepted, in UTF-8 or UTF-16. A workbook has
   to be saved as CSV first.
-- 50 MB and 2,000,000 rows per file.
+- 50 MB and 2,000,000 rows per file, and 1,000 columns. A file with more
+  columns is refused at the Check step with "The file has more than 1,000
+  columns."; changing the delimiter or the header row there reads it again
+  (`SEC-17`).
+- Four uploads in progress per user and sixteen in all, at once: files being
+  received and loads running are each counted against both numbers. The next
+  is refused with "Too many uploads are in progress. Try again in a moment."
+  and can be sent again; nothing waits (`SEC-17`, `UPLOAD_MAX_CONCURRENT_PER_USER`
+  and `UPLOAD_MAX_CONCURRENT`; `docs/core/features/upload-limits-and-safe-csv.md`).
 - Every column is text. Numbers and dates have to be converted afterwards.
 - An uploaded table stays in the raw layer. The pipeline builder cannot read
   raw tables yet, and a dashboard reads Gold tables only. So an uploaded
