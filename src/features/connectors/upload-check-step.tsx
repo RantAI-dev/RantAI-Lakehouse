@@ -17,7 +17,8 @@ import {
 import { uploadService } from "@/services"
 import type { UploadParseOptions, UploadPreview } from "@/services/contracts/uploads"
 import type { ServiceError } from "@/services/errors"
-import { Refusal } from "./upload-parts"
+import { Refusal, UploadNotice } from "./upload-parts"
+import { UploadPreviewGrid } from "./upload-preview-grid"
 
 const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -148,9 +149,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
                 </option>
               ))}
             </select>
-            <p className="text-xs text-muted-foreground">
-              The first visible sheet is chosen to begin with. Only the sheet chosen is loaded.
-            </p>
+            <p className="text-xs text-muted-foreground">First visible sheet to begin with. Only the sheet chosen is loaded.</p>
           </div>
         ) : (
           <>
@@ -206,18 +205,18 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             {view.headerProblem ??
               `Detected: ${headerRowDisplay(shown.detected.headerRow)}. ${
                 workbook
-                  ? "Counts every row of the sheet from its first filled cell, blank ones in between included, starting at 1."
-                  : "Counts every row from the top of the file, blank ones included, starting at 1."
+                  ? "Counted from the sheet's first filled cell, blank rows included."
+                  : "Counted from the top of the file, blank rows included."
               }`}
           </p>
         </div>
       </div>
       {workbook ? (
-        <p className="text-xs text-muted-foreground">
+        <UploadNotice>
           Every column is loaded as text. Numbers are written as the cell holds them, without its display format
           (1234.5, not 1,234.50). Dates are written as 2025-09-24, with the time (2025-09-24 13:30:00) when the
           cell has one. A formula loads the result the file stored, and a merged cell only its top-left value.
-        </p>
+        </UploadNotice>
       ) : null}
 
       {settled === null && view.error === null ? (
@@ -240,7 +239,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
           line. Choose another header row to go on.
         </p>
       ) : (
-        <PreviewTable preview={shown} stale={settled === null} />
+        <UploadPreviewGrid preview={shown} stale={settled === null} />
       )}
     </div>
   )
@@ -254,45 +253,6 @@ function PreviewFailure({ error, onRetry }: { readonly error: ServiceError; read
       <Button type="button" variant="outline" size="sm" onClick={onRetry}>
         Retry
       </Button>
-    </div>
-  )
-}
-
-function PreviewTable({ preview, stale }: { readonly preview: UploadPreview; readonly stale: boolean }) {
-  const { columns, rows } = preview
-  return (
-    <div className={stale ? "space-y-2 opacity-60" : "space-y-2"}>
-      <div className="overflow-x-auto rounded-md border">
-        <table className="w-full text-left text-sm">
-          <thead className="bg-muted/40">
-            <tr>
-              {columns.map((name, i) => (
-                <th key={i} scope="col" className="whitespace-nowrap px-3 py-1.5 font-medium">
-                  {name}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, r) => (
-              <tr key={r} className="border-t border-border">
-                {row.map((cell, c) => (
-                  <td key={c} className="whitespace-nowrap px-3 py-1.5">
-                    {cell}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        {rows.length === 0
-          ? "There are no rows below the header row."
-          : preview.truncated
-            ? `Showing the first ${rows.length} rows. The file has more.`
-            : `Showing all ${rows.length} rows.`}
-      </p>
     </div>
   )
 }

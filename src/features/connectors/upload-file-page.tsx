@@ -3,30 +3,20 @@
 import * as React from "react"
 import Link from "next/link"
 import { usePathname, useSearchParams } from "next/navigation"
-import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { formatBytes, formatDateTime } from "@/lib/format"
-import {
-  TABLE_NAME_RULE,
-  delimiterLabel,
-  encodingLabel,
-  fileProblem,
-  headerRowDisplay,
-  isUploadedTable,
-  suggestTableName,
-  tableNameProblem,
-} from "@/lib/uploads"
+import { fileProblem, isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
 import { uploadService } from "@/services"
 import type { IngestUploadInput, Upload, UploadLoadMode } from "@/services/contracts/uploads"
 import { UploadCheckStep, useUploadPreview } from "./upload-check-step"
+import { FileStep } from "./upload-file-step"
 import { DuplicateNotice, LoadFailure, Refusal } from "./upload-parts"
+import { UploadReviewStep } from "./upload-review-step"
 import { UploadRunView } from "./upload-run-view"
+import { UploadTableStep } from "./upload-table-step"
 
 const STEPS: FormStep[] = [
   { id: "file", label: "File", description: "Choose a CSV, TSV or Excel file" },
@@ -47,98 +37,6 @@ const TABLE_STEP = 2
  */
 function setAddress(pathname: string, id: string | null) {
   window.history.replaceState(null, "", id === null ? pathname : `${pathname}?id=${encodeURIComponent(id)}`)
-}
-
-/**
- * Step 1: a real, labelled file control (reachable by keyboard) and a drop
- * area that sets the same file. A file over 50 MB, or one whose name says it is
- * a workbook the API does not read (not `.xls` or `.xlsx`) or another binary,
- * is refused here with the reason, and nothing is sent.
- */
-function FileStep({
-  file,
-  onFile,
-  sent,
-  onChooseAnother,
-  refusal,
-}: {
-  readonly file: File | null
-  readonly onFile: (file: File | null) => void
-  /** The upload already stored from this page, when there is one. */
-  readonly sent: Upload | null
-  readonly onChooseAnother: () => void
-  readonly refusal: React.ReactNode
-}) {
-  const [dragging, setDragging] = React.useState(false)
-  const [several, setSeveral] = React.useState(false)
-  const problem = file ? fileProblem(file.name, file.size) : null
-
-  function take(files: FileList | null) {
-    setSeveral((files?.length ?? 0) > 1)
-    onFile(files && files.length > 0 ? files[0] : null)
-  }
-
-  if (sent !== null) {
-    return (
-      <div className="space-y-3">
-        <p className="text-sm">
-          <span className="font-medium">{sent.originalFilename}</span> ({formatBytes(sent.sizeBytes)}) is stored.
-          Press Next to check how it is read.
-        </p>
-        <Button type="button" variant="outline" size="sm" onClick={onChooseAnother}>
-          Choose a different file
-        </Button>
-      </div>
-    )
-  }
-
-  return (
-    <div className="space-y-3">
-      <div
-        onDragOver={(e) => {
-          e.preventDefault()
-          setDragging(true)
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(e) => {
-          e.preventDefault()
-          setDragging(false)
-          take(e.dataTransfer.files)
-        }}
-        className={`space-y-3 rounded-lg border border-dashed p-6 ${dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"}`}
-      >
-        <p className="text-sm text-muted-foreground">
-          Drop a CSV, TSV or Excel file here, or choose one. Delimited text files (CSV, TSV) and Excel
-          workbooks (.xls, .xlsx) up to 50 MB are accepted. Of a workbook one sheet is loaded, chosen on the
-          next step. Other kinds of file (.xlsm, .xlsb, .ods, archives) are refused with the reason.
-        </p>
-        <div className="space-y-1.5">
-          <Label htmlFor="upload-file-input">Choose a file</Label>
-          {/* `accept` only steers the picker; drag and drop is not limited by it, and the checks above decide. */}
-          <Input
-            id="upload-file-input"
-            type="file"
-            accept=".csv,.tsv,.txt,.xls,.xlsx,text/csv,text/tab-separated-values,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            onChange={(e) => take(e.target.files)}
-          />
-        </div>
-      </div>
-      {file ? (
-        <p className="text-sm">
-          <span className="font-medium">{file.name}</span> ({formatBytes(file.size)})
-        </p>
-      ) : null}
-      {several ? (
-        <p className="text-sm text-muted-foreground">One file at a time: the first one was taken.</p>
-      ) : null}
-      {problem ? (
-        <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          {problem}
-        </p>
-      ) : null}
-      {refusal}
-    </div>
-  )
 }
 
 /**
@@ -249,7 +147,6 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           ? tableName !== "" && nameProblem === null
           : view.ready && tableName !== "" && nameProblem === null
 
-  const using = view.settled?.using
   const notices =
     upload !== null && step !== FILE_STEP ? (
       <div className="space-y-3">
@@ -266,6 +163,12 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   return (
     <FormStepLayout
       steps={STEPS}
+      // Below `lg` the pattern's grid has one implicit `auto` track, whose
+      // minimum is the widest content's min-content (a nowrap preview table, a
+      // long file name), so the page scrolled sideways at phone width. A
+      // `minmax(0, 1fr)` track lets the content shrink and scroll in its own
+      // frame; from `lg` the pattern's own two columns apply.
+      className="grid-cols-[minmax(0,1fr)]"
       currentIndex={step}
       onStepChange={(next) => void changeStep(next)}
       canProceed={canProceed}
@@ -289,98 +192,23 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       ) : null}
       {step === CHECK_STEP ? <UploadCheckStep view={view} /> : null}
       {step === TABLE_STEP ? (
-        <div className="space-y-5">
-          <div className="space-y-1.5">
-            <Label htmlFor="upload-table-name">Table name</Label>
-            <Input
-              id="upload-table-name"
-              value={tableName}
-              autoComplete="off"
-              spellCheck={false}
-              aria-invalid={nameProblem !== null}
-              aria-describedby="upload-table-name-note"
-              onChange={(e) => setTableName(e.target.value)}
-            />
-            <p
-              id="upload-table-name-note"
-              className={nameProblem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
-            >
-              {nameProblem ?? TABLE_NAME_RULE}
-            </p>
-          </div>
-          {offersMode ? (
-            <fieldset className="space-y-2">
-              <legend className="text-sm font-medium">
-                {tableName} was created by an earlier upload. What should happen to its rows?
-              </legend>
-              {(
-                [
-                  { value: "replace", label: "Replace its rows" },
-                  { value: "append", label: "Add to its rows" },
-                ] as const
-              ).map((option) => (
-                <label key={option.value} className="flex items-center gap-2 text-sm">
-                  <input
-                    type="radio"
-                    name="upload-load-mode"
-                    value={option.value}
-                    checked={mode === option.value}
-                    onChange={() => setMode(option.value)}
-                  />
-                  {option.label}
-                </label>
-              ))}
-            </fieldset>
-          ) : null}
-          <p className="text-sm text-muted-foreground">
-            Every column is stored as text. Numbers and dates have to be converted afterwards.
-          </p>
-        </div>
+        <UploadTableStep
+          tableName={tableName}
+          onTableName={setTableName}
+          offersMode={offersMode}
+          mode={mode}
+          onMode={setMode}
+        />
       ) : null}
       {step === STEPS.length - 1 && upload !== null ? (
-        <div className="space-y-4">
-          <FormReviewSummary
-            sections={[
-              {
-                title: "File",
-                items: [
-                  { label: "Name", value: upload.originalFilename },
-                  { label: "Size", value: formatBytes(upload.sizeBytes) },
-                  { label: "Uploaded", value: formatDateTime(upload.createdAt) },
-                ],
-              },
-              {
-                title: "How it is read",
-                items: [
-                  ...(view.settled?.workbook
-                    ? [{ label: "Sheet", value: view.settled.workbook.sheet }]
-                    : [
-                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "" },
-                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "" },
-                      ]),
-                  { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "" },
-                  { label: "Columns", value: view.settled ? String(view.settled.columns.length) : "" },
-                ],
-              },
-              {
-                title: "Table",
-                items: [
-                  { label: "Table name", value: tableName },
-                  ...(offersMode
-                    ? [
-                        {
-                          label: "Rows already in it",
-                          value: effectiveMode === "append" ? "Add to its rows" : "Replace its rows",
-                        },
-                      ]
-                    : []),
-                  { label: "Column types", value: "Text" },
-                ],
-              },
-            ]}
-          />
-          {ingest.error !== null ? <Refusal error={ingest.error} /> : null}
-        </div>
+        <UploadReviewStep
+          upload={upload}
+          view={view}
+          tableName={tableName}
+          offersMode={offersMode}
+          mode={effectiveMode}
+          error={ingest.error}
+        />
       ) : null}
     </FormStepLayout>
   )
@@ -404,7 +232,7 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring a CSV or TSV file in as a raw table. Check how it is read, name the table, then load it."
+        description="Bring a CSV, TSV or Excel file in as a raw table. Check how it is read, name the table, then load it."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

@@ -55,6 +55,29 @@ export function tableNameProblem(name: string): string | null {
   return null
 }
 
+/**
+ * The specific reason `name` breaks the table-name rule, in a sentence, or
+ * `null` when it does not break it. For the hint under the field, which turns
+ * from the rule into this; `tableNameProblem` stays the judge (this returns
+ * `null` exactly when it does) and its rule sentence is the fallback for a
+ * break none of the checks below names.
+ */
+export function tableNameFault(name: string): string | null {
+  if (tableNameProblem(name) === null) return null
+  if (name.length > MAX_TABLE_NAME_CHARS) {
+    return `The name has ${name.length} characters; the most is ${MAX_TABLE_NAME_CHARS}.`
+  }
+  if (/^[0-9]/.test(name)) return "A name cannot start with a digit; it starts with a lower-case letter."
+  if (name.startsWith("_")) return "A name cannot start with an underscore; it starts with a lower-case letter."
+  if (/[A-Z]/.test(name)) return "Upper-case letters are not allowed: use lower case."
+  if (/\s/.test(name)) return "Spaces are not allowed: use an underscore."
+  const odd = [...name].find((ch) => !/[a-z0-9_]/.test(ch))
+  if (odd !== undefined) return `"${odd}" is not allowed: use lower-case letters, digits and underscores.`
+  if (name.endsWith("_")) return "A name cannot end with an underscore."
+  if (name.includes("__")) return "Underscores are single: a name cannot have two in a row."
+  return TABLE_NAME_RULE
+}
+
 /** What a table is called when a file's name leaves nothing to build one from. */
 const FALLBACK_TABLE_NAME = "uploaded_file"
 
@@ -259,4 +282,46 @@ export function retryInput(upload: Upload): IngestUploadInput | null {
         ? "append"
         : "replace"
   return { ...parseOptions, bronzeTable, mode }
+}
+
+/**
+ * The name a raw table has in Data Explorer and in queries: the writer puts
+ * it in the `bronze` namespace (`Iceberg bronze.<table>` in
+ * `dagster/dispar_orchestrate/file_ingest.py`; `BRONZE_NAMESPACE` in
+ * `routes/catalog_source.rs`). Shown on the Table and Review steps so the
+ * person sees where the rows will land before pressing Load.
+ */
+export function rawTableFullName(table: string): string {
+  return `bronze.${table}`
+}
+
+/** What a chosen file looks like to the eye: an Excel workbook, CSV or TSV text, or anything else. */
+export type UploadFileKind = "workbook" | "delimited" | "other"
+
+/** The extension of a file name, lower-cased, or `""` when there is none (`.csv` alone and `a.` have none). */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf(".")
+  return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase()
+}
+
+/**
+ * The kind of a file by its name only, for the mark beside it (presentation;
+ * the API still judges by content). `.txt`, an unknown extension and no
+ * extension are `other`. Case does not matter.
+ */
+export function uploadFileKind(name: string): UploadFileKind {
+  const extension = extensionOf(name)
+  if (extension === "xls" || extension === "xlsx") return "workbook"
+  if (extension === "csv" || extension === "tsv") return "delimited"
+  return "other"
+}
+
+/** The longest extension shown as a label; a longer one would not fit the mark. */
+const MAX_LABEL_CHARS = 5
+
+/** The extension in capitals for the mark (`XLS`, `CSV`), or `null` when there is none or it is too long to fit. */
+export function uploadFileLabel(name: string): string | null {
+  const extension = extensionOf(name)
+  if (extension === "" || extension.length > MAX_LABEL_CHARS || !/^[a-z0-9]+$/.test(extension)) return null
+  return extension.toUpperCase()
 }

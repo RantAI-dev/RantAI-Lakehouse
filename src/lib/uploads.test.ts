@@ -18,10 +18,14 @@ import {
   headerRowDisplay,
   headerRowFromDisplay,
   isUploadedTable,
+  rawTableFullName,
   retryInput,
   statusLabel,
   suggestTableName,
+  tableNameFault,
   tableNameProblem,
+  uploadFileKind,
+  uploadFileLabel,
 } from "./uploads"
 
 test("MAX_UPLOAD_BYTES is the API's cap, 50 MiB", () => {
@@ -334,4 +338,54 @@ test("fileProblem gives the kind first, then the size, and null for an acceptabl
   assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
   assert.equal(fileProblem("a.xlsx", 1024), null)
+})
+
+test("rawTableFullName puts the table in the bronze namespace, as Data Explorer names it", () => {
+  assert.equal(rawTableFullName("stock"), "bronze.stock")
+})
+
+test("uploadFileKind tells a workbook from delimited text by the name alone, whatever the case", () => {
+  assert.equal(uploadFileKind("a.xlsx"), "workbook")
+  assert.equal(uploadFileKind("A.XLS"), "workbook")
+  assert.equal(uploadFileKind("a.csv"), "delimited")
+  assert.equal(uploadFileKind("a.TSV"), "delimited")
+  for (const name of ["a.txt", "a.dat", "export", ".csv", "a.", "a.xlsm"]) assert.equal(uploadFileKind(name), "other", name)
+})
+
+test("uploadFileLabel is the extension in capitals, or null when there is none or it is too long", () => {
+  assert.equal(uploadFileLabel("a.xls"), "XLS")
+  assert.equal(uploadFileLabel("a.XLSX"), "XLSX")
+  assert.equal(uploadFileLabel("a.csv"), "CSV")
+  assert.equal(uploadFileLabel("a.Tsv"), "TSV")
+  assert.equal(uploadFileLabel("a.txt"), "TXT")
+  assert.equal(uploadFileLabel("export"), null)
+  assert.equal(uploadFileLabel(".csv"), null)
+  assert.equal(uploadFileLabel("a."), null)
+  assert.equal(uploadFileLabel("a.verylongext"), null)
+  assert.equal(uploadFileLabel("a.b c"), null)
+})
+
+test("tableNameFault names the specific break and is null exactly when tableNameProblem is", () => {
+  const cases: [string, string][] = [
+    ["Orders", "Upper-case"],
+    ["orders 2025", "Spaces"],
+    ["2025_orders", "start with a digit"],
+    ["_orders", "start with an underscore"],
+    ["orders_", "end with an underscore"],
+    ["orders__raw", "two in a row"],
+    ["orders-raw", '"-" is not allowed'],
+    ["a".repeat(MAX_TABLE_NAME_CHARS + 1), "129 characters"],
+    ["orders\n", "Spaces"],
+  ]
+  for (const [name, part] of cases) {
+    assert.ok(tableNameFault(name)?.includes(part), `${JSON.stringify(name)} -> ${tableNameFault(name)}`)
+  }
+  for (const name of ["stock", "stock_2025", "a", "a".repeat(MAX_TABLE_NAME_CHARS), "x_1_y"]) {
+    assert.equal(tableNameProblem(name), null)
+    assert.equal(tableNameFault(name), null)
+  }
+  for (const name of ["", "A", "_", "a_", "é", "a b", "a\n"]) {
+    assert.notEqual(tableNameProblem(name), null, name)
+    assert.notEqual(tableNameFault(name), null, name)
+  }
 })

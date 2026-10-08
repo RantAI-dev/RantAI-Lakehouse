@@ -20,6 +20,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { formatBytes } from "@/lib/format"
 import { MAX_UPLOAD_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
 import type { Upload, UploadPreview } from "@/services/contracts/uploads"
 import { UploadFilePage } from "./upload-file-page"
@@ -143,7 +144,9 @@ describe("UploadFilePage, first step", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
-    expect(screen.getByLabelText("Choose a file")).toBeDefined()
+    // The file is still chosen (shown as a row), and the same control can pick another.
+    expect(screen.getByLabelText("Choose another")).toBeDefined()
+    expect(screen.getByText("stock.dat")).toBeDefined()
   })
 
   it("refuses a workbook the API does not read by its name before any request, saying what to save it as", async () => {
@@ -160,17 +163,104 @@ describe("UploadFilePage, first step", () => {
     expect(calls.filter((c) => c.method === "POST")).toEqual([])
   })
 
-  it("states the accepted kinds and the 50 MB limit up front, and suggests text and Excel files in the picker", () => {
+  it("states the limits as short facts up front, and suggests text and Excel files in the picker", () => {
     stubFetch()
     render(<UploadFilePage />)
-    const hint = screen.getByText(/Delimited text files \(CSV, TSV\) and Excel/)
-    expect(hint.textContent).toContain("workbooks (.xls, .xlsx) up to 50 MB are accepted")
-    expect(hint.textContent).toContain("(.xlsm, .xlsb, .ods, archives) are refused")
+    const facts = new Map(
+      screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
+    )
+    expect(facts.get("Accepted")).toBe("CSV, TSV, .xls, .xlsx")
+    expect(facts.get("Size")).toBe("Up to 50 MB")
+    expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, archives")
+    expect(facts.get("Workbooks")).toContain("One sheet is loaded")
     const input = screen.getByLabelText("Choose a file") as HTMLInputElement
+    expect(input.type).toBe("file")
     expect(input.accept).toContain(".csv")
     expect(input.accept).toContain(".tsv")
     expect(input.accept).toContain(".xls")
     expect(input.accept).toContain(".xlsx")
+  })
+
+  it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
+    stubFetch()
+    render(<UploadFilePage />)
+    expect(screen.getByText("Drop a file here, or choose one")).toBeDefined()
+    expect(screen.getByText(/CSV, TSV or Excel file in as a raw table/)).toBeDefined()
+    const input = screen.getByLabelText("Choose a file")
+    const button = screen.getByText("Choose a file", { selector: "label" })
+    expect(button.getAttribute("for")).toBe(input.id)
+  })
+
+  it("highlights the area while a file is dragged over it, and takes the dropped file as a row", async () => {
+    const calls = stubFetch()
+    render(<UploadFilePage />)
+    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
+    expect(area.dataset.dragging).toBe("false")
+
+    fireEvent.dragOver(area)
+    expect(area.dataset.dragging).toBe("true")
+    expect(screen.getByText("Release to choose this file")).toBeDefined()
+    fireEvent.dragLeave(area)
+    expect(area.dataset.dragging).toBe("false")
+
+    const file = CSV()
+    fireEvent.dragOver(area)
+    fireEvent.drop(area, { dataTransfer: { files: [file] } })
+    expect(area.dataset.dragging).toBe("false")
+    await waitFor(() => expect(screen.getByText("stock.csv")).toBeDefined())
+    expect(screen.getByText(formatBytes(file.size))).toBeDefined()
+    expect(screen.getByText("Choose another")).toBeDefined()
+    expect(screen.queryByText("Drop a file here, or choose one")).toBeNull()
+    expect(next().disabled).toBe(false)
+    expect(calls.filter((c) => c.method === "POST")).toEqual([])
+  })
+
+  it("marks the chosen file by its format: green spreadsheet and XLS/XLSX, text and CSV/TSV, neutral otherwise, in any case", () => {
+    stubFetch()
+    render(<UploadFilePage />)
+    const cases: [string, string | null, string, string][] = [
+      ["stock.xls", "XLS", "workbook", "text-emerald-700"],
+      ["Stock.XLSX", "XLSX", "workbook", "text-emerald-700"],
+      ["stock.csv", "CSV", "delimited", "text-primary"],
+      ["STOCK.TSV", "TSV", "delimited", "text-primary"],
+      ["notes.txt", "TXT", "other", "text-muted-foreground"],
+      ["export", null, "other", "text-muted-foreground"],
+    ]
+    for (const [name, label, kind, tone] of cases) {
+      // After the first file the label reads "Choose another"; the input is the same.
+      fireEvent.change(document.getElementById("upload-file-input") as HTMLInputElement, {
+        target: { files: [new File(["x"], name)] },
+      })
+      const mark = document.querySelector("[data-file-mark]") as HTMLElement
+      expect(mark.dataset.fileMark).toBe(kind)
+      expect(mark.className).toContain(tone)
+      expect(mark.getAttribute("aria-hidden")).toBe("true")
+      expect(mark.textContent).toBe(label ?? "")
+      // Same size whatever the kind: the mark never changes the row's height.
+      expect(mark.className).toContain("size-10")
+    }
+  })
+
+  it("refuses a dropped file by the same checks as a chosen one, and a drop with no file keeps the file chosen", async () => {
+    stubFetch()
+    render(<UploadFilePage />)
+    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
+    fireEvent.drop(area, { dataTransfer: { files: [new File(["x"], "stock.XLSM")] } })
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("not an .xls or .xlsx file")
+    expect(next().disabled).toBe(true)
+
+    fireEvent.drop(area, { dataTransfer: { files: [] } })
+    expect(screen.getByText("stock.XLSM")).toBeDefined()
+  })
+
+  it("says only the first of several files was taken", async () => {
+    stubFetch()
+    render(<UploadFilePage />)
+    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
+    fireEvent.drop(area, { dataTransfer: { files: [CSV(), new File(["x"], "other.csv")] } })
+    expect(await screen.findByText("One file at a time: the first one was taken.")).toBeDefined()
+    expect(screen.getByText("stock.csv")).toBeDefined()
   })
 
   it("sends an .xlsx instead of refusing it by name, and lands on a Check step with a sheet picker", async () => {
@@ -290,6 +380,58 @@ describe("UploadFilePage, Check step", () => {
     expect(next().disabled).toBe(false)
   })
 
+  it("frames the preview: a line with the columns and the rows shown, a row-number gutter and a header that stays", async () => {
+    await openCheck({ preview: () => preview({ rows: [["a1", "3"], ["b2", "5"], ["c3", "7"]] }) })
+    expect(screen.getByText("2 columns")).toBeDefined()
+    expect(screen.getByText("Showing all 3 rows.")).toBeDefined()
+    const frame = screen.getByRole("region", { name: "Preview of the first rows" })
+    expect(frame.getAttribute("tabindex")).toBe("0")
+    expect(frame.parentElement?.className).toContain("isolate")
+    const gutter = screen.getAllByRole("rowheader").map((cell) => cell.textContent)
+    expect(gutter).toEqual(["1", "2", "3"])
+    expect(screen.getByRole("columnheader", { name: "sku" }).className).toContain("sticky")
+    expect(screen.getByRole("columnheader", { name: "Row number" })).toBeDefined()
+  })
+
+  it("says one column in the singular", async () => {
+    await openCheck({ preview: () => preview({ columns: ["sku"], rows: [["a1"]] }) })
+    expect(screen.getByText("1 column")).toBeDefined()
+  })
+
+  it("shows an empty cell in the quiet tone and a cell a short row lacks as a dash", async () => {
+    await openCheck({ preview: () => preview({ rows: [["a1", ""], ["b2"]] }) })
+    const empty = screen.getByText("(empty)")
+    expect(empty.className).toContain("italic")
+    expect(empty.className).toContain("text-muted-foreground")
+    const missing = screen.getByText("—")
+    expect(missing.className).toContain("italic")
+    expect(missing.parentElement?.getAttribute("title")).toBe("No cell in this row")
+  })
+
+  it("marks a row with more cells than the header, names it above the frame and draws no nameless column", async () => {
+    await openCheck({ preview: () => preview({ rows: [["a1", "3"], ["b2", "5", "extra"]] }) })
+    const notice = screen.getByText(/Row 2 has more cells than the header \(2\)/)
+    expect(notice.textContent).toContain("The extra cells are not shown here.")
+    expect(notice.closest("[role=status]")).not.toBeNull()
+    expect(screen.getByRole("img", { name: "This row has 3 cells; the header has 2" })).toBeDefined()
+    expect(screen.getAllByRole("columnheader").length).toBe(3)
+    expect(screen.queryByText("extra")).toBeNull()
+  })
+
+  it("names several marked rows, and still shows the header when there are no rows below it", async () => {
+    await openCheck({ preview: () => preview({ rows: [["a", "b", "c"], ["d", "e"], ["f", "g", "h"]] }) })
+    expect(screen.getByText(/Rows 1, 3 have more cells than the header/)).toBeDefined()
+    cleanup()
+    await openCheck({ preview: () => preview({ rows: [] }) })
+    expect(screen.getByText("There are no rows below the header row.")).toBeDefined()
+    expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
+  })
+
+  it("keeps the hints under the controls to one quiet line each", async () => {
+    await openCheck({ preview: () => preview() })
+    expect(screen.getByText("Detected: 1. Counted from the top of the file, blank rows included.")).toBeDefined()
+  })
+
   it("shows the API's refusal of a preview, with Retry", async () => {
     url.search = "?id=up-1"
     const sentence = "Upload storage is unavailable (timeout)."
@@ -406,8 +548,32 @@ describe("UploadFilePage, Table step", () => {
   it("refuses a name that breaks the rule with the rule's sentence", async () => {
     await openTable([])
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "Orders 2025" } })
-    expect(screen.getByText(TABLE_NAME_RULE).className).toContain("text-destructive")
+    // The hint turns from the rule into the specific break, in the destructive tone.
+    expect(screen.queryByText(TABLE_NAME_RULE)).toBeNull()
+    expect(screen.getByText("Upper-case letters are not allowed: use lower case.").className).toContain("text-destructive")
+    expect(screen.getByLabelText("Table name").getAttribute("aria-invalid")).toBe("true")
     expect(next().disabled).toBe(true)
+
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "orders 2025" } })
+    expect(screen.getByText("Spaces are not allowed: use an underscore.")).toBeDefined()
+  })
+
+  it("shows where the data will land, as Data Explorer names it, only for a name that passes", async () => {
+    await openTable([])
+    expect(screen.getByText("bronze.stock")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
+    expect(screen.getByText("bronze.stock_b")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "Stock B" } })
+    expect(screen.queryByText(/^bronze\./)).toBeNull()
+    expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "" } })
+    expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
+  })
+
+  it("says the columns are text in a notice", async () => {
+    await openTable([])
+    const note = screen.getByText(/Every column is stored as text/)
+    expect(note.closest("[role=status]")).not.toBeNull()
   })
 
   it("offers Replace or Add only for a table an earlier upload loaded", async () => {
@@ -471,6 +637,71 @@ describe("UploadFilePage, after Load", () => {
     const settled = calls.length
     await new Promise((resolve) => setTimeout(resolve, 120))
     expect(calls.length).toBe(settled)
+  })
+
+  it("summarises the file, how it is read and the table by its full name, with one sentence saying what Load does", async () => {
+    await review({ get: () => upload(), ingest: json({ upload: started, runId: "run-1" }) })
+    const labels = screen.getAllByRole("term").map((term) => term.textContent)
+    expect(labels).toEqual(["Name", "Size", "Uploaded", "Encoding", "Delimiter", "Header row", "Columns", "Table", "Column types"])
+    const value = (label: string) =>
+      screen.getAllByRole("term").find((term) => term.textContent === label)?.nextElementSibling?.textContent
+    expect(value("Table")).toBe("bronze.stock")
+    expect(value("Columns")).toBe("2")
+    const sentence = screen.getByText(/^Load reads/)
+    expect(sentence.textContent).toContain("stock.csv")
+    expect(sentence.textContent).toContain("bronze.stock")
+    expect(sentence.textContent).toContain("every column as text")
+    expect(sentence.textContent).toContain("Any rows the table already holds are replaced by this file's.")
+  })
+
+  it("says in the Load sentence that the rows are added after the ones there when Add was chosen", async () => {
+    await review({
+      list: [upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock" })],
+      get: () => upload(),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }))
+    fireEvent.click(await screen.findByRole("radio", { name: "Add to its rows" }))
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+    expect(screen.getByText(/^Load reads/).textContent).toContain("this file's are added after them")
+    expect(screen.getByText("Rows already in it").nextElementSibling?.textContent).toBe("Add to its rows")
+  })
+
+  it("shows the loaded view: status first, then the table and rows, then the next actions", async () => {
+    await review({
+      get: (n) => (n === 1 ? upload() : { ...started, status: "ingested", rows: 1234, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Loaded", { selector: "span" })
+    expect(screen.getByText("Load finished")).toBeDefined()
+    expect(screen.getByText("bronze.stock")).toBeDefined()
+    expect(screen.getByText("1,234")).toBeDefined()
+    expect(screen.getByText("Replace its rows")).toBeDefined()
+    expect(screen.getByText("stock.csv")).toBeDefined()
+    expect(document.querySelector("[data-file-mark=delimited]")?.textContent).toBe("CSV")
+    const open = screen.getByText("Open in Data Explorer").closest("a")
+    expect(open?.getAttribute("href")).toBe("/data/assets/stock")
+  })
+
+  it("offers no action while loading, and Upload another file after a failure goes back to an empty first step", async () => {
+    await review({
+      get: (n) => (n === 1 ? upload() : n === 2 ? started : { ...started, status: "failed", error: "The load into the table failed." }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Load in progress")
+    expect(screen.queryByRole("button", { name: "Upload another file" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
+
+    await screen.findByText("Load failed")
+    expect(screen.getByText("The load into bronze.stock failed.")).toBeDefined()
+    expect(screen.getByText("The load into the table failed.")).toBeDefined()
+    expect(screen.getByRole("button", { name: "Try again" })).toBeDefined()
+    expect(screen.getByRole("button", { name: "Change settings" })).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Upload another file" }))
+    expect(await screen.findByText("Drop a file here, or choose one")).toBeDefined()
   })
 
   it("sends append when Add to its rows was chosen for a table an upload created", async () => {
