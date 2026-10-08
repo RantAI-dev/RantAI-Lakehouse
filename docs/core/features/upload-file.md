@@ -94,6 +94,13 @@ table once it is loaded.
 - A table name an upload has asked for stays reserved for that tenant's
   uploads. Another tenant cannot upload into it and a connector cannot load
   into it, even if the first load never wrote anything.
+- A table name that cannot be used is refused with one sentence, "That table
+  name cannot be used. Choose another name.", whether another tenant holds
+  it, another tenant's connector loads it, or it exists and nobody
+  claimed it. Only a connector of the person's own tenant is named: "A
+  connector loads that table, so a file cannot be loaded into it." (`SEC-16`.)
+  A refused name still tells a person that someone has taken it; only a
+  namespace per tenant would remove that.
 - An upload is not resumable. If the connection drops, it starts again.
 - In an install with several tenants, the table an upload creates appears in
   the shared catalog, which only the tenant that owns the catalog sees.
@@ -130,7 +137,8 @@ Prepare four files:
 | 12 | Load file B into `qa_upload_b` | Loaded; the title lines are not rows | |
 | 13 | Upload file C | Refused, with a message to save it as CSV. Nothing new under "Uploaded files" | |
 | 14 | Upload file D | Refused, naming the 50 MB limit. Nothing new under "Uploaded files" | |
-| 15 | Load file A into a table a connector loads | Refused; that table is unchanged | |
+| 15 | Load file A into a table a connector of your own tenant loads | Refused, saying a connector loads it; that table is unchanged | |
+| 15a | Load file A into a table another tenant's connector loads | Refused with "That table name cannot be used. Choose another name.", which does not mention a connector | |
 | 16 | Load file A into a table named `Orders 2025` | Refused, with the naming rule | |
 | 17 | (operator) Stop the orchestrator's code location; load file A into `qa_upload_fail`; start it again | The upload shows "Failed" with a reason, or the load is refused as unavailable. It is never shown as loaded | |
 | 18 | Look at the rows of the failed upload | "Not measured", not 0 | |
