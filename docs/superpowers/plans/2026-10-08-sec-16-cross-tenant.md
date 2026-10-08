@@ -276,4 +276,42 @@ in `0033`); Bayu is in two tenants, so his ingestible test now sends
 
 ## 8. Review
 
-(The planner writes here.)
+Reviewed 2026-10-08 at `e110756`: every non-test change in
+`routes/connectors.rs`, `routes/catalog.rs`, `routes/uploads.rs` and
+`lakehouse-store/src/connectors.rs`, and `catalog_profile::resolve_source`,
+which the existence check relies on. The tests were not read line by line.
+
+CI on pull request 87: 25 checks pass, the Rust test jobs among them; the
+two `gitleaks` jobs fail as on `main`. The first run failed in the new
+ingestible tests because the test helper gave every connector one name
+(`connector.name` is unique); the test was wrong and was fixed, not
+weakened (`e110756`). No Rust test was run on the build machine (*not
+verified* locally), and the workspace clippy I ran there finished in
+seconds on a build cache shared with other worktrees, so I do not count
+it; CI's clippy job is the evidence.
+
+No `BLOCKER`. No `SHOULD-FIX`.
+
+Checked and found right:
+
+- `list_ingestible`: a missing principal is 401; only a service principal
+  (`PrincipalId::Service`) or an unrestricted one takes the unfiltered
+  query; the tenant filter is a bound parameter; a caller in no tenant gets
+  an empty list; a forged `X-Tenant` is `tenant_scope::resolve`'s 404.
+- `ensure_asset_exists`: for a `silver.`/`serving.` id, no table is 404;
+  for any other id `resolve_source` itself answers 404 when no registry row
+  has the slug, and `Ok(None)` there means a real asset with nothing
+  readable behind it, which is correctly let through. Any other failure is
+  the fixed 503.
+- `ensure_table_free`: the caller's own tenant's connector is asked first
+  and keeps its sentence; every other connector closes the name with the
+  one sentence.
+
+For the product owner:
+
+- An asset id that the detail page can show but that is neither a
+  `silver.`/`serving.` table nor a Bronze slug would now get 404 on its
+  annotation. The developer found no such kind; the acceptance checklist
+  should include editing an annotation on one asset of each layer.
+- In the write, the asset is checked before the body, so a bad body for an
+  unknown id answers 404, not 400.
