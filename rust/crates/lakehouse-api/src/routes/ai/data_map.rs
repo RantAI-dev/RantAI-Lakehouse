@@ -773,20 +773,21 @@ fn is_key_like(name: &str) -> bool {
 ///
 /// A column's role in `notes` overrides the name and type guess: a numeric
 /// column with the role `flag`, `non_additive`, `key`, `dimension` or `time`
-/// is not a measure. A numeric, non-key-like `flag` or `non_additive` column
-/// (one that would otherwise be a measure) is not part of the grain either,
-/// because it describes a row instead of naming it. A text or boolean `flag`
-/// or `non_additive` column stays among the grain keys, because rows still
-/// differ by it. The `non_additive` columns are listed after the measures,
-/// with the warning not to total them. `None` when no column names the
-/// grain, or when there is neither a measure nor a `non_additive` column to
-/// say anything about.
+/// is not a measure. A `flag` or `non_additive` column that would otherwise
+/// be a measure (a number whose name does not look like a key, such as a
+/// year, a month or an id) is not part of the grain either, because it
+/// describes a row instead of naming it. Any other `flag` or `non_additive`
+/// column, such as a text or boolean one, stays among the grain keys,
+/// because rows still differ by it. The `non_additive` columns are listed
+/// after the measures, with the warning not to total them. `None` when no
+/// column names the grain, or when there is neither a measure nor a
+/// `non_additive` column to say anything about.
 fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
     let asset = format!("{}.{}", table.db, table.name);
     let role = |c: &Column| notes.role(&asset, &c.name);
-    let is_candidate = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
+    let would_be_measure = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
     let (measures, others): (Vec<&Column>, Vec<&Column>) = table.columns.iter().partition(|c| {
-        is_candidate(c)
+        would_be_measure(c)
             && !matches!(
                 role(c),
                 Some("flag" | "non_additive" | "key" | "dimension" | "time")
@@ -794,7 +795,7 @@ fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
     });
     let keys: Vec<&str> = others
         .iter()
-        .filter(|c| !(is_candidate(c) && matches!(role(c), Some("flag" | "non_additive"))))
+        .filter(|c| !(would_be_measure(c) && matches!(role(c), Some("flag" | "non_additive"))))
         .map(|c| c.name.as_str())
         .collect();
     let non_additive: Vec<&str> = table
@@ -2066,6 +2067,25 @@ mod tests {
             grain_line(&table, &notes),
             Some(format!(
                 "    grain: one row per year x region x band; measures: net_amt (SUM them over rows for any total); not additive: band {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_numeric_non_additive_column_with_a_key_like_name_stays_in_the_grain() {
+        let table = sales_with(&[
+            ("region", "String"),
+            ("monthly_active_users", "UInt64"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![role_of("monthly_active_users", "non_additive", true)],
+        );
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per region x monthly_active_users; measures: net_amt (SUM them over rows for any total); not additive: monthly_active_users {NOT_ADDITIVE_ADVICE}\n"
             ))
         );
     }
