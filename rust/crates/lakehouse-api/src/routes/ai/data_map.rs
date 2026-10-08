@@ -773,17 +773,20 @@ fn is_key_like(name: &str) -> bool {
 ///
 /// A column's role in `notes` overrides the name and type guess: a numeric
 /// column with the role `flag`, `non_additive`, `key`, `dimension` or `time`
-/// is not a measure. A `flag` or `non_additive` column is not part of the
-/// grain either, because it describes a row instead of naming it. The
-/// `non_additive` columns are listed after the measures, with the warning
-/// not to total them. `None` when no column names the grain, or when there
-/// is neither a measure nor a `non_additive` column to say anything about.
+/// is not a measure. A numeric, non-key-like `flag` or `non_additive` column
+/// (one that would otherwise be a measure) is not part of the grain either,
+/// because it describes a row instead of naming it. A text or boolean `flag`
+/// or `non_additive` column stays among the grain keys, because rows still
+/// differ by it. The `non_additive` columns are listed after the measures,
+/// with the warning not to total them. `None` when no column names the
+/// grain, or when there is neither a measure nor a `non_additive` column to
+/// say anything about.
 fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
     let asset = format!("{}.{}", table.db, table.name);
     let role = |c: &Column| notes.role(&asset, &c.name);
+    let is_candidate = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
     let (measures, others): (Vec<&Column>, Vec<&Column>) = table.columns.iter().partition(|c| {
-        is_numeric_type(&c.ty)
-            && !is_key_like(&c.name)
+        is_candidate(c)
             && !matches!(
                 role(c),
                 Some("flag" | "non_additive" | "key" | "dimension" | "time")
@@ -791,7 +794,7 @@ fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
     });
     let keys: Vec<&str> = others
         .iter()
-        .filter(|c| !matches!(role(c), Some("flag" | "non_additive")))
+        .filter(|c| !(is_candidate(c) && matches!(role(c), Some("flag" | "non_additive"))))
         .map(|c| c.name.as_str())
         .collect();
     let non_additive: Vec<&str> = table
@@ -1882,8 +1885,8 @@ mod tests {
     #[test]
     fn with_no_roles_every_numeric_non_key_column_is_a_measure_and_no_line_is_tagged() {
         let table = sales_with(&[
-            ("tahun", "UInt16"),
-            ("negara", "String"),
+            ("year", "UInt16"),
+            ("region", "String"),
             ("orders", "UInt32"),
             ("net_amt", "Float64"),
             ("active", "UInt8"),
@@ -1892,7 +1895,7 @@ mod tests {
         assert_eq!(
             grain_line(&table, &notes).as_deref(),
             Some(
-                "    grain: one row per tahun x negara; measures: orders, net_amt, active (SUM them over rows for any total)\n"
+                "    grain: one row per year x region; measures: orders, net_amt, active (SUM them over rows for any total)\n"
             )
         );
         let rendered = render_sales(&table, &notes);
@@ -1902,8 +1905,8 @@ mod tests {
     #[test]
     fn a_non_additive_column_leaves_the_measures_and_is_named_with_the_warning() {
         let table = sales_with(&[
-            ("tahun", "UInt16"),
-            ("negara", "String"),
+            ("year", "UInt16"),
+            ("region", "String"),
             ("orders", "UInt32"),
             ("net_amt", "Float64"),
         ]);
@@ -1917,7 +1920,7 @@ mod tests {
         assert_eq!(
             grain_line(&table, &notes),
             Some(format!(
-                "    grain: one row per tahun x negara; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
             ))
         );
         let rendered = render_sales(&table, &notes);
@@ -1931,8 +1934,8 @@ mod tests {
     #[test]
     fn a_flag_column_leaves_the_measures_and_its_line_says_it_is_a_flag() {
         let table = sales_with(&[
-            ("tahun", "UInt16"),
-            ("negara", "String"),
+            ("year", "UInt16"),
+            ("region", "String"),
             ("net_amt", "Float64"),
             ("active", "UInt8"),
         ]);
@@ -1940,7 +1943,7 @@ mod tests {
         assert_eq!(
             grain_line(&table, &notes).as_deref(),
             Some(
-                "    grain: one row per tahun x negara; measures: net_amt (SUM them over rows for any total)\n"
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total)\n"
             )
         );
         let rendered = render_sales(&table, &notes);
@@ -1953,8 +1956,8 @@ mod tests {
     #[test]
     fn with_every_numeric_column_non_additive_the_line_does_not_tell_the_model_to_sum() {
         let table = sales_with(&[
-            ("tahun", "UInt16"),
-            ("negara", "String"),
+            ("year", "UInt16"),
+            ("region", "String"),
             ("orders", "UInt32"),
             ("visitors", "UInt32"),
         ]);
@@ -1971,7 +1974,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "    grain: one row per tahun x negara; not additive: orders, visitors {NOT_ADDITIVE_ADVICE}\n"
+                "    grain: one row per year x region; not additive: orders, visitors {NOT_ADDITIVE_ADVICE}\n"
             )
         );
     }
@@ -1979,8 +1982,8 @@ mod tests {
     #[test]
     fn a_draft_role_counts_the_same_as_a_confirmed_one() {
         let table = sales_with(&[
-            ("tahun", "UInt16"),
-            ("negara", "String"),
+            ("year", "UInt16"),
+            ("region", "String"),
             ("orders", "UInt32"),
             ("net_amt", "Float64"),
             ("active", "UInt8"),
@@ -1995,7 +1998,7 @@ mod tests {
         assert_eq!(
             grain_line(&table, &notes),
             Some(format!(
-                "    grain: one row per tahun x negara; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
             ))
         );
         let rendered = render_sales(&table, &notes);
@@ -2013,7 +2016,7 @@ mod tests {
     fn a_dimension_time_or_key_role_takes_a_numeric_column_out_of_the_measures() {
         for role in ["dimension", "time", "key"] {
             let table = sales_with(&[
-                ("negara", "String"),
+                ("region", "String"),
                 ("wave", "UInt8"),
                 ("net_amt", "Float64"),
             ]);
@@ -2021,7 +2024,7 @@ mod tests {
             assert_eq!(
                 grain_line(&table, &notes).as_deref(),
                 Some(
-                    "    grain: one row per negara x wave; measures: net_amt (SUM them over rows for any total)\n"
+                    "    grain: one row per region x wave; measures: net_amt (SUM them over rows for any total)\n"
                 ),
                 "role {role}"
             );
@@ -2029,15 +2032,54 @@ mod tests {
     }
 
     #[test]
+    fn a_text_flag_column_stays_in_the_grain_and_its_line_says_it_is_a_flag() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("active", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(
+            grain_line(&table, &notes).as_deref(),
+            Some(
+                "    grain: one row per year x region x active; measures: net_amt (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    active String [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_text_non_additive_column_stays_in_the_grain_and_is_not_listed_as_a_measure() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("band", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("band", "non_additive", true)]);
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per year x region x band; measures: net_amt (SUM them over rows for any total); not additive: band {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
     fn a_table_left_with_no_measure_and_no_non_additive_column_has_no_grain_line() {
-        let table = sales_with(&[("negara", "String"), ("active", "UInt8")]);
+        let table = sales_with(&[("region", "String"), ("active", "UInt8")]);
         let notes = notes(vec![], vec![role_of("active", "flag", true)]);
         assert_eq!(grain_line(&table, &notes), None);
     }
 
     #[test]
     fn the_role_tag_follows_the_description_and_synonyms_and_precedes_the_stats() {
-        let table = sales_with(&[("negara", "String"), ("orders", "UInt32")]);
+        let table = sales_with(&[("region", "String"), ("orders", "UInt32")]);
         let notes = notes(
             vec![],
             vec![with_role(
