@@ -901,19 +901,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
 /// public constructor outside this module, so holding one is the proof that
 /// the check ran.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "the dialers take the approved address in the next commit (SEC-15 K2), which removes this"
-)]
 pub(crate) struct Approved {
     primary: std::net::SocketAddr,
     all: Vec<std::net::SocketAddr>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the dialers take the approved address in the next commit (SEC-15 K2), which removes this"
-)]
 impl Approved {
     /// The address a single-address client (a `sqlx` host string, a
     /// `TcpStream`) connects to: the first one the resolver returned, i.e.
