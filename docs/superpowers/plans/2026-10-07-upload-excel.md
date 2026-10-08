@@ -320,3 +320,39 @@ negative or past about year 9990 is written as the number.
 
 
 ## 9. Review (planner)
+
+## 10. Touch-ups of the upload wizard (asked for by the product owner on 2026-10-08)
+
+Seen on screenshots of the four steps at 1440 px. Console only; no API or
+contract change; what each control does stays as it is.
+
+- **U1, File step.** A bare native file input in a dashed box under a
+  four-sentence paragraph. Make it a drop area that looks like one: an
+  icon, one line ("Drop a file here, or choose one"), a real button, and
+  under it the limits as a short list of facts (accepted: CSV, TSV, .xls,
+  .xlsx; up to 50 MB; not accepted: .xlsm, .xlsb, .ods, archives). A
+  dragged file highlights the area. A chosen file shows as a row: icon by
+  kind, name, size, "Choose another". A refusal stays in place, in the
+  destructive tone. The page's subtitle names Excel too.
+- **U2, Check step.** The preview table runs the whole page, so Next is
+  far below the fold, and nothing says how much is shown. Give the preview
+  its own frame: a height cap with its own scroll, a header that stays, a
+  row-number gutter, an empty cell shown in the quiet tone the Sample tab
+  uses, and a line above it saying how many columns and how many rows are
+  shown of how many read. The three controls keep their order; "Detected:"
+  hints become one quiet line each. A row with more cells than the header
+  is marked, not silently given a nameless column.
+- **U3, Table step.** One input and a sentence in an empty card. Show
+  where the data will land (the full name of the raw table as it will
+  appear in Data Explorer), the rule as a hint under the input that turns
+  into the specific problem when the name breaks it, and the "every column
+  is text" note as a notice in the app's notice style.
+- **U4, Review step.** Keep the three groups; make them read as one
+  summary (consistent label and value sizes, the table's full name, the
+  sheet for a workbook), and say in one sentence above Load what pressing
+  it does.
+- **U5, after Load.** Look at the running, loaded and failed views and
+  bring them to the same level: status first, then what happened, then
+  the next actions (open the table in Data Explorer, upload another).
+- **U6, all steps.** No sideways scroll at 390 px; the step list on the
+  left collapses the way the connector wizard's does; both themes.
