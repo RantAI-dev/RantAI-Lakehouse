@@ -239,6 +239,7 @@ fn test_batch(
 #[tokio::test]
 #[ignore = "needs a live docker compose stack; see this file's module doc"]
 async fn g1_half_a_rust_writes_clickhouse_reads() {
+    panic!("deliberate acceptance test failure to verify gate goes red");
     let env = G1Env::from_process_env();
     let table_name = "g1_rust_write";
 
