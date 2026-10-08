@@ -44,7 +44,9 @@ type Settled = { key: string; preview: UploadPreview | null }
  *
  * For an Excel workbook the preview carries `workbook`, the person chooses a
  * sheet instead of an encoding and a delimiter, and a change of sheet drops
- * the header row chosen for the previous one (another sheet has its own).
+ * the header row chosen for the previous one (another sheet has its own). For
+ * a Parquet file the preview carries `parquet` and nothing here is the
+ * person's to choose (see `UploadCheckStep`).
  */
 export function useUploadPreview(uploadId: string | null) {
   const [overrides, setOverrides] = React.useState<Partial<UploadParseOptions>>({})
@@ -124,6 +126,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
   }
 
   const workbook = shown.workbook
+  const parquet = shown.parquet
   const encodings = UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
     ? UPLOAD_ENCODINGS
     : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
@@ -133,6 +136,17 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
 
   return (
     <div className="space-y-4">
+      {parquet ? (
+        // A Parquet file has one table and its own column names, so there is
+        // no sheet to pick, no encoding or delimiter to get wrong and no
+        // header row to find: the three controls would be decoration.
+        <UploadNotice>
+          This is a Parquet file, so there is nothing to choose here: its column names are the header, and every
+          column is loaded as text. Each column shows the type the file declares for it. Numbers are written
+          without a display format (1234.5), a decimal keeps its exact digits (12.50), dates are written as
+          2025-09-24, and a timestamp as 2025-09-24T13:30:00, with a trailing Z when the column is in UTC.
+        </UploadNotice>
+      ) : (
       <div className={workbook ? "grid gap-4 sm:grid-cols-2" : "grid gap-4 sm:grid-cols-3"}>
         {workbook ? (
           <div className="space-y-1.5">
@@ -211,6 +225,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
           </p>
         </div>
       </div>
+      )}
       {workbook ? (
         <UploadNotice>
           Every column is loaded as text. Numbers are written as the cell holds them, without its display format
@@ -235,8 +250,9 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
 
       {shown.columns.length === 0 ? (
         <p role="alert" className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
-          The header row has no columns: it is past the part of the file that was read, or it is an empty
-          line. Choose another header row to go on.
+          {parquet
+            ? "This file has no columns."
+            : "The header row has no columns: it is past the part of the file that was read, or it is an empty line. Choose another header row to go on."}
         </p>
       ) : (
         <UploadPreviewGrid preview={shown} stale={settled === null} />

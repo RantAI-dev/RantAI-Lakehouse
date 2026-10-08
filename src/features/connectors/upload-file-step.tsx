@@ -13,14 +13,15 @@ const INPUT_ID = "upload-file-input"
 
 /** What the picker suggests. `accept` only steers it; drag and drop is not limited by it, `fileProblem` decides. */
 const ACCEPT =
-  ".csv,.tsv,.txt,.xls,.xlsx,text/csv,text/tab-separated-values,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ".csv,.tsv,.txt,.xls,.xlsx,.parquet,text/csv,text/tab-separated-values,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.apache.parquet"
 
 /** The limits as short facts. They repeat what the API and `fileProblem` enforce; the sheet fact repeats the Check step. */
 const FACTS: readonly { label: string; value: string }[] = [
-  { label: "Accepted", value: "CSV, TSV, .xls, .xlsx" },
+  { label: "Accepted", value: "CSV, TSV, .xls, .xlsx, .parquet" },
   { label: "Size", value: "Up to 50 MB" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, archives" },
   { label: "Workbooks", value: "One sheet is loaded, chosen on the next step" },
+  { label: "Parquet", value: "Every column is loaded as text; a file with a binary or nested column is refused" },
 ]
 
 /**

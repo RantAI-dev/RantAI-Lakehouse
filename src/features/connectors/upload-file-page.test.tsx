@@ -169,23 +169,25 @@ describe("UploadFilePage, first step", () => {
     const facts = new Map(
       screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
     )
-    expect(facts.get("Accepted")).toBe("CSV, TSV, .xls, .xlsx")
+    expect(facts.get("Accepted")).toBe("CSV, TSV, .xls, .xlsx, .parquet")
     expect(facts.get("Size")).toBe("Up to 50 MB")
     expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, archives")
     expect(facts.get("Workbooks")).toContain("One sheet is loaded")
+    expect(facts.get("Parquet")).toContain("binary or nested column is refused")
     const input = screen.getByLabelText("Choose a file") as HTMLInputElement
     expect(input.type).toBe("file")
     expect(input.accept).toContain(".csv")
     expect(input.accept).toContain(".tsv")
     expect(input.accept).toContain(".xls")
     expect(input.accept).toContain(".xlsx")
+    expect(input.accept).toContain(".parquet")
   })
 
   it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
     stubFetch()
     render(<UploadFilePage />)
     expect(screen.getByText("Drop a file here, or choose one")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV or Excel file in as a raw table/)).toBeDefined()
+    expect(screen.getByText(/CSV, TSV, Excel or Parquet file in as a raw table/)).toBeDefined()
     const input = screen.getByLabelText("Choose a file")
     const button = screen.getByText("Choose a file", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)
@@ -221,6 +223,8 @@ describe("UploadFilePage, first step", () => {
     const cases: [string, string | null, string, string][] = [
       ["stock.xls", "XLS", "workbook", "text-emerald-700"],
       ["Stock.XLSX", "XLSX", "workbook", "text-emerald-700"],
+      ["orders.parquet", "PARQUET", "parquet", "text-violet-700"],
+      ["ORDERS.Parquet", "PARQUET", "parquet", "text-violet-700"],
       ["stock.csv", "CSV", "delimited", "text-primary"],
       ["STOCK.TSV", "TSV", "delimited", "text-primary"],
       ["notes.txt", "TXT", "other", "text-muted-foreground"],
@@ -274,6 +278,20 @@ describe("UploadFilePage, first step", () => {
     fireEvent.click(next())
 
     await screen.findByLabelText("Sheet")
+    expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/uploads")
+  })
+
+  it("sends a .parquet instead of refusing it by name, and lands on a Check step without controls", async () => {
+    const calls = stubFetch({
+      create: json({ ...upload({ originalFilename: "orders.parquet" }), parquet: PARQUET }, 201),
+      preview: () => parquetPreview(),
+    })
+    render(<UploadFilePage />)
+    chooseFile(new File(["x"], "orders.parquet"))
+    expect(screen.queryByRole("alert")).toBeNull()
+    fireEvent.click(next())
+
+    await screen.findByRole("columnheader", { name: /sku/ })
     expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/uploads")
   })
 
@@ -521,6 +539,90 @@ describe("UploadFilePage, Check step for a workbook", () => {
       headerRow: 0,
       sheet: "Quirks",
       bronzeTable: "stock",
+      mode: "replace",
+    })
+  })
+})
+
+const PARQUET = {
+  columns: [
+    { name: "sku", type: "string" },
+    { name: "qty", type: "int64" },
+    { name: "price", type: "decimal(10,2)" },
+  ],
+  rows: 3000,
+}
+
+/** What the API answers for a Parquet file's preview: the fixed dialect, the header at row 1, and the declared types. */
+function parquetPreview(over: Partial<UploadPreview> = {}): UploadPreview {
+  return preview({
+    columns: ["sku", "qty", "price"],
+    rows: [
+      ["a1", "3", "1.50"],
+      ["b2", "5", "12.00"],
+    ],
+    truncated: true,
+    parquet: PARQUET,
+    ...over,
+  })
+}
+
+describe("UploadFilePage, Check step for a Parquet file", () => {
+  async function openParquet(routes: Routes = {}) {
+    url.search = "?id=up-1"
+    const calls = stubFetch({
+      get: () => upload({ originalFilename: "orders.parquet" }),
+      preview: () => parquetPreview(),
+      ...routes,
+    })
+    render(<UploadFilePage />)
+    await screen.findByRole("columnheader", { name: /sku/ })
+    return calls
+  }
+
+  it("shows no sheet, encoding, delimiter or header-row control, and says every column is loaded as text", async () => {
+    await openParquet()
+    expect(screen.queryByLabelText("Sheet")).toBeNull()
+    expect(screen.queryByLabelText("Encoding")).toBeNull()
+    expect(screen.queryByLabelText("Delimiter")).toBeNull()
+    expect(screen.queryByLabelText("Header row")).toBeNull()
+    const note = screen.getByText(/This is a Parquet file/)
+    expect(note.textContent).toContain("every column is loaded as text")
+    expect(note.textContent).toContain("2025-09-24")
+  })
+
+  it("shows each column's declared type under its name, and counts the rows against the file's total", async () => {
+    await openParquet()
+    expect(screen.getByText("was: string")).toBeDefined()
+    expect(screen.getByText("was: int64")).toBeDefined()
+    expect(screen.getByText("was: decimal(10,2)")).toBeDefined()
+    expect(screen.getByText("Showing the first 2 rows of 3,000.")).toBeDefined()
+    await waitFor(() => expect(next().disabled).toBe(false))
+  })
+
+  it("sends the settings the preview used when Load is pressed (the API ignores them for Parquet), and the review names the format", async () => {
+    const started = upload({ status: "ingesting", bronzeTable: "orders", loadMode: "replace" })
+    const calls = await openParquet({ ingest: json({ upload: started, runId: "run-1" }) })
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+    expect(screen.getByText("Format")).toBeDefined()
+    expect(screen.getByText("Parquet")).toBeDefined()
+    expect(screen.getByText("3,000")).toBeDefined()
+    expect(screen.queryByText("Encoding")).toBeNull()
+    expect(screen.queryByText("Header row")).toBeNull()
+    expect(screen.queryByText("Sheet")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
+    const post = calls.find((c) => c.url.endsWith("/ingest"))
+    expect(post?.body).toEqual({
+      encoding: "utf-8",
+      delimiter: ",",
+      headerRow: 0,
+      bronzeTable: "orders",
       mode: "replace",
     })
   })

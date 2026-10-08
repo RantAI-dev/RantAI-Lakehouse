@@ -42,6 +42,16 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
    deletes the upload. The API converts the sheet and stores it beside the
    workbook; the load job is the one step 3 runs, unchanged.
 
+9. A Parquet file (Q4 of section 11 of the same plan): it uploads
+   `ops/fixtures/parquet/orders.parquet`, expects the answer to list its five
+   columns with the types the file declares, previews it (the fixed dialect,
+   the file's column names as the header, its rows as text: a decimal with its
+   scale, a date as `2025-09-24`), loads it with `replace` into
+   `<table>_parquet` without sending an encoding, delimiter, header row or
+   sheet, expects the table to hold the three rows as text, one succeeded
+   `ingest_run`, and deletes the upload. The API converts the file and stores
+   the text beside it; the load job is the one step 3 runs, unchanged.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -59,15 +69,16 @@ Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 - `G9_TENANT_ID`: a tenant the account belongs to, sent as `X-Tenant`.
   Optional: without it the API uses the account's first tenant.
 
-It reads the fixtures from `ops/fixtures/uploads/` and `ops/fixtures/workbooks/`
-beside this directory, so a container that runs it needs `ops/` and not only
+It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` and
+`ops/fixtures/parquet/` beside this directory, so a container that runs it needs `ops/` and not only
 `ops/g9/`.
 
 # What it leaves behind
 
-The raw tables `g9_upload_<suffix>` (four rows) and `g9_upload_<suffix>_xlsx`
-(three) with their Iceberg files and catalog entries; the claims on their
-names, which are never released; three `ingest_run` rows; audit events and query history entries. A raw table and
+The raw tables `g9_upload_<suffix>` (four rows), `g9_upload_<suffix>_xlsx`
+(three) and `g9_upload_<suffix>_parquet` (three) with their Iceberg files and
+catalog entries; the claims on their names, which are never released; four
+`ingest_run` rows; audit events and query history entries. A raw table and
 its claim cannot be removed through the API (deleting a raw table is outside
 the plan, section 5), so an operator who wants them gone removes them by hand.
 The upload itself is deleted at the end, and also when a step fails, as far as
@@ -88,6 +99,23 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "uploads"
 FIXTURE = "sap_report_utf16"
 WORKBOOKS = Path(__file__).resolve().parents[1] / "fixtures" / "workbooks"
 WORKBOOK = "stock.xlsx"
+PARQUETS = Path(__file__).resolve().parents[1] / "fixtures" / "parquet"
+PARQUET = "orders.parquet"
+# What `orders.parquet` holds, as text (see
+# `ops/fixtures/parquet/make_parquet.py`): the types the file declares, in
+# column order, and the rows the conversion writes (a decimal keeps its scale).
+PARQUET_COLUMNS = [
+    {"name": "sku", "type": "string"},
+    {"name": "name", "type": "string"},
+    {"name": "qty", "type": "int64"},
+    {"name": "price", "type": "decimal(10,2)"},
+    {"name": "received", "type": "date"},
+]
+PARQUET_ROWS = [
+    ["A-100", "Bolt, hex M6", "10", "1.50", "2025-09-24"],
+    ["A-200", "Washer", "250", "0.05", "2025-09-25"],
+    ["A-300", "Flange DN50 \u2013 steel", "4", "12.00", "2025-10-01"],
+]
 # What the `Stock` sheet of `stock.xlsx` holds, as text (see
 # `ops/fixtures/workbooks/make_workbooks.py`), and the columns the job names
 # from its header row.
@@ -422,6 +450,78 @@ def step_workbook(api, base_table: str, state: dict) -> None:
     print("[g9] workbook: PASS (the upload is gone, the table stays)")
 
 
+def step_parquet(api, base_table: str, state: dict) -> None:
+    path = PARQUETS / PARQUET
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/parquet/ beside it)")
+    raw = path.read_bytes()
+    names = [c["name"] for c in PARQUET_COLUMNS]
+    state["upload_id"], state["deleted"] = None, False
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (PARQUET, raw, "application/octet-stream")},
+        timeout=60,
+    )
+    upload = _expect(resp, 201, "POST /api/uploads (parquet)").json()
+    upload_id = upload["id"]
+    state["upload_id"] = upload_id
+    parquet = upload.get("parquet") or {}
+    if parquet.get("columns") != PARQUET_COLUMNS or parquet.get("rows") != len(PARQUET_ROWS):
+        raise G9Failure(f"the Parquet file's footer should list {PARQUET_COLUMNS} and {len(PARQUET_ROWS)} rows, got {parquet}")
+    print(f"[g9] parquet: uploaded {PARQUET} as {upload_id}, columns {names}")
+
+    preview = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=60), 200, "parquet preview").json()
+    if preview.get("columns") != names or preview.get("rows") != PARQUET_ROWS:
+        raise G9Failure(f"the Parquet preview shows {preview.get('columns')} and {preview.get('rows')}")
+    if (preview.get("parquet") or {}).get("columns") != PARQUET_COLUMNS:
+        raise G9Failure(f"the preview should carry the declared types, got {preview.get('parquet')}")
+
+    table = f"{base_table}_parquet"
+    # No dialect, header row or sheet: none of them is read for a Parquet file.
+    resp = api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json={"bronzeTable": table, "mode": "replace"}, timeout=60)
+    launched = _expect(resp, 200, "POST .../ingest (parquet)").json()
+    if not launched.get("runId") or launched["upload"].get("status") != "ingesting":
+        raise G9Failure(f"an accepted load should return a run id and an `ingesting` upload, got {launched}")
+    print(f"[g9] parquet: launched run {launched['runId']}")
+
+    def settled():
+        current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+        print(f"[g9] upload {upload_id} status={current.get('status')}")
+        if current.get("status") == "failed":
+            raise G9Failure(f"the Parquet load failed: {current.get('error')!r}")
+        return current if current.get("status") == "ingested" else None
+
+    loaded = _wait_for(f"upload {upload_id} ingested", settled, LOAD_TIMEOUT_S)
+    if loaded.get("rows") != len(PARQUET_ROWS) or loaded.get("bronzeTable") != table:
+        raise G9Failure(f"the Parquet load settled with the wrong record: rows {loaded.get('rows')!r}, table {loaded.get('bronzeTable')!r}")
+    if loaded.get("parseOptions") != {"encoding": "utf-8", "delimiter": ",", "headerRow": 0}:
+        raise G9Failure(f"a Parquet load records the fixed dialect and no sheet, parseOptions is {loaded.get('parseOptions')}")
+
+    body = run_query(api, f"SELECT {', '.join(names)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY sku")
+    got = [[row[c] for c in names] for row in body["rows"]]
+    if got != PARQUET_ROWS:
+        raise G9Failure(f"the table holds {got}, the file says {PARQUET_ROWS}")
+    types = run_query(
+        api,
+        "SELECT " + ", ".join(f"toTypeName({c}) AS t_{c}" for c in names)
+        + f" FROM {QUERY_DB}.`bronze.{table}` WHERE 1 LIMIT 1",
+    )["rows"][0]
+    not_text = {c: types[f"t_{c}"] for c in names if "String" not in types[f"t_{c}"]}
+    if not_text:
+        raise G9Failure(f"every column of a Parquet load should be text, these are not: {not_text}")
+    print("[g9] parquet: the file's rows are in the table, every column as text")
+
+    resp = api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{upload_id}"}, timeout=30)
+    runs = _expect(resp, 200, "GET /api/governance/ingest-runs (parquet)").json()
+    if len(runs) != 1 or runs[0].get("status") != "succeeded" or runs[0].get("rows") != len(PARQUET_ROWS):
+        raise G9Failure(f"the Parquet load should have left one succeeded ingest_run row, found {runs}")
+
+    _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE the Parquet upload")
+    state["deleted"] = True
+    _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 404, "GET of the deleted Parquet upload")
+    print("[g9] parquet: PASS (the upload is gone, the table stays)")
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -446,6 +546,7 @@ def main() -> int:
         step_one_ingest_run_per_load(api, upload_id, table, file_rows)
         step_delete_keeps_the_table(api, upload_id, table, 2 * file_rows, state)
         step_workbook(api, table, state)
+        step_parquet(api, table, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
         print(f"[g9] FAILED: {reason}", file=sys.stderr)

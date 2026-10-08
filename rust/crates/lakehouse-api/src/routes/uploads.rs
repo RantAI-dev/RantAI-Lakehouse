@@ -59,15 +59,30 @@
 //! beside the original ([`converted_key`]) and launches the unchanged
 //! `file_ingest_job` on it with a fixed dialect (UTF-8, comma). Whether an
 //! upload IS a workbook is decided by its stored name AND its first bytes
-//! ([`is_workbook`]): a text export named `.xls` (the file that motivated
+//! ([`conversion_of_head`]): a text export named `.xls` (the file that motivated
 //! the feature) is still text. The chosen sheet cannot go in the job's run
 //! configuration (its schema is closed and the job does not change), so it is
 //! recorded in the upload's `parse_options` and in the audit event.
 //!
+//! # Parquet files
+//!
+//! A `.parquet` file takes the same path as a workbook (section 11 of
+//! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it arrived,
+//! converted in memory for the preview ([`crate::upload_parquet`]) and, at
+//! ingest, stored as a CSV object beside the original ([`converted_key`]) that
+//! the unchanged job loads with the fixed dialect. A file has one table and its
+//! own column names, so there is no sheet and the header row is fixed at 0
+//! (`headerRow` in a request is not read). Whether an upload IS a Parquet file
+//! is decided by its stored name AND its first bytes, as for a workbook
+//! ([`conversion_of_head`]). Where the code branches on "is this converted
+//! before it is loaded", it branches on [`Conversion`], not on a workbook.
+//!
 //! # Statuses
 //!
 //! Every refusal of the upload itself (no part, empty, too large, a workbook
-//! that is not an `.xls` or `.xlsx` or does not open, or another binary) is a 400 with a fixed sentence; `lakehouse_core::
+//! that is not an `.xls` or `.xlsx` or does not open, a Parquet file that does
+//! not open, is encrypted, has a binary or nested column or is past the cell
+//! cap, or another binary) is a 400 with a fixed sentence; `lakehouse_core::
 //! ApiError` has no 413 and this change does not add one.
 
 use std::collections::HashMap;
@@ -103,6 +118,7 @@ use super::lakehouse::is_unknown_table_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_parquet::{self, ParquetInfo};
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
@@ -134,6 +150,11 @@ const PREVIEW_ROWS: usize = 20;
 /// change re-runs it: a prefix keeps that cheap. A header row chosen past this
 /// shows no columns, as for a text file whose head is shorter than the row.
 const WORKBOOK_PREVIEW_RECORDS: usize = 2000;
+
+/// How many rows of a Parquet file the preview decodes (the converted text has
+/// one record more, the column names). Only these are decoded: the footer
+/// already says how many rows the file has.
+const PARQUET_PREVIEW_ROWS: usize = 2000;
 
 /// How many leading bytes tell a workbook from text for an upload that is
 /// named like one (the magic numbers are four bytes).
@@ -187,12 +208,13 @@ const NO_FILE_PART: &str = "The form has no part named file.";
 const UNREADABLE: &str = "The upload could not be read.";
 const EMPTY_FILE: &str = "The file is empty.";
 const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
-const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
-const PARQUET: &str = "This looks like a Parquet file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.";
-const OTHER_BINARY: &str = "This is not a delimited text file or an Excel workbook. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.";
+const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+const PARQUET: &str = "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again.";
+const OTHER_BINARY: &str = "This is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.";
 const EMPTY_SHEET: &str = "That sheet is empty, so there is nothing to load.";
+const EMPTY_PARQUET: &str = "That Parquet file has no rows, so there is nothing to load.";
 const SHEET_RULE: &str = "sheet must be text.";
-const CONVERSION_FAILED: &str = "The workbook could not be converted.";
+const CONVERSION_FAILED: &str = "The file could not be converted.";
 const BODY_NOT_AN_OBJECT: &str = "The request body must be a JSON object.";
 /// The sentence for a table name [`table_name_problem`] refuses, in words a
 /// person can follow (review finding C1). T10's `tableNameProblem` in the
@@ -374,6 +396,10 @@ pub struct CreateResponse {
     /// asked for. Absent for a text file.
     #[serde(skip_serializing_if = "Option::is_none")]
     workbook: Option<WorkbookInfo>,
+    /// For a Parquet file: its columns with their declared types and its row
+    /// count. Absent for anything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parquet: Option<ParquetInfo>,
 }
 
 /// `POST /api/uploads/{id}/ingest`'s response.
@@ -431,46 +457,90 @@ fn storage_key(tenant: &str, id: &str, filename: &str) -> String {
 
 /// Whether a name (or a storage key, which ends in the stored extension) is
 /// one an Excel workbook may have: `.xls` or `.xlsx`. Necessary, not
-/// sufficient: a text file can carry either ([`is_workbook`]).
+/// sufficient: a text file can carry either ([`conversion_of`]).
 fn has_workbook_name(name: &str) -> bool {
     matches!(extension_of(name).as_str(), "xls" | "xlsx")
 }
 
-/// The key a workbook's converted sheet is stored under, beside the original:
+/// Whether a name (or a storage key) is `.parquet`. Necessary, not
+/// sufficient, as for a workbook.
+fn has_parquet_name(name: &str) -> bool {
+    extension_of(name) == "parquet"
+}
+
+/// What an upload is turned into before the load reads it: the load job reads
+/// delimited text and nothing else, so these two are converted in the API, once
+/// (ADR 0014, decision 3 and its amendments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conversion {
+    /// An Excel workbook: one sheet becomes the text.
+    Workbook,
+    /// A Parquet file: its one table becomes the text.
+    Parquet,
+}
+
+/// The conversion a stored name allows, before its bytes are looked at.
+fn conversion_for_name(name: &str) -> Option<Conversion> {
+    if has_workbook_name(name) {
+        Some(Conversion::Workbook)
+    } else if has_parquet_name(name) {
+        Some(Conversion::Parquet)
+    } else {
+        None
+    }
+}
+
+/// The key a converted upload is stored under, beside the original:
 /// server-made like [`storage_key`], inside the same prefix.
 fn converted_key(storage_key: &str) -> String {
     format!("{storage_key}.converted.csv")
 }
 
-/// Whether a stored upload is a workbook: named like one AND starting like
-/// one. A text export called `.xls` (ADR 0014's motivating file) is text. An
-/// upload that is not named like a workbook costs no storage read.
+/// The conversion an upload needs, judged from its stored name AND its first
+/// bytes: a text export called `.xls` (ADR 0014's motivating file) is text, and
+/// so is a text file called `.parquet`. A file whose footer is encrypted starts
+/// with `PARE` and not with the magic [`upload_parse::sniff`] knows, so a
+/// `.parquet` that starts so is still a Parquet file (the reader refuses it
+/// with its own reason).
+fn conversion_of_head(key: &str, head: &[u8]) -> Option<Conversion> {
+    match (conversion_for_name(key)?, upload_parse::sniff(head)) {
+        (Conversion::Workbook, Kind::Workbook) => Some(Conversion::Workbook),
+        (Conversion::Parquet, Kind::Parquet) => Some(Conversion::Parquet),
+        (Conversion::Parquet, _) if upload_parquet::has_encrypted_magic(head) => {
+            Some(Conversion::Parquet)
+        }
+        _ => None,
+    }
+}
+
+/// The conversion a stored upload needs, or `None` for text. An upload that is
+/// not named like a workbook or a Parquet file costs no storage read.
 ///
 /// # Errors
 ///
 /// 503 when the object store is unavailable.
-async fn is_workbook(state: &AppState, row: &Upload) -> Result<bool, ApiError> {
-    if !has_workbook_name(&row.storage_key) {
-        return Ok(false);
+async fn conversion_of(state: &AppState, row: &Upload) -> Result<Option<Conversion>, ApiError> {
+    if conversion_for_name(&row.storage_key).is_none() {
+        return Ok(None);
     }
     let store = UploadStore::connect(&state.config).await?;
     let head = store
         .head_bytes(&row.storage_key, SNIFF_PROBE_BYTES)
         .await?;
-    Ok(upload_parse::sniff(&head) == Kind::Workbook)
+    Ok(conversion_of_head(&row.storage_key, &head))
 }
 
-/// Run a workbook read on a blocking thread (parsing is CPU work on up to
-/// 50 MB) and turn its refusal into a 400 with the refusal's own sentence. A
-/// task that did not finish is logged and answered with a fixed sentence.
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, WorkbookError> + Send + 'static,
+/// Run a conversion on a blocking thread (parsing is CPU work on up to 50 MB)
+/// and turn its refusal into a 400 with the refusal's own sentence. A task that
+/// did not finish is logged and answered with a fixed sentence.
+async fn blocking<T: Send + 'static, E: std::fmt::Display + Send + 'static>(
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
 ) -> Result<T, ApiError> {
     match tokio::task::spawn_blocking(work).await {
         Ok(Ok(done)) => Ok(done),
         Ok(Err(refusal)) => Err(ApiError::BadRequest(refusal.to_string())),
         Err(err) => {
-            tracing::warn!(%err, "a workbook conversion task did not finish");
+            tracing::warn!(%err, "a file conversion task did not finish");
             Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
         }
     }
@@ -558,13 +628,16 @@ enum Accepted {
     /// Starts like a workbook and is named `.xls` or `.xlsx`; whether it
     /// really opens is for `upload_workbook` to say.
     Workbook,
+    /// Starts like a Parquet file (or like an encrypted one) and is named
+    /// `.parquet`; whether it really opens is for `upload_parquet` to say.
+    Parquet,
 }
 
 /// Whether the bytes of an upload are acceptable: not empty, within the cap,
-/// and delimited text or a workbook by their first bytes (never by the type
-/// the browser claimed, and the name only to refuse a zip or OLE file that is
-/// not named `.xls` or `.xlsx`: the file that motivated this was called `.xls`
-/// and was text).
+/// and delimited text, a workbook or a Parquet file by their first bytes (never
+/// by the type the browser claimed, and the name only to refuse a zip, OLE or
+/// Parquet file that is not named for what it is: the file that motivated this
+/// was called `.xls` and was text).
 fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
     if bytes.is_empty() {
         return Err(ApiError::BadRequest(EMPTY_FILE.to_owned()));
@@ -572,10 +645,15 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
     if bytes.len() > MAX_UPLOAD_BYTES {
         return Err(ApiError::BadRequest(TOO_LARGE.to_owned()));
     }
+    if has_parquet_name(filename) && upload_parquet::has_encrypted_magic(bytes) {
+        // Not a magic `sniff` knows; the reader names the real reason.
+        return Ok(Accepted::Parquet);
+    }
     let message = match upload_parse::sniff(bytes) {
         Kind::DelimitedText => return Ok(Accepted::Text),
         Kind::Workbook if has_workbook_name(filename) => return Ok(Accepted::Workbook),
         Kind::Workbook => WORKBOOK,
+        Kind::Parquet if has_parquet_name(filename) => return Ok(Accepted::Parquet),
         Kind::Parquet => PARQUET,
         Kind::OtherBinary => OTHER_BINARY,
     };
@@ -596,8 +674,9 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
 /// 400 for a caller in no tenant, a request that is not a multipart form, no
 /// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], a workbook
 /// that is not an `.xls` or `.xlsx` or does not open (damaged, password
-/// protected, no sheet), a Parquet file or another binary (each with its own
-/// fixed sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
+/// protected, no sheet), a Parquet file that is not named `.parquet` or does
+/// not open (damaged, encrypted, a binary or nested column, over the cell cap)
+/// or another binary (each with its own fixed sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
 /// 503 when Postgres or the object store is unavailable.
 pub async fn create(
     State(state): State<AppState>,
@@ -619,12 +698,24 @@ pub async fn create(
     })?;
     let part = read_file_part(form).await?;
     let accepted = check_file(&part.bytes, &part.filename)?;
-    // A workbook is opened before anything is stored: only what opens is kept.
-    let workbook = match accepted {
-        Accepted::Text => None,
+    // A workbook or a Parquet file is opened before anything is stored: only
+    // what opens is kept. (A Parquet file is opened by its footer; a page that
+    // cannot be decoded is found when the file is converted.)
+    let (workbook, parquet) = match accepted {
+        Accepted::Text => (None, None),
         Accepted::Workbook => {
             let bytes = part.bytes.clone();
-            Some(blocking(move || upload_workbook::list_sheets(&bytes)).await?)
+            (
+                Some(blocking(move || upload_workbook::list_sheets(&bytes)).await?),
+                None,
+            )
+        }
+        Accepted::Parquet => {
+            let bytes = part.bytes.clone();
+            (
+                None,
+                Some(blocking(move || upload_parquet::inspect(&bytes)).await?),
+            )
         }
     };
 
@@ -685,6 +776,7 @@ pub async fn create(
             upload: row.into(),
             duplicate_of: duplicate.map(Into::into),
             workbook,
+            parquet,
         }),
     ))
 }
@@ -1000,6 +1092,10 @@ pub struct PreviewResponse {
     preview: Preview,
     #[serde(skip_serializing_if = "Option::is_none")]
     workbook: Option<WorkbookView>,
+    /// For a Parquet file: its columns with the types the file declares and
+    /// the row count its footer states (`preview.rows` are the first ones).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parquet: Option<ParquetInfo>,
 }
 
 /// What a workbook preview adds to a [`Preview`].
@@ -1049,11 +1145,18 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// answer says `utf-8` and `,`), `headerRow` applies, and `sheet` picks the
 /// sheet. The answer adds `workbook`: the sheet read and the sheets there are.
 ///
+/// A Parquet file is converted the same way (only the first
+/// [`PARQUET_PREVIEW_ROWS`] rows are decoded). `encoding`, `delimiter`,
+/// `headerRow` and `sheet` are validated and then ignored: the header is the
+/// file's own column names, always the first record. The answer adds
+/// `parquet`: each column's declared type and the file's row count.
+///
 /// # Errors
 ///
 /// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid, and
-/// for a workbook that cannot be read, a `sheet` it does not have or a sheet
-/// over the cell limit (each with its own fixed sentence); 404
+/// for a workbook or Parquet file that cannot be read, a `sheet` a workbook
+/// does not have or a sheet or file over the cell limit (each with its own
+/// fixed sentence); 404
 /// for an unknown upload or another tenant's; 503 when Postgres or the object
 /// store is unavailable.
 pub async fn preview(
@@ -1071,9 +1174,16 @@ pub async fn preview(
         .ok_or_else(not_found)?;
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
-    if has_workbook_name(&row.storage_key) && upload_parse::sniff(&head) == Kind::Workbook {
-        let response = workbook_preview(&store, &row, query.sheet, overrides.header_row).await?;
-        return Ok(ApiJson(response));
+    match conversion_of_head(&row.storage_key, &head) {
+        Some(Conversion::Workbook) => {
+            let response =
+                workbook_preview(&store, &row, query.sheet, overrides.header_row).await?;
+            return Ok(ApiJson(response));
+        }
+        Some(Conversion::Parquet) => {
+            return Ok(ApiJson(parquet_preview(&store, &row).await?));
+        }
+        None => {}
     }
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
@@ -1081,6 +1191,7 @@ pub async fn preview(
     Ok(ApiJson(PreviewResponse {
         preview: upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS),
         workbook: None,
+        parquet: None,
     }))
 }
 
@@ -1097,7 +1208,7 @@ async fn workbook_preview(
         let read = upload_workbook::read_sheet(&bytes, sheet.as_deref())?;
         let cut = read.data.rows() > WORKBOOK_PREVIEW_RECORDS;
         let csv = read.data.to_csv(Some(WORKBOOK_PREVIEW_RECORDS));
-        Ok((read.info, read.data.name().to_owned(), csv, cut))
+        Ok::<_, WorkbookError>((read.info, read.data.name().to_owned(), csv, cut))
     })
     .await?;
     let overrides = Overrides {
@@ -1108,6 +1219,26 @@ async fn workbook_preview(
     Ok(PreviewResponse {
         preview: upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS),
         workbook: Some(WorkbookView { sheet: name, info }),
+        parquet: None,
+    })
+}
+
+/// The preview of a Parquet file: its first rows as text, read the way the load
+/// reads them (UTF-8, comma, the first record is the header).
+async fn parquet_preview(store: &UploadStore, row: &Upload) -> Result<PreviewResponse, ApiError> {
+    let bytes = store.get_all(&row.storage_key).await?;
+    let converted =
+        blocking(move || upload_parquet::convert(&bytes, Some(PARQUET_PREVIEW_ROWS))).await?;
+    let cut = converted.info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
+    let overrides = Overrides {
+        encoding: Some(Encoding::Utf8),
+        delimiter: Some(','),
+        header_row: Some(0),
+    };
+    Ok(PreviewResponse {
+        preview: upload_parse::preview(&converted.csv, cut, overrides, PREVIEW_ROWS),
+        workbook: None,
+        parquet: Some(converted.info),
     })
 }
 
@@ -1181,12 +1312,17 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 /// `headerRow` and, optional, `sheet`. All are checked; the load uses exactly
 /// what was confirmed and nothing is guessed (ADR 0014, decision 3).
 ///
-/// For a `workbook` the dialect is not the user's to choose: the converted
-/// text is always UTF-8 with commas, `encoding` and `delimiter` are not read
-/// (a retry sends back what the upload recorded, which may carry them), and
-/// `sheet` picks the sheet. For a text file `sheet` has no meaning and is
-/// only checked to be text.
-fn parse_ingest_request(body: &[u8], workbook: bool) -> Result<IngestRequest, ApiError> {
+/// For a `conversion` (a workbook or a Parquet file) the dialect is not the
+/// user's to choose: the converted text is always UTF-8 with commas, `encoding`
+/// and `delimiter` are not read (a retry sends back what the upload recorded,
+/// which may carry them). A workbook's `sheet` picks the sheet; a Parquet
+/// file's header is its own column names, so `headerRow` is not read either
+/// and is 0. For a text file `sheet` has no meaning and is only checked to be
+/// text.
+fn parse_ingest_request(
+    body: &[u8],
+    conversion: Option<Conversion>,
+) -> Result<IngestRequest, ApiError> {
     let bad = |message: &str| ApiError::BadRequest(message.to_owned());
     let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad(BODY_NOT_AN_OBJECT));
@@ -1200,7 +1336,7 @@ fn parse_ingest_request(body: &[u8], workbook: bool) -> Result<IngestRequest, Ap
         Some(Value::String(text)) => LoadMode::parse(text).ok_or_else(|| bad(MODE_RULE))?,
         Some(_) => return Err(bad(MODE_RULE)),
     };
-    let (encoding, delimiter) = if workbook {
+    let (encoding, delimiter) = if conversion.is_some() {
         (Encoding::Utf8, ',')
     } else {
         (
@@ -1209,9 +1345,10 @@ fn parse_ingest_request(body: &[u8], workbook: bool) -> Result<IngestRequest, Ap
                 .ok_or_else(|| bad(DELIMITER_RULE))?,
         )
     };
-    let header_row = match fields.get("headerRow") {
-        None | Some(Value::Null) => return Err(bad("headerRow is required.")),
-        Some(value) => value.as_u64().ok_or_else(|| bad(HEADER_ROW_RULE))?,
+    let header_row = match (conversion, fields.get("headerRow")) {
+        (Some(Conversion::Parquet), _) => 0,
+        (_, None | Some(Value::Null)) => return Err(bad("headerRow is required.")),
+        (_, Some(value)) => value.as_u64().ok_or_else(|| bad(HEADER_ROW_RULE))?,
     };
     let sheet = match fields.get("sheet") {
         None | Some(Value::Null) => None,
@@ -1401,40 +1538,53 @@ async fn launch(
     Err(failure)
 }
 
-/// A workbook's sheet, converted and stored.
+/// An upload converted to delimited text and stored.
 struct Converted {
     /// The object the job reads.
     key: String,
-    /// The sheet's name, as the workbook spells it.
-    sheet: String,
+    /// A workbook's sheet, as the workbook spells it; `None` for a Parquet file.
+    sheet: Option<String>,
 }
 
-/// Convert the chosen sheet of a workbook upload and store it as a CSV beside
-/// the original. The object is written again by the next load of the same
-/// upload, and removed with the upload ([`delete`]).
-async fn convert_workbook(
+/// Convert a workbook upload's chosen sheet, or a Parquet upload's table, and
+/// store the text as a CSV beside the original. The object is written again by
+/// the next load of the same upload, and removed with the upload ([`delete`]).
+async fn convert_upload(
     state: &AppState,
     row: &Upload,
+    conversion: Conversion,
     sheet: Option<&str>,
 ) -> Result<Converted, ApiError> {
     let store = UploadStore::connect(&state.config).await?;
     let bytes = store.get_all(&row.storage_key).await?;
-    let asked = sheet.map(str::to_owned);
-    let (name, empty, csv) = blocking(move || {
-        let read = upload_workbook::read_sheet(&bytes, asked.as_deref())?;
-        Ok((
-            read.data.name().to_owned(),
-            read.data.is_empty(),
-            read.data.to_csv(None),
-        ))
-    })
-    .await?;
-    if empty {
-        return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
-    }
+    let (sheet, csv) = match conversion {
+        Conversion::Workbook => {
+            let asked = sheet.map(str::to_owned);
+            let (name, empty, csv) = blocking(move || {
+                let read = upload_workbook::read_sheet(&bytes, asked.as_deref())?;
+                Ok::<_, WorkbookError>((
+                    read.data.name().to_owned(),
+                    read.data.is_empty(),
+                    read.data.to_csv(None),
+                ))
+            })
+            .await?;
+            if empty {
+                return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
+            }
+            (Some(name), csv)
+        }
+        Conversion::Parquet => {
+            let converted = blocking(move || upload_parquet::convert(&bytes, None)).await?;
+            if converted.info.rows == 0 {
+                return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
+            }
+            (None, converted.csv)
+        }
+    };
     let key = converted_key(&row.storage_key);
     store.put(&key, Bytes::from(csv)).await?;
-    Ok(Converted { key, sheet: name })
+    Ok(Converted { key, sheet })
 }
 
 /// `POST /api/uploads/{id}/ingest` — load this file into a raw table, with
@@ -1447,7 +1597,10 @@ async fn convert_workbook(
 /// a CSV beside the original ([`converted_key`]) after the table checks and
 /// before the table is claimed, so a sheet that cannot be read claims
 /// nothing, and the job is launched on that object. The sheet is recorded in
-/// the upload's `parse_options` and in the audit event.
+/// the upload's `parse_options` and in the audit event. A Parquet file is
+/// converted the same way: `encoding`, `delimiter`, `headerRow` and `sheet`
+/// are not read (the header is the file's column names, row 0), a file with no
+/// rows is refused, and the audit event says `"format": "parquet"`.
 ///
 /// # The order, and why
 ///
@@ -1472,8 +1625,9 @@ async fn convert_workbook(
 /// # Errors
 ///
 /// 400 for a body that is not valid (each field has its own sentence), and
-/// for a workbook that cannot be read, a sheet it does not have, a sheet over
-/// the cell limit or an empty sheet; 404
+/// for a workbook or Parquet file that cannot be read, a sheet a workbook does
+/// not have, a sheet or file over the cell limit, an empty sheet or a Parquet
+/// file with no rows; 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
 /// loading, another is loading into that table, a connector loads it, or the
 /// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
@@ -1494,8 +1648,8 @@ pub async fn ingest(
     let pool = pool(&state)?;
     let row = uploads::get(pool, &id).await?.ok_or_else(not_found)?;
     // The row first: what the body must carry depends on what the upload is.
-    let workbook = is_workbook(&state, &row).await?;
-    let request = parse_ingest_request(&body, workbook)?;
+    let conversion = conversion_of(&state, &row).await?;
+    let request = parse_ingest_request(&body, conversion)?;
     let row = Settler::new(&state, pool).settle(row).await;
     if row.status == "ingesting" {
         return Err(ApiError::Conflict(ALREADY_LOADING.to_owned()).into());
@@ -1507,10 +1661,9 @@ pub async fn ingest(
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
     }
-    let converted = if workbook {
-        Some(convert_workbook(&state, &row, request.sheet.as_deref()).await?)
-    } else {
-        None
+    let converted = match conversion {
+        Some(kind) => Some(convert_upload(&state, &row, kind, request.sheet.as_deref()).await?),
+        None => None,
     };
     let load_key = converted
         .as_ref()
@@ -1529,8 +1682,14 @@ pub async fn ingest(
         "delimiter": request.delimiter.to_string(),
         "headerRow": request.header_row,
     });
-    if let (Value::Object(map), Some(done)) = (&mut parse_options, &converted) {
-        map.insert("sheet".to_owned(), json!(done.sheet));
+    if let (
+        Value::Object(map),
+        Some(Converted {
+            sheet: Some(sheet), ..
+        }),
+    ) = (&mut parse_options, &converted)
+    {
+        map.insert("sheet".to_owned(), json!(sheet));
     }
     let Some(claimed) = uploads::mark_ingesting(
         pool,
@@ -1565,8 +1724,21 @@ pub async fn ingest(
         "table": request.table,
         "mode": request.mode.as_str(),
     });
-    if let (Value::Object(map), Some(done)) = (&mut args, &converted) {
-        map.insert("sheet".to_owned(), json!(done.sheet));
+    if let Value::Object(map) = &mut args {
+        match (&converted, conversion) {
+            (
+                Some(Converted {
+                    sheet: Some(sheet), ..
+                }),
+                _,
+            ) => {
+                map.insert("sheet".to_owned(), json!(sheet));
+            }
+            (Some(_), Some(Conversion::Parquet)) => {
+                map.insert("format".to_owned(), json!("parquet"));
+            }
+            _ => {}
+        }
     }
     let event = upload_audit_event(&principal, "upload.ingest", &attached.id, args, "executed");
     record_audit(pool, event).await;
@@ -1578,8 +1750,8 @@ pub async fn ingest(
 
 // ── Delete ───────────────────────────────────────────────────────────────
 
-/// `DELETE /api/uploads/{id}` — remove the object (and a workbook's converted
-/// sheet), then the row. 204. The
+/// `DELETE /api/uploads/{id}` — remove the object (and the converted text of a
+/// workbook or Parquet file), then the row. 204. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -1609,10 +1781,11 @@ pub async fn delete(
         return Err(ApiError::Conflict(DELETE_WHILE_LOADING.to_owned()).into());
     }
     let store = UploadStore::connect(&state.config).await?;
-    if has_workbook_name(&row.storage_key) {
-        // The converted sheet of a workbook, if a load wrote one: derived data
-        // goes first, and a key that is not there is success. A text file
-        // named `.xls` has none, and deleting a missing key is a no-op.
+    if conversion_for_name(&row.storage_key).is_some() {
+        // The converted text of a workbook or a Parquet file, if a load wrote
+        // one: derived data goes first, and a key that is not there is
+        // success. A text file named `.xls` or `.parquet` has none, and
+        // deleting a missing key is a no-op.
         store.delete(&converted_key(&row.storage_key)).await?;
     }
     store.delete(&row.storage_key).await?;
@@ -1715,15 +1888,108 @@ mod tests {
             Accepted::Text
         );
         assert!(check_file(&[b'a'; 1024], "x.csv").is_ok());
-        // X2 of the Excel plan: the sentence changed with what is accepted.
+        // X2 of the Excel plan, then Q2 of the Parquet plan: the sentence
+        // changed with what is accepted.
         assert_eq!(
             refusal(b"PK\x03\x04rest of a zip"),
-            "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
+            "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
         );
         assert!(refusal(&[0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]).contains("workbook"));
-        assert!(refusal(b"PAR1\x15\x04rest").contains("Parquet"));
+        assert_eq!(
+            refusal(b"PAR1\x15\x04rest"),
+            "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again."
+        );
         assert!(refusal(b"%PDF-1.7 ...").contains("not a delimited text file"));
         assert!(refusal(b"a,b\0c,d").contains("not a delimited text file"));
+    }
+
+    /// A Parquet file is accepted by its first bytes AND a `.parquet` name;
+    /// text keeps its name's freedom; a Parquet file under another name is
+    /// refused, and so is a binary file that merely has the name.
+    #[test]
+    fn a_parquet_file_needs_both_its_first_bytes_and_a_parquet_name() {
+        let parquet = b"PAR1\x15\x04\x15\x30rest of a parquet file";
+        for name in ["a.parquet", "A.PARQUET", "dir/a.b.parquet"] {
+            assert_eq!(
+                check_file(parquet, name).unwrap(),
+                Accepted::Parquet,
+                "{name}"
+            );
+            assert_eq!(
+                check_file(b"id,name\n1,a\n", name).unwrap(),
+                Accepted::Text,
+                "text called {name} is text"
+            );
+            assert!(
+                check_file(b"%PDF-1.7 ...", name).is_err(),
+                "a PDF called {name} is not a Parquet file"
+            );
+        }
+        for name in ["a.csv", "a.parq", "a.parquet.gz", "a", ""] {
+            assert!(check_file(parquet, name).is_err(), "{name}");
+        }
+        // An encrypted file starts `PARE`: named `.parquet` it is taken so the
+        // reader can say why it is refused; named anything else it is not.
+        let encrypted = b"PARE\x00\x01\x02\x03 encrypted";
+        assert_eq!(
+            check_file(encrypted, "a.parquet").unwrap(),
+            Accepted::Parquet
+        );
+        assert!(check_file(encrypted, "a.csv").is_err());
+    }
+
+    #[test]
+    fn what_a_stored_upload_is_converted_from_follows_its_name_and_its_first_bytes() {
+        let zip = b"PK\x03\x04rest";
+        let parquet = b"PAR1\x15\x04rest";
+        let text = b"id,name\n1,a\n";
+        assert_eq!(
+            conversion_of_head("uploads/t/up-1.xlsx", zip),
+            Some(Conversion::Workbook)
+        );
+        assert_eq!(
+            conversion_of_head("uploads/t/up-1.parquet", parquet),
+            Some(Conversion::Parquet)
+        );
+        assert_eq!(
+            conversion_of_head("uploads/t/up-1.parquet", b"PARE\x00rest"),
+            Some(Conversion::Parquet),
+            "an encrypted file is still read by the Parquet reader, which refuses it"
+        );
+        // Text called by either name is text; each kind under the other's name
+        // is not converted either.
+        for key in ["uploads/t/up-1.xlsx", "uploads/t/up-1.parquet"] {
+            assert_eq!(conversion_of_head(key, text), None, "{key}");
+        }
+        assert_eq!(conversion_of_head("uploads/t/up-1.parquet", zip), None);
+        assert_eq!(conversion_of_head("uploads/t/up-1.xlsx", parquet), None);
+        assert_eq!(conversion_of_head("uploads/t/up-1.csv", parquet), None);
+        assert_eq!(conversion_of_head("uploads/t/up-1", zip), None);
+    }
+
+    #[test]
+    fn a_parquet_load_reads_neither_a_dialect_nor_a_header_row() {
+        let bare = json!({ "bronzeTable": "orders_raw" });
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Parquet)).unwrap();
+        assert_eq!(request.encoding, Encoding::Utf8);
+        assert_eq!(request.delimiter, ',');
+        assert_eq!(request.header_row, 0);
+        // A retry sends back what it recorded; none of it is read.
+        let mut sent = bare.clone();
+        sent["headerRow"] = json!(5);
+        sent["encoding"] = json!("utf-16");
+        sent["delimiter"] = json!(";");
+        let request = parse_ingest_request(&body(&sent), Some(Conversion::Parquet)).unwrap();
+        assert_eq!((request.header_row, request.encoding), (0, Encoding::Utf8));
+        // The rest of the body is checked as for any upload.
+        let mut bad_table = bare;
+        bad_table["bronzeTable"] = json!("Orders");
+        assert_eq!(
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Parquet))
+                .unwrap_err()
+                .to_string(),
+            TABLE_NAME_RULE
+        );
     }
 
     /// A workbook is accepted by its first bytes AND an `.xls` or `.xlsx`
@@ -1763,6 +2029,11 @@ mod tests {
         assert!(converted_key(&key).starts_with(&format!("{PREFIX}/")));
         assert!(has_workbook_name(&key));
         assert!(!has_workbook_name(&converted_key(&key)));
+        assert_eq!(conversion_for_name(&key), Some(Conversion::Workbook));
+        let parquet_key = storage_key(TENANT, "up-10", "Orders.PARQUET");
+        assert_eq!(parquet_key, format!("uploads/{TENANT}/up-10.parquet"));
+        assert_eq!(conversion_for_name(&parquet_key), Some(Conversion::Parquet));
+        assert_eq!(conversion_for_name(&converted_key(&parquet_key)), None);
         assert!(!has_workbook_name("uploads/t/up-1.csv"));
         assert!(!has_workbook_name("uploads/t/up-1"));
     }
@@ -1873,14 +2144,14 @@ mod tests {
     }
 
     fn refusal_of(value: &Value) -> String {
-        parse_ingest_request(&body(value), false)
+        parse_ingest_request(&body(value), None)
             .unwrap_err()
             .to_string()
     }
 
     #[test]
     fn a_complete_body_is_accepted_and_mode_defaults_to_replace() {
-        let request = parse_ingest_request(&body(&valid()), false).unwrap();
+        let request = parse_ingest_request(&body(&valid()), None).unwrap();
         assert_eq!(
             request,
             IngestRequest {
@@ -1897,7 +2168,7 @@ mod tests {
         full["encoding"] = json!("utf-16");
         full["delimiter"] = json!("\t");
         full["headerRow"] = json!(4);
-        let request = parse_ingest_request(&body(&full), false).unwrap();
+        let request = parse_ingest_request(&body(&full), None).unwrap();
         assert_eq!(request.mode, LoadMode::Append);
         assert_eq!(request.encoding, Encoding::Utf16);
         assert_eq!(request.delimiter, '\t');
@@ -1905,7 +2176,7 @@ mod tests {
         let mut null_mode = valid();
         null_mode["mode"] = Value::Null;
         assert_eq!(
-            parse_ingest_request(&body(&null_mode), false).unwrap().mode,
+            parse_ingest_request(&body(&null_mode), None).unwrap().mode,
             LoadMode::Replace
         );
     }
@@ -1965,7 +2236,7 @@ mod tests {
         };
         let longest = "a".repeat(128);
         for ok in ["a", "a1", "a_1", "sap_material_master", longest.as_str()] {
-            let request = parse_ingest_request(&body(&with_table(ok)), false).unwrap();
+            let request = parse_ingest_request(&body(&with_table(ok)), None).unwrap();
             assert_eq!(request.table, ok);
         }
         let too_long = "a".repeat(129);
@@ -1997,7 +2268,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_a_json_object_is_refused_without_serde_text() {
         for raw in [&b""[..], b"not json", b"[1]", b"\"x\"", b"null", b"{"] {
-            let err = parse_ingest_request(raw, false).unwrap_err();
+            let err = parse_ingest_request(raw, None).unwrap_err();
             assert_eq!(err.status(), 400);
             assert_eq!(err.to_string(), "The request body must be a JSON object.");
         }
@@ -2026,18 +2297,18 @@ mod tests {
         v["encoding"] = json!("utf-16");
         v["delimiter"] = json!(";");
         v["sheet"] = json!("Quirks");
-        let request = parse_ingest_request(&body(&v), true).unwrap();
+        let request = parse_ingest_request(&body(&v), Some(Conversion::Workbook)).unwrap();
         assert_eq!(request.encoding, Encoding::Utf8);
         assert_eq!(request.delimiter, ',');
         assert_eq!(request.sheet.as_deref(), Some("Quirks"));
         // Not read at all, so not required either.
         let bare = json!({ "bronzeTable": "stock_raw", "headerRow": 2 });
-        let request = parse_ingest_request(&body(&bare), true).unwrap();
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Workbook)).unwrap();
         assert_eq!(request.header_row, 2);
         assert_eq!(request.sheet, None);
         // Still required and checked for a text file.
         assert_eq!(
-            parse_ingest_request(&body(&bare), false)
+            parse_ingest_request(&body(&bare), None)
                 .unwrap_err()
                 .to_string(),
             "encoding is required."
@@ -2046,7 +2317,7 @@ mod tests {
         let mut bad_table = bare.clone();
         bad_table["bronzeTable"] = json!("Orders");
         assert_eq!(
-            parse_ingest_request(&body(&bad_table), true)
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Workbook))
                 .unwrap_err()
                 .to_string(),
             TABLE_NAME_RULE
@@ -2059,9 +2330,12 @@ mod tests {
         bad_sheet["sheet"] = json!(3);
         let mut bad_text_sheet = valid();
         bad_text_sheet["sheet"] = json!(3);
-        for (workbook, body_with_bad_sheet) in [(true, &bad_sheet), (false, &bad_text_sheet)] {
+        for (conversion, body_with_bad_sheet) in [
+            (Some(Conversion::Workbook), &bad_sheet),
+            (None, &bad_text_sheet),
+        ] {
             assert_eq!(
-                parse_ingest_request(&body(body_with_bad_sheet), workbook)
+                parse_ingest_request(&body(body_with_bad_sheet), conversion)
                     .unwrap_err()
                     .to_string(),
                 "sheet must be text."
@@ -2073,7 +2347,7 @@ mod tests {
     fn the_job_is_told_the_converted_object_and_the_fixed_dialect() {
         let request = parse_ingest_request(
             &body(&json!({ "bronzeTable": "stock_raw", "headerRow": 1, "sheet": "Stock" })),
-            true,
+            Some(Conversion::Workbook),
         )
         .unwrap();
         let config = run_config("up-1", &request, "uploads/t/up-1.xlsx.converted.csv");
@@ -2372,6 +2646,8 @@ mod tests {
             WORKBOOK,
             PARQUET,
             OTHER_BINARY,
+            EMPTY_PARQUET,
+            CONVERSION_FAILED,
             TABLE_NAME_RULE,
             ALREADY_LOADING,
             TABLE_BUSY,

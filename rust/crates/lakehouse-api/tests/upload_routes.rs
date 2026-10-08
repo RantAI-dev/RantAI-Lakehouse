@@ -90,6 +90,15 @@ fn workbook(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
+/// A Parquet fixture of `ops/fixtures/parquet/`.
+fn parquet_file(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../../../ops/fixtures/parquet/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -946,7 +955,7 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
     .await;
     assert_eq!(
         workbook,
-        "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
+        "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
     );
     assert!(
         refuse(
@@ -956,10 +965,11 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
         .await
         .contains("not an .xls or .xlsx file")
     );
-    assert!(
-        refuse("t.parquet", b"PAR1\x15\x04\x15\x30rest".to_vec())
-            .await
-            .contains("Parquet")
+    // Q2 of the Parquet plan: a Parquet-shaped file is refused unless it is
+    // named `.parquet` (then it must open: see the Parquet tests below).
+    assert_eq!(
+        refuse("t.csv", b"PAR1\x15\x04\x15\x30rest".to_vec()).await,
+        "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again."
     );
     assert!(
         refuse("report.pdf", b"%PDF-1.7 ...".to_vec())
@@ -3456,7 +3466,7 @@ async fn a_workbook_that_cannot_be_read_or_is_not_named_like_one_is_refused_with
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     let xlsx = workbook("stock.xlsx");
-    let not_accepted = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+    let not_accepted = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
     // A workbook-shaped file under a name that is not `.xls` or `.xlsx`.
     for name in [
         "macros.xlsm",
@@ -3808,6 +3818,356 @@ async fn deleting_a_workbook_upload_removes_the_original_and_the_converted_sheet
     let id = id_of(&upload);
     let reply = stack
         .ingest(&bayu, &id, workbook_ingest_body("stock_raw", None))
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.text
+    );
+    assert_eq!(stack.bucket.keys().len(), 2);
+
+    let gone = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+
+    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
+    assert!(stack.bucket.keys().is_empty(), "{:?}", stack.bucket.keys());
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Parquet files (Q2 of section 11 of
+// docs/superpowers/plans/2026-10-07-upload-excel.md)
+// ════════════════════════════════════════════════════════════════════════
+
+const UNREADABLE_PARQUET: &str = "This file could not be opened as a Parquet file.";
+const EMPTY_PARQUET: &str = "That Parquet file has no rows, so there is nothing to load.";
+
+/// The columns `orders.parquet` declares, as the API lists them.
+fn orders_columns() -> Value {
+    json!([
+        { "name": "sku", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "qty", "type": "int64" },
+        { "name": "price", "type": "decimal(10,2)" },
+        { "name": "received", "type": "date" },
+    ])
+}
+
+/// What `orders.parquet` converts to: the file's column names, then its rows as
+/// text (a decimal keeps its scale, a date is ISO).
+const ORDERS_CSV: &str = "sku,name,qty,price,received\n\
+     A-100,\"Bolt, hex M6\",10,1.50,2025-09-24\n\
+     A-200,Washer,250,0.05,2025-09-25\n\
+     A-300,Flange DN50 \u{2013} steel,4,12.00,2025-10-01\n";
+
+/// The ingest body of a Parquet file: no encoding, no delimiter, no header
+/// row, no sheet.
+fn parquet_ingest_body(table: &str) -> Value {
+    json!({ "bronzeTable": table })
+}
+
+#[tokio::test]
+async fn a_parquet_file_is_stored_as_it_arrived_and_the_answer_lists_its_columns() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = parquet_file("orders.parquet");
+    let upload = stack.upload(&bayu, "orders.parquet", &bytes).await;
+    let id = id_of(&upload);
+    assert_eq!(upload["status"], "uploaded");
+    assert_eq!(
+        upload["parquet"],
+        json!({ "columns": orders_columns(), "rows": 3 })
+    );
+    assert!(upload.get("workbook").is_none());
+    assert_eq!(
+        stack
+            .bucket
+            .get(&format!("uploads/{GROUP}/{id}.parquet"))
+            .unwrap(),
+        bytes,
+        "byte for byte"
+    );
+    let text = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+    assert!(
+        text.get("parquet").is_none(),
+        "a text file has no columns list"
+    );
+}
+
+#[tokio::test]
+async fn a_parquet_file_that_cannot_be_read_or_is_not_named_like_one_is_refused_with_its_reason() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let orders = parquet_file("orders.parquet");
+    assert_eq!(
+        refused_upload(&stack, &bayu, "orders.csv", &orders).await,
+        "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again."
+    );
+    for (name, bytes) in [
+        ("cut.parquet", orders[..orders.len() / 2].to_vec()),
+        ("garbage.parquet", b"PAR1\x15\x04\x15\x30rest".to_vec()),
+    ] {
+        assert_eq!(
+            refused_upload(&stack, &bayu, name, &bytes).await,
+            UNREADABLE_PARQUET,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        refused_upload(
+            &stack,
+            &bayu,
+            "locked.parquet",
+            b"PARE\x00\x01\x02\x03 an encrypted footer PARE"
+        )
+        .await,
+        "This Parquet file is encrypted, so it cannot be read. Upload an unencrypted copy."
+    );
+    assert_eq!(
+        refused_upload(
+            &stack,
+            &bayu,
+            "blob.parquet",
+            &parquet_file("binary_column.parquet")
+        )
+        .await,
+        "Column \"blob\" holds binary values, which cannot be loaded as text. Remove that column and upload the file again."
+    );
+    assert_eq!(
+        refused_upload(
+            &stack,
+            &bayu,
+            "tags.parquet",
+            &parquet_file("nested_column.parquet")
+        )
+        .await,
+        "Column \"tags\" holds list values, which cannot be loaded as text. Remove that column and upload the file again."
+    );
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "nothing was stored for a refused file"
+    );
+    assert!(stack.audit_actions().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_parquet_preview_shows_its_rows_as_text_and_its_declared_types() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let uri = format!("/api/uploads/{}/preview", id_of(&upload));
+
+    let reply = stack.get(&bayu, &uri).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.json["columns"],
+        json!(["sku", "name", "qty", "price", "received"])
+    );
+    assert_eq!(
+        reply.json["rows"],
+        json!([
+            ["A-100", "Bolt, hex M6", "10", "1.50", "2025-09-24"],
+            ["A-200", "Washer", "250", "0.05", "2025-09-25"],
+            [
+                "A-300",
+                "Flange DN50 \u{2013} steel",
+                "4",
+                "12.00",
+                "2025-10-01"
+            ],
+        ])
+    );
+    assert_eq!(reply.json["truncated"], false);
+    assert_eq!(
+        reply.json["using"],
+        json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 })
+    );
+    assert_eq!(
+        reply.json["parquet"],
+        json!({ "columns": orders_columns(), "rows": 3 })
+    );
+    assert!(reply.json.get("workbook").is_none());
+
+    // The dialect, the header row and the sheet mean nothing for a Parquet
+    // file: a valid value is ignored, an invalid one is refused as for text.
+    let ignored = stack
+        .get(
+            &bayu,
+            &format!("{uri}?encoding=utf-16&delimiter=%3B&headerRow=2&sheet=Nope"),
+        )
+        .await;
+    assert_eq!(ignored.status, StatusCode::OK, "{}", ignored.text);
+    assert_eq!(ignored.json["columns"], reply.json["columns"]);
+    assert_eq!(ignored.json["using"], reply.json["using"]);
+    let refused = stack.get(&bayu, &format!("{uri}?encoding=latin-1")).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.json["error"], "encoding must be utf-8 or utf-16.");
+}
+
+#[tokio::test]
+async fn a_parquet_preview_of_a_file_with_no_rows_shows_the_columns_alone() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "empty.parquet", &parquet_file("empty.parquet"))
+        .await;
+
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{}/preview", id_of(&upload)))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.json["columns"],
+        json!(["sku", "name", "qty", "price", "received"])
+    );
+    assert_eq!(reply.json["rows"], json!([]));
+    assert_eq!(reply.json["parquet"]["rows"], 0);
+}
+
+#[tokio::test]
+async fn a_text_file_named_like_a_parquet_file_previews_and_loads_as_text() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let text = stack
+        .upload(&bayu, "orders.parquet", b"id,name\n1,a\n")
+        .await;
+    let id = id_of(&text);
+    assert!(text.get("parquet").is_none());
+
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    assert_eq!(preview.json["columns"], json!(["id", "name"]));
+    assert!(preview.json.get("parquet").is_none());
+
+    let reply = stack.ingest(&bayu, &id, ingest_body("orders_raw")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(stack.bucket.keys().len(), 1, "nothing was converted");
+    // And a text upload still needs its dialect.
+    let missing = stack
+        .ingest(&bayu, &id, parquet_ingest_body("orders_raw"))
+        .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json["error"], "encoding is required.");
+}
+
+#[tokio::test]
+async fn a_parquet_ingest_stores_the_converted_text_beside_the_original_and_launches_on_it() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let bytes = parquet_file("orders.parquet");
+    let upload = stack.upload(&bayu, "orders.parquet", &bytes).await;
+    let id = id_of(&upload);
+
+    // A retry may send back the dialect and a header row it recorded: none of
+    // it is read for a Parquet file.
+    let mut body = parquet_ingest_body("orders_raw");
+    body["headerRow"] = json!(4);
+    body["encoding"] = json!("utf-16");
+    let reply = stack.ingest(&bayu, &id, body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["runId"], "run-1");
+    assert_eq!(
+        reply.json["upload"]["parseOptions"],
+        json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 }),
+        "no sheet"
+    );
+    let original = format!("uploads/{GROUP}/{id}.parquet");
+    let converted = format!("{original}.converted.csv");
+    assert_eq!(stack.bucket.keys(), [original.clone(), converted.clone()]);
+    assert_eq!(
+        stack.bucket.get(&original).unwrap(),
+        bytes,
+        "the original is untouched"
+    );
+    assert_eq!(
+        String::from_utf8(stack.bucket.get(&converted).unwrap()).unwrap(),
+        ORDERS_CSV
+    );
+
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    assert_eq!(launches.len(), 1);
+    assert_eq!(
+        launches[0]["variables"]["cfg"],
+        json!({ "ops": { "ingest_uploaded_file": { "config": {
+            "upload_id": id,
+            "storage_key": converted,
+            "bronze_table_name": "orders_raw",
+            "load_mode": "replace",
+            "encoding": "utf-8",
+            "delimiter": ",",
+            "header_row": 0,
+        } } } }),
+        "the job's own configuration, the converted object and the fixed dialect"
+    );
+    let audit = stack.audit_actions().await;
+    let ingest = audit.iter().find(|a| a.0 == "upload.ingest").unwrap();
+    assert_eq!(
+        ingest.3,
+        json!({
+            "fileName": "orders.parquet", "sizeBytes": bytes.len(),
+            "table": "orders_raw", "mode": "replace", "format": "parquet"
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_parquet_ingest_that_cannot_convert_claims_nothing_and_launches_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack
+        .upload(&bayu, "empty.parquet", &parquet_file("empty.parquet"))
+        .await;
+    let id = id_of(&upload);
+
+    let reply = stack
+        .ingest(&bayu, &id, parquet_ingest_body("orders_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], EMPTY_PARQUET);
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert_eq!(stack.status_of(&id).await.0, "uploaded");
+    assert!(stack.claims().await.is_empty());
+    assert_eq!(
+        stack.bucket.keys(),
+        [format!("uploads/{GROUP}/{id}.parquet")],
+        "no converted object for a file that could not be converted"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_parquet_upload_removes_the_original_and_the_converted_text() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    // The launch is refused, which settles the claim as failed and leaves the
+    // converted object in place: the state a delete must clean up.
+    mount_launch_refused(&stack.dagster).await;
+    let upload = stack
+        .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    let id = id_of(&upload);
+    let reply = stack
+        .ingest(&bayu, &id, parquet_ingest_body("orders_raw"))
         .await;
     assert_eq!(
         reply.status,

@@ -20,6 +20,9 @@
  *   header is marked in the gutter and named in a line above the frame, and
  *   its extra cells are not drawn: no column without a name is invented. The
  *   numbers are places among the rows shown, not line numbers of the file.
+ * - For a Parquet file each header cell carries a second, quiet line "was:
+ *   <type>", the type the file declares (the table's column is text), and
+ *   the line above the frame counts against the row total the file states.
  */
 import { TriangleAlertIcon } from "lucide-react"
 import { formatNumber } from "@/lib/format"
@@ -50,7 +53,10 @@ function plural(n: number, one: string, many: string) {
 }
 
 export function UploadPreviewGrid({ preview, stale }: { readonly preview: UploadPreview; readonly stale: boolean }) {
-  const { columns, rows, truncated } = preview
+  const { columns, rows, truncated, parquet } = preview
+  // The declared types, by position; a name that does not line up (cannot
+  // happen for the API's answer) simply has no line.
+  const types = parquet ? columns.map((_, i) => parquet.columns[i]?.type) : null
   const long = longRows(preview)
   const named = long.slice(0, NAMED_ROWS).join(", ") + (long.length > NAMED_ROWS ? " and more" : "")
 
@@ -62,9 +68,11 @@ export function UploadPreviewGrid({ preview, stale }: { readonly preview: Upload
         <span>
           {rows.length === 0
             ? "There are no rows below the header row."
-            : truncated
-              ? `Showing the first ${rows.length} rows. The file has more.`
-              : `Showing all ${rows.length} rows.`}
+            : parquet && parquet.rows > rows.length
+              ? `Showing the first ${formatNumber(rows.length)} rows of ${formatNumber(parquet.rows)}.`
+              : truncated
+                ? `Showing the first ${rows.length} rows. The file has more.`
+                : `Showing all ${rows.length} rows.`}
         </span>
       </p>
       {long.length > 0 ? (
@@ -79,14 +87,20 @@ export function UploadPreviewGrid({ preview, stale }: { readonly preview: Upload
             tabIndex={0}
             role="region"
             aria-label="Preview of the first rows"
-            className="max-h-[22rem] scroll-pt-9 scroll-pl-14 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
+            className={cn(
+              "max-h-[22rem] scroll-pl-14 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50",
+              types ? "scroll-pt-12" : "scroll-pt-9"
+            )}
           >
             <table className="w-max min-w-full border-separate border-spacing-0 text-left text-xs">
               <thead>
                 <tr>
                   <th
                     scope="col"
-                    className="sticky top-0 left-0 z-30 h-9 w-14 min-w-14 max-w-14 border-r border-b border-border bg-muted px-2 text-right align-middle text-[11px] font-medium text-muted-foreground"
+                    className={cn(
+                      "sticky top-0 left-0 z-30 w-14 min-w-14 max-w-14 border-r border-b border-border bg-muted px-2 text-right align-middle text-[11px] font-medium text-muted-foreground",
+                      types ? "h-12" : "h-9"
+                    )}
                   >
                     <span className="sr-only">Row number</span>
                     <span aria-hidden>#</span>
@@ -95,11 +109,19 @@ export function UploadPreviewGrid({ preview, stale }: { readonly preview: Upload
                     <th
                       key={i}
                       scope="col"
-                      className="sticky top-0 z-20 h-9 border-b border-border bg-muted px-2 align-middle font-medium"
+                      className={cn(
+                        "sticky top-0 z-20 border-b border-border bg-muted px-2 align-middle font-medium",
+                        types ? "h-12" : "h-9"
+                      )}
                     >
                       <div title={name.length > TITLE_ABOVE ? name : undefined} className="max-w-64 truncate font-mono">
                         {name === "" ? <span className={quiet}>{EMPTY_LABEL}</span> : name}
                       </div>
+                      {types?.[i] !== undefined ? (
+                        <div className="max-w-64 truncate text-[11px] font-normal text-muted-foreground">
+                          was: {types[i]}
+                        </div>
+                      ) : null}
                     </th>
                   ))}
                 </tr>

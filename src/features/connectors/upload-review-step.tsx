@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
-import { formatBytes, formatDateTime } from "@/lib/format"
+import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import { delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
 import type { Upload, UploadLoadMode } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
@@ -69,14 +69,22 @@ export function UploadReviewStep({
         <Group
           title="How it is read"
           items={[
-            ...(settled?.workbook
-              ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
+            ...(settled?.parquet
+              ? [
+                  { label: "Format", value: "Parquet" },
+                  { label: "Columns", value: String(settled.columns.length) },
+                  { label: "Rows in the file", value: formatNumber(settled.parquet.rows) },
+                ]
               : [
-                  { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
-                  { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
+                  ...(settled?.workbook
+                    ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
+                    : [
+                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
+                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
+                      ]),
+                  { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
+                  { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
                 ]),
-            { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
-            { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
           ]}
         />
         <Group

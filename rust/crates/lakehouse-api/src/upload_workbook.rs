@@ -516,11 +516,23 @@ fn cell_text(value: &Data) -> Option<String> {
 /// A number as text: shortest form that reads back to the same value, in
 /// plain digits between `1e-6` and `1e21`, in exponent form outside.
 fn number_text(value: f64) -> String {
-    if value.classify() == FpCategory::Zero {
+    float_text(value)
+}
+
+/// [`number_text`] for any float that widens to `f64` exactly (`f32` too, so a
+/// Parquet `float` is written in its own shortest form, `0.1`, and not as the
+/// `f64` it widens to). One rule for both upload readers
+/// (`upload_parquet` calls this).
+pub(crate) fn float_text<T>(value: T) -> String
+where
+    T: Copy + Into<f64> + std::fmt::Display + std::fmt::LowerExp,
+{
+    let wide: f64 = value.into();
+    if wide.classify() == FpCategory::Zero {
         // Also negative zero, which `Display` would write as `-0`.
         return "0".to_owned();
     }
-    if value.is_finite() && !(1e-6..1e21).contains(&value.abs()) {
+    if wide.is_finite() && !(1e-6..1e21).contains(&wide.abs()) {
         return format!("{value:e}");
     }
     format!("{value}")
@@ -605,7 +617,7 @@ const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// Both readers drop a byte order mark at the start of the text, so text that
 /// really starts with U+FEFF (an unquoted first cell that begins with it) gets
 /// a mark of its own in front, and the cell keeps its character.
-fn finish_text(mut out: Vec<u8>) -> Vec<u8> {
+pub(crate) fn finish_text(mut out: Vec<u8>) -> Vec<u8> {
     if out.starts_with(BOM) {
         let mut marked = BOM.to_vec();
         marked.append(&mut out);

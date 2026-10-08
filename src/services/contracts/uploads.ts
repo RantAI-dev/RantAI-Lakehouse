@@ -70,6 +70,24 @@ export type UploadWorkbook = {
   defaultSheet: string
 }
 
+/** One column of an uploaded Parquet file: its name and the type the file declares for it ("int64", "decimal(10,2)", "timestamp (us, UTC)"). */
+export type UploadParquetColumn = {
+  name: string
+  /** What the file said, shown as "was: ..."; the table's column is text whatever this is. */
+  type: string
+}
+
+/**
+ * What the footer of an uploaded Parquet file says: its columns in file order
+ * and the number of rows it states. Mirrors Rust `ParquetInfo`
+ * (`lakehouse-api/src/upload_parquet.rs`). `rows` is the file's own count, not
+ * a measurement of the data.
+ */
+export type UploadParquet = {
+  columns: UploadParquetColumn[]
+  rows: number
+}
+
 /**
  * One uploaded file, as `GET /api/uploads` and `GET /api/uploads/{id}`
  * return it. The API never sends the object key, the tenant, the content
@@ -128,6 +146,8 @@ export type CreateUploadResponse = Upload & {
   duplicateOf?: Upload
   /** Present when the file is an Excel workbook: its sheets. */
   workbook?: UploadWorkbook
+  /** Present when the file is a Parquet file: its columns with their declared types. */
+  parquet?: UploadParquet
 }
 
 /**
@@ -160,6 +180,13 @@ export type UploadPreview = {
    * is the person's to choose.
    */
   workbook?: UploadWorkbook & { sheet: string }
+  /**
+   * Present when the file is a Parquet file: each column's declared type and
+   * the row count the file states. The preview then reads UTF-8 and a comma
+   * (what the API converts the file to), the header is the file's own column
+   * names (row 1), and none of the three settings is the person's to choose.
+   */
+  parquet?: UploadParquet
 }
 
 /**
@@ -187,7 +214,8 @@ export interface UploadService {
   /**
    * `POST /api/uploads`: sends the file as a multipart form with one part
    * named `file`. The API refuses an empty file, one over 50 MB and one that
-   * is neither delimited text nor an `.xls` or `.xlsx` workbook that opens,
+   * is neither delimited text, nor an `.xls` or `.xlsx` workbook that opens,
+   * nor a `.parquet` file that opens and has only columns that can be text,
    * each with its own sentence.
    */
   create(file: File, signal?: AbortSignal): Promise<CreateUploadResponse>

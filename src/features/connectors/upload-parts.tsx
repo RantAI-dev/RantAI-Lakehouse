@@ -1,7 +1,7 @@
 "use client"
 
 import type { LucideIcon } from "lucide-react"
-import { FileIcon, FileSpreadsheetIcon, FileTextIcon, InfoIcon, TriangleAlertIcon } from "lucide-react"
+import { Columns3Icon, FileIcon, FileSpreadsheetIcon, FileTextIcon, InfoIcon, TriangleAlertIcon } from "lucide-react"
 import { ErrorState } from "@/components/patterns/page-states"
 import { Pill } from "@/components/patterns/status-badge"
 import { formatDateTime } from "@/lib/format"
@@ -57,23 +57,29 @@ export function Refusal({ error }: { readonly error: ServiceError }) {
 
 /**
  * The mark beside a file name, by the format its name says: a spreadsheet
- * glyph in green for an Excel workbook, a text glyph in the primary tone for
- * CSV and TSV, the neutral document glyph for anything else, each with the
- * extension in capitals. A generic glyph, never a vendor's logo (see
- * `src/lib/connectors/brand-marks.ts`).
+ * glyph in green for an Excel workbook, a columns glyph in violet for a
+ * Parquet file, a text glyph in the primary tone for CSV and TSV, the neutral
+ * document glyph for anything else, each with the extension in capitals. A
+ * generic glyph, never a vendor's logo (see `src/lib/connectors/brand-marks.ts`).
  *
  * Decoration only: the name beside it already shows the extension, so the
- * whole mark is `aria-hidden`. The chip is a fixed size (`tile`: the square
+ * whole mark is `aria-hidden`. The chip is a fixed height (`tile`: the square
  * of a file row; `inline`: one text line high) and `shrink-0`, so it never
- * changes the row's height or takes room from the name.
+ * changes the row's height or takes room from the name. A label longer than five
+ * letters (`PARQUET`) is set a size smaller and without letter spacing so it
+ * stays inside the square tile.
  *
  * Contrast, by numbers: the workbook tone is `emerald-700` on the chip's
  * `emerald-500/12` in light (about 4.6:1) and `emerald-400` in dark (about
  * 6.2:1 to 7.5:1). `emerald-600`, the Pill's text tone, is 3.3:1 there, too
- * low for the 10px label.
+ * low for the 10px label. The Parquet tone is `violet-700` on
+ * `violet-500/12` in light (6.1:1 over white) and `violet-400` in dark (5.8:1
+ * over `zinc-900`, 7.1:1 over black), computed from the Tailwind palette
+ * values; the app's own card colours were not measured.
  */
 const MARK_TONE = {
   workbook: "bg-emerald-500/12 text-emerald-700 dark:text-emerald-400",
+  parquet: "bg-violet-500/12 text-violet-700 dark:text-violet-400",
   delimited: "bg-primary/10 text-primary",
   other: "bg-muted text-muted-foreground",
 } as const
@@ -81,7 +87,14 @@ const MARK_TONE = {
 export function FileMark({ name, variant }: { readonly name: string; readonly variant: "tile" | "inline" }) {
   const kind = uploadFileKind(name)
   const label = uploadFileLabel(name)
-  const Icon = kind === "workbook" ? FileSpreadsheetIcon : kind === "delimited" ? FileTextIcon : FileIcon
+  const Icon =
+    kind === "workbook"
+      ? FileSpreadsheetIcon
+      : kind === "parquet"
+        ? Columns3Icon
+        : kind === "delimited"
+          ? FileTextIcon
+          : FileIcon
   return (
     <span
       aria-hidden
@@ -96,7 +109,12 @@ export function FileMark({ name, variant }: { readonly name: string; readonly va
     >
       <Icon className={variant === "tile" ? "size-4" : "size-3.5"} />
       {label !== null ? (
-        <span className={cn("font-semibold leading-none tracking-wide", variant === "tile" ? "text-[9px]" : "text-[10px]")}>
+        <span
+          className={cn(
+            "font-semibold leading-none",
+            variant === "tile" ? (label.length > 5 ? "text-[8px] tracking-tight" : "text-[9px] tracking-wide") : "text-[10px] tracking-wide"
+          )}
+        >
           {label}
         </span>
       ) : null}

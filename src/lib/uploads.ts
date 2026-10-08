@@ -222,8 +222,9 @@ export function fileSizeProblem(name: string, sizeBytes: number): string | null 
  * The sentence for a file a person must not send, and the extensions it is
  * for. The words follow the API's `WORKBOOK`, `PARQUET` and `OTHER_BINARY`
  * (`routes/uploads.rs`); the API still decides by content, so a file that
- * passes here can be refused there, and only a name that is clearly neither
- * delimited text nor an `.xls` / `.xlsx` workbook is refused here. The
+ * passes here can be refused there (a `.parquet` with a binary column, say),
+ * and only a name that is clearly neither
+ * delimited text, nor an `.xls` / `.xlsx` workbook, nor a `.parquet` file is refused here. The
  * workbook kinds the API does not open (`.xlsm`, `.xlsb`, `.ods`) and
  * archives are refused with the workbook sentence.
  */
@@ -233,10 +234,10 @@ const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "avro", "o
 
 /**
  * Why a file cannot be sent judging by its NAME alone, or `null`. A workbook
- * the API does not read, an archive, a Parquet file or another binary is
+ * the API does not read, an archive or another binary is
  * refused at once, before any byte is sent, in words consistent with the
- * API's. `.xls` and `.xlsx` pass: the API opens them, and refuses one that
- * does not open, in its own sentence. A name with no
+ * API's. `.xls`, `.xlsx` and `.parquet` pass: the API opens them, and refuses
+ * one that does not open, in its own sentence. A name with no
  * extension or an unknown one (`.txt`, `.dat`, an extension-less export) is
  * never refused here: it may be delimited text, and the API judges content.
  * Case does not matter.
@@ -246,13 +247,10 @@ export function fileKindProblem(name: string): string | null {
   if (dot < 0) return null
   const extension = name.slice(dot + 1).toLowerCase()
   if (WORKBOOK_EXTENSIONS.includes(extension) || ARCHIVE_EXTENSIONS.includes(extension)) {
-    return `${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.`
-  }
-  if (extension === "parquet") {
-    return `${name} looks like a Parquet file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.`
   }
   if (OTHER_BINARY_EXTENSIONS.includes(extension)) {
-    return `${name} is not a delimited text file or an Excel workbook. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
   }
   return null
 }
@@ -295,8 +293,8 @@ export function rawTableFullName(table: string): string {
   return `bronze.${table}`
 }
 
-/** What a chosen file looks like to the eye: an Excel workbook, CSV or TSV text, or anything else. */
-export type UploadFileKind = "workbook" | "delimited" | "other"
+/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, CSV or TSV text, or anything else. */
+export type UploadFileKind = "workbook" | "parquet" | "delimited" | "other"
 
 /** The extension of a file name, lower-cased, or `""` when there is none (`.csv` alone and `a.` have none). */
 function extensionOf(name: string): string {
@@ -312,12 +310,13 @@ function extensionOf(name: string): string {
 export function uploadFileKind(name: string): UploadFileKind {
   const extension = extensionOf(name)
   if (extension === "xls" || extension === "xlsx") return "workbook"
+  if (extension === "parquet") return "parquet"
   if (extension === "csv" || extension === "tsv") return "delimited"
   return "other"
 }
 
 /** The longest extension shown as a label; a longer one would not fit the mark. */
-const MAX_LABEL_CHARS = 5
+const MAX_LABEL_CHARS = 7
 
 /** The extension in capitals for the mark (`XLS`, `CSV`), or `null` when there is none or it is too long to fit. */
 export function uploadFileLabel(name: string): string | null {

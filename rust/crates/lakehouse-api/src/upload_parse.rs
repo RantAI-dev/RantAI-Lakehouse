@@ -80,7 +80,9 @@ pub enum Kind {
     /// decision 4). A zip that is not a workbook is also reported here: the
     /// first bytes cannot tell them apart.
     Workbook,
-    /// A Parquet file. Refused.
+    /// A Parquet file. The routes accept it when it is also named `.parquet`
+    /// and refuse it otherwise; `upload_parquet` converts it (ADR 0014,
+    /// amendment of 2026-10-08).
     Parquet,
     /// Another binary format (a PDF, a gzip stream), or bytes that are not
     /// text (NUL bytes in something that is not UTF-16). Refused.

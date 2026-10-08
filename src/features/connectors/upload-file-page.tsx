@@ -19,7 +19,7 @@ import { UploadRunView } from "./upload-run-view"
 import { UploadTableStep } from "./upload-table-step"
 
 const STEPS: FormStep[] = [
-  { id: "file", label: "File", description: "Choose a CSV, TSV or Excel file" },
+  { id: "file", label: "File", description: "Choose a CSV, TSV, Excel or Parquet file" },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
   { id: "review", label: "Review", description: "Load the file" },
@@ -232,7 +232,7 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring a CSV, TSV or Excel file in as a raw table. Check how it is read, name the table, then load it."
+        description="Bring a CSV, TSV, Excel or Parquet file in as a raw table. Check how it is read, name the table, then load it."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

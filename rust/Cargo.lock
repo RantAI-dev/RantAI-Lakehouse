@@ -2640,6 +2640,7 @@ dependencies = [
  "lakehouse-test-support",
  "lakehouse-trino",
  "object_store",
+ "parquet",
  "rand 0.10.2",
  "reqwest 0.12.28",
  "rsa",

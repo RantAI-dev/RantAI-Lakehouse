@@ -1,6 +1,6 @@
 # ADR 0014 — Files uploaded from the console
 
-- **Status:** Accepted (product owner, 2026-10-02); implementation in progress. Amended 2026-10-07: Excel workbooks (see "Amendment" below)
+- **Status:** Accepted (product owner, 2026-10-02); implementation in progress. Amended 2026-10-07: Excel workbooks, and 2026-10-08: Parquet files (see "Amendment" below)
 - **Phase:** `DATA-9`, plan `docs/superpowers/plans/2026-10-02-upload-file.md`
 - **Date:** 2026-10-02
 
@@ -171,6 +171,42 @@ converting ONE sheet to delimited text in the API.
   `parse_options` and in the `upload.ingest` audit event. No migration.
 - New dependency: `calamine` (MIT), with seven transitive crates, all MIT or
   Apache-2.0 and in `deny.toml`'s allow list.
+
+## Amendment, 2026-10-08 — Parquet files
+
+The product owner asked for `.parquet` (plan
+`docs/superpowers/plans/2026-10-07-upload-excel.md`, section 11). Decision 4's
+first paragraph no longer holds for that kind either: a Parquet file is
+accepted by converting its one table to delimited text in the API, by the
+same path as a workbook.
+
+- The file is stored as it arrived. Preview decodes only the rows it shows and
+  runs the existing preview on the text. A load converts the whole file,
+  stores the text beside the original (`<key>.converted.csv`, deleted with the
+  upload) and launches the unchanged `file_ingest_job` with a fixed dialect.
+  The first record is the file's column names; a Parquet file has no header
+  row to choose and no sheet.
+- Decision 3's invariant is unchanged for the same reason as above: the load
+  job reads delimited text and nothing else; the conversion is a writer of
+  that dialect.
+- Decision 4's second paragraph holds: every column is text. The file's own
+  types are shown in the preview and not carried into the table. The rules are
+  in `upload_parquet.rs` and on the feature page: a float in its shortest
+  round-trip form, a decimal as its exact digits, a timestamp as ISO 8601 with
+  a `Z` only for a column adjusted to UTC, a legacy `INT96` timestamp as a local
+  time read as microseconds (nanoseconds since 1970 cover only the years 1677
+  to 2262).
+- A binary column and a nested column (list, map, struct) have no honest text
+  form: the file is refused, naming the first such column and its type. An
+  encrypted file, a file that does not open, a file of more than 5,000,000
+  cells (rows times columns, from the footer, before any row is decoded) and a
+  conversion of more than 512 MB of text are refused with a reason. All three
+  numbers are caps, not measurements.
+- A Parquet file is recognised by its first bytes (`PAR1`, or `PARE` for an
+  encrypted footer) AND a `.parquet` name, as a workbook is.
+- No migration. The `parquet` crate was already in the lockfile through the
+  Iceberg client; the API crate now declares it with the same features, so no
+  crate and no licence is added.
 
 ## Verification
 

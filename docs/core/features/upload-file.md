@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Data (Sources) |
 | Backlog | `DATA-9` |
-| Status | In build. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions not yet signed) |
+| Status | In build. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 and Parquet files 2026-10-08 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions not yet signed) |
 | Plan | `docs/superpowers/plans/2026-10-02-upload-file.md` |
 
 ## Problem
@@ -23,11 +23,15 @@ screen.
 
 1. On Sources, press "Upload file". The same page is offered from the first
    step of "New Connector".
-2. Choose a delimited text file (CSV or TSV) or an Excel workbook (`.xls`, `.xlsx`) of up to 50 MB and send it.
+2. Choose a delimited text file (CSV or TSV), an Excel workbook (`.xls`,
+   `.xlsx`) or a Parquet file (`.parquet`) of up to 50 MB and send it.
 3. See what the file looks like before anything is loaded: the encoding,
    the delimiter and the header row the system detected, the column names,
    and the first 20 rows. For a workbook: the sheet (the first visible one
    to begin with), the header row, the column names and the first 20 rows.
+   For a Parquet file: the column names and, under each, the type the file
+   declares ("was: int64"), the number of rows the file states and the first
+   20 rows; there is nothing to choose.
 4. Correct any of the three and see the preview change. For a workbook,
    choose another sheet (a hidden one is marked and can be chosen) and see
    that sheet.
@@ -47,8 +51,10 @@ delete, and does not see other people's uploads.
 
 ## Not included
 
-- `.xlsm`, `.xlsb`, `.ods`, other archives, JSON and Parquet. They are
-  refused with a message that says what to do, never half-read.
+- `.xlsm`, `.xlsb`, `.ods`, other archives and JSON. They are refused with
+  a message that says what to do, never half-read.
+- Typed columns from a Parquet file, and Parquet columns of binary or nested
+  type (the file is refused, naming the first such column).
 - Loading several sheets of a workbook in one upload (load the workbook
   again with another sheet), typed columns, calculating formulas, and
   password-protected workbooks (refused, with the reason).
@@ -72,6 +78,7 @@ table once it is loaded.
 | --- | --- | --- | --- |
 | 1 | Which files are accepted | Delimited text: UTF-8 or UTF-16; comma, semicolon, tab or pipe | Product owner, 2026-10-02 |
 | 10 | Excel workbooks | `.xls` and `.xlsx`, one sheet per load, converted to text in the API as described under "How a workbook is read" | Asked for by the product owner, 2026-10-07; the conversion rules are the planner's defaults, to be signed |
+| 11 | Parquet files | `.parquet`, the file's one table, converted to text in the API as described under "How a Parquet file is read"; every column text; binary and nested columns refused | Asked for by the product owner, 2026-10-08; the conversion rules are the planner's defaults, to be signed |
 | 2 | Size limits | 50 MB and 2,000,000 rows per file. Over either, the file is refused, not cut short | Product owner, 2026-10-02 |
 | 3 | Where it sits | A button and an "Uploaded files" tab on Sources; a link from "New Connector" | Product owner, 2026-10-02 |
 | 4 | Who may upload | Holders of the existing `connector:manage` permission (Data Engineer, Platform Admin). No new permission | Product owner, 2026-10-02 |
@@ -117,16 +124,56 @@ memory bounded, not a measurement; a workbook can hold far more than its file
 size suggests because it is compressed. The preview shows at most the first
 2,000 rows of the sheet, so a header row past that shows no columns.
 
+## How a Parquet file is read
+
+The API stores the file as it arrived. For the preview it decodes only the
+rows shown and writes them as comma-separated UTF-8 text in memory; for the
+load it writes the whole file as text beside the original and the load job
+reads it like any other CSV. The first record is the file's own column names,
+so there is no header row to choose. Every column is text. A value becomes
+text like this:
+
+| Parquet value | Text |
+| --- | --- |
+| Null | Empty (so is an empty string) |
+| String | As stored |
+| Integer (signed or unsigned) | Its digits |
+| `float`, `double` | The shortest form that reads back the same, never widened first: `0.1`; a whole number has no decimal point; exponent form (`1e21`, `1e-7`) from 1e21 and below 1e-6; `NaN`, `inf`, `-inf` |
+| Decimal | Its exact digits with the scale applied, never through a float: `12.50` for `decimal(10,2)` |
+| Boolean | `true` / `false` |
+| Date | `2025-09-24` |
+| Timestamp, adjusted to UTC | `2025-09-24T13:30:05.123456Z`: the fraction only when there is one, exact to the unit the file uses (milliseconds, microseconds, nanoseconds) |
+| Timestamp, not adjusted | The same without the `Z`: a local date and time, never converted to a zone the file does not name |
+| Legacy `INT96` timestamp (Spark, Impala) | A local time, without `Z` (the type carries no zone flag); read as microseconds, so a year outside 1677 to 2262 does not wrap, and a sub-microsecond part is dropped |
+| Time of day | `13:30:00`, with the fraction only when there is one |
+| Binary, list, map, struct | Not loaded: the file is refused, naming the first such column and its type |
+
+A date, timestamp or time that no calendar date or day can hold (a year past
+9999, a time outside one day) is written as the integer the file holds, not as
+a wrong date. A column name is loaded the way the job names the columns of any
+file (`_column_names` in `file_ingest.py`): lower case, only ASCII letters,
+digits and `_`, a blank one `col_<position>`, a repeated one with `_2`, `_3`.
+So the table's column can be spelled differently from the file's (`Unit Price`
+becomes `unit_price`); the preview shows the file's own names, and no column is
+renamed or refused by the API. A file is also
+refused when it is encrypted, does not open, has more than 5,000,000 cells
+(rows times columns, read from its footer before any row is decoded), or would
+make more than 512 MB of text. Those are caps that keep the conversion's
+memory bounded, not measurements. The preview decodes at most the first 2,000
+rows and shows 20.
+
 ## Limits to tell a customer
 
-- Delimited text files are accepted in UTF-8 or UTF-16, and Excel workbooks
-  (`.xls`, `.xlsx`) one sheet at a time; every other kind is refused with the
-  reason. A macro-enabled `.xlsm`, an `.xlsb` or an `.ods` has to be saved as
+- Delimited text files are accepted in UTF-8 or UTF-16, Excel workbooks
+  (`.xls`, `.xlsx`) one sheet at a time, and Parquet files; every other kind
+  is refused with the reason. A macro-enabled `.xlsm`, an `.xlsb` or an `.ods` has to be saved as
   `.xlsx` or CSV first.
 - 50 MB per file, and 2,000,000 rows per load. A workbook sheet of more than
   5,000,000 cells is refused.
-- A workbook is stored twice while it is loaded: the original and the
-  converted sheet, both removed with the upload.
+- A workbook or Parquet file is stored twice while it is loaded: the
+  original and the converted text, both removed with the upload.
+- A Parquet file of more than 5,000,000 cells is refused, and so is one with
+  a binary or nested column: remove the column and save the file again.
 - Every column is text. Numbers and dates have to be converted afterwards.
 - An uploaded table stays in the raw layer. The pipeline builder cannot read
   raw tables yet, and a dashboard reads Gold tables only. So an uploaded
@@ -164,6 +211,8 @@ Prepare four files:
 - **E**: an `.xlsm` workbook (or a password-protected `.xlsx`), and an
   `.xls` (the old format) with any content.
 - **D**: any file larger than 50 MB.
+- **F**: a `.parquet` file with a decimal, a date and a timestamp column, and a
+  second one with a binary or list column.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -195,8 +244,13 @@ Prepare four files:
 | 26 | Upload an `.xls` of file E | The same as 23-25 | |
 | 27 | Upload the `.xlsm` or the password-protected file of E | Refused with the reason; nothing new under "Uploaded files" | |
 | 28 | Delete the upload from step 25 | It leaves the list; both stored objects are removed (operator: none under its key in the bucket) | |
+| 29 | Upload the first file of F | Accepted: the Check step has no sheet, encoding, delimiter or header-row control; each column shows "was: <type>" under its name; the line above the preview gives the file's row count | |
+| 30 | Look at the decimal, date and timestamp columns of the preview | A decimal with its scale (`12.50`), a date as `YYYY-MM-DD`, a timestamp as `YYYY-MM-DDTHH:MM:SS`, with a trailing `Z` only for a column in UTC | |
+| 31 | Load it into `qa_upload_f`, then open it | Loaded with the file's rows; every column text | |
+| 32 | Upload the second file of F | Refused, naming the first binary or list column and its type; nothing new under "Uploaded files" | |
+| 33 | Delete the upload from step 31 | It leaves the list; both stored objects are removed | |
 
-**Accepted** when 1–16, 19, 22 and 23–28 pass, and 17, 18, 20 and 21 pass or have
+**Accepted** when 1–16, 19, 22 and 23–33 pass, and 17, 18, 20 and 21 pass or have
 an agreed exception.
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______

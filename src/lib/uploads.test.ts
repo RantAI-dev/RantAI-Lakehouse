@@ -297,7 +297,7 @@ test("fileKindProblem refuses a workbook the API does not read, or an archive, b
   for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsm"]) {
     const problem = fileKindProblem(name)
     assert.ok(problem?.startsWith(`${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file.`), name)
-    assert.ok(problem?.includes("save the sheet as .xlsx or CSV first"), name)
+    assert.ok(problem?.includes("Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."), name)
   }
 })
 
@@ -307,15 +307,17 @@ test("fileKindProblem lets an .xls or .xlsx through: the API opens it, and refus
   }
 })
 
-test("fileKindProblem refuses Parquet and other binaries, each in its own sentence", () => {
-  assert.equal(
-    fileKindProblem("a.parquet"),
-    "a.parquet looks like a Parquet file. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded."
-  )
+test("fileKindProblem lets a .parquet through: the API opens it, and refuses one that does not open", () => {
+  for (const name of ["a.parquet", "DATA.PARQUET", "report.final.parquet", "a.csv.parquet"]) {
+    assert.equal(fileKindProblem(name), null, name)
+  }
+})
+
+test("fileKindProblem refuses other binaries in the API's sentence, which now names Parquet too", () => {
   for (const name of ["a.pdf", "a.docx", "a.avro", "a.orc", "a.sqlite"]) {
     assert.equal(
       fileKindProblem(name),
-      `${name} is not a delimited text file or an Excel workbook. Only .xls and .xlsx workbooks and delimited text files (CSV, TSV) can be uploaded.`
+      `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
     )
   }
 })
@@ -323,7 +325,7 @@ test("fileKindProblem refuses Parquet and other binaries, each in its own senten
 test("fileKindProblem ignores the case of the extension", () => {
   assert.ok(fileKindProblem("DATA.XLSM")?.includes("not an .xls or .xlsx file"))
   assert.ok(fileKindProblem("Data.OdS")?.includes("not an .xls or .xlsx file"))
-  assert.ok(fileKindProblem("DATA.PARQUET")?.includes("Parquet"))
+  assert.equal(fileKindProblem("DATA.PARQUET"), null)
 })
 
 test("fileKindProblem lets through delimited text, unknown extensions and names with no extension", () => {
@@ -349,6 +351,8 @@ test("uploadFileKind tells a workbook from delimited text by the name alone, wha
   assert.equal(uploadFileKind("A.XLS"), "workbook")
   assert.equal(uploadFileKind("a.csv"), "delimited")
   assert.equal(uploadFileKind("a.TSV"), "delimited")
+  assert.equal(uploadFileKind("a.parquet"), "parquet")
+  assert.equal(uploadFileKind("A.PARQUET"), "parquet")
   for (const name of ["a.txt", "a.dat", "export", ".csv", "a.", "a.xlsm"]) assert.equal(uploadFileKind(name), "other", name)
 })
 
@@ -357,6 +361,7 @@ test("uploadFileLabel is the extension in capitals, or null when there is none o
   assert.equal(uploadFileLabel("a.XLSX"), "XLSX")
   assert.equal(uploadFileLabel("a.csv"), "CSV")
   assert.equal(uploadFileLabel("a.Tsv"), "TSV")
+  assert.equal(uploadFileLabel("a.parquet"), "PARQUET")
   assert.equal(uploadFileLabel("a.txt"), "TXT")
   assert.equal(uploadFileLabel("export"), null)
   assert.equal(uploadFileLabel(".csv"), null)
