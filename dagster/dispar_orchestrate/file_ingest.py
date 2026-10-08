@@ -99,6 +99,15 @@ UPLOAD_PREFIX = "uploads/"
 # so this is where the limit is enforced, as a failure and never a truncation.
 MAX_ROWS = 2_000_000
 
+# The limit on a file's columns (`SEC-17`): the header record's cells under the
+# reading the load was told. A header decided how many columns a table got and
+# nothing bounded it, so a 50 MB file of commas asked for tens of millions. The
+# API refuses a wider file at the preview and at the ingest request
+# (`upload_parse::MAX_COLUMNS`) from the first 256 KiB; this counts the whole
+# file and is the authority, so it is also checked for a load that did not come
+# through those routes.
+MAX_COLUMNS = 1_000
+
 # The API's own bound on a table name (`routes::uploads::MAX_TABLE_NAME_CHARS`).
 MAX_TABLE_NAME_CHARS = 128
 
@@ -123,7 +132,7 @@ DELIMITERS = (",", ";", "\t", "|")
 
 # The reasons a failed load records, in the order of
 # `ops/fixtures/upload_load_failure_reasons.json` (review finding B6): the
-# API shows a recorded reason only when it is one of these seven, and
+# API shows a recorded reason only when it is one of these eight, and
 # `test_file_ingest.py` asserts this list against that file.
 UNREADABLE = "The stored file could not be read."
 HEADER_PAST_END = "The header row is past the end of the file."
@@ -135,6 +144,8 @@ NO_ROWS = "The file has no rows below the header row."
 TOO_MANY_ROWS = "The file has more than 2,000,000 rows."
 LOAD_FAILED = "The load into the table failed."
 NOT_REGISTERED = "The table was loaded but could not be registered in the catalog."
+# `SEC-17`: appended last, so the fixture's order of the first seven is kept.
+TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
 
 FAILURE_REASONS = (
     UNREADABLE,
@@ -144,6 +155,7 @@ FAILURE_REASONS = (
     TOO_MANY_ROWS,
     LOAD_FAILED,
     NOT_REGISTERED,
+    TOO_MANY_COLUMNS,
 )
 
 
@@ -367,11 +379,18 @@ def parse_file(text: str, delimiter: str, header_row: int) -> ParsedFile:
     the preview reports it and the case above alike as an empty `columns`, and
     the two have a sentence each since review finding C2), `NO_ROWS` (nothing
     below the header that is not blank) or `TOO_MANY_ROWS` (more than
-    `MAX_ROWS`, found while counting, so nothing was cut).
+    `MAX_ROWS`, found while counting, so nothing was cut) or `TOO_MANY_COLUMNS`
+    (a header of more than `MAX_COLUMNS` cells, found before any row is read).
     """
     header, records = read_table(text, delimiter, header_row)
     if not header:
         raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("the header record has no cells")
+    # `SEC-17`: before the first row is read, so a file that cannot load costs
+    # nothing beyond its header.
+    if len(header) > MAX_COLUMNS:
+        raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(
+            f"the header record has {len(header)} cells, more than {MAX_COLUMNS}"
+        )
     count = 0
     for _ in records:
         count += 1
