@@ -7,11 +7,11 @@ import { brandMarkForTypeName } from "@/lib/connectors/brand-marks"
 afterEach(cleanup)
 
 const TYPES: ConnectorType[] = [
-  { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null },
-  { name: "Oracle", adapter: "sql", supported: true, docsUrl: null },
-  { name: "PostgreSQL CDC", adapter: "cdc", supported: true, docsUrl: null },
-  { name: "SQL Server CDC", adapter: "cdc", supported: true, docsUrl: null },
-  { name: "SAP / ERP", adapter: null, supported: false, docsUrl: null },
+  { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "Oracle", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "PostgreSQL CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "SQL Server CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "SAP / ERP", adapter: null, supported: false, docsUrl: null, unsupportedReason: null },
 ]
 
 function tile(name: string) {
@@ -64,7 +64,7 @@ describe("ConnectorTypePicker marks", () => {
   })
 
   it("draws a mark whose brand colour is too dark for the dark theme in the foreground there", () => {
-    render(<ConnectorTypePicker types={[{ name: "MariaDB", adapter: "sql", supported: true, docsUrl: null }]} value={null} onChange={() => {}} />)
+    render(<ConnectorTypePicker types={[{ name: "MariaDB", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null }]} value={null} onChange={() => {}} />)
     const svg = tile("MariaDB").querySelector("svg[data-brand-mark]")!
     expect(svg.getAttribute("class")).toContain("dark:text-foreground")
     cleanup()
@@ -84,7 +84,7 @@ describe("ConnectorTypePicker marks", () => {
 
 describe("MySQL mark", () => {
   it("draws both paths of the dolphin on its own non-square view box, in the brand colour and the foreground in dark", () => {
-    render(<ConnectorTypePicker types={[{ name: "MySQL CDC", adapter: "cdc", supported: true, docsUrl: null }]} value={null} onChange={() => {}} />)
+    render(<ConnectorTypePicker types={[{ name: "MySQL CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null }]} value={null} onChange={() => {}} />)
     const svg = tile("MySQL CDC").querySelector("svg[data-brand-mark]")!
     expect(svg.getAttribute("viewBox")).toBe("0 0 256 252")
     expect(svg.querySelectorAll("path")).toHaveLength(2)

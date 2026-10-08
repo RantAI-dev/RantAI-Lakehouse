@@ -94,7 +94,7 @@ function stubFetch(
     if (overrides[key]) return overrides[key]()
     if (url.includes("/api/auth/me")) return json(ME)
     if (key === "GET /api/connectors/types") {
-      return json([{ name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null }])
+      return json([{ name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null }])
     }
     if (key === "GET /api/connectors/conn-a") return json(detail)
     if (key === "GET /api/connectors/conn-a/ingest-spec") return json(SPEC)
@@ -343,7 +343,7 @@ describe("ConnectorEditPage", () => {
     }
     const calls = stubFetch(
       {
-        "GET /api/connectors/types": () => json([{ name: "REST API", adapter: "rest", supported: true, docsUrl: null }]),
+        "GET /api/connectors/types": () => json([{ name: "REST API", adapter: "rest", supported: true, docsUrl: null, unsupportedReason: null }]),
         "GET /api/connectors/conn-a/ingest-spec": () => json(restSpec),
         "PUT /api/connectors/conn-a/ingest-spec": () => json(restSpec),
       },

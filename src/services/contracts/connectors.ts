@@ -555,6 +555,8 @@ export type ConnectorType = {
   adapter: IngestAdapter | null
   supported: boolean
   docsUrl: string | null
+  /** Why a `supported: false` type is unavailable (SRC-6 F5); null when there is no specific reason. */
+  unsupportedReason: string | null
 }
 
 /**

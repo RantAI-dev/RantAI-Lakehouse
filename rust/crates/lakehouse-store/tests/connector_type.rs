@@ -37,15 +37,18 @@ async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Every `supported = false` row has `adapter = NULL` — there is no
-/// `Dial::parse` shape yet for a type this build cannot dial.
+/// Every `supported = false` row other than Google Sheets has
+/// `adapter = NULL` — there is no `Dial::parse` shape yet for a type this
+/// build cannot dial. Google Sheets (`SRC-6` F5, `0061`) keeps its adapter
+/// so existing connectors still open; the assertion that used to cover it
+/// was narrowed by name, not loosened for other rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unsupported_rows_have_no_adapter(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");
     for connector_type in &types {
-        if !connector_type.supported {
+        if !connector_type.supported && connector_type.name != "Google Sheets" {
             assert!(
                 connector_type.adapter.is_none(),
                 "unsupported type {connector_type:?} must have adapter = NULL"
@@ -68,6 +71,46 @@ async fn supported_rows_name_an_adapter(pool: PgPool) -> sqlx::Result<()> {
                 "supported type {connector_type:?} must name an adapter"
             );
         }
+    }
+    Ok(())
+}
+
+/// `0061` (`SRC-6` F5): Google Sheets is listed, unsupported, with a
+/// reason, and keeps its `sheets` adapter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    let sheets = types
+        .iter()
+        .find(|t| t.name == "Google Sheets")
+        .expect("Google Sheets must stay listed");
+    assert!(!sheets.supported, "{sheets:?}");
+    assert_eq!(sheets.adapter.as_deref(), Some("sheets"));
+    assert!(
+        sheets
+            .unsupported_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{sheets:?}"
+    );
+    Ok(())
+}
+
+/// `0061`: only Google Sheets carries a reason; the other roadmap rows keep
+/// the generic "Not available yet" in the console, and supported rows have
+/// none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_google_sheets_has_an_unsupported_reason(pool: PgPool) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    for connector_type in types.iter().filter(|t| t.name != "Google Sheets") {
+        assert!(
+            connector_type.unsupported_reason.is_none(),
+            "{connector_type:?} must have no unsupported_reason"
+        );
     }
     Ok(())
 }

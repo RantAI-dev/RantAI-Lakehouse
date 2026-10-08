@@ -54,8 +54,8 @@ function stubFetch(extra: (url: string, method: string) => Response | null = () 
     if (url.includes("/api/auth/me")) return json(ME)
     if (url.endsWith("/api/connectors/types")) {
       return json([
-        { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null },
-        { name: "Kafka", adapter: null, supported: false, docsUrl: null },
+        { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+        { name: "Kafka", adapter: null, supported: false, docsUrl: null, unsupportedReason: null },
       ])
     }
     const handled = extra(url, method)
