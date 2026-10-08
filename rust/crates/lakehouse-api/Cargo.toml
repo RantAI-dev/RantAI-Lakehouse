@@ -96,6 +96,13 @@ sqlparser = { workspace = true, features = ["visitor"] }
 # dependency of something else in the tree, but this is the first direct
 # use of it in this crate (WS4 item G2).
 chrono = "0.4"
+# Reads `.xls` and `.xlsx` for the file upload (`upload_workbook`, ADR 0014,
+# amendment of 2026-10-07). MIT; it adds `atoi_simd`, `codepage`,
+# `debug_unsafe`, `fast-float2`, `typed-path`, `zip` and `zopfli` to the
+# lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
+# features: dates are rendered from its date components, so its `chrono`
+# feature is not needed.
+calamine = "0.36"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
@@ -111,6 +118,12 @@ object_store = { version = "0.14", features = ["aws"] }
 # happen in one place at a time.
 arrow-array = "58"
 arrow-schema = "58"
+# Reads `.parquet` for the file upload (`upload_parquet`, ADR 0014, amendment
+# of 2026-10-08). The same crate and the same default features
+# `lakehouse-iceberg` already uses (so the lockfile gains no crate and no
+# licence); declared here because the upload's reader is the API's own, not
+# routed through the Iceberg crate.
+parquet = "58"
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
