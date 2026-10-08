@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_dagster::{DgConfiguredRun, iso_from_unix_seconds, map_run_status};
@@ -179,7 +179,7 @@ pub struct IngestibleQuery {
     due_until: Option<String>,
 }
 
-/// `GET /api/connectors/ingestible` — every connector that has an ingest
+/// `GET /api/connectors/ingestible` — the connectors that have an ingest
 /// spec set (`adapter IS NOT NULL`), as an
 /// [`connectors::IngestibleConnector`]. Gated on `ingest:read`
 /// (`POLICY_TABLE`), a strictly narrower grant than the base
@@ -187,6 +187,17 @@ pub struct IngestibleQuery {
 /// `dagster/dispar_orchestrate/ingest_factory.py`'s `ingest:read`-scoped
 /// service identity calls, from its schedule sensor and at run time
 /// (`run_ingest`'s own re-fetch of its own connector).
+///
+/// # Who sees which rows (`SEC-16`)
+///
+/// A service principal ([`PrincipalId::Service`], the identity the
+/// orchestrator holds) and an unrestricted (`*:*`) principal see every
+/// tenant's rows: scheduled loads of every tenant depend on it. Any other
+/// caller sees only the rows of the tenant [`crate::tenant_scope::resolve`]
+/// gives, filtered in SQL, and a caller in no tenant gets `[]`. Before this
+/// the route returned every tenant's hosts, usernames and secret names to
+/// anyone holding `ingest:read`. The service check reads the principal's
+/// kind, never its display name or provider.
 ///
 /// With `?dueAfter=&dueUntil=`, only the batch connectors whose
 /// `scheduleCron` fires in `(dueAfter, dueUntil]` — what the schedule
@@ -197,13 +208,29 @@ pub struct IngestibleQuery {
 /// # Errors
 ///
 /// 400 if only one bound is given or either is not RFC 3339; 503 if no
-/// pool is configured; 500 on a database failure.
+/// pool is configured; 500 on a database failure; 401 without a
+/// principal; 404 if `X-Tenant` names a tenant the caller is not in.
 pub async fn list_ingestible(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Query(query): Query<IngestibleQuery>,
 ) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     let window = due_window(&query)?;
-    let all = connectors::list_ingestible_connectors(pool(&state)?).await?;
+    // SEC-16: only a service identity or an unrestricted principal reads
+    // across tenants; everyone else is scoped like `list`, fail closed.
+    let all = if matches!(principal.id, PrincipalId::Service(_))
+        || crate::routes::catalog::is_unrestricted(&principal)
+    {
+        connectors::list_ingestible_connectors(pool(&state)?).await?
+    } else if let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? {
+        connectors::list_ingestible_connectors_for_tenant(pool(&state)?, tenant_id).await?
+    } else {
+        Vec::new()
+    };
     Ok(ApiJson(match window {
         Some((after, until)) => all
             .into_iter()

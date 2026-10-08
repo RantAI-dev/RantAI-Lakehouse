@@ -27,7 +27,8 @@ use lakehouse_store::connectors::{
     IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
     connector_in_tenants, create_connector, delete_connector, get_connector,
     get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
+    list_ingestible_connectors_for_tenant, record_test_result, set_ingest_spec, swap_secret_ref,
+    swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -812,6 +813,65 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     assert_eq!(row.schedule_cron.as_deref(), Some("0 * * * *"));
     assert_eq!(row.secret_ref, credential_names.primary);
     assert_eq!(row.secret_ref_secondary, None);
+    Ok(())
+}
+
+/// `SEC-16`: `list_ingestible_connectors_for_tenant` returns the asked
+/// tenant's rows and nothing else; a connector with no tenant is in no
+/// tenant's list, only in the unscoped one. Written to fail against a query
+/// that ignores the tenant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_ingestible_connectors_for_tenant_returns_only_that_tenants_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-ingestible"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-ingestible"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "mysql",
+            "host": "source.example.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects: serde_json::json!([{"name": "orders", "target": "orders"}]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    let mut ids = Vec::new();
+    for name in ["ingestible of a", "ingestible of b", "ingestible of nobody"] {
+        let (created, _credential_names) =
+            create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    let of_a = list_ingestible_connectors_for_tenant(&pool, tenant_a_id)
+        .await
+        .unwrap();
+    assert!(of_a.iter().any(|r| r.id == ids[0]), "A's own row is listed");
+    assert!(!of_a.iter().any(|r| r.id == ids[1]), "B's row is absent");
+    assert!(
+        !of_a.iter().any(|r| r.id == ids[2]),
+        "a connector with no tenant is in no tenant's list"
+    );
+
+    let all = list_ingestible_connectors(&pool).await.unwrap();
+    for id in &ids {
+        assert!(
+            all.iter().any(|r| &r.id == id),
+            "the unscoped list has {id}"
+        );
+    }
     Ok(())
 }
 
