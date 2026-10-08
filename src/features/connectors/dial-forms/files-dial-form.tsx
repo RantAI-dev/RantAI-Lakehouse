@@ -27,16 +27,13 @@ export function FilesDialForm({
   return (
     <div className="grid gap-3 sm:grid-cols-2">
       <div className="space-y-1.5">
-        <Label htmlFor="files-dial-protocol">Protocol</Label>
-        <select
-          id="files-dial-protocol"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-          value={dial.protocol}
-          onChange={(e) => set("protocol", e.target.value as FilesDial["protocol"])}
-        >
-          <option value="s3">S3-compatible</option>
-          <option value="sftp">SFTP</option>
-        </select>
+        {/* SRC-6 F8: this adapter reads S3 only (adapters/files.py); SFTP is its
+            own connector type. A stored dial that still says "sftp" is shown
+            as it is, never rewritten, so the connector opens. */}
+        <Label>Protocol</Label>
+        <p id="files-dial-protocol" className="flex h-8 items-center text-sm">
+          {dial.protocol === "s3" ? "S3-compatible" : dial.protocol}
+        </p>
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-format">Format</Label>
@@ -70,14 +67,20 @@ export function FilesDialForm({
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="files-dial-endpoint">Endpoint override (optional)</Label>
+        <Label htmlFor="files-dial-endpoint">Endpoint</Label>
         <Input
           id="files-dial-endpoint"
           value={dial.endpoint ?? ""}
           onChange={(e) => set("endpoint", e.target.value === "" ? null : e.target.value)}
           placeholder="https://rustfs.internal:9000"
           autoComplete="off"
+          aria-describedby="files-dial-endpoint-hint"
         />
+        {/* SRC-6 D3: the console's test dials this endpoint; with none it has
+            nothing to dial. */}
+        <p id="files-dial-endpoint-hint" className="text-xs text-muted-foreground">
+          Needed to test the connection. Leave empty for AWS S3.
+        </p>
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-region">Region (optional)</Label>
