@@ -34,8 +34,9 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete, find_by_sha256, get,
-    insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim, table_claimed,
+    LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload, attach_run, claim_table,
+    delete, find_by_sha256, get, insert, list, loads_under_limits, mark_finished, mark_ingesting,
+    mark_ingesting_within_limits, table_being_loaded, table_claim, table_claimed,
     upload_in_tenants,
 };
 use serde_json::{Value, json};
@@ -1688,4 +1689,153 @@ fn load_mode_parses_exactly_the_two_lowercase_names_and_defaults_to_replace() {
     for mode in [LoadMode::Replace, LoadMode::Append] {
         assert_eq!(LoadMode::parse(mode.as_str()), Some(mode));
     }
+}
+
+// ── SEC-17: load limits ──────────────────────────────────────────────────
+
+/// Add an upload recorded as uploaded by `uploaded_by`.
+async fn add_by(pool: &PgPool, id: &str, tenant_id: Uuid, uploaded_by: &str) -> Upload {
+    add(pool, id, tenant_id, "").await;
+    sqlx::query("UPDATE file_upload SET uploaded_by = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .unwrap();
+    get(pool, id).await.unwrap().unwrap()
+}
+
+async fn start_limited(pool: &PgPool, id: &str, limits: LoadLimits) -> MarkOutcome {
+    mark_ingesting_within_limits(
+        pool,
+        id,
+        &options(),
+        "limited_raw",
+        LoadMode::Replace,
+        limits,
+    )
+    .await
+    .unwrap()
+}
+
+/// Four loads of one `uploaded_by` refuse a fifth; another `uploaded_by`
+/// passes; the refused row is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fifth_load_of_one_uploader_is_refused_and_another_uploader_passes(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-user").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+    };
+    for n in 0..5 {
+        add_by(&pool, &format!("up-mine-{n}"), tenant_a, "Ada").await;
+    }
+    add_by(&pool, "up-theirs", tenant_a, "Bob").await;
+
+    for n in 0..4 {
+        let outcome = start_limited(&pool, &format!("up-mine-{n}"), limits).await;
+        assert!(matches!(outcome, MarkOutcome::Marked(_)), "load {n}");
+    }
+    assert!(
+        !loads_under_limits(&pool, "up-mine-4", limits)
+            .await
+            .unwrap()
+    );
+    let fifth = start_limited(&pool, "up-mine-4", limits).await;
+    assert!(matches!(fifth, MarkOutcome::LimitReached));
+    assert_eq!(
+        get(&pool, "up-mine-4").await.unwrap().unwrap().status,
+        "uploaded",
+        "a refused load changes nothing"
+    );
+
+    assert!(
+        loads_under_limits(&pool, "up-theirs", limits)
+            .await
+            .unwrap()
+    );
+    let other = start_limited(&pool, "up-theirs", limits).await;
+    assert!(matches!(other, MarkOutcome::Marked(_)));
+    Ok(())
+}
+
+/// Sixteen loads in total refuse the next, whoever asks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seventeenth_load_in_total_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-total").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+    };
+    for n in 0..17 {
+        add_by(
+            &pool,
+            &format!("up-{n}"),
+            tenant_a,
+            &format!("User {}", n / 4),
+        )
+        .await;
+    }
+    for n in 0..16 {
+        let outcome = start_limited(&pool, &format!("up-{n}"), limits).await;
+        assert!(matches!(outcome, MarkOutcome::Marked(_)), "load {n}");
+    }
+    let last = start_limited(&pool, "up-16", limits).await;
+    assert!(matches!(last, MarkOutcome::LimitReached));
+    Ok(())
+}
+
+/// A load that has ended gives its place back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_load_that_ended_no_longer_counts(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-ended").await;
+    let limits = LoadLimits {
+        per_user: 1,
+        total: 16,
+    };
+    add_by(&pool, "up-1", tenant_a, "Ada").await;
+    add_by(&pool, "up-2", tenant_a, "Ada").await;
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-2", limits).await,
+        MarkOutcome::LimitReached
+    ));
+    mark_finished(&pool, "up-1", None, None, Some(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        start_limited(&pool, "up-2", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    Ok(())
+}
+
+/// A row that is already loading is `NotMarked`, as `mark_ingesting` answers
+/// `None`, and an unknown id the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn marking_a_loading_or_unknown_upload_changes_no_row(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-notmarked").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+    };
+    add_by(&pool, "up-1", tenant_a, "Ada").await;
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::NotMarked
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-missing", limits).await,
+        MarkOutcome::NotMarked
+    ));
+    Ok(())
 }

@@ -52,5 +52,6 @@ pub mod state;
 pub mod tenant;
 pub mod tenant_scope;
 pub mod transform_grammar;
+pub mod upload_limits;
 pub mod upload_parse;
 pub mod upload_store;

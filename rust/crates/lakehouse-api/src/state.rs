@@ -28,6 +28,7 @@ use crate::bronze_stats_cache::BronzeStatsCache;
 use crate::config::Config;
 use crate::connector_secret_store::ConnectorSecretStore;
 use crate::gold_lock::MartLocks;
+use crate::upload_limits::ReceiveLimiter;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -197,6 +198,9 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
+    /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
+    /// per user and in total. Shared across clones; always populated.
+    pub upload_receive: ReceiveLimiter,
 }
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
@@ -575,6 +579,10 @@ impl AppState {
             window: Duration::seconds(i64::from(config.login_failure_window_secs)),
             lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
         };
+        let upload_receive = ReceiveLimiter::new(
+            config.upload_max_concurrent_per_user,
+            config.upload_max_concurrent,
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -597,6 +605,7 @@ impl AppState {
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
+            upload_receive,
         }
     }
 }

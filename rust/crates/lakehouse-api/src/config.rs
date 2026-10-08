@@ -55,6 +55,15 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
+    /// `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set but
+    /// is not a whole number of 1 or more (`SEC-17`).
+    ///
+    /// Fails config resolution, unlike the login-throttle numbers: a limit
+    /// that silently fell back to its default would leave an operator who
+    /// meant to tighten it believing it holds (fail closed). Holds the
+    /// variable's name and the value as given.
+    #[error("{0} must be a whole number of 1 or more, got {1:?}")]
+    InvalidUploadLimit(&'static str, String),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -736,6 +745,14 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Files one user may have being received, and loads one user may have
+    /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
+    /// (`SEC-17`). A value that is not a whole number of 1 or more fails
+    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_concurrent_per_user: u32,
+    /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
+    /// default 16 (`SEC-17`).
+    pub upload_max_concurrent: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -925,6 +942,11 @@ impl std::fmt::Debug for Config {
             .field("login_failure_window_secs", &self.login_failure_window_secs)
             .field("login_lockout_secs", &self.login_lockout_secs)
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "upload_max_concurrent_per_user",
+                &self.upload_max_concurrent_per_user,
+            )
+            .field("upload_max_concurrent", &self.upload_max_concurrent)
             .finish()
     }
 }
@@ -980,6 +1002,24 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .unwrap_or(default)
 }
 
+/// Parses `key` as a whole number of 1 or more, `default` when unset or
+/// empty (see [`truthy`]). Anything else is an error: see
+/// [`ConfigError::InvalidUploadLimit`]. Used by the two `SEC-17` upload limits.
+fn parse_limit(
+    env: &HashMap<String, String>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match truthy(env, key) {
+        None => Ok(default),
+        Some(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or(ConfigError::InvalidUploadLimit(key, raw)),
+    }
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1023,6 +1063,9 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiRelevantTables`], if
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
+    /// - [`ConfigError::InvalidUploadLimit`], if
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set
+    ///   and non-empty but is not a whole number of 1 or more.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1241,6 +1284,8 @@ impl Config {
             ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
+            upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
         })
     }
 
@@ -2152,5 +2197,42 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("\"true\""), "{message}");
         assert!(message.contains("\"false\""), "{message}");
+    }
+
+    // ── SEC-17: upload limits ───────────────────────────────────────────
+
+    #[test]
+    fn the_upload_limits_default_to_4_per_user_and_16_in_total() {
+        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT", "")] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_concurrent_per_user, 4);
+            assert_eq!(cfg.upload_max_concurrent, 16);
+        }
+    }
+
+    #[test]
+    fn the_upload_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONCURRENT_PER_USER", "2");
+        env.insert("UPLOAD_MAX_CONCURRENT".to_owned(), "9".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_concurrent_per_user, 2);
+        assert_eq!(cfg.upload_max_concurrent, 9);
+    }
+
+    #[test]
+    fn an_upload_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for bad in ["0", "-1", "abc", "2.5", " 3"] {
+            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_PER_USER", bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_PER_USER", bad.to_owned())
+            );
+        }
+        let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT", "0")).expect_err("zero");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
+        ));
     }
 }

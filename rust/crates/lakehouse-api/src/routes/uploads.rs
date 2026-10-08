@@ -74,7 +74,9 @@ use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, TableClaim, Upload};
+use lakehouse_store::uploads::{
+    self, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -89,6 +91,7 @@ use super::lakehouse::is_unknown_table_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_limits::too_many_uploads;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
 
@@ -509,7 +512,9 @@ fn check_file(bytes: &[u8]) -> Result<(), ApiError> {
 ///
 /// # Errors
 ///
-/// 400 for a caller in no tenant, a request that is not a multipart form, no
+/// 429 (`Retry-After: 5`) when the caller already has the configured number of
+/// files being received, or the installation has (`SEC-17`); 400 for a caller
+/// in no tenant, a request that is not a multipart form, no
 /// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], and a
 /// workbook, Parquet file or other binary (each with its own fixed
 /// sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
@@ -525,6 +530,14 @@ pub async fn create(
     };
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Err(ApiError::BadRequest(NO_TENANT.to_owned()).into());
+    };
+    // `SEC-17`: a place is taken before the body is read, because each file
+    // being received is held in memory (up to 50 MB), and is given back when
+    // `_place` drops at the end of the handler, on every path. Keyed by the
+    // display name, the same text `uploaded_by` records, so the per-user
+    // number means the same for receiving and for loading.
+    let Some(_place) = state.upload_receive.try_acquire(&principal.display_name) else {
+        return Err(too_many_uploads().into());
     };
     let pool = pool(&state)?;
     let store = UploadStore::connect(&state.config).await?;
@@ -1198,6 +1211,14 @@ fn run_config(row: &Upload, request: &IngestRequest) -> Value {
     })
 }
 
+/// The load limits of `SEC-17`, from the configuration.
+fn load_limits(state: &AppState) -> LoadLimits {
+    LoadLimits {
+        per_user: i64::from(state.config.upload_max_concurrent_per_user),
+        total: i64::from(state.config.upload_max_concurrent),
+    }
+}
+
 /// Launch `file_ingest_job` for the claimed upload and return the run id. A
 /// launch that does not happen settles the claim as failed
 /// ([`COULD_NOT_START`]) before the error is returned, so the upload is not
@@ -1244,7 +1265,7 @@ async fn launch(
 /// finished must not block the next one); check the table is free
 /// ([`ensure_table_free`]) and not being loaded by another upload; CLAIM THE
 /// TABLE NAME ([`uploads::claim_table`]); CLAIM the row
-/// ([`uploads::mark_ingesting`], no run id); launch; attach the run
+/// ([`uploads::mark_ingesting_within_limits`], no run id); launch; attach the run
 /// ([`uploads::attach_run`]).
 ///
 /// The table claim comes just before the row claim (review finding B4): the
@@ -1260,6 +1281,8 @@ async fn launch(
 ///
 /// # Errors
 ///
+/// 429 (`Retry-After: 5`) when the person who uploaded the file already has
+/// the configured number of loads running, or the installation has (`SEC-17`);
 /// 400 for a body that is not valid (each field has its own sentence) and for
 /// a header with more than 1,000 columns under the confirmed reading
 /// (`SEC-17`, checked before any claim); 404
@@ -1294,6 +1317,15 @@ pub async fn ingest(
     // before any claim, mark or launch, so a file the job would refuse
     // leaves no table claim behind. The job counts the whole file and stays
     // the authority.
+    let limits = load_limits(&state);
+    // `SEC-17`: asked before the table name is claimed, so a refusal leaves
+    // no claim behind. A read: the decision is the locked count in
+    // `mark_ingesting_within_limits` below, and a request that passes here and
+    // loses there keeps its claim, as a claim does when a launch fails (a
+    // claim is never released).
+    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
+        return Err(too_many_uploads().into());
+    }
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
@@ -1323,22 +1355,28 @@ pub async fn ingest(
         "delimiter": request.delimiter.to_string(),
         "headerRow": request.header_row,
     });
-    let Some(claimed) = uploads::mark_ingesting(
+    // `SEC-17`: counts and marks in one locked transaction, so two starts at
+    // the same moment cannot both take the last place.
+    let claimed = match uploads::mark_ingesting_within_limits(
         pool,
         &row.id,
         &parse_options,
         &request.table,
         request.mode,
-        None,
+        limits,
     )
     .await?
-    else {
-        // Lost the race to another request, or the upload went away.
-        return Err(match uploads::get(pool, &row.id).await? {
-            Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
-            None => not_found(),
+    {
+        MarkOutcome::Marked(claimed) => *claimed,
+        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        MarkOutcome::NotMarked => {
+            // Lost the race to another request, or the upload went away.
+            return Err(match uploads::get(pool, &row.id).await? {
+                Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
+                None => not_found(),
+            }
+            .into());
         }
-        .into());
     };
 
     let run_id = launch(&state, pool, &claimed, &request).await?;
