@@ -2583,10 +2583,11 @@ pub struct IngestSpecBody {
 ///
 /// # Errors
 ///
-/// Returns `ApiError::BadRequest` naming the offending resolved address
-/// (the same message [`connector_probe::resolve_checked`] already produces
-/// for `POST .../test`) if a checked host resolves to a private/internal
-/// address that `internal_hosts` does not permit.
+/// Returns `ApiError::BadRequest` with the fixed message
+/// [`connector_probe::resolve_checked`] produces for `POST .../test` (the
+/// caller's own host, never the address it resolved to: `SEC-15`) if a
+/// checked host resolves to a private/internal address that
+/// `internal_hosts` does not permit, or does not resolve.
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
@@ -2616,8 +2617,11 @@ async fn check_dial_ssrf(
     let Some((host, port)) = host_port else {
         return Ok(());
     };
+    // The approved address is dropped on purpose: this is the advisory
+    // save-time check, and nothing is dialled here.
     connector_probe::resolve_checked(host, port, internal_hosts)
         .await
+        .map(|_approved| ())
         .map_err(ApiError::BadRequest)
 }
 
