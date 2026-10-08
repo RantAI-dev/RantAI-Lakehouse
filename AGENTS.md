@@ -216,6 +216,10 @@ bun run typecheck && bun run lint && bun run test
 python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py
 (cd dagster && python -m pytest dispar_orchestrate -q)
 docker compose --profile '*' config --quiet   # plus a real `up` for compose edits
+# SEC-18: compose has no default credentials, so `config` needs
+# POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY and
+# LAKEKEEPER_ENCRYPTION_KEY set: run `sh ops/init-env.sh` once (it writes a
+# local .env and refuses to overwrite one), or export throwaway values.
 git status                                    # nothing generated staged
 ```
 

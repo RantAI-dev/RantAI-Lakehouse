@@ -478,7 +478,7 @@ python3 ops/lint/check_intra_package_imports.py
 python3 ops/lint/check_bare_iceberg_count.py
 (cd dagster && python -m pytest dispar_orchestrate -q)
 # Compose (config is necessary, not sufficient — see §8.8)
-docker compose --profile '*' config --quiet
+docker compose --profile '*' config --quiet   # needs the must-set secrets: sh ops/init-env.sh (SEC-18)
 # Hygiene
 git status                                   # nothing generated staged
 gitleaks git --log-opts="<base>..HEAD" --config .gitleaks.toml --redact

@@ -102,11 +102,15 @@ bun install
 
 # 3. Configure the backend stack. Copy the example env file and set (at
 #    minimum) AUTH_BOOTSTRAP_EMAIL / AUTH_BOOTSTRAP_PASSWORD — without
-#    those there is deliberately no way to log in. Every other variable
-#    has a safe local default; see .env.example and the Configuration
-#    table below.
-cp .env.example .env
-$EDITOR .env
+#    those there is deliberately no way to log in. SEC-18: there are NO
+#    default credentials. docker-compose.yml refuses to start while
+#    POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY or
+#    LAKEKEEPER_ENCRYPTION_KEY is empty, and `cp .env.example .env` alone
+#    does not start the stack. This writes a `.env` with generated values
+#    (and refuses to overwrite an existing one):
+sh ops/init-env.sh
+$EDITOR .env    # set AUTH_BOOTSTRAP_EMAIL; see .env.example and the
+                # Configuration table below
 
 # 4. Bring up Postgres, ClickHouse, and the Rust API (built from
 #    rust/Dockerfile). Dagster and a real LLM are NOT part of this stack —
@@ -279,14 +283,14 @@ talks to it:
 
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
-| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key — RustFS's own ROOT credential. No longer what the seeded `conn-s3-warehouse` connector dials with (see `CONNECTOR_S3_ACCESS_KEY` below); migration 0023 moved that off this var so the connector secret allowlist never has to name RustFS's root key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
-| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key. Same note as `RUSTFS_ACCESS_KEY` above | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
-| `CONNECTOR_S3_ACCESS_KEY` | Access key the seeded `conn-s3-warehouse` connector's `secretRef` (`env:CONNECTOR_S3_ACCESS_KEY`) resolves to for a real connectivity test, and what `dagster/dispar_orchestrate/dlt_pipeline.py` and `ops/g3/g3_loadgen.py` authenticate to RustFS with. Deliberately a name distinct from `RUSTFS_ACCESS_KEY` (RustFS's own root key) — this name matches the connector secret allowlist's fixed `env:CONNECTOR_*_ACCESS_KEY` pattern (`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`), so the allowlist never has to name a process secret to let the seeded connector dial. Defaults to the same value as `RUSTFS_ACCESS_KEY` for the local stack; set to a least-privilege identity in a real deployment | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
-| `CONNECTOR_S3_SECRET_KEY` | Secret key half of the pair above (`env:CONNECTOR_S3_SECRET_KEY`) | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key — RustFS's own ROOT credential. No longer what the seeded `conn-s3-warehouse` connector dials with (see `CONNECTOR_S3_ACCESS_KEY` below); migration 0023 moved that off this var so the connector secret allowlist never has to name RustFS's root key | none; **must be set** (compose refuses to start without it) | Yes |
+| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key. Same note as `RUSTFS_ACCESS_KEY` above | none; **must be set** | Yes |
+| `CONNECTOR_S3_ACCESS_KEY` | Access key the seeded `conn-s3-warehouse` connector's `secretRef` (`env:CONNECTOR_S3_ACCESS_KEY`) resolves to for a real connectivity test, and what `dagster/dispar_orchestrate/dlt_pipeline.py` and `ops/g3/g3_loadgen.py` authenticate to RustFS with. Deliberately a name distinct from `RUSTFS_ACCESS_KEY` (RustFS's own root key) — this name matches the connector secret allowlist's fixed `env:CONNECTOR_*_ACCESS_KEY` pattern (`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`), so the allowlist never has to name a process secret to let the seeded connector dial. When empty, falls back to `RUSTFS_ACCESS_KEY` (never to a literal); set to a least-privilege identity in a real deployment | the value of `RUSTFS_ACCESS_KEY` | No |
+| `CONNECTOR_S3_SECRET_KEY` | Secret key half of the pair above (`env:CONNECTOR_S3_SECRET_KEY`); when empty, falls back to `RUSTFS_SECRET_KEY` | the value of `RUSTFS_SECRET_KEY` | No |
 | `RUSTFS_HOST_PORT` | Host port mapped to RustFS's S3 API (container port 9000) | `9010` | No |
 | `RUSTFS_CONSOLE_HOST_PORT` | Host port mapped to RustFS's web console (container port 9001) | `9011` | No |
 | `LAKEKEEPER_PG_DB` | Name of Lakekeeper's own Postgres database on the existing `postgres` service (separate from the `lakehouse` app database's `console` schema) | `lakekeeper` | No |
-| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | Lakekeeper's own placeholder — **change before any non-throwaway use** | No |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | none; **must be set** (compose refuses to start without it). Changing it later makes the credentials Lakekeeper already stores unreadable | Yes |
 | `LAKEKEEPER_BASE_URI` | Base URL Lakekeeper advertises in its own REST responses | `http://localhost:8181` | No |
 | `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
 | `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store Lakekeeper's authorization model lives in | `lakekeeper` | No |
@@ -342,13 +346,13 @@ their opt-in compose profiles:
 
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
-| `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
-| `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
+| `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | none; empty unless you use `--profile seaweedfs`, which refuses to start (`seaweedfs-iam-init` exits 1) while it is empty | Only with `--profile seaweedfs` |
+| `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | none; same rule as the access key | Only with `--profile seaweedfs` |
 | `TRINO_PUBLISH_HOST_PORT` | SECURITY: `trino` has no authentication of its own, so its host port is NOT published by default — `trino-maintenance-cron` (the only real consumer) reaches it in-network as `http://trino:8080`. Set to the literal string `trino` (matching the Compose profile, not `true`/`1`) to opt in to host access; any other value leaves it disabled. See the `trino-host-port` service comment in `docker-compose.yml` for why the value must be that exact profile name | unset (disabled) | No, and CHANGE ME only on a trusted host if you do |
 | `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile), only published when `TRINO_PUBLISH_HOST_PORT` is also set. Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
 | `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials and database for the compose `postgres` service. `POSTGRES_PASSWORD` is `lakehouse-api`'s OWN database password — no longer what the seeded `conn-pg-lakehouse` connector dials with (see `CONNECTOR_PG_PASSWORD` below) | `lakehouse` / `lakehouse` / `lakehouse` | No |
-| `CONNECTOR_PG_PASSWORD` | Password the seeded `conn-pg-lakehouse` connector's `secretRef` (`env:CONNECTOR_PG_PASSWORD`) resolves to for a real connectivity test. Deliberately a name distinct from `POSTGRES_PASSWORD` (the console's own database password) — this name matches the connector secret allowlist's fixed `env:CONNECTOR_*_PASSWORD` pattern (`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`), so the allowlist never has to name a process secret to let the seeded connector dial. A connector created through the console or the copilot does NOT name its own var (ADR 0002 Addendum 3, `docs/adr/0002-secretref-resolution.md`): it picks a source/kind, and the server derives an `env:CONNECTOR_CONN_<ID>_<PASSWORD\|SECRET_KEY\|ACCESS_KEY\|API_KEY\|TOKEN>` (or `file:/run/secrets/connector_conn_<id>_<suffix>`) name from the id it generates, returned once at creation — the six allowlist patterns are still fixed in code, not configurable, but the exact var name is per-connector and cannot be listed here. Defaults to the same value as `POSTGRES_PASSWORD` for the local stack; set to a least-privilege credential in a real deployment | `lakehouse` | No |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials and database for the compose `postgres` service. `POSTGRES_PASSWORD` is `lakehouse-api`'s OWN database password — no longer what the seeded `conn-pg-lakehouse` connector dials with (see `CONNECTOR_PG_PASSWORD` below) | `lakehouse` / none, **must be set** / `lakehouse` (user and database names are not secrets; the password has no default) | `POSTGRES_PASSWORD`: Yes |
+| `CONNECTOR_PG_PASSWORD` | Password the seeded `conn-pg-lakehouse` connector's `secretRef` (`env:CONNECTOR_PG_PASSWORD`) resolves to for a real connectivity test. Deliberately a name distinct from `POSTGRES_PASSWORD` (the console's own database password) — this name matches the connector secret allowlist's fixed `env:CONNECTOR_*_PASSWORD` pattern (`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`), so the allowlist never has to name a process secret to let the seeded connector dial. A connector created through the console or the copilot does NOT name its own var (ADR 0002 Addendum 3, `docs/adr/0002-secretref-resolution.md`): it picks a source/kind, and the server derives an `env:CONNECTOR_CONN_<ID>_<PASSWORD\|SECRET_KEY\|ACCESS_KEY\|API_KEY\|TOKEN>` (or `file:/run/secrets/connector_conn_<id>_<suffix>`) name from the id it generates, returned once at creation — the six allowlist patterns are still fixed in code, not configurable, but the exact var name is per-connector and cannot be listed here. When empty, falls back to `POSTGRES_PASSWORD` (never to a literal); set to a least-privilege credential in a real deployment | the value of `POSTGRES_PASSWORD` | No |
 | `POSTGRES_HOST_PORT` | Host port for Postgres | `5432` | No |
 | `CH_HTTP_HOST_PORT` / `CH_NATIVE_HOST_PORT` | Host ports for ClickHouse's HTTP and native interfaces | `8123` / `9000` | No |
 | `CH_DB` | ClickHouse default database created at first boot | `default` | No |
