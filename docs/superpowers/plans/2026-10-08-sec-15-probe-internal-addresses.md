@@ -217,3 +217,17 @@ No `BLOCKER`.
   until `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` or a CIDR list is set;
   an existing install that relied on the old default must set it before
   upgrading or its internal connectors stop testing.
+
+### Handoff: review fixes
+
+- `SHOULD-FIX` 1: removed both `dead_code` allows on `Approved` and its
+  `impl`; clippy reports no unused item, so nothing else was removed.
+- `SHOULD-FIX` 2: `connector_probe::pg_options_for_address` now sets the
+  `PostgreSQL` TLS mode (`Prefer`, unchanged); `pg_connect_options` and
+  `connector_deprovision::drop_slot_and_publication` both call it.
+  `connector_discover` already used `pg_connect_options`, no change.
+  `PgTarget` and the dialled address are unchanged.
+- Commands run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (clean, after each fix; a one-line doc-comment edit followed the second
+  run); `cargo fmt --check` (clean).
+- *Not verified*: all Rust tests (`cargo test` is not run on this machine).
