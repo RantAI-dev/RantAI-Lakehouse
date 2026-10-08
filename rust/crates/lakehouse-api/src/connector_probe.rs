@@ -901,19 +901,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
 /// public constructor outside this module, so holding one is the proof that
 /// the check ran.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "the dialers take the approved address in the next commit (SEC-15 K2), which removes this"
-)]
 pub(crate) struct Approved {
     primary: std::net::SocketAddr,
     all: Vec<std::net::SocketAddr>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the dialers take the approved address in the next commit (SEC-15 K2), which removes this"
-)]
 impl Approved {
     /// The address a single-address client (a `sqlx` host string, a
     /// `TcpStream`) connects to: the first one the resolver returned, i.e.
@@ -950,9 +942,30 @@ pub(crate) fn pg_connect_options(
     password: &str,
     database: &str,
 ) -> PgConnectOptions {
+    pg_options_for_address(
+        &approved.primary_host(),
+        approved.primary().port(),
+        user,
+        password,
+        database,
+    )
+}
+
+/// The one place the `PostgreSQL` TLS mode is set for connector dials
+/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changes it here).
+/// `host` must already be an approved IP text, not a name:
+/// [`pg_connect_options`] passes [`Approved::primary_host`], and
+/// `connector_deprovision::PgTarget` carries the same text and port.
+pub(crate) fn pg_options_for_address(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> PgConnectOptions {
     PgConnectOptions::new()
-        .host(&approved.primary_host())
-        .port(approved.primary().port())
+        .host(host)
+        .port(port)
         .username(user)
         .password(password)
         .database(database)

@@ -180,3 +180,54 @@ ingest-spec or delete route.
 connectors whether a port is open, on an address that is allowed.
 
 ## 5. Review (planner)
+
+Reviewed 2026-10-08 at `9382f45`, the non-test diff of `connector_probe.rs`,
+`connector_discover.rs`, `connector_deprovision.rs` and
+`routes/connectors.rs` against `origin/main`, plus the compose and gate
+changes.
+
+What I checked myself: every call of `resolve_checked` (seven outside the
+tests) either dials the `Approved` address it returns or, in the save-time
+check of `routes/connectors.rs`, dials nothing and says so; no dialer in
+these modules still opens a socket, builds an HTTP client or builds connect
+options from the name; the S3 client forces path-style requests, so the
+bucket never becomes part of a host name that the pin would not cover; the
+REST and S3 clients follow no redirect and use no proxy; a refusal repeats
+the caller's own host and never the resolved address or the resolver's
+text. CI on pull request 82: 25 checks pass, the Rust test jobs and the G6
+ingest matrix among them; the two `gitleaks` jobs fail as on `main`. No
+Rust test was run on the build machine (*not verified* locally).
+
+No `BLOCKER`.
+
+- `SHOULD-FIX` 1. `connector_probe.rs`, on `struct Approved` and its
+  `impl`: two `#[allow(dead_code, reason = "the dialers take the approved
+  address in the next commit (SEC-15 K2), which removes this")]`. K2 landed
+  and did not remove them, so the reason is no longer true (`AGENTS.md`:
+  an `allow` carries a checkable reason). Remove both; if clippy then
+  reports an unused item, remove the item instead of keeping the `allow`.
+- `SHOULD-FIX` 2. `connector_deprovision.rs:278` builds its own
+  `PgConnectOptions` with the same `Prefer` setting that
+  `connector_probe::pg_connect_options` already states (rule 4). It is
+  given the approved address, so it is not a hole, but `SEC-14` part B is
+  about to change the TLS mode and must find one place, not two. Use the
+  helper, or leave it to part B and say so there.
+- For the product owner, unchanged from the handoff: with the new default a
+  fresh compose install refuses the tests of its own seeded connectors
+  until `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` or a CIDR list is set;
+  an existing install that relied on the old default must set it before
+  upgrading or its internal connectors stop testing.
+
+### Handoff: review fixes
+
+- `SHOULD-FIX` 1: removed both `dead_code` allows on `Approved` and its
+  `impl`; clippy reports no unused item, so nothing else was removed.
+- `SHOULD-FIX` 2: `connector_probe::pg_options_for_address` now sets the
+  `PostgreSQL` TLS mode (`Prefer`, unchanged); `pg_connect_options` and
+  `connector_deprovision::drop_slot_and_publication` both call it.
+  `connector_discover` already used `pg_connect_options`, no change.
+  `PgTarget` and the dialled address are unchanged.
+- Commands run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (clean, after each fix; a one-line doc-comment edit followed the second
+  run); `cargo fmt --check` (clean).
+- *Not verified*: all Rust tests (`cargo test` is not run on this machine).

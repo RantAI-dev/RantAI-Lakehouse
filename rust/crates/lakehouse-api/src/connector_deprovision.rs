@@ -40,7 +40,7 @@ use std::time::Duration;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_store::cdc::ConnectorSlug;
 use sqlx::Connection;
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::postgres::PgConnection;
 
 /// Bound on every individual query this module issues (connect, drop
 /// publication, terminate backend, poll, drop slot) — a hung/unreachable
@@ -62,7 +62,7 @@ const SLOT_INACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// source `Postgres` database directly — resolved and owned by the caller
 /// (`routes::connectors::delete`), never a DSN string this module would
 /// have to parse. Every field is bound as an individual
-/// [`PgConnectOptions`] setter, never interpolated into a connection
+/// `PgConnectOptions` setter, never interpolated into a connection
 /// string, matching `connector_probe::probe_postgres`'s exact reasoning
 /// for why that matters.
 pub struct PgTarget {
@@ -275,17 +275,15 @@ pub async fn drop_slot_and_publication(
     slot_name: &str,
     publication_name: &str,
 ) -> Result<Deprovisioned, DeprovisionError> {
-    let options = PgConnectOptions::new()
-        .host(&target.host)
-        .port(target.port)
-        .username(&target.user)
-        .password(target.password.expose_secret())
-        .database(&target.database)
-        // Matches `connector_probe::probe_postgres`'s exact posture: this
-        // deployment's compose-network Postgres does not terminate TLS, so
-        // `Prefer` (attempt TLS, fall back to plaintext) is the correct
-        // default rather than leaving it to sqlx's own default.
-        .ssl_mode(PgSslMode::Prefer);
+    // SEC-15 review fix (SHOULD-FIX 2): the TLS mode is set in one place,
+    // `connector_probe`, shared with the connection test and discovery.
+    let options = crate::connector_probe::pg_options_for_address(
+        &target.host,
+        target.port,
+        &target.user,
+        target.password.expose_secret(),
+        &target.database,
+    );
 
     let connect_label = format!("slot {slot_name:?} / publication {publication_name:?}");
     let mut conn = with_timeout(
