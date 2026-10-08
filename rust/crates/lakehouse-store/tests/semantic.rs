@@ -12,9 +12,16 @@
 
 use lakehouse_test_support as _;
 
+use std::borrow::Cow;
+
 use lakehouse_store::semantic::{self, SemanticInput};
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
 use uuid::Uuid;
+
+/// The embedded migration set, to apply in two steps in the data-migration
+/// test.
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 fn input(asset: &str, column: &str, description: &str) -> SemanticInput {
     SemanticInput {
@@ -300,6 +307,35 @@ async fn semantic_an_unknown_role_is_refused(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// `flag` and `non_additive` are stored for a confirmed entry, as the four
+/// older roles are.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_a_confirmed_entry_may_be_a_flag_or_non_additive(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let person = Uuid::new_v4();
+    for (column, role) in [("active", "flag"), ("orders", "non_additive")] {
+        let mut entry = input("serving.orders", column, "Column text");
+        entry.role = Some(role.to_owned());
+        semantic::confirm(&pool, &entry, person)
+            .await
+            .expect("confirm should succeed");
+    }
+
+    let rows = semantic::list_for_asset(&pool, "serving.orders")
+        .await
+        .unwrap();
+    let roles: Vec<(&str, Option<&str>)> = rows
+        .iter()
+        .map(|row| (row.column_name.as_str(), row.role.as_deref()))
+        .collect();
+    assert_eq!(
+        roles,
+        [("active", Some("flag")), ("orders", Some("non_additive"))]
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn semantic_a_role_on_the_table_itself_is_refused(pool: PgPool) -> sqlx::Result<()> {
     assert_check_violation(
@@ -341,5 +377,85 @@ async fn semantic_an_over_long_asset_or_column_name_is_refused(pool: PgPool) -> 
     .await
     .map(|_| ());
     assert_check_violation(err, "a 201-character asset");
+    Ok(())
+}
+
+/// The migrations a database that stopped at `version` would have applied.
+fn migrations_up_to(version: i64) -> Migrator {
+    let upto: Vec<_> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(upto),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// The migration that adds the two roles also deletes every draft: they were
+/// written under a prompt that let them copy values and call a flag a
+/// measure. A person's confirmed entry stays, and from then on the two new
+/// roles are accepted where the old `CHECK` refused them.
+#[sqlx::test(migrations = false)]
+async fn semantic_the_roles_migration_deletes_drafts_and_keeps_confirmed_entries(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrations_up_to(60).run(&pool).await.unwrap();
+    raw_insert(
+        &pool,
+        "draft_col",
+        "Drafted",
+        &[],
+        Some("measure"),
+        "draft",
+        None,
+    )
+    .await?;
+    raw_insert(&pool, "", "Drafted table", &[], None, "draft", None).await?;
+    raw_insert(
+        &pool,
+        "kept_col",
+        "Confirmed",
+        &[],
+        Some("measure"),
+        "confirmed",
+        Some(Uuid::new_v4()),
+    )
+    .await?;
+    assert_check_violation(
+        raw_insert(&pool, "flag_col", "d", &[], Some("flag"), "draft", None).await,
+        "the old CHECK refuses a flag",
+    );
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let rows = semantic::list_for_asset(&pool, "serving.t").await.unwrap();
+    let left: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|row| (row.column_name.as_str(), row.status.as_str()))
+        .collect();
+    assert_eq!(left, [("kept_col", "confirmed")]);
+
+    raw_insert(
+        &pool,
+        "flag_col",
+        "d",
+        &[],
+        Some("flag"),
+        "confirmed",
+        Some(Uuid::new_v4()),
+    )
+    .await?;
+    raw_insert(
+        &pool,
+        "orders",
+        "d",
+        &[],
+        Some("non_additive"),
+        "confirmed",
+        Some(Uuid::new_v4()),
+    )
+    .await?;
     Ok(())
 }

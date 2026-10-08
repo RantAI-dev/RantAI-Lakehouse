@@ -313,7 +313,14 @@ pub(crate) const MAX_SYNONYMS: usize = 6;
 /// Longest single synonym, in characters.
 pub(crate) const SYNONYM_CHARS: usize = 40;
 /// The roles a column may have (the `CHECK` on `semantic_entry.role`).
-pub(crate) const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
+pub(crate) const ROLES: [&str; 6] = [
+    "measure",
+    "dimension",
+    "time",
+    "key",
+    "flag",
+    "non_additive",
+];
 
 /// What people and the drafting pass wrote about tables and columns, to be
 /// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
@@ -332,6 +339,9 @@ pub(crate) struct Notes {
 struct Note {
     description: String,
     synonyms: Vec<String>,
+    /// The entry's role, whatever its status: a draft's role counts until a
+    /// person changes it.
+    role: Option<String>,
     confirmed: bool,
 }
 
@@ -364,6 +374,7 @@ impl Notes {
                         Note {
                             description: e.description,
                             synonyms: e.synonyms,
+                            role: e.role,
                             confirmed: e.status == "confirmed",
                         },
                     )
@@ -412,6 +423,14 @@ impl Notes {
             .map(|n| one_line(&n.description, COLUMN_TEXT_CHARS))
             .filter(|t| !t.is_empty());
         confirmed.or(source).or(draft)
+    }
+
+    /// A column's role, whatever the entry's status.
+    fn role(&self, asset: &str, column: &str) -> Option<&str> {
+        self.entries
+            .get(&(asset.to_owned(), column.to_owned()))?
+            .role
+            .as_deref()
     }
 
     /// The synonyms of a table (`column` is `""`) or a column that
@@ -750,22 +769,62 @@ fn is_key_like(name: &str) -> bool {
 /// was added for: `qwen3:4b` answered "the peak month's visits" with one
 /// country's row (`ORDER BY jumlah DESC LIMIT 1`) instead of the month's
 /// total, because nothing said a row is one combination of several
-/// columns. `None` when the table has no numeric measure.
-fn grain_line(table: &Table) -> Option<String> {
-    let (measures, keys): (Vec<&Column>, Vec<&Column>) = table
+/// columns.
+///
+/// A column's role in `notes` overrides the name and type guess: a numeric
+/// column with the role `flag`, `non_additive`, `key`, `dimension` or `time`
+/// is not a measure. A `flag` or `non_additive` column that would otherwise
+/// be a measure (a number whose name does not look like a key, such as a
+/// year, a month or an id) is not part of the grain either, because it
+/// describes a row instead of naming it. Any other `flag` or `non_additive`
+/// column, such as a text or boolean one, stays among the grain keys,
+/// because rows still differ by it. The `non_additive` columns are listed
+/// after the measures, with the warning not to total them. `None` when no
+/// column names the grain, or when there is neither a measure nor a
+/// `non_additive` column to say anything about.
+fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
+    let asset = format!("{}.{}", table.db, table.name);
+    let role = |c: &Column| notes.role(&asset, &c.name);
+    let would_be_measure = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
+    let (measures, others): (Vec<&Column>, Vec<&Column>) = table.columns.iter().partition(|c| {
+        would_be_measure(c)
+            && !matches!(
+                role(c),
+                Some("flag" | "non_additive" | "key" | "dimension" | "time")
+            )
+    });
+    let keys: Vec<&str> = others
+        .iter()
+        .filter(|c| !(would_be_measure(c) && matches!(role(c), Some("flag" | "non_additive"))))
+        .map(|c| c.name.as_str())
+        .collect();
+    let non_additive: Vec<&str> = table
         .columns
         .iter()
-        .partition(|c| is_numeric_type(&c.ty) && !is_key_like(&c.name));
-    if measures.is_empty() || keys.is_empty() {
+        .filter(|c| role(c) == Some("non_additive"))
+        .map(|c| c.name.as_str())
+        .collect();
+    if keys.is_empty() || (measures.is_empty() && non_additive.is_empty()) {
         return None;
     }
-    let keys: Vec<&str> = keys.iter().map(|c| c.name.as_str()).collect();
-    let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
-    Some(format!(
-        "    grain: one row per {}; measures: {} (SUM them over rows for any total)\n",
-        keys.join(" x "),
-        measures.join(", ")
-    ))
+    let mut line = format!("    grain: one row per {}", keys.join(" x "));
+    if !measures.is_empty() {
+        let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
+        let _ = write!(
+            line,
+            "; measures: {} (SUM them over rows for any total)",
+            measures.join(", ")
+        );
+    }
+    if !non_additive.is_empty() {
+        let _ = write!(
+            line,
+            "; not additive: {} (never SUM these across rows: compute them from a detail table, or say the total cannot be read from this table)",
+            non_additive.join(", ")
+        );
+    }
+    line.push('\n');
+    Some(line)
 }
 
 /// `720 rows`, or `row count unknown`.
@@ -817,7 +876,7 @@ fn render_table(
         out.push_str(&synonyms);
     }
     out.push('\n');
-    if let Some(grain) = grain_line(table) {
+    if let Some(grain) = grain_line(table, notes) {
         out.push_str(&grain);
     }
     for col in &table.columns {
@@ -830,6 +889,11 @@ fn render_table(
         }
         if let Some(synonyms) = notes.synonyms(&asset, &col.name) {
             out.push_str(&synonyms);
+        }
+        match notes.role(&asset, &col.name) {
+            Some("non_additive") => out.push_str(" [never SUM across rows]"),
+            Some("flag") => out.push_str(" [0/1 flag]"),
+            _ => {}
         }
         if let Some(fact) = stats.get(&col.name) {
             let _ = write!(out, "; {fact}");
@@ -1629,7 +1693,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            grain_line(&table).as_deref(),
+            grain_line(&table, &Notes::default()).as_deref(),
             Some(
                 "    grain: one row per tahun x bulan_no x negara; measures: jumlah (SUM them over rows for any total)\n"
             )
@@ -1638,7 +1702,7 @@ mod tests {
             columns: vec![col("indikator", "String")],
             ..table
         };
-        assert_eq!(grain_line(&only_labels), None);
+        assert_eq!(grain_line(&only_labels, &Notes::default()), None);
     }
 
     fn col(name: &str, ty: &str) -> Column {
@@ -1782,6 +1846,285 @@ mod tests {
 
     fn notes(annotations: Vec<AnnotationRow>, entries: Vec<SemanticEntry>) -> Notes {
         Notes::from_rows(annotations, entries)
+    }
+
+    fn with_role(mut e: SemanticEntry, role: &str) -> SemanticEntry {
+        e.role = Some(role.to_owned());
+        e
+    }
+
+    /// `serving.sales` with the given `(name, type)` columns.
+    fn sales_with(columns: &[(&str, &str)]) -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "sales".to_owned(),
+            rows: Some(48),
+            columns: columns.iter().map(|(n, t)| col(n, t)).collect(),
+        }
+    }
+
+    /// A role-only entry for a column of `serving.sales`.
+    fn role_of(column: &str, role: &str, confirmed: bool) -> SemanticEntry {
+        with_role(entry("serving.sales", column, "", confirmed), role)
+    }
+
+    const NOT_ADDITIVE_ADVICE: &str = "(never SUM these across rows: compute them from a detail table, or say the total cannot be read from this table)";
+
+    fn render_sales(table: &Table, notes: &Notes) -> String {
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            table,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            notes,
+        );
+        out
+    }
+
+    #[test]
+    fn with_no_roles_every_numeric_non_key_column_is_a_measure_and_no_line_is_tagged() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(vec![], vec![]);
+        assert_eq!(
+            grain_line(&table, &notes).as_deref(),
+            Some(
+                "    grain: one row per year x region; measures: orders, net_amt, active (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(!rendered.contains('['), "{rendered}");
+    }
+
+    #[test]
+    fn a_non_additive_column_leaves_the_measures_and_is_named_with_the_warning() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", true),
+                role_of("net_amt", "measure", true),
+            ],
+        );
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    orders UInt32 [never SUM across rows]\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("    net_amt Float64\n"), "{rendered}");
+    }
+
+    #[test]
+    fn a_flag_column_leaves_the_measures_and_its_line_says_it_is_a_flag() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(
+            grain_line(&table, &notes).as_deref(),
+            Some(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    active UInt8 [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn with_every_numeric_column_non_additive_the_line_does_not_tell_the_model_to_sum() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("visitors", "UInt32"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", true),
+                role_of("visitors", "non_additive", true),
+            ],
+        );
+        let line = grain_line(&table, &notes).unwrap_or_default();
+        assert!(!line.contains("SUM them"), "{line}");
+        assert!(!line.contains("measures:"), "{line}");
+        assert_eq!(
+            line,
+            format!(
+                "    grain: one row per year x region; not additive: orders, visitors {NOT_ADDITIVE_ADVICE}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_draft_role_counts_the_same_as_a_confirmed_one() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", false),
+                role_of("active", "flag", true),
+            ],
+        );
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    orders UInt32 [never SUM across rows]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("    active UInt8 [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dimension_time_or_key_role_takes_a_numeric_column_out_of_the_measures() {
+        for role in ["dimension", "time", "key"] {
+            let table = sales_with(&[
+                ("region", "String"),
+                ("wave", "UInt8"),
+                ("net_amt", "Float64"),
+            ]);
+            let notes = notes(vec![], vec![role_of("wave", role, true)]);
+            assert_eq!(
+                grain_line(&table, &notes).as_deref(),
+                Some(
+                    "    grain: one row per region x wave; measures: net_amt (SUM them over rows for any total)\n"
+                ),
+                "role {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_flag_column_stays_in_the_grain_and_its_line_says_it_is_a_flag() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("active", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(
+            grain_line(&table, &notes).as_deref(),
+            Some(
+                "    grain: one row per year x region x active; measures: net_amt (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    active String [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_text_non_additive_column_stays_in_the_grain_and_is_not_listed_as_a_measure() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("band", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("band", "non_additive", true)]);
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per year x region x band; measures: net_amt (SUM them over rows for any total); not additive: band {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_numeric_non_additive_column_with_a_key_like_name_stays_in_the_grain() {
+        let table = sales_with(&[
+            ("region", "String"),
+            ("monthly_active_users", "UInt64"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![role_of("monthly_active_users", "non_additive", true)],
+        );
+        assert_eq!(
+            grain_line(&table, &notes),
+            Some(format!(
+                "    grain: one row per region x monthly_active_users; measures: net_amt (SUM them over rows for any total); not additive: monthly_active_users {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_table_left_with_no_measure_and_no_non_additive_column_has_no_grain_line() {
+        let table = sales_with(&[("region", "String"), ("active", "UInt8")]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(grain_line(&table, &notes), None);
+    }
+
+    #[test]
+    fn the_role_tag_follows_the_description_and_synonyms_and_precedes_the_stats() {
+        let table = sales_with(&[("region", "String"), ("orders", "UInt32")]);
+        let notes = notes(
+            vec![],
+            vec![with_role(
+                with_synonyms(
+                    entry("serving.sales", "orders", "Orders placed", true),
+                    &["purchases"],
+                ),
+                "non_additive",
+            )],
+        );
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &table,
+            None,
+            &HashMap::new(),
+            &HashMap::from([("orders".to_owned(), "range 1..9".to_owned())]),
+            &notes,
+        );
+        assert!(
+            out.contains(
+                "    orders UInt32 — Orders placed (also called: purchases) [never SUM across rows]; range 1..9\n"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

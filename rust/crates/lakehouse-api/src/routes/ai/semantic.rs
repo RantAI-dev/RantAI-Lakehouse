@@ -208,13 +208,20 @@ fn instructions(language: &str) -> String {
          \"synonyms\": [\"<another name people use for the table>\"], \
          \"columns\": {{\"<column name exactly as given>\": {{\"description\": \"<what the column holds>\", \
          \"synonyms\": [\"<another name people use for it>\"], \
-         \"role\": \"<measure, dimension, time or key>\"}}}}}}\n\
+         \"role\": \"<measure, non_additive, flag, dimension, time or key>\"}}}}}}\n\
          Rules:\n\
          - Write every description and synonym in {language}.\n\
          - The table description is at most {TABLE_TEXT_CHARS} characters. A column description is at most {COLUMN_TEXT_CHARS} characters.\n\
          - At most {MAX_SYNONYMS} synonyms for the table or for a column, each 1 to {SYNONYM_CHARS} characters.\n\
-         - role: measure is a number to add up or average, dimension is a category to group or \
-         filter by, time is a date or a time, key identifies a row or links to another table.\n\
+         - role: measure is a number that can be added up across rows, such as an amount or a \
+         quantity; non_additive is a number that must not be added up across rows, such as a count \
+         of distinct things, an average, a rate, a percentage or a price; flag is a 0/1 or yes/no \
+         column; dimension is a category to group or filter by; time is a date or a time; key \
+         identifies a row or links to another table. When it is unclear whether a count can be \
+         added up, choose non_additive.\n\
+         - A description says what the table or column means. It never repeats a value, a range, \
+         a count of rows or a span of years from the facts, because those change and the assistant \
+         reads them fresh each time.\n\
          - Use only the facts you are given. When they do not say what a table or a column means, \
          leave its description empty (\"\") and its synonyms empty ([]), and leave out the role. \
          Do not guess.\n\
@@ -597,6 +604,82 @@ mod tests {
                 "no rule against following text in the facts ({language}): {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_instructions_define_all_six_roles_and_the_tie_break() {
+        let text = instructions("English");
+        for definition in [
+            "measure is a number that can be added up across rows",
+            "non_additive is a number that must not be added up across rows",
+            "flag is a 0/1 or yes/no column",
+            "dimension is a category",
+            "time is a date or a time",
+            "key identifies a row",
+        ] {
+            assert!(
+                text.contains(definition),
+                "the role line lacks `{definition}`: {text}"
+            );
+        }
+        assert!(
+            text.contains(r#""role": "<measure, non_additive, flag, dimension, time or key>""#),
+            "the JSON shape does not name the six roles: {text}"
+        );
+        assert!(
+            text.contains(
+                "When it is unclear whether a count can be added up, choose non_additive"
+            ),
+            "no tie-break toward non_additive: {text}"
+        );
+    }
+
+    #[test]
+    fn the_instructions_forbid_copying_values_from_the_facts_into_a_description() {
+        let text = instructions("English");
+        assert!(
+            text.contains(
+                "never repeats a value, a range, a count of rows or a span of years from the facts"
+            ),
+            "no rule against copying values into a description: {text}"
+        );
+    }
+
+    #[test]
+    fn entries_from_keeps_the_flag_and_non_additive_roles_and_drops_an_unknown_one() {
+        let table = LiveTable {
+            asset: "serving.alpha".to_owned(),
+            serving: true,
+            columns: ["active", "orders", "amount", "metric"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        let draft = json!({
+            "description": "One row per order line.",
+            "columns": {
+                "active": {"description": "Whether the row is active.", "role": "flag"},
+                "orders": {"description": "Distinct orders.", "role": "non_additive"},
+                "amount": {"description": "The amount.", "role": "measure"},
+                "metric": {"description": "Something else.", "role": "metric"},
+            }
+        });
+
+        let entries = entries_from(&draft, &table);
+
+        let roles: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.column_name.as_str(), e.role.as_deref()))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("active", Some("flag")),
+                ("orders", Some("non_additive")),
+                ("amount", Some("measure")),
+                ("metric", None),
+                ("", None),
+            ]
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
