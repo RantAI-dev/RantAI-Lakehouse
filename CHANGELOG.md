@@ -234,6 +234,9 @@ once a first release is tagged.
 - The alerts table now distinguishes an API failure from having no alerts,
   instead of showing an empty state for both.
 - Query Studio's "Natural language" box asks the copilot's engine (`POST /api/ai/chat`) for both "Ask (agentic)" and "Generate SQL only", so masking, row filters and `query:read` apply to the SQL it runs. "Generate SQL only" runs the query once on the server on its way to loading the SQL into the editor, and its `assumptions` list is gone because the chat has no such list.
+- The semantic layer has two new column roles, `flag` (a 0/1 or yes/no column) and `non_additive` (a number that must not be added up across rows, such as a distinct count, an average, a rate or a price). The chat's data map marks them and no longer totals a column marked `non_additive`.
+- The semantic layer's drafts no longer repeat values from the data, such as a range, a row count or a span of years, because the assistant reads those fresh each time.
+- On upgrade, migration 0061 deletes every existing semantic draft once, and the drafting pass writes them again within about fifteen minutes, ten tables at a time. Confirmed entries are kept. A table whose own description is confirmed is skipped by the pass, so its column drafts stay deleted until a person sets them through `PUT /api/semantic/{asset}`.
 
 ### Fixed
 
