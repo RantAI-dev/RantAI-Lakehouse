@@ -1,3 +1,12 @@
+# SEC-18 -- no default credentials. These variables have NO fallback and
+# compose refuses to start without them (`${X:?}`): POSTGRES_PASSWORD,
+# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY.
+# `CONNECTOR_PG_PASSWORD` / `CONNECTOR_S3_*` fall back to those, never to a
+# literal. `ops/init-env.sh` writes a local `.env` with generated values;
+# docs/OPERATIONS.md has the upgrade note. Compose interpolates the whole
+# file whatever profiles are active, so a variable used only by an optional
+# profile (SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY) defaults to empty
+# and `seaweedfs-iam-init` refuses to run while it is empty.
 services:
   # Phase 2 OLTP store (mutation state that ClickHouse — analytics-only, no
   # transactions — is a poor fit for). ClickHouse remains the analytics
@@ -28,7 +37,7 @@ services:
       ]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     ports:
       - "${POSTGRES_HOST_PORT:-5432}:5432"
@@ -290,7 +299,7 @@ services:
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
       # ── secretRef-resolvable credentials for `connector_probe`'s real
       #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
       #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
@@ -305,13 +314,14 @@ services:
       # `connector:manage` principal creating a connector that names
       # `env:POSTGRES_PASSWORD` (the console's own database password) with a
       # caller-chosen external host and having the API authenticate to it.
-      # They default to the same values so the local stack still works —
+      # They fall back to the must-set values above (SEC-18: never to a
+      # literal) so the local stack still works —
       # separate NAMES, not necessarily separate values. Point them at
       # least-privilege credentials in any deployment that accepts connector
       # definitions from callers you do not fully trust.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
-      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
-      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # The connector connectivity probe blocks private/internal address
       # ranges by DEFAULT (SSRF guard — otherwise a `connector:manage`
       # principal gets an internal port scanner with output). This stack's own
@@ -521,8 +531,8 @@ services:
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       # SECURITY: these defaults are public and well-known — override
       # before exposing this listener beyond localhost.
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       RUSTFS_OBS_LOGGER_LEVEL: info
     ports:
       - "${RUSTFS_HOST_PORT:-9010}:9000"
@@ -546,8 +556,8 @@ services:
       rustfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
@@ -593,7 +603,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
     entrypoint: ["/bin/sh", "-c"]
@@ -624,9 +634,9 @@ services:
       openfga-ready:
         condition: service_completed_successfully
     environment:
-      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
-      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
-      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?LAKEKEEPER_ENCRYPTION_KEY is required (catalog encryption key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__AUTHZ_BACKEND: openfga
       LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
       LAKEKEEPER__OPENFGA__STORE_NAME: ${LAKEKEEPER_OPENFGA_STORE_NAME:-lakekeeper}
@@ -645,7 +655,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
     entrypoint: ["/bin/sh", "-c"]
@@ -677,7 +687,7 @@ services:
     command:
       - migrate
       - --datastore-engine=postgres
-      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
     restart: "no"
 
   # R1 — OpenFGA: Lakekeeper's native authorization backend (the
@@ -701,7 +711,7 @@ services:
     command:
       - run
       - --datastore-engine=postgres
-      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
       - --http-addr=0.0.0.0:8080
       - --grpc-addr=0.0.0.0:8081
       - --playground-enabled=false
@@ -817,9 +827,9 @@ services:
       oidc-mock:
         condition: service_healthy
     environment:
-      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
-      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
-      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?LAKEKEEPER_ENCRYPTION_KEY is required (catalog encryption key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       # R1 — authorization: OpenFGA backend, OIDC-identified principals.
       # `LAKEKEEPER__INSTANCE_ADMINS` bootstraps a full-access identity
@@ -887,8 +897,8 @@ services:
       LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — this job
       # only ever needs `admin.jwt`.
@@ -1362,8 +1372,16 @@ services:
     profiles: ["seaweedfs"]
     image: alpine:3.20
     environment:
-      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      # SEC-18: no repository-written default. Compose interpolates the
+      # whole file whatever profiles are active, so `${VAR:?}` here would
+      # stop a default `up` that never starts SeaweedFS. They default to
+      # empty instead and the script below refuses to render when either
+      # is empty; `seaweedfs` waits for this job to complete and every
+      # other `seaweedfs` profile service waits for `seaweedfs`, so an
+      # empty key stops the whole profile (fail closed) rather than
+      # starting an S3 gateway with no or a known key.
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-}
       # CHANGE ME (or leave unset) BEFORE ANY DEPLOYMENT: see docs comment
       # above — unset is safe (a random key is generated per deployment),
       # a shared/known value here is not.
@@ -1375,6 +1393,10 @@ services:
     command:
       - |
         set -eu
+        if [ -z "$$SEAWEEDFS_ACCESS_KEY" ] || [ -z "$$SEAWEEDFS_SECRET_KEY" ]; then
+          echo "seaweedfs-iam-init: SEAWEEDFS_ACCESS_KEY and SEAWEEDFS_SECRET_KEY are required for the seaweedfs profile (SEC-18; run ops/init-env.sh or see docs/OPERATIONS.md)." >&2
+          exit 1
+        fi
         signing_key="$$SEAWEEDFS_STS_SIGNING_KEY"
         if [ -z "$$signing_key" ] && [ -f /rendered/iam.json ]; then
           signing_key="$$(sed -n 's/.*"signingKey": *"\([^"]*\)".*/\1/p' /rendered/iam.json | head -n1)"
@@ -1448,8 +1470,8 @@ services:
       seaweedfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-}
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
@@ -1513,8 +1535,8 @@ services:
     environment:
       LAKEKEEPER_WAREHOUSE: seaweedfs
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
-      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — `admin.jwt`
       # only.
@@ -1646,7 +1668,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     entrypoint: ["/bin/sh", "-c"]
@@ -1722,7 +1744,7 @@ services:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # CREDENTIAL HYGIENE (review finding): this used to be a single
       # `BRONZE_SOURCE_DATABASE_URL` env var carrying a full
@@ -1745,7 +1767,7 @@ services:
       BRONZE_SOURCE_DB_HOST: postgres
       BRONZE_SOURCE_DB_PORT: "5432"
       BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
-      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
       # only ever fed the g3a demo pipeline's OWN hardcoded credential
       # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
@@ -1760,7 +1782,7 @@ services:
       # deployment of this compose file, not just the gate. Exported here
       # under its own name, same value as above, so both readers resolve
       # it.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -1792,8 +1814,8 @@ services:
       # see .env.example's note by these vars). A deployment that can
       # mint a scoped RustFS/S3 identity should set these two to it
       # without touching `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` at all.
-      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
-      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -1932,7 +1954,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
@@ -1964,7 +1986,7 @@ services:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
     ports:
@@ -2002,7 +2024,7 @@ services:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     command: ["dagster-daemon", "run", "-w", "/opt/dagster/app/workspace.yaml"]
     restart: unless-stopped
@@ -2036,7 +2058,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -2249,8 +2271,8 @@ services:
       # Trino's own file I/O, and reusing them would blur that boundary
       # rather than reduce actual risk (both ultimately default to the same
       # `RUSTFS_*` value anyway).
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `trino.jwt` (interpolated into
@@ -2489,7 +2511,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -2580,10 +2602,10 @@ services:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     volumes:
       - lakehouse_debezium_data:/debezium/data
@@ -2715,7 +2737,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       # WS5 item C3 -- g4_test.py's own env var names (duplicated from
       # ops/g3a/g3a_test.py per its module comment, but NOT identically
@@ -2844,7 +2866,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -3121,8 +3143,8 @@ services:
       # `g6-files` connector's derived `file:` credential (ADR 0002
       # Addendum 3) with the value that actually unlocks this stack's
       # RustFS.
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       # MYSQL_ROOT_PASSWORD, MSSQL_SA_PASSWORD, MONGO_G6_ROOT_PASSWORD:
       # gate-only, set in ops/g6/docker-compose.g6.override.yml -- see
       # the comment above mysql-g6/mssql-g6 in this file (WS3 item 37).
