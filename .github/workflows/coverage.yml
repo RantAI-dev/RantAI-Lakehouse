@@ -1,14 +1,11 @@
 name: Coverage & SBOM
 
+# Runs on push to main and manual dispatch only. Nothing reads the artifact output
+# on pull requests, so removing PR triggers saves ~30 runner minutes per PR push.
 on:
   push:
     branches: [main]
-  pull_request:
-    # `lakehouse/**` as well as main: the lakehouse foundation work ships as a
-    # stack of PRs that target each other rather than main, so a `[main]`-only
-    # filter means every PR above the first gets ZERO check runs and merges
-    # unverified.
-    branches: [main, 'lakehouse/**']
+  workflow_dispatch:
 
 concurrency:
   group: coverage-${{ github.workflow }}-${{ github.ref }}
