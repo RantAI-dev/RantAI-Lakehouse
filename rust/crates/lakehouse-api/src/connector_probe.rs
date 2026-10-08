@@ -102,9 +102,9 @@
 //!   address; the configured name is kept for the TDS handshake.
 //! - `reqwest` (REST): `ClientBuilder::resolve_to_addrs` maps the URL's
 //!   host to the approved addresses, so `Host` and SNI keep the name.
-//!   Redirects are not followed and the system proxy is not used.
+//!   The system proxy is not used.
 //! - `object_store` (S3): an [`HttpConnector`] built on a pinned `reqwest`
-//!   client that follows no redirects and uses no proxy.
+//!   client that uses no proxy.
 //!
 //! `SEC-14` (TLS) must keep the NAME for certificate verification when it
 //! turns verification on; the pinned address replaces only where the socket
@@ -398,9 +398,10 @@ async fn probe_mysql(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -409,16 +410,12 @@ async fn probe_mysql(
             ));
         }
     };
-    let options = MySqlConnectOptions::new()
-        .host(target.host)
-        .port(target.port)
-        .username(target.user)
-        .password(password.expose_secret())
-        .database(target.database)
-        // Same explicit-not-implicit reasoning as probe_postgres's
-        // PgSslMode::Prefer: state the effective TLS posture rather than
-        // leaving it to sqlx's default.
-        .ssl_mode(MySqlSslMode::Preferred);
+    let options = mysql_connect_options(
+        &approved,
+        target.user,
+        password.expose_secret(),
+        target.database,
+    );
 
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
@@ -482,9 +479,10 @@ async fn probe_mssql(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -508,12 +506,12 @@ async fn probe_mssql(
     // "accept the presented certificate without verifying its chain"
     // knob.
     config.trust_cert();
-    let addr = config.get_addr();
-
+    // SEC-15: the socket goes to the approved address; `config.host` keeps
+    // the configured name for the TDS handshake, which is what `SEC-14`
+    // needs for certificate verification.
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async move {
-        let tcp = tokio::net::TcpStream::connect(&addr).await?;
-        tcp.set_nodelay(true)?;
+        let tcp = connect_pinned(&approved).await?;
         let mut client = Box::pin(tiberius::Client::connect(config, tcp.compat_write())).await?;
         // A literal, constant query string -- never built from caller
         // input (tiberius's own `simple_query` doc comment: do not use
@@ -607,11 +605,16 @@ async fn probe_rest(
             "connector is misconfigured: a rest adapter's baseUrl must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(host, port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(host, port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    let client = match pinned_http_client(&dial.base_url, host, port, &approved) {
+        Ok(client) => client,
+        Err(message) => return Outcome::misconfigured(message),
+    };
 
-    let request = reqwest::Client::new().get(&dial.base_url);
+    let request = client.get(&dial.base_url);
     let request = match &dial.auth {
         RestAuth::ApiKey { header } => {
             let key = match resolver.resolve_dyn(secret_ref).await {
@@ -701,6 +704,82 @@ async fn probe_rest(
             elapsed,
             format!("REST request timed out after {}s", DIAL_TIMEOUT.as_secs()),
         ),
+    }
+}
+
+/// `SEC-15`: whether `url`, as the HTTP client will parse it, names exactly
+/// the `host`/`port` that [`resolve_checked`] approved. The check parses the
+/// URL with [`parse_endpoint_host_port`]'s hand-rolled splitter, the client
+/// with the `url` crate; a URL the two read differently could make the client
+/// dial a host the check never saw, so a mismatch is refused.
+fn url_names_target(url: &str, host: &str, port: u16) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|parsed| {
+        parsed
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case(host))
+            && parsed.port_or_known_default() == Some(port)
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    })
+}
+
+/// `SEC-15`: the `reqwest` client for the REST test. The URL's host is mapped
+/// to the [`Approved`] addresses (the `Host` header and SNI keep the name),
+/// the system proxy is not used (a proxy resolves the name
+/// itself, which defeats the pin).
+///
+/// # Errors
+///
+/// A fixed message when `url` does not name the checked host and port, or the
+/// client cannot be built.
+fn pinned_http_client(
+    url: &str,
+    host: &str,
+    port: u16,
+    approved: &Approved,
+) -> Result<reqwest::Client, String> {
+    if !url_names_target(url, host, port) {
+        return Err(
+            "connector is misconfigured: a rest adapter's baseUrl must be a plain http(s):// URL \
+             with a host and an optional port, and no user name or password"
+                .to_owned(),
+        );
+    }
+    reqwest::Client::builder()
+        .resolve_to_addrs(host, approved.all())
+        .no_proxy()
+        .build()
+        .map_err(|err| {
+            tracing::warn!(error = %err, "SEC-15: could not build the pinned REST client");
+            "could not build the HTTP client for this test".to_owned()
+        })
+}
+
+/// `SEC-15`: the HTTP client `object_store` uses for the S3 test, pinned like
+/// [`pinned_http_client`] (approved addresses, no proxy).
+/// `object_store`'s own client cannot be given a pinned address through its
+/// options, so the connector supplies a `reqwest` 0.13 client built here
+/// instead.
+#[derive(Debug)]
+struct PinnedHttpConnector {
+    host: String,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+impl object_store::client::HttpConnector for PinnedHttpConnector {
+    fn connect(
+        &self,
+        _options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let client = reqwest013::Client::builder()
+            .resolve_to_addrs(&self.host, &self.addrs)
+            .no_proxy()
+            .build()
+            .map_err(|err| object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(err),
+            })?;
+        Ok(object_store::client::HttpClient::new(client))
     }
 }
 
@@ -842,6 +921,54 @@ impl Approved {
     pub(crate) fn all(&self) -> &[std::net::SocketAddr] {
         &self.all
     }
+}
+
+/// `SEC-15`: `PostgreSQL` connect options that dial the [`Approved`] address
+/// (host and port), never the name. The TLS posture is pinned explicitly
+/// rather than left to `sqlx`'s default so it is a decision this module
+/// states: `Prefer` (attempt TLS, fall back to plaintext) matches this
+/// deployment's compose-network Postgres, which does not terminate TLS.
+/// `SEC-14` owns changing it, and must keep the name for certificate
+/// verification when it does.
+pub(crate) fn pg_connect_options(
+    approved: &Approved,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> PgConnectOptions {
+    PgConnectOptions::new()
+        .host(&approved.primary_host())
+        .port(approved.primary().port())
+        .username(user)
+        .password(password)
+        .database(database)
+        .ssl_mode(PgSslMode::Prefer)
+}
+
+/// `SEC-15`: `MySQL`/`MariaDB` connect options that dial the [`Approved`]
+/// address. Same TLS note as [`pg_connect_options`] (`Preferred`).
+pub(crate) fn mysql_connect_options(
+    approved: &Approved,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> MySqlConnectOptions {
+    MySqlConnectOptions::new()
+        .host(&approved.primary_host())
+        .port(approved.primary().port())
+        .username(user)
+        .password(password)
+        .database(database)
+        .ssl_mode(MySqlSslMode::Preferred)
+}
+
+/// `SEC-15`: open the TCP connection for a `tiberius` client to the
+/// [`Approved`] address, never the name. The client's own `host` setting
+/// stays the configured name for the TDS handshake.
+pub(crate) async fn connect_pinned(approved: &Approved) -> std::io::Result<tokio::net::TcpStream> {
+    let tcp = tokio::net::TcpStream::connect(approved.primary()).await?;
+    tcp.set_nodelay(true)?;
+    Ok(tcp)
 }
 
 /// The refusal text for a host that resolves to an address
@@ -1015,9 +1142,10 @@ async fn dial_postgres(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
-        return Outcome::misconfigured(message);
-    }
+    let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
     let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
@@ -1026,18 +1154,12 @@ async fn dial_postgres(
             ));
         }
     };
-    let options = PgConnectOptions::new()
-        .host(target.host)
-        .port(target.port)
-        .username(target.user)
-        .password(password.expose_secret())
-        .database(target.database)
-        // Pinned explicitly rather than left to sqlx's default so the
-        // effective TLS posture is a decision this module states, not an
-        // artifact of whatever `sqlx` happens to default to. `Prefer`
-        // (attempt TLS, fall back to plaintext) matches this deployment's
-        // compose-network Postgres, which does not terminate TLS.
-        .ssl_mode(PgSslMode::Prefer);
+    let options = pg_connect_options(
+        &approved,
+        target.user,
+        password.expose_secret(),
+        target.database,
+    );
 
     let started = Instant::now();
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
@@ -1149,6 +1271,36 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
     "connection failed"
 }
 
+/// The S3 client for [`probe_s3`], pinned to the [`Approved`] addresses of
+/// `endpoint_host` (see [`PinnedHttpConnector`]). Separate from `probe_s3` so
+/// a test can build the same client against a stand-in server.
+fn s3_client(
+    endpoint: &str,
+    bucket: &str,
+    endpoint_host: &str,
+    approved: &Approved,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> object_store::Result<object_store::aws::AmazonS3> {
+    AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_access_key_id(access_key_id)
+        .with_secret_access_key(secret_access_key)
+        // Self-hosted (RustFS), not real AWS S3: path-style addressing, and
+        // `object_store` must be told explicitly this is not talking to
+        // AWS or it refuses a plain-http/self-signed endpoint outright —
+        // same posture `lakehouse-iceberg::storage`'s client uses.
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        // SEC-15: the pinned HTTP client.
+        .with_http_connector(PinnedHttpConnector {
+            host: endpoint_host.to_owned(),
+            addrs: approved.all().to_vec(),
+        })
+        .build()
+}
+
 async fn probe_s3(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
@@ -1164,8 +1316,15 @@ async fn probe_s3(
             "connector is misconfigured: S3 endpoint must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(endpoint_host, endpoint_port, internal_hosts).await {
-        return Outcome::misconfigured(message);
+    let approved = match resolve_checked(endpoint_host, endpoint_port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    if !url_names_target(endpoint, endpoint_host, endpoint_port) {
+        return Outcome::misconfigured(
+            "connector is misconfigured: S3 endpoint must be a plain http(s):// URL with a host \
+             and an optional port, and no user name or password",
+        );
     }
     let Some(secret_ref_secondary) = info.secret_ref_secondary.as_deref() else {
         return Outcome::misconfigured(
@@ -1190,22 +1349,21 @@ async fn probe_s3(
         }
     };
 
-    let built = AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(bucket)
-        .with_access_key_id(access_key.expose_secret())
-        .with_secret_access_key(secret_key.expose_secret())
-        // Self-hosted (RustFS), not real AWS S3: path-style addressing, and
-        // `object_store` must be told explicitly this is not talking to
-        // AWS or it refuses a plain-http/self-signed endpoint outright —
-        // same posture `lakehouse-iceberg::storage`'s client uses.
-        .with_virtual_hosted_style_request(false)
-        .with_allow_http(true)
-        .build();
+    let built = s3_client(
+        endpoint,
+        bucket,
+        endpoint_host,
+        &approved,
+        access_key.expose_secret(),
+        secret_key.expose_secret(),
+    );
     let client = match built {
         Ok(client) => client,
         Err(err) => {
-            return Outcome::misconfigured(format!("failed to build the S3 client: {err}"));
+            // The error's own text is not the caller's to read (principle
+            // 4); it goes to the log.
+            tracing::warn!(error = %err, "SEC-15: could not build the S3 test client");
+            return Outcome::misconfigured("failed to build the S3 client for this connector");
         }
     };
 
@@ -1691,6 +1849,118 @@ mod tests {
 
     fn sock_with_port(ip: &str, port: u16) -> std::net::SocketAddr {
         std::net::SocketAddr::new(ip.parse().unwrap(), port)
+    }
+
+    // -- SEC-15 K2: the dial goes to the approved address --
+
+    fn approved_for(addr: std::net::SocketAddr, host: &str) -> Approved {
+        check_addrs(host, vec![addr], &InternalHosts::ALL).unwrap()
+    }
+
+    /// SEC-15 (K2): the `PostgreSQL` and `MySQL` options carry the approved
+    /// address and port, not the name the connector was configured with.
+    #[test]
+    fn sql_connect_options_dial_the_approved_address_not_the_name() {
+        let approved = approved_for(sock_with_port("192.0.2.9", 6543), "db.example.com");
+        let pg = pg_connect_options(&approved, "u", "p", "d");
+        assert_eq!(pg.get_host(), "192.0.2.9");
+        assert_eq!(pg.get_port(), 6543);
+        let mysql = mysql_connect_options(&approved, "u", "p", "d");
+        assert_eq!(mysql.get_host(), "192.0.2.9");
+        assert_eq!(mysql.get_port(), 6543);
+    }
+
+    /// SEC-15 (K2): the `tiberius` socket goes to the approved address. The
+    /// name given for the check does not resolve at all (`.invalid`), so a
+    /// connection can only arrive if the dial used the address.
+    #[tokio::test]
+    async fn connect_pinned_dials_the_approved_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let approved = approved_for(listener.local_addr().unwrap(), "mssql.invalid");
+        let (accepted, connected) = tokio::join!(listener.accept(), connect_pinned(&approved));
+        accepted.unwrap();
+        connected.unwrap();
+    }
+
+    /// SEC-15 (K2): the REST client reaches a server through a name that
+    /// resolves nowhere, because the name is pinned to the approved address;
+    /// an unpinned client cannot (the control).
+    #[tokio::test]
+    async fn pinned_http_client_dials_the_approved_address_not_the_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let url = format!("http://pinned-rest.invalid:{}/", addr.port());
+        assert!(
+            reqwest::Client::new().get(&url).send().await.is_err(),
+            "control: the name must not resolve without the pin"
+        );
+        let approved = approved_for(addr, "pinned-rest.invalid");
+        let client =
+            pinned_http_client(&url, "pinned-rest.invalid", addr.port(), &approved).unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        assert!(response.status().is_success());
+    }
+
+    /// SEC-15 (K2): a URL the client would read as another host than the
+    /// one that was checked is refused instead of dialled.
+    #[test]
+    fn pinned_http_client_refuses_a_url_that_names_another_host() {
+        let approved = approved_for(sock_with_port("93.184.216.34", 80), "example.com");
+        for url in [
+            "http://example.com@10.0.0.1/",
+            "http://other.example.org/",
+            "http://example.com:81/",
+            "not a url",
+        ] {
+            assert!(
+                pinned_http_client(url, "example.com", 80, &approved).is_err(),
+                "{url} must be refused"
+            );
+        }
+        assert!(
+            pinned_http_client("http://example.com/path?q=1", "example.com", 80, &approved).is_ok()
+        );
+    }
+
+    fn empty_bucket_listing() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/xml")
+            .set_body_string(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult><Name>bucket</Name><KeyCount>0</KeyCount>\
+                 <IsTruncated>false</IsTruncated></ListBucketResult>",
+            )
+    }
+
+    /// SEC-15 (K2): the S3 client reaches a server through a name that
+    /// resolves nowhere.
+    #[tokio::test]
+    async fn s3_client_dials_the_approved_address_not_the_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(empty_bucket_listing())
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let endpoint = format!("http://pinned-s3.invalid:{}", addr.port());
+        let approved = approved_for(addr, "pinned-s3.invalid");
+        let client = s3_client(
+            &endpoint,
+            "bucket",
+            "pinned-s3.invalid",
+            &approved,
+            "ak",
+            "sk",
+        )
+        .unwrap();
+        tokio::time::timeout(DIAL_TIMEOUT, client.list_with_delimiter(None))
+            .await
+            .expect("the listing must finish inside the dial bound")
+            .expect("the pinned client must reach the stand-in server");
     }
 
     // -- WS3 item 13: probe_mysql/probe_mssql/probe_rest/probe_sheets --
