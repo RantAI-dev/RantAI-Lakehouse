@@ -367,6 +367,26 @@ fn reject_non_patchable_fields(body: &Bytes) -> Result<(), ApiError> {
     })
 }
 
+/// The refusal for a `host` change on a connector that connects using its
+/// `host` column (`SEC-14`, decision D4).
+const HOST_CHANGE_NEEDS_CREDENTIALS: &str = "This connector connects using its host, so changing \
+     the host would send its stored credential to a different server. Nothing was changed. Where \
+     a connector points is changed through PUT /api/connectors/{id}/ingest-spec, together with \
+     its credentials.";
+
+/// `SEC-14` (decision D4): the refusal for `PATCH` changing `host` on a
+/// connector that dials from that column — a row with no adapter (the
+/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from it)
+/// and a `files` row (the S3 probe reads `<endpoint>|<bucket>`). For every
+/// other adapter the column is a label: the dial comes from `dial`, which
+/// has its own guarded route. A `host` equal to the stored one (ignoring
+/// case and padding) changes nothing and is accepted.
+fn host_change_refusal(stored: &ConnectorDialInfo, new_host: &str) -> Option<ApiError> {
+    let dials_from_host = matches!(stored.adapter.as_deref(), None | Some("files"));
+    (dials_from_host && !stored.host.trim().eq_ignore_ascii_case(new_host.trim()))
+        .then(|| ApiError::Conflict(HOST_CHANGE_NEEDS_CREDENTIALS.to_owned()))
+}
+
 /// `PATCH /api/connectors/{id}` — edit a connector's name, direction,
 /// environment, residency and connection-target label. The console's edit
 /// page calls this alongside the ingest-spec, tenant and credential routes,
@@ -376,7 +396,9 @@ fn reject_non_patchable_fields(body: &Bytes) -> Result<(), ApiError> {
 ///
 /// 401 without a principal (see [`create`] on why it is `Option`); 400 per
 /// [`update_input`] / [`reject_non_patchable_fields`]; 404 if `id` is
-/// unknown; 409 if the new name is taken; 503/500 as every other route.
+/// unknown; 409 if the new name is taken, or if `host` changes on a
+/// connector that dials from it ([`host_change_refusal`], `SEC-14`);
+/// 503/500 as every other route.
 pub async fn update(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -398,6 +420,14 @@ pub async fn update(
     .into_iter()
     .filter_map(|(field, changed)| changed.then_some(field))
     .collect();
+    // SEC-14: before anything is written — a connector that dials from
+    // `host` would send its stored credential to the new one.
+    if let Some(new_host) = input.host.as_deref()
+        && let Some(stored) = connectors::get_connector_dial_info(pool(&state)?, &id).await?
+        && let Some(refusal) = host_change_refusal(&stored, new_host)
+    {
+        return Err(refusal.into());
+    }
     let updated = match connectors::update_connector(pool(&state)?, &id, &input).await {
         Ok(updated) => updated,
         Err(lakehouse_store::StoreError::NotFound) => {
@@ -1448,7 +1478,9 @@ fn slot_changes(
 /// # Errors
 ///
 /// 400 for settings sent to a connector that has none to replace, or that
-/// do not parse as its adapter's shape.
+/// do not parse as its adapter's shape; 409 ([`REPOINT_NEEDS_CREDENTIALS`])
+/// for settings that change the connector's target identity when `changes`
+/// does not carry every credential slot they read (`SEC-14`).
 fn candidate_dial_info(
     dial_info: &ConnectorDialInfo,
     changes: &[SlotChange],
@@ -1470,7 +1502,27 @@ fn candidate_dial_info(
                     .to_owned(),
             )
         })?;
-        Dial::parse(adapter, &dial).map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        let parsed = Dial::parse(adapter, &dial)
+            .map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        // SEC-14: settings that move the connector to another target are
+        // tested with the credentials of THIS request only. A slot left out
+        // would be resolved from the stored ref and sent to the new target,
+        // so every slot the new settings read must be in the request.
+        // Refused before the probe, hence before any lookup or connection.
+        if lakehouse_store::ingest_spec::is_repoint(
+            dial_info.adapter.as_deref(),
+            &dial_info.dial,
+            &parsed,
+        ) {
+            let has = |slot: connectors::SecretSlot| changes.iter().any(|c| c.slot == slot);
+            if !slots_cover(
+                credential_slots_read(adapter, &parsed),
+                has(connectors::SecretSlot::Primary),
+                has(connectors::SecretSlot::Secondary),
+            ) {
+                return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()));
+            }
+        }
         candidate.dial = dial;
     }
     Ok(candidate)
@@ -1608,8 +1660,10 @@ async fn publish_credentials<T>(
 /// 400 on a malformed body, no slot at all, or an unusable value; 404 if
 /// `id` is unknown; 422 if the probe dialed and the source rejected the
 /// credential; 409 if a slot's ref changed between this handler's read and
-/// its write; 503 if the credential store is not mounted; 500 as every
-/// other route.
+/// its write, or ([`REPOINT_NEEDS_CREDENTIALS`], `SEC-14`) if `dial` moves
+/// the connector to another target without every credential slot it reads
+/// in the same request; 503 if the credential store is not mounted; 500 as
+/// every other route.
 ///
 /// [`CandidateSecretResolver`]: crate::connector_secret_store::CandidateSecretResolver
 pub async fn set_credential(
@@ -4561,6 +4615,84 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
+    fn rest_dial(base_url: &str, auth: &str) -> serde_json::Value {
+        json!({
+            "baseUrl": base_url,
+            "auth": { "type": auth },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        })
+    }
+
+    /// `SEC-14`: settings that move a two-credential connector to another
+    /// host, sent with only one of its credentials, are refused with the
+    /// fixed 409 before any probe — the stored other slot would otherwise be
+    /// resolved and sent to the new host.
+    #[test]
+    fn candidate_dial_info_refuses_a_re_pointing_dial_without_every_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let moved = rest_dial("https://elsewhere.example.com", "basic");
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        let err = candidate_dial_info(&info, &primary_only, Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        let ApiError::Conflict(message) = err else {
+            panic!("expected 409");
+        };
+        assert_eq!(message, REPOINT_NEEDS_CREDENTIALS);
+
+        let neither = candidate_dial_info(&info, &[], Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        assert!(matches!(neither, ApiError::Conflict(_)));
+
+        let both = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .unwrap();
+        let candidate = candidate_dial_info(&info, &both, Some(moved.clone())).unwrap();
+        assert_eq!(candidate.dial, moved);
+    }
+
+    /// Settings that keep the target (same host, default port written out,
+    /// other pagination) are tested with the stored credentials as before.
+    #[test]
+    fn candidate_dial_info_accepts_settings_that_keep_the_target_with_one_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let mut same = rest_dial("https://API.example.com:443/v2", "basic");
+        same["pagination"] = json!({ "type": "page", "param": "p" });
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        candidate_dial_info(&info, &primary_only, Some(same))
+            .expect("the target is the same, so one slot may change alone");
+    }
+
     #[test]
     fn slots_cover_names_what_each_slot_count_needs() {
         assert!(slots_cover(0, false, false));
@@ -4569,6 +4701,37 @@ mod tests {
         assert!(!slots_cover(2, true, false));
         assert!(!slots_cover(2, false, true));
         assert!(slots_cover(2, true, true));
+    }
+
+    fn host_row(adapter: Option<&str>, host: &str) -> ConnectorDialInfo {
+        let mut info = credential_info(adapter, "env:X", None);
+        info.host = host.to_owned();
+        info
+    }
+
+    /// `SEC-14` (D4): a connector that dials from its `host` column cannot
+    /// have it changed through `PATCH`; one that dials from `dial` can (the
+    /// column is a label), and so can a `PATCH` that repeats the stored
+    /// value.
+    #[test]
+    fn host_change_refusal_covers_the_rows_that_dial_from_host() {
+        let legacy = host_row(None, "lakehouse@db:5432/lakehouse");
+        let files = host_row(Some("files"), "http://rustfs:9000|bucket");
+        let sql = host_row(Some("sql"), "label");
+
+        for stored in [&legacy, &files] {
+            let err = host_change_refusal(stored, "lakehouse@other:5432/lakehouse")
+                .expect("a changed host must be refused");
+            let ApiError::Conflict(message) = err else {
+                panic!("expected 409");
+            };
+            assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
+        }
+        assert!(host_change_refusal(&legacy, " LAKEHOUSE@db:5432/lakehouse ").is_none());
+        assert!(host_change_refusal(&sql, "another label").is_none());
+        for adapter in ["cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
+            assert!(host_change_refusal(&host_row(Some(adapter), "x"), "y").is_none());
+        }
     }
 
     /// Two slots trading kinds end up naming different files, so it is

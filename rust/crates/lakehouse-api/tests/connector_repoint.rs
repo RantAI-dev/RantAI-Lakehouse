@@ -542,6 +542,102 @@ async fn one_credential_slot_of_two_is_refused_and_never_dialled() {
     assert_eq!(dial_of(&fx.app.pool, "conn-sec14-basic").await, before);
 }
 
+// ── PUT .../credential with a dial ───────────────────────────────────────
+
+/// The `dial` override of `PUT .../credential` was the same hole: sending one
+/// slot plus a new `dial` probed the new host with the stored other slot.
+/// Now a `dial` that changes the target needs every slot, otherwise 409
+/// before any probe.
+#[tokio::test]
+async fn a_credential_request_with_a_re_pointing_dial_needs_every_slot() {
+    let fx = fixture(true).await;
+    let listener = Listener::start().await;
+    seed_rest(&fx.app.pool, "conn-sec14-cred", "http://127.0.0.1", true).await;
+    let dial = rest_spec(&format!("http://127.0.0.1:{}", listener.port), "basic")["dial"].clone();
+
+    let (status, body) = send(
+        &fx,
+        "PUT",
+        "/api/connectors/conn-sec14-cred/credential",
+        Some(json!({
+            "primary": { "kind": "access_key", "value": "someone" },
+            "dial": dial,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], REPOINT_REFUSAL);
+    assert_eq!(
+        listener.connections().await,
+        0,
+        "the stored second credential must not be sent to the new host"
+    );
+
+    // Both slots: probed (and refused here, the listener hangs up).
+    let (status, _) = send(
+        &fx,
+        "PUT",
+        "/api/connectors/conn-sec14-cred/credential",
+        Some(json!({
+            "primary": { "kind": "access_key", "value": "someone" },
+            "secondary": { "kind": "password", "value": "a-password" },
+            "dial": dial,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(listener.connections().await >= 1);
+    assert_eq!(stored_files(&fx), 0);
+}
+
+// ── PATCH host ───────────────────────────────────────────────────────────
+
+/// `PATCH` `host` on a connector that dials from that column (one with no
+/// adapter) is refused; the same value is accepted; and for a connector with
+/// an adapter, where the column is a label, it still works.
+#[tokio::test]
+async fn patching_the_host_of_a_connector_that_dials_from_it_is_refused() {
+    let fx = fixture(true).await;
+    let listener = Listener::start().await;
+    seed_legacy(&fx.app.pool, "conn-sec14-legacy").await;
+    seed_sql(&fx.app.pool, "conn-sec14-label", listener.port).await;
+
+    let (status, body) = send(
+        &fx,
+        "PATCH",
+        "/api/connectors/conn-sec14-legacy",
+        Some(json!({ "host": "lakehouse@attacker:5432/lakehouse" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let host: String = sqlx::query_scalar("SELECT host FROM connector WHERE id = $1")
+        .bind("conn-sec14-legacy")
+        .fetch_one(&fx.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(host, "lakehouse@legacy-db:5432/lakehouse");
+
+    // The value it already has changes nothing.
+    let (status, body) = send(
+        &fx,
+        "PATCH",
+        "/api/connectors/conn-sec14-legacy",
+        Some(json!({ "host": "Lakehouse@legacy-db:5432/lakehouse" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A connector with an adapter dials from `dial`: its `host` is a label.
+    let (status, body) = send(
+        &fx,
+        "PATCH",
+        "/api/connectors/conn-sec14-label",
+        Some(json!({ "host": "a new label" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // ── The assistant ────────────────────────────────────────────────────────
 
 /// The assistant's `set_ingest_spec` tool never carries a credential, so a
