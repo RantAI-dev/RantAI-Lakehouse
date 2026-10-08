@@ -143,9 +143,9 @@ Scope outputs and what sets them:
 | `rust` | `rust/**`, `src/lib/dashboard-specs.ts` |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
-| `stack` | `docker-compose.yml`, `ops/**`, `scripts/**`, `.env.example` |
+| `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
 | `docs_only` | true when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
-| `all` | `.github/**`, an unreadable base SHA, or any file the rules above do not classify |
+| `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file the rules above do not classify |
 
 `all` forces every job to run. An unclassified file must set `all`; the
 script fails safe, never open.

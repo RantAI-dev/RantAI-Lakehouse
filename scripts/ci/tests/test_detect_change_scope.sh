@@ -36,7 +36,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   git config user.email "ci-test@example.com"
   git config user.name "CI Test"
 
-  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 scripts .github/workflows
+  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/fixtures scripts .github/workflows
 
   : > docs/test.md
   : > GTM/test.md
@@ -59,6 +59,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > dagster/pipeline.py
   : > docker-compose.yml
   : > ops/g6/test.py
+  : > ops/fixtures/upload_load_failure_reasons.json
   : > scripts/compose.sh
   : > .env.example
   : > .github/workflows/ci.yml
@@ -144,9 +145,16 @@ assert_case "src/components/button.tsx is frontend-only" "false" "true" "false" 
 assert_case "public/robots.txt is frontend-only" "false" "true" "false" "false" "false" "false" "public/robots.txt"
 assert_case "package.json is frontend-only" "false" "true" "false" "false" "false" "false" "package.json"
 assert_case "bun.lock is frontend-only" "false" "true" "false" "false" "false" "false" "bun.lock"
+assert_case "bunfig.toml is frontend-only" "false" "true" "false" "false" "false" "false" "bunfig.toml"
+assert_case "tsconfig.json is frontend-only" "false" "true" "false" "false" "false" "false" "tsconfig.json"
+assert_case "next.config.ts is frontend-only" "false" "true" "false" "false" "false" "false" "next.config.ts"
+assert_case "eslint.config.mjs is frontend-only" "false" "true" "false" "false" "false" "false" "eslint.config.mjs"
+assert_case "postcss.config.mjs is frontend-only" "false" "true" "false" "false" "false" "false" "postcss.config.mjs"
+assert_case "components.json is frontend-only" "false" "true" "false" "false" "false" "false" "components.json"
+assert_case "Dockerfile.frontend is frontend-only" "false" "true" "false" "false" "false" "false" "Dockerfile.frontend"
 
-# Dashboard specs special case: sets both rust and frontend
-assert_case "src/lib/dashboard-specs.ts sets rust and frontend" "true" "true" "false" "false" "false" "false" "src/lib/dashboard-specs.ts"
+# Cross-boundary: dashboard-specs.ts sets rust AND frontend
+assert_case "dashboard-specs.ts sets rust and frontend" "true" "true" "false" "false" "false" "false" "src/lib/dashboard-specs.ts"
 
 # Rust tests
 assert_case "rust/crates/lib.rs is rust-only" "true" "false" "false" "false" "false" "false" "rust/crates/lib.rs"
@@ -159,6 +167,9 @@ assert_case "docker-compose.yml is stack-only" "false" "false" "false" "true" "f
 assert_case "ops/g6/test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g6/test.py"
 assert_case "scripts/compose.sh is stack-only" "false" "false" "false" "true" "false" "false" "scripts/compose.sh"
 assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" "false" ".env.example"
+
+# Cross-cutting fixture tests
+assert_case "ops/fixtures forces all" "true" "true" "true" "true" "false" "true" "ops/fixtures/upload_load_failure_reasons.json"
 
 # Workflow tests
 assert_case ".github/workflows/ci.yml forces all" "true" "true" "true" "true" "false" "true" ".github/workflows/ci.yml"
@@ -188,7 +199,7 @@ assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false"
   fi
 )
 
-# Unreadable base SHA test
+# Unreadable base commit test
 (
   output="$REPO_DIR/github_output_badbase"
   : > "$output"
@@ -209,4 +220,3 @@ echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
-exit 0

@@ -111,6 +111,14 @@ while IFS= read -r file; do
     classified=true
   fi
 
+  # Test fixtures: ops/fixtures/** is read across scopes by Rust tests (lakehouse-api
+  # upload_parse.rs, routes/uploads.rs, tests/upload_routes.rs), frontend test
+  # (src/lib/uploads.test.ts) and Dagster test (test_file_ingest.py). Must force all=true.
+  if [[ "$file" == ops/fixtures/* ]]; then
+    all=true
+    classified=true
+  fi
+
   # Stack: docker-compose.yml, ops/**, scripts/**, .env.example
   if [[ "$file" == "docker-compose.yml" ]] || [[ "$file" == ops/* ]] || \
      [[ "$file" == scripts/* ]] || [[ "$file" == ".env.example" ]]; then
@@ -140,7 +148,7 @@ if [ "$all" = true ]; then
   docs_only=false
 fi
 
-echo "Change scope outputs:"
+echo "Scope detection result:"
 echo "  rust=$rust"
 echo "  frontend=$frontend"
 echo "  dagster=$dagster"

@@ -29,9 +29,9 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 | `rust` | `rust/**`, `src/lib/dashboard-specs.ts` |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
-| `stack` | `docker-compose.yml`, `ops/**`, `scripts/**`, `.env.example` |
+| `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
-| `all` | `.github/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
+| `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
 
 On a `push` to `main`, all jobs run unconditionally.
 
