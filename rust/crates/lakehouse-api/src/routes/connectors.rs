@@ -1338,6 +1338,29 @@ struct SlotChange {
     old_ref: Option<String>,
 }
 
+/// The refusal for a change of where a connector points that does not
+/// carry the connector's credentials (`SEC-14`, decisions D2 and D3). One
+/// fixed text for every route that can re-point, so the console and the
+/// assistant show the same thing; it names no host, address or credential.
+const REPOINT_NEEDS_CREDENTIALS: &str = "This change points the connector at a different server, \
+     so every credential it signs in with must be sent again in the same request. Nothing was \
+     saved and no connection was made.";
+
+/// How many credential slots (0, 1 or 2) a connector of `adapter` with this
+/// `dial` reads: the length of its `secret_field_names` entry, which is what
+/// the ingest job resolves. `Kafka` without authentication reads none.
+fn credential_slots_read(adapter: &str, dial: &Dial) -> usize {
+    lakehouse_store::ingest_spec::secret_field_names(adapter, dial.secret_map_auth_type())
+        .map_or(0, <[&str]>::len)
+}
+
+/// Whether the credentials a request carries cover every slot a connector
+/// reads (`required` from [`credential_slots_read`]): the primary for one or
+/// two slots, the secondary for two.
+fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
+    (required == 0 || primary) && (required < 2 || secondary)
+}
+
 /// Whether a connector can have a second credential: an S3-shaped `files`
 /// connector (access key + secret key) or a `rest` one (basic auth's
 /// username + password, an `OAuth2` client id + secret). Every other adapter
@@ -1480,6 +1503,46 @@ async fn replace_credentials(
     id: &str,
     changes: &[SlotChange],
 ) -> Result<(), ApiError> {
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    publish_credentials(state, id, changes, async {
+        if swaps.is_empty() {
+            return Ok(());
+        }
+        connectors::swap_secret_refs(pool(state)?, id, &swaps)
+            .await
+            .map_err(|err| swap_error(id, err))
+    })
+    .await
+}
+
+/// The part of [`replace_credentials`] every credential change shares
+/// (`SEC-14` extracts it so the ingest-spec re-point reuses it): write the
+/// new values aside, put them in place keeping the files they replace, then
+/// run `write` — the database write that makes the change real. If `write`
+/// fails the files go back exactly as they were; if it succeeds the backups
+/// are dropped and any managed file a slot no longer names is removed.
+///
+/// `write` is awaited only after the values are in place and while the
+/// store's change lock is held, so it must not itself take that lock.
+///
+/// # Errors
+///
+/// A store failure (400/503) staging or publishing the values, or whatever
+/// `write` returns; in every case nothing changed.
+async fn publish_credentials<T>(
+    state: &AppState,
+    id: &str,
+    changes: &[SlotChange],
+    write: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
     let store = &state.connector_secret_store;
     let _serialized = store.lock().await;
     let staged = store
@@ -1495,29 +1558,13 @@ async fn replace_credentials(
         .publish()
         .await
         .map_err(|err| secret_store_error(&err))?;
-    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
-        .iter()
-        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
-        .map(|c| connectors::SecretRefSwap {
-            slot: c.slot,
-            expected_old: c.old_ref.as_deref(),
-            new_ref: &c.new_ref,
-        })
-        .collect();
-    let swapped = if swaps.is_empty() {
-        Ok(())
-    } else {
-        match pool(state) {
-            Ok(pool) => connectors::swap_secret_refs(pool, id, &swaps)
-                .await
-                .map_err(|err| swap_error(id, err)),
-            Err(err) => Err(err),
+    let written = match write.await {
+        Ok(written) => written,
+        Err(err) => {
+            published.rollback().await;
+            return Err(err);
         }
     };
-    if let Err(err) = swapped {
-        published.rollback().await;
-        return Err(err);
-    }
     published.commit().await;
     // A slot whose kind changed no longer names its old managed file —
     // unless that file is now the OTHER slot's (the two swapped kinds).
@@ -1529,7 +1576,7 @@ async fn replace_credentials(
             remove_managed_credentials(state, id, Some(old_ref), None).await;
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// `PUT /api/connectors/{id}/credential` — the user supplies credential
@@ -2597,6 +2644,22 @@ pub struct IngestSpecBody {
     source_objects: serde_json::Value,
     #[serde(default)]
     schedule_cron: Option<String>,
+    /// The connector's credentials, sent again when this save changes where
+    /// it points (`SEC-14`). Absent for any other save.
+    #[serde(default)]
+    credential: Option<IngestCredentialBody>,
+}
+
+/// `credential` on the `PUT /api/connectors/{id}/ingest-spec` body: the
+/// same slots as `PUT .../credential` (without a `dial`, which is the spec
+/// itself). Write-only values, never echoed back.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngestCredentialBody {
+    #[serde(default)]
+    primary: Option<CredentialSlotBody>,
+    #[serde(default)]
+    secondary: Option<CredentialSlotBody>,
 }
 
 /// A second, non-authoritative SSRF check on `dial`'s host, run at
@@ -2733,16 +2796,42 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// would let a scheduled connector replace or append to what a person
 /// uploaded.
 ///
+/// # Changing where the connector points needs its credentials (`SEC-14`)
+///
+/// The connector keeps its stored credential, and every later test,
+/// discovery, delete or scheduled ingest resolves it and sends it to
+/// whatever `dial` names. So a save that changes the connector's target
+/// identity ([`lakehouse_store::ingest_spec::is_repoint`]: adapter, host,
+/// port, database, endpoint, bucket, base URL, brokers…) must carry every
+/// credential slot the new `dial` reads, in `credential`. Without them it
+/// is refused with a fixed 409 ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
+/// save-time address check and before any connection: nothing is resolved,
+/// dialled or written. With them the new settings are probed with those
+/// credentials alone (a [`crate::connector_secret_store::CandidateSecretResolver`],
+/// as `PUT .../credential` does), a failed probe is a 422, and otherwise the
+/// credential files and the spec are written together
+/// ([`publish_credentials`] around
+/// [`lakehouse_store::connectors::repoint_ingest_spec`]): both or neither.
+/// The first dial of a connector that has none yet is not a re-point.
+///
+/// The assistant's `set_ingest_spec` tool calls this handler with no
+/// principal and never forwards a `credential`, so it reaches the 409 for a
+/// re-point and cannot carry a secret.
+///
 /// # Errors
 ///
 /// 404 if `id` is unknown; 400 if `dial` fails
 /// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
 /// refuses `dial`'s host (`StoreError::Validation` maps to
 /// `ApiError::BadRequest`, never `Internal` — both messages are safe to
-/// surface); 409 if a target is a table name uploads have reserved; 503/500 as
-/// above.
+/// surface), or a credential value is unusable; 409 if a target is a table
+/// name uploads have reserved, or the save re-points the connector without
+/// every credential slot ([`REPOINT_NEEDS_CREDENTIALS`]); 401 if
+/// credentials arrive without a principal; 422 if the probe dialled and the
+/// source rejected the credentials; 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
@@ -2767,7 +2856,29 @@ pub async fn ingest_spec_put(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+
+    // SEC-14: decide whether this save re-points the connector BEFORE the
+    // address check below, which resolves the new host. A re-point without
+    // the credentials is refused here, so nothing is looked up or dialled.
+    let stored = connectors::get_connector_dial_info(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, &dial);
+    let required = credential_slots_read(&body.adapter, &dial);
+    if repoint
+        && !body.credential.as_ref().is_some_and(|credential| {
+            slots_cover(
+                required,
+                credential.primary.is_some(),
+                credential.secondary.is_some(),
+            )
+        })
+    {
+        return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into());
+    }
+
+    let credential = body.credential;
     let input = connectors::IngestSpecInput {
         adapter: body.adapter,
         ingest_mode: body.ingest_mode,
@@ -2775,16 +2886,146 @@ pub async fn ingest_spec_put(
         source_objects: body.source_objects,
         schedule_cron: body.schedule_cron,
     };
-    match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
-        Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
-            spec,
-            time::OffsetDateTime::now_utc(),
-        ))),
-        Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
-        }
-        Err(err) => Err(ApiError::from(err).into()),
+    let Some(credential) = credential else {
+        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+            Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
+                spec,
+                time::OffsetDateTime::now_utc(),
+            ))),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+            }
+            // The stored target changed between the read above and the
+            // store's own locked comparison: this save is now a re-point
+            // without credentials.
+            Err(lakehouse_store::StoreError::Conflict) => {
+                Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into())
+            }
+            Err(err) => Err(ApiError::from(err).into()),
+        };
+    };
+    save_with_credentials(&state, principal, &id, stored, &dial, input, credential).await
+}
+
+/// The credential-carrying half of [`ingest_spec_put`]: probe the new
+/// settings with the request's credentials alone, then write the credential
+/// files and the spec together.
+///
+/// # Errors
+///
+/// 401 without a principal (the audit event needs one); 400 for an unusable
+/// credential value, a slot the connector does not read, or a refused
+/// address; 422 when the probe dialled and the source rejected the
+/// credentials; 409/404/503/500 from the write.
+async fn save_with_credentials(
+    state: &AppState,
+    principal: Option<Extension<Principal>>,
+    id: &str,
+    stored: ConnectorDialInfo,
+    dial: &Dial,
+    input: connectors::IngestSpecInput,
+    credential: IngestCredentialBody,
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    if credential_slots_read(&input.adapter, dial) == 0 {
+        return Err(ApiError::BadRequest(
+            "this connection signs in with no credential, so there is none to send".to_owned(),
+        )
+        .into());
     }
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, dial);
+
+    // The connector as it will be once saved, so the slot rules (which
+    // adapters have a second credential) are those of the NEW adapter.
+    let mut after = stored;
+    after.adapter = Some(input.adapter.clone());
+    after.dial = input.dial.clone();
+    let changes = slot_changes(
+        id,
+        &after,
+        SetCredentialBody {
+            primary: credential.primary,
+            secondary: credential.secondary,
+            dial: None,
+        },
+    )?;
+    let candidate = candidate_dial_info(&after, &changes, None)?;
+
+    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .map(|c| (c.new_ref.clone(), c.value.clone()))
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    );
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        &resolver,
+        &state.config.connector_internal_hosts(),
+    )
+    .await;
+    if outcome.supported && !outcome.ok {
+        return Err(ApiError::Unprocessable(format!(
+            "the change was NOT saved: {}",
+            outcome.message
+        ))
+        .into());
+    }
+
+    // Every slot sent is a swap, including one whose ref name stays the same
+    // (its file is replaced): the store counts the slots to know the
+    // credentials were supplied, and the swap still checks nobody changed
+    // the ref since it was read.
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    let spec = publish_credentials(state, id, &changes, async {
+        match connectors::repoint_ingest_spec(pool(state)?, id, &input, &swaps).await {
+            Ok(spec) => Ok(spec),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")))
+            }
+            Err(lakehouse_store::StoreError::Conflict) => Err(ApiError::Conflict(
+                "the connector changed since it was read; reload and retry".to_owned(),
+            )),
+            Err(err) => Err(ApiError::from(err)),
+        }
+    })
+    .await?;
+
+    // The slots and whether the probe really dialled — never a ref name,
+    // never a value (same convention as `connector.credential_set`).
+    let event = connector_audit_event(
+        &principal,
+        if repoint {
+            "connector.repoint"
+        } else {
+            "connector.credential_set"
+        },
+        id,
+        json!({
+            "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
+            "verified": outcome.supported,
+        }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record the connector credential audit event");
+    }
+    Ok(ApiJson(IngestSpecResponse::new(
+        spec,
+        time::OffsetDateTime::now_utc(),
+    )))
 }
 
 /// `POST /api/connectors/{id}/ingest/run`'s response for a `cdc`-adapter
@@ -4318,6 +4559,16 @@ mod tests {
             .err()
             .expect("must be refused");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn slots_cover_names_what_each_slot_count_needs() {
+        assert!(slots_cover(0, false, false));
+        assert!(!slots_cover(1, false, false));
+        assert!(slots_cover(1, true, false));
+        assert!(!slots_cover(2, true, false));
+        assert!(!slots_cover(2, false, true));
+        assert!(slots_cover(2, true, true));
     }
 
     /// Two slots trading kinds end up naming different files, so it is
