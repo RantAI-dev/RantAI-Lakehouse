@@ -32,6 +32,15 @@ choices below are the planner's, where the spec leaves room.
   allow-list (or the allow-all switch) before any connection test works.
   The seeded demo connectors point at services inside the compose network,
   so on a fresh install their tests are refused until the operator opts in.
+- With an address allowed, "connection refused" and "timed out" still differ
+  in a test result, so a person who may test connectors can tell an open
+  port from a closed one on that network. The spec's Target table does not
+  cover it.
+- A name that resolves to several addresses is refused if any is blocked;
+  otherwise the first address the system ranks first is dialled and the
+  others are not tried.
+- The REST and S3 tests do not use a system proxy: a proxy would resolve the
+  name itself and defeat the pin.
 - The orchestrator's own dials are a separate guard with its own settings
   and are not changed here.
 - TLS and what a server is sent are `SEC-14`.
