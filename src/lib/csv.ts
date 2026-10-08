@@ -7,12 +7,43 @@
  */
 
 /**
+ * SEC-17: a cell whose first character is one of these is a formula to a
+ * spreadsheet (a tab or a carriage return because some programs skip them
+ * before looking), so data one person loaded would run on the machine of the
+ * person who opens the export.
+ */
+const FORMULA_START = /^[=+\-@\t\r]/
+
+/**
+ * SEC-17: a plain number is never a formula, so `-5` and `+3.2e4` stay
+ * numbers. Decided on the cell's text alone: `-1+1` is not a number.
+ * `$` without the `m` flag matches only at the very end, so a number with a
+ * line break after it is not plain, as in the Rust twin of this rule
+ * (`needs_apostrophe` in `rust/crates/lakehouse-api/src/csv_safe.rs`).
+ */
+const PLAIN_NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/
+
+/**
+ * SEC-17: puts `'` in front of a cell that would start a formula. It goes on
+ * before the quoting, so it ends up inside the quotes. The price is that a
+ * program reading the export back gets `'=A1`, not `=A1`.
+ */
+function neutralizeFormula(value: string): string {
+  return FORMULA_START.test(value) && !PLAIN_NUMBER.test(value)
+    ? `'${value}`
+    : value
+}
+
+/**
  * Membungkus satu sel bila mengandung karakter yang bisa merusak struktur.
  *
  * Aturan RFC 4180: sel yang memuat koma, tanda kutip ganda, CR, atau LF harus
  * dibungkus tanda kutip ganda, dan setiap tanda kutip di dalamnya digandakan.
+ * Sebelum itu, sel yang diawali karakter rumus diberi apostrof di depan
+ * (SEC-17), untuk header dan isi sama.
  */
-function escapeCell(value: string): string {
+function escapeCell(raw: string): string {
+  const value = neutralizeFormula(raw)
   if (!/[",\r\n]/.test(value)) return value
   return `"${value.replace(/"/g, '""')}"`
 }
