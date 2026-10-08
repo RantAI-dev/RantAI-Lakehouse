@@ -944,10 +944,13 @@ async fn remove_managed_credentials(
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
 ///
 /// Opens a REAL, bounded (5s, no retries) connectivity probe for
-/// `PostgreSQL` and S3-compatible object-storage connectors — see
-/// `crate::connector_probe`'s module doc comment for exactly what that
-/// does and does not cover. Every other connector `type` gets an honest
-/// `supported: false` result, never a fabricated latency or success.
+/// `PostgreSQL`, `MySQL`/`MariaDB`, SQL Server, REST and S3-compatible
+/// object-storage connectors (an object-storage connector is tested at the
+/// endpoint in its `dial`, `SRC-6`) — see `crate::connector_probe`'s module
+/// doc comment for exactly what that does and does not cover. Every other
+/// connector gets an honest `supported: false` result, never a fabricated
+/// latency or success: Oracle, `MongoDB`, Kafka and SFTP connect only from
+/// the orchestrator (`SRC-6` F3, F4), and a stored `health` is left alone.
 ///
 /// # Errors
 ///
@@ -1653,7 +1656,9 @@ async fn publish_credentials<T>(
 /// refusing an unprobeable type (Kafka, SFTP, `MongoDB`, Oracle, …) would
 /// make its credential impossible to set at all. So an unsupported probe
 /// saves the value with `verified: false` and says so — never a fabricated
-/// success.
+/// success. Oracle used to answer "supported, misconfigured" and so was
+/// refused here; it now answers `supported: false` like the others
+/// (`SRC-6` F3).
 ///
 /// # Errors
 ///

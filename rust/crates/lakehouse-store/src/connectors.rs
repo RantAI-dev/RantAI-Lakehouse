@@ -804,9 +804,9 @@ pub struct ConnectorTestResult {
     /// success.
     pub ok: bool,
     /// Whether this build knows how to dial this connector's type at all.
-    /// `false` for every type besides `PostgreSQL` and S3-compatible object
-    /// storage today — see `connector_probe`'s module doc comment for the
-    /// full list and why.
+    /// `false` for a type this build has no client for (Oracle, `MongoDB`,
+    /// Kafka, SFTP, Google Sheets, ...) — see `connector_probe`'s module doc
+    /// comment for the types it does dial and why.
     pub supported: bool,
     /// Real measured latency in milliseconds, or `None` when `supported`
     /// is `false` (no attempt was made, so no latency exists to report).
