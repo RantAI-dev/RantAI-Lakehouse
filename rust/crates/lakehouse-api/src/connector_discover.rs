@@ -17,17 +17,18 @@
 //! interpolation site at all — `discover_sql_queries_bind_the_schema_never_interpolate_it`
 //! (below) asserts this on the query TEXT itself, for all three drivers.
 //!
-//! # How MySQL/SQL Server discovery is actually exercised (Z14)
+//! # How MySQL/SQL Server discovery is tested today: it is not (Z14, `SRC-6` F9)
 //!
-//! This workspace's `#[sqlx::test]` macro stands up only a scratch
-//! Postgres database (`grep -rn testcontainers rust/Cargo.toml` finds
-//! nothing) — there is no `MySQL` or SQL Server live-database fixture
-//! inside `cargo test`. [`discover_sql_postgres`] therefore has a real, live
-//! `#[sqlx::test]` proof in this task; [`discover_sql_mysql`] and
-//! [`discover_sql_mssql`] do not, and are instead exercised by the
-//! `ops/g6` gate against real `mysql`/`mssql` compose services, calling
-//! this route over real HTTP against them. This is deliberate
-//! coverage placement (stated in the plan), not a gap left unmentioned.
+//! This workspace's `#[sqlx::test]` macro and its `testcontainers` fixture
+//! (`lakehouse-test-support`, `postgres` module only) stand up a scratch
+//! Postgres database; there is no `MySQL` or SQL Server live-database
+//! fixture inside `cargo test`. [`discover_sql_postgres`] therefore has a
+//! real, live `#[sqlx::test]` proof; [`discover_sql_mysql`] and
+//! [`discover_sql_mssql`] have no live test at all. An earlier version of
+//! this comment said the `ops/g6` gate exercised them against its
+//! `mysql`/`mssql` compose services; it does not (`grep -i discover ops/g6/`
+//! finds only an unrelated comment in the compose override). `SRC-9` owns
+//! adding that test.
 //!
 //! # Scope: `sql`/`cdc` only in this task
 //!
