@@ -59,8 +59,8 @@ times, while the full test suite runs under `stable`.
 
 `rust-toolchain.toml` pins `1.96.1` — intentionally newer than the MSRV. That
 file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
-with; the MSRV check job exists specifically to catch MSRV
-regressions that the day-to-day toolchain wouldn't.
+with; the MSRV check job exists specifically to catch MSRV regressions that the
+day-to-day toolchain wouldn't.
 
 ## `history-scan`: currently RED, and correctly so
 
@@ -78,76 +78,85 @@ than no scan at all: it tells a reviewer history is clean when it is not.
 them, the scan reports the truth:
 
 ```
-Finding:     https://...:8443
-RuleID:      rantai-internal-lan-host
-Commit:      8cdd285 (chore: save local dev progress)
-
-Finding:     <prefix>-<32-hex>
-RuleID:      rantai-llm-node-api-key
-Commit:      8cdd285 (chore: save local dev progress)
-Commit:      b067f96 (chore: update config)
+$ gitleaks detect --config .gitleaks.toml
+leaks found: 6
+  rantai-llm-node-api-key: 1
+  rantai-internal-lan-host: 5
 ```
 
-The key has been revoked upstream, so the exposure is dormant, but the
-secret remains in the reachable DAG until an explicit rewrite (`git filter-repo`
-or `bfg`) is performed. That rewrite would rewrite every commit SHA in the
-repo and force every collaborator to re-clone or rebase; the team chose to
-defer the rewrite until the next scheduled maintenance window.
+**This job is expected to fail until the history is rewritten.** Clearing it
+requires `git filter-repo` (or equivalent) plus a force-push, which rewrites
+published history — a human decision that has deliberately not been taken.
+The leaked key should also be rotated at its source, independently of any
+rewrite; removing it from git does not un-leak it.
 
-Until then, `history-scan` **must stay red** to tell the truth.
-`security.yml` marks it non-blocking by **not** including it in `main`'s
-required status checks. A future contributor who fixes the repo history
-will see this job turn green on its own, without having to touch CI config.
+The working-tree `gitleaks` job uses the same config and **is** green, because
+the key is no longer present in any tracked file (the file that held it was
+deleted during the Rust port). `.env.local` does contain live values and is
+flagged on a local scan, but it is gitignored and never checked out in CI.
 
-Do not remove the custom rules to make the job green. Do not add `|| true`
-to the gitleaks invocation. Do not delete the job. The red check is a
-reminder of pending technical debt, not a CI bug.
+`history-scan` stays a **separate job**, not folded into the working-tree
+`gitleaks` job and not wrapped in `continue-on-error`, precisely so that
+whichever way it goes (red or green) is independently visible in the
+Actions UI on every run, rather than being averaged into another job's
+status. It is **excluded from required status checks** (see below) so that
+if a future run does turn red — a real regression, a rule update, or new
+evidence — that alone cannot silently block a merge; a human needs to look
+at it.
+
+If the Phase 1 leak is confirmed for real (e.g. by locating the exact commit
+by other means), resolving it requires:
+
+1. Rotating the exposed key at the provider.
+2. Rewriting history (`git filter-repo` or BFG) to purge the blob from every
+   affected commit.
+3. Force-pushing every affected ref, which invalidates every existing clone
+   and any open PR based on the old history.
+
+That is a destructive, cross-cutting, and irreversible-for-clones operation,
+deliberately not undertaken as a side effect of a CI-hardening pass — it
+needs a human to explicitly decide to take it on and coordinate with anyone
+holding a local clone.
+
+## Docker
+
+`docker.yml` builds the image and runs it standalone (no Postgres/ClickHouse
+containers), because `lakehouse-api` is designed to boot and serve its
+DB-independent routes — including `/health` — without either dependency
+(`entrypoint.api.sh` skips migrations when `DATABASE_URL` is unset; see
+`lakehouse_store::connect_lazy`'s doc comment). That's a real smoke test of
+the container's own boot path, not a substitute for `docker compose up`
+against the full stack.
+
+The `push-ghcr` job is gated on `startsWith(github.ref, 'refs/tags/')` and,
+even when that condition is met, does not actually push anywhere — there is
+no `docker/login-action` step and no registry credential configured. Wiring
+up real publishing is an explicit, separate decision for a later phase.
 
 ## Dependency review: now works, verified on a real PR
 
-`dependency-review-action` previously failed with:
+This job previously failed unconditionally: `dependency-review-action`
+requires GitHub Advanced Security for *private* repositories, and this org
+was on GitHub's free plan. Now that the repository is public, **GHAS
+dependency review is free for public repositories**, so the job was
+expected to start passing. This was verified directly, not assumed: a
+throwaway PR (#23, "dependency-review probe", closed without merging, branch
+deleted) was opened against `main` with a trivial docs-only change, and its
+`Dependency review (PR only)` job (`security.yml`) completed with
+`conclusion: success` (checked via
+`gh api repos/RantAI-dev/RantAI-Lakehouse/actions/jobs/<id>`, all steps
+`success`, including the `Dependency review` step itself).
 
-```
-Error: Dependency Review is not supported on this repository.
-Please ensure that the repository is public or has GitHub Advanced
-Security enabled.
-```
+It is still left out of required status checks for now — not because it's
+expected to fail, but so it can prove itself stable across a few more real
+PRs (e.g. one that actually touches a manifest with a diff for it to
+evaluate) before being promoted to required in the branch-protection command
+below.
 
-The repo is public, so GitHub Advanced Security features (including
-Dependency Review) are free and available without a paid license, but the
-feature was not enabled in repository settings.
+## Recommended branch protection (attempted, blocked — apply manually)
 
-It has since been enabled: `dependency-review-action` runs on every pull
-request targeting `main`, parsing package manifest changes (`bun.lock`,
-`Cargo.lock`) and failing the PR if a newly introduced dependency has a
-known advisory with severity above the configured threshold.
-
-Because the action requires a PR event payload (`github.event.pull_request`),
-it is skipped on `push: branches: [main]` runs. That is normal and expected.
-
-## Docker smoke test: `/health` contract
-
-`docker.yml` builds `rust/Dockerfile` via `docker buildx`, starts the
-container with minimal required environment variables (`POSTGRES_URL`,
-`CLICKHOUSE_URL`, `LAKEKEEPER_BASE_URI`, `JWT_SECRET`), waits up to 60 seconds
-for the container to become healthy, and executes:
-
-```sh
-curl -fsS http://localhost:8080/health
-```
-
-The `/health` endpoint is unauthenticated and returns `{"status":"ok"}`
-when the axum server is ready to accept traffic. It does not probe database
-connectivity (those checks belong to the readiness probe, not the liveness
-smoke test).
-
-If the container crashes on boot (e.g. missing environment variable, dynamic
-linker failure, panic during router initialization), `docker inspect` dumps
-the container logs to the CI transcript before the job exits with failure.
-
-## Recommended branch protection
-
-Branch protection cannot be fully managed by contributors unless the
+An attempt was made to set this via `gh api` during the public-release
+hardening pass; it was blocked by a permission classifier even though the
 acting account has org-admin rights. Rather than fight that, here is the
 exact command an owner can run themselves, and the reasoning behind each
 choice, so it can be applied (or adjusted) in one step instead of clicking
@@ -172,7 +181,11 @@ gh api \
   -F 'allow_deletions=false'
 ```
 
-The check names above reflect `ci-required` (which consolidates and validates all scope-dependent tests in `ci.yml`), `Repo lints`, security scans, and the Docker smoke test.
+The check names above reflect the real `name:` values from
+`.github/workflows/{ci,security,docker}.yml` as of this writing — not
+guessed. `ci-required` consolidates and enforces all scope-dependent tests
+in `ci.yml`. If a workflow's job names change, this list needs to be updated to
+match, or `strict` mode will block merges on a check that no longer reports.
 
 Why each choice:
 
@@ -214,3 +227,9 @@ Why each choice:
   they're also expressed as a GitHub secret-scanning custom pattern) will
   be blocked at push time, before it ever reaches `main`. This is a
   second, earlier line of defense, not a replacement for branch protection.
+- Consider **requiring signed commits** and **linear history** once the
+  team's workflow is settled; neither is load-bearing for this phase.
+
+This has to be applied by someone with admin rights on the repo — it is not
+something a workflow file can configure for itself, and (as noted above) it
+could not be applied programmatically during this pass either.
