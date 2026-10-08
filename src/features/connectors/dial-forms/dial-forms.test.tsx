@@ -41,6 +41,10 @@ describe("dial forms", () => {
     fireEvent.change(screen.getByLabelText("Bucket / root"), { target: { value: "b" } })
     expect(onChange.mock.calls[0][0]).toMatchObject({ protocol: "s3", bucket: "b" })
   })
+  it("FilesDialForm names the protocol text by its Protocol label (SRC-6 slice A review, SHOULD-FIX 1)", () => {
+    render(<FilesDialForm value={null} onChange={mock()} />)
+    expect(screen.getByLabelText("Protocol").textContent).toBe("S3-compatible")
+  })
   it("FilesDialForm labels the endpoint and says why it is needed (SRC-6 D3)", () => {
     render(<FilesDialForm value={null} onChange={mock()} />)
     expect(screen.getByLabelText("Endpoint")).toBeDefined()

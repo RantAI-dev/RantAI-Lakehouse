@@ -30,8 +30,16 @@ export function FilesDialForm({
         {/* SRC-6 F8: this adapter reads S3 only (adapters/files.py); SFTP is its
             own connector type. A stored dial that still says "sftp" is shown
             as it is, never rewritten, so the connector opens. */}
-        <Label>Protocol</Label>
-        <p id="files-dial-protocol" className="flex h-8 items-center text-sm">
+        {/* SRC-6 slice A review, SHOULD-FIX 1: the value is plain text, so the
+            label names it through aria-labelledby on a group role (a bare
+            <p> does not expose a name). */}
+        <Label id="files-dial-protocol-label">Protocol</Label>
+        <p
+          id="files-dial-protocol"
+          role="group"
+          aria-labelledby="files-dial-protocol-label"
+          className="flex h-8 items-center text-sm"
+        >
           {dial.protocol === "s3" ? "S3-compatible" : dial.protocol}
         </p>
       </div>
