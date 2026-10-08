@@ -109,3 +109,35 @@ describe("SelectedTypeSummary marks", () => {
     expect(document.querySelector("svg.lucide-database")).not.toBeNull()
   })
 })
+
+describe("unavailable tiles (SRC-6 F5)", () => {
+  const SHEETS: ConnectorType = {
+    name: "Google Sheets",
+    adapter: "sheets",
+    supported: false,
+    docsUrl: null,
+    unsupportedReason: "No verified Google sign-in exists in this build, so a Google Sheets connector cannot be tested or loaded.",
+  }
+
+  it("disables the Google Sheets tile and shows its reason as text and title", () => {
+    render(<ConnectorTypePicker types={[SHEETS]} value={null} onChange={() => {}} />)
+    const el = tile("Google Sheets") as HTMLButtonElement
+    expect(el.disabled).toBe(true)
+    expect(el.textContent).toContain(SHEETS.unsupportedReason!)
+    expect(el.getAttribute("title")).toBe(SHEETS.unsupportedReason!)
+  })
+
+  it("shows Not available yet on an unavailable type that has no reason", () => {
+    render(<ConnectorTypePicker types={TYPES} value={null} onChange={() => {}} />)
+    const el = tile("SAP / ERP") as HTMLButtonElement
+    expect(el.disabled).toBe(true)
+    expect(el.textContent).toContain("Not available yet")
+    expect(el.getAttribute("title")).toBe("Not available yet")
+  })
+
+  it("no longer tells the user that Google Sheets can be configured and tested", () => {
+    render(<ConnectorTypePicker types={[SHEETS]} value="Google Sheets" onChange={() => {}} />)
+    expect(screen.queryByText(/can be configured and tested/)).toBeNull()
+    expect(screen.queryByText("Test only")).toBeNull()
+  })
+})
