@@ -153,6 +153,101 @@ expect 1 "Failing acceptance blocks stack PR" "${base_stack_green[@]}" G4_CDC_RE
 expect 1 "Cancelled job blocks gate" "${base_rust_green[@]}" RUST_TEST_RESULT=cancelled
 expect 1 "Skipped job on push blocks gate" "${base_push_green[@]}" RUST_TEST_RESULT=skipped
 
+# 3. Workflow & Gate structure consistency checks (SHOULD-FIX 6)
+CI_YML="${SCRIPT_DIR}/../../../.github/workflows/ci.yml"
+
+test_consistency() {
+  local ci_file="$1"
+  local gate_file="$2"
+  python3 - "$ci_file" "$gate_file" <<'EOF'
+import sys, re, yaml
+
+ci_file = sys.argv[1]
+gate_file = sys.argv[2]
+
+with open(ci_file) as f:
+    ci = yaml.safe_load(f)
+
+jobs = list(ci.get("jobs", {}).keys())
+other_jobs = [j for j in jobs if j != "ci-required"]
+needs = ci.get("jobs", {}).get("ci-required", {}).get("needs", [])
+
+missing_needs = [j for j in other_jobs if j not in needs]
+if missing_needs:
+    sys.stderr.write(f"Missing from ci-required needs: {missing_needs}\n")
+    sys.exit(1)
+
+steps = ci.get("jobs", {}).get("ci-required", {}).get("steps", [])
+env_map = {}
+for s in steps:
+    if "env" in s:
+        for k, v in s["env"].items():
+            m = re.search(r"needs\.([a-zA-Z0-9_-]+)\.result", str(v))
+            if m:
+                env_map[m.group(1)] = k
+
+with open(gate_file) as f:
+    gate_sh = f.read()
+
+missing_vars = []
+for j in other_jobs:
+    var = env_map.get(j)
+    if not var or var not in gate_sh:
+        missing_vars.append(j)
+
+if missing_vars:
+    sys.stderr.write(f"Missing result var in required_gate.sh: {missing_vars}\n")
+    sys.exit(2)
+
+sys.exit(0)
+EOF
+}
+
+# Positive test: real ci.yml and required_gate.sh
+if test_consistency "$CI_YML" "$SCRIPT" >/dev/null 2>&1; then
+  log_pass "all jobs in ci.yml are present in ci-required needs and have result variables in required_gate.sh"
+else
+  log_fail "job in ci.yml missing from ci-required needs or lacks result variable in required_gate.sh"
+fi
+
+# Negative test 1: fails when any job is missing from ci-required needs
+(
+  tmp_ci="$(mktemp)"
+  python3 - "$CI_YML" "$tmp_ci" <<'EOF'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    ci = yaml.safe_load(f)
+ci["jobs"]["ci-required"]["needs"] = [n for n in ci["jobs"]["ci-required"]["needs"] if n != "g1-rustfs"]
+with open(sys.argv[2], "w") as f:
+    yaml.dump(ci, f)
+EOF
+  if ! test_consistency "$tmp_ci" "$SCRIPT" >/dev/null 2>&1; then
+    log_pass "self-test fails when a job in ci.yml is missing from ci-required needs"
+  else
+    log_fail "self-test did not fail when job was missing from ci-required needs"
+  fi
+  rm -f "$tmp_ci"
+)
+
+# Negative test 2: fails when any job lacks a result variable in required_gate.sh
+(
+  tmp_gate="$(mktemp)"
+  python3 - "$SCRIPT" "$tmp_gate" <<'EOF'
+import sys
+with open(sys.argv[1]) as f:
+    content = f.read()
+content = content.replace("G1_RUSTFS_RESULT", "UNUSED_VAR_TEST")
+with open(sys.argv[2], "w") as f:
+    f.write(content)
+EOF
+  if ! test_consistency "$CI_YML" "$tmp_gate" >/dev/null 2>&1; then
+    log_pass "self-test fails when a job in ci.yml lacks a result variable in required_gate.sh"
+  else
+    log_fail "self-test did not fail when result variable was missing"
+  fi
+  rm -f "$tmp_gate"
+)
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   exit 1
