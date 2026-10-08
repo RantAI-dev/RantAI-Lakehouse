@@ -248,3 +248,67 @@ async fn an_unauthenticated_request_is_401_before_touching_clickhouse() {
             .is_empty()
     );
 }
+
+/// `SEC-17`: a CSV cell that would run as a formula in a spreadsheet gets a
+/// leading apostrophe inside its quotes; a number and an ordinary cell are
+/// untouched.
+#[tokio::test]
+async fn a_csv_download_puts_an_apostrophe_before_a_cell_that_starts_a_formula() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("\"=1+1\",-5,\"@x\",plain\n\"+3.2e4\",\"-1+1\"\n"),
+        )
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    insert_history_row(
+        &pool,
+        "q-7",
+        "SELECT n FROM t",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-7", "csv", &cookie).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &bytes[..],
+        b"\"'=1+1\",-5,\"'@x\",plain\n\"+3.2e4\",\"'-1+1\"\n".as_slice()
+    );
+}
+
+/// `SEC-17`: Parquet has typed columns and runs no formula, so its bytes are
+/// returned exactly as `ClickHouse` wrote them, even when they look like CSV.
+#[tokio::test]
+async fn a_parquet_download_is_returned_unchanged() {
+    let ch = MockServer::start().await;
+    let body: &[u8] = b"PAR1\x00=1+1,\"=2\"\n\xff\xfe";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    insert_history_row(
+        &pool,
+        "q-8",
+        "SELECT n FROM t",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-8", "parquet", &cookie).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], body);
+}

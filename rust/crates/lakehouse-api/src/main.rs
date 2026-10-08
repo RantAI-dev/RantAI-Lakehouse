@@ -15,6 +15,7 @@ mod connector_deprovision;
 mod connector_discover;
 mod connector_probe;
 mod connector_secret_store;
+mod csv_safe;
 mod error;
 mod gold_export;
 mod gold_export_history;
