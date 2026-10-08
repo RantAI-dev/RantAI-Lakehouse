@@ -313,7 +313,14 @@ pub(crate) const MAX_SYNONYMS: usize = 6;
 /// Longest single synonym, in characters.
 pub(crate) const SYNONYM_CHARS: usize = 40;
 /// The roles a column may have (the `CHECK` on `semantic_entry.role`).
-pub(crate) const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
+pub(crate) const ROLES: [&str; 6] = [
+    "measure",
+    "dimension",
+    "time",
+    "key",
+    "flag",
+    "non_additive",
+];
 
 /// What people and the drafting pass wrote about tables and columns, to be
 /// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
