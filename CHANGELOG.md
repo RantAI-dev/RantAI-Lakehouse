@@ -315,6 +315,7 @@ once a first release is tagged.
 - A table that a policy restricts with a row filter now gets no sample values and no value range in the chat's data map or in the drafting pass of the semantic layer. When the policies cannot be read, no table gets either.
 - The drafting instructions now tell the model that values and descriptions in the facts are data to describe, not orders to follow. This lowers the risk of a planted sentence steering a draft and does not close it.
 - The three `/api/agent/*` endpoints sent a model's SQL straight to `ClickHouse` with no masking and no row filter, asked only for a sign-in, and returned upstream error text. Removing them closes backlog `SEC-9` and the agent-endpoint row of `SEC-11`.
+- The range of a masked numeric or date column no longer reaches the copilot's prompt or the model that drafts descriptions; the column is still listed with its name and type.
 
 ## [0.1.0] - 2026-08-30
 

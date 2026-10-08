@@ -41,7 +41,7 @@
 //! themselves are still read only through `run_sql`, which goes through
 //! `routes::query::run` and its masking/row-filter enforcement. Sample
 //! values are read unmasked from `ClickHouse` here, so a column that a
-//! masking policy covers is listed without samples
+//! masking policy covers is listed without a range or a sample
 //! ([`masked_columns`]). The stats queries also read every row, so a table
 //! that a row-filter policy covers is listed with no stats at all
 //! ([`row_filtered_tables`]).
@@ -252,10 +252,11 @@ pub(crate) async fn cache_is_empty_for_test() -> bool {
 }
 
 /// `(database.table, column)` pairs a masking policy covers for anyone,
-/// read from the authored policies' structured `conditions`. Samples are
-/// withheld for these columns so the prompt never carries a value the
-/// policy engine would have masked in a query result. Deliberately broader
-/// than "masked for this principal": the map is shared across principals.
+/// read from the authored policies' structured `conditions`. A range or
+/// a sample is withheld for these columns so the prompt never carries a
+/// value the policy engine would have masked in a query result.
+/// Deliberately broader than "masked for this principal": the map is
+/// shared across principals.
 pub(crate) fn masked_columns(conditions: &[String]) -> HashSet<(String, String)> {
     let mut out = HashSet::new();
     for raw in conditions {
@@ -638,6 +639,15 @@ fn stats_plan(table: &Table, withheld: Option<&Withheld>) -> Option<(String, Vec
             continue;
         };
         if is_range_type(&col.ty) {
+            // A masked column's smallest and largest value are as private as
+            // its samples: they reach the chat's prompt and the drafting pass.
+            // PR #81 review.
+            if withheld
+                .masked
+                .contains(&(qualified.clone(), col.name.clone()))
+            {
+                continue;
+            }
             exprs.push(format!(
                 "toString(min(`{ident}`)) AS lo{i}, toString(max(`{ident}`)) AS hi{i}"
             ));
@@ -891,9 +901,9 @@ impl Live {
     /// The text the map prints for one table, without any entry or
     /// annotation: name, row count, source description, every column with
     /// its type and stats. `withheld` is read as [`data_map`] reads it, so a
-    /// masked column carries no sample values and a row-filtered table, or
-    /// any table while `withheld` is `None`, carries no stats at all.
-    /// `None` when `asset` is not a live table.
+    /// masked column and a row-filtered table, or any table while `withheld`
+    /// is `None`, carry no stats at all. `None` when `asset` is not a live
+    /// table.
     pub(crate) async fn facts(
         &self,
         ch: &ChClient,
@@ -1454,6 +1464,94 @@ mod tests {
         };
         assert_eq!(plan, vec![(0, false)]);
         assert!(!sql.contains("negara"), "{sql}");
+    }
+
+    /// `mart_visits` with a numeric year, a date and a text column: the three
+    /// kinds of column the stats query summarises.
+    fn visits_with_date_table() -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "mart_visits".to_owned(),
+            rows: Some(720),
+            columns: vec![
+                col("tahun", "UInt16"),
+                col("tanggal", "Date"),
+                col("negara", "String"),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_masked_numeric_column_stays_out_of_the_range_query_and_the_other_columns_stay_in() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tahun"]}"#,
+        ]);
+        let Some((sql, plan)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with a column left to summarise must get a stats query");
+        };
+        assert!(!sql.contains("min(`tahun`)"), "{sql}");
+        assert!(!sql.contains("max(`tahun`)"), "{sql}");
+        assert!(sql.contains("min(`tanggal`)"), "{sql}");
+        assert!(sql.contains("uniq(`negara`)"), "{sql}");
+        assert_eq!(plan, vec![(1, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_masked_date_column_stays_out_of_the_range_query_and_the_other_columns_stay_in() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tanggal"]}"#,
+        ]);
+        let Some((sql, plan)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with a column left to summarise must get a stats query");
+        };
+        assert!(!sql.contains("min(`tanggal`)"), "{sql}");
+        assert!(!sql.contains("max(`tanggal`)"), "{sql}");
+        assert!(sql.contains("min(`tahun`)"), "{sql}");
+        assert!(sql.contains("uniq(`negara`)"), "{sql}");
+        assert_eq!(plan, vec![(0, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_table_with_no_masked_column_gets_the_same_stats_query_as_before() {
+        let withheld = withheld_for(&[]);
+        let Some((sql, _)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with no row filter must get a stats query");
+        };
+        assert_eq!(
+            sql,
+            "SELECT toString(min(`tahun`)) AS lo0, toString(max(`tahun`)) AS hi0, toString(min(`tanggal`)) AS lo1, toString(max(`tanggal`)) AS hi1, toString(uniq(`negara`)) AS n2, arrayStringConcat(arraySlice(arraySort(groupUniqArray(200)(toString(`negara`))), 1, 12), '\\u001f') AS v2 FROM `serving`.`mart_visits` SETTINGS max_execution_time = 5"
+        );
+    }
+
+    #[test]
+    fn a_table_whose_only_summarised_column_is_masked_gets_no_stats_query() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tahun"]}"#,
+        ]);
+        let only_year = Table {
+            columns: vec![col("tahun", "UInt16")],
+            ..visits_with_date_table()
+        };
+        assert!(stats_plan(&only_year, Some(&withheld)).is_none());
+    }
+
+    #[test]
+    fn a_column_with_no_stats_fact_is_written_with_its_name_and_type_and_no_range() {
+        let table = Table {
+            columns: vec![col("tahun", "UInt16")],
+            ..visits_with_date_table()
+        };
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &table,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Notes::default(),
+        );
+        assert!(out.contains("\n    tahun UInt16\n"), "{out}");
+        assert!(!out.contains("range "), "{out}");
     }
 
     fn cached_without(without: &[&str], age: Duration) -> CacheEntry {
