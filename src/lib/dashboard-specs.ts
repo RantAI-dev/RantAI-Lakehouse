@@ -260,3 +260,4 @@ export function toRenderSpec(spec: ChartSpec, source: ChartSource): ChartRenderS
   const { sql: _sql, ...rest } = spec;
   return { ...rest, source };
 }
+// specs probe
