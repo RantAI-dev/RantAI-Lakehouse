@@ -72,6 +72,7 @@ Until signed, the default is used.
 | D6 | Whose load it is | The person who uploaded the file (the only person the upload records), not the person who pressed Load | |
 | D7 | Which cells get the apostrophe | A cell whose first character is `=`, `+`, `-`, `@`, a tab or a carriage return, unless the whole cell is a plain number | |
 | D8 | Header cells | Treated like any other cell | |
+| D9 | A load that has shown as running for a very long time | After 6 hours *(proposed by the planner)* it no longer counts against either limit, so loads whose job died and whose owner never looks cannot close uploads for everyone | |
 
 ## Limits
 

@@ -240,4 +240,33 @@ D1 to D8 of the feature page are unsigned; the defaults are built. The page's ac
 
 ## 8. Review
 
-(The planner writes here.)
+Reviewed 2026-10-08 at `1a6b7af`: the non-test code of `csv_safe.rs`, the
+store function `mark_ingesting_within_limits` and its count, and the
+handoff. The rest of the diff (`upload_limits.rs`, the handlers, the
+console) is not yet read line by line.
+
+CI on pull request 86: every check passes, the Rust test jobs, the Dagster
+unit tests and the G-gates among them, except the two `gitleaks` jobs,
+which fail on `main` as well. No Rust test was run on the build machine
+(*not verified* locally).
+
+Plan errors, mine: section 3 T2 said a refused claim "must be released, as
+the existing refusal paths release it". Nothing releases a claim. The
+developer's read-only count before the claim is accepted as built.
+
+- `SHOULD-FIX` 1. `lakehouse-store/src/uploads.rs`, `under_limits`: every
+  row in `ingesting` counts, for ever. A row leaves `ingesting` when its
+  job reports or when someone reads it (`Settler`, on `get`, `list`,
+  `ingest`, `delete`), and `list` reads one tenant's rows. So sixteen loads
+  whose jobs died, in tenants where nobody opens the page, refuse every
+  load in the installation: one tenant's neglect becomes every tenant's
+  outage. Feature page D9: a row whose `updated_at` is more than 6 hours
+  old does not count. Apply it in `under_limits` and in the read-only
+  `loads_under_limits`, as one constant with the reason beside it, bound
+  as a parameter; add a store test (sixteen old rows do not refuse, a
+  fresh sixteenth does).
+- Accepted, written on the feature page: files being received are counted
+  by display name, and a load counts against the uploader.
+- For the product owner: the job still builds a 50 MB header in memory
+  before refusing it; the API refuses first, so this is reachable only by a
+  load started without the API.
