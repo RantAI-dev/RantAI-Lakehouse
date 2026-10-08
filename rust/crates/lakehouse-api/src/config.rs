@@ -154,10 +154,11 @@ pub struct Config {
     /// the caller choose that `host`, so without this a `connector:manage`
     /// principal gets an internal port scanner with output. This
     /// deployment's own seeded connectors (`postgres:5432`,
-    /// `http://rustfs:9000`) ARE internal names, so the compose stack opts
-    /// out explicitly — an opt-out rather than a default, so the safe
-    /// posture is what a deployment gets unless it says otherwise. `true`
-    /// only when the env var is exactly `"true"`.
+    /// `http://rustfs:9000`) ARE internal names, so an install that wants
+    /// their tests to run opts in explicitly — an opt-in rather than a
+    /// default, in compose as here (`SEC-15`: compose used to default it to
+    /// `true`), so the safe posture is what a deployment gets unless it says
+    /// otherwise. `true` only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
     /// Private networks a connector may dial even though the SSRF guard
     /// refuses internal addresses (`CONNECTOR_PROBE_ALLOWED_CIDRS`, e.g.
