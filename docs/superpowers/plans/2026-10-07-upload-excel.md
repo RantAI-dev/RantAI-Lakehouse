@@ -384,3 +384,108 @@ Follow-up (2026-10-08, uncommitted): the file row's mark follows the format
 `XLS` / `XLSX` for a workbook, a text glyph in the primary tone with
 `CSV` / `TSV`, the neutral document otherwise (`TXT`, or no label). A
 generic glyph, no vendor mark. By name only; the API still judges content.
+
+## 11. Parquet files (asked for by the product owner on 2026-10-08)
+
+**Goal:** the upload also accepts a `.parquet` file.
+
+Decisions (the planner's defaults; the product owner may change any):
+
+1. **The same path as a workbook.** The API stores the file as it
+   arrived, converts it to delimited text for the preview (in memory) and
+   at ingest (stored as a CSV object beside the original), and the
+   existing load job loads that. The load job does not change and there
+   is no migration. A Parquet file has one table, so there is nothing to
+   pick: the Check step shows neither a sheet picker nor the encoding and
+   delimiter controls; the header is the file's own column names, so the
+   header-row control does not show either.
+2. **Every column is still text**, as for CSV and Excel. The file's own
+   types are shown in the preview's header as information ("was: int64")
+   and are not carried into the table. Typed loading is a separate piece
+   of work.
+3. **How a value becomes text:** null: empty; text: as stored; integers
+   and floats: as for a workbook (shortest form that reads back, no
+   display format); decimal: its exact digits; boolean: `true` / `false`;
+   date: `YYYY-MM-DD`; timestamp: ISO 8601, in UTC with a trailing `Z`
+   when the column is zoned, without when it is not; time: `HH:MM:SS`
+   with fractional seconds only when present; binary: refused, see 4;
+   list, map and struct: refused, see 4.
+4. **Refused with a reason, by column name:** a file with a binary or a
+   nested column (the sentence names the first such column and its type);
+   an encrypted file; a file that cannot be read; a file over the same
+   5,000,000-cell cap as a workbook (rows × columns, from the file's
+   metadata, before any row is decoded).
+5. **Reader:** the `parquet` crate already in `Cargo.lock` (58.x, through
+   the Iceberg dependency), declared for the API crate; no new crate
+   family. If declaring it changes `cargo deny`'s answer, stop and report.
+
+Tasks, one per commit, as X1 to X4 above: Q1 the pure reader with unit
+tests on small fixture files under `ops/fixtures/` (each type of decision
+3, a refused binary column, a refused nested column, the cap, a truncated
+file); Q2 the routes (`create`, `preview`, `ingest`, `delete`) with route
+tests; Q3 the console (accepted kinds, the facts on the File step, the
+file mark `PARQUET` in its own tone, the Check step without controls and
+with the "was: <type>" line, the Review summary); Q4 the G9 gate, the
+changelog, the feature page and the ADR amendment.
+
+### Parquet handoff (developer, 2026-10-08, uncommitted)
+
+Q1 to Q4 are implemented in the working tree; nothing is committed. **Q1**:
+`rust/crates/lakehouse-api/src/upload_parquet.rs` (the pure reader and its unit
+tests), `parquet = "58"` declared in the API crate's `Cargo.toml` (the lockfile
+gains the one line `"parquet"` under `lakehouse-api` and no package), module
+lines in `lib.rs` and `main.rs`, `float_text`/`finish_text` lifted to
+`pub(crate)` in `upload_workbook.rs`, fixtures and `make_parquet.py` in
+`ops/fixtures/parquet/`. **Q2**: `routes/uploads.rs` branches on a `Conversion`
+(workbook or Parquet) wherever it branched on "is a workbook"
+(`conversion_of_head`, `conversion_of`, `convert_upload`, `parse_ingest_request`
+takes `Option<Conversion>`, `delete`), `parquet` in the answers of `create` and
+`preview`, route tests at the end of `tests/upload_routes.rs`. **Q3**: contract,
+`src/lib/uploads.ts`, `FileMark`, File step, Check step, preview grid, Review
+step and their tests. **Q4**: `ops/g9/upload_test.py` (`step_parquet`),
+`CHANGELOG.md`, `docs/core/features/upload-file.md`, ADR 0014 amendment.
+
+Decisions taken where section 11 left room (each is in the code and on the
+feature page): the Arrow reader of the `parquet` crate with the schema
+embedded by some writers ignored; a timestamp is written with a `T`
+(`2025-09-24T13:30:05`), not the space a workbook uses, because section 11 says
+ISO 8601; a legacy `INT96` timestamp is retyped to microseconds with the crate's
+own supplied-schema mechanism and written as a local time (no `Z`, the type has
+no zone flag); `float` is written in its own shortest form, not widened to
+`double` first; `uuid` stored as 16 bytes is refused as binary; a value no
+calendar can hold is written as the integer the file holds. Departures:
+(1) a 512 MiB cap on the converted text (`TooMuchText`), not in section 11,
+because the 5,000,000-cell cap does not bound a cell's size and a column of long
+repeated strings compresses to almost nothing; (2) `headerRow` in a load body is
+not read for Parquet (the header is the file's names, row 0), so a body without
+it is valid; (3) the sentences for a workbook and for other binaries changed to
+list `.parquet` (assertions in `tests/upload_routes.rs`, `routes/uploads.rs`
+and `src/lib/uploads.test.ts` updated), and a Parquet-shaped file not named
+`.parquet` has its own sentence; (4) `create` opens a Parquet file by its
+footer only, so a damaged page is found when it is converted (ingest, before
+the table is claimed), not at upload; (5) a file with no rows is refused at
+ingest (`EMPTY_PARQUET`) and previews as its columns alone.
+
+Column names the job would change are not renamed or refused by the API:
+`file_ingest.py` `_column_names` makes them lower case, ASCII letters, digits
+and `_`, gives a blank one `col_<position>` and a repeat `_2`, so the preview
+shows the file's names and the table's columns may differ; the feature page says
+so. Commands run in the foreground or detached with their log read (rule 7):
+`cargo fmt --check` clean; `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` clean on the final tree (this type-checks the new unit and route
+tests; no test count: **no Rust test was run**, as section 6 requires);
+`bun run typecheck`, `bun run lint` (0 errors, the same 6 warnings), `bun run
+test` (856 passed, 1 skipped, 0 failed; 857 tests in 92 files); the two `ops/lint`
+scripts OK; `python3 -m py_compile` on `ops/g9/upload_test.py` and
+`ops/fixtures/parquet/make_parquet.py`. *Not verified*: every Rust test (the new
+`upload_parquet.rs` unit tests, the `routes/uploads.rs` unit tests, the Parquet
+tests in `tests/upload_routes.rs`); that the `parquet` crate's supplied-schema
+route accepts the retyped `INT96` field exactly as the source suggests;
+`cargo deny` and `cargo audit` (not installed; the lockfile gained no package,
+so no new licence or advisory surface is expected); the gate; any browser
+view of the Check step's "was:" line or the `PARQUET` mark (the contrast of the
+mark is computed from Tailwind palette values only). Fixtures: `pyarrow` 25.0.1
+was `pip download`ed into `/home/hv/.cache/lakehouse-deploy/pyarrowlib` and
+unpacked there (`pkg/`); nothing was installed anywhere; the script ran with
+`PYTHONPATH` pointing at it. The legacy `INT96` file was checked by reading it
+back with pyarrow's `coerce_int96_timestamp_unit='us'` (year 1 intact).
