@@ -227,6 +227,10 @@ All Rust commands with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-targe
 5. **Where the 400 is checked in `ingest`:** after the `ingesting` and tenant checks and before `ensure_table_free` (the first external call), reading the head with `head_bytes`. A missing object now answers 503 from `ingest` where it used to answer from the launch; no existing test seeds an upload without its object.
 6. **Python `parse_file`:** the column count is taken on a header list the reader already built, so a 50 MB header of commas still builds that list in the job before it is refused. The API refuses such a file first; the job is the authority for a load started another way.
 
+### Review fixes
+
+- `SEC-17 review fix (SHOULD-FIX 1)`: `under_limits` (and so `loads_under_limits`) ignores `ingesting` rows whose `updated_at` is over 6 hours old (`LOAD_COUNTS_FOR_HOURS`, bound as `$2` of `make_interval`). New store test `loads_older_than_six_hours_do_not_count_against_the_limits` (sqlx::test, not run locally; `file_upload.updated_at` has no trigger in the migrations, so the test sets it directly). 6 hours added to the Limits list of `upload-file.md`.
+
 ### T4: what each file does
 
 - `rust/crates/lakehouse-api/src/gold_export.rs`: exports a Gold mart to Iceberg (Parquet files) through `iceberg-rust`. The only "CSV" in it is a test string, `url('h', 'CSV')`, for the read-only SQL gate. Writes no CSV a person downloads. No change.

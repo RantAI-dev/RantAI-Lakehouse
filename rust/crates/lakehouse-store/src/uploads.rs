@@ -403,6 +403,15 @@ pub async fn mark_ingesting(
         .await?)
 }
 
+/// Hours after which an `ingesting` row no longer counts against the load
+/// limits (`SEC-17 review fix (SHOULD-FIX 1)`, feature page decision D9). A
+/// row leaves `ingesting` only when its job reports or someone reads it, so
+/// loads whose job died in a tenant nobody opens would otherwise count for
+/// ever and refuse every load in the installation. Six hours is far past the
+/// longest load (the request deadline and the job's own bounds are minutes);
+/// the row itself is not changed here, it is only not counted.
+const LOAD_COUNTS_FOR_HOURS: i32 = 6;
+
 /// How many loads may run at once (`SEC-17`): per `uploaded_by` and in
 /// total. Both are at least 1; the API reads them from its configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,9 +466,11 @@ async fn under_limits(
            count(*) FILTER (WHERE uploaded_by = \
              (SELECT uploaded_by FROM file_upload WHERE id = $1)), \
            count(*) \
-         FROM file_upload WHERE status = 'ingesting'",
+         FROM file_upload WHERE status = 'ingesting' \
+           AND updated_at > now() - make_interval(hours => $2)",
     )
     .bind(id)
+    .bind(LOAD_COUNTS_FOR_HOURS)
     .fetch_one(conn)
     .await?;
     Ok(mine < limits.per_user && all < limits.total)

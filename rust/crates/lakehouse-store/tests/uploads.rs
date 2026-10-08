@@ -1839,3 +1839,51 @@ async fn marking_a_loading_or_unknown_upload_changes_no_row(pool: PgPool) -> sql
     ));
     Ok(())
 }
+
+/// `SEC-17 review fix (SHOULD-FIX 1)`: a load that has been `ingesting` for
+/// more than 6 hours does not count, so dead loads in a neglected tenant
+/// cannot refuse everyone; fresh ones still do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn loads_older_than_six_hours_do_not_count_against_the_limits(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-stale").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+    };
+    for n in 0..16 {
+        let id = format!("up-old-{n}");
+        add_by(&pool, &id, tenant_a, &format!("User {}", n / 4)).await;
+        assert!(matches!(
+            start_limited(&pool, &id, limits).await,
+            MarkOutcome::Marked(_)
+        ));
+    }
+    add_by(&pool, "up-next", tenant_a, "Newcomer").await;
+    assert!(!loads_under_limits(&pool, "up-next", limits).await.unwrap());
+
+    // `updated_at` has no trigger (0057): a direct UPDATE sticks.
+    sqlx::query(
+        "UPDATE file_upload SET updated_at = now() - interval '7 hours' WHERE id LIKE 'up-old-%'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(loads_under_limits(&pool, "up-next", limits).await.unwrap());
+    assert!(matches!(
+        start_limited(&pool, "up-next", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+
+    // Fresh again: five hours old still counts.
+    sqlx::query(
+        "UPDATE file_upload SET updated_at = now() - interval '5 hours' WHERE id LIKE 'up-old-%'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    add_by(&pool, "up-last", tenant_a, "Another").await;
+    assert!(!loads_under_limits(&pool, "up-last", limits).await.unwrap());
+    Ok(())
+}

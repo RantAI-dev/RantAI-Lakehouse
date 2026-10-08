@@ -85,7 +85,8 @@ table once it is loaded.
 - Four uploads in progress per user and sixteen in all, at once: files being
   received and loads running are each counted against both numbers. The next
   is refused with "Too many uploads are in progress. Try again in a moment."
-  and can be sent again; nothing waits (`SEC-17`, `UPLOAD_MAX_CONCURRENT_PER_USER`
+  and can be sent again; nothing waits. A load that has shown as running for more
+  than 6 hours no longer counts (`SEC-17`, `UPLOAD_MAX_CONCURRENT_PER_USER`
   and `UPLOAD_MAX_CONCURRENT`; `docs/core/features/upload-limits-and-safe-csv.md`).
 - Every column is text. Numbers and dates have to be converted afterwards.
 - An uploaded table stays in the raw layer. The pipeline builder cannot read
