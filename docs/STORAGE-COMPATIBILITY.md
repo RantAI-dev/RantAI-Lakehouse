@@ -88,6 +88,10 @@ host — see that test file's module doc for why), via a profile-gated
 compose service:
 
 ```bash
+# SEC-18: no default credentials. Run `sh ops/init-env.sh` once (or export
+# POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY,
+# LAKEKEEPER_ENCRYPTION_KEY and, for SeaweedFS, SEAWEEDFS_ACCESS_KEY /
+# SEAWEEDFS_SECRET_KEY) first.
 # Against RustFS (the default store):
 docker compose -p g1check --profile test run --rm g1-test-runner
 
@@ -164,7 +168,7 @@ P3).** Measured directly at the S3 API level against both stores (per
 this row's own "How to test" — `aws s3api create-multipart-upload` /
 `upload-part` / `complete-multipart-upload`), using the exact static
 credentials each store's warehouse init already provisions
-(`rustfsadmin`/`rustfsadmin`, `seaweedfsadmin`/`seaweedfsadmin`): a 3-part,
+(at the time of the measurement: `rustfsadmin`/`rustfsadmin`, `seaweedfsadmin`/`seaweedfsadmin`; since `SEC-18` the stack has no default keys, and the same stores are provisioned from `RUSTFS_*` / `SEAWEEDFS_*` you set): a 3-part,
 30 MiB object (well past `object_store`'s single-PUT threshold) uploaded
 and completed cleanly on both, confirmed by a `head-object` showing the
 full 31,457,280-byte size and a multipart-shaped ETag

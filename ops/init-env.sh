@@ -65,6 +65,19 @@ for var in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
   fi
 done
 
+# Local dev only: the tenant warehouse pair may equal the RustFS pair (ADR 0002
+# Addendum 2, "may equal, must never alias"), as .env.example used to say.
+# Without it, tenant provisioning answers "not configured".
+rk=$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$tmp")
+rs=$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$tmp")
+TA=$rk TS=$rs awk '
+  $0 == "TENANT_WAREHOUSE_S3_ACCESS_KEY=" { print $0 ENVIRON["TA"]; next }
+  $0 == "TENANT_WAREHOUSE_S3_SECRET_KEY=" { print $0 ENVIRON["TS"]; next }
+  { print }
+' "$tmp" > "$tmp.next"
+mv "$tmp.next" "$tmp"
+filled="$filled TENANT_WAREHOUSE_S3_ACCESS_KEY TENANT_WAREHOUSE_S3_SECRET_KEY"
+
 mv "$tmp" "$target"
 trap - EXIT HUP INT TERM
 echo "init-env: wrote $target (mode 600). Filled:"

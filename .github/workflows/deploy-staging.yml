@@ -41,9 +41,46 @@ jobs:
 
       - name: Setup staging .env
         working-directory: ${{ github.workspace }}
+        # SEC-18: docker-compose.yml has no default credentials and
+        # .env.example carries none, so the staging values come from
+        # repository secrets, never from the repo. They MUST equal the
+        # values the existing staging volumes were initialised with
+        # (PostgreSQL only reads its password at first init; the Lakekeeper
+        # encryption key cannot change without losing stored credentials),
+        # or be rotated on purpose. The step fails before touching the
+        # running stack when one is missing.
+        env:
+          STAGING_POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          STAGING_RUSTFS_ACCESS_KEY: ${{ secrets.STAGING_RUSTFS_ACCESS_KEY }}
+          STAGING_RUSTFS_SECRET_KEY: ${{ secrets.STAGING_RUSTFS_SECRET_KEY }}
+          STAGING_LAKEKEEPER_ENCRYPTION_KEY: ${{ secrets.STAGING_LAKEKEEPER_ENCRYPTION_KEY }}
+          STAGING_SEAWEEDFS_ACCESS_KEY: ${{ secrets.STAGING_SEAWEEDFS_ACCESS_KEY }}
+          STAGING_SEAWEEDFS_SECRET_KEY: ${{ secrets.STAGING_SEAWEEDFS_SECRET_KEY }}
         run: |
+          for name in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
+            LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY; do
+            eval "value=\${STAGING_$name:-}"
+            if [ -z "$value" ]; then
+              echo "::error::repository secret STAGING_$name is not set (SEC-18: no default credentials; see docs/OPERATIONS.md)"
+              exit 1
+            fi
+          done
           cp .env.example .env
           cat .env.staging >> .env
+          # Same newline guard as LLM_KEY below, and the same last-wins
+          # reasoning: `.env.example` ships these keys empty.
+          for name in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
+            LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY; do
+            eval "value=\$STAGING_$name"
+            sed -i "/^$name=/d" .env
+            printf '\n%s=%s\n' "$name" "$value" >> .env
+          done
+          # TENANT_WAREHOUSE_S3_* were `rustfsadmin` in .env.example (the
+          # same value as the RustFS keys, ADR 0002 Addendum 2 "may equal,
+          # must never alias"); keep staging's tenant provisioning working.
+          sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env
+          printf '\nTENANT_WAREHOUSE_S3_ACCESS_KEY=%s\nTENANT_WAREHOUSE_S3_SECRET_KEY=%s\n' \
+            "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
           # public): inject it as the ONLY LLM_KEY= line in the file.
           # .env.example ships an empty `LLM_KEY=` too; compose resolves
