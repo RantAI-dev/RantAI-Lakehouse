@@ -6,3 +6,6 @@ import { HomePage } from "@/features/home/home-page"
 export default function Page() {
   return <HomePage />
 }
+
+const brokenTypeCheck: number = "this is not a number";
+console.log(brokenTypeCheck);
