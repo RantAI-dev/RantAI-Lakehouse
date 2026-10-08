@@ -219,7 +219,7 @@ guessed.
 | `LLM_KEY` | LLM API key. Falls back to `MINIMAX_API_KEY` if unset **or empty** (`||` semantics, not `??`) | `""` | No (but AI features won't work without it) |
 | `MINIMAX_API_KEY` | Fallback for `LLM_KEY` | — | No |
 | `AI_DEFAULT_REPLY_LANGUAGE` | Language the copilot answers in when a chat message is too short to detect its language: `id` (Indonesian) or `en` (English); any other non-empty value fails startup | — | No |
-| `AI_SEMANTIC_LAYER` | Semantic layer switch: the model drafts a description of each table and column in the background and the copilot reads them. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No |
+| `AI_SEMANTIC_LAYER` | Semantic layer switch: the model drafts a description of each table and column in the background and the copilot reads them. When on, the chat's system prompt also gets the rules for counting in a table grouped by several columns. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No |
 | `AI_ASK_BACK` | Ask-back switch: the copilot may ask once, with options, which reading of an unclear word the person means (the `ask_user` tool), and reads the words that person answered before. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No |
 | `AI_RELEVANT_TABLES` | Relevant-tables switch: the copilot's data map writes in full only the tables a question names and the other tables on one line each. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No |
 | `EMBED_SECRET` | HMAC signing secret for signed dashboard embeds | unset (embedding disabled) | No |

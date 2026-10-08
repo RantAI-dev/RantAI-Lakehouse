@@ -82,6 +82,25 @@ UNCLEAR WORDS
 - Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
 - If the question is not about data, answer it as it is. Do not ask.";
 
+/// Appended after the mode text (and after [`ASK_BACK_RULES`]) when
+/// `AI_SEMANTIC_LAYER` is on, in both modes. It is a separate block and not
+/// part of [`SYSTEM_BASE`], so a deployment with the switch off keeps the
+/// prompt it was measured with, byte for byte.
+///
+/// Rule 2 of [`SYSTEM_BASE`] says to `SUM` the measure. A count of distinct
+/// things in a table grouped by several columns is no measure: the same
+/// thing can sit in more than one row, so a sum counts it more than once.
+/// The rules name no table, column or value, because they apply to any
+/// dataset; the marker they quote is the one `data_map` writes for a
+/// `non_additive` column.
+pub(super) const DISTINCT_COUNT_RULES: &str = "
+
+COUNTS IN A GROUPED TABLE
+- A count column in a table whose grain has several columns may count the same thing in more than one row, so adding it up counts that thing more than once. Amounts and quantities are added up as before.
+- Never add up a column the DATA MAP marks [never SUM across rows], or a count you judge to overlap in this way. If a detail table in the DATA MAP has one row per thing or per line of it, count the distinct things there, with the same filters.
+- If there is no such detail table, give the figure per row of the grain and say that a total cannot be read from this table.
+- Say in one clause which table the count came from.";
+
 /// Most remembered words carried in one prompt: the newest ones. A person
 /// may keep more (`lakehouse_store::chat_term::MAX_TERMS_PER_OWNER`), but a
 /// small model's context is better spent on the question.
@@ -598,6 +617,24 @@ pub(super) fn select_tools(recent: &[&str]) -> std::collections::HashSet<&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_count_rules_are_five_lines_and_name_no_dataset() {
+        let lines = DISTINCT_COUNT_RULES
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines <= 5, "{lines} lines: {DISTINCT_COUNT_RULES}");
+        // A word of one dataset would tie these rules to one deployment.
+        let lower = DISTINCT_COUNT_RULES.to_lowercase();
+        for word in ["wisman", "pariwisata", "mart_", "outlet", "distributor"] {
+            assert!(!lower.contains(word), "`{word}` in {DISTINCT_COUNT_RULES}");
+        }
+        assert!(
+            DISTINCT_COUNT_RULES.contains(crate::routes::ai::data_map::NON_ADDITIVE_MARKER.trim()),
+            "the marker the DATA MAP writes is not quoted"
+        );
+    }
 
     #[test]
     fn a_data_question_gets_only_the_data_tools_and_listings() {

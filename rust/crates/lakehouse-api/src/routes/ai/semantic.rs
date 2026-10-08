@@ -218,7 +218,9 @@ fn instructions(language: &str) -> String {
          of distinct things, an average, a rate, a percentage or a price; flag is a 0/1 or yes/no \
          column; dimension is a category to group or filter by; time is a date or a time; key \
          identifies a row or links to another table. When it is unclear whether a count can be \
-         added up, choose non_additive.\n\
+         added up, choose non_additive. When the facts show that one row is a combination of \
+         several columns, a column that counts things which can belong to more than one such row \
+         is non_additive.\n\
          - A description says what the table or column means. It never repeats a value, a range, \
          a count of rows or a span of years from the facts, because those change and the assistant \
          reads them fresh each time.\n\
@@ -631,6 +633,18 @@ mod tests {
                 "When it is unclear whether a count can be added up, choose non_additive"
             ),
             "no tie-break toward non_additive: {text}"
+        );
+    }
+
+    #[test]
+    fn the_instructions_make_a_count_that_can_overlap_between_rows_non_additive() {
+        let text = instructions("English");
+        assert!(
+            text.contains(
+                "When the facts show that one row is a combination of several columns, a column \
+                 that counts things which can belong to more than one such row is non_additive"
+            ),
+            "no rule for a count that overlaps between rows: {text}"
         );
     }
 
