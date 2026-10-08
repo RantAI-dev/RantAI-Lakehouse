@@ -356,3 +356,31 @@ contract change; what each control does stays as it is.
   the next actions (open the table in Data Explorer, upload another).
 - **U6, all steps.** No sideways scroll at 390 px; the step list on the
   left collapses the way the connector wizard's does; both themes.
+
+### Touch-ups handoff (developer, 2026-10-08, uncommitted)
+
+U1 to U6 are implemented in the console only; nothing is committed. New
+files: `upload-file-step.tsx` (drop area, chosen-file row, limits as facts),
+`upload-preview-grid.tsx` (framed preview), `upload-table-step.tsx`,
+`upload-review-step.tsx`; changed: `upload-file-page.tsx`,
+`upload-check-step.tsx`, `upload-run-view.tsx`, `upload-parts.tsx`
+(`UploadNotice`, `KindIcon`), `src/lib/uploads.ts` (`rawTableFullName`,
+`uploadFileKind`, `tableNameFault`) and the two test files. No request, API
+sentence or control behaviour changed. U6: the page passes
+`grid-cols-[minmax(0,1fr)]` to `FormStepLayout`, because below `lg` the
+pattern's grid has one implicit `auto` track that grows with the widest
+content (the shared pattern is left as it is). Commands run in the
+foreground on the final tree: `bun run typecheck` (0 errors), `bun run lint`
+(0 errors, 6 warnings), `bun run test` (849 passed, 1 skipped, 0 failed).
+*Not verified*: nothing was seen in a browser, so widths (390 / 900 / 1280 /
+1440 px) and both themes are reasoned from the classes only; the "Lands in
+Data Explorer as `bronze.<table>`" name is taken from the writer
+(`file_ingest.py`) and `catalog_source.rs`, not checked against a running
+Data Explorer.
+
+Follow-up (2026-10-08, uncommitted): the file row's mark follows the format
+(`FileMark` in `upload-parts.tsx`, kind and label from `uploadFileKind` /
+`uploadFileLabel` in `src/lib/uploads.ts`): a green spreadsheet glyph with
+`XLS` / `XLSX` for a workbook, a text glyph in the primary tone with
+`CSV` / `TSV`, the neutral document otherwise (`TXT`, or no label). A
+generic glyph, no vendor mark. By name only; the API still judges content.
