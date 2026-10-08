@@ -100,8 +100,11 @@ while IFS= read -r file; do
   # Any file outside the docs-only set means docs_only is false
   docs_only=false
 
-  # Rust: rust/**, src/lib/dashboard-specs.ts
-  if [[ "$file" == rust/* ]] || [[ "$file" == "src/lib/dashboard-specs.ts" ]]; then
+  # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml
+  # Note: docker-compose.yml is embedded via include_str! in
+  # rust/crates/lakehouse-store/src/cdc.rs:1131 for demo_connector_compose_properties.
+  if [[ "$file" == rust/* ]] || [[ "$file" == "src/lib/dashboard-specs.ts" ]] || \
+     [[ "$file" == "docker-compose.yml" ]]; then
     rust=true
     classified=true
   fi

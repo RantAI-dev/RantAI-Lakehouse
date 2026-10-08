@@ -26,7 +26,7 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 
 | Scope | Triggered By |
 |---|---|
-| `rust` | `rust/**`, `src/lib/dashboard-specs.ts` |
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
 | `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |

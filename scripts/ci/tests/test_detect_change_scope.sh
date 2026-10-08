@@ -165,7 +165,8 @@ assert_case "rust/crates/lib.rs is rust-only" "true" "false" "false" "false" "fa
 assert_case "dagster/pipeline.py is dagster-only" "false" "false" "true" "false" "false" "false" "dagster/pipeline.py"
 
 # Stack tests
-assert_case "docker-compose.yml is stack-only" "false" "false" "false" "true" "false" "false" "docker-compose.yml"
+# docker-compose.yml sets rust and stack (embedded for demo_connector_compose_properties)
+assert_case "docker-compose.yml sets rust and stack" "true" "false" "false" "true" "false" "false" "docker-compose.yml"
 assert_case "ops/g6/test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g6/test.py"
 assert_case "scripts/compose.sh is stack-only" "false" "false" "false" "true" "false" "false" "scripts/compose.sh"
 assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" "false" ".env.example"
