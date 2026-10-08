@@ -199,6 +199,34 @@ assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false"
   fi
 )
 
+# Move test: file moved from rust/ into docs/ must set rust=true
+test_rename_rust_to_docs() {
+  local output="$REPO_DIR/github_output_mv"
+  : > "$output"
+  (
+    cd "$REPO_DIR"
+    git reset --hard "$BASE_SHA" >/dev/null 2>&1
+    git mv rust/crates/lib.rs docs/lib_moved.md
+    git commit -q -m "move rust file to docs"
+  )
+  (
+    cd "$REPO_DIR"
+    EVENT_NAME="pull_request" \
+    BASE_SHA="$BASE_SHA" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  )
+  local r doc
+  r="$(grep "^rust=" "$output" | cut -d= -f2)"
+  doc="$(grep "^docs_only=" "$output" | cut -d= -f2)"
+  if [ "$r" = "true" ] && [ "$doc" = "false" ]; then
+    log_pass "file moved from rust/ into docs/ sets rust=true"
+  else
+    log_fail "file moved from rust/ into docs/ did not set rust=true (rust=$r, docs_only=$doc)"
+  fi
+}
+test_rename_rust_to_docs
+
 # Unreadable base commit test
 (
   output="$REPO_DIR/github_output_badbase"

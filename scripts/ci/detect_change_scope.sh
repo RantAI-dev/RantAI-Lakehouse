@@ -48,7 +48,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
   exit 0
 fi
 
-CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+CHANGED="$(git diff --no-renames --name-only "$BASE" HEAD || true)"
 if [ -z "$CHANGED" ]; then
   echo "No changed files detected."
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
