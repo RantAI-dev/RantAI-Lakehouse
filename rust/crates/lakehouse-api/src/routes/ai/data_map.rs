@@ -765,6 +765,18 @@ fn is_key_like(name: &str) -> bool {
         || n == "id"
 }
 
+/// How much a table's grain line says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grain {
+    /// The line the DATA MAP prints: the grain, the measures to `SUM` and
+    /// the columns never to total.
+    Advice,
+    /// The grain columns alone. The facts for a draft use it, because a
+    /// measures list with "SUM them" makes the drafting model read a count
+    /// that can overlap between rows as something to add up.
+    Only,
+}
+
 /// The table's grain and its measures, for the small-model mistake this
 /// was added for: `qwen3:4b` answered "the peak month's visits" with one
 /// country's row (`ORDER BY jumlah DESC LIMIT 1`) instead of the month's
@@ -782,7 +794,11 @@ fn is_key_like(name: &str) -> bool {
 /// after the measures, with the warning not to total them. `None` when no
 /// column names the grain, or when there is neither a measure nor a
 /// `non_additive` column to say anything about.
-fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
+///
+/// With [`Grain::Only`] the line names the grain columns and stops: no list
+/// of measures, no "SUM them", no "not additive". The gate above is the
+/// same, so a table with no number to add up has no line in either style.
+fn grain_line(table: &Table, notes: &Notes, style: Grain) -> Option<String> {
     let asset = format!("{}.{}", table.db, table.name);
     let role = |c: &Column| notes.role(&asset, &c.name);
     let would_be_measure = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
@@ -808,6 +824,10 @@ fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
         return None;
     }
     let mut line = format!("    grain: one row per {}", keys.join(" x "));
+    if style == Grain::Only {
+        line.push('\n');
+        return Some(line);
+    }
     if !measures.is_empty() {
         let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
         let _ = write!(
@@ -827,6 +847,10 @@ fn grain_line(table: &Table, notes: &Notes) -> Option<String> {
     Some(line)
 }
 
+/// The marker a `non_additive` column carries in the DATA MAP. A test in
+/// `prompt.rs` fails if the chat's count rules stop quoting this marker.
+pub(super) const NON_ADDITIVE_MARKER: &str = " [never SUM across rows]";
+
 /// `720 rows`, or `row count unknown`.
 fn rows_text(table: &Table) -> String {
     table
@@ -844,6 +868,7 @@ fn render_table(
     descriptions: &HashMap<(String, String), String>,
     stats: &HashMap<String, String>,
     notes: &Notes,
+    grain: Grain,
 ) {
     let rows = rows_text(table);
     let _ = write!(out, "- {}.{} ({rows})", table.db, table.name);
@@ -876,8 +901,8 @@ fn render_table(
         out.push_str(&synonyms);
     }
     out.push('\n');
-    if let Some(grain) = grain_line(table, notes) {
-        out.push_str(&grain);
+    if let Some(line) = grain_line(table, notes, grain) {
+        out.push_str(&line);
     }
     for col in &table.columns {
         let _ = write!(out, "    {} {}", col.name, col.ty);
@@ -891,7 +916,7 @@ fn render_table(
             out.push_str(&synonyms);
         }
         match notes.role(&asset, &col.name) {
-            Some("non_additive") => out.push_str(" [never SUM across rows]"),
+            Some("non_additive") => out.push_str(NON_ADDITIVE_MARKER),
             Some("flag") => out.push_str(" [0/1 flag]"),
             _ => {}
         }
@@ -979,17 +1004,34 @@ impl Live {
             .iter()
             .find(|t| format!("{}.{}", t.db, t.name) == asset)?;
         let stats = column_stats(ch, table, withheld).await;
-        let mut out = String::new();
-        render_table(
-            &mut out,
+        Some(draft_facts(
             table,
             self.dataset(table),
             &self.descriptions,
             &stats.facts,
-            &Notes::default(),
-        );
-        Some(out)
+        ))
     }
+}
+
+/// The text [`Live::facts`] returns for one table, with no `ClickHouse`
+/// call: the same inputs always give the same text.
+fn draft_facts(
+    table: &Table,
+    dataset: Option<&Dataset>,
+    descriptions: &HashMap<(String, String), String>,
+    stats: &HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    render_table(
+        &mut out,
+        table,
+        dataset,
+        descriptions,
+        stats,
+        &Notes::default(),
+        Grain::Only,
+    );
+    out
 }
 
 /// Read every table's facts from `ClickHouse`: the expensive part of the
@@ -1164,6 +1206,7 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
             &live.descriptions,
             &stats.facts,
             notes,
+            Grain::Advice,
         );
         tables.push(TablePiece {
             qualified: format!("{}.{}", table.db, table.name),
@@ -1613,6 +1656,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &Notes::default(),
+            Grain::Advice,
         );
         assert!(out.contains("\n    tahun UInt16\n"), "{out}");
         assert!(!out.contains("range "), "{out}");
@@ -1693,7 +1737,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            grain_line(&table, &Notes::default()).as_deref(),
+            grain_line(&table, &Notes::default(), Grain::Advice).as_deref(),
             Some(
                 "    grain: one row per tahun x bulan_no x negara; measures: jumlah (SUM them over rows for any total)\n"
             )
@@ -1702,7 +1746,10 @@ mod tests {
             columns: vec![col("indikator", "String")],
             ..table
         };
-        assert_eq!(grain_line(&only_labels, &Notes::default()), None);
+        assert_eq!(
+            grain_line(&only_labels, &Notes::default(), Grain::Advice),
+            None
+        );
     }
 
     fn col(name: &str, ty: &str) -> Column {
@@ -1772,6 +1819,7 @@ mod tests {
             &served_descriptions(),
             &served_stats(),
             notes,
+            Grain::Advice,
         );
         out
     }
@@ -1785,6 +1833,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             notes,
+            Grain::Advice,
         );
         out
     }
@@ -1804,6 +1853,35 @@ mod tests {
     origin String
     count UInt32
 ";
+
+    #[test]
+    fn the_facts_for_a_draft_name_the_grain_and_give_no_advice_on_what_to_sum() {
+        let facts = draft_facts(
+            &served_table(),
+            Some(&served_dataset()),
+            &served_descriptions(),
+            &served_stats(),
+        );
+        assert!(
+            facts.contains("    grain: one row per tahun x negara\n"),
+            "{facts}"
+        );
+        assert!(!facts.contains("SUM them"), "{facts}");
+        assert!(!facts.contains("measures:"), "{facts}");
+        assert!(!facts.contains("not additive"), "{facts}");
+        // The column lines are rendered as before.
+        assert!(facts.contains("    jumlah UInt32\n"), "{facts}");
+    }
+
+    #[test]
+    fn the_facts_for_a_table_with_no_number_to_add_up_have_no_grain_line() {
+        let only_labels = Table {
+            columns: vec![col("indikator", "String"), col("negara", "String")],
+            ..served_table()
+        };
+        let facts = draft_facts(&only_labels, None, &HashMap::new(), &HashMap::new());
+        assert!(!facts.contains("grain:"), "{facts}");
+    }
 
     #[test]
     fn with_no_notes_a_table_with_a_dataset_renders_as_it_did_before() {
@@ -1879,6 +1957,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             notes,
+            Grain::Advice,
         );
         out
     }
@@ -1894,7 +1973,7 @@ mod tests {
         ]);
         let notes = notes(vec![], vec![]);
         assert_eq!(
-            grain_line(&table, &notes).as_deref(),
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
             Some(
                 "    grain: one row per year x region; measures: orders, net_amt, active (SUM them over rows for any total)\n"
             )
@@ -1919,7 +1998,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            grain_line(&table, &notes),
+            grain_line(&table, &notes, Grain::Advice),
             Some(format!(
                 "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
             ))
@@ -1942,7 +2021,7 @@ mod tests {
         ]);
         let notes = notes(vec![], vec![role_of("active", "flag", true)]);
         assert_eq!(
-            grain_line(&table, &notes).as_deref(),
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
             Some(
                 "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total)\n"
             )
@@ -1969,7 +2048,7 @@ mod tests {
                 role_of("visitors", "non_additive", true),
             ],
         );
-        let line = grain_line(&table, &notes).unwrap_or_default();
+        let line = grain_line(&table, &notes, Grain::Advice).unwrap_or_default();
         assert!(!line.contains("SUM them"), "{line}");
         assert!(!line.contains("measures:"), "{line}");
         assert_eq!(
@@ -1997,7 +2076,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            grain_line(&table, &notes),
+            grain_line(&table, &notes, Grain::Advice),
             Some(format!(
                 "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
             ))
@@ -2023,7 +2102,7 @@ mod tests {
             ]);
             let notes = notes(vec![], vec![role_of("wave", role, true)]);
             assert_eq!(
-                grain_line(&table, &notes).as_deref(),
+                grain_line(&table, &notes, Grain::Advice).as_deref(),
                 Some(
                     "    grain: one row per region x wave; measures: net_amt (SUM them over rows for any total)\n"
                 ),
@@ -2042,7 +2121,7 @@ mod tests {
         ]);
         let notes = notes(vec![], vec![role_of("active", "flag", true)]);
         assert_eq!(
-            grain_line(&table, &notes).as_deref(),
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
             Some(
                 "    grain: one row per year x region x active; measures: net_amt (SUM them over rows for any total)\n"
             )
@@ -2064,7 +2143,7 @@ mod tests {
         ]);
         let notes = notes(vec![], vec![role_of("band", "non_additive", true)]);
         assert_eq!(
-            grain_line(&table, &notes),
+            grain_line(&table, &notes, Grain::Advice),
             Some(format!(
                 "    grain: one row per year x region x band; measures: net_amt (SUM them over rows for any total); not additive: band {NOT_ADDITIVE_ADVICE}\n"
             ))
@@ -2083,7 +2162,7 @@ mod tests {
             vec![role_of("monthly_active_users", "non_additive", true)],
         );
         assert_eq!(
-            grain_line(&table, &notes),
+            grain_line(&table, &notes, Grain::Advice),
             Some(format!(
                 "    grain: one row per region x monthly_active_users; measures: net_amt (SUM them over rows for any total); not additive: monthly_active_users {NOT_ADDITIVE_ADVICE}\n"
             ))
@@ -2094,7 +2173,7 @@ mod tests {
     fn a_table_left_with_no_measure_and_no_non_additive_column_has_no_grain_line() {
         let table = sales_with(&[("region", "String"), ("active", "UInt8")]);
         let notes = notes(vec![], vec![role_of("active", "flag", true)]);
-        assert_eq!(grain_line(&table, &notes), None);
+        assert_eq!(grain_line(&table, &notes, Grain::Advice), None);
     }
 
     #[test]
@@ -2118,6 +2197,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::from([("orders".to_owned(), "range 1..9".to_owned())]),
             &notes,
+            Grain::Advice,
         );
         assert!(
             out.contains(

@@ -301,7 +301,9 @@ async fn users_terms(
 /// MAP is matched to (`AI_RELEVANT_TABLES`).
 ///
 /// With `AI_ASK_BACK` off the text is what it was before the switch
-/// existed.
+/// existed. `AI_SEMANTIC_LAYER` adds [`prompt::DISTINCT_COUNT_RULES`] after
+/// the mode text and the ask-back rules, in both modes; with it off that
+/// block is absent.
 async fn system_prompt(
     state: &AppState,
     principal: Option<&Principal>,
@@ -350,11 +352,16 @@ async fn system_prompt(
     } else {
         format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
     };
-    let rules = if state.config.ai_ask_back && asking {
-        prompt::ASK_BACK_RULES
-    } else {
-        ""
-    };
+    let mut rules = String::new();
+    if state.config.ai_ask_back && asking {
+        rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    // Read from the switch alone, in both modes: a count that overlaps
+    // between rows is a fact about the data, not about asking back. With
+    // the switch off the text is what it was before the block existed.
+    if state.config.ai_semantic_layer {
+        rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
     let words = prompt::user_words_section(&terms);
     let ctx_line = page_context_line(context);
     (if schema.is_empty() {
@@ -1918,6 +1925,15 @@ mod tests {
         ])
     }
 
+    /// [`state_with_ask_back`] with `AI_SEMANTIC_LAYER` set too.
+    fn state_with_ask_back_and_layer(ask_back: &str, layer: &str) -> AppState {
+        state_with_env(&[
+            ("AI_ASK_BACK", ask_back),
+            ("AI_SEMANTIC_LAYER", layer),
+            ("DATABASE_URL", "not a postgres url"),
+        ])
+    }
+
     /// Length and FNV-1a fingerprint of `prompt::SYSTEM_BASE` as committed
     /// before this change, computed from the file's text and not from this
     /// code.
@@ -1946,7 +1962,9 @@ mod tests {
 
     #[tokio::test]
     async fn with_ask_back_off_the_prompt_is_the_text_it_was_before_the_switch() {
-        let state = state_with_ask_back("false");
+        // The layer is on by default and adds its own block; this test pins
+        // what the ask-back switch alone does.
+        let state = state_with_ask_back_and_layer("false", "false");
         let headers = axum::http::HeaderMap::new();
         for asking in [false, true] {
             let ask =
@@ -1974,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_ask_back_on_the_rules_come_after_the_mode_text_and_before_the_data_map() {
-        let state = state_with_ask_back("true");
+        let state = state_with_ask_back_and_layer("true", "false");
         let headers = axum::http::HeaderMap::new();
         let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
         assert_eq!(
@@ -1987,6 +2005,88 @@ mod tests {
             )
         );
         assert!(prompt::ASK_BACK_RULES.contains("ask_user"));
+    }
+
+    #[tokio::test]
+    async fn with_the_semantic_layer_off_the_prompt_is_the_text_it_was_before_the_count_rules() {
+        // Today's prompt for one fixed input, spelled out from the pieces
+        // that existed before `DISTINCT_COUNT_RULES`.
+        let headers = axum::http::HeaderMap::new();
+        for ask_back in ["false", "true"] {
+            let state = state_with_ask_back_and_layer(ask_back, "false");
+            let rules = if ask_back == "true" {
+                prompt::ASK_BACK_RULES
+            } else {
+                ""
+            };
+            let ask =
+                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+            assert_eq!(
+                ask,
+                format!(
+                    "{}{}{rules}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                    prompt::SYSTEM_BASE,
+                    prompt::SYSTEM_ASK_SUFFIX
+                )
+            );
+            let build =
+                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], true).await;
+            assert_eq!(
+                build,
+                format!(
+                    "{}{}{rules}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                    prompt::SYSTEM_BASE,
+                    prompt::SYSTEM_BUILD_SUFFIX
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_the_semantic_layer_on_the_count_rules_follow_the_mode_text_in_both_modes() {
+        // The layer is on when unset, so this is the default deployment.
+        let headers = axum::http::HeaderMap::new();
+        let state = state_with_env(&[
+            ("AI_ASK_BACK", "false"),
+            ("DATABASE_URL", "not a postgres url"),
+        ]);
+        let ask = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        assert_eq!(
+            ask,
+            format!(
+                "{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
+        let build = system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], false).await;
+        assert_eq!(
+            build,
+            format!(
+                "{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_BUILD_SUFFIX,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
+        let state = state_with_ask_back_and_layer("true", "true");
+        let headers = axum::http::HeaderMap::new();
+        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        assert_eq!(
+            text,
+            format!(
+                "{}{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX,
+                prompt::ASK_BACK_RULES,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
     }
 
     #[tokio::test]
