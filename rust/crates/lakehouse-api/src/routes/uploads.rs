@@ -39,7 +39,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   seven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   eight the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -211,10 +211,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these seven (review finding
+// shows a recorded reason only when it is one of these eight (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same seven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same eight as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -226,10 +226,14 @@ const JOB_NO_ROWS: &str = "The file has no rows below the header row.";
 const JOB_TOO_MANY_ROWS: &str = "The file has more than 2,000,000 rows.";
 const JOB_LOAD_FAILED: &str = "The load into the table failed.";
 const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be registered in the catalog.";
+// `SEC-17`: the one sentence for the column cap, as the preview's and the
+// ingest's 400 and as the job's failure reason (`TOO_MANY_COLUMNS` in
+// `file_ingest.py`). One constant, so the three cannot word it differently.
+const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 7] = [
+const JOB_FAILURE_REASONS: [&str; 8] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -237,6 +241,7 @@ const JOB_FAILURE_REASONS: [&str; 7] = [
     JOB_TOO_MANY_ROWS,
     JOB_LOAD_FAILED,
     JOB_NOT_REGISTERED,
+    JOB_TOO_MANY_COLUMNS,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -923,7 +928,8 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 ///
 /// # Errors
 ///
-/// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid; 404
+/// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid, and
+/// for a header with more than 1,000 columns (`SEC-17`); 404
 /// for an unknown upload or another tenant's; 503 when Postgres or the object
 /// store is unavailable.
 pub async fn preview(
@@ -944,6 +950,13 @@ pub async fn preview(
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    // `SEC-17`: a header with more than `MAX_COLUMNS` cells is refused here,
+    // not shown. The 400 is per reading, so the Check step can still change
+    // the delimiter or header row (a wrong guess must not lock a good file
+    // out).
+    if upload_parse::header_width(&head, head_is_truncated, overrides) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
     Ok(ApiJson(upload_parse::preview(
         &head,
         head_is_truncated,
@@ -1247,7 +1260,9 @@ async fn launch(
 ///
 /// # Errors
 ///
-/// 400 for a body that is not valid (each field has its own sentence); 404
+/// 400 for a body that is not valid (each field has its own sentence) and for
+/// a header with more than 1,000 columns under the confirmed reading
+/// (`SEC-17`, checked before any claim); 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
 /// loading, another is loading into that table, a connector loads it, or the
 /// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
@@ -1275,6 +1290,21 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
+    // `SEC-17`: count the header's cells under the reading the user confirmed,
+    // before any claim, mark or launch, so a file the job would refuse
+    // leaves no table claim behind. The job counts the whole file and stays
+    // the authority.
+    let store = UploadStore::connect(&state.config).await?;
+    let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
+    let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    let confirmed = Overrides {
+        encoding: Some(request.encoding),
+        delimiter: Some(request.delimiter),
+        header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+    };
+    if upload_parse::header_width(&head, head_is_truncated, confirmed) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
@@ -1887,8 +1917,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the seven the API knows (six before finding C2). Each of the
-    /// seven is kept; text that is near one of them, text with detail added,
+    /// one of the eight the API knows (six before finding C2). Each of the
+    /// eight is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -1923,8 +1953,8 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the seven reasons the API knows are the
-    /// seven in the file the job's own tests assert its constants against
+    /// Review findings B6 and C2: the eight reasons the API knows are the
+    /// eight in the file the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -1940,7 +1970,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 7, "seven different reasons");
+        assert_eq!(distinct.len(), 8, "eight different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

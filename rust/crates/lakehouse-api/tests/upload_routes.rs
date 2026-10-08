@@ -1639,6 +1639,102 @@ async fn the_mode_defaults_to_replace() {
     );
 }
 
+/// `SEC-17`: a CSV whose header has `columns` cells, and one row.
+fn csv_of_width(columns: usize) -> Vec<u8> {
+    let names: Vec<String> = (0..columns).map(|n| format!("c{n}")).collect();
+    format!("{}\n1\n", names.join(",")).into_bytes()
+}
+
+const TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
+
+/// `SEC-17`: 1,000 columns is the largest width that previews; one more is a
+/// 400 with the fixed sentence, and the same file read under another
+/// delimiter previews again.
+#[tokio::test]
+async fn a_preview_over_1000_columns_is_400_and_a_preview_of_1000_is_not() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let fits = stack.upload(&bayu, "fits.csv", &csv_of_width(1_000)).await;
+    let wide = stack.upload(&bayu, "wide.csv", &csv_of_width(1_001)).await;
+
+    let ok = stack
+        .get(&bayu, &format!("/api/uploads/{}/preview", id_of(&fits)))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+    assert_eq!(ok.json["columns"].as_array().unwrap().len(), 1_000);
+
+    let uri = format!("/api/uploads/{}/preview", id_of(&wide));
+    let refused = stack.get(&bayu, &uri).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+    assert_eq!(refused.json["error"], TOO_MANY_COLUMNS);
+
+    // A wrong delimiter must not lock a good file out: under a semicolon the
+    // same bytes are one column.
+    let again = stack.get(&bayu, &format!("{uri}?delimiter=%3B")).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+    assert_eq!(again.json["columns"].as_array().unwrap().len(), 1);
+}
+
+/// `SEC-17`: a header of nothing but commas, longer than the 256 KiB the
+/// preview reads, is refused (the cut record is counted, not dropped).
+#[tokio::test]
+async fn a_header_of_commas_longer_than_the_preview_is_refused() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "commas.csv", &vec![b','; 300 * 1024])
+        .await;
+
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{}/preview", id_of(&upload)))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], TOO_MANY_COLUMNS);
+}
+
+/// `SEC-17`: an ingest over the cap is a 400 before any claim, mark or
+/// launch: no table claim, the row still `uploaded`, no run launched.
+#[tokio::test]
+async fn an_ingest_over_1000_columns_is_400_and_claims_marks_and_launches_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "wide.csv", &csv_of_width(1_001)).await;
+    let id = id_of(&upload);
+
+    let reply = stack.ingest(&bayu, &id, ingest_body("wide_raw")).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], TOO_MANY_COLUMNS);
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
+    let row = stack.status_of(&id).await;
+    assert_eq!((row.0.as_str(), row.1, row.2), ("uploaded", None, None));
+    assert_eq!(
+        count_requests_containing(&stack.dagster, "launchRun").await,
+        0,
+        "no run was launched"
+    );
+}
+
+/// `SEC-17`: the cap is not a reason to refuse the largest file allowed.
+#[tokio::test]
+async fn an_ingest_of_1000_columns_is_launched() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "fits.csv", &csv_of_width(1_000)).await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("fits_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["runId"], "run-1");
+}
+
 /// Review finding B2: the row is claimed before the launch, so two requests
 /// sent at the same moment cannot both launch.
 ///
