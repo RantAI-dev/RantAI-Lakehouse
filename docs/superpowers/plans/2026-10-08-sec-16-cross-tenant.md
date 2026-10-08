@@ -263,6 +263,17 @@ New or changed Rust tests, all awaiting CI:
 - Not changed: `routes/lineage.rs`, `routes/pipelines.rs`, Dagster, the
   spec's "Today" column, any migration or dependency.
 
+**CI fix (test only).** `connector_ingestible_tenant.rs` inserted every
+fixture connector with the same `name`, and `connector.name` is unique
+(`connector_name_unique`, migration 0013): all five tests failed with 23505.
+The name is now bound and derived from the id (rule 2: the test was wrong,
+nothing weakened). Re-read against the migrations: the other new insert
+(`upload_routes.rs`, one connector per test database, name not seeded) has a
+unique name and id; the seeded users, tenants and roles the new tests use
+exist as assumed (`0002_seed_identity.sql`; Data Engineer gets `ingest:read`
+in `0033`); Bayu is in two tenants, so his ingestible test now sends
+`X-Tenant`. Still not run (Rust).
+
 ## 8. Review
 
 (The planner writes here.)

@@ -39,12 +39,15 @@ async fn seed_connector(app: &TestApp, id: &str, tenant: Option<&str>) {
          name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
          ($1, $2, \
-         'ingestible tenant test', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
+         $3, 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
     .bind(id)
     .bind(tenant_id)
+    // `connector.name` is unique (`connector_name_unique`), so each fixture
+    // gets a name of its own, derived from its id (SEC-16 test fix).
+    .bind(format!("ingestible test {id}"))
     .execute(&app.pool)
     .await
     .expect("seed a sql-adapter connector");
@@ -100,7 +103,9 @@ async fn a_user_sees_their_own_tenants_connector_and_not_another_tenants() {
     let app = spin_up().await;
     seed_three(&app).await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
-    let (status, ids) = ingestible(&app, ("cookie", &bayu), None).await;
+    // Bayu is in Group and Logistics; naming Group keeps the test independent
+    // of which membership comes first.
+    let (status, ids) = ingestible(&app, ("cookie", &bayu), Some(GROUP)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ids, vec![GROUP_CONNECTOR.to_owned()]);
 }
