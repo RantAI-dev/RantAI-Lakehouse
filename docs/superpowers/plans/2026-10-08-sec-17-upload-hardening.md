@@ -173,7 +173,70 @@ handoff. CI on the pull request runs them.
 
 ## 7. Handoff
 
-(The developer writes here.)
+Developer: Claude Sonnet 5.5. Branch `fix/sec-17-upload-hardening`, one slice
+(all tasks), eight task commits on top of `1e47938`.
+
+### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `e8ac7f8` | fix(api): refuse a file with more than 1,000 columns at preview and ingest |
+| T2 | `92c2018` | fix(api): limit uploads in progress per user and in total |
+| T3 | `2a8e936` | fix(api): query CSV download writes cells that cannot run a formula |
+| T4 | `2121421` | docs(api): no other CSV writer in the API needs the formula rule (empty commit, the finding) |
+| T5 | `3636e12` | fix(dagster): the file load refuses a header of more than 1,000 columns |
+| T6 | `9ea65bc` | fix(frontend): CSV files the console writes cannot run a formula |
+| T7 | `8590342` | fix(frontend): keep the Check step's controls when the file has too many columns |
+| T8 | `deaa69b` | docs(ops): gate step, changelog and settings for the SEC-17 upload limits |
+
+### Commands run, with results
+
+All Rust commands with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, in the foreground.
+
+- `cd rust && cargo fmt --check`: clean on the final commit.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D warnings`: finished, 0 warnings, on the final commit. (`--all-targets` type-checks the unit and integration tests without linking them.) Also run per Rust commit as `cargo clippy -p lakehouse-api` / `-p lakehouse-store --all-targets -- -D warnings`.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings (all in files this change does not touch, present before).
+- `bun run test`: 877 pass, 1 skip, 0 fail, 878 tests in 99 files.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK.
+- `docker compose --profile '*' config --quiet`: exit 0, no output.
+- `git status`: clean apart from the untracked `node_modules` symlink (not staged).
+
+### Not verified, and why
+
+- **Every Rust test** (`cargo test` is forbidden on this machine): the new unit tests in `upload_parse.rs`, `upload_limits.rs`, `csv_safe.rs`, `config.rs`; the `sqlx::test` store tests in `lakehouse-store/tests/uploads.rs`; the route tests in `lakehouse-api/tests/upload_routes.rs` and `query_download.rs`; and every existing Rust test (the changed `ingest` now reads the stored object before the claim). Only compilation (clippy `--all-targets`) is shown.
+- `(cd dagster && python -m pytest ...)`: `pytest` and `dagster` are not installed here. The new tests in `test_file_ingest.py` and the changed one (seven to eight reasons) were not run. Only `ast.parse` of both files was checked.
+- `ops/g9/upload_test.py` step 8: needs a running stack; only `ast.parse`.
+- `docker compose up` for the two new variables (AGENTS.md rule 8): not done; only `config --quiet`. The change is two `${X:-}` lines on the API service.
+- Console behaviour in a browser (the Check step with the controls on a first-read 400): component tests only.
+
+### Tests most likely to fail in CI, and why
+
+1. `the_fifth_simultaneous_upload_of_one_user_is_429_with_retry_after` (`upload_routes.rs`): five uploads in `tokio::join!` over a 1.5 s delayed `PUT`; it counts exactly four 201 and one 429, so it depends on all five reaching the handler within 1.5 s. A slow CI database could break the overlap (then it would see five 201). It is the only timing-based test. It also assumes `wiremock` priority 1 beats the default `PUT` mock, as `break_bucket` relies on.
+2. `a_fifth_load_of_one_uploader_is_429_and_claims_and_launches_nothing` and `loads_of_another_uploader_do_not_count_against_this_one`: they build the four loads with `seed_loading` (uploaded by `Seeded Uploader`) and ingest a fifth seeded upload as Bayu. They rely on `ingest` counting the upload's recorded `uploaded_by` and not Bayu's name (decision D6). If the store's `COLS` or `seed` change, they fail.
+3. `a_header_of_commas_longer_than_the_preview_is_refused`: 300 KiB of commas goes through `sniff` and `check_file` at upload; I read both and expect it accepted as text, but did not run it.
+4. `lakehouse-store` tests (`mark_ingesting_within_limits`): first use of `pool.begin()` with the advisory lock for this table; `under_limits` takes `&mut PgConnection` and is called with `&mut tx` (it compiles under clippy).
+5. `the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture`: the fixture has the eighth sentence appended last; the Rust and Python constants are in that order.
+6. Python: `test_a_header_of_1001_columns_is_refused_before_any_row_is_read` relies on a header-only file otherwise failing as `NO_ROWS`, which `parse_file` does.
+
+### Mismatches between the plan and the code, and what I chose
+
+1. **"The claim made just before it must be released, as the existing refusal paths release it" (T2).** No existing path releases a table claim: `uploads.rs` (store) states "A claim is NEVER RELEASED", and `ingest` leaves the claim after a conflict or a failed launch. I did not add a release (that would break the module's invariant). Instead `ingest` asks a read-only count (`uploads::loads_under_limits`) before `claim_table`, so the normal refusal leaves no claim and the row `uploaded`; the locked count in `mark_ingesting_within_limits` stays the decision. In the race where a request passes the read and loses the locked count, the claim stands, like a claim after a failed launch. The route test for the 429 asserts no claim for the normal case. **Planner: confirm this is acceptable, or ask for a claim-and-mark in one transaction.**
+2. **E9 "rewritten ... by a small state machine" and T3 `format=parquet`:** done as planned; the CSV test also covers the existing happy path (`n\n1\n2\n` is unchanged).
+3. **E3/T7 "the Check step shows it and keeps its controls".** Not tests-only: on a first-read 400 the step had only a Retry button (no preview, so no controls). `UploadCheckStep` now renders the controls with an undecided "Detected by the service" option when the failure is `invalid_request` and nothing is shown yet. The client already carried the 429 and 400 sentences and statuses unchanged, so no client change (tests added).
+4. **Per-user key for received files.** `create` has no `uploaded_by`; it uses `principal.display_name`, the same text `uploaded_by` records (two users with one display name share a place count; the same holds for loads).
+5. **Where the 400 is checked in `ingest`:** after the `ingesting` and tenant checks and before `ensure_table_free` (the first external call), reading the head with `head_bytes`. A missing object now answers 503 from `ingest` where it used to answer from the launch; no existing test seeds an upload without its object.
+6. **Python `parse_file`:** the column count is taken on a header list the reader already built, so a 50 MB header of commas still builds that list in the job before it is refused. The API refuses such a file first; the job is the authority for a load started another way.
+
+### T4: what each file does
+
+- `rust/crates/lakehouse-api/src/gold_export.rs`: exports a Gold mart to Iceberg (Parquet files) through `iceberg-rust`. The only "CSV" in it is a test string, `url('h', 'CSV')`, for the read-only SQL gate. Writes no CSV a person downloads. No change.
+- `rust/crates/lakehouse-api/src/routes/alerts.rs`: the only "CSV" is a gate test (`url('http://example.com/x.csv', 'CSV')`). No CSV is written. No change.
+- `rust/crates/lakehouse-api/src/routes/support.rs`: the only "CSV" is the same kind of gate test string. No change.
+- A search for `text/csv`, `FORMAT CSV`, `to_csv` and `.csv` over `rust/crates` finds one writer, `routes/query.rs` `download` (done in T3). The console's writers all go through `toCsv` in `src/lib/csv.ts` (T6).
+
+### Open decisions (the product owner's)
+
+D1 to D8 of the feature page are unsigned; the defaults are built. The page's acceptance checklist is for the product owner on a running console and was not run.
 
 ## 8. Review
 
