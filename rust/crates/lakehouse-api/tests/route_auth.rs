@@ -730,6 +730,12 @@ async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
             "endpoints": [],
         },
         "sourceObjects": [],
+        // SEC-14: this body moves `conn-pg-lakehouse` from `sql` to `rest`,
+        // which is a re-point and so needs its credential in the same
+        // request; without it the answer would be the 409 of that rule
+        // (tests/connector_repoint.rs), not the address check's 400 this
+        // test is about. The credential is a throwaway bearer token.
+        "credential": { "primary": { "kind": "token", "value": "throwaway-token" } },
     });
 
     let response = router

@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
+import { targetChanged } from "@/lib/connectors/target-identity"
 import { connectorService } from "@/services"
 import { isServiceError } from "@/services/errors"
 import type {
@@ -22,6 +23,7 @@ import type {
   ConnectorType,
   CredentialKind,
   IngestSpec,
+  IngestSpecInput,
   SetConnectorCredentialRequest,
   UpdateConnectorInput,
 } from "@/services/contracts/connectors"
@@ -66,6 +68,12 @@ type SaveStep = { label: string; status: "done" | "failed"; message?: string; no
  * (ingest spec), tenant — followed by a connection test. It stops at the
  * first failure and reports exactly which parts were saved, rather than a
  * bare "failed".
+ *
+ * A change of where the connector points (`SEC-14`: host, port, database,
+ * endpoint, bucket, base URL, brokers…) is the exception to that sequence.
+ * The stored credential is never sent to a new place, so the credential
+ * inputs become required and travel WITH the connection settings in one
+ * ingest-spec request, which the server tests and saves as one step.
  *
  * The type is shown but not editable: it fixes the adapter, the shape of the
  * connection settings and the credential names, so a different type is a
@@ -127,9 +135,15 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   const [testResult, setTestResult] = React.useState<ConnectorTestResult | null>(null)
 
   const noCredential = needsNoCredential(adapter, dial)
+  const dialChanged = JSON.stringify(dial ?? {}) !== JSON.stringify(originalDial)
+  // SEC-14: pointing the connector somewhere else needs the credential again.
+  // The server decides (its function is the authority); this only decides
+  // what the form asks for.
+  const repoints =
+    dialChanged && targetChanged({ storedAdapter: spec.adapter ?? null, storedDial: originalDial, adapter, dial })
   const problems = credentialProblems({
     noCredential,
-    optional: !signInChanged,
+    optional: !signInChanged && !repoints,
     slots,
     primaryValue,
     secondaryValue,
@@ -141,8 +155,11 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   if (direction !== detail.direction) basic.direction = direction
   if (environment.trim() !== detail.environment) basic.environment = environment.trim()
   if (residency.trim() !== detail.residency) basic.residency = residency.trim()
-  const dialChanged = JSON.stringify(dial ?? {}) !== JSON.stringify(originalDial)
-  if (dialChanged) {
+  // The `host` column is only a label for a connector that dials from its
+  // dial; a connector with no adapter yet, or a `files` one, still dials from
+  // it, and the API refuses to change it here (SEC-14).
+  const hostIsDialed = spec.adapter === null || spec.adapter === "files"
+  if (dialChanged && !hostIsDialed) {
     const host = hostFromDial(adapter, dial)
     if (host) basic.host = host
   }
@@ -184,55 +201,72 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
         return false
       }
     }
-    const credential: SetConnectorCredentialRequest = dialChanged ? { dial: (dial ?? {}) as IngestSpec["dial"] } : {}
+    const values: Pick<SetConnectorCredentialRequest, "primary" | "secondary"> = {}
     if (credentialTyped) {
-      credential.primary = { kind: slots.primary.kind, value: normalizedCredential(slots.primary, primaryValue) }
+      values.primary = { kind: slots.primary.kind, value: normalizedCredential(slots.primary, primaryValue) }
       if (slots.secondary) {
-        credential.secondary = {
+        values.secondary = {
           kind: slots.secondary.kind,
           value: normalizedCredential(slots.secondary, secondaryValue),
         }
       }
     }
+    const credential: SetConnectorCredentialRequest = {
+      ...(dialChanged ? { dial: (dial ?? {}) as IngestSpec["dial"] } : {}),
+      ...values,
+    }
+    const specInput: IngestSpecInput = {
+      adapter: adapter as NonNullable<IngestSpec["adapter"]>,
+      ingestMode: spec.ingestMode ?? (adapter === "cdc" ? "cdc" : "batch"),
+      dial: (dial ?? {}) as IngestSpec["dial"],
+      // Kept as they are: this page does not edit what is ingested.
+      sourceObjects: spec.sourceObjects,
+      ...(spec.scheduleCron ? { scheduleCron: spec.scheduleCron } : {}),
+      // Pointing somewhere else: the credential goes with the settings, in
+      // one request, and is never kept (SEC-14).
+      ...(repoints && credentialTyped ? { credential: values } : {}),
+    }
     // Never keep a credential in memory longer than the request needs it.
     setPrimaryValue("")
     setSecondaryValue("")
 
-    // Order matters: the credential goes BEFORE the connection settings.
-    // It is tested with the settings this edit makes (sent along with it),
-    // and a sign-in method that needs a second credential (REST basic auth)
-    // is only accepted once that credential exists.
+    const saveConnection = record(
+      repoints ? "Connection settings and credential (tested against the new place first)" : "Connection settings",
+      async () => {
+        await connectorService.setIngestSpec(detail.id, specInput)
+      }
+    )
+    const saveBasic = record("Name, direction, environment and residency", async () => {
+      await connectorService.updateConnector(detail.id, basic)
+    })
+    const saveTenant = record("Tenant", async () => {
+      await connectorService.assignTenant(detail.id, tenantId)
+    })
+
     const sequence: (() => Promise<boolean>)[] = []
-    if (basicChanged) {
-      sequence.push(record("Name, direction, environment and residency", async () => {
-        await connectorService.updateConnector(detail.id, basic)
-      }))
+    if (repoints) {
+      // Connection settings and credential first: if the server refuses them
+      // (409, or the credential does not work at the new place), nothing else
+      // has been saved.
+      sequence.push(saveConnection)
+      if (basicChanged) sequence.push(saveBasic)
+    } else {
+      // Order matters: the credential goes BEFORE the connection settings.
+      // It is tested with the settings this edit makes (sent along with it),
+      // and a sign-in method that needs a second credential (REST basic auth)
+      // is only accepted once that credential exists.
+      if (basicChanged) sequence.push(saveBasic)
+      if (credentialTyped) {
+        sequence.push(record("Credential (tested against the source first)", async () => {
+          const saved = await connectorService.setCredential(detail.id, credential)
+          return saved.verified
+            ? undefined
+            : `stored without a test: this connector type cannot be tested yet (${saved.message})`
+        }))
+      }
+      if (dialChanged) sequence.push(saveConnection)
     }
-    if (credentialTyped) {
-      sequence.push(record("Credential (tested against the source first)", async () => {
-        const saved = await connectorService.setCredential(detail.id, credential)
-        return saved.verified
-          ? undefined
-          : `stored without a test: this connector type cannot be tested yet (${saved.message})`
-      }))
-    }
-    if (dialChanged) {
-      sequence.push(record("Connection settings", async () => {
-        await connectorService.setIngestSpec(detail.id, {
-          adapter: adapter as NonNullable<IngestSpec["adapter"]>,
-          ingestMode: spec.ingestMode ?? (adapter === "cdc" ? "cdc" : "batch"),
-          dial: (dial ?? {}) as IngestSpec["dial"],
-          // Kept as they are: this page does not edit what is ingested.
-          sourceObjects: spec.sourceObjects,
-          ...(spec.scheduleCron ? { scheduleCron: spec.scheduleCron } : {}),
-        })
-      }))
-    }
-    if (tenantChanged) {
-      sequence.push(record("Tenant", async () => {
-        await connectorService.assignTenant(detail.id, tenantId)
-      }))
-    }
+    if (tenantChanged) sequence.push(saveTenant)
 
     let allSaved = true
     for (const run of sequence) {
@@ -336,7 +370,9 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
             label: "Credential",
             value: `New ${slots.primary.label.toLowerCase()}${
               slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
-            } · tested before it replaces the current one`,
+            } · ${
+              repoints ? "sent with the new connection settings and tested against them" : "tested before it replaces the current one"
+            }`,
           },
         ]
       : []),
@@ -405,14 +441,16 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 icon={<KeyRoundIcon className="size-4" />}
                 title="Credential"
                 description={
-                  signInChanged
-                    ? "The sign-in method changed, so the stored credential no longer fits. Enter the new one."
-                    : "Leave blank to keep the current credential."
+                  repoints
+                    ? "This points the connector at a different place, so the stored credential is not sent there. Enter it again."
+                    : signInChanged
+                      ? "The sign-in method changed, so the stored credential no longer fits. Enter the new one."
+                      : "Leave blank to keep the current credential."
                 }
               />
               <CredentialFields
                 noCredential={noCredential}
-                optional={!signInChanged}
+                optional={!signInChanged && !repoints}
                 credentialManaged={detail.credentialManaged}
                 slots={slots}
                 primaryValue={primaryValue}

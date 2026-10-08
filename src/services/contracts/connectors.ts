@@ -541,6 +541,18 @@ export type IngestSpecInput = {
   dial: Dial
   sourceObjects: SourceObject[]
   scheduleCron?: string
+  /**
+   * The connector's credentials, sent again when this save changes where the
+   * connector points (host, port, database, endpoint, bucket, base URL,
+   * brokers; `SEC-14`). Every slot the new settings read must be here,
+   * otherwise the server answers 409 and saves nothing. The server tests the
+   * new settings with these credentials first and saves them together with
+   * the spec. Write-only: never read back. Omit it for any other save.
+   */
+  credential?: {
+    primary?: CredentialSlotValue
+    secondary?: CredentialSlotValue
+  }
 }
 
 /**

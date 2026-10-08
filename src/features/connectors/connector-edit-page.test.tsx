@@ -209,33 +209,123 @@ describe("ConnectorEditPage", () => {
   })
 
   /**
-   * Changing the connection re-saves the ingest spec with the tables and
-   * schedule it already had (this page does not edit those) and keeps the
-   * row's `host` label in step. The credential goes FIRST, carrying the new
-   * settings, so its server-side test dials where the connector will.
+   * Changing a connection setting that does not move the connector (here
+   * the user) re-saves the ingest spec with the tables and schedule it
+   * already had (this page does not edit those) and keeps the row's `host`
+   * label in step. Nothing asks for the credential and none is sent: the
+   * stored one still goes to the same place.
    */
-  it("keeps the ingested tables and schedule when the connection changes", async () => {
+  it("keeps the ingested tables and schedule when the connection changes without moving", async () => {
     const calls = stubFetch()
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))
     next(page)
-    fireEvent.change(page.getByLabelText("Host"), { target: { value: "10.0.0.9" } })
-    fireEvent.change(page.getByLabelText("Password"), { target: { value: "pw" } })
+    fireEvent.change(page.getByLabelText("User"), { target: { value: "someone_else" } })
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false)
     next(page)
     next(page)
     fireEvent.click(page.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
 
     const w = writes(calls)
-    expect(w[0].body).toEqual({ host: "10.0.0.9" })
-    expect(w[1].url).toContain("/credential")
-    const credential = w[1].body as Record<string, unknown>
-    expect((credential.dial as Record<string, unknown>).host).toBe("10.0.0.9")
-    const spec = w[2].body as Record<string, unknown>
-    expect(w[2].url).toContain("/ingest-spec")
+    expect(w.some((c) => c.url.endsWith("/credential"))).toBe(false)
+    const save = w.find((c) => c.url.endsWith("/ingest-spec"))!
+    const spec = save.body as Record<string, unknown>
     expect(spec.sourceObjects).toEqual(SPEC.sourceObjects)
     expect(spec.scheduleCron).toBe("0 * * * *")
+    expect((spec.dial as Record<string, unknown>).user).toBe("someone_else")
+    expect("credential" in spec).toBe(false)
+  })
+
+  /**
+   * SEC-14: pointing the connector at another host cannot keep the stored
+   * credential, so the password is required before the form moves on, and it
+   * travels WITH the connection settings in one ingest-spec request (no
+   * separate credential call). The host label follows, after the settings.
+   */
+  it("asks for the credential again when the host changes and sends it with the settings", async () => {
+    const calls = stubFetch()
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.change(page.getByLabelText("Host"), { target: { value: "10.0.0.9" } })
+    // Blank no longer means "keep": the stored password is not sent to a new host.
+    expect(page.getByText(/points the connector at a different place/)).toBeDefined()
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "pw" } })
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false)
+    next(page)
+    next(page)
+    expect(page.queryByText(/pw$/)).toBeNull()
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+
+    const w = writes(calls)
+    expect(w.some((c) => c.url.endsWith("/credential"))).toBe(false)
+    expect(w[0].url).toContain("/ingest-spec")
+    const spec = w[0].body as Record<string, unknown>
     expect((spec.dial as Record<string, unknown>).host).toBe("10.0.0.9")
+    expect(spec.credential).toEqual({ primary: { kind: "password", value: "pw" } })
+    expect(spec.sourceObjects).toEqual(SPEC.sourceObjects)
+    expect(spec.scheduleCron).toBe("0 * * * *")
+    expect(w[1].body).toEqual({ host: "10.0.0.9" })
+  })
+
+  /**
+   * When the server refuses the re-point (409, or a credential that does not
+   * work at the new place) its message is shown, and nothing after it runs:
+   * not the label, not the connection test.
+   */
+  it("shows the server's message when it refuses to point the connector elsewhere", async () => {
+    const calls = stubFetch({
+      "PUT /api/connectors/conn-a/ingest-spec": () =>
+        json({ error: "the change was NOT saved: PostgreSQL connection failed: authentication failed" }, 422),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.change(page.getByLabelText("Host"), { target: { value: "10.0.0.9" } })
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "wrong" } })
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+
+    await waitFor(() => expect(page.getByText("Some changes were not saved")).toBeDefined())
+    expect(page.getByText(/Not saved · Connection settings and credential .*authentication failed/)).toBeDefined()
+    expect(writes(calls).map((c) => c.method)).toEqual(["PUT"])
+  })
+
+  /**
+   * A connector with no adapter yet dials from its `host` column, which the
+   * API will not change through PATCH. Its first connection settings are not
+   * a re-point (no credential is asked for), and the label is not sent.
+   */
+  it("does not send the host label for a connector that has no connection settings yet", async () => {
+    const calls = stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({
+          adapter: null,
+          ingestMode: null,
+          dial: {},
+          sourceObjects: [],
+          scheduleCron: null,
+          secretRefs: { primary: "env:CONNECTOR_CONN_A_PASSWORD", secondary: null },
+        }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.change(await waitFor(() => page.getByLabelText("Host")), { target: { value: "10.0.0.9" } })
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false)
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+
+    const w = writes(calls)
+    expect(w.some((c) => c.method === "PATCH")).toBe(false)
+    expect(w.some((c) => c.url.endsWith("/credential"))).toBe(false)
+    expect("credential" in (w[0].body as Record<string, unknown>)).toBe(false)
   })
 
   it("says so plainly when moving tenants is not permitted", async () => {

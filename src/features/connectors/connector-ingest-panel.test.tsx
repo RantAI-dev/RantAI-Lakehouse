@@ -253,7 +253,9 @@ describe("ConnectorIngestPanel layout", () => {
     expect(card("Schedule").getByLabelText("Schedule")).toBeDefined()
     expect(card("Schedule").getByRole("button", { name: "Save tables and schedule" })).toBeDefined()
     expect(card("Runs").getByRole("button", { name: "Run now" })).toBeDefined()
-    expect(card("Runs").getByText("No runs yet.")).toBeDefined()
+    // The runs card loads its own two lists after the spec, and shows a
+    // skeleton until both are in: wait for the sentence, do not read it at once.
+    expect(await card("Runs").findByText("No runs yet.")).toBeDefined()
   })
 
   it("puts tables and schedule in a wider left column and the runs in the right one from xl up", async () => {
@@ -389,7 +391,9 @@ describe("ConnectorIngestPanel onTableCount", () => {
       />
     )
     await screen.findByLabelText("Bronze table for public.orders")
-    expect(counts).toEqual([1])
+    // `onTableCount` is called from an effect that runs after the table
+    // appears, so wait for the call instead of reading it at once.
+    await waitFor(() => expect(counts).toEqual([1]))
 
     fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.customers/))
