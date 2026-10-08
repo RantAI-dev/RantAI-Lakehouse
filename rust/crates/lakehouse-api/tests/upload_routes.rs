@@ -405,6 +405,8 @@ struct Reply {
     status: StatusCode,
     json: Value,
     text: String,
+    /// The `Retry-After` header, as sent.
+    retry_after: Option<String>,
 }
 
 enum Payload {
@@ -529,12 +531,18 @@ impl Stack {
             .await
             .expect("router never fails a request outright");
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes).into_owned();
         Reply {
             status,
             json: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
             text,
+            retry_after,
         }
     }
 
@@ -1637,6 +1645,246 @@ async fn the_mode_defaults_to_replace() {
         launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"]["load_mode"],
         "replace"
     );
+}
+
+/// `SEC-17`: a CSV whose header has `columns` cells, and one row.
+fn csv_of_width(columns: usize) -> Vec<u8> {
+    let names: Vec<String> = (0..columns).map(|n| format!("c{n}")).collect();
+    format!("{}\n1\n", names.join(",")).into_bytes()
+}
+
+const TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
+
+/// `SEC-17`: 1,000 columns is the largest width that previews; one more is a
+/// 400 with the fixed sentence, and the same file read under another
+/// delimiter previews again.
+#[tokio::test]
+async fn a_preview_over_1000_columns_is_400_and_a_preview_of_1000_is_not() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let fits = stack.upload(&bayu, "fits.csv", &csv_of_width(1_000)).await;
+    let wide = stack.upload(&bayu, "wide.csv", &csv_of_width(1_001)).await;
+
+    let ok = stack
+        .get(&bayu, &format!("/api/uploads/{}/preview", id_of(&fits)))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+    assert_eq!(ok.json["columns"].as_array().unwrap().len(), 1_000);
+
+    let uri = format!("/api/uploads/{}/preview", id_of(&wide));
+    let refused = stack.get(&bayu, &uri).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+    assert_eq!(refused.json["error"], TOO_MANY_COLUMNS);
+
+    // A wrong delimiter must not lock a good file out: under a semicolon the
+    // same bytes are one column.
+    let again = stack.get(&bayu, &format!("{uri}?delimiter=%3B")).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+    assert_eq!(again.json["columns"].as_array().unwrap().len(), 1);
+}
+
+/// `SEC-17`: a header of nothing but commas, longer than the 256 KiB the
+/// preview reads, is refused (the cut record is counted, not dropped).
+#[tokio::test]
+async fn a_header_of_commas_longer_than_the_preview_is_refused() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let upload = stack
+        .upload(&bayu, "commas.csv", &vec![b','; 300 * 1024])
+        .await;
+
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{}/preview", id_of(&upload)))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], TOO_MANY_COLUMNS);
+}
+
+/// `SEC-17`: an ingest over the cap is a 400 before any claim, mark or
+/// launch: no table claim, the row still `uploaded`, no run launched.
+#[tokio::test]
+async fn an_ingest_over_1000_columns_is_400_and_claims_marks_and_launches_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "wide.csv", &csv_of_width(1_001)).await;
+    let id = id_of(&upload);
+
+    let reply = stack.ingest(&bayu, &id, ingest_body("wide_raw")).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], TOO_MANY_COLUMNS);
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
+    let row = stack.status_of(&id).await;
+    assert_eq!((row.0.as_str(), row.1, row.2), ("uploaded", None, None));
+    assert_eq!(
+        count_requests_containing(&stack.dagster, "launchRun").await,
+        0,
+        "no run was launched"
+    );
+}
+
+/// `SEC-17`: the cap is not a reason to refuse the largest file allowed.
+#[tokio::test]
+async fn an_ingest_of_1000_columns_is_launched() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "fits.csv", &csv_of_width(1_000)).await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("fits_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["runId"], "run-1");
+}
+
+const TOO_MANY_UPLOADS: &str = "Too many uploads are in progress. Try again in a moment.";
+
+/// A `PUT` that takes a second, so requests sent together overlap.
+struct SlowPut(Bucket);
+impl Respond for SlowPut {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        PutObject(self.0.clone())
+            .respond(request)
+            .set_delay(Duration::from_millis(1_500))
+    }
+}
+
+/// `SEC-17`: five files sent by one user at the same moment, four are
+/// accepted and one is a 429 with `Retry-After`; nothing of the refused one
+/// is stored. (Each accepted file is held in memory for the second its `PUT`
+/// takes, which is what keeps the five overlapping.)
+#[tokio::test]
+async fn the_fifth_simultaneous_upload_of_one_user_is_429_with_retry_after() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(OBJECT_PATH))
+        .respond_with(SlowPut(stack.bucket.clone()))
+        .with_priority(1)
+        .mount(&stack.s3)
+        .await;
+    let send = |name: &'static str| {
+        stack.send(
+            &bayu,
+            "POST",
+            "/api/uploads",
+            file_form(name, "text/csv", format!("a,b\n{name},2\n").as_bytes()),
+        )
+    };
+
+    let replies = tokio::join!(
+        send("one.csv"),
+        send("two.csv"),
+        send("three.csv"),
+        send("four.csv"),
+        send("five.csv"),
+    );
+    let replies = [replies.0, replies.1, replies.2, replies.3, replies.4];
+
+    let accepted = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::CREATED)
+        .count();
+    let refused: Vec<&Reply> = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::TOO_MANY_REQUESTS)
+        .collect();
+    assert_eq!(
+        accepted,
+        4,
+        "{:?}",
+        replies.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].json["error"], TOO_MANY_UPLOADS);
+    assert_eq!(refused[0].retry_after.as_deref(), Some("5"));
+    assert_eq!(
+        stack.bucket.keys().len(),
+        4,
+        "the refused file stored nothing"
+    );
+
+    // The places were given back: a sixth sent afterwards is accepted.
+    let again = stack.upload(&bayu, "six.csv", b"a,b\n6,2\n").await;
+    assert!(again["id"].is_string());
+}
+
+/// `SEC-17`: with four loads of the uploader running, a fifth ingest is a 429
+/// with `Retry-After`, the upload stays `uploaded`, no table is claimed and
+/// nothing is launched.
+#[tokio::test]
+async fn a_fifth_load_of_one_uploader_is_429_and_claims_and_launches_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    for n in 0..4 {
+        stack
+            .seed_loading(
+                GROUP,
+                &format!("up-busy-{n}"),
+                &format!("busy_{n}"),
+                None,
+                "10 seconds",
+            )
+            .await;
+    }
+    stack.seed(GROUP, "up-fifth", b"id,name\n1,a\n").await;
+    let claims_before = stack.claims().await.len();
+
+    let reply = stack
+        .ingest(&bayu, "up-fifth", ingest_body("fifth_raw"))
+        .await;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.json["error"], TOO_MANY_UPLOADS);
+    assert_eq!(reply.retry_after.as_deref(), Some("5"));
+    let row = stack.status_of("up-fifth").await;
+    assert_eq!((row.0.as_str(), row.1, row.2), ("uploaded", None, None));
+    assert_eq!(stack.claims().await.len(), claims_before, "no table claim");
+    assert_eq!(
+        count_requests_containing(&stack.dagster, "launchRun").await,
+        0
+    );
+}
+
+/// `SEC-17`: the number is per uploader (the person the upload records), so
+/// loads of another person do not use it up.
+#[tokio::test]
+async fn loads_of_another_uploader_do_not_count_against_this_one() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    for n in 0..4 {
+        let id = format!("up-other-{n}");
+        stack
+            .seed_loading(GROUP, &id, &format!("other_{n}"), None, "10 seconds")
+            .await;
+        sqlx::query("UPDATE file_upload SET uploaded_by = 'Someone Else' WHERE id = $1")
+            .bind(&id)
+            .execute(&stack.app.pool)
+            .await
+            .unwrap();
+    }
+    stack.seed(GROUP, "up-mine", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, "up-mine", ingest_body("mine_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
 }
 
 /// Review finding B2: the row is claimed before the launch, so two requests

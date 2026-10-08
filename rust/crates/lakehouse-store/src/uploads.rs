@@ -403,6 +403,129 @@ pub async fn mark_ingesting(
         .await?)
 }
 
+/// Hours after which an `ingesting` row no longer counts against the load
+/// limits (`SEC-17 review fix (SHOULD-FIX 1)`, feature page decision D9). A
+/// row leaves `ingesting` only when its job reports or someone reads it, so
+/// loads whose job died in a tenant nobody opens would otherwise count for
+/// ever and refuse every load in the installation. Six hours is far past the
+/// longest load (the request deadline and the job's own bounds are minutes);
+/// the row itself is not changed here, it is only not counted.
+const LOAD_COUNTS_FOR_HOURS: i32 = 6;
+
+/// How many loads may run at once (`SEC-17`): per `uploaded_by` and in
+/// total. Both are at least 1; the API reads them from its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadLimits {
+    /// Loads (`ingesting` rows) one `uploaded_by` may have at once.
+    pub per_user: i64,
+    /// Loads any `uploaded_by` may have at once, together.
+    pub total: i64,
+}
+
+/// What [`mark_ingesting_within_limits`] did.
+#[derive(Debug)]
+pub enum MarkOutcome {
+    /// The upload is now `ingesting`.
+    Marked(Box<Upload>),
+    /// No row changed: no such upload, or it is already `ingesting`
+    /// (the same case [`mark_ingesting`] answers `None` for).
+    NotMarked,
+    /// A limit was reached; nothing was changed.
+    LimitReached,
+}
+
+/// Whether `uploaded_by` (the person recorded on upload `id`) and the
+/// installation are both under `limits`, counting `ingesting` rows. A read:
+/// the route asks it before it claims a table name so that a refusal leaves
+/// no claim behind; [`mark_ingesting_within_limits`] is what decides.
+///
+/// The person is the one the upload records, not whoever pressed Load
+/// (`SEC-17`, decision D6).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn loads_under_limits(
+    pool: &PgPool,
+    id: &str,
+    limits: LoadLimits,
+) -> Result<bool, StoreError> {
+    let mut conn = pool.acquire().await?;
+    Ok(under_limits(&mut conn, id, limits).await?)
+}
+
+/// The two counts and the comparison, on a connection that may already hold
+/// the lock of [`mark_ingesting_within_limits`].
+async fn under_limits(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    limits: LoadLimits,
+) -> Result<bool, sqlx::Error> {
+    let (mine, all): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE uploaded_by = \
+             (SELECT uploaded_by FROM file_upload WHERE id = $1)), \
+           count(*) \
+         FROM file_upload WHERE status = 'ingesting' \
+           AND updated_at > now() - make_interval(hours => $2)",
+    )
+    .bind(id)
+    .bind(LOAD_COUNTS_FOR_HOURS)
+    .fetch_one(conn)
+    .await?;
+    Ok(mine < limits.per_user && all < limits.total)
+}
+
+/// [`mark_ingesting`] with the load limits of `SEC-17`: counts the
+/// `ingesting` rows and marks this one in ONE transaction, serialised by a
+/// transaction-level advisory lock, so two starts at the same moment cannot
+/// both take the last place.
+///
+/// The lock is one key for the whole installation: starting a load is rare
+/// and the section it guards is two short statements. The count is of rows,
+/// not of runs: a row is `ingesting` from the claim until it is settled, so
+/// a claim that never got a run counts until it is settled as stale.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_ingesting_within_limits(
+    pool: &PgPool,
+    id: &str,
+    parse_options: &Value,
+    bronze_table: &str,
+    load_mode: LoadMode,
+    limits: LoadLimits,
+) -> Result<MarkOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    // `hashtext()` keys the lock on a constant string; the prefix keeps it
+    // apart from the other advisory locks keyed on bare strings.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('file_upload:ingest_limit'))")
+        .execute(&mut *tx)
+        .await?;
+    if !under_limits(&mut tx, id, limits).await? {
+        tx.rollback().await?;
+        return Ok(MarkOutcome::LimitReached);
+    }
+    let sql = format!(
+        "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
+         bronze_table = $3, load_mode = $4, run_id = NULL, error = NULL, row_count = NULL, \
+         updated_at = now() \
+         WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
+    );
+    let marked: Option<Upload> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(Json(parse_options.clone()))
+        .bind(bronze_table)
+        .bind(load_mode.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(marked.map_or(MarkOutcome::NotMarked, |row| {
+        MarkOutcome::Marked(Box::new(row))
+    }))
+}
+
 /// Give a claimed upload the Dagster run that carries its load out: sets
 /// `run_id` on a row that is `ingesting` and has no run yet.
 ///

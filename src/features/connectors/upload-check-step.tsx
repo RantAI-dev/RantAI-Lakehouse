@@ -23,6 +23,8 @@ const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent p
 
 const HEADER_ROW_PROBLEM = "Enter a whole number, 1 or more."
 
+type ChoiceOption = { value: string; label: string; disabled?: boolean }
+
 type Settled = { key: string; preview: UploadPreview | null }
 
 /**
@@ -108,17 +110,31 @@ function Detected({ text }: { readonly text: string }) {
  */
 export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) {
   const { shown, settled } = view
-  if (shown === null) {
+  // SEC-17: a refusal of the reading itself (400, such as "The file has more
+  // than 1,000 columns.") with nothing shown yet keeps the controls on screen,
+  // because a wrong delimiter guess is what the person must be able to
+  // change. Any other failure with nothing to show has no controls to offer.
+  const refusedReading = shown === null && view.error !== null && view.error.code === "invalid_request"
+  if (shown === null && !refusedReading) {
     if (view.error !== null) return <PreviewFailure error={view.error} onRetry={view.retry} />
     return <LoadingSkeleton rows={3} />
   }
 
-  const encodings = UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
-    ? UPLOAD_ENCODINGS
-    : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
-  const delimiters = UPLOAD_DELIMITERS.some((d) => d.value === view.values.delimiter)
-    ? UPLOAD_DELIMITERS
-    : [...UPLOAD_DELIMITERS, { value: view.values.delimiter, label: delimiterLabel(view.values.delimiter) }]
+  // With no preview yet, a control has no value: the first option says the
+  // service detects it, and it is not one to choose.
+  const undecided: ChoiceOption = { value: "", label: "Detected by the service", disabled: true }
+  const encodings: readonly ChoiceOption[] =
+    view.values.encoding === ""
+      ? [undecided, ...UPLOAD_ENCODINGS]
+      : UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
+        ? UPLOAD_ENCODINGS
+        : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
+  const delimiters: readonly ChoiceOption[] =
+    view.values.delimiter === ""
+      ? [undecided, ...UPLOAD_DELIMITERS]
+      : UPLOAD_DELIMITERS.some((d) => d.value === view.values.delimiter)
+        ? UPLOAD_DELIMITERS
+        : [...UPLOAD_DELIMITERS, { value: view.values.delimiter, label: delimiterLabel(view.values.delimiter) }]
 
   return (
     <div className="space-y-4">
@@ -132,12 +148,12 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             onChange={(e) => view.setEncoding(e.target.value as UploadParseOptions["encoding"])}
           >
             {encodings.map((e) => (
-              <option key={e.value} value={e.value}>
+              <option key={e.value} value={e.value} disabled={e.disabled}>
                 {e.label}
               </option>
             ))}
           </select>
-          <Detected text={encodingLabel(shown.detected.encoding)} />
+          {shown !== null ? <Detected text={encodingLabel(shown.detected.encoding)} /> : null}
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="upload-delimiter">Delimiter</Label>
@@ -148,12 +164,12 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             onChange={(e) => view.setDelimiter(e.target.value)}
           >
             {delimiters.map((d) => (
-              <option key={d.value} value={d.value}>
+              <option key={d.value} value={d.value} disabled={d.disabled}>
                 {d.label}
               </option>
             ))}
           </select>
-          <Detected text={delimiterLabel(shown.detected.delimiter)} />
+          {shown !== null ? <Detected text={delimiterLabel(shown.detected.delimiter)} /> : null}
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="upload-header-row">Header row</Label>
@@ -170,7 +186,8 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             id="upload-header-row-note"
             className={view.headerProblem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
           >
-            {view.headerProblem ?? `Detected: ${headerRowDisplay(shown.detected.headerRow)}. Counts every row from the top of the file, blank ones included, starting at 1.`}
+            {view.headerProblem ??
+              `${shown !== null ? `Detected: ${headerRowDisplay(shown.detected.headerRow)}. ` : ""}Counts every row from the top of the file, blank ones included, starting at 1.`}
           </p>
         </div>
       </div>
@@ -189,7 +206,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
         </div>
       ) : null}
 
-      {shown.columns.length === 0 ? (
+      {shown === null ? null : shown.columns.length === 0 ? (
         <p role="alert" className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
           The header row has no columns: it is past the part of the file that was read, or it is an empty
           line. Choose another header row to go on.

@@ -33,6 +33,11 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
 7. It deletes the upload: the answer is 204, the upload is gone from the list
    and from `GET /api/uploads/{id}`, and the table keeps all its rows.
 
+8. SEC-17: it uploads a CSV file with 1,001 columns. Its preview answers 400
+   with "The file has more than 1,000 columns." and the same file read with
+   another delimiter previews again; a load request for it answers 400 with the
+   same sentence, before any table name is claimed. The upload is deleted.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -336,6 +341,48 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
     print(f"[g9] the upload is gone and the table keeps its {left} rows")
 
 
+# SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
+# (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
+TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+
+
+def step_column_cap(api) -> None:
+    """A file of 1,001 columns is refused at the preview and at the load request,
+    with the one sentence, and a delimiter that reads it as fewer columns
+    previews again (a wrong guess must not lock a good file out). The 400 at the
+    load request comes before any claim, mark or launch, so nothing is left
+    behind but the upload, which is deleted."""
+    header = ",".join(f"c{n}" for n in range(1_001))
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": ("g9_wide.csv", f"{header}\n1\n".encode(), "text/csv")},
+        timeout=60,
+    )
+    upload_id = _expect(resp, 201, "POST /api/uploads (1,001 columns)").json()["id"]
+    try:
+        refused = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=30), 400, "preview of 1,001 columns")
+        if refused.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the preview's 400 should say {TOO_MANY_COLUMNS!r}, it said {refused.text[:200]}")
+        again = _expect(
+            api.get(f"{API_URL}/api/uploads/{upload_id}/preview", params={"delimiter": ";"}, timeout=30),
+            200,
+            "preview of the same file with another delimiter",
+        ).json()
+        if len(again.get("columns", [])) != 1:
+            raise G9Failure(f"with ';' the file is one column, the preview shows {again.get('columns')}")
+        body = {"bronzeTable": f"g9_wide_{secrets.token_hex(4)}", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+        ingest = _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=30), 400, "ingest of 1,001 columns")
+        if ingest.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the ingest's 400 should say {TOO_MANY_COLUMNS!r}, it said {ingest.text[:200]}")
+        print("[g9] 1,001 columns: refused at the preview and at the load request, one column under ';'")
+    finally:
+        # Never loaded, so the delete is allowed; a failed delete must not hide
+        # the failure that matters, so it is reported and not raised.
+        gone = api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30)
+        if gone.status_code != 204:
+            print(f"[g9] cleanup: DELETE of the wide upload answered {gone.status_code}", file=sys.stderr)
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -359,6 +406,7 @@ def main() -> int:
         step_rows_and_types(api, table, expected)
         step_one_ingest_run_per_load(api, upload_id, table, file_rows)
         step_delete_keeps_the_table(api, upload_id, table, 2 * file_rows, state)
+        step_column_cap(api)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
         print(f"[g9] FAILED: {reason}", file=sys.stderr)

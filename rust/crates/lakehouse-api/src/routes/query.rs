@@ -1050,6 +1050,15 @@ pub async fn download(
         .raw_bytes(&capped_sql, None)
         .await
         .map_err(|err| map_download_ch_error(&err))?;
+    // `SEC-17`: a cell that starts `=`, `+`, `-` or `@` would run as a
+    // formula in the spreadsheet that opens the file, so each such cell gets
+    // a leading apostrophe. Parquet has typed columns and runs no formula,
+    // so it is returned as `ClickHouse` wrote it.
+    let bytes = if format_clause == "CSV" {
+        crate::csv_safe::neutralize_csv(&bytes)
+    } else {
+        bytes
+    };
 
     let content_disposition = format!("attachment; filename=\"{id}.{extension}\"");
     // Bypasses the `ApiJson` choke point deliberately: the response body

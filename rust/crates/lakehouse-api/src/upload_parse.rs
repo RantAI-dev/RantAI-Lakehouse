@@ -544,6 +544,41 @@ pub fn preview(
     }
 }
 
+/// Most columns a file may have (`SEC-17`). The load job holds the same
+/// number (`MAX_COLUMNS` in `file_ingest.py`) and is the authority; the API
+/// checks early so a file that cannot load is refused before a run exists.
+pub const MAX_COLUMNS: usize = 1_000;
+
+/// How many cells the header record has under the reading in force, for the
+/// column cap (`SEC-17`).
+///
+/// Unlike [`preview`] this does not drop the last record of a cut head: a
+/// header that is longer than the head (a file whose first line is nothing
+/// but delimiters) is then the cut record, and dropping it would count zero
+/// columns for exactly the file the cap is for. A cut can only undercount,
+/// and `MAX_COLUMNS + 1` cells need about 1 KB, so a header that breaks the
+/// cap is always seen whole enough. The header row is detected the way
+/// [`preview`] detects it, on the records that are surely complete, so both
+/// read the same record.
+#[must_use]
+pub fn header_width(head: &[u8], head_is_truncated: bool, overrides: Overrides) -> usize {
+    let encoding = overrides.encoding.unwrap_or_else(|| detect_encoding(head));
+    let text = decode(head, encoding);
+    let delimiter = overrides
+        .delimiter
+        .unwrap_or_else(|| detect_delimiter(&text));
+    let records = split_records(&text, delimiter);
+    let header_row = overrides.header_row.unwrap_or_else(|| {
+        let complete = if head_is_truncated {
+            records.len().saturating_sub(1)
+        } else {
+            records.len()
+        };
+        detect_header_row(&records[..complete])
+    });
+    records.get(header_row).map_or(0, Vec::len)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1394,5 +1429,49 @@ mod tests {
             found, listed,
             "add the new file (and its .expected.json) to FIXTURES, or delete the stray one"
         );
+    }
+
+    // ── header_width (SEC-17) ───────────────────────────────────────────
+
+    fn header_of(width: usize) -> String {
+        let names: Vec<String> = (0..width).map(|n| format!("c{n}")).collect();
+        format!("{}\n1\n", names.join(","))
+    }
+
+    #[test]
+    fn a_header_of_1000_columns_is_within_the_cap_and_1001_is_over_it() {
+        let ok = header_width(header_of(1_000).as_bytes(), false, Overrides::default());
+        let over = header_width(header_of(1_001).as_bytes(), false, Overrides::default());
+        assert_eq!(ok, MAX_COLUMNS);
+        assert!(over > MAX_COLUMNS);
+    }
+
+    #[test]
+    fn a_head_of_256_kb_of_commas_is_over_the_cap() {
+        let head = vec![b','; 256 * 1024];
+        let width = header_width(&head, true, Overrides::default());
+        assert!(width > MAX_COLUMNS);
+    }
+
+    #[test]
+    fn a_header_cut_off_by_the_head_is_counted_as_far_as_it_goes() {
+        let head = b"a,b,c,d";
+        assert_eq!(header_width(head, true, Overrides::default()), 4);
+    }
+
+    #[test]
+    fn the_width_follows_the_delimiter_and_header_row_in_force() {
+        let text = "title\na;b;c\n1;2;3\n";
+        let told = Overrides {
+            delimiter: Some(';'),
+            header_row: Some(1),
+            ..Overrides::default()
+        };
+        assert_eq!(header_width(text.as_bytes(), false, told), 3);
+        let past = Overrides {
+            header_row: Some(99),
+            ..Overrides::default()
+        };
+        assert_eq!(header_width(text.as_bytes(), false, past), 0);
     }
 }
