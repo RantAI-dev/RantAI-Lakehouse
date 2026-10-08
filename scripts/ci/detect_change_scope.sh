@@ -119,6 +119,13 @@ while IFS= read -r file; do
     classified=true
   fi
 
+  # CI automation scripts: scripts/ci/** modifications affect CI automation itself
+  # and must force all=true.
+  if [[ "$file" == scripts/ci/* ]]; then
+    all=true
+    classified=true
+  fi
+
   # Stack: docker-compose.yml, ops/**, scripts/**, .env.example
   if [[ "$file" == "docker-compose.yml" ]] || [[ "$file" == ops/* ]] || \
      [[ "$file" == scripts/* ]] || [[ "$file" == ".env.example" ]]; then

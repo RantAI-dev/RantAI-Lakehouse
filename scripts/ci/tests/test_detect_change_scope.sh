@@ -60,6 +60,8 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > docker-compose.yml
   : > ops/g6/test.py
   : > ops/fixtures/upload_load_failure_reasons.json
+  mkdir -p scripts/ci
+  : > scripts/ci/detect_change_scope.sh
   : > scripts/compose.sh
   : > .env.example
   : > .github/workflows/ci.yml
@@ -170,6 +172,9 @@ assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" 
 
 # Cross-cutting fixture tests
 assert_case "ops/fixtures forces all" "true" "true" "true" "true" "false" "true" "ops/fixtures/upload_load_failure_reasons.json"
+
+# CI script tests
+assert_case "scripts/ci forces all" "true" "true" "true" "true" "false" "true" "scripts/ci/detect_change_scope.sh"
 
 # Workflow tests
 assert_case ".github/workflows/ci.yml forces all" "true" "true" "true" "true" "false" "true" ".github/workflows/ci.yml"
