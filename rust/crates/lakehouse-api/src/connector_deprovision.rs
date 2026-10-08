@@ -40,7 +40,7 @@ use std::time::Duration;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_store::cdc::ConnectorSlug;
 use sqlx::Connection;
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::postgres::PgConnection;
 
 /// Bound on every individual query this module issues (connect, drop
 /// publication, terminate backend, poll, drop slot) — a hung/unreachable
@@ -62,14 +62,17 @@ const SLOT_INACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// source `Postgres` database directly — resolved and owned by the caller
 /// (`routes::connectors::delete`), never a DSN string this module would
 /// have to parse. Every field is bound as an individual
-/// [`PgConnectOptions`] setter, never interpolated into a connection
+/// `PgConnectOptions` setter, never interpolated into a connection
 /// string, matching `connector_probe::probe_postgres`'s exact reasoning
 /// for why that matters.
 pub struct PgTarget {
-    /// Source database hostname (already SSRF-checked by the caller if
-    /// that matters for this deployment — this module does not repeat
-    /// that check, since deprovisioning a connector's own registered host
-    /// is not the same trust boundary as a caller-chosen probe target).
+    /// The address to dial, as text: the IP that
+    /// `connector_probe::resolve_checked` approved for the connector's
+    /// registered host, never the host name itself. `SEC-15`: deleting a
+    /// connector dials the host a caller registered, so it goes through the
+    /// same address check as a connection test, and the caller
+    /// (`routes::connectors::delete`) is responsible for running it and
+    /// handing over the approved address.
     pub host: String,
     /// Source database port.
     pub port: u16,
@@ -198,6 +201,33 @@ pub enum DeprovisionError {
     },
 }
 
+impl DeprovisionError {
+    /// A fixed sentence for this failure that is safe to put in a response
+    /// (`SEC-15`, principle 4): it names the step that failed and, for a
+    /// connection, the generic class `connector_probe::classify_sqlx_error`
+    /// gives, but never `sqlx`'s own text (the `Display` above is for the
+    /// server log only).
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Connect { source } => format!(
+                "could not connect to the source database ({})",
+                crate::connector_probe::classify_sqlx_error(source)
+            ),
+            Self::DropPublication { .. } => "dropping the publication failed".to_owned(),
+            Self::TerminateBackend { .. } => {
+                "ending the session that holds the replication slot failed".to_owned()
+            }
+            Self::CheckSlot { .. } => "checking the replication slot failed".to_owned(),
+            Self::DropSlot { .. } => "dropping the replication slot failed".to_owned(),
+            Self::Timeout { timeout_secs, .. } => {
+                format!("the source database did not answer within {timeout_secs}s")
+            }
+            Self::InvalidName { field, .. } => format!("{field} is not a valid identifier"),
+        }
+    }
+}
+
 /// Bound a query future by [`QUERY_TIMEOUT`], collapsing "timed out" and
 /// the query's own error into [`DeprovisionError`] via `on_timeout`/`on_err`
 /// so every call site stays a single `.await?`-shaped line rather than
@@ -245,17 +275,15 @@ pub async fn drop_slot_and_publication(
     slot_name: &str,
     publication_name: &str,
 ) -> Result<Deprovisioned, DeprovisionError> {
-    let options = PgConnectOptions::new()
-        .host(&target.host)
-        .port(target.port)
-        .username(&target.user)
-        .password(target.password.expose_secret())
-        .database(&target.database)
-        // Matches `connector_probe::probe_postgres`'s exact posture: this
-        // deployment's compose-network Postgres does not terminate TLS, so
-        // `Prefer` (attempt TLS, fall back to plaintext) is the correct
-        // default rather than leaving it to sqlx's own default.
-        .ssl_mode(PgSslMode::Prefer);
+    // SEC-15 review fix (SHOULD-FIX 2): the TLS mode is set in one place,
+    // `connector_probe`, shared with the connection test and discovery.
+    let options = crate::connector_probe::pg_options_for_address(
+        &target.host,
+        target.port,
+        &target.user,
+        target.password.expose_secret(),
+        &target.database,
+    );
 
     let connect_label = format!("slot {slot_name:?} / publication {publication_name:?}");
     let mut conn = with_timeout(

@@ -66,6 +66,16 @@ services:
         read_only: true
 
   lakehouse-api:
+    environment:
+      # SEC-15, GATE-ONLY: the default docker-compose.yml now blocks
+      # internal addresses for the API's connection test, discovery and
+      # delete clean-up, and `PUT .../ingest-spec` runs the same address
+      # check at save time. This gate saves ingest specs that point at its
+      # own mysql-g6/mssql-g6/rest-stub-g6/mongo-g6/kafka-g6 fixtures inside
+      # the compose network, so the API must be allowed to reach them, the
+      # same way INGEST_ALLOW_INTERNAL_HOSTS is set for Dagster above. Not
+      # for a real deployment.
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
     volumes:
       - type: volume
         source: g6_secrets

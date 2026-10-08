@@ -2261,18 +2261,34 @@ async fn deprovision_with_names(
     slot_name: &str,
     publication_name: &str,
 ) -> Result<Deprovisioned, ApiError> {
+    // SEC-15: the clean-up dials the host a caller registered, so it gets the
+    // same address check as a connection test, BEFORE the credential is
+    // resolved, and dials the address the check approved. A refused target
+    // is never dialled (feature page decision 7); `delete` turns the refusal
+    // into a fixed 409, and `?force=true` removes the row without dialling.
+    let approved = connector_probe::resolve_checked(
+        &target.host,
+        target.port,
+        &state.config.connector_internal_hosts(),
+    )
+    .await
+    .map_err(|message| {
+        ApiError::Conflict(format!("the source database was not contacted: {message}"))
+    })?;
     let password = state
         .connector_secret_resolver
         .resolve_dyn(&dial_info.secret_ref)
         .await
         .map_err(|err| {
+            // The resolver's text is for the log, not the response.
+            tracing::warn!(connector_id = %id, error = %err, "could not resolve a connector's credential to deprovision its CDC slot");
             ApiError::Internal(format!(
-                "could not resolve connector {id}'s credential to deprovision its CDC slot: {err}"
+                "could not resolve connector {id}'s credential to deprovision its CDC slot"
             ))
         })?;
     let pg_target = PgTarget {
-        host: target.host.clone(),
-        port: target.port,
+        host: approved.primary_host(),
+        port: approved.primary().port(),
         user: target.user.clone(),
         password,
         database: target.database.clone(),
@@ -2280,6 +2296,9 @@ async fn deprovision_with_names(
     connector_deprovision::drop_slot_and_publication(&pg_target, slot_name, publication_name)
         .await
         .map_err(|err| {
+            // SEC-15: `sqlx`'s own text stays in the log; the response gets
+            // `DeprovisionError::summary`.
+            tracing::warn!(connector_id = %id, error = %err, "CDC deprovisioning failed");
             ApiError::Internal(deprovision_error_message(
                 id,
                 slot_name,
@@ -2291,9 +2310,9 @@ async fn deprovision_with_names(
 
 /// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
 /// a log line — never the credential [`deprovision_with_names`] resolved,
-/// only the slot/publication names and the error's own `Display` (which,
-/// per [`DeprovisionError`]'s doc comment, never includes connection
-/// credentials).
+/// and (`SEC-15`) never the error's own `Display`, which carries `sqlx`'s
+/// text: only the slot/publication names and
+/// [`DeprovisionError::summary`]'s fixed sentence.
 fn deprovision_error_message(
     id: &str,
     slot_name: &str,
@@ -2302,7 +2321,8 @@ fn deprovision_error_message(
 ) -> String {
     format!(
         "deprovisioning connector {id}'s CDC replication slot ({slot_name:?}) and publication \
-         ({publication_name:?}) failed: {err}"
+         ({publication_name:?}) failed: {}",
+        err.summary()
     )
 }
 
@@ -2338,6 +2358,16 @@ fn deprovision_error_message(
 ///   at a decommissioned or now-unreachable host — deprovisioning can
 ///   never succeed there, and an operator who already knows that needs a
 ///   way to remove the row anyway rather than being stuck forever.
+///
+/// # The clean-up goes through the address check (`SEC-15`)
+///
+/// The clean-up dials the host the connector was registered with, so it runs
+/// [`connector_probe::resolve_checked`] first and dials the address that
+/// approved (feature page decision 7). A target the check refuses (an
+/// internal address while the block is on, or a name that does not resolve)
+/// is never dialled: without `force` the delete is a 409 carrying the fixed
+/// refusal, with `?force=true` the row is removed and nothing is dialled.
+/// The 409 text is a fixed sentence either way, never driver text.
 ///
 /// # Pipelines that read from the connector block the delete
 ///
@@ -2402,11 +2432,13 @@ pub async fn delete(
                 |_| "its CDC slot/publication".to_owned(),
                 |s| format!("slot {s}_slot / publication {s}_pub"),
             );
+            // SEC-15: `err` is a fixed sentence (a refusal of the target by
+            // the address check, or a classified failure), never driver text.
             return Err(ApiError::Conflict(format!(
-                "connector {id} was NOT deleted: dropping {slug_hint} failed ({err}); the \
-                 registry row is kept deliberately so this orphaned slot stays visible instead \
-                 of silently pinning WAL on the source database forever. Retry once the source \
-                 is reachable, or pass ?force=true to delete the row anyway (the \
+                "connector {id} was NOT deleted: dropping {slug_hint} did not complete ({err}); \
+                 the registry row is kept deliberately so this orphaned slot stays visible \
+                 instead of silently pinning WAL on the source database forever. Retry once the \
+                 source is reachable, or pass ?force=true to delete the row anyway (the \
                  slot/publication will then have to be cleaned up manually)."
             ))
             .into());
@@ -2583,10 +2615,11 @@ pub struct IngestSpecBody {
 ///
 /// # Errors
 ///
-/// Returns `ApiError::BadRequest` naming the offending resolved address
-/// (the same message [`connector_probe::resolve_checked`] already produces
-/// for `POST .../test`) if a checked host resolves to a private/internal
-/// address that `internal_hosts` does not permit.
+/// Returns `ApiError::BadRequest` with the fixed message
+/// [`connector_probe::resolve_checked`] produces for `POST .../test` (the
+/// caller's own host, never the address it resolved to: `SEC-15`) if a
+/// checked host resolves to a private/internal address that
+/// `internal_hosts` does not permit, or does not resolve.
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
@@ -2616,8 +2649,11 @@ async fn check_dial_ssrf(
     let Some((host, port)) = host_port else {
         return Ok(());
     };
+    // The approved address is dropped on purpose: this is the advisory
+    // save-time check, and nothing is dialled here.
     connector_probe::resolve_checked(host, port, internal_hosts)
         .await
+        .map(|_approved| ())
         .map_err(ApiError::BadRequest)
 }
 
@@ -3338,7 +3374,17 @@ mod tests {
     /// reaches the real dial attempt (and its slot/publication names),
     /// never a real database.
     fn state_with_stub_secret_resolver() -> AppState {
-        let mut state = state_without_pool();
+        // SEC-15: these tests are about which slot/publication names are
+        // attempted, so they aim at a loopback port nothing listens on and
+        // must be allowed to reach it; the refusal of an internal target is
+        // covered by `deprovision_refuses_an_internal_target_before_anything_else`.
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).unwrap());
         state.connector_secret_resolver = std::sync::Arc::new(
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::from([(
                 "TEST_CONNECTOR_PASSWORD".to_owned(),
@@ -3365,8 +3411,11 @@ mod tests {
             Some("cdc"),
             serde_json::json!({
                 "driver": "postgres",
-                "host": "source.example.internal",
-                "port": 5432,
+                // A loopback port nothing listens on (the connect fails
+                // fast), rather than a made-up name that no longer reaches
+                // the dial now that the target is resolved first (SEC-15).
+                "host": "127.0.0.1",
+                "port": 1,
                 "database": "oms",
                 "user": "replicator",
                 "slotName": "dial_supplied_slot",
@@ -3381,6 +3430,10 @@ mod tests {
             text.contains("dial_supplied_slot") && text.contains("dial_supplied_pub"),
             "expected the error to name dial's own slot/publication: {text}"
         );
+        // SEC-15: the failure is a fixed, classified sentence, never the
+        // driver's own text.
+        assert!(text.contains("connection refused"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
         // The slug this connector's `id` would derive to must never appear
         // -- proves `dial` won with NO fallback, not merely that it was
         // tried first.
@@ -3388,6 +3441,42 @@ mod tests {
             !text.contains("conn_cdc_dial_wins"),
             "the slug-derived name must never appear once adapter=cdc: {text}"
         );
+    }
+
+    /// `SEC-15` (K4): with the internal-address block on (the default), the
+    /// clean-up of a connector aimed at a loopback host is refused with the
+    /// fixed message BEFORE the credential is resolved (this state's
+    /// resolver resolves nothing, so a late check would answer with the
+    /// credential error instead) and BEFORE anything is dialled. `localhost`
+    /// is used so the test can also assert that the resolved address is not
+    /// in the message.
+    #[tokio::test]
+    async fn deprovision_refuses_an_internal_target_before_anything_else() {
+        let state = state_without_pool();
+        let info = dial_info(
+            "Custom CDC System",
+            Some("cdc"),
+            serde_json::json!({
+                "driver": "postgres",
+                "host": "localhost",
+                "port": 1,
+                "database": "oms",
+                "user": "replicator",
+                "slotName": "refused_slot",
+                "publicationName": "refused_pub",
+            }),
+        );
+        let err = deprovision_postgres_connector(&state, "conn-cdc-refused", &info)
+            .await
+            .expect_err("a loopback target must be refused");
+        let ApiError::Conflict(text) = err else {
+            panic!("expected the refusal as a Conflict, got {err:?}");
+        };
+        assert!(text.contains("private/internal"), "{text}");
+        assert!(text.contains("\"localhost\""), "{text}");
+        for resolved in ["127.0.0.1", "::1"] {
+            assert!(!text.contains(resolved), "no resolved address: {text}");
+        }
     }
 
     /// The exact defect this rule fixes: a `sql`-adapter connector must never

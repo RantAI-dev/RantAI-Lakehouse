@@ -122,6 +122,13 @@ tiberius = { version = "0.13", default-features = false, features = ["tds73", "r
 # `tokio_util::io::ReaderStream` turns `routes::ai::stream_chat`'s
 # `tokio::io::duplex` reader into the `POST /api/ai/chat` NDJSON body.
 tokio-util = { workspace = true, features = ["compat", "io"] }
+# SEC-15: `connector_probe`'s S3 test hands `object_store` a pinned HTTP
+# client (an `HttpConnector`), and `object_store` 0.14 is built on
+# `reqwest` 0.13 while the rest of this crate is on 0.12, so the client must
+# be a 0.13 one to be accepted. Same version `object_store` already pulls
+# (one copy in `Cargo.lock`); no TLS provider of its own beyond the `rustls`
+# feature `object_store`'s `aws` feature already turns on for it.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
