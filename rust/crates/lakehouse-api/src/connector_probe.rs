@@ -102,9 +102,9 @@
 //!   address; the configured name is kept for the TDS handshake.
 //! - `reqwest` (REST): `ClientBuilder::resolve_to_addrs` maps the URL's
 //!   host to the approved addresses, so `Host` and SNI keep the name.
-//!   The system proxy is not used.
+//!   Redirects are not followed and the system proxy is not used.
 //! - `object_store` (S3): an [`HttpConnector`] built on a pinned `reqwest`
-//!   client that uses no proxy.
+//!   client that follows no redirects and uses no proxy.
 //!
 //! `SEC-14` (TLS) must keep the NAME for certificate verification when it
 //! turns verification on; the pinned address replaces only where the socket
@@ -688,6 +688,16 @@ async fn probe_rest(
     let elapsed = started.elapsed();
 
     match attempt {
+        // SEC-15: a redirect is reported, never followed; the `Location`
+        // is not echoed (it is the server's text, and may name an address).
+        Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
+            elapsed,
+            format!(
+                "REST request was answered with a redirect (HTTP {}); connection tests do \
+                 not follow redirects",
+                response.status().as_u16()
+            ),
+        ),
         Ok(Ok(response)) if response.status().is_success() => Outcome::success(
             elapsed,
             "Connected via REST and received a successful response.",
@@ -725,7 +735,8 @@ fn url_names_target(url: &str, host: &str, port: u16) -> bool {
 
 /// `SEC-15`: the `reqwest` client for the REST test. The URL's host is mapped
 /// to the [`Approved`] addresses (the `Host` header and SNI keep the name),
-/// the system proxy is not used (a proxy resolves the name
+/// redirects are not followed (a redirect would be a second target nobody
+/// checked) and the system proxy is not used (a proxy resolves the name
 /// itself, which defeats the pin).
 ///
 /// # Errors
@@ -747,6 +758,7 @@ fn pinned_http_client(
     }
     reqwest::Client::builder()
         .resolve_to_addrs(host, approved.all())
+        .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
         .map_err(|err| {
@@ -756,10 +768,11 @@ fn pinned_http_client(
 }
 
 /// `SEC-15`: the HTTP client `object_store` uses for the S3 test, pinned like
-/// [`pinned_http_client`] (approved addresses, no proxy).
-/// `object_store`'s own client cannot be given a pinned address through its
-/// options, so the connector supplies a `reqwest` 0.13 client built here
-/// instead.
+/// [`pinned_http_client`] (approved addresses, no redirects, no proxy).
+/// `object_store`'s own client follows redirects and cannot be told not to
+/// (a `ClientOptions` DNS resolver pins names, but a redirect to an address
+/// literal would not use it), so the connector supplies a `reqwest` 0.13
+/// client built here instead.
 #[derive(Debug)]
 struct PinnedHttpConnector {
     host: String,
@@ -773,6 +786,7 @@ impl object_store::client::HttpConnector for PinnedHttpConnector {
     ) -> object_store::Result<object_store::client::HttpClient> {
         let client = reqwest013::Client::builder()
             .resolve_to_addrs(&self.host, &self.addrs)
+            .redirect(reqwest013::redirect::Policy::none())
             .no_proxy()
             .build()
             .map_err(|err| object_store::Error::Generic {
@@ -1293,7 +1307,7 @@ fn s3_client(
         // same posture `lakehouse-iceberg::storage`'s client uses.
         .with_virtual_hosted_style_request(false)
         .with_allow_http(true)
-        // SEC-15: the pinned HTTP client.
+        // SEC-15: the pinned, redirect-free HTTP client.
         .with_http_connector(PinnedHttpConnector {
             host: endpoint_host.to_owned(),
             addrs: approved.all().to_vec(),
@@ -1851,7 +1865,7 @@ mod tests {
         std::net::SocketAddr::new(ip.parse().unwrap(), port)
     }
 
-    // -- SEC-15 K2: the dial goes to the approved address --
+    // -- SEC-15 K2/K3: the dial goes to the approved address; no redirects --
 
     fn approved_for(addr: std::net::SocketAddr, host: &str) -> Approved {
         check_addrs(host, vec![addr], &InternalHosts::ALL).unwrap()
@@ -1926,6 +1940,58 @@ mod tests {
         );
     }
 
+    /// SEC-15 (K3): a redirect is reported as one and the second request is
+    /// never made; the message carries neither the `Location` nor its address.
+    #[tokio::test]
+    async fn probe_rest_reports_a_redirect_and_never_follows_it() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let dial = RestDial {
+            base_url: origin.uri(),
+            auth: RestAuth::Bearer,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest(
+            &dial,
+            "env:REST_TEST_TOKEN",
+            None,
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.message.contains("redirect"), "{}", outcome.message);
+        assert!(outcome.message.contains("302"), "{}", outcome.message);
+        assert!(
+            !outcome
+                .message
+                .contains(&target.address().port().to_string()),
+            "the Location must not be echoed: {}",
+            outcome.message
+        );
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            0,
+            "the redirect target must never be requested"
+        );
+    }
+
     fn empty_bucket_listing() -> wiremock::ResponseTemplate {
         wiremock::ResponseTemplate::new(200)
             .insert_header("Content-Type", "application/xml")
@@ -1961,6 +2027,37 @@ mod tests {
             .await
             .expect("the listing must finish inside the dial bound")
             .expect("the pinned client must reach the stand-in server");
+    }
+
+    /// SEC-15 (K3, S3): a redirect from the S3 endpoint is not followed.
+    #[tokio::test]
+    async fn s3_client_does_not_follow_a_redirect() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(empty_bucket_listing())
+            .mount(&target)
+            .await;
+        let origin = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let addr = *origin.address();
+        let approved = approved_for(addr, "127.0.0.1");
+        let client =
+            s3_client(&origin.uri(), "bucket", "127.0.0.1", &approved, "ak", "sk").unwrap();
+        let listed = tokio::time::timeout(DIAL_TIMEOUT, client.list_with_delimiter(None))
+            .await
+            .expect("the listing must finish inside the dial bound");
+        assert!(listed.is_err(), "a redirect is not a successful listing");
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            0,
+            "the redirect target must never be requested"
+        );
     }
 
     // -- WS3 item 13: probe_mysql/probe_mssql/probe_rest/probe_sheets --
