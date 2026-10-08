@@ -451,6 +451,7 @@ def _register_and_run(
     dial: dict,
     source_objects: list,
     ingest_mode: str = "batch",
+    connector_ids: dict[str, str] | None = None,
 ) -> str | None:
     """POST /api/connectors (writing the derived `file:` credential's
     real value, if any, from `credential_values`), PUT .../ingest-spec,
@@ -458,6 +459,8 @@ def _register_and_run(
     honest supported:false response (CDC/Sheets)."""
     body = _create_connector(name=name, kind=kind, host=host, credential=credential)
     connector_id = body["id"]
+    if connector_ids is not None:
+        connector_ids[name] = connector_id
     derived = body.get("credential") or {}
     if credential.get("source") == "file" and credential_values:
         if credential_values.get("primary") and derived.get("primary"):
@@ -483,6 +486,60 @@ def _register_and_run(
         raise G6Failure(f"ingest/run for {name!r} returned no runId: {result}")
     print(f"[g6] launched run {run_id} for {name!r}")
     return run_id
+
+
+def _check_object_storage_test_and_key_change(connector_id: str) -> None:
+    """SRC-6 B3 (F1, F2): the object-storage connector made the way the
+    wizard makes it (`host` is not the endpoint, the endpoint is in `dial`)
+    is tested at its dial endpoint, and a wrong secret key is refused
+    without being stored.
+
+    Not covered here: `PUT .../credential` with the RIGHT pair answering
+    `verified: true`. That request writes a `connector_managed_*` file, and
+    in this gate `/run/secrets` is the read-only `g6_secrets` volume in
+    `lakehouse-api` (ops/g6/docker-compose.g6.override.yml), so the API
+    cannot write it (503), and a file it did write would not reach
+    `dagster-code-location` either. Making that step honest needs a
+    writable credential volume shared by the API and Dagster in this
+    override; it is reported to the planner, not faked here (AGENTS.md
+    principle 2). The 422 below never writes: the probe runs on an
+    in-memory candidate before `replace_credentials`.
+    """
+    test_url = f"{API_URL}/api/connectors/{connector_id}/test"
+    first = API.post(test_url, timeout=30)
+    if not first.ok:
+        raise G6Failure(f"POST .../test for g6-files failed: {first.status_code} {first.text}")
+    first_body = first.json()
+    if first_body.get("supported") is not True or first_body.get("ok") is not True:
+        raise G6Failure(
+            "expected the g6-files connection test to report supported=true, ok=true "
+            f"(tested at the dial endpoint, SRC-6 F1), got {first_body}"
+        )
+    print(f"[g6] g6-files connection test: ok, {first_body.get('latencyMs')} ms")
+
+    wrong = API.put(
+        f"{API_URL}/api/connectors/{connector_id}/credential",
+        json={
+            "primary": {"kind": "access_key", "value": RUSTFS_ACCESS_KEY},
+            "secondary": {"kind": "secret_key", "value": RUSTFS_SECRET_KEY + "-wrong"},
+        },
+        timeout=30,
+    )
+    if wrong.status_code != 422:
+        raise G6Failure(
+            "expected PUT .../credential with a wrong secret key to be refused with 422 "
+            f"(SRC-6 F2), got {wrong.status_code} {wrong.text}"
+        )
+    print("[g6] g6-files wrong secret key: refused with 422")
+
+    again = API.post(test_url, timeout=30)
+    again_body = again.json() if again.ok else {}
+    if again_body.get("supported") is not True or again_body.get("ok") is not True:
+        raise G6Failure(
+            "expected the g6-files connection test to still pass after the refused key change, "
+            f"got {again.status_code} {again.text}"
+        )
+    print("[g6] g6-files connection test after the refused key change: still ok")
 
 
 def step_wait_for_run_success(run_id: str) -> None:
@@ -614,7 +671,9 @@ def step_ingest_matrix() -> None:
     # landing/orders.csv, registered against a NEW test connector -- never
     # conn-s3-warehouse, which rust/migrations/0033_connector_ingest_spec.sql
     # deliberately seeds with an empty source_objects.
+    connector_ids: dict[str, str] = {}
     files_run_id = _register_and_run(
+        connector_ids=connector_ids,
         name="g6-files", kind="Object storage", host="rustfs:9000",
         credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
         credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
@@ -631,6 +690,9 @@ def step_ingest_matrix() -> None:
     )
     if files_run_id:
         run_ids["g6-files"] = files_run_id
+    # SRC-6 B3: after the ingest spec is saved (inside _register_and_run).
+    # Read-only against the connector, so the run just launched is unaffected.
+    _check_object_storage_test_and_key_change(connector_ids["g6-files"])
 
     # kafka: ingestMode="stream" (widened by 0043_ingest_tier2_adapters.sql
     # -- `ingest_factory.py::run_ingest` dispatches "stream" to
