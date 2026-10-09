@@ -138,9 +138,9 @@ pub(crate) fn use_keys(
         .iter()
         .filter_map(|id| match table_of.get(id.as_str()) {
             Some(table) if !table.is_empty() => Some((format!("bronze.{table}"), id.clone())),
-            Some(_) => None,
+            // A Bronze row with no registry table has no key SQL could name.
             None if id.contains('.') => Some((id.to_lowercase(), id.clone())),
-            None => None,
+            Some(_) | None => None,
         })
         .map(|(key, id)| (key.to_lowercase(), id))
         .collect()

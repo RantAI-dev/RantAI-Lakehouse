@@ -248,16 +248,25 @@ pub async fn list(
             Err(err) => list_unavailable(err),
         };
     }
-    match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
-        Ok((mut body, bronze_pairs)) => {
-            apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-            enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-            apply_annotations(&state, &mut body).await;
-            apply_badges(&state, &mut body, &bronze_pairs).await;
-            (StatusCode::OK, ApiJson(body)).into_response()
-        }
+    match assemble_catalog(&state).await {
+        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => list_unavailable(err),
     }
+}
+
+/// The catalog as `list` serves it: [`list_body`] and the four enrichment
+/// steps, none of which takes a `Principal`. The one assembly behind the
+/// live list, the live `query`, and the search copy
+/// ([`build_search_snapshot`]); also hands back the Bronze `(slug,
+/// table_name)` pairs the use ranking needs.
+async fn assemble_catalog(state: &AppState) -> Result<(Value, Vec<(String, String)>), ChError> {
+    let (mut body, bronze_pairs) =
+        list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await?;
+    apply_sla_targets(state, &mut body, &bronze_pairs).await;
+    enrich_bronze_assets(state, &mut body, bronze_pairs.clone()).await;
+    apply_annotations(state, &mut body).await;
+    apply_badges(state, &mut body, &bronze_pairs).await;
+    Ok((body, bronze_pairs))
 }
 
 /// `catch (e) { return NextResponse.json({ error: String(e), assets:
@@ -392,15 +401,10 @@ pub async fn query(
             Err(err) => return unavailable(err),
         }
     } else {
-        let (mut body, bronze_pairs) =
-            match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
-                Ok(v) => v,
-                Err(err) => return unavailable(err),
-            };
-        apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-        enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-        apply_annotations(&state, &mut body).await;
-        apply_badges(&state, &mut body, &bronze_pairs).await;
+        let body = match assemble_catalog(&state).await {
+            Ok((body, _bronze_pairs)) => body,
+            Err(err) => return unavailable(err),
+        };
         let assets = body
             .get("assets")
             .and_then(Value::as_array)
@@ -680,17 +684,12 @@ async fn search_snapshot(
         .await
 }
 
-/// The rebuild behind [`search_snapshot`]: `list`'s assembly, exactly as
-/// `list` runs it, then the columns and the use counts.
+/// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
+/// what `list` serves, then the columns and the use counts.
 async fn build_search_snapshot(
     state: &AppState,
 ) -> Result<crate::catalog_search_cache::CatalogSearchSnapshot, ChError> {
-    let (mut body, bronze_pairs) =
-        list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await?;
-    apply_sla_targets(state, &mut body, &bronze_pairs).await;
-    enrich_bronze_assets(state, &mut body, bronze_pairs.clone()).await;
-    apply_annotations(state, &mut body).await;
-    apply_badges(state, &mut body, &bronze_pairs).await;
+    let (body, bronze_pairs) = assemble_catalog(state).await?;
     let (columns, column_search_partial) = search_column_index(&state.clickhouse).await?;
     let assets = body
         .get("assets")
