@@ -29,8 +29,10 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiRejection;
 
-/// Fields a client may filter on. Every entry is a key present on the
-/// asset objects `catalog::list_body` emits.
+/// Fields a client may filter on. Every entry is a key the asset objects
+/// `catalog::list_body` emits can carry; `tags` only exists on an asset
+/// someone annotated, and reads as an empty list on the others
+/// ([`ARRAY_FIELDS`]).
 pub const FILTERABLE_FIELDS: &[&str] = &[
     "id",
     "name",
@@ -51,11 +53,38 @@ pub const FILTERABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "tags",
 ];
 
-/// Fields a client may sort on. Same set as filtering — there is no field
-/// that is meaningful to filter but not to order by.
-pub const SORTABLE_FIELDS: &[&str] = FILTERABLE_FIELDS;
+/// Fields whose value is a list of strings rather than one scalar. They
+/// filter with the any/none rules of [`matches_array_filter`].
+const ARRAY_FIELDS: &[&str] = &["tags"];
+
+/// Fields a client may sort on: the filterable ones except `tags`, which is
+/// a list and has no order to sort by (`DATA-11`). Kept as its own list so
+/// a new filterable field is not sortable by accident; a test pins the two
+/// together.
+pub const SORTABLE_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "namespace",
+    "type",
+    "layer",
+    "tier",
+    "classification",
+    "owner",
+    "domain",
+    "description",
+    "format",
+    "engine",
+    "rows",
+    "sizeBytes",
+    "columnCount",
+    "freshnessLagSeconds",
+    "lastUpdated",
+    "health",
+    "residency",
+];
 
 /// Fields a client may group by. Restricted to the low-cardinality
 /// categorical ones: grouping by `name` or `sizeBytes` would produce one
@@ -250,6 +279,9 @@ pub fn parse_group_by(raw: Option<&str>) -> Result<Option<String>, ApiRejection>
 /// dangerous direction for a governed catalog.
 fn matches_filter(asset: &Value, filter: &Filter) -> bool {
     let field = filter.id.as_str();
+    if ARRAY_FIELDS.contains(&field) {
+        return matches_array_filter(asset, filter);
+    }
     let actual = field_str(asset, field);
     let first = filter.values.first().map_or("", String::as_str);
 
@@ -288,6 +320,41 @@ fn matches_filter(asset: &Value, filter: &Filter) -> bool {
         // module impure and untestable. The Data Explorer exposes no date
         // filter today; wiring one means passing "now" in as a parameter
         // rather than reading it here.
+        _ => false,
+    }
+}
+
+/// [`matches_filter`] for a field that is a list of strings (`tags`,
+/// `DATA-11`). `eq`, `iLike` and `inArray` match when any entry matches;
+/// `ne`, `notILike` and `notInArray` match when no entry does; `isEmpty`
+/// and `isNotEmpty` look at the list's length. The ordering operators match
+/// nothing: a list has no order. An asset without the field is an empty
+/// list, so a negative filter keeps it, as it does for a missing scalar.
+fn matches_array_filter(asset: &Value, filter: &Filter) -> bool {
+    let entries: Vec<&str> = asset
+        .get(filter.id.as_str())
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let first = filter.values.first().map_or("", String::as_str);
+    let any = |positive: &str| {
+        entries.iter().any(|entry| match positive {
+            "eq" => entry.eq_ignore_ascii_case(first),
+            "iLike" => entry.to_lowercase().contains(&first.to_lowercase()),
+            _ => filter.values.iter().any(|c| c.eq_ignore_ascii_case(entry)),
+        })
+    };
+    match filter.operator.as_str() {
+        "isEmpty" => entries.is_empty(),
+        "isNotEmpty" => !entries.is_empty(),
+        "eq" => any("eq"),
+        "iLike" => any("iLike"),
+        "inArray" => any("inArray"),
+        "ne" => !any("eq"),
+        "notILike" => !any("iLike"),
+        "notInArray" => !any("inArray"),
+        // Ordering operators, `isBetween`, and anything unknown: fail
+        // closed, like the scalar path.
         _ => false,
     }
 }
@@ -537,6 +604,89 @@ mod tests {
         );
         assert!(ids(&hits).contains(&"silver.dim_negara"));
         assert!(!ids(&hits).contains(&"gold.restoran"));
+    }
+
+    // --- array field: tags (DATA-11 R5) ------------------------------
+
+    fn tagged() -> Vec<Value> {
+        vec![
+            json!({ "id": "a", "tags": ["Finance", "pii"] }),
+            json!({ "id": "b", "tags": ["finance-archive"] }),
+            json!({ "id": "c", "tags": [] }),
+            // No `tags` key at all: an asset nobody annotated.
+            json!({ "id": "d" }),
+        ]
+    }
+
+    fn tag_hits(operator: &str, values: &[&str]) -> Vec<String> {
+        apply_filters(
+            &tagged(),
+            &[filter("tags", operator, values)],
+            JoinOperator::And,
+        )
+        .iter()
+        .filter_map(|a| a["id"].as_str().map(str::to_owned))
+        .collect()
+    }
+
+    #[test]
+    fn tags_eq_matches_when_any_entry_equals_ignoring_case() {
+        assert_eq!(tag_hits("eq", &["finance"]), vec!["a"]);
+    }
+
+    #[test]
+    fn tags_i_like_matches_when_any_entry_contains_the_text() {
+        assert_eq!(tag_hits("iLike", &["FINANCE"]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tags_in_array_matches_when_any_entry_is_listed() {
+        assert_eq!(tag_hits("inArray", &["pii", "nothing"]), vec!["a"]);
+    }
+
+    #[test]
+    fn tags_negative_operators_match_when_no_entry_does_and_keep_untagged_assets() {
+        assert_eq!(tag_hits("ne", &["pii"]), vec!["b", "c", "d"]);
+        assert_eq!(tag_hits("notILike", &["finance"]), vec!["c", "d"]);
+        assert_eq!(
+            tag_hits("notInArray", &["pii", "finance-archive"]),
+            vec!["c", "d"]
+        );
+    }
+
+    #[test]
+    fn tags_is_empty_and_is_not_empty_look_at_the_length_and_a_missing_key_is_empty() {
+        assert_eq!(tag_hits("isEmpty", &[]), vec!["c", "d"]);
+        assert_eq!(tag_hits("isNotEmpty", &[]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tags_ordering_operators_match_nothing() {
+        for operator in ["lt", "lte", "gt", "gte"] {
+            assert!(tag_hits(operator, &["m"]).is_empty(), "{operator}");
+        }
+        assert!(tag_hits("isBetween", &["a", "z"]).is_empty());
+    }
+
+    #[test]
+    fn tags_can_be_filtered_but_not_sorted_or_grouped_by() {
+        assert!(parse_filters(Some(r#"[{"id":"tags","value":"pii","operator":"iLike"}]"#)).is_ok());
+        for err in [
+            parse_sort(Some(r#"[{"id":"tags","desc":false}]"#)).unwrap_err(),
+            parse_group_by(Some("tags")).unwrap_err(),
+        ] {
+            assert!(matches!(err.0, ApiError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn the_sortable_fields_are_the_filterable_fields_without_the_list_ones() {
+        let expected: Vec<&str> = FILTERABLE_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| !ARRAY_FIELDS.contains(f))
+            .collect();
+        assert_eq!(SORTABLE_FIELDS, expected.as_slice());
     }
 
     #[test]
