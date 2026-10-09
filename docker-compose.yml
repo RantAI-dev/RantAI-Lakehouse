@@ -2854,6 +2854,58 @@ services:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_governance_test.py"
     restart: "no"
 
+  # DATA-16 (F2) — time-travel acceptance test:
+  # `ops/g8/g8_time_travel_test.py` loads a Bronze table twice through
+  # `bronze_ingest_job` and proves a masked, row-filtered Analyst still gets
+  # `***` and only the allowed rows when the OLDER version is pinned. It
+  # needs the Bronze-ingest stack, so it takes `g3a-test-runner`'s shape and
+  # dependencies (`dagster` profile, `g3a-source-init` for the demo source),
+  # plus `clickhouse-iceberg-init` (the `icecat_api` database the API reads
+  # Iceberg tables through) and direct Postgres access to seed an Analyst
+  # login and to change the demo source between the loads, as
+  # `g8-test-runner` does.
+  #
+  # Usage (from a clean stack, as the `g8-time-travel` CI job does):
+  #   docker compose -p <project> --profile dagster up -d --build \
+  #     lakehouse-api dagster-code-location dagster-webserver \
+  #     dagster-daemon g3a-source-init clickhouse-iceberg-init
+  #   docker compose -p <project> --profile dagster run --rm \
+  #     g8-time-travel-test-runner
+  g8-time-travel-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g8:/work
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      # `./ops/g8` is bound read-write as root (see `g3a-test-runner`):
+      # keep a root-owned `__pycache__/` from ever landing in the checkout.
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_time_travel_test.py"
+    restart: "no"
+
   # WS3 (G6) — Tier 1 ingestion matrix gate fixtures: one MySQL and one
   # SQL Server source the `sql` adapter (`dagster/dispar_orchestrate/
   # adapters/sql.py`) dials, plus a stdlib REST fixture server the `rest`

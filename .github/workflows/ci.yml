@@ -770,6 +770,53 @@ jobs:
         if: always()
         run: docker compose -p g8ci down -v
 
+  # ── DATA-16 (F2) — time travel keeps the policy. A Bronze table is
+  # loaded twice through bronze_ingest_job and read at its OLDER version:
+  # the admin gets clear text, a masked and row-filtered Analyst gets ***
+  # and only the allowed rows, also with the pin inside a subquery or CTE.
+  # See ops/g8/g8_time_travel_test.py. Needs the Bronze-ingest stack, so it
+  # is shaped like g3a-dagster above (same .env, same services) plus
+  # clickhouse-iceberg-init, which the runner's depends_on starts. ──
+  g8-time-travel:
+    name: Rust · G8 time travel keeps the policy
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # Same as g3a-dagster's .env: bronze_ingest_job dials this compose
+          # network's own `postgres`, which the dlt SSRF guard refuses unless
+          # the gate opts in for itself.
+          INGEST_ALLOW_INTERNAL_HOSTS=true
+          EOF
+
+      - name: Bring up lakehouse-api + Dagster + the demo source table + the Iceberg query database
+        run: >
+          docker compose -p g8ttci --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          g3a-source-init clickhouse-iceberg-init
+
+      - name: Run the time-travel acceptance test inside the compose network
+        run: docker compose -p g8ttci --profile dagster run --rm g8-time-travel-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g8ttci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g8ttci down -v
+
   # ── CI Required Gate ────────────────────────────────────────────────
   # The single gate job that evaluates the entire CI run and enforces that
   # all required jobs passed or were legitimately skipped based on the
@@ -796,6 +843,7 @@ jobs:
       - g6-ingest
       - gold-export
       - g8-governance
+      - g8-time-travel
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -830,4 +878,5 @@ jobs:
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
+          G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}
         run: ./scripts/ci/required_gate.sh
