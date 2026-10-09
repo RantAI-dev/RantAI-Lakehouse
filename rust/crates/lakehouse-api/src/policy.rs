@@ -275,8 +275,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Rewriting or removing a rule is a governance decision, like setting an SLA.
     ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
+    // SEC-22 (F1): reading rules stays open to any login, but adding one
+    // (quality, classification, residency) takes `governance:write` — the
+    // grant that rewriting or removing the same rule already takes above.
+    // It used to be `RequiresAuth`, so anyone logged in could add a rule
+    // they could not then edit or delete.
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
-    ("POST", "/api/governance/{kind}",    Policy::RequiresAuth),
+    ("POST", "/api/governance/{kind}",    Policy::RequiresPermission("governance:write")),
 
     // ── Storage: no seeded resource — auth only. Restore (destructive)
     //    requires `storage:restore`, deliberately Platform-Admin-only —
@@ -777,6 +782,20 @@ mod tests {
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
         assert_eq!(public_count, 7);
+    }
+
+    /// SEC-22 (F1): adding a governance rule needs `governance:write`, the
+    /// same grant as changing or removing one; listing rules needs a login.
+    #[test]
+    fn adding_a_governance_rule_needs_governance_write_but_listing_needs_a_login() {
+        assert_eq!(
+            policy_for("POST", "/api/governance/{kind}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+        assert_eq!(
+            policy_for("GET", "/api/governance/{kind}"),
+            Some(Policy::RequiresAuth)
+        );
     }
 
     #[test]
