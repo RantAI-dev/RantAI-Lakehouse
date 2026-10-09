@@ -4,9 +4,8 @@
 | --- | --- |
 | Backlog | `SEC-18` in [BACKLOG.md](../BACKLOG.md) |
 | Module | Administration & Security |
-| When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 

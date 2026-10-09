@@ -299,14 +299,16 @@ versions.
 ### Risks worth knowing
 
 The base's Risk fields: Owner (the module's owner, held in the base),
-Likelihood and Impact (High / Medium / Low), and the Mitigation.
+Likelihood and Impact (High / Medium / Low), and the Mitigation. The
+Likelihood and Impact ratings are the planner's estimate, not yet confirmed
+by the product owner.
 
-| Risk | Likelihood | Impact | Mitigation |
-| --- | --- | --- | --- |
-| We claim something that fails in a customer's test | Medium | High | Section 3 lists every limit plainly; a status is Have only when it matches or beats the best competitor |
-| A wrong number is shown without an error | Low | High | Principle 2: show "Not measured" or "unsupported", never an invented value; gate `ops/g8` proves masking end to end |
-| Everything depends on one person and AI agents | High | High | Every decision is written down in `docs/core/`; the base holds who owns and who accepts each item |
-| Chasing every competitor feature | Medium | Medium | Section 5 picks the gaps a switching customer hits first; the `DEC-*` list says no to the rest |
+| Risk | Why it matters | Likelihood | Impact | Mitigation |
+| --- | --- | --- | --- | --- |
+| We claim something that fails in a customer's test | Costs more than the claim was worth | Medium | High | Section 3 lists every limit plainly; a status is Have only when it matches or beats the best competitor |
+| A wrong number is shown without an error | The most damaging kind of failure for a data product | Low | High | Principle 2: show "Not measured" or "unsupported", never an invented value; gate `ops/g8` proves masking end to end |
+| Everything depends on one person and AI agents | Decisions must be written down; that is what this folder is for | High | High | Every decision is written down in `docs/core/`; the base holds who owns and who accepts each item |
+| Chasing every competitor feature | We cannot match three large platforms | Medium | Medium | Section 5 picks the gaps a switching customer hits first; the `DEC-*` list says no to the rest |
 
 ---
 

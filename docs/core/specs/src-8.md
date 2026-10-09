@@ -4,9 +4,8 @@
 | --- | --- |
 | Backlog | `SRC-8` in [BACKLOG.md](../BACKLOG.md) |
 | Module | Data |
-| When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 

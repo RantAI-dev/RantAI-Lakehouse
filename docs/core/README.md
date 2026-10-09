@@ -28,10 +28,10 @@ stays current.
 Merged is not accepted. A feature counts as done at step 4.
 
 **The repo and the base.** `BACKLOG.md` is the master list the agents read.
-The Lark base mirrors it and adds what a public repo cannot hold: the person
-(Owner, Acceptor), the dates, and the QA-case results. When the repo's
-columns change, the base row is updated to match; nothing the repo owns is
-edited only in the base.
+The Lark base mirrors it: status, PR, dates and QA-case results are kept in
+the repo and copied to the base. The base adds only what a public repo must
+not hold: the people (Owner, Acceptor). When the repo changes, the base row
+is updated to match; nothing the repo holds is changed only in the base.
 
 ## Rules
 
