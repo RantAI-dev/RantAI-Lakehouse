@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
 import { assetService } from "@/services";
+import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
 
@@ -21,6 +22,17 @@ const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
 export function openCommandPalette() {
   window.dispatchEvent(new Event(OPEN_EVENT));
+}
+
+/** What the box says when a search did not return assets. Upstream error text
+ * never reaches the user (principle 4): only a `403` and a `supported: false`
+ * answer (thrown with status `200` by `loadCatalog`) have their own line. */
+function failureLine(err: unknown): string {
+  if (isServiceError(err)) {
+    if (err.code === "permission_denied") return "You do not have access to the catalog";
+    if (err.status === 200) return err.message;
+  }
+  return "Catalog search is unavailable";
 }
 
 type Recent = { href: string; title: string };
@@ -44,7 +56,9 @@ export function CommandPalette() {
   const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
   // A failed search is said out loud (principle 2); an empty list would
   // read as "nothing matches".
-  const [searchFailed, setSearchFailed] = React.useState(false);
+  // The line to show for it: a refusal, a `supported: false` reason, or the
+  // outage text (DATA-11 review SHOULD-FIX 4). Null when the search worked.
+  const [searchFailed, setSearchFailed] = React.useState<string | null>(null);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -62,7 +76,7 @@ export function CommandPalette() {
     const term = search.trim();
     if (!term) {
       setAssetResults([]);
-      setSearchFailed(false);
+      setSearchFailed(null);
       return;
     }
     let cancelled = false;
@@ -72,13 +86,13 @@ export function CommandPalette() {
         .listAssets({ search: term }, controller.signal)
         .then((assets) => {
           if (cancelled) return;
-          setSearchFailed(false);
+          setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
-          setSearchFailed(true);
+          setSearchFailed(failureLine(err));
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
@@ -154,7 +168,7 @@ export function CommandPalette() {
         ) : null}
         {searchFailed ? (
           <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
-            Catalog search is unavailable
+            {searchFailed}
           </div>
         ) : null}
 

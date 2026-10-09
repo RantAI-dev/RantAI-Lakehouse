@@ -99,4 +99,20 @@ describe("CommandPalette catalog search", () => {
     await waitFor(() => expect(screen.getByText("Catalog search is unavailable")).toBeTruthy())
     expect(screen.queryByText("See all results")).toBeNull()
   })
+
+  it("says the caller has no access to the catalog on a 403, not that it is unavailable", async () => {
+    stubCatalog({ error: "forbidden" }, 403)
+    await search("orders")
+    await waitFor(() =>
+      expect(screen.getByText("You do not have access to the catalog")).toBeTruthy()
+    )
+    expect(screen.queryByText("Catalog search is unavailable")).toBeNull()
+  })
+
+  it("shows the API's reason when the catalog answers supported: false", async () => {
+    stubCatalog({ assets: [], namespaces: [], supported: false, reason: "Set CATALOG_TENANT_ID first." })
+    await search("orders")
+    await waitFor(() => expect(screen.getByText("Set CATALOG_TENANT_ID first.")).toBeTruthy())
+    expect(screen.queryByText("Catalog search is unavailable")).toBeNull()
+  })
 })
