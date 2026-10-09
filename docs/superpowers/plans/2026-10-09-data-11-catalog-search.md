@@ -729,3 +729,11 @@ Orders` with a column `customer_id` gives `{field: "column", value:
 `matchedOn`; the existing test `the_reason_comes_from_the_first_word` is
 changed to the new rule, with the reason in a comment (rule 2).
 
+*Reviewed 2026-10-09 at `ea5721b`: fixed as written (`0b547ac`).* By the
+planner, after `touch` of the crate sources: `cargo fmt --check` exit 0,
+`cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D
+warnings` clean in 1m15s. Live on the separate instance, `northwind
+customer` now returns `Northwind Orders` with `column customer_id` and the
+three customer tables with no reason. Not verified: the Rust tests (CI
+first).
+
