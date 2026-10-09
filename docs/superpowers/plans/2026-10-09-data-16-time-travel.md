@@ -215,6 +215,16 @@ on this machine for this task.
 - Whether `icecat_api` sees the table the moment the second load ends, and whether the policy engine resolves `real_columns` for `icecat_api.`bronze.g3a_orders``: read from the code, not run.
 - Whether ClickHouse accepts `SETTINGS` inside a subquery or CTE through the rewrite; the gate passes either way (masked or 422).
 
+### Developer, 2026-10-09 (T6, DATA-16 review BLOCKER 1)
+
+**Commit:** see `git log` (fix(api): keep the quoting of the derived alias in the masking rewrite), local only. Only `rust/crates/lakehouse-api/src/sql_rewrite.rs` changed: new `derived_alias_ident`, used by `substitute_table_factor`; `policy_engine.rs` untouched.
+
+**Read first:** `Ident` displays `quote_style` with escaping, or the bare value when `None`. `ClickHouseDialect` does not override `identifier_quote_style` (default `None`), so the dialect cannot name the quote; the helper asks it and falls back to a backtick, the quote the derived `SELECT` already uses. The review's cause is right. Plain words keep the old lower-cased unquoted alias, so the `serving.mart_x`-style output is unchanged. No other place in `sql_rewrite.rs` builds an `Ident` from a lower-cased string (`SqlIdent` was used once); the lower-cased `parts` elsewhere are only for canonical lookup.
+
+**Commands** (from `rust/`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, 46G free): after `touch` of crate sources, `cargo fmt --check` clean (after `cargo fmt` on my own hunks); `cargo clippy -p lakehouse-api --all-targets -- -D warnings` finished with no warnings (re-run after fixing a `manual_unwrap_or` finding).
+
+**Not verified:** the new test `data_lake_catalog_table_gets_a_quoted_alias_that_parses_again` and every existing test (*not verified, first run is CI's*; `cargo test` not allowed). No live Analyst query was run.
+
 ## Review
 
 ### First review, 2026-10-09 at `aeda03d`
