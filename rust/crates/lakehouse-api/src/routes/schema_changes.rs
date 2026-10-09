@@ -245,6 +245,10 @@ fn validate(body: &ObservationBody) -> Result<(), ApiError> {
     for column in &body.columns {
         check_name("column name", &column.name, MAX_NAME_LEN)?;
         check_name("typeName", &column.type_name, MAX_TYPE_LEN)?;
+        // `SRC-8` task 11: same rules and bounds as the column's own name.
+        if let Some(loaded_name) = &column.loaded_name {
+            check_name("loadedName", loaded_name, MAX_NAME_LEN)?;
+        }
         if !seen.insert(column.name.as_str()) {
             return Err(ApiError::BadRequest(
                 "column names must be unique within a table".to_owned(),
@@ -698,6 +702,7 @@ mod tests {
             name: name.to_owned(),
             type_name: type_name.to_owned(),
             nullable: true,
+            loaded_name: None,
         }
     }
 
@@ -741,6 +746,24 @@ mod tests {
         let mut object = body(vec![col("id", "integer")]);
         object.object = "orders\u{7}".to_owned();
         assert!(validate(&object).is_err());
+    }
+
+    /// `SRC-8` task 11: `loadedName` is optional, takes the name rules and
+    /// bounds of a column name, and an unknown field is still refused.
+    #[test]
+    fn a_loaded_name_is_optional_and_follows_the_column_name_rules() {
+        let mut named = col("OrderDate", "date");
+        named.loaded_name = Some("order_date".to_owned());
+        assert!(validate(&body(vec![named])).is_ok());
+        for bad in ["", "  ", "x".repeat(MAX_NAME_LEN + 1).as_str(), "a\nb"] {
+            let mut column = col("OrderDate", "date");
+            column.loaded_name = Some(bad.to_owned());
+            assert!(validate(&body(vec![column])).is_err(), "{bad:?}");
+        }
+        let wire = json!({"name": "a", "typeName": "t", "nullable": true, "loadedName": "a"});
+        assert!(serde_json::from_value::<ObservedColumn>(wire).is_ok());
+        let unknown = json!({"name": "a", "typeName": "t", "nullable": true, "loaded": "a"});
+        assert!(serde_json::from_value::<ObservedColumn>(unknown).is_err());
     }
 
     #[test]
@@ -1175,6 +1198,58 @@ mod tests {
         )
         .await;
         assert_eq!(listed["inactiveColumns"], json!([]));
+    }
+
+    /// `SRC-8` task 11: the loaded name sent with a before-load column is kept
+    /// with the baseline and written to the inactive column when the removal
+    /// is approved; a column sent without one stores `null` and marks nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_approved_removal_keeps_the_loaded_name_the_orchestrator_sent(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "loaded name", "apply_non_breaking").await;
+        let observe = |columns: Value| {
+            let h = &h;
+            let id = &id;
+            async move {
+                let (status, answer) = call(
+                    h,
+                    &service(),
+                    "POST",
+                    &format!("/api/connectors/{id}/schema-observations"),
+                    Some(json!({
+                        "object": "orders", "columns": columns,
+                        "primaryKey": ["id"], "phase": "before_load",
+                    })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{answer}");
+            }
+        };
+        let id_col = json!({"name": "id", "typeName": "integer", "nullable": false});
+        observe(json!([
+            id_col,
+            {"name": "OrderDate", "typeName": "date", "nullable": true, "loadedName": "order_date"},
+            {"name": "legacy", "typeName": "text", "nullable": true},
+        ]))
+        .await;
+        observe(json!([id_col])).await;
+
+        let (status, approved) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+
+        let inactive = listed(&h, &id).await["inactiveColumns"].clone();
+        assert_eq!(inactive.as_array().unwrap().len(), 2);
+        let by_name = |name: &str| {
+            inactive
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["columnName"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("OrderDate")["loadedName"], "order_date");
+        assert_eq!(by_name("legacy")["loadedName"], Value::Null);
     }
 
     /// Spec "pause": the connector stops, `ingest/run` answers 409 without

@@ -335,6 +335,23 @@ describe("a column's row", () => {
     expect(within(email).queryByText("sort key")).toBeNull()
   })
 
+  it("marks a column the source no longer has as inactive since its date, and no other column", () => {
+    renderCard(
+      [
+        schemaRow(column("qty", "Int64", { inactiveSince: "2026-10-09T12:00:00.000Z" })),
+        schemaRow(column("id", "Int64", { inactiveSince: null })),
+        schemaRow(column("note")),
+      ],
+      ready([])
+    )
+    expectMark(rowOf("qty"), "Int64", "inactive since Oct 9, 2026")
+    expect(
+      within(nameLine(rowOf("qty"))).getByTitle("The source no longer has this column. Its old values are kept.")
+    ).toBeTruthy()
+    expect(within(rowOf("id")).queryByText(/inactive since/)).toBeNull()
+    expect(within(rowOf("note")).queryByText(/inactive since/)).toBeNull()
+  })
+
   it("marks a column the sorting key names, but not one that is only inside an expression", () => {
     renderCard(
       [schemaRow(column("plnt")), schemaRow(column("material")), schemaRow(column("d", "Date"))],

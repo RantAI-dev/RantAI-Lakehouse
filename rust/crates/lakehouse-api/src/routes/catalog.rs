@@ -1954,9 +1954,14 @@ async fn bronze_asset_detail_body(
             if !deskripsi.is_empty() {
                 o.insert("description".to_owned(), json!(deskripsi));
             }
+            // Filled by `mark_inactive_columns` below; `null` for a column
+            // the source still has (`SRC-8` task 11).
+            o.insert("inactiveSince".to_owned(), Value::Null);
             Value::Object(o)
         })
         .collect();
+    let mut schema = schema;
+    mark_inactive_columns(state, table, &mut schema).await;
 
     let rows = num_or_zero(Some(sync), "total");
     let sekunder = str_col(sync, "tier") == "sekunder";
@@ -2023,6 +2028,51 @@ async fn bronze_asset_detail_body(
     mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
+}
+
+/// Sets `inactiveSince` on the columns of a Bronze table that the connector
+/// loading it no longer finds at its source (`SRC-8` task 11, decision D8).
+///
+/// ONE extra query for the whole table
+/// ([`lakehouse_store::schema_change::inactive_columns_of_table`]), matched on
+/// the column's name in the Bronze table (the loader's normalised name, which
+/// the orchestrator sent as `loadedName`); a row that has none marks nothing.
+///
+/// Tenant: this runs inside [`detail`], after `catalog_tenant_refusal`, so
+/// the caller may already read this table's whole column list; the query is
+/// keyed by that table's name and returns only which of those columns are
+/// inactive and since when. It takes no connector id, name or tenant from
+/// the caller and returns nothing about any connector.
+///
+/// The marks are decoration: with no pool configured, or when the query
+/// fails, the detail still answers, without marks, and a warning is logged
+/// (the Schema tab must not break because of this; the text of the failure
+/// stays in the log).
+async fn mark_inactive_columns(state: &AppState, table: &str, schema: &mut [Value]) {
+    if table.is_empty() {
+        return;
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let marks = match lakehouse_store::schema_change::inactive_columns_of_table(pool, table).await {
+        Ok(marks) => marks,
+        Err(err) => {
+            tracing::warn!(%err, table, "inactive-column lookup failed; the detail shows no marks");
+            return;
+        }
+    };
+    for (loaded_name, since) in marks {
+        let found = schema
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .find(|column| {
+                column.get("name").and_then(Value::as_str) == Some(loaded_name.as_str())
+            });
+        if let Some(column) = found {
+            column.insert("inactiveSince".to_owned(), json!(since.as_str()));
+        }
+    }
 }
 
 /// Whether the catalog list shows a Silver table as a row of its own. One
@@ -4342,6 +4392,134 @@ mod tests {
                 assert_eq!(body["schemaVersions"], json!([]));
                 Ok(())
             }
+        }
+    }
+
+    /// `SRC-8` task 11: the Schema tab's inactive-column marks.
+    mod inactive_marks {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn schema() -> Vec<Value> {
+            ["id", "order_date", "legacy"]
+                .iter()
+                .map(|n| json!({"name": n, "dataType": "String", "inactiveSince": Value::Null}))
+                .collect()
+        }
+
+        /// A connector that loads `orders_raw` from its source object `public.orders`,
+        /// whose column `OrderDate` (loaded as `order_date`) was approved as removed.
+        async fn seed(pool: &lakehouse_store::PgPool) {
+            use lakehouse_store::connectors::{
+                CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
+            };
+            let created = lakehouse_store::connectors::create_connector(
+                pool,
+                &CreateConnectorInput {
+                    name: "marks".to_owned(),
+                    kind: "PostgreSQL".to_owned(),
+                    direction: "source".to_owned(),
+                    host: "db.example".to_owned(),
+                    credential: CredentialSpec {
+                        source: CredentialSource::Env,
+                        primary: CredentialKind::Password,
+                        secondary: None,
+                    },
+                    environment: "staging".to_owned(),
+                    tenant: "Meridian Group".to_owned(),
+                    residency: "in-region".to_owned(),
+                    capabilities: vec![],
+                    owner: None,
+                },
+            )
+            .await
+            .unwrap()
+            .0
+            .id;
+            sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+                .bind(&created)
+                .bind(json!([{"name": "public.orders", "target": "orders_raw", "loadMode": "replace"}]))
+                .execute(pool)
+                .await
+                .unwrap();
+            for (column, loaded) in [("OrderDate", Some("order_date")), ("legacy", None)] {
+                sqlx::query(
+                    "INSERT INTO connector_inactive_column \
+                     (connector_id, object_name, column_name, inactive_since, loaded_name) \
+                     VALUES ($3, 'public.orders', $1, '2026-10-01T08:00:00Z', $2)",
+                )
+                .bind(column)
+                .bind(loaded)
+                .bind(&created)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        /// The marked column carries its date and the others stay `null`; a
+        /// row with no loaded name marks nothing, and another table is not
+        /// touched.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_removed_column_is_marked_by_its_name_in_the_bronze_table(
+            pool: lakehouse_store::PgPool,
+        ) {
+            seed(&pool).await;
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+            assert_eq!(schema[0]["inactiveSince"], Value::Null);
+            assert_eq!(
+                schema[1]["inactiveSince"],
+                json!("2026-10-01T08:00:00.000Z")
+            );
+            assert_eq!(
+                schema[2]["inactiveSince"],
+                Value::Null,
+                "no loaded name, no mark"
+            );
+
+            let mut other = self::schema();
+            mark_inactive_columns(&state, "customers_raw", &mut other).await;
+            assert!(other.iter().all(|c| c["inactiveSince"].is_null()));
+        }
+
+        /// A failed lookup leaves the columns as they were: the detail still
+        /// answers, only without marks.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_failed_lookup_leaves_the_columns_unmarked(pool: lakehouse_store::PgPool) {
+            seed(&pool).await;
+            sqlx::query("DROP TABLE connector_inactive_column")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+
+            assert!(schema.iter().all(|c| c["inactiveSince"].is_null()));
         }
     }
 }

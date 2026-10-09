@@ -1739,6 +1739,18 @@ def test_the_columns_of_a_file_load_are_posted_after_the_load_succeeded(monkeypa
     assert [r["status"] for r in recorded] == ["succeeded"]
 
 
+def test_the_columns_of_a_file_load_carry_their_own_name_as_the_loaded_name(monkeypatch, observations) -> None:
+    """SRC-8 task 11: after a load the pipeline's names are already the loaded
+    ones, so `loadedName` is the name itself."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded(("order_date", "date"), ("note", "text")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT, run_id="run-9")
+
+    [call] = observations.calls
+    assert [(c.name, c.loaded_name) for c in call["columns"]] == [("order_date", "order_date"), ("note", "note")]
+
+
 def test_the_request_is_just_what_was_loaded_so_a_missing_column_is_not_reported_at_all(
     monkeypatch, observations
 ) -> None:

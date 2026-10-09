@@ -154,7 +154,7 @@ describe("ConnectorSchemaChangesPanel", () => {
     const after: SchemaChangeList = {
       pending: [],
       recent: [change({ status: "approved", canApprove: false })],
-      inactiveColumns: [{ objectName: "public.orders", columnName: "note", inactiveSince: "2026-10-09T02:00:00.000Z" }],
+      inactiveColumns: [{ objectName: "public.orders", columnName: "note", inactiveSince: "2026-10-09T02:00:00.000Z", loadedName: "note" }],
     }
     const calls = stubFetch([pending, after], {
       "POST /api/connectors/conn-a/schema-changes/approve": () =>

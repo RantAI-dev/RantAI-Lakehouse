@@ -115,6 +115,13 @@ pub struct ObservedColumn {
     /// Whether the source allows NULL. Recorded; a nullability change is
     /// not a schema change in `SRC-8`.
     pub nullable: bool,
+    /// The name the loader gives the column in the Bronze table (`dlt`'s
+    /// normalised name), when the orchestrator knows it (`SRC-8` task 11).
+    /// Kept with the shape so an approved removal can store it with the
+    /// inactive column; never compared (a change of it is not a schema
+    /// change). Absent in shapes stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_name: Option<String>,
 }
 
 /// What kind of change was found.
@@ -324,6 +331,10 @@ pub struct InactiveColumn {
     pub column_name: String,
     /// When it became inactive, ISO 8601.
     pub inactive_since: IsoTime,
+    /// The name the Bronze table gives the column (`SRC-8` task 11); `None`
+    /// when the orchestrator did not send it, and then the Schema tab marks
+    /// nothing for this row.
+    pub loaded_name: Option<String>,
 }
 
 /// One change as [`ObservationTx::record`] left it, and whether this call
@@ -906,8 +917,9 @@ pub async fn list_inactive_columns(
     pool: &PgPool,
     connector_id: &str,
 ) -> Result<Vec<InactiveColumn>, StoreError> {
-    let rows: Vec<(String, String, OffsetDateTime)> = sqlx::query_as(
-        "SELECT object_name, column_name, inactive_since FROM connector_inactive_column \
+    let rows: Vec<(String, String, OffsetDateTime, Option<String>)> = sqlx::query_as(
+        "SELECT object_name, column_name, inactive_since, loaded_name \
+         FROM connector_inactive_column \
          WHERE connector_id = $1 ORDER BY object_name, column_name",
     )
     .bind(connector_id)
@@ -915,11 +927,57 @@ pub async fn list_inactive_columns(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(object_name, column_name, at)| InactiveColumn {
-            object_name,
-            column_name,
-            inactive_since: at.into(),
-        })
+        .map(
+            |(object_name, column_name, at, loaded_name)| InactiveColumn {
+                object_name,
+                column_name,
+                inactive_since: at.into(),
+                loaded_name,
+            },
+        )
+        .collect())
+}
+
+/// The columns of one Bronze table that a connector loading it marked
+/// inactive, as `(loaded name, inactive since)` (`SRC-8` task 11): what the
+/// Schema tab of the catalog marks.
+///
+/// The table is found the way the catalog finds it: a connector's source
+/// object `target` IS the Bronze table's name (`register_connector_table`),
+/// and the inactive row belongs to that source object by name. One query for
+/// the whole table, never one per column. A row with no loaded name marks
+/// nothing and is left out: it cannot be matched to a Bronze column, and a
+/// guess could mark the wrong one. `source_objects` that is not an array
+/// (a connector with no spec yet stores `[]`) contributes nothing.
+///
+/// This function does not decide who may see the table; the catalog route
+/// calls it only after its own tenant gate, keyed by the table the caller is
+/// already allowed to read.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn inactive_columns_of_table(
+    pool: &PgPool,
+    target: &str,
+) -> Result<Vec<(String, IsoTime)>, StoreError> {
+    let rows: Vec<(String, OffsetDateTime)> = sqlx::query_as(
+        "SELECT ic.loaded_name, MIN(ic.inactive_since) \
+         FROM connector_inactive_column ic \
+         JOIN connector c ON c.id = ic.connector_id \
+         CROSS JOIN LATERAL jsonb_array_elements( \
+              CASE WHEN jsonb_typeof(c.source_objects) = 'array' \
+                   THEN c.source_objects ELSE '[]'::jsonb END) o(value) \
+         WHERE o.value ->> 'target' = $1 AND o.value ->> 'name' = ic.object_name \
+           AND ic.loaded_name IS NOT NULL \
+         GROUP BY ic.loaded_name ORDER BY ic.loaded_name",
+    )
+    .bind(target)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, at)| (name, at.into()))
         .collect())
 }
 
@@ -982,6 +1040,30 @@ async fn accept_waiting_shape(
     approved: &[SchemaChange],
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
+    // Before the baseline moves: the removed column is only in the OLD
+    // accepted shape, which is where its loaded name is read from (`SRC-8`
+    // task 11). A column the old shape has no loaded name for stores NULL
+    // and so marks nothing in the Schema tab.
+    for change in approved.iter().filter(|c| c.kind == "column_removed") {
+        sqlx::query(
+            "INSERT INTO connector_inactive_column \
+               (connector_id, object_name, column_name, inactive_since, loaded_name) \
+             VALUES ($1, $2, $3, $4, ( \
+               SELECT e.value ->> 'loadedName' \
+               FROM connector_source_schema s, jsonb_array_elements(s.columns) e \
+               WHERE s.connector_id = $1 AND s.object_name = $2 AND e.value ->> 'name' = $3 \
+               LIMIT 1)) \
+             ON CONFLICT (connector_id, object_name, column_name) DO UPDATE SET \
+               loaded_name = COALESCE(EXCLUDED.loaded_name, connector_inactive_column.loaded_name)",
+        )
+        .bind(connector_id)
+        .bind(object_name)
+        .bind(&change.column_name)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // The waiting shape is the last one observed; without it (it is always
     // set together with a pending row) the baseline simply stays.
     sqlx::query(
@@ -996,19 +1078,6 @@ async fn accept_waiting_shape(
     .execute(&mut *tx)
     .await?;
 
-    for change in approved.iter().filter(|c| c.kind == "column_removed") {
-        sqlx::query(
-            "INSERT INTO connector_inactive_column \
-               (connector_id, object_name, column_name, inactive_since) \
-             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-        )
-        .bind(connector_id)
-        .bind(object_name)
-        .bind(&change.column_name)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-    }
     // An approved addition accepts the column again: not inactive.
     let added: Vec<&str> = approved
         .iter()

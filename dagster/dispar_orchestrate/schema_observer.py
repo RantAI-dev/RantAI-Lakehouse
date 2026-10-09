@@ -52,6 +52,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import dlt
 import requests
 
 PHASES = ("before_load", "after_load")
@@ -77,18 +78,52 @@ class ReflectionMissing(ObservationRefused):
     there is nothing to observe. Raised instead of loading unchecked."""
 
 
+def loaded_column_name(name: str) -> str | None:
+    """The name `dlt` gives a source column in the Bronze table (SRC-8,
+    task 11): its own naming convention for a schema, `OrderDate` ->
+    `order_date`. The Schema tab lists the Bronze table's columns, so the
+    API can only mark a column inactive by THIS name, and nothing outside
+    `dlt` reproduces the convention.
+
+    A default `dlt.Schema` is what the pipeline's source schema starts as
+    (convention from `dlt`'s configuration, `snake_case` unless
+    `SCHEMA__NAMING` says otherwise), so it is asked rather than a copy of
+    the rules kept here; `test_schema_loaded_name.py` loads a table through
+    the sink's kind of destination and checks the names match. The one
+    difference not covered: the schema is not given the destination's
+    maximum identifier length, so a name past `dlt`'s default limit of that
+    convention could differ; the API accepts names of at most 256
+    characters.
+
+    `None` when `dlt` cannot normalise the name: the API then marks nothing
+    for that column (never a guess).
+    """
+    try:
+        return dlt.Schema("bronze").naming.normalize_identifier(name)
+    except Exception:  # noqa: BLE001 -- a name `dlt` refuses just gets no mark
+        return None
+
+
 @dataclass(frozen=True)
 class ReflectedColumn:
     """One column as SQLAlchemy reflected it. `type_name` is the database's
     own spelling (`str(column.type)`); lower-casing and comparing is the
-    API's job (`lakehouse-store::schema_diff`)."""
+    API's job (`lakehouse-store::schema_diff`).
+
+    `loaded_name` is the name the Bronze table will give the column
+    (`loaded_column_name`); after a load it is the name itself, already the
+    loaded one. `None` is left out of the wire body (`SRC-8` task 11)."""
 
     name: str
     type_name: str
     nullable: bool
+    loaded_name: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
-        return {"name": self.name, "typeName": self.type_name, "nullable": self.nullable}
+        wire: dict[str, Any] = {"name": self.name, "typeName": self.type_name, "nullable": self.nullable}
+        if self.loaded_name is not None:
+            wire["loadedName"] = self.loaded_name
+        return wire
 
 
 @dataclass(frozen=True)
@@ -128,7 +163,12 @@ class ReflectionCollector:
                 columns=tuple(
                     # `nullable` can be None once `dlt` strips nullability
                     # hints; only an explicit NOT NULL is "not nullable".
-                    ReflectedColumn(name=c.name, type_name=_type_name(c), nullable=c.nullable is not False)
+                    ReflectedColumn(
+                        name=c.name,
+                        type_name=_type_name(c),
+                        nullable=c.nullable is not False,
+                        loaded_name=loaded_column_name(c.name),
+                    )
                     for c in table.columns
                 ),
                 primary_key=tuple(c.name for c in table.primary_key.columns),

@@ -48,6 +48,7 @@ fn col(name: &str, type_name: &str) -> ObservedColumn {
         name: name.to_owned(),
         type_name: type_name.to_owned(),
         nullable: true,
+        loaded_name: None,
     }
 }
 
@@ -1049,4 +1050,81 @@ async fn removing_one_table_leaves_another_tables_pending_change_and_the_pause(p
     assert!(list_pending(&pool, &id).await.unwrap().is_empty());
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
     assert_eq!(after.paused_reason.as_deref(), Some("other"));
+}
+
+// --- SRC-8 task 11: inactive columns of one Bronze table ------------------------
+
+/// Approving a removal stores the loaded name read from the old baseline, and
+/// the catalog's one query finds the column by the table's target, leaving
+/// out a row without a loaded name and another table's rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_inactive_columns_of_a_bronze_table_are_found_by_target_and_loaded_name(pool: PgPool) {
+    use lakehouse_store::schema_change::inactive_columns_of_table;
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    let mut named = col("OrderDate", "date");
+    named.loaded_name = Some("order_date".to_owned());
+    {
+        let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
+        tx.record(&ObservationWrite {
+            observed_columns: &[col("id", "integer"), named, col("legacy", "text")],
+            observed_primary_key: &["id".to_owned()],
+            changes: &[],
+            accept_observed: true,
+            pause_connector: false,
+            run_id: None,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let removed_both = [
+        removed("OrderDate", ChangeStatus::Pending),
+        removed("legacy", ChangeStatus::Pending),
+    ];
+    let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
+    tx.record(&ObservationWrite {
+        observed_columns: &[col("id", "integer")],
+        observed_primary_key: &["id".to_owned()],
+        changes: &removed_both,
+        accept_observed: false,
+        pause_connector: false,
+        run_id: None,
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    let marks = inactive_columns_of_table(&pool, "t_orders").await.unwrap();
+    assert_eq!(
+        marks.len(),
+        1,
+        "the row without a loaded name marks nothing"
+    );
+    assert_eq!(marks[0].0, "order_date");
+    assert!(
+        inactive_columns_of_table(&pool, "t_customers")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        inactive_columns_of_table(&pool, "no_such_target")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let listed = list_inactive_columns(&pool, &id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|c| c.column_name == "OrderDate")
+            .and_then(|c| c.loaded_name.as_deref()),
+        Some("order_date")
+    );
 }

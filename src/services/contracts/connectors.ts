@@ -83,6 +83,8 @@ export type InactiveColumn = {
   objectName: string
   columnName: string
   inactiveSince: string
+  /** The name the Bronze table gives the column; `null` when it was not reported, and then the Schema tab marks nothing. */
+  loadedName: string | null
 }
 
 export type SchemaChangeList = {

@@ -95,6 +95,20 @@ def test_the_observation_is_posted_to_the_connectors_route_with_the_wire_shape_a
     assert calls[0]["timeout"] == 10
 
 
+def test_a_column_with_a_loaded_name_posts_it_as_loadedname_and_one_without_leaves_it_out(monkeypatch) -> None:
+    calls = _post(monkeypatch, _Resp(body={"action": "load", "columns": None, "changes": []}))
+    _observe(
+        columns=[
+            so.ReflectedColumn("OrderDate", "DATE", True, loaded_name="order_date"),
+            so.ReflectedColumn("id", "INTEGER", False),
+        ]
+    )
+    assert calls[0]["json"]["columns"] == [
+        {"name": "OrderDate", "typeName": "DATE", "nullable": True, "loadedName": "order_date"},
+        {"name": "id", "typeName": "INTEGER", "nullable": False},
+    ]
+
+
 def test_the_service_token_is_sent_as_a_bearer_and_appears_in_no_message_or_log(monkeypatch, caplog) -> None:
     calls = _post(monkeypatch, _Resp(status=500))
     with caplog.at_level(logging.DEBUG):

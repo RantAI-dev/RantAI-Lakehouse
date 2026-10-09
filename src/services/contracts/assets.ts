@@ -94,6 +94,13 @@ export type AssetColumn = {
   description?: string
   masked?: boolean
   classification?: Classification
+  /**
+   * When the connector that loads this Bronze table found the column gone
+   * from its source (`SRC-8`): the column and its old values are kept.
+   * `null` for a column the source still has. Absent on tables that no
+   * connector loads (Silver, Serving), which carry no such fact.
+   */
+  inactiveSince?: string | null
 }
 
 export type AssetDetail = Asset & {

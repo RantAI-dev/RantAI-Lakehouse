@@ -526,6 +526,7 @@ mod tests {
             name: name.to_owned(),
             type_name: type_name.to_owned(),
             nullable: true,
+            loaded_name: None,
         }
     }
 

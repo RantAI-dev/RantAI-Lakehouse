@@ -387,7 +387,8 @@ def _observe_after_load(
             schema_observer.ObserverConfig.from_env(),
             connector_id,
             object_name,
-            [schema_observer.ReflectedColumn(c.name, c.data_type, c.nullable) for c in columns],
+            # SRC-8 task 11: these are the pipeline's own (already loaded) names.
+            [schema_observer.ReflectedColumn(c.name, c.data_type, c.nullable, loaded_name=c.name) for c in columns],
             [],
             "after_load",
             run_id,
