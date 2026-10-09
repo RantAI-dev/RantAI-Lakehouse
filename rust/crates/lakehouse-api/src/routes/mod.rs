@@ -741,6 +741,7 @@ pub fn router(state: AppState) -> Router {
                 .put(alerts::update)
                 .delete(alerts::delete),
         )
+        .route("/api/alerts/status", get(alerts::status))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",

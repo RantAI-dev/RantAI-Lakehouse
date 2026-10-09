@@ -20,7 +20,7 @@ use lakehouse_iceberg::IcebergClient;
 use lakehouse_notify::{EmailSender, SmtpConfig};
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, FiredRule};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -31,13 +31,13 @@ use crate::state::AppState;
 
 /// `GET /api/alerts` — list the alert & digest rules the caller may see.
 ///
-/// The body is `{"rules": [...], "runEventsConfigured": bool}`. Rules of
+/// The body is `{"rules": [...]}`, as the `TypeScript` handler's. Rules of
 /// the pre-`SRC-7` kinds are returned exactly as before; rules of the six
 /// `SRC-7` kinds are filtered by [`visible_rules`] (`SRC-7` review BLOCKER 1:
 /// the list is one for the installation, and such a rule names a connector
-/// and carries a webhook target). The body also carries
-/// `runEventsConfigured` (`SRC-7` D9), true when this API has
-/// `PIPELINE_RUN_TOKEN` set.
+/// and carries a webhook target). Whether run reports can arrive is a
+/// separate route, [`status`], so this body stays what the parity corpus
+/// recorded (`SRC-7` review SHOULD-FIX 3).
 ///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
@@ -57,10 +57,35 @@ pub async fn list(
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
     let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
-    Ok(ApiJson(json!({
-        "rules": rules,
-        "runEventsConfigured": state.config.pipeline_run_token.is_some(),
-    })))
+    Ok(ApiJson(json!({ "rules": rules })))
+}
+
+/// Body of `GET /api/alerts/status`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertsStatus {
+    /// True when this API has `PIPELINE_RUN_TOKEN` set (non-empty), the
+    /// condition under which the orchestrator's run sensors can post failed
+    /// and finished runs.
+    run_events_configured: bool,
+}
+
+/// `GET /api/alerts/status` — whether connector and upload alerts can fire
+/// at all (`SRC-7` D9): unset, no run report is accepted, and the console
+/// says so instead of showing a silent "no alerts". It cannot see the
+/// orchestrator's own copy of the token.
+///
+/// # Errors
+///
+/// None; the signature is the handlers' shared shape.
+#[allow(
+    clippy::unused_async,
+    reason = "axum handlers are async fns; the body reads config only"
+)]
+pub async fn status(State(state): State<AppState>) -> ApiResult<ApiJson<AlertsStatus>> {
+    Ok(ApiJson(AlertsStatus {
+        run_events_configured: state.config.pipeline_run_token.is_some(),
+    }))
 }
 
 /// The rules of `rules` that `principal` may see (`SRC-7` review BLOCKER 1).
@@ -2149,41 +2174,37 @@ mod rule_scope_authorisation {
 
 #[cfg(test)]
 mod run_events_configured {
-    //! `SRC-7` D9: `GET /api/alerts` says whether run reports can arrive.
+    //! `SRC-7` D9 (review SHOULD-FIX 3): `GET /api/alerts/status` says whether
+    //! run reports can arrive.
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
     use super::*;
 
-    async fn listed(token: Option<&str>) -> Value {
-        let ch = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "meta": [], "rows": 0, "data": [] })),
-            )
-            .mount(&ch)
-            .await;
+    async fn reported(token: Option<&str>) -> Value {
         let mut env = HashMap::new();
-        env.insert("CH_URL".to_owned(), ch.uri());
         if let Some(token) = token {
             env.insert("PIPELINE_RUN_TOKEN".to_owned(), token.to_owned());
         }
         let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
-        list(State(state), None).await.expect("listed").0
+        serde_json::to_value(status(State(state)).await.expect("status").0).unwrap()
     }
 
     #[tokio::test]
     async fn the_flag_is_true_with_a_token_and_false_without_or_with_an_empty_one() {
-        let set = listed(Some("a-token")).await;
-        assert_eq!(set["runEventsConfigured"], true);
-        assert_eq!(set["rules"], json!([]));
-        assert_eq!(listed(None).await["runEventsConfigured"], false);
-        assert_eq!(listed(Some("")).await["runEventsConfigured"], false);
+        assert_eq!(
+            reported(Some("a-token")).await,
+            json!({ "runEventsConfigured": true })
+        );
+        assert_eq!(
+            reported(None).await,
+            json!({ "runEventsConfigured": false })
+        );
+        assert_eq!(
+            reported(Some("")).await,
+            json!({ "runEventsConfigured": false })
+        );
     }
 }

@@ -300,6 +300,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/alerts",      Policy::RequiresPermission("alert:write")),
     ("PUT",    "/api/alerts",      Policy::RequiresPermission("alert:write")),
     ("DELETE", "/api/alerts",      Policy::RequiresPermission("alert:write")),
+    // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
+    ("GET",    "/api/alerts/status", Policy::RequiresAuth),
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
