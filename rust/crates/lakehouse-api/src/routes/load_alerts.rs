@@ -473,6 +473,13 @@ mod tests {
         state: AppState,
         dagster: MockServer,
         webhook: MockServer,
+        /// Kept alive on purpose (PR #101 CI, `a_failed_connector_run_delivers_stamps_the_row_and_persists_an_instance`
+        /// and `a_success_run_of_a_connector_with_a_waiting_schema_change_is_a_success_and_never_a_failure`):
+        /// dropping a `MockServer` clears its mocks and hands the port back
+        /// to wiremock's pool, so a `ClickHouse` mock dropped at the end of
+        /// `harness` answered 404 (the rules "could not be read") or, once
+        /// another test took the port, with that test's rules.
+        _clickhouse: MockServer,
     }
 
     /// Postgres plus mocked `Dagster`, `ClickHouse` and webhook servers.
@@ -540,6 +547,7 @@ mod tests {
             state,
             dagster,
             webhook,
+            _clickhouse: ch,
         }
     }
 

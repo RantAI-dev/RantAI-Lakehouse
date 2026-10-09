@@ -860,6 +860,11 @@ mod tests {
         state: AppState,
         dagster: MockServer,
         webhook: MockServer,
+        /// Kept alive on purpose (PR #101 CI, the same defect as
+        /// `load_alerts`' harness): a dropped `MockServer` clears its mocks
+        /// and returns its port to wiremock's pool, so the rule store would
+        /// answer 404 or another test's rules.
+        _clickhouse: MockServer,
         tenant: Uuid,
     }
 
@@ -924,6 +929,7 @@ mod tests {
             state,
             dagster,
             webhook,
+            _clickhouse: ch,
             tenant,
         }
     }
