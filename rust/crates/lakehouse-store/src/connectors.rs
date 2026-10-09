@@ -1553,16 +1553,45 @@ type IngestibleConnectorRow = (
 /// factory and `run_ingest` op both read from, via
 /// `GET /api/connectors/ingestible`.
 ///
+/// Every tenant's rows, and the unassigned ones: only for the service
+/// identity and an unrestricted principal (`SEC-16`). A tenant-scoped
+/// caller goes through [`list_ingestible_connectors_for_tenant`].
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_ingestible_connectors(
     pool: &PgPool,
 ) -> Result<Vec<IngestibleConnector>, StoreError> {
+    list_ingestible(pool, None).await
+}
+
+/// The ingest-spec connectors of one tenant (`SEC-16`): the same rows as
+/// [`list_ingestible_connectors`] narrowed in SQL to `tenant_id = $1`. A
+/// connector with no tenant never matches (`NULL = $1` is never true), so
+/// it is visible only to the unscoped list. `tenant_id` is bound.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_ingestible_connectors_for_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<Vec<IngestibleConnector>, StoreError> {
+    list_ingestible(pool, Some(tenant_id)).await
+}
+
+/// Shared body of the two public lists; `None` means unscoped.
+async fn list_ingestible(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+) -> Result<Vec<IngestibleConnector>, StoreError> {
     let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
         "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
-         secret_ref_secondary FROM connector WHERE adapter IS NOT NULL",
+         secret_ref_secondary FROM connector WHERE adapter IS NOT NULL \
+         AND ($1::uuid IS NULL OR tenant_id = $1)",
     )
+    .bind(tenant_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1629,6 +1658,30 @@ pub async fn any_connector_targets(pool: &PgPool, table: &str) -> Result<bool, S
         "SELECT EXISTS (SELECT 1 FROM connector \
          WHERE source_objects @> jsonb_build_array(jsonb_build_object('target', $1::text)))",
     )
+    .bind(table)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// [`any_connector_targets`] narrowed to the connectors of one tenant
+/// (`SEC-16`): an upload may learn that a connector blocks a name only when
+/// that connector is its own tenant's; another tenant's connector must not
+/// be distinguishable from any other reason a name is taken. Same
+/// containment match, `table` and `tenant_id` bound.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn any_connector_of_tenant_targets(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    table: &str,
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector WHERE tenant_id = $1 \
+         AND source_objects @> jsonb_build_array(jsonb_build_object('target', $2::text)))",
+    )
+    .bind(tenant_id)
     .bind(table)
     .fetch_one(pool)
     .await?)

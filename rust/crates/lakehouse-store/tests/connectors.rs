@@ -24,10 +24,11 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
-    connector_in_tenants, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
+    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput,
+    any_connector_of_tenant_targets, any_connector_targets, connector_in_tenants, create_connector,
+    delete_connector, get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    list_ingestible_connectors, list_ingestible_connectors_for_tenant, record_test_result,
+    set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -815,6 +816,65 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     Ok(())
 }
 
+/// `SEC-16`: `list_ingestible_connectors_for_tenant` returns the asked
+/// tenant's rows and nothing else; a connector with no tenant is in no
+/// tenant's list, only in the unscoped one. Written to fail against a query
+/// that ignores the tenant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_ingestible_connectors_for_tenant_returns_only_that_tenants_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-ingestible"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-ingestible"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "mysql",
+            "host": "source.example.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects: serde_json::json!([{"name": "orders", "target": "orders"}]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    let mut ids = Vec::new();
+    for name in ["ingestible of a", "ingestible of b", "ingestible of nobody"] {
+        let (created, _credential_names) =
+            create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    let of_a = list_ingestible_connectors_for_tenant(&pool, tenant_a_id)
+        .await
+        .unwrap();
+    assert!(of_a.iter().any(|r| r.id == ids[0]), "A's own row is listed");
+    assert!(!of_a.iter().any(|r| r.id == ids[1]), "B's row is absent");
+    assert!(
+        !of_a.iter().any(|r| r.id == ids[2]),
+        "a connector with no tenant is in no tenant's list"
+    );
+
+    let all = list_ingestible_connectors(&pool).await.unwrap();
+    for id in &ids {
+        assert!(
+            all.iter().any(|r| &r.id == id),
+            "the unscoped list has {id}"
+        );
+    }
+    Ok(())
+}
+
 /// A `dial` that fails its adapter's own validation (`sql` requires
 /// `driver`/`host`/`port`/`database`/`user`, and rejects an unknown field
 /// like `password`) is rejected as [`StoreError::Validation`] and never
@@ -1598,6 +1658,58 @@ fn sql_spec_with_objects(source_objects: serde_json::Value) -> IngestSpecInput {
         source_objects,
         schedule_cron: None,
     }
+}
+
+/// `SEC-16`: `any_connector_of_tenant_targets` answers for the asked
+/// tenant's connectors only. Another tenant's connector, and one with no
+/// tenant, never count, however exactly the target matches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_of_tenant_targets_counts_only_that_tenants_connectors(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-targets"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-targets"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = |target: &str| {
+        sql_spec_with_objects(serde_json::json!([{ "name": "public.t", "target": target }]))
+    };
+    let mut ids = Vec::new();
+    for (name, target) in [
+        ("targets of a", "a_target"),
+        ("targets of b", "b_target"),
+        ("targets of nobody", "nobody_target"),
+    ] {
+        let (created, _) = create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec(target))
+            .await
+            .unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    assert!(
+        any_connector_of_tenant_targets(&pool, tenant_a_id, "a_target")
+            .await
+            .unwrap()
+    );
+    for other in ["b_target", "nobody_target", "a_targe"] {
+        assert!(
+            !any_connector_of_tenant_targets(&pool, tenant_a_id, other)
+                .await
+                .unwrap(),
+            "{other} is not a target of tenant A's connectors"
+        );
+    }
+    // The unscoped question still sees all of them.
+    assert!(any_connector_targets(&pool, "b_target").await.unwrap());
+    assert!(any_connector_targets(&pool, "nobody_target").await.unwrap());
+    Ok(())
 }
 
 /// An upload may never load into a table a connector loads (ADR 0014,

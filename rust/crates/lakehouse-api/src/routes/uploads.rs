@@ -229,11 +229,15 @@ const ALREADY_LOADING: &str = "This upload is already being loaded.";
 const TABLE_BUSY: &str = "Another upload is loading into that table.";
 const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be loaded into it.";
 /// The one sentence for a table name that is not this tenant's to load into:
-/// another tenant holds the claim on it, or it exists and nobody claimed it.
-/// Deliberately the same for both, so that the answer does not tell a caller
-/// which of the two it is (review finding B4): a tenant must not be able to
-/// learn what other tenants have claimed, or which names are theirs.
-const TABLE_NOT_FREE: &str = "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it.";
+/// another tenant holds the claim on it, another tenant's connector loads it,
+/// a lost claim, or it exists and nobody claimed it. Deliberately the same
+/// for all of them, so that the answer does not tell a caller which it is
+/// (review finding B4, `SEC-16`): a tenant must not be able to learn what
+/// other tenants have claimed or connected, or which names are theirs. It
+/// names no reason and no connector. The constant keeps its name; the text is
+/// `SEC-16`'s, replacing a sentence that said "no upload of this tenant
+/// created it".
+const TABLE_NOT_FREE: &str = "That table name cannot be used. Choose another name.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -1368,7 +1372,12 @@ fn parse_ingest_request(
 /// Whether `table` may be loaded into by an upload of `tenant_id`, or why
 /// not. The rule (ADR 0014, decision 5, review finding B4), in this order:
 ///
-/// 1. A table a connector loads: never.
+/// 1. A table a connector loads: never. The sentence says so
+///    ([`CONNECTOR_TABLE`]) only when the connector is the caller's own
+///    tenant's; for another tenant's (or an unassigned) connector it is the
+///    one sentence of [`TABLE_NOT_FREE`], so the answer does not tell a
+///    person that someone else has a connector writing a table of that name
+///    (`SEC-16`).
 /// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
 ///    tenant's, and it is free to load into, whether or not the table exists
 ///    yet; or it is another tenant's, and it is not.
@@ -1382,9 +1391,10 @@ fn parse_ingest_request(
 ///
 /// # Errors
 ///
-/// 409 for a connector's table, for a name another tenant holds, and for an
-/// existing table nobody claimed (the last two with one sentence,
-/// [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
+/// 409 for a connector's table ([`CONNECTOR_TABLE`] for the caller's own
+/// tenant's connector, otherwise [`TABLE_NOT_FREE`]), for a name another
+/// tenant holds, and for an existing table nobody claimed (those with the one
+/// sentence, [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
 /// `ClickHouse` or the Iceberg query database did not give a definite
 /// answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
@@ -1397,11 +1407,21 @@ async fn ensure_table_free(
         tracing::warn!(%err, table, "could not check whether a raw table name is free");
         ApiError::Unavailable(TABLE_UNCHECKED.to_owned())
     };
-    if connectors::any_connector_targets(pool, table)
+    // SEC-16: the connector's own sentence only for the caller's tenant. A
+    // connector of anyone else still closes the name (ADR 0014, decision 5:
+    // raw table names are shared), but with the sentence every other reason
+    // gets.
+    if connectors::any_connector_of_tenant_targets(pool, tenant_id, table)
         .await
         .map_err(|err| unchecked(&err))?
     {
         return Err(ApiError::Conflict(CONNECTOR_TABLE.to_owned()));
+    }
+    if connectors::any_connector_targets(pool, table)
+        .await
+        .map_err(|err| unchecked(&err))?
+    {
+        return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()));
     }
     match uploads::table_claim(pool, tenant_id, table)
         .await
@@ -1630,9 +1650,9 @@ async fn convert_upload(
 /// file with no rows; 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
 /// loading, another is loading into that table, a connector loads it, or the
-/// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
-/// another tenant holds the claim, the table exists and nobody claimed it, or
-/// another tenant won the claim a moment ago); 422 when the orchestrator
+/// name cannot be used ([`TABLE_NOT_FREE`]: another tenant's connector loads
+/// it, another tenant holds the claim, the table exists and nobody claimed it,
+/// or another tenant won the claim a moment ago); 422 when the orchestrator
 /// refuses the launch; 503 when the table check cannot be made or the
 /// orchestrator cannot be reached; 500 when a launched run could not be
 /// recorded.
@@ -2623,7 +2643,7 @@ mod tests {
         assert_eq!(RUN_UNKNOWN, "The orchestrator no longer knows this load.");
         assert_eq!(
             TABLE_NOT_FREE,
-            "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it."
+            "That table name cannot be used. Choose another name."
         );
         // T7a, review findings C1 and C2.
         assert_eq!(

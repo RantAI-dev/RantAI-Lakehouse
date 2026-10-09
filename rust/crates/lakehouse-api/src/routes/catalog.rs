@@ -2362,19 +2362,69 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Whether `id` names an asset of the catalog, by the rule `detail` and
+/// `sample` apply (`SEC-16`): a `silver.`/`serving.` id is an asset when a
+/// `ClickHouse` table of that name exists; any other id is one when a
+/// registry (`bronze_meta`, `bronze_meta_sec`) holds it as a slug. Both are
+/// answered by [`super::catalog_profile::resolve_source`], the one lookup
+/// of this module that tells "no such asset" from "an asset with nothing
+/// readable behind it" (`Ok(None)` for a Bronze slug that is registered).
+///
+/// An annotation is stored under whatever id the caller sends, so without
+/// this a person could write one for a table that is not there, and read
+/// back what another wrote for a name they had only guessed. Costs one or
+/// two `ClickHouse` reads per call; no catalog listing.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] (`Asset not found.`) when no asset has that id;
+/// [`ApiError::Unavailable`] with a fixed sentence when the catalog cannot be
+/// asked, so the answer fails closed and never carries upstream text.
+async fn ensure_asset_exists(state: &AppState, id: &str) -> Result<(), ApiError> {
+    let by_table = id.starts_with("silver.") || id.starts_with("serving.");
+    match super::catalog_profile::resolve_source(state, id).await {
+        Ok(source) if !by_table || source.is_some() => Ok(()),
+        Ok(_) | Err(ApiError::NotFound(_)) => {
+            Err(ApiError::NotFound("Asset not found.".to_owned()))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "the catalog could not be asked whether an asset exists");
+            Err(ApiError::Unavailable(
+                "The catalog could not be checked. Try again.".to_owned(),
+            ))
+        }
+    }
+}
+
 /// `GET /api/catalog/{id}/annotation` — one asset's console-only metadata.
 /// An asset with no annotation row returns the empty shape rather than
 /// `404`, matching how the rest of this module nulls out unmeasured
 /// fields instead of failing.
 ///
 /// # Errors
+/// `SEC-16`: the tenant gate runs first, as for the write. It answers
+/// [`ApiError::PermissionDenied`] (`403`) with the gate's fixed reason, and
+/// passes through the [`ApiError::NotFound`] (`404`) of a malformed or
+/// foreign `X-Tenant`. Then `400` for an `id` over the bound; `404`
+/// (`Asset not found.`) when the catalog holds no asset of that id, `503`
+/// when it cannot be asked ([`ensure_asset_exists`]); then
 /// [`ApiError::Unavailable`] if no Postgres pool is configured; a
 /// classified [`lakehouse_store::StoreError`] on any other database
 /// failure.
 pub async fn get_annotation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
+    // SEC-16: the read skipped the gate the write already passes. The
+    // description of an annotation is as readable to a caller outside the
+    // catalog's tenant as the catalog itself, so it gets the catalog's rule.
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    validate_annotation_id(&id)?;
+    ensure_asset_exists(&state, &id).await?;
     let pool = annotation_pool(&state)?;
     let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
     Ok(ApiJson(row.map_or_else(
@@ -2413,7 +2463,10 @@ pub async fn get_annotation(
 /// `CATALOG_TENANT_ID`, the gate also passes through the
 /// [`ApiError::NotFound`] (`404`) that `tenant_scope::resolve` returns for an
 /// `X-Tenant` header that is malformed or names a tenant the caller does not
-/// belong to, again before the body is read. A caller the gate admits then gets `400` if the body is not JSON,
+/// belong to, again before the body is read. A caller the gate admits then gets
+/// `404` (`Asset not found.`) when the catalog holds no asset of that id and
+/// `503` when it cannot be asked ([`ensure_asset_exists`]), before the body is
+/// read and with nothing written; then `400` if the body is not JSON,
 /// or if `id`/`owner`/`steward`/`description`/any `tags` entry exceeds its
 /// bound (see the module doc above), or a classified
 /// [`lakehouse_store::StoreError`] on any database failure (including a
@@ -2434,6 +2487,9 @@ pub async fn put_annotation(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // SEC-16: an annotation for a table that is not in the catalog is
+    // refused before anything is stored.
+    ensure_asset_exists(&state, &id).await?;
     let parsed: AnnotationBody = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
     validate_annotation_body(&parsed)?;
@@ -3584,6 +3640,24 @@ mod tests {
             server
         }
 
+        /// A mock `ClickHouse` that answers every query with one column, so
+        /// any `silver.`/`serving.` table exists for `ensure_asset_exists`.
+        async fn mock_clickhouse_with_table() -> wiremock::MockServer {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        { "name": "name", "type": "String" },
+                        { "name": "type", "type": "String" },
+                    ],
+                    "data": [{ "name": "id", "type": "UInt64" }],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
         fn principal(tenant_ids: &[Uuid], permissions: &str) -> Principal {
             Principal {
                 id: PrincipalId::User(Uuid::new_v4()),
@@ -3812,7 +3886,11 @@ mod tests {
         async fn put_annotation_still_writes_when_the_caller_is_a_member_of_the_catalog_tenant(
             pool: lakehouse_store::PgPool,
         ) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: the write now needs the asset to exist, so the mock
+            // catalog has a `serving.mart_x`; the dead address this test used
+            // before answers 503.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
 
             let result = put_annotation(
@@ -3828,6 +3906,156 @@ mod tests {
             };
             assert_eq!(body, json!({ "ok": true }));
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
+        }
+
+        /// SEC-16 regression: the read passed no tenant gate, so a caller
+        /// outside the catalog's tenant read an annotation. It fails before
+        /// the fix (200), and the refusal is the write's fixed 403.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_refuses_with_403_when_the_caller_is_not_a_member(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:read");
+
+            let result = get_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(outsider),
+                HeaderMap::new(),
+            )
+            .await;
+            let Err(rejection) = result else {
+                panic!("a refused read must be an error, never a 200");
+            };
+            let (status, body) = response_json(rejection.into_response()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("CATALOG_TENANT_ID"), "{message}");
+            assert!(
+                !message.contains(TENANT_A) && !message.contains(TENANT_B),
+                "the refusal must not name a tenant id: {message}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_answers_the_empty_shape_for_an_existing_asset_without_one(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            let result = get_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+            )
+            .await;
+            let Ok(ApiJson(body)) = result else {
+                panic!("a member must read the annotation of an existing asset");
+            };
+            assert_eq!(body["owner"], Value::Null);
+            assert_eq!(body["tags"], json!([]));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_answers_404_for_an_id_that_is_not_in_the_catalog(
+            pool: lakehouse_store::PgPool,
+        ) {
+            // Every query returns no rows: no such table, no such slug.
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            for id in ["serving.not_there", "not-a-registered-slug"] {
+                let result = get_annotation(
+                    State(state.clone()),
+                    Path(id.to_owned()),
+                    Extension(member.clone()),
+                    HeaderMap::new(),
+                )
+                .await;
+                let Err(rejection) = result else {
+                    panic!("{id}: an unknown asset must be an error");
+                };
+                let (status, body) = response_json(rejection.into_response()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body["error"], json!("Asset not found."), "{id}");
+            }
+        }
+
+        /// SEC-16 regression: an annotation could be written for an id that
+        /// is not an asset. Nothing is written.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_annotation_answers_404_and_writes_nothing_for_an_id_that_is_not_in_the_catalog(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+
+            for id in ["serving.not_there", "not-a-registered-slug"] {
+                let result = put_annotation(
+                    State(state.clone()),
+                    Path(id.to_owned()),
+                    Extension(member.clone()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"description":"visits per month"}"#),
+                )
+                .await;
+                let Err(rejection) = result else {
+                    panic!("{id}: a write for an unknown asset must be an error");
+                };
+                let (status, body) = response_json(rejection.into_response()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body["error"], json!("Asset not found."), "{id}");
+                assert_eq!(annotation_rows(&pool, id).await, 0, "{id}: no row");
+            }
+        }
+
+        /// Fail closed: when the catalog cannot be asked, the answer is a
+        /// fixed 503 sentence, not a pass and not the upstream's text.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn annotation_routes_answer_503_when_the_catalog_cannot_be_asked(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read,catalog:write");
+
+            let Err(read) = get_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(member.clone()),
+                HeaderMap::new(),
+            )
+            .await
+            else {
+                panic!("a read must not pass when the catalog cannot be asked");
+            };
+            let (status, body) = response_json(read.into_response()).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                body["error"],
+                json!("The catalog could not be checked. Try again.")
+            );
+
+            let Err(write) = put_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"description":"visits per month"}"#),
+            )
+            .await
+            else {
+                panic!("a write must not pass when the catalog cannot be asked");
+            };
+            let (status, _) = response_json(write.into_response()).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
         }
     }
 

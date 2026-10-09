@@ -505,6 +505,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // comment). An `ingest:read`-only caller (the Dagster ingest service
     // identity, `dagster/dispar_orchestrate/ingest_factory.py`) must
     // never be able to call the base `/api/connectors` route.
+    // SEC-16: who sees which rows is decided in the handler, not here: a
+    // service identity and a `*:*` principal see every tenant's connectors,
+    // anyone else only the active tenant's (none, if in no tenant).
     ("GET",  "/api/connectors/ingestible",  Policy::RequiresPermission("ingest:read")),
     // Gap fix (WS3 item 33): the creation wizard's connector-type list --
     // a small reference table feeding directly into `POST
