@@ -345,6 +345,16 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::PipelineSlow => "Pipeline SLA: duration",
         AlertKind::PipelineLate => "Pipeline SLA: late",
         AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
+        // `SRC-7`: connector and upload rules fire from the run event
+        // routes (`routes::pipelines`), which persist their own instance
+        // with the source label; `run_rules` skips them, so these labels
+        // are only a fallback for an exhaustive match.
+        AlertKind::ConnectorFailure
+        | AlertKind::ConnectorRepeatedFailure
+        | AlertKind::ConnectorDisabled
+        | AlertKind::ConnectorSchemaChange
+        | AlertKind::ConnectorSuccess => "Connector runs",
+        AlertKind::UploadFailure => "File uploads",
     }
 }
 
@@ -377,6 +387,14 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         AlertKind::PipelineVolumeDrop => {
             "pipeline run processed fewer than half the median rows of prior runs".to_owned()
         }
+        // `SRC-7`: never reached from `run_rules` (it skips these kinds);
+        // the event routes write their own detail.
+        AlertKind::ConnectorFailure
+        | AlertKind::ConnectorRepeatedFailure
+        | AlertKind::ConnectorDisabled
+        | AlertKind::ConnectorSchemaChange
+        | AlertKind::ConnectorSuccess
+        | AlertKind::UploadFailure => "connector or upload event".to_owned(),
     }
 }
 
