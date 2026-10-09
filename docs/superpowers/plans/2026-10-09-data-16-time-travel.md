@@ -276,3 +276,58 @@ so an unparseable output cannot pass again.
 
 The rest of the diff (T1 to T4) is reviewed after this is fixed and the
 planner has re-run the Analyst queries on a live build.
+
+### Second review, 2026-10-09 at `044b52a`
+
+No open `BLOCKER`. `BLOCKER 1` is fixed (`c0af722`): the derived alias keeps
+the table name's quoting; a plain-word name is rewritten byte for byte as
+before; one new test re-parses the rewrite's output for four shapes.
+
+**Run by the planner on a live build of this commit** (own port, the
+separate Postgres database with the Analyst and the policy described under
+BLOCKER 1, the dev ClickHouse; table with four versions of 14, 28, 42 and
+56 rows, pinned to the oldest):
+- Analyst: `category_name` is `***`, `description` is clear; `count()` is 4
+  pinned and 16 current (the row filter `category_id <= 4`).
+- Admin: clear text; 14 pinned, 4 with the filter written by hand.
+- Analyst with the pin inside a subquery and inside a CTE: rows returned,
+  `***`.
+- Engine `trino`, `FOR VERSION AS OF 123`: `422 Querying a past version of a
+  table is available on the ClickHouse engine only.`
+
+**Checked and correct.**
+- T1: the message is chosen only after the rewrite answered `Unparseable`
+  on Trino, from the SQL's tokens; a query that parses is untouched.
+- T2: `pinSnapshot` writes the pin for ClickHouse only and refuses an id
+  that is not all digits; `insertAsOfClause` is gone with its caller (in T3,
+  since T2 alone would not compile; accepted).
+- T3: the picker moved to `time-travel-controls.tsx` so it can be tested;
+  the Snapshots card and the picker show the retention text.
+- T4: the gate asserts masked, filtered and equal-to-admin on the unmasked
+  columns at the older version, and that the pin changed the count. The
+  subquery and CTE shapes accept "masked or 422"; live they are masked.
+  `g8-time-travel` is in `ci-required` and in `required_gate.sh`.
+
+**Verification, by the planner, at `044b52a`.** After `touch` of the crate
+sources: `cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api
+--all-targets -- -D warnings` clean in 1m03s. `bun run typecheck` exit 0;
+`bun run lint` 0 errors, 6 warnings, none in a changed file; `bun run test`
+922 pass, 1 skip, 0 fail. `check_intra_package_imports.py`,
+`check_bare_iceberg_count.py` OK; `test_required_gate.sh` 27 passed;
+`test_detect_change_scope.sh` 32 passed; `docker compose --profile '*'
+config --quiet` exit 0.
+
+**Not verified.**
+- No Rust test has run locally; CI runs them first.
+- The gate, its compose service and its CI job have never run; rule 8 is
+  met only by the CI job. The pull request does not merge before it passes.
+- The picker and the Snapshots card were not tried in a browser: the
+  separate instance has no Lakekeeper read token, so it cannot list a
+  table's versions. The product owner's check needs a deployment that has
+  one.
+- Nothing was run on Trino (none here).
+
+**Carried, not caused.** A version id that does not exist, and the syntax
+error behind BLOCKER 1 before the fix, reach the response as ClickHouse's
+own text (principle 4). Backlog `SEC-11`.
+
