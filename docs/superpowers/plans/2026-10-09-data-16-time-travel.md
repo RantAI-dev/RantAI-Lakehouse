@@ -217,5 +217,52 @@ on this machine for this task.
 
 ## Review
 
+### First review, 2026-10-09 at `aeda03d`
 
-*(planner)*
+One `BLOCKER`, found by running, and it is an error in this plan.
+
+**BLOCKER 1. A restricted user cannot read a governed raw table at all, at
+any version: the masking rewrite writes SQL that ClickHouse rejects (plan
+error: section 3 said nothing in `sql_rewrite.rs` changes, on the strength
+of F1, which the planner ran with a hand-written subquery and not through
+the rewrite).**
+
+*Run by the planner on 2026-10-09* against a live API and the dev
+ClickHouse: a ready policy for role Analyst on `bronze.northwind_categories`
+(mask `category_name`, row filter `category_id <= 4`) and an Analyst login.
+As the Analyst, ``SELECT count() n FROM icecat_api.`bronze.northwind_categories`
+WHERE 1``, with or without `SETTINGS iceberg_snapshot_id`, is answered `422`
+with ClickHouse's `Syntax error: failed at position … (.)
+.northwind_categories WHERE 1`. The admin, who has no obligation, gets 14
+rows pinned and 56 current. The pin inside a subquery and inside a CTE fails
+the same way.
+
+*Cause, by reading:* `substitute_table_factor` (`sql_rewrite.rs`) gives the
+derived subquery, when the query wrote no alias, the alias
+`SqlIdent::new(parts.last())`. For a `DataLakeCatalog` name the last part is
+the quoted identifier `bronze.northwind_categories`, and `SqlIdent::new`
+writes it unquoted, so the output reads `(SELECT …) bronze.northwind_categories
+WHERE 1`. It fails closed (nothing leaks), but every governed raw table is
+unreadable for the roles its policy names, in Query Studio and in the asset
+page's sample. The gate of T4 would fail at its first Analyst query.
+
+*Fix (new task T6, before anything else):* in `substitute_table_factor`,
+when the alias is derived from the table name, keep the identifier's own
+quoting: take the last `ObjectNamePart`'s `Ident` (its `quote_style`), not
+the lower-cased string; an identifier that is not a plain `[A-Za-z_][A-Za-z0-9_]*`
+word and carries no quote style is quoted with the dialect's identifier
+quote. Do not change what is substituted, what is masked, or the
+canonicalisation used to look up obligations. This is the one change this
+task makes in `sql_rewrite.rs`; `policy_engine.rs` stays untouched.
+*Check:* unit tests beside the existing rewrite tests: a query on
+``icecat_api.`bronze.orders` `` with no alias, under a mask and a row filter,
+rewrites to SQL that parses again under `ClickHouseDialect` and whose derived
+alias is the quoted `` `bronze.orders` ``; the same with an explicit alias
+keeps that alias; with `SETTINGS iceberg_snapshot_id = 1` the setting is
+still at the end; a plain `serving.mart_x` rewrite is byte-for-byte what it
+was (an existing test already pins it: do not change its expectation). Add
+one test that re-parses the output of the rewrite for each of these shapes,
+so an unparseable output cannot pass again.
+
+The rest of the diff (T1 to T4) is reviewed after this is fixed and the
+planner has re-run the Analyst queries on a live build.
