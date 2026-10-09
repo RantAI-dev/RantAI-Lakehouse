@@ -109,9 +109,60 @@ fn reads_any(sql: &str, tables: &[String]) -> bool {
     {
         return false;
     }
-    let referenced = crate::sql_rewrite::referenced_tables(sql, &ClickHouseDialect {})
-        .or_else(|| crate::sql_rewrite::referenced_tables(sql, &GenericDialect {}));
-    referenced.is_some_and(|names| names.iter().any(|name| is_one_of(name, tables)))
+    referenced(sql).is_some_and(|names| names.iter().any(|name| is_one_of(name, tables)))
+}
+
+/// The tables `sql` reads, as `schema.table` keys: parsed as `ClickHouse`
+/// first, then generically. `None` when neither parses. The one parser
+/// path of [`reads_any`] and [`use_counts`].
+fn referenced(sql: &str) -> Option<Vec<String>> {
+    crate::sql_rewrite::referenced_tables(sql, &ClickHouseDialect {})
+        .or_else(|| crate::sql_rewrite::referenced_tables(sql, &GenericDialect {}))
+}
+
+/// Which table key (lower-cased, as [`referenced`] gives it) stands for
+/// which catalog asset id, for [`use_counts`]. Three id shapes exist: a
+/// Bronze asset is its slug and is read as `bronze.<registry table>`
+/// (`bronze_pairs` are the `(slug, table_name)` rows of the registry), and
+/// a Silver or Gold asset is its own `silver.<name>` / `serving.<name>`
+/// id. `DATA-11` D4.
+pub(crate) fn use_keys(
+    asset_ids: &[String],
+    bronze_pairs: &[(String, String)],
+) -> HashMap<String, String> {
+    let table_of: HashMap<&str, &str> = bronze_pairs
+        .iter()
+        .map(|(slug, table)| (slug.as_str(), table.as_str()))
+        .collect();
+    asset_ids
+        .iter()
+        .filter_map(|id| match table_of.get(id.as_str()) {
+            Some(table) if !table.is_empty() => Some((format!("bronze.{table}"), id.clone())),
+            Some(_) => None,
+            None if id.contains('.') => Some((id.to_lowercase(), id.clone())),
+            None => None,
+        })
+        .map(|(key, id)| (key.to_lowercase(), id))
+        .collect()
+}
+
+/// How many of `sqls` read each asset, by asset id: a query that reads two
+/// assets counts for both, and for one asset once however many times it
+/// names it. SQL that does not parse counts for none (nothing can be shown
+/// to read it), as in [`reads_any`]. `keys` is [`use_keys`]. `DATA-11` D4.
+pub(crate) fn use_counts(sqls: &[String], keys: &HashMap<String, String>) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for sql in sqls {
+        let Some(names) = referenced(sql) else {
+            continue;
+        };
+        let ids: std::collections::HashSet<&String> =
+            names.iter().filter_map(|name| keys.get(name)).collect();
+        for id in ids {
+            *counts.entry(id.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// `orders` of `silver.orders`: what a table's key ends in.
@@ -978,6 +1029,69 @@ mod tests {
         assert!(!reads_any("SELECT * FROM silver.orders", &orders));
         // Not SQL at all.
         assert!(!reads_any("orders, please", &orders));
+    }
+
+    fn id_list(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|i| (*i).to_owned()).collect()
+    }
+
+    #[test]
+    fn use_keys_maps_the_three_id_shapes_to_the_keys_a_query_names() {
+        let pairs = vec![
+            ("orders".to_owned(), "commerce_orders".to_owned()),
+            ("no-table".to_owned(), String::new()),
+        ];
+        let keys = use_keys(
+            &id_list(&[
+                "orders",
+                "no-table",
+                "silver.Clean",
+                "serving.mart_x",
+                "stray",
+            ]),
+            &pairs,
+        );
+        assert_eq!(
+            keys.get("bronze.commerce_orders").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            keys.get("silver.clean").map(String::as_str),
+            Some("silver.Clean")
+        );
+        assert_eq!(
+            keys.get("serving.mart_x").map(String::as_str),
+            Some("serving.mart_x")
+        );
+        // A Bronze row with no registry table, and an id of no known shape,
+        // cannot be recognised in SQL and get no key.
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn use_counts_counts_a_query_once_per_asset_it_reads() {
+        let keys = use_keys(
+            &id_list(&["orders", "silver.clean", "serving.mart_x"]),
+            &[("orders".to_owned(), "commerce_orders".to_owned())],
+        );
+        let sqls = id_list(&[
+            "SELECT * FROM silver.clean",
+            // Two tables: counts for both. Same table twice: counts once.
+            "SELECT a.id FROM silver.clean a JOIN serving.mart_x b ON a.id = b.id",
+            "SELECT * FROM silver.clean a JOIN silver.clean b ON a.id = b.id",
+            "SELECT * FROM icecat_api.`bronze.commerce_orders`",
+        ]);
+        let counts = use_counts(&sqls, &keys);
+        assert_eq!(counts.get("silver.clean"), Some(&3));
+        assert_eq!(counts.get("serving.mart_x"), Some(&1));
+        assert_eq!(counts.get("orders"), Some(&1));
+    }
+
+    #[test]
+    fn use_counts_ignores_sql_that_does_not_parse_and_tables_nobody_lists() {
+        let keys = use_keys(&id_list(&["silver.clean"]), &[]);
+        let sqls = id_list(&["silver.clean, please", "SELECT * FROM silver.other"]);
+        assert!(use_counts(&sqls, &keys).is_empty());
     }
 
     fn mention(id: &str, sql: &str, owner: uuid::Uuid, status: &str, ms: i64) -> HistoryMention {

@@ -642,6 +642,93 @@ async fn list_body(
     ))
 }
 
+/// Most rows each of the two column queries of [`search_column_index`]
+/// reads. A catalog of 10,000 tables at 20 columns is 200,000 rows; this
+/// leaves room for 2.5 times that, and bounds the memory the search copy
+/// can take whatever the registry holds. A query that returns exactly this
+/// many was cut, and search says so (`DATA-11` F2, principle 2).
+const SEARCH_COLUMN_ROWS_MAX: usize = 500_000;
+
+/// Column names and descriptions per asset id for the search copy
+/// (`DATA-11` F2): Bronze `slug, key_asli, deskripsi` from both
+/// `dataset_column` registries, and `silver` / `serving` from
+/// `system.columns`. Run only when the copy is rebuilt, never per search.
+///
+/// The `bool` is true when either query hit [`SEARCH_COLUMN_ROWS_MAX`]:
+/// column search is then partial, and a warning is logged.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of whichever query failed; the caller treats it
+/// as the catalog being unreachable.
+async fn search_column_index(
+    ch: &ChClient,
+) -> Result<(crate::routes::catalog_search::ColumnIndex, bool), ChError> {
+    // `SEARCH_COLUMN_ROWS_MAX` is a constant integer, not caller input.
+    let bronze_sql = format!(
+        "SELECT slug, key_asli, deskripsi FROM (
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column`
+           UNION ALL
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column`
+         ) LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let system_sql = format!(
+        "SELECT database db, table, name, comment FROM system.columns
+         WHERE database IN ('silver','serving') LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let (bronze, system) =
+        tokio::try_join!(ch.rows(&bronze_sql, None), ch.rows(&system_sql, None))?;
+    let partial = bronze.len() >= SEARCH_COLUMN_ROWS_MAX || system.len() >= SEARCH_COLUMN_ROWS_MAX;
+    if partial {
+        tracing::warn!(
+            limit = SEARCH_COLUMN_ROWS_MAX,
+            "catalog search: a column query reached its row limit; column search is partial"
+        );
+    }
+    Ok((collect_columns(&bronze, &system), partial))
+}
+
+/// The asset id the row builders give a `system.columns` table: Silver
+/// `silver.<name>` ([`silver_catalog_row`]), Gold `serving.<name>`
+/// ([`gold_catalog_row`]). `None` for any other database.
+fn system_column_key(db: &str, table: &str) -> Option<String> {
+    matches!(db, "silver" | "serving").then(|| format!("{db}.{table}"))
+}
+
+/// [`search_column_index`]'s rows as `asset id -> [(name, description)]`.
+/// A Bronze row is keyed by its slug, which is the asset id
+/// ([`bronze_catalog_row`]); a row with no name is skipped.
+fn collect_columns(
+    bronze: &[Map<String, Value>],
+    system: &[Map<String, Value>],
+) -> crate::routes::catalog_search::ColumnIndex {
+    let mut index = crate::routes::catalog_search::ColumnIndex::new();
+    for row in bronze {
+        let (slug, name) = (str_col(row, "slug"), str_col(row, "key_asli"));
+        if slug.is_empty() || name.is_empty() {
+            continue;
+        }
+        index
+            .entry(slug.to_owned())
+            .or_default()
+            .push((name.to_owned(), str_col(row, "deskripsi").to_owned()));
+    }
+    for row in system {
+        let (name, table) = (str_col(row, "name"), str_col(row, "table"));
+        let Some(key) = system_column_key(str_col(row, "db"), table) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        index
+            .entry(key)
+            .or_default()
+            .push((name.to_owned(), str_col(row, "comment").to_owned()));
+    }
+    index
+}
+
 // WS2 — filling Bronze `sizeBytes`/`freshnessLagSeconds` from Iceberg.
 //
 // `dataset_catalog.table_name` (read by `list_body` above as the second
@@ -2811,6 +2898,71 @@ mod tests {
         })];
         let filtered = filter_assets_by_query(&assets, "übersee", &[]);
         assert_eq!(filtered.len(), 1);
+    }
+
+    fn row(pairs: &[(&str, &str)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect()
+    }
+
+    // DATA-11 R2: the three id shapes the row builders give.
+    #[test]
+    fn collect_columns_keys_bronze_by_slug_and_silver_and_gold_by_database() {
+        let bronze = vec![
+            row(&[
+                ("slug", "orders"),
+                ("key_asli", "total"),
+                ("deskripsi", "Order total"),
+            ]),
+            row(&[("slug", "orders"), ("key_asli", "buyer"), ("deskripsi", "")]),
+            row(&[("slug", ""), ("key_asli", "orphan"), ("deskripsi", "")]),
+        ];
+        let system = vec![
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", "amount"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "serving"),
+                ("table", "mart_x"),
+                ("name", "visitors"),
+                ("comment", "Visitors"),
+            ]),
+            row(&[
+                ("db", "lake"),
+                ("table", "other"),
+                ("name", "ignored"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", ""),
+                ("comment", ""),
+            ]),
+        ];
+        let index = collect_columns(&bronze, &system);
+        assert_eq!(
+            index.get("orders"),
+            Some(&vec![
+                ("total".to_owned(), "Order total".to_owned()),
+                ("buyer".to_owned(), String::new()),
+            ])
+        );
+        assert_eq!(
+            index.get("silver.clean"),
+            Some(&vec![("amount".to_owned(), String::new())])
+        );
+        assert_eq!(
+            index.get("serving.mart_x"),
+            Some(&vec![("visitors".to_owned(), "Visitors".to_owned())])
+        );
+        // The empty slug, the other database and the unnamed column add nothing.
+        assert_eq!(index.len(), 3);
     }
 
     #[test]
