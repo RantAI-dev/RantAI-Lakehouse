@@ -1,5 +1,7 @@
-//! Search / filter / sort / group / paginate over an already-assembled
-//! catalog, for `GET /api/catalog/query`.
+//! Filter / sort / group / paginate over an already-assembled catalog, for
+//! `GET /api/catalog/query`. Free-text search is not here: it ranks, so it
+//! lives in [`super::catalog_search`] and runs before these steps
+//! (`DATA-11` F1).
 //!
 //! # Why this is pure
 //!
@@ -70,11 +72,6 @@ pub const GROUPABLE_FIELDS: &[&str] = &[
     "health",
     "residency",
 ];
-
-/// Free-text search covers the fields a person would recognise an asset
-/// by. Deliberately not every string field: matching on `format` or
-/// `residency` would surface rows with no visible reason for matching.
-const SEARCHABLE_FIELDS: &[&str] = &["id", "name", "namespace", "description", "owner"];
 
 /// How multiple filters combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,23 +310,6 @@ fn compare_op(asset: &Value, field: &str, operator: &str, operand: &str) -> bool
     }
 }
 
-/// Case-insensitive substring match across [`SEARCHABLE_FIELDS`].
-pub fn apply_search(assets: &[Value], search: &str) -> Vec<Value> {
-    let term = search.trim().to_lowercase();
-    if term.is_empty() {
-        return assets.to_vec();
-    }
-    assets
-        .iter()
-        .filter(|asset| {
-            SEARCHABLE_FIELDS.iter().any(|field| {
-                field_str(asset, field).is_some_and(|v| v.to_lowercase().contains(&term))
-            })
-        })
-        .cloned()
-        .collect()
-}
-
 /// Combine `filters` with `join`. No filters means no filtering, for
 /// either operator — an empty `or` must not reject every row.
 pub fn apply_filters(assets: &[Value], filters: &[Filter], join: JoinOperator) -> Vec<Value> {
@@ -535,54 +515,6 @@ mod tests {
             operator: operator.to_owned(),
             values: values.iter().map(|v| (*v).to_owned()).collect(),
         }
-    }
-
-    // --- search -----------------------------------------------------
-
-    #[test]
-    fn search_is_case_insensitive_and_spans_several_fields() {
-        // Upper-case term against a mixed-case `name`.
-        assert_eq!(
-            ids(&apply_search(&fixture(), "WISMAN")),
-            vec!["silver.mart_wisman"]
-        );
-        // "restoran" appears in `description` here and in `id`/`name` on
-        // another row — both are legitimate hits.
-        assert_eq!(
-            ids(&apply_search(&fixture(), "restoran")),
-            vec!["gold.restoran"]
-        );
-        // Matched via `description` ("Kunjungan wisatawan") only.
-        assert_eq!(
-            ids(&apply_search(&fixture(), "kunjungan")),
-            vec!["silver.mart_wisman"]
-        );
-    }
-
-    #[test]
-    fn search_matches_on_id_as_well_as_name() {
-        // `id` is searchable, so a namespace-qualified term finds rows
-        // whose `name` alone would not match — `dim_negara`'s name is
-        // "dim negara", but its id carries the "silver." prefix.
-        let hits = apply_search(&fixture(), "silver.");
-        assert_eq!(ids(&hits), vec!["silver.mart_wisman", "silver.dim_negara"]);
-    }
-
-    #[test]
-    fn blank_search_returns_everything() {
-        assert_eq!(apply_search(&fixture(), "   ").len(), 4);
-    }
-
-    #[test]
-    fn search_does_not_match_unlisted_fields() {
-        // "Bronze" is this row's `layer` and `tier`, neither of which is
-        // searchable — free text must not silently behave like a layer
-        // filter. The one hit is `bronze.event_2026`, matched on its `id`.
-        let hits = apply_search(&fixture(), "bronze");
-        assert_eq!(ids(&hits), vec!["bronze.event_2026"]);
-        // `dim_negara` is `tier: "bronze"` but does not surface, which is
-        // the actual assertion here.
-        assert!(!ids(&hits).contains(&"silver.dim_negara"));
     }
 
     // --- filter operators -------------------------------------------
@@ -935,11 +867,13 @@ mod tests {
 
     #[test]
     fn full_pipeline_composes_in_the_documented_order() {
-        // search → filter → sort → paginate, the sequence the handler runs.
+        // filter → sort → paginate, the sequence the handler runs. Search
+        // used to be the first step; it is `catalog_search::search` now and
+        // runs before this pipeline (DATA-11 F1), so this test starts at the
+        // filter and its expected answer is unchanged.
         let assets = fixture();
-        let searched = apply_search(&assets, "");
         let mut filtered = apply_filters(
-            &searched,
+            &assets,
             &[filter("tier", "inArray", &["gold", "silver"])],
             JoinOperator::And,
         );
