@@ -282,7 +282,70 @@ time-travel findings recorded in the `DATA-13` and `DATA-16` specs);
 
 ## Handoff
 
-*(developer)*
+### Rust slice (R1-R5), developer, 2026-10-09
+
+Commits on `feat/data-11-catalog-search`, in order (none pushed):
+
+- `15d6b54` feat(api): one catalog matcher that ranks words, tags, columns and typos (R1)
+- `e9ed1ff` feat(api): read column names and query use for the catalog search copy (R2)
+- `7f57a35` feat(api): keep a 30-second search copy of the assembled catalog (R3)
+- `a344d30` feat(api): both catalog routes search through the one ranked matcher (R4)
+- `8155a28` feat(api): filter the catalog by tag (R5)
+- `dfae2ad` refactor(api): one catalog assembly for list, query and the search copy (clippy follow-up of R2-R4)
+
+Commands run, from `/home/hv/lakehouse-data11/rust`, with
+`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`,
+`df -h /` checked before each (58G free):
+
+- `cargo check -p lakehouse-api` (and `-p lakehouse-store`) between edits: no errors.
+- After the batch: `touch rust/crates/*/src/lib.rs rust/crates/lakehouse-store/src/*.rs`,
+  then `cargo fmt --check`: exit 0.
+- Then `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings`:
+  first run failed with two findings (`too_many_lines` on `query`,
+  `match_same_arms` in `use_keys`), fixed in `dfae2ad`; the rerun
+  finished clean (`Finished dev profile`, 2m 08s, `lakehouse-api` and
+  `lakehouse-store` re-checked). `--all-targets` type-checks every new test.
+
+*Not verified:* every Rust test. None was run (`cargo test` is forbidden on
+this machine); the first run is CI's. That covers the new tests in
+`catalog_search.rs`, `catalog_search_cache.rs`, `catalog_governance.rs`
+(`use_keys`, `use_counts`), `catalog.rs` (`collect_columns`,
+`order_results`, the refused-search tenant test), `catalog_query.rs` (tags),
+and the `sqlx::test` `history_recent_is_newest_first_and_respects_days_and_limit`
+in `lakehouse-store/tests/queries.rs`. Also not verified: the full workspace
+clippy and test run of the verification block, any request against a live
+`ClickHouse` (the two column queries, the `UNION ALL` subquery with `LIMIT`,
+and `system.columns` were never run), and the speed budget (T4).
+
+Not covered by a test: that `put_annotation` drops the copy (it needs a
+write through Postgres and a primed cache; the drop itself is covered at the
+cache); a route-level search through a mock `ClickHouse` returning rows.
+
+Deviations and choices the plan did not spell out:
+
+- The cache lives in its own module `catalog_search_cache.rs` (like
+  `bronze_stats_cache`), not inside `state.rs`: `routes::catalog_search` is
+  private to `routes`, so `AppState` could not name its types. `AppState`
+  holds `catalog_search_cache`.
+- `SEARCH_COLUMN_ROWS_MAX` is defined in R2 (the query needs it); the plan
+  listed it under R3. The Bronze column query is a `UNION ALL` wrapped in a
+  subquery so one `LIMIT` caps the union.
+- `USAGE_DAYS` became `pub(crate)` and the 5,000-row read is
+  `USE_RANKING_ROWS` in `catalog_governance.rs`.
+- `history_recent` returns `Vec<String>` (SQL text only, all statuses).
+- A failed rebuild also drops an expired copy, and `invalidate` waits for a
+  rebuild in flight, so `put_annotation` can wait up to one rebuild.
+- `apply_annotations` now returns nothing (it handed the rows back only for
+  the deleted matcher). `assemble_catalog` is the one assembly for `list`,
+  `query` and the copy.
+- The 503 body of both routes still carries `js_error(err)`, as before; the
+  plan says to answer what the routes answer today. It is the known
+  principle-4 gap, not a new one.
+- No per-caller value was found in the assembled rows: the four `apply_*`
+  steps take only `AppState`.
+- The parity corpus has no `q` or `search` request on the catalog routes
+  (the `"search"` in `ai-chat-ok.json` is the assistant's `list_datasets`
+  argument).
 
 ## Review
 
