@@ -34,6 +34,7 @@ mod overview;
 mod pipelines;
 mod quality;
 mod query;
+mod schema_changes;
 pub(crate) mod schema_versions;
 mod storage;
 pub(crate) mod support;
@@ -501,6 +502,16 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/ingest/runs",
             get(connectors::ingest_run_history),
         )
+        // `SRC-8` decision D6: a person with `connector:manage` on a
+        // connector of their own tenant reads and approves schema changes.
+        .route(
+            "/api/connectors/{id}/schema-changes",
+            get(schema_changes::list),
+        )
+        .route(
+            "/api/connectors/{id}/schema-changes/approve",
+            axum::routing::post(schema_changes::approve),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             connectors::require_connector_in_tenants,
@@ -535,6 +546,13 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/tenant",
             axum::routing::put(connectors::assign_connector_tenant),
+        )
+        // `SRC-8`: the orchestrator's observation. Outside the tenant gate on
+        // purpose: its only caller is a service identity, which belongs to no
+        // tenant (see `schema_changes`' module doc).
+        .route(
+            "/api/connectors/{id}/schema-observations",
+            axum::routing::post(schema_changes::observe),
         )
         .merge(per_connector)
 }

@@ -570,6 +570,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // audience as the per-table results (`/api/governance/ingest-runs`)
     // and the probe history above.
     ("GET",  "/api/connectors/{id}/ingest/runs", Policy::RequiresPermission("connector:manage")),
+    // `SRC-8`: the orchestrator reports a source table's columns before it
+    // loads the table and obeys the answer. `ingest:read` is the one
+    // permission its ingest identity holds (`main::bootstrap_ingest_run_service`,
+    // scoped to `ingest:read` ONLY); a user can hold it too (Data Engineer), so
+    // the handler adds the `run_failed_event` check: a service identity or an
+    // unrestricted administrator only. No new permission was invented.
+    ("POST", "/api/connectors/{id}/schema-observations", Policy::RequiresPermission("ingest:read")),
+    // A person reads what changed at the source and approves what waits
+    // (`SRC-8` decision D6). The tenant gate is the route layer.
+    ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/schema-changes/approve", Policy::RequiresPermission("connector:manage")),
     // The tenant-assignment route. `identity:
     // write`, not `connector:manage` — this is a governance decision about
     // WHO may see the row, the same permission every other tenant-

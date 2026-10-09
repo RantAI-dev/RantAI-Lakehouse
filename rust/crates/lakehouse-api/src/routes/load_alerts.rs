@@ -205,7 +205,7 @@ async fn confirm_status(
 /// therefore both DELIVER (webhook or email), but only the first appears on
 /// the Alerts page; the second is not written. That primitive is not changed
 /// here (`SRC-7` plan, task 4).
-async fn deliver_event(
+pub(super) async fn deliver_event(
     state: &AppState,
     pool: &PgPool,
     kind: AlertKind,

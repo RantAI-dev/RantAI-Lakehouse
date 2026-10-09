@@ -572,7 +572,13 @@ impl<'r> FromRow<'r, sqlx::postgres::PgRow> for SchemaChangeInserted {
 const CHANGE_COLUMNS: &str = "id, object_name, kind, column_name, before_value, after_value, \
                               breaking, status, run_id, detected_at, decided_by, decided_at";
 
-/// Every pending change of a connector, oldest first.
+/// The most pending changes [`list_pending`] returns. A connector with more
+/// waiting than this is far past what a person can review on one page; the
+/// approval still takes every change of a table.
+pub const PENDING_LIST_LIMIT: i64 = 500;
+
+/// The pending changes of a connector, oldest first, at most
+/// [`PENDING_LIST_LIMIT`].
 ///
 /// # Errors
 ///
@@ -583,10 +589,11 @@ pub async fn list_pending(
 ) -> Result<Vec<SchemaChange>, StoreError> {
     let sql = format!(
         "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
-         WHERE connector_id = $1 AND status = 'pending' ORDER BY detected_at, id"
+         WHERE connector_id = $1 AND status = 'pending' ORDER BY detected_at, id LIMIT $2"
     );
     Ok(sqlx::query_as(&sql)
         .bind(connector_id)
+        .bind(PENDING_LIST_LIMIT)
         .fetch_all(pool)
         .await?)
 }
@@ -638,6 +645,21 @@ pub async fn list_inactive_columns(
             inactive_since: at.into(),
         })
         .collect())
+}
+
+/// Whether the connector is paused (`SRC-8` F6): `None` for an unknown
+/// connector, so a caller can answer 404 before 409.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn is_paused(pool: &PgPool, connector_id: &str) -> Result<Option<bool>, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM connector WHERE id = $1")
+            .bind(connector_id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 /// What [`approve_object`] did.
