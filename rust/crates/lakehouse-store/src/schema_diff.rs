@@ -841,14 +841,26 @@ mod tests {
         let narrowed = shape(&[("id", "smallint"), ("note", "text")], &["id"]);
         let other = shape(&[("id", "timestamp"), ("note", "text")], &["id"]);
         let rekeyed = shape(&[("id", "integer"), ("note", "text")], &["note"]);
-        for observed in [with_removed(), narrowed, other, rekeyed] {
+        for (unapprovable, observed) in [
+            (false, with_removed()),
+            (false, narrowed),
+            (true, other),
+            (false, rekeyed),
+        ] {
             for policy in POLICIES {
                 let d = evaluate(policy, true, Some(&base()), &observed);
                 assert_eq!(d.action, Action::Wait, "{policy:?}");
                 assert_eq!(d.columns, None);
                 assert!(d.changes.iter().any(|c| c.change.is_breaking()));
                 assert!(d.changes.iter().all(|c| c.status == ChangeStatus::Pending));
-                assert_eq!(d.pause_connector, policy == SchemaChangePolicy::Pause);
+                // `PR #101 CI run 2` / `SRC-8 review BLOCKER 3a`: Pause
+                // pauses the connector, except for a type change Approve
+                // refuses (`Other`): pausing would leave it stuck for good.
+                assert_eq!(
+                    d.pause_connector,
+                    policy == SchemaChangePolicy::Pause && !unapprovable,
+                    "{policy:?} unapprovable={unapprovable}"
+                );
             }
         }
     }
