@@ -866,6 +866,197 @@ def step_failed_run_updates_connector_health() -> None:
     )
 
 
+# SRC-8: a table of its own and a connector of its own, so the matrix steps
+# above never see a source whose shape changes under them.
+SRC8_TABLE = "src8_drift"
+SRC8_BRONZE = "g6_mysql_schema_drift"
+
+
+def _src8_mysql(*statements: str) -> None:
+    """Run DDL/DML on the MySQL fixture as root (the connector's own user,
+    `g6_reader`, only reads)."""
+    import pymysql
+    conn = pymysql.connect(host="mysql-g6", user="root", password=MYSQL_ROOT_PASSWORD, database="g6_ingest")
+    try:
+        with conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _bronze_columns(bronze_table: str) -> list[str]:
+    """The column names ClickHouse sees on `bronze.<table>`, read the way
+    `connector_catalog.register_loaded_table` reads them (`DESCRIBE TABLE`).
+    `_bronze_row_count` runs first only to create the catalog database."""
+    _bronze_row_count(bronze_table)
+    text = ch_query(f"DESCRIBE TABLE {CATALOG_DB}.`bronze.{bronze_table}` FORMAT TabSeparated")
+    return [line.split("\t", 1)[0] for line in text.splitlines() if line]
+
+
+def _schema_changes(connector_id: str) -> dict:
+    resp = API.get(f"{API_URL}/api/connectors/{connector_id}/schema-changes", timeout=10)
+    if not resp.ok:
+        raise G6Failure(f"GET schema-changes for {connector_id!r} failed: {resp.status_code} {resp.text[:300]}")
+    return resp.json()
+
+
+def _src8_run(connector_id: str, label: str) -> None:
+    run_id = _post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise G6Failure(f"SRC-8 {label}: ingest/run returned no runId")
+    print(f"[g6] SRC-8 {label}: launched run {run_id}")
+    step_wait_for_run_success(run_id)
+
+
+def _src8_changes_of(listing: dict, bucket: str, kind: str, column: str) -> list[dict]:
+    return [
+        c for c in listing[bucket]
+        if c["objectName"] == SRC8_TABLE and c["kind"] == kind and c["columnName"] == column
+    ]
+
+
+def step_source_schema_changes() -> None:
+    """SRC-8 task 12: a MySQL table that changes shape between runs, on a
+    connector of its own (policy: the default, apply non-breaking).
+
+    1. `id, name, qty` is loaded; no change is listed (a first observation
+       is the baseline).
+    2. `ADD COLUMN note`: the run succeeds, Bronze gains `note`, and
+       `column_added` is in `recent` (applied).
+    3. `DROP COLUMN qty` (and a new source row): the run SUCCEEDS (a waiting
+       table is not a failure, decision 7), the table is reported as
+       waiting (a pending `column_removed` with `canApprove`), and its Bronze
+       row count is the one from before; nothing was loaded.
+    4. Approve, run: the new row arrives, `qty` is still a Bronze column,
+       and `inactiveColumns` lists it.
+
+    NOT asserted here: the "schema changed" alert (needs a webhook target
+    this gate cannot receive, as for SRC-7); the other policies, a type
+    change, a primary-key change (route and store tests cover them; the
+    gate has one MySQL fixture and a type change that cannot be loaded
+    needs a table re-added under a new target); the Schema tab mark of an
+    inactive column (task 11 was not built)."""
+    _src8_mysql(
+        f"DROP TABLE IF EXISTS {SRC8_TABLE}",
+        f"CREATE TABLE {SRC8_TABLE} (id INT PRIMARY KEY, name VARCHAR(50), qty INT)",
+        f"INSERT INTO {SRC8_TABLE} (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+    )
+    body = _create_connector(
+        name="g6-mysql-schema-drift", kind="MySQL", host="mysql-g6:3306",
+        credential={"source": "file", "primary": "password"},
+    )
+    connector_id = body["id"]
+    derived = (body.get("credential") or {}).get("primary")
+    if not derived:
+        raise G6Failure(f"create response for g6-mysql-schema-drift carried no derived credential name: {body}")
+    _write_credential_file(derived, CONNECTOR_MYSQL_PASSWORD)
+    # `replace`, so a loaded run leaves exactly the source's rows in Bronze and
+    # "the count did not change" means "nothing was loaded".
+    spec_resp = API.put(
+        f"{API_URL}/api/connectors/{connector_id}/ingest-spec",
+        json={
+            "adapter": "sql", "ingestMode": "batch",
+            "dial": {"driver": "mysql", "host": "mysql-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
+            "sourceObjects": [{"name": SRC8_TABLE, "target": SRC8_BRONZE, "loadMode": "replace"}],
+        },
+        timeout=10,
+    )
+    if not spec_resp.ok:
+        raise G6Failure(f"set ingest-spec for g6-mysql-schema-drift failed: {spec_resp.status_code} {spec_resp.text}")
+
+    # 1. baseline
+    _src8_run(connector_id, "step 1 (baseline)")
+    rows = _wait_for(f"bronze.{SRC8_BRONZE} rows visible", lambda: _bronze_row_count(SRC8_BRONZE) or None, 30, interval_s=3.0)
+    listing = _schema_changes(connector_id)
+    if rows != 3 or listing["pending"] or listing["recent"]:
+        raise G6Failure(
+            f"SRC-8 step 1: expected 3 rows and no change listed, got {rows} rows, "
+            f"pending={listing['pending']!r} recent={listing['recent']!r}"
+        )
+    print(f"[g6] SRC-8 step 1: {rows} rows in bronze.{SRC8_BRONZE}, columns {_bronze_columns(SRC8_BRONZE)}, no change listed")
+
+    # 2. a column is added
+    _src8_mysql(
+        f"ALTER TABLE {SRC8_TABLE} ADD COLUMN note VARCHAR(50)",
+        f"INSERT INTO {SRC8_TABLE} (id, name, qty, note) VALUES (4, 'd', 40, 'added')",
+    )
+    _src8_run(connector_id, "step 2 (column added)")
+    columns = _wait_for(
+        f"bronze.{SRC8_BRONZE} has column note",
+        lambda: (lambda cols: cols if "note" in cols else None)(_bronze_columns(SRC8_BRONZE)),
+        45, interval_s=3.0,
+    )
+    listing = _schema_changes(connector_id)
+    added = _src8_changes_of(listing, "recent", "column_added", "note")
+    if not added or added[0]["status"] != "applied" or listing["pending"]:
+        raise G6Failure(
+            f"SRC-8 step 2: expected an applied column_added for note in recent and nothing pending, "
+            f"got recent={listing['recent']!r} pending={listing['pending']!r}"
+        )
+    print(
+        f"[g6] SRC-8 step 2: run succeeded, bronze columns {columns}, "
+        f"recent has column_added note status={added[0]['status']}"
+    )
+
+    # 3. a column is dropped: the table waits, the run does not fail
+    rows_before = _bronze_row_count(SRC8_BRONZE)
+    _src8_mysql(
+        f"ALTER TABLE {SRC8_TABLE} DROP COLUMN qty",
+        f"INSERT INTO {SRC8_TABLE} (id, name, note) VALUES (5, 'e', 'after the drop')",
+    )
+    _src8_run(connector_id, "step 3 (column dropped)")  # raises if the run FAILED
+    listing = _schema_changes(connector_id)
+    removed = _src8_changes_of(listing, "pending", "column_removed", "qty")
+    if not removed or removed[0]["canApprove"] is not True:
+        raise G6Failure(
+            f"SRC-8 step 3: expected a pending column_removed for qty with canApprove true, got pending={listing['pending']!r}"
+        )
+    waiting_rows = [
+        r for r in API.get(
+            f"{API_URL}/api/governance/ingest-runs?connectorId={connector_id}", timeout=10
+        ).json()
+        if r["object"] == SRC8_TABLE and r["status"] == "waiting"
+    ]
+    if not waiting_rows:
+        raise G6Failure("SRC-8 step 3: the run succeeded but no ingest-runs row for the table says 'waiting'")
+    rows_after = _bronze_row_count(SRC8_BRONZE)
+    if rows_after != rows_before:
+        raise G6Failure(
+            f"SRC-8 step 3: the table was loaded while it waited: {rows_before} rows before, {rows_after} after"
+        )
+    print(
+        f"[g6] SRC-8 step 3: run succeeded, pending column_removed qty canApprove={removed[0]['canApprove']}, "
+        f"ingest-runs row status=waiting, bronze rows {rows_before} -> {rows_after} (not loaded)"
+    )
+
+    # 4. approve: it loads, and the dropped column is kept, marked inactive
+    approved = API.post(
+        f"{API_URL}/api/connectors/{connector_id}/schema-changes/approve", json={"object": SRC8_TABLE}, timeout=10
+    )
+    if not approved.ok:
+        raise G6Failure(f"SRC-8 step 4: approve failed: {approved.status_code} {approved.text[:300]}")
+    _src8_run(connector_id, "step 4 (approved)")
+    rows_loaded = _wait_for(
+        f"bronze.{SRC8_BRONZE} loads the row added after the drop",
+        lambda: (lambda n: n if n == rows_before + 1 else None)(_bronze_row_count(SRC8_BRONZE)),
+        45, interval_s=3.0,
+    )
+    columns = _bronze_columns(SRC8_BRONZE)
+    listing = _schema_changes(connector_id)
+    inactive = [i for i in listing["inactiveColumns"] if i["objectName"] == SRC8_TABLE and i["columnName"] == "qty"]
+    if "qty" not in columns or not inactive or listing["pending"]:
+        raise G6Failure(
+            f"SRC-8 step 4: expected qty still in bronze columns {columns!r}, listed inactive, nothing pending; "
+            f"got inactiveColumns={listing['inactiveColumns']!r} pending={listing['pending']!r}"
+        )
+    print(
+        f"[g6] SRC-8 step 4: approved, run loaded ({rows_before} -> {rows_loaded} rows), "
+        f"bronze columns {columns} (qty kept), inactiveColumns lists qty since {inactive[0]['inactiveSince']}"
+    )
+
+
 def step_column_gate_rejects_an_unsupported_column() -> None:
     """A real, asserted FAILURE -- calls column_gate.reject_unsupported_column_types
     inside the REAL shipped image (not a mocked unit test), asserting it
@@ -1047,6 +1238,7 @@ def main() -> int:
         step_ensure_tenant()
         step_ingest_matrix()
         step_failed_run_updates_connector_health()
+        step_source_schema_changes()
         step_column_gate_rejects_an_unsupported_column()
         step_cdc_reports_unsupported_not_a_launch()
         step_cdc_mongo_debezium_properties()
