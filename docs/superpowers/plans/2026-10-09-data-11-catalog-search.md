@@ -347,6 +347,93 @@ Deviations and choices the plan did not spell out:
   (the `"search"` in `ai-chat-ok.json` is the assistant's `list_datasets`
   argument).
 
+### Review fixes, console (T1-T3) and benchmark script (T4), developer, 2026-10-09
+
+Commits on `feat/data-11-catalog-search` after the first entry, in order
+(none pushed):
+
+- `71184f6` fix(api): forgive a typo in a search word that has punctuation (review SHOULD-FIX 1)
+- `fe4d136` fix(api): count a dataset's use under the Silver table its page reads (review SHOULD-FIX 2)
+- `46f5f6e` test(api): an annotation edit drops the search copy, a refused one does not (review SHOULD-FIX 3)
+- T1 `4f02196` feat(console): carry why a search matched on the asset contract
+- T2 `5d0c385` feat(console): the Cmd+K box shows why a table matched and links to all results
+- T3 `7df1f88` feat(console): Data Explorer searches columns and tags, filters by owner and tag
+- T4 `cee90a3` feat(ops): a benchmark for catalog search on 10,000 tables
+
+Commands run, with counts:
+
+- Rust, from `/home/hv/lakehouse-data11/rust`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target
+  CARGO_BUILD_JOBS=2`, `df -h /` checked before each (54-55G free):
+  `cargo check -p lakehouse-api` and `cargo check -p lakehouse-api --tests`
+  between edits: no errors. Then `touch rust/crates/*/src/lib.rs
+  rust/crates/lakehouse-store/src/*.rs`; `cargo fmt --check` failed on two
+  closures of my SHOULD-FIX 3 helpers only; `cargo fmt` fixed them (7 lines
+  added, 15 removed, all in my hunks), rerun `cargo fmt --check`: exit 0.
+  `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D
+  warnings`: finished clean (1m 23s, every crate re-checked). That clippy run
+  came before the `cargo fmt` rewrite of those two closures; no clippy was
+  re-run after it.
+- TypeScript, from the worktree root, after `bun install --frozen-lockfile`
+  (772 packages, lockfile unchanged): `bun run typecheck` exit 0; `bun run
+  lint`: 0 errors, 6 warnings, none in a file this slice touches (alerts-page,
+  open-format-card.test, use-data-table, dashboard-specs and two more);
+  `bun run test`: 928 pass, 1 skip, 0 fail, 929 tests across 102 files.
+  New: 5 in `command-palette.test.tsx`, 4 in `palette-search.test.ts`, 5 in
+  `data-explorer-columns.test.tsx`.
+- Python: `python3 -m py_compile ops/bench/catalog_search_bench.py` ok;
+  `python3 ops/lint/check_intra_package_imports.py` and
+  `python3 ops/lint/check_bare_iceberg_count.py` both OK.
+
+Choices the plan did not spell out:
+
+- SHOULD-FIX 1: `best_hit` lost its `word_chars` argument and `search` no
+  longer builds `word_chars`; the new `approximately_in` applies the 4-character
+  rule per word token, so a word such as `ab_cd` is not approximated as a whole.
+  Every part of a punctuated word that is contained in the field counts as
+  matching, so `id_customer` finds a field `customer_id` (flagged approximate).
+- SHOULD-FIX 2: `use_keys` and `use_by_asset` take the `silver_fallback`
+  value (`iceberg_query_db.is_none()`); a listed Silver asset keeps its own key.
+- SHOULD-FIX 3: the two tests prime and read the cache through
+  `get_or_build` with a flag in the build closure.
+- T2: the box shows "No results." only when the server returned no asset
+  (the force-mounted rows would otherwise sit above cmdk's own empty line);
+  "See all results" appears only when at least one asset is listed; a
+  `supported: false` refusal still shows "No results.", not the unavailable
+  line (the API answers 200 with an empty list).
+- T3: the plan did not say what happens to the new columns on a narrow window.
+  Tags hides below 1400 px and Owner below 1280 px, ahead of Size, through the
+  page's existing `hiddenByWidth`; while hidden, their filters are not
+  offered, as for Type and Layer today. Tags has `enableSorting: false`
+  because the server refuses a `tags` sort.
+- T3 sort check: the Data Explorer sends no default `sort`. `useDataTable`
+  is given no initial `sorting` and `toQueryParams` leaves an empty sort out.
+  A sort the user chose (a header click, which puts it in the
+  URL) is sent and is obeyed by the API; saved table memory was not read.
+- T4: the benchmark's registry columns come from the `SELECT`s in `catalog.rs`
+  (`dataset_catalog`, `dataset_sync`, `dataset_column`); the real Iceberg
+  table definitions are not in this repo. `run` waits `--cold-wait` (35 s) so
+  the first search builds the copy. The query terms assume 20 columns per
+  table.
+
+*Not verified:*
+
+- Every Rust test, new and old (no `cargo test` on this machine): the
+  `custmer_id` / `silver.ordrs` / `custmer_xx` test, the `use_keys`
+  both-settings test and the two `put_annotation` copy tests. First run is CI's.
+  They are type-checked by `clippy --all-targets` and `cargo check --tests`.
+- The workspace-wide Rust verification block, and the Python test suite
+  `(cd dagster && python -m pytest ...)` (no Python change in `dagster/`).
+- `ops/bench/catalog_search_bench.py` was never run against a stack: `seed`
+  was not run, no compose project was started, and `run` was only
+  started without settings to see it refuse. No number exists; the Speed row
+  (T4, 500 ms) stays open. Whether ClickHouse accepts the INSERT into the
+  Iceberg registries is unknown.
+- No browser check of the Cmd+K box or the Data Explorer; the user interface
+  was exercised only through happy-dom tests with a stubbed `fetch`.
+- The `forceMount` on `Command.Item` alone: removing only the item-level
+  prop left the tests passing, removing the group-level one too made two fail,
+  so the group-level `forceMount` is what the tests pin.
+
 ## Review
 
 ### Rust slice (R1–R5), reviewed 2026-10-09 at `4b61231`
