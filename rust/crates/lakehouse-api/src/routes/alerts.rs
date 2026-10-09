@@ -31,6 +31,15 @@ use crate::state::AppState;
 
 /// `GET /api/alerts` — list every alert & digest rule.
 ///
+/// The body is `{"rules": [...], "runEventsConfigured": bool}` (`SRC-7`,
+/// decision D9). `runEventsConfigured` is true when this API has
+/// `PIPELINE_RUN_TOKEN` set (non-empty), the condition under which the
+/// orchestrator's run sensors can post failed and finished runs; unset, no
+/// connector or upload alert can ever fire, and the console says so instead
+/// of showing a silent "no alerts". It is added beside `rules`, which keeps
+/// its place, so a client that reads only `rules` is unaffected. It cannot
+/// say whether the orchestrator's own copy of the token is set.
+///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
 /// the same kind of failure — the status code here depends on which route
@@ -44,7 +53,10 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_alerts::list_rules(&state.clickhouse)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
-    Ok(ApiJson(json!({ "rules": rules })))
+    Ok(ApiJson(json!({
+        "rules": rules,
+        "runEventsConfigured": state.config.pipeline_run_token.is_some(),
+    })))
 }
 
 /// Parse the raw request body as JSON into an [`AlertRuleInput`].
@@ -1942,5 +1954,46 @@ mod rule_scope_authorisation {
         update_as(&state, admin(), "connector_failure", Some("*"))
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_events_configured {
+    //! `SRC-7` D9: `GET /api/alerts` says whether run reports can arrive.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn listed(token: Option<&str>) -> Value {
+        let ch = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "rows": 0, "data": [] })),
+            )
+            .mount(&ch)
+            .await;
+        let mut env = HashMap::new();
+        env.insert("CH_URL".to_owned(), ch.uri());
+        if let Some(token) = token {
+            env.insert("PIPELINE_RUN_TOKEN".to_owned(), token.to_owned());
+        }
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        list(State(state)).await.expect("listed").0
+    }
+
+    #[tokio::test]
+    async fn the_flag_is_true_with_a_token_and_false_without_or_with_an_empty_one() {
+        let set = listed(Some("a-token")).await;
+        assert_eq!(set["runEventsConfigured"], true);
+        assert_eq!(set["rules"], json!([]));
+        assert_eq!(listed(None).await["runEventsConfigured"], false);
+        assert_eq!(listed(Some("")).await["runEventsConfigured"], false);
     }
 }
