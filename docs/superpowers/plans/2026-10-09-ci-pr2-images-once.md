@@ -458,4 +458,72 @@ final message rather than in this file.
 
 ## Review
 
-(Planner.)
+### Review 1 (planner, 2026-10-09, at `291e997`)
+
+No `BLOCKER`, no `SHOULD-FIX`. The diff matches decisions 1–12 and tasks
+T1–T8.
+
+**Reality check.** `git ls-remote --heads origin ci/pr2-images-once` is
+`291e997`, equal to local `HEAD`; nine commits over `a78ad62`; tree clean.
+The handoff's claims about git state are true.
+
+**Checked and correct.**
+- `rust/Dockerfile`: tools base above every repo `COPY`, both tools
+  pinned (`sqlx-cli` 0.8.6, `cargo-chef` 0.1.78); `cook` and `build` use
+  the same profile, package and `--locked`; the cache mount stays at
+  `/build/target` on both steps; the runtime stage is untouched.
+- `docker-compose.yml`: one `image:` key on the API, one shared key on
+  all five `./dagster` services, and the two that lacked `args: GIT_SHA`
+  now have it, so the five `build:` blocks are identical.
+- `ci.yml`: `images` and `image-smoke` carry the acceptance `if:`; the six
+  consumers `needs: [changes, images]`; every `up -d --build` became
+  `up -d --no-build`; each `build` of a fixture uses the same `-p`, `-f`
+  and `--profile` flags as its `up`; no test-runner command changed;
+  `g1-rustfs` and `g2-seaweedfs` are untouched; `cache-to` is empty off
+  `push`; `permissions: contents: read` is workflow-wide.
+- Gate: both new jobs are in `needs`, in the `env:`, and in
+  `required_gate.sh`, required exactly when acceptance is. The case
+  "`images` failed, every consumer skipped" is tested and red.
+- `docker.yml`: tag trigger only, reads `api-image`, writes no cache.
+
+**Re-run by the reviewer, in the foreground, on `291e997`.**
+- `bash scripts/ci/tests/test_required_gate.sh`: 37 passed, 0 failed.
+- `bash scripts/ci/tests/test_detect_change_scope.sh`: 32 passed, 0 failed.
+- `python3 ops/lint/check_compose_init_readiness.py`: exit 0.
+- `docker compose --profile '*' config --quiet`: exit 0.
+- Real `up` from a clean project of my own (`pr2review1`, `down -v`
+  first): `up -d --build lakehouse-api` exit 0, the service runs
+  `rantai-lakehouse-api:local`, `/health` 200, torn down with `down -v`.
+  The build was a cache hit, so this proves the compose wiring, not a
+  cold build.
+
+**Not re-run by the reviewer.** The T1 timing series, the Dagster half
+of the real `up`, the `GIT_SHA` inspection and the `--no-build` failure
+case: taken from the handoff, which quotes commands and outputs.
+`actionlint` is not installed in the reviewer's shell.
+
+**The plan was wrong in one place.** T2 named
+`demo_connector_compose_properties` as a test; it is a helper. The
+developer ran the test that calls it,
+`demo_connector_properties_match_the_checked_in_compose_file` (1 passed).
+That was the right call.
+
+**Accepted as they are.**
+- The T3 and T4 commits fail the gate's consistency self-test on their
+  own, because the plan put the gate wiring in T5. The PR is squashed, so
+  `main` never sees those states. Planner's ordering mistake.
+- A `v*` tag build no longer runs the `/health` smoke test. Tags are cut
+  from `main` commits, which `image-smoke` has already tested.
+
+**Risks to watch in CI, from the handoff's numbers.**
+- A warm local rebuild of the 13 workspace crates took 343 s on six
+  cores. Runners have four. The parent plan's "`images` in 5 minutes or
+  less on a warm cache" may be missed; it will be reported as measured,
+  not adjusted.
+- The API layer cache is about 0.95 GB (local export). With the Actions
+  cache at 9.9 GB, eviction on `main` is likely until the PR-scoped
+  `rust-cache` entries age out.
+- Warm-cache time cannot be measured on this PR at all: only a push to
+  `main` writes the cache. It is measured on the first runs after merge.
+
+CI results are appended below once the PR has run.
