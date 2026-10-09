@@ -373,6 +373,29 @@ pub async fn connector_in_tenants(
     .await?)
 }
 
+/// Which of `ids` are connectors of one of `tenant_ids`: [`connector_in_tenants`]
+/// for many ids in one query, for a caller that filters a list (the alert
+/// rule list, `SRC-7` review BLOCKER 1) and must not pay a round trip per
+/// row. An unknown id, another tenant's connector and one with no tenant are
+/// all absent from the answer alike.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_ids_in_tenants(
+    pool: &PgPool,
+    ids: &[String],
+    tenant_ids: &[Uuid],
+) -> Result<Vec<String>, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT id FROM connector WHERE id = ANY($1) AND tenant_id = ANY($2)")
+            .bind(ids)
+            .bind(tenant_ids)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
 /// Assign (or reassign) a connector to a tenant — the write behind `PUT
 /// /api/connectors/{id}/tenant`. Closes the gap
 /// `0042_tenant_provisioning.sql` deliberately leaves open: that migration

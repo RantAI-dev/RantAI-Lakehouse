@@ -25,10 +25,10 @@ use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
     IngestSpecInput, REPEATED_FAILURE_STREAK, SecretRefSwap, SecretSlot, UpdateConnectorInput,
-    any_connector_targets, connector_in_tenants, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_run_result, record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs,
-    update_connector,
+    any_connector_targets, connector_ids_in_tenants, connector_in_tenants, create_connector,
+    delete_connector, get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    list_ingestible_connectors, record_run_result, record_test_result, set_ingest_spec,
+    swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -1759,6 +1759,32 @@ async fn record_run_result_refuses_an_unknown_id_and_a_manual_test_leaves_run_fa
     assert_eq!(
         c.failure_streak, 1,
         "a manual Test does not touch the streak"
+    );
+    Ok(())
+}
+
+/// `SRC-7` review BLOCKER 1: the many-ids form answers as the one-id form
+/// does, in one query.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connector_ids_in_tenants_keeps_only_the_ids_of_the_callers_tenants(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("seeded tenant id");
+    let ids = vec![
+        "conn-pg-lakehouse".to_owned(),
+        "conn-s3-warehouse".to_owned(),
+        "conn-does-not-exist".to_owned(),
+    ];
+    let own = connector_ids_in_tenants(&pool, &ids, &[group])
+        .await
+        .expect("query");
+    assert!(own.contains(&"conn-pg-lakehouse".to_owned()));
+    assert!(!own.contains(&"conn-does-not-exist".to_owned()));
+    assert!(
+        connector_ids_in_tenants(&pool, &ids, &[])
+            .await
+            .expect("query")
+            .is_empty()
     );
     Ok(())
 }

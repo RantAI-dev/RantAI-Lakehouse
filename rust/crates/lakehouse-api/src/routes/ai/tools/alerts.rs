@@ -42,9 +42,14 @@ fn parse_input(args: &Map<String, Value>) -> AlertRuleInput {
     serde_json::from_value(Value::Object(args.clone())).unwrap_or_default()
 }
 
-pub(super) async fn list_alert_rules(ch: &ChClient) -> Value {
-    match lakehouse_alerts::list_rules(ch).await {
-        Ok(rules) => json!({ "rules": rules }),
+pub(super) async fn list_alert_rules(state: &AppState, principal: Option<&Principal>) -> Value {
+    match lakehouse_alerts::list_rules(&state.clickhouse).await {
+        // `SRC-7` review BLOCKER 1: the copilot lists through the same
+        // filter as `GET /api/alerts`, else it is a way around it.
+        Ok(rules) => match crate::routes::alerts::visible_rules(state, principal, rules).await {
+            Ok(rules) => json!({ "rules": rules }),
+            Err(err) => json!({ "error": err.to_string() }),
+        },
         Err(err) => json!({ "error": err.to_string() }),
     }
 }

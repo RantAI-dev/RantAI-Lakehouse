@@ -29,16 +29,15 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
 
-/// `GET /api/alerts` — list every alert & digest rule.
+/// `GET /api/alerts` — list the alert & digest rules the caller may see.
 ///
-/// The body is `{"rules": [...], "runEventsConfigured": bool}` (`SRC-7`,
-/// decision D9). `runEventsConfigured` is true when this API has
-/// `PIPELINE_RUN_TOKEN` set (non-empty), the condition under which the
-/// orchestrator's run sensors can post failed and finished runs; unset, no
-/// connector or upload alert can ever fire, and the console says so instead
-/// of showing a silent "no alerts". It is added beside `rules`, which keeps
-/// its place, so a client that reads only `rules` is unaffected. It cannot
-/// say whether the orchestrator's own copy of the token is set.
+/// The body is `{"rules": [...], "runEventsConfigured": bool}`. Rules of
+/// the pre-`SRC-7` kinds are returned exactly as before; rules of the six
+/// `SRC-7` kinds are filtered by [`visible_rules`] (`SRC-7` review BLOCKER 1:
+/// the list is one for the installation, and such a rule names a connector
+/// and carries a webhook target). The body also carries
+/// `runEventsConfigured` (`SRC-7` D9), true when this API has
+/// `PIPELINE_RUN_TOKEN` set.
 ///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
@@ -48,15 +47,80 @@ use crate::state::AppState;
 ///
 /// # Errors
 ///
-/// Returns a 500 [`ApiError::Internal`] on a `ClickHouse` failure.
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+/// Returns a 500 [`ApiError::Internal`] on a `ClickHouse` failure; for the
+/// `SRC-7` kinds, whatever [`visible_rules`] returns.
+pub async fn list(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_alerts::list_rules(&state.clickhouse)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
     Ok(ApiJson(json!({
         "rules": rules,
         "runEventsConfigured": state.config.pipeline_run_token.is_some(),
     })))
+}
+
+/// The rules of `rules` that `principal` may see (`SRC-7` review BLOCKER 1).
+///
+/// Rules of the pre-`SRC-7` kinds pass untouched. For the six new kinds an
+/// unrestricted caller ([`crate::routes::catalog::is_unrestricted`]) sees
+/// all; anyone else sees only the rules scoped to a connector of their
+/// tenants. A `*` rule, an `upload_failure` rule and a rule whose connector
+/// no longer exists (or has no tenant) are hidden from them, as the save
+/// check refuses the same scopes. Membership is decided for all connectors
+/// in one query, not one per rule.
+///
+/// # Errors
+///
+/// 401 with no principal when a rule of the new kinds exists; 503 if no
+/// pool is configured; 500 on a database failure.
+pub(crate) async fn visible_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+    rules: Vec<AlertRule>,
+) -> Result<Vec<AlertRule>, ApiError> {
+    if !rules.iter().any(|rule| rule.kind.is_connector_scoped()) {
+        return Ok(rules);
+    }
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    if crate::routes::catalog::is_unrestricted(principal) {
+        return Ok(rules);
+    }
+    let mut ids: Vec<String> = rules
+        .iter()
+        .filter(|rule| rule.kind.is_connector_scoped())
+        .filter_map(|rule| rule.connector.clone())
+        .filter(|connector| connector != "*")
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let own: std::collections::HashSet<String> = if ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let pool = state
+            .pg
+            .as_deref()
+            .ok_or_else(|| ApiError::Unavailable("connector store unavailable".to_owned()))?;
+        lakehouse_store::connectors::connector_ids_in_tenants(pool, &ids, &principal.tenant_ids)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    Ok(rules
+        .into_iter()
+        .filter(|rule| {
+            !rule.kind.is_connector_scoped()
+                || rule
+                    .connector
+                    .as_deref()
+                    .is_some_and(|connector| own.contains(connector))
+        })
+        .collect())
 }
 
 /// Parse the raw request body as JSON into an [`AlertRuleInput`].
@@ -1955,6 +2019,57 @@ mod rule_scope_authorisation {
             .await
             .unwrap();
     }
+
+    async fn listed_as(state: &AppState, principal: Option<Principal>) -> Result<Value, ApiError> {
+        list(State(state.clone()), principal.map(Extension))
+            .await
+            .map(|json| json.0)
+            .map_err(|rejection| rejection.0)
+    }
+
+    /// `SRC-7` review BLOCKER 1: the list shows a non-administrator only the
+    /// connector rules of their tenants.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_shows_a_caller_only_the_connector_rules_of_their_tenants(pool: sqlx::PgPool) {
+        // The rule store answers every read with this one rule.
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(body["rules"][0]["connector"], OWN_CONNECTOR);
+
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"], serde_json::json!([]));
+
+        // A connector that no longer exists is hidden from a non-admin.
+        let (state, _ch) = setup(&pool, ("connector_failure", "conn-gone")).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"], serde_json::json!([]));
+
+        // `*` and upload rules are an unrestricted caller's alone.
+        for existing in [("connector_failure", "*"), ("upload_failure", "*")] {
+            let (state, _ch) = setup(&pool, existing).await;
+            let body = listed_as(&state, Some(engineer())).await.unwrap();
+            assert_eq!(body["rules"], serde_json::json!([]));
+            let body = listed_as(&state, Some(admin())).await.unwrap();
+            assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    /// Other kinds are returned as before, to anyone and with no principal;
+    /// the new kinds with no principal are a 401.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_returns_other_kinds_untouched_and_refuses_new_kinds_without_a_principal(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("pipeline_failure", "")).await;
+        for principal in [None, Some(engineer())] {
+            let body = listed_as(&state, principal).await.unwrap();
+            assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        }
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        assert_eq!(listed_as(&state, None).await.unwrap_err().status(), 401);
+    }
 }
 
 #[cfg(test)]
@@ -1985,7 +2100,7 @@ mod run_events_configured {
             env.insert("PIPELINE_RUN_TOKEN".to_owned(), token.to_owned());
         }
         let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
-        list(State(state)).await.expect("listed").0
+        list(State(state), None).await.expect("listed").0
     }
 
     #[tokio::test]
