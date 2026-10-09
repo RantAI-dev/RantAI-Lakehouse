@@ -135,6 +135,9 @@ describe("ConnectorCreatePage", () => {
             tenant: "Other Co",
             lastTestAt: null,
             lastActivityAt: null,
+            lastRunSuccessAt: null,
+            lastRunFailureAt: null,
+            failureStreak: 0,
             capabilities: [],
             owner: "Current user",
             credential: {

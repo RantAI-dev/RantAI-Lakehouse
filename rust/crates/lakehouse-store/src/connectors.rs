@@ -101,6 +101,16 @@ pub struct Connector {
     pub capabilities: Vec<String>,
     /// Owning team or person.
     pub owner: String,
+    /// When the latest successful run finished, ISO 8601. `None` until a
+    /// run has been reported by the orchestrator (`SRC-7` F4): never
+    /// derived from a manual test.
+    pub last_run_success_at: Option<String>,
+    /// When the latest failed run finished, ISO 8601. `None` until a failed
+    /// run has been reported (`SRC-7` F4).
+    pub last_run_failure_at: Option<String>,
+    /// Failed runs since the last success; `0` after a success (`SRC-7` F4,
+    /// decision D2).
+    pub failure_streak: i32,
 }
 
 /// A dependent pipeline, derived (never stored) from `pipeline_definition`
@@ -230,6 +240,10 @@ struct ConnectorRow {
     residency: String,
     /// Read only by [`get_connector`], for [`ConnectorDetail::tenant_id`].
     tenant_id: Option<Uuid>,
+    /// `SRC-7` F4: written only by [`record_run_result`].
+    last_run_success_at: Option<OffsetDateTime>,
+    last_run_failure_at: Option<OffsetDateTime>,
+    failure_streak: i32,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -254,6 +268,9 @@ impl std::fmt::Debug for ConnectorRow {
             .field("owner", &self.owner)
             .field("residency", &self.residency)
             .field("tenant_id", &self.tenant_id)
+            .field("last_run_success_at", &self.last_run_success_at)
+            .field("last_run_failure_at", &self.last_run_failure_at)
+            .field("failure_streak", &self.failure_streak)
             .finish()
     }
 }
@@ -274,6 +291,9 @@ impl From<ConnectorRow> for Connector {
             last_activity_at: None,
             capabilities: row.capabilities,
             owner: row.owner,
+            last_run_success_at: iso_opt(row.last_run_success_at),
+            last_run_failure_at: iso_opt(row.last_run_failure_at),
+            failure_streak: row.failure_streak,
         }
     }
 }
@@ -282,7 +302,8 @@ impl From<ConnectorRow> for Connector {
 // (see `Connector::last_activity_at`'s doc comment), so every read maps it
 // to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
-     secret_ref, last_test_at, capabilities, owner, residency, tenant_id";
+     secret_ref, last_test_at, capabilities, owner, residency, tenant_id, \
+     last_run_success_at, last_run_failure_at, failure_streak";
 
 /// Optional narrowing for [`list_connectors`] for tenant isolation: a
 /// caller must never see a connector outside its own tenant.
@@ -1303,6 +1324,65 @@ pub async fn record_test_result(
     })
 }
 
+/// Failed runs in a row at which a connector turns `"unhealthy"` and the
+/// "repeated failures" alert fires (`SRC-7`, decision D2/D6). One constant for
+/// the store's health rule and the API's alert trigger, so they cannot drift.
+pub const REPEATED_FAILURE_STREAK: i32 = 3;
+
+/// What [`record_run_result`] leaves on the connector row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHealth {
+    /// `"healthy"` after a success, `"degraded"` for 1 or 2 failures in a
+    /// row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`].
+    pub health: String,
+    /// Failed runs since the last success, after this result.
+    pub failure_streak: i32,
+}
+
+/// Record the outcome of one real run (not a manual test) on the connector:
+/// the run time, the failure streak and `health`, together in one
+/// `UPDATE ... RETURNING` (`SRC-7` F4, decision D6). Success: `healthy`,
+/// streak 0. Failure: streak + 1, `degraded` below
+/// [`REPEATED_FAILURE_STREAK`], `unhealthy` from it. `at` is the caller's
+/// run-end time; nothing is stamped that was not reported.
+///
+/// The caller must dedupe the run first (`pipelines::record_pipeline_run_event`):
+/// this function counts every call.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn record_run_result(
+    pool: &PgPool,
+    id: &str,
+    succeeded: bool,
+    at: OffsetDateTime,
+) -> Result<RunHealth, StoreError> {
+    let sql = "UPDATE connector SET \
+                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
+                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
+                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
+                 health = CASE WHEN $2 THEN 'healthy' \
+                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
+                               ELSE 'degraded' END \
+               WHERE id = $1 RETURNING health, failure_streak";
+    let row: Option<(String, i32)> = sqlx::query_as(sql)
+        .bind(id)
+        .bind(succeeded)
+        .bind(at)
+        .bind(REPEATED_FAILURE_STREAK)
+        .fetch_optional(pool)
+        .await?;
+    let Some((health, failure_streak)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    Ok(RunHealth {
+        health,
+        failure_streak,
+    })
+}
+
 /// Which of a connector's two credential slots [`swap_secret_ref`]
 /// targets. Mirrors `RotateConnectorSecretRequest["slot"]` in
 /// `contracts/connectors.ts`.
@@ -1851,6 +1931,9 @@ mod tests {
             last_activity_at: None,
             capabilities: vec!["CDC".to_owned()],
             owner: "o".to_owned(),
+            last_run_success_at: None,
+            last_run_failure_at: Some("2026-01-02T00:00:00.000Z".to_owned()),
+            failure_streak: 1,
         };
         let value = serde_json::to_value(&connector).unwrap();
         for key in [
@@ -1865,6 +1948,9 @@ mod tests {
             "lastActivityAt",
             "capabilities",
             "owner",
+            "lastRunSuccessAt",
+            "lastRunFailureAt",
+            "failureStreak",
         ] {
             assert!(value.get(key).is_some(), "Connector is missing `{key}`");
         }
@@ -1891,6 +1977,9 @@ mod tests {
                 last_activity_at: None,
                 capabilities: vec![],
                 owner: "o".to_owned(),
+                last_run_success_at: None,
+                last_run_failure_at: None,
+                failure_streak: 0,
             },
             discovered_assets: 0,
             discovered_schemas: vec![],
@@ -1940,6 +2029,9 @@ mod tests {
             owner: "o".to_owned(),
             residency: "in-region".to_owned(),
             tenant_id: None,
+            last_run_success_at: None,
+            last_run_failure_at: None,
+            failure_streak: 0,
         };
         let debug = format!("{row:?}");
         assert!(!debug.contains("super-secret-internal-host"));

@@ -24,10 +24,11 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
-    connector_in_tenants, create_connector, delete_connector, get_connector,
+    IngestSpecInput, REPEATED_FAILURE_STREAK, SecretRefSwap, SecretSlot, UpdateConnectorInput,
+    any_connector_targets, connector_in_tenants, create_connector, delete_connector, get_connector,
     get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
+    record_run_result, record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs,
+    update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -1681,5 +1682,83 @@ async fn any_connector_targets_ignores_a_source_objects_value_that_is_not_a_list
         .execute(&pool)
         .await?;
     assert!(any_connector_targets(&pool, "sales_orders").await.unwrap());
+    Ok(())
+}
+
+/// `SRC-7` F4: three failed runs in a row walk the badge degraded, degraded,
+/// unhealthy; a success resets the streak and the badge, and keeps the last
+/// failure time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_result_counts_failures_and_a_success_resets_them(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    assert_eq!(REPEATED_FAILURE_STREAK, 3);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let h = record_run_result(&pool, id, false, at).await.unwrap();
+        seen.push((h.health, h.failure_streak));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("degraded".to_owned(), 1),
+            ("degraded".to_owned(), 2),
+            ("unhealthy".to_owned(), 3),
+        ]
+    );
+    let after_fail = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(after_fail.failure_streak, 3);
+    assert!(after_fail.last_run_failure_at.is_some());
+    assert!(after_fail.last_run_success_at.is_none());
+
+    let fourth = record_run_result(&pool, id, false, at).await.unwrap();
+    assert_eq!(fourth.failure_streak, 4);
+    assert_eq!(fourth.health, "unhealthy");
+
+    let ok = record_run_result(&pool, id, true, at).await.unwrap();
+    assert_eq!((ok.health.as_str(), ok.failure_streak), ("healthy", 0));
+    let after_ok = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert!(after_ok.last_run_success_at.is_some());
+    assert_eq!(
+        after_ok.last_run_failure_at, after_fail.last_run_failure_at,
+        "a success must not erase when the last failure happened"
+    );
+    Ok(())
+}
+
+/// An unknown connector id is `NotFound`, and `record_test_result` still
+/// leaves the run facts alone (`SRC-7` task 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_result_refuses_an_unknown_id_and_a_manual_test_leaves_run_facts(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let err = record_run_result(&pool, "conn-nope", false, time::OffsetDateTime::now_utc())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+
+    record_run_result(
+        &pool,
+        "conn-pg-lakehouse",
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    record_test_result(&pool, "conn-pg-lakehouse", true, true, Some(3), "ok")
+        .await
+        .unwrap();
+    let c = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap()
+        .connector;
+    assert_eq!(c.health, "healthy", "a manual Test still sets health");
+    assert_eq!(
+        c.failure_streak, 1,
+        "a manual Test does not touch the streak"
+    );
     Ok(())
 }

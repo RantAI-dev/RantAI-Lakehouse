@@ -14,6 +14,12 @@ export type Connector = {
   lastActivityAt: string | null
   capabilities: string[]
   owner: string
+  /** `null` until the orchestrator has reported a successful run (`SRC-7`). */
+  lastRunSuccessAt: string | null
+  /** `null` until the orchestrator has reported a failed run (`SRC-7`). */
+  lastRunFailureAt: string | null
+  /** Failed runs since the last success; 0 after a success (`SRC-7`). */
+  failureStreak: number
 }
 
 export type ConnectorDependent = {
