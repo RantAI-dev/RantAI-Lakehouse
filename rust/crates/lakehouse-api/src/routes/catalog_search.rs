@@ -28,6 +28,13 @@
 //! punctuation (`custmer_id`) is split like a field, and each part must
 //! match (`DATA-11` review `SHOULD-FIX 1`). The best field per
 //! word counts, and an asset's score is the sum over its words.
+//!
+//! The reason an asset is shown (`matchedOn`) comes from the first word, in
+//! typed order, whose best field is not the name (`DATA-11` review
+//! `SHOULD-FIX 8`): `northwind customer` finds `Northwind Orders` through
+//! its column `customer_id`, and the first word alone (the name) would leave
+//! the reader with no reason. When every word's best field is the name there
+//! is no `matchedOn`: the name is already on screen.
 
 use std::collections::HashMap;
 
@@ -279,8 +286,10 @@ fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
 /// An empty or all-whitespace term returns every asset in input order with
 /// no `matchedOn`. Otherwise only assets matching every word are returned,
 /// ordered by score descending, then use descending, then `id` ascending,
-/// each with `matchedOn` set for the field that scored highest on its first
-/// word (omitted when that field is the name). `usage` is `DATA-11` D4.
+/// each with `matchedOn` set for the best field of the first word, in typed
+/// order, whose best field is not the name (omitted when every word's best
+/// field is the name; `DATA-11` review `SHOULD-FIX 8`). `usage` is
+/// `DATA-11` D4.
 pub fn search(
     assets: &[Value],
     columns: &ColumnIndex,
@@ -297,21 +306,23 @@ pub fn search(
     for asset in assets {
         let cands = candidates(asset, columns);
         let mut total = 0_u32;
-        let mut first = None;
+        let mut reason = None;
         let mut all = true;
-        for (i, word) in words.iter().enumerate() {
+        for word in &words {
             let Some(hit) = best_hit(word, &cands) else {
                 all = false;
                 break;
             };
             total += hit.score;
-            if i == 0 {
-                first = Some(hit);
+            // `DATA-11` review `SHOULD-FIX 8`: not the first word as such but
+            // the first one the name does not already explain.
+            if reason.is_none() && hit.field.reported().is_some() {
+                reason = Some(hit);
             }
         }
         if all {
             let used = usage.get(text_of(asset, "id")).copied().unwrap_or(0);
-            ranked.push((total, used, asset, first));
+            ranked.push((total, used, asset, reason));
         }
     }
     ranked.sort_by(|a, b| {
@@ -683,8 +694,14 @@ mod tests {
         assert!(find(&assets, "nine").is_empty());
     }
 
+    // `DATA-11` review `SHOULD-FIX 8` changed this test (rule 2: the rule it
+    // pinned was wrong, not the code). The reason used to come from the first
+    // word even when that word matched the name, which left a result found
+    // through its second word with no reason. It now comes from the first
+    // word whose best field is not the name; with two non-name words the
+    // typed order still decides, as before.
     #[test]
-    fn the_reason_comes_from_the_first_word() {
+    fn the_reason_comes_from_the_first_word_the_name_does_not_explain() {
         let assets = vec![json!({
             "id": "a", "name": "Plain", "tags": ["finance"], "owner": "Ops"
         })];
@@ -692,6 +709,35 @@ mod tests {
         assert_eq!(hits[0]["matchedOn"]["field"], "tag");
         let hits = find(&assets, "ops finance");
         assert_eq!(hits[0]["matchedOn"]["field"], "owner");
+    }
+
+    // `DATA-11` review `SHOULD-FIX 8`.
+    #[test]
+    fn a_result_found_through_its_second_word_shows_that_word_as_the_reason() {
+        let mut columns = ColumnIndex::new();
+        columns.insert(
+            "bronze.northwind_orders".to_owned(),
+            vec![("customer_id".to_owned(), String::new())],
+        );
+        let assets = vec![json!({
+            "id": "bronze.northwind_orders", "name": "Northwind Orders"
+        })];
+        let hits = search(&assets, &columns, &UsageIndex::new(), "northwind customer");
+        assert_eq!(
+            hits[0]["matchedOn"],
+            json!({ "field": "column", "value": "customer_id", "approximate": false })
+        );
+    }
+
+    // `DATA-11` review `SHOULD-FIX 8`: every word explained by the name.
+    #[test]
+    fn no_reason_is_shown_when_every_word_matches_the_name() {
+        let assets = vec![json!({
+            "id": "bronze.northwind_customers", "name": "Northwind Customers"
+        })];
+        let hits = find(&assets, "northwind customer");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].get("matchedOn").is_none());
     }
 
     #[test]

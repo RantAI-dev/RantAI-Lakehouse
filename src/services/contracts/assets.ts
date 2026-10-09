@@ -80,7 +80,9 @@ export type Asset = {
   tags?: string[]
   /**
    * Why a search returned this asset (`DATA-11`): present only on a result
-   * of a search with a term, and absent when the asset matched by its name.
+   * of a search with a term, and absent when every word matched the name.
+   * With several words it explains the first word, in typed order, that the
+   * name does not (`DATA-11` review `SHOULD-FIX 8`).
    * `field` is `"id"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
    * `"description"` or `"columnDescription"`; `value` is the tag or column
    * name and `""` for the rest; `approximate` is true when the match
