@@ -357,6 +357,16 @@ describe("Activity tab", () => {
     expect(decodeURIComponent(href)).toContain("iceberg_snapshot_id+=+248842615326512766")
   })
 
+  it("says how far back versions go from the list itself, with no day count (DATA-16 D2)", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs()
+
+    await screen.findByText("append")
+    expect(screen.getByText(/1 version, from /)).toBeTruthy()
+    expect(screen.queryByText(/\bdays?\b/i)).toBeNull()
+  })
+
   it("says a ClickHouse table keeps no snapshots, rather than that it has none", () => {
     stubApi()
     url.search = "tab=activity"
