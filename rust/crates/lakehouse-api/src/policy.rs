@@ -192,6 +192,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    permission string, no grant migration (WS2 plan review W8). ─────
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
+    // DATA-12 D1: the certified / deprecated mark is its own write, behind
+    // `governance:write`, so a `catalog:write` holder who edits the details
+    // cannot vouch for a table.
+    ("PUT", "/api/catalog/{id}/certification", Policy::RequiresPermission("governance:write")),
 
     // ── Semantic layer (AI-16): plain-words descriptions of tables and
     //    columns, read by the Copilot's DATA MAP. The same two permissions
@@ -737,6 +741,16 @@ pub async fn auth_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DATA-12` D1: the certified / deprecated mark is gated by
+    /// `governance:write`, not by the `catalog:write` of the details.
+    #[test]
+    fn the_certification_write_needs_governance_write() {
+        assert_eq!(
+            policy_for("PUT", "/api/catalog/{id}/certification"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
 
     #[test]
     fn health_is_public() {

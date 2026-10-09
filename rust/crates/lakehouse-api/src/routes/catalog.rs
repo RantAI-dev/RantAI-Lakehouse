@@ -2655,6 +2655,213 @@ fn changed_annotation_fields(
     changed
 }
 
+// ── PUT /api/catalog/{id}/certification (DATA-12 part 1) ───────────────
+
+/// Body of `PUT /api/catalog/{id}/certification`. `status` has no default
+/// on purpose: a body without it must not read as "clear the mark", so the
+/// field is required and `null` is the explicit way to clear.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificationBody {
+    status: Value,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    replacement_asset_id: Option<String>,
+}
+
+const CERTIFICATION_NOTE_MAX_LEN: usize = 1000;
+const CERTIFIED_BY_MAX_LEN: usize = 128;
+
+/// A trimmed text field, with blank read as absent.
+fn trimmed_or_none(value: Option<&String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// The body of [`put_certification`] after the checks that need no store:
+/// `status` is `None` to clear the mark.
+#[derive(Debug, PartialEq, Eq)]
+struct CertificationChange {
+    status: Option<&'static str>,
+    note: Option<String>,
+    replacement_asset_id: Option<String>,
+}
+
+/// Validates the shape of a certification body against the asset it is
+/// for. The checks that need the catalog or the store (does the replacement
+/// exist, is it deprecated) run after this, in the handler.
+///
+/// # Errors
+/// [`ApiError::BadRequest`] with a fixed sentence for an unknown status, a
+/// note or replacement without `deprecated`, a note over 1000 characters,
+/// a replacement over 200 characters, or a replacement equal to `id`.
+fn validate_certification(
+    id: &str,
+    body: &CertificationBody,
+) -> Result<CertificationChange, ApiError> {
+    let status = match &body.status {
+        Value::Null => None,
+        Value::String(s) if s == "certified" => Some("certified"),
+        Value::String(s) if s == "deprecated" => Some("deprecated"),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "status must be \"certified\", \"deprecated\" or null".to_owned(),
+            ));
+        }
+    };
+    let note = trimmed_or_none(body.note.as_ref());
+    let replacement = trimmed_or_none(body.replacement_asset_id.as_ref());
+    if status != Some("deprecated") && (note.is_some() || replacement.is_some()) {
+        return Err(ApiError::BadRequest(
+            "a note or a replacement is allowed only with the deprecated mark".to_owned(),
+        ));
+    }
+    if note
+        .as_ref()
+        .is_some_and(|n| n.chars().count() > CERTIFICATION_NOTE_MAX_LEN)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "note must be at most {CERTIFICATION_NOTE_MAX_LEN} characters"
+        )));
+    }
+    if replacement
+        .as_ref()
+        .is_some_and(|r| r.chars().count() > ANNOTATION_ID_MAX_LEN)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "replacementAssetId must be at most {ANNOTATION_ID_MAX_LEN} characters"
+        )));
+    }
+    if replacement.as_deref() == Some(id) {
+        return Err(ApiError::BadRequest(
+            "a table cannot be its own replacement".to_owned(),
+        ));
+    }
+    Ok(CertificationChange {
+        status,
+        note,
+        replacement_asset_id: replacement,
+    })
+}
+
+/// `PUT /api/catalog/{id}/certification` — mark an asset certified or
+/// deprecated, or clear the mark with `"status": null` (`DATA-12` D1).
+/// Needs `governance:write` (`POLICY_TABLE`), not the `catalog:write` that
+/// edits the details: who may vouch for a table is a governance decision.
+///
+/// # Errors
+/// The tenant gate runs first and answers [`ApiError::PermissionDenied`]
+/// (`403`) with a fixed reason, exactly as [`put_annotation`] does, before
+/// the body is read and with nothing written. Then `400` with a fixed
+/// sentence for each refusal of [`validate_certification`], for a
+/// replacement that is not an asset in the catalog, and for a replacement
+/// that is itself deprecated. [`ApiError::Unavailable`] without a Postgres
+/// pool, or when the catalog cannot be read to check a replacement (fail
+/// closed: an unchecked replacement is not stored). A classified
+/// [`lakehouse_store::StoreError`] on any database failure.
+pub async fn put_certification(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    validate_annotation_id(&id)?;
+    let parsed: CertificationBody = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::BadRequest("body must be JSON with a \"status\" field".to_owned())
+    })?;
+    let change = validate_certification(&id, &parsed)?;
+    let pool = annotation_pool(&state)?;
+    if let Some(replacement) = change.replacement_asset_id.as_deref() {
+        // The search copy is the catalog's asset list without a rebuild per
+        // write; a failed read refuses rather than storing an unchecked id.
+        let snapshot = search_snapshot(&state).await.map_err(|err| {
+            tracing::warn!(%err, "catalog read failed while checking a replacement");
+            ApiError::Unavailable("the catalog could not be read to check the replacement".to_owned())
+        })?;
+        let exists = snapshot
+            .assets
+            .iter()
+            .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
+        if !exists {
+            return Err(ApiError::BadRequest(
+                "the replacement is not an asset in the catalog".to_owned(),
+            )
+            .into());
+        }
+        let replacement_row = lakehouse_store::annotation::get_annotation(pool, replacement).await?;
+        if replacement_row.is_some_and(|r| r.certification.as_deref() == Some("deprecated")) {
+            return Err(ApiError::BadRequest(
+                "the replacement is itself deprecated".to_owned(),
+            )
+            .into());
+        }
+    }
+    let before = lakehouse_store::annotation::get_annotation(pool, &id)
+        .await?
+        .and_then(|r| r.certification);
+    let (action, args) = match change.status {
+        Some(status) => {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.clone(),
+                    status: status.to_owned(),
+                    note: change.note.clone(),
+                    replacement_asset_id: change.replacement_asset_id.clone(),
+                    certified_by: principal
+                        .display_name
+                        .chars()
+                        .take(CERTIFIED_BY_MAX_LEN)
+                        .collect(),
+                },
+            )
+            .await?;
+            if status == "deprecated" {
+                (
+                    Some("catalog.deprecate"),
+                    json!({ "note": change.note, "replacementAssetId": change.replacement_asset_id }),
+                )
+            } else {
+                (Some("catalog.certify"), json!({}))
+            }
+        }
+        None => {
+            lakehouse_store::annotation::clear_certification(pool, &id).await?;
+            // Clearing an asset that had no mark changed nothing and records
+            // nothing, as a details save that changes nothing does.
+            (
+                before.as_ref().map(|_| "catalog.uncertify"),
+                json!({ "was": before }),
+            )
+        }
+    };
+    state.catalog_search_cache.invalidate().await;
+    if let Some(action) = action {
+        let _ = lakehouse_store::audit::insert(
+            pool,
+            lakehouse_store::audit::NewAuditEvent {
+                principal_id: Some(principal.id.uuid().to_string()),
+                principal_kind: Some("user".to_owned()),
+                actor_label: Some(principal.display_name.clone()),
+                action: action.to_owned(),
+                resource_kind: Some("catalog".to_owned()),
+                resource_id: Some(id),
+                args: Some(args),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    Ok(ApiJson(json!({ "ok": true })))
+}
+
 // ── POST /api/catalog/{id}/access-request (WS7 item E2) ────────────────
 
 /// `{permission, reason}` — the `POST /api/catalog/{id}/access-request`
@@ -4086,6 +4293,173 @@ mod tests {
             };
             assert_eq!(body, json!({ "ok": true }));
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
+        }
+
+        // ── DATA-12 part 1: PUT /api/catalog/{id}/certification ──────
+
+        async fn put_mark(
+            state: &AppState,
+            principal: Principal,
+            id: &str,
+            body: &str,
+        ) -> Result<(), (StatusCode, String)> {
+            let result = put_certification(
+                State(state.clone()),
+                Path(id.to_owned()),
+                Extension(principal),
+                HeaderMap::new(),
+                Bytes::copy_from_slice(body.as_bytes()),
+            )
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(rejection) => {
+                    let (status, body) = response_json(rejection.into_response()).await;
+                    Err((status, body["error"].as_str().unwrap_or_default().to_owned()))
+                }
+            }
+        }
+
+        fn governor(tenant: &str) -> Principal {
+            principal(&[tenant.parse().unwrap()], "governance:write")
+        }
+
+        /// Puts a search copy in the cache that lists `ids` as assets, so a
+        /// replacement can be checked without a catalog behind the mock.
+        async fn prime_search_copy_with(state: &AppState, ids: &[&str]) {
+            let mut copy = empty_copy();
+            copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    Ok::<_, String>(copy)
+                })
+                .await
+                .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn each_certification_refusal_has_its_sentence_and_writes_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y", "serving.old"])
+                .await;
+            // A deprecated asset, to be refused as a replacement.
+            put_mark(&state, governor(TENANT_A), "serving.old", r#"{"status":"deprecated"}"#)
+                .await
+                .unwrap();
+            let long_note = format!(r#"{{"status":"deprecated","note":"{}"}}"#, "a".repeat(1001));
+            let cases: [(&str, &str); 7] = [
+                (r#"{"status":"trusted"}"#, "status must be"),
+                (r#"{"status":"certified","note":"x"}"#, "only with the deprecated mark"),
+                (r#"{"status":null,"replacementAssetId":"serving.mart_y"}"#, "only with the deprecated mark"),
+                (long_note.as_str(), "note must be at most 1000 characters"),
+                (r#"{"status":"deprecated","replacementAssetId":"serving.mart_x"}"#, "its own replacement"),
+                (r#"{"status":"deprecated","replacementAssetId":"serving.nope"}"#, "not an asset in the catalog"),
+                (r#"{"status":"deprecated","replacementAssetId":"serving.old"}"#, "itself deprecated"),
+            ];
+            for (body, sentence) in cases {
+                let err = put_mark(&state, governor(TENANT_A), "serving.mart_x", body)
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.0, StatusCode::BAD_REQUEST, "{body}");
+                assert!(err.1.contains(sentence), "{body}: {}", err.1);
+            }
+            assert_eq!(
+                annotation_rows(&pool, "serving.mart_x").await,
+                0,
+                "a refused write must leave no row"
+            );
+            // A body without `status` is not a clear.
+            let err = put_mark(&state, governor(TENANT_A), "serving.mart_x", r"{}")
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_member_certifies_with_their_display_name_and_clears_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":"certified"}"#)
+                .await
+                .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification.as_deref(), Some("certified"));
+            assert_eq!(row.certified_by.as_deref(), Some("Test Principal"));
+            assert!(row.certified_at.is_some());
+
+            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":null}"#)
+                .await
+                .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification, None);
+            assert_eq!(row.certified_by, None);
+            assert_eq!(row.certified_at, None);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecation_stores_its_note_and_replacement(pool: lakehouse_store::PgPool) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y"]).await;
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"deprecated","note":" Superseded ","replacementAssetId":"serving.mart_y"}"#,
+            )
+            .await
+            .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification.as_deref(), Some("deprecated"));
+            assert_eq!(row.certification_note.as_deref(), Some("Superseded"));
+            assert_eq!(row.replacement_asset_id.as_deref(), Some("serving.mart_y"));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_certification_tenant_refusal_is_403_and_writes_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let err = put_mark(&state, governor(TENANT_B), "serving.mart_x", r#"{"status":"certified"}"#)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert!(err.1.contains("CATALOG_TENANT_ID"), "{}", err.1);
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_certification_write_drops_the_search_copy_and_a_refusal_keeps_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            prime_search_copy(&state).await;
+            put_mark(&state, governor(TENANT_B), "serving.mart_x", r#"{"status":"certified"}"#)
+                .await
+                .unwrap_err();
+            assert!(
+                !next_read_rebuilds(&state).await,
+                "a refused write must not drop the copy"
+            );
+            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":"certified"}"#)
+                .await
+                .unwrap();
+            assert!(
+                next_read_rebuilds(&state).await,
+                "a mark must drop the copy so a search shows it at once"
+            );
         }
 
         fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
