@@ -130,5 +130,38 @@ then `bun run typecheck && bun run lint && bun run test` in full.
 
 ## Review
 
+### Reviewed 2026-10-09 at `76fc39e`
 
-*(planner)*
+No `BLOCKER`, no `SHOULD-FIX`.
+
+**The plan was wrong in one place, and the developer was right.** Section 3
+asked each assistant tool to check the caller and return a fixed sentence.
+The tools already declare a required permission (`ToolSpec.permission`,
+`routes/ai/registry.rs`), enforced by `gate::decide` for the chat and `POST
+/api/ai/tool`, and by the employee permission check in `routes/agents.rs`
+for a Digital Employee's run. Declaring `governance:write` on the two tools
+is the fix; a second check would have been a duplicated guard (rule 4). The
+refusal text is the gate's own.
+
+**Checked and correct.**
+- `POST /api/governance/{kind}` is `RequiresPermission("governance:write")`;
+  `GET` is unchanged. The new `route_auth` test posts valid bodies for all
+  three kinds without the permission and asserts 403 and unchanged row
+  counts.
+- The developer's worry about scheduled runs does not hold: the headless
+  loop refuses a tool whose `spec.permission` the employee lacks before it
+  reaches `run_tool`.
+- Two registry tests that pinned the old open behaviour were changed to the
+  new one, with the reason in the commit. `tool_schemas.json` is untouched.
+- The four console buttons follow the Edit and Delete buttons beside them.
+  No residency add button exists.
+
+**Verification, by the planner, at `76fc39e`.** After `touch` of the crate
+sources: `cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api
+--all-targets -- -D warnings` clean in 1m07s. `bun run typecheck` exit 0;
+`bun run lint` 0 errors, 6 warnings, none in a changed file; `bun run test`
+920 pass, 1 skip, 0 fail, 921 tests in 102 files.
+
+**Not verified.** No Rust test has been run locally; CI runs them first, and
+the pull request does not merge before they pass. Nothing was tried in a
+browser.
