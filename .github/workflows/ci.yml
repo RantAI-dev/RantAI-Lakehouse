@@ -1115,6 +1115,8 @@ jobs:
       - g6-ingest
       - gold-export
       - g8-governance
+      - images
+      - image-smoke
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -1149,4 +1151,6 @@ jobs:
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
+          IMAGES_RESULT: ${{ needs.images.result }}
+          IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh

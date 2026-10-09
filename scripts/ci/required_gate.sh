@@ -31,6 +31,8 @@
 #   G6_INGEST_RESULT      result of `g6-ingest` job
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
+#   IMAGES_RESULT         result of `images` job (builds the shared images)
+#   IMAGE_SMOKE_RESULT    result of `image-smoke` job (/health on the API image)
 set -euo pipefail
 
 run_gate() {
@@ -133,6 +135,15 @@ run_gate() {
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
+
+  # Shared images and their smoke test. Required exactly when the acceptance
+  # jobs are: `images` has the same `if:` as they do and is what they consume.
+  # This is also what keeps the gate red when `images` fails. Every job that
+  # `needs: images` is then SKIPPED, not failed, and a skip alone would read
+  # as "not required"; but each of them is required here, so a skip is an
+  # error on its own, and `images` failing is reported by name as well.
+  check_job "images" "${IMAGES_RESULT:-skipped}" "$req_acceptance"
+  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_acceptance"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."
