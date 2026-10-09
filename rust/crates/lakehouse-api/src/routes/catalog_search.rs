@@ -24,7 +24,9 @@
 //! words are used. Every word must match the asset somewhere, in any order.
 //! A word matches a field when the field contains it (exact) or, for a word
 //! of [`MIN_APPROX_CHARS`] or more characters, when one token of the field
-//! is one edit away from it (approximate; `DATA-11` D3). The best field per
+//! is one edit away from it (approximate; `DATA-11` D3). A typed word with
+//! punctuation (`custmer_id`) is split like a field, and each part must
+//! match (`DATA-11` review `SHOULD-FIX 1`). The best field per
 //! word counts, and an asset's score is the sum over its words.
 
 use std::collections::HashMap;
@@ -203,8 +205,36 @@ fn within_one_edit(a: &[char], b: &[char]) -> bool {
         && short[first + 2..] == long[first + 2..]
 }
 
-fn best_hit(word: &str, word_chars: &[char], candidates: &[Candidate]) -> Option<Hit> {
-    let may_approximate = word_chars.len() >= MIN_APPROX_CHARS;
+/// Whether `word`, not contained in `field` as typed, matches it
+/// approximately.
+///
+/// `DATA-11` review `SHOULD-FIX 1`: the typed word is split the way fields are
+/// (`tokens`), because a field's tokens never hold punctuation, so
+/// `custmer_id` could never be one edit from a token of `customer_id`. Every
+/// token of the word must be contained in the field or, at
+/// `MIN_APPROX_CHARS` characters or more, one edit from one of its tokens. A
+/// word with no letter or digit has no token and matches nothing.
+fn approximately_in(word: &str, field: &str) -> bool {
+    let mut any = false;
+    for part in tokens(word) {
+        any = true;
+        if field.contains(part) {
+            continue;
+        }
+        let part_chars: Vec<char> = part.chars().collect();
+        if part_chars.len() < MIN_APPROX_CHARS
+            || !tokens(field).any(|t| {
+                let t: Vec<char> = t.chars().collect();
+                within_one_edit(&t, &part_chars)
+            })
+        {
+            return false;
+        }
+    }
+    any
+}
+
+fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
     let mut best: Option<Hit> = None;
     for c in candidates {
         let (score, approximate) = if c.lower.contains(word) {
@@ -217,12 +247,7 @@ fn best_hit(word: &str, word_chars: &[char], candidates: &[Candidate]) -> Option
                 },
                 false,
             )
-        } else if may_approximate
-            && tokens(&c.lower).any(|t| {
-                let t: Vec<char> = t.chars().collect();
-                within_one_edit(&t, word_chars)
-            })
-        {
+        } else if approximately_in(word, &c.lower) {
             (c.field.weights().1, true)
         } else {
             continue;
@@ -258,7 +283,6 @@ pub fn search(
     if words.is_empty() {
         return assets.to_vec();
     }
-    let word_chars: Vec<Vec<char>> = words.iter().map(|w| w.chars().collect()).collect();
 
     let mut ranked: Vec<(u32, u32, &Value, Option<Hit>)> = Vec::new();
     for asset in assets {
@@ -266,8 +290,8 @@ pub fn search(
         let mut total = 0_u32;
         let mut first = None;
         let mut all = true;
-        for (i, (word, chars)) in words.iter().zip(&word_chars).enumerate() {
-            let Some(hit) = best_hit(word, chars, &cands) else {
+        for (i, word) in words.iter().enumerate() {
+            let Some(hit) = best_hit(word, &cands) else {
                 all = false;
                 break;
             };
@@ -484,6 +508,31 @@ mod tests {
         // must not be matched approximately against "rev".
         assert!(find(&assets, "rvn").is_empty());
         assert!(find(&assets, "ravanue").is_empty());
+    }
+
+    #[test]
+    fn a_typo_in_a_word_with_punctuation_finds_the_column_or_table() {
+        // DATA-11 review SHOULD-FIX 1: the word is split like the field.
+        let assets = vec![
+            json!({ "id": "silver.orders", "name": "Orders" }),
+            json!({ "id": "silver.other", "name": "Other" }),
+        ];
+        let columns: ColumnIndex = [(
+            "silver.other".to_owned(),
+            vec![("customer_id".to_owned(), String::new())],
+        )]
+        .into();
+        let hit = search(&assets, &columns, &UsageIndex::new(), "custmer_id");
+        assert_eq!(ids(&hit), ["silver.other"]);
+        assert_eq!(
+            hit[0]["matchedOn"],
+            json!({ "field": "column", "value": "customer_id", "approximate": true })
+        );
+        assert_eq!(find(&assets, "silver.ordrs").len(), 1);
+        // `xx` is under 4 characters and is not in the column: no match.
+        assert!(search(&assets, &columns, &UsageIndex::new(), "custmer_xx").is_empty());
+        // No letter or digit: nothing to match.
+        assert!(find(&assets, "___").is_empty());
     }
 
     #[test]
