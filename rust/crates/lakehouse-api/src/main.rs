@@ -10,6 +10,7 @@
 mod auth;
 mod bounded;
 mod bronze_stats_cache;
+mod catalog_search_cache;
 mod config;
 mod connector_deprovision;
 mod connector_discover;

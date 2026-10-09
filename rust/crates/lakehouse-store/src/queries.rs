@@ -181,6 +181,35 @@ pub async fn history_mentioning(
     Ok(rows)
 }
 
+/// The SQL text of the newest `limit` queries run in the last `days` days,
+/// by anyone, newest first.
+///
+/// For the catalog's use ranking (`DATA-11` D4): one read per rebuild of
+/// the search copy, parsed once in the API, in place of one
+/// [`history_mentioning`] per asset. Text only: the ranking needs which
+/// tables a query reads, never who ran it, so no user, owner or status
+/// leaves this function.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn history_recent(
+    pool: &PgPool,
+    days: i32,
+    limit: i64,
+) -> Result<Vec<String>, StoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT sql FROM query_history \
+         WHERE at >= now() - make_interval(days => $1) \
+         ORDER BY at DESC LIMIT $2",
+    )
+    .bind(days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(sql,)| sql).collect())
+}
+
 /// Insert a new saved query. New for the AI Copilot's `save_query` tool
 /// (T1.4 of the copilot-operations-handover plan) — `SavedQuery` had no
 /// writer anywhere in the `QueryService` contract before this (see the
