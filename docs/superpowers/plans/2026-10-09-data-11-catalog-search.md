@@ -560,3 +560,37 @@ file; `bun run test` 928 pass, 1 skip, 0 fail, 929 tests in 102 files.
 page, acceptance rows 1 to 12) and signs or changes decisions 1 to 8; `main`
 is merged into the branch; then the planner pushes and opens the pull
 request, and CI gives the Rust tests their first run.
+
+### First run on a live stack, by the planner, 2026-10-09 at `3f3e663`
+
+A separate API (own port, own empty Postgres database, the dev stack's
+ClickHouse) and console were started from this branch; nothing shared was
+rebuilt. Catalog of 29 assets.
+
+**Now verified.** The two column queries run. `GET /api/catalog?q=id`
+answered in 60 ms on the first search (copy built) and 12 ms on the second.
+`custmer_id` finds the tables with a `customer_id` column, marked
+approximate; two words in either order match; words matching nothing return
+an empty list; a tag saved with `PUT …/annotation` is found by the next
+search; the `tags` filter with `iLike` returns the tagged table; `tags` as a
+sort is a 400. In a headless browser: the Data Explorer shows the reason
+line and the Owner and Tags columns, and the ⌘K box lists a table found
+only by its tag. These are 29 assets, not 10,000: D1 is still not measured.
+
+Two more `SHOULD-FIX` from that run. With 4 and 5 above they are fixed now,
+before the product owner's check.
+
+**SHOULD-FIX 6. "See all results" is listed above the tables in the ⌘K
+box.** `cmdk` orders items by its own score and the row's `value` holds the
+typed text. *Fix:* the row is the last entry of the "Catalog assets" group
+whatever is typed (for example its own group after the assets, or a `value`
+that cannot outrank them); test the order.
+
+**SHOULD-FIX 7. The Data Explorer scrolls sideways at 1500 px.** With the
+two new columns the table is wider than the page beside the open sidebar;
+Size is cut off. The thresholds (`tags` under 1400, `owner` under 1280) were
+chosen without the sidebar. *Fix:* choose them so the table fits without a
+sideways scroll at 1280, 1440 and 1536 px with the sidebar open, hiding Tags
+first, then Owner; cap the Owner cell's width with a truncation and the full
+value as its title, as the Name cell does.
+
