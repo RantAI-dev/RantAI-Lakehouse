@@ -7,7 +7,7 @@
 | Who builds it | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | In build. Feature page [`load-failure-alerts.md`](../features/load-failure-alerts.md), decisions signed 2026-10-09; plan `docs/superpowers/plans/2026-10-08-src-7-load-failure-alerts.md` |
 
 ## Why
 

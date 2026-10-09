@@ -7,7 +7,7 @@
 | Who builds it | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | In build. Feature page [`source-schema-changes.md`](../features/source-schema-changes.md), decisions signed 2026-10-09 (3, 9 and 10 changed by a measurement and waiting); plan `docs/superpowers/plans/2026-10-09-src-8-source-schema-changes.md` |
 
 ## Why
 
