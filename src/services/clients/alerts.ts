@@ -1,5 +1,6 @@
 import type {
   AlertRule,
+  AlertsStatus,
   AlertRuleService,
   AlertRunResult,
   SaveAlertRuleInput,
@@ -50,6 +51,13 @@ export const clickhouseAlertRuleService: AlertRuleService = {
       "Alert rules could not be loaded"
     );
     return json.rules;
+  },
+  async getStatus(signal) {
+    return request<AlertsStatus>(
+      "/api/alerts/status",
+      { cache: "no-store", signal },
+      "Run alert status could not be loaded"
+    );
   },
   async createRule(input, signal) {
     const json = await request<{ ok: true; rule: AlertRule }>(
