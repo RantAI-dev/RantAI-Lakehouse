@@ -433,6 +433,65 @@ Choices the plan did not spell out:
   prop left the tests passing, removing the group-level one too made two fail,
   so the group-level `forceMount` is what the tests pin.
 
+### Review fixes SHOULD-FIX 4 to 7, developer, 2026-10-09
+
+Commits on `feat/data-11-catalog-search`, one per finding (none pushed):
+
+- `f8c8c90` fix(console): the Cmd+K box tells a refusal and a catalog reason from an outage (SHOULD-FIX 4)
+- `796bd5e` fix(api): a search word whose parts all match exactly is not marked approximate (SHOULD-FIX 5)
+- `f0e3fc2` fix(console): "See all results" stays after the tables in the Cmd+K box (SHOULD-FIX 6)
+- `0dd2b2e` fix(console): the Data Explorer fits beside the open sidebar at 1280 to 1536 px (SHOULD-FIX 7)
+
+Commands run:
+
+- Rust, from `rust/` with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target
+  CARGO_BUILD_JOBS=2` (`df -h /` first: 49G free), after `touch
+  rust/crates/*/src/lib.rs rust/crates/lakehouse-store/src/*.rs`: the first
+  `cargo fmt --check` failed on one `assert!` in my new test; I formatted that
+  hunk by hand. Then `cargo fmt --check` exit 0 and `cargo clippy -p
+  lakehouse-api -p lakehouse-store --all-targets -- -D warnings` finished clean
+  (1m 17s), both after the last Rust edit.
+- TypeScript, worktree root, on the final code commit: `bun run typecheck`
+  exit 0; `bun run lint` 0 errors, 6 warnings (same as before, none in a
+  touched file); `bun run test` 932 pass, 1 skip, 0 fail, 933 tests in 102
+  files. New tests: 2 in `command-palette.test.tsx` for 4, 1 for 6 (red before
+  the fix: See all results was row 0), 1 in `data-explorer-columns.test.tsx`
+  for 7.
+
+Notes:
+
+- 4: `loadCatalog` now throws `errorFor(res.status, ...)` (the helper the other
+  methods of the file use), so a `403` is `permission_denied`. A `supported:
+  false` answer to a search (the contract has no field for it on
+  `listAssets`) is thrown as `ServiceError("unavailable", reason, 200)`; the
+  palette shows the message only when the status is `200` (no failed request
+  has it), so upstream error text still never reaches the box. Only a search
+  throws; `listNamespaces` and the unsearched lists keep reading the empty
+  answer. This status-200 marker is a choice the review did not spell out.
+- 5: `approximately_in` returns `Option<bool>`; the weight is the approximate
+  one either way. The test orders `silver.exact` (column `id_customer`) before
+  `silver.swapped` (`customer_id`, `approximate: false`); `custmer_id` stays
+  `approximate: true` (also pinned by the older SHOULD-FIX 1 test).
+- 6: `cmdk` 1.1.1 scores each row's `value` against the typed text and
+  reorders; the row's value is now one arrow character (no letter or digit, so
+  it scores zero for any word) and stays last on equal scores.
+- 7: the page measures the window (`useWindowWidth`), not the table's
+  container; the mechanism is unchanged. Tags now shows from 1760 px (was
+  1400) and Owner from 1500 px (was 1280). The figures are estimates from the
+  column caps (Owner 10rem, Tags 14rem) and the comment's existing
+  window-minus-296px rule, with ~55 px to spare.
+
+*Not verified:*
+
+- Every Rust test (no `cargo test` here); the new test is type-checked by
+  clippy only. First run is CI's.
+- SHOULD-FIX 7 in a browser: no width was opened at 1280, 1440 or 1536 px. The
+  thresholds are not measured, and a table with long names, many tags or
+  other data could still be wider than estimated.
+- SHOULD-FIX 4 and 6 against the real API and a real browser: tested only with
+  `happy-dom` and a stubbed `fetch`.
+- The workspace-wide Rust block and the Python lines.
+
 ## Review
 
 ### Rust slice (R1–R5), reviewed 2026-10-09 at `4b61231`
