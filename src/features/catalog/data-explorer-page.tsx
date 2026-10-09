@@ -82,6 +82,8 @@ const QUICK_LAYERS: DataLayer[] = ["raw", "bronze", "silver", "gold"]
 
 /** Column labels, for telling the user which ones the window is too narrow for. */
 const WIDTH_HIDDEN_LABEL: Record<string, string> = {
+  tags: "Tags",
+  owner: "Owner",
   sizeBytes: "Size",
   freshnessLagSeconds: "Freshness",
   type: "Type",
@@ -155,8 +157,8 @@ export function DataExplorerPage() {
   // the sidebar and navbar with it and clips the last columns outright),
   // leave out the columns that earn their width least as space runs out.
   //
-  // Order of sacrifice, least useful first: Size (nice to know) →
-  // Freshness (also shown on the detail page) → Type (largely implied by
+  // Order of sacrifice, least useful first: Tags and Owner (DATA-11; both
+  // are on the detail page) → Size (nice to know) → Freshness (also shown on the detail page) → Type (largely implied by
   // Layer). Name, Namespace, Tier and the actions menu always stay.
   //
   // These are removed from the column list rather than toggled through
@@ -169,6 +171,10 @@ export function DataExplorerPage() {
     // table and then trimming reads better than the reverse.
     if (width === null) return []
     const hidden: string[] = []
+    // Tags and Owner (DATA-11) are the widest new columns and go first;
+    // they stay filterable only while shown, like Type and Layer below.
+    if (width < 1400) hidden.push("tags")
+    if (width < 1280) hidden.push("owner")
     if (width < 1280) hidden.push("sizeBytes")
     if (width < 1100) hidden.push("freshnessLagSeconds")
     if (width < 950) hidden.push("type")
@@ -300,7 +306,7 @@ export function DataExplorerPage() {
             onRefresh={() => void refetch()}
             exportName="Data Explorer"
           >
-            <DataTableSearch placeholder="Search assets by name, namespace, or owner…" />
+            <DataTableSearch placeholder="Search by name, column, tag, description or owner…" />
           </DataTableAdvancedToolbar>
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
             <div className="flex flex-wrap items-center gap-1">
