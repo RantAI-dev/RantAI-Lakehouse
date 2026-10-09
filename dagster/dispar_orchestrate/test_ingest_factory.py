@@ -46,6 +46,74 @@ def _no_catalog_registration(monkeypatch):
     monkeypatch.setattr(f.connector_catalog, "register_connector_table", lambda *a, **k: 0)
 
 
+class _FakeColumn:
+    def __init__(self, name: str, type_name: str, nullable: bool = True) -> None:
+        self.name, self.type, self.nullable = name, type_name, nullable
+
+    def __str__(self) -> str:  # `str(column.type)` is the database's spelling
+        return self.type
+
+
+class _FakeTable:
+    """What `sql_database` hands a `table_adapter_callback`: a reflected
+    SQLAlchemy `Table`, reduced to what `schema_observer` reads."""
+
+    def __init__(self, columns=(("id", "INTEGER", False), ("note", "VARCHAR(40)", True)), key=("id",)) -> None:
+        self._columns = [_FakeColumn(n, _FakeType(t), nullable) for n, t, nullable in columns]
+        self.columns = self._columns
+        by_name = {c.name: c for c in self._columns}
+        self.primary_key = type("PK", (), {"columns": [by_name[k] for k in key]})()
+
+
+class _FakeType:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _reflect(callback, table=None) -> None:
+    """What a real `sql_database` build does: reflect, and hand the table to
+    the callback (SRC-8). A fake source builder calls this."""
+    if callback is not None:
+        callback(table or _FakeTable())
+
+
+@pytest.fixture(autouse=True)
+def observations(monkeypatch):
+    """Every test here runs with an API that answers `load` for every
+    schema observation (SRC-8) and records what was asked. A test of the
+    observation itself replaces the answer through `observations.answer`."""
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import schema_observer
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.answer = schema_observer.Decision(action="load", columns=None, changes=[])
+
+    recorder = Recorder()
+
+    def fake_post(cfg, connector_id, object_name, columns, primary_key, phase, run_id):
+        recorder.calls.append(
+            {
+                "connector_id": connector_id,
+                "object": object_name,
+                "columns": list(columns),
+                "primary_key": list(primary_key),
+                "phase": phase,
+                "run_id": run_id,
+            }
+        )
+        if isinstance(recorder.answer, Exception):
+            raise recorder.answer
+        return recorder.answer
+
+    monkeypatch.setattr(f.schema_observer, "post_observation", fake_post)
+    return recorder
+
+
 UNTIL = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
 
 
@@ -168,7 +236,8 @@ def test_run_one_object_resolves_secrets_via_the_allowlisted_resolver(monkeypatc
                 (),
                 {
                     "build_source": staticmethod(
-                        lambda dial, secrets, objs: calls.append(secrets)
+                        lambda dial, secrets, objs, table_adapter_callback=None: calls.append(secrets)
+                        or _reflect(table_adapter_callback)
                         or type("R", (), {"source": iter(()), "resolved": None})()
                     )
                 },
@@ -228,7 +297,7 @@ def test_run_one_object_records_failed_and_reraises_on_any_other_exception(monke
                 (),
                 {
                     "build_source": staticmethod(
-                        lambda dial, secrets, objs: (_ for _ in ()).throw(
+                        lambda dial, secrets, objs, table_adapter_callback=None: (_ for _ in ()).throw(
                             ConnectionError("db.internal:5432 refused")
                         )
                     )
@@ -278,7 +347,7 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
 
     plans = []
 
-    def fake_run_bronze_ingest(cfg, plan):
+    def fake_run_bronze_ingest(cfg, plan, gate=None):
         assert isinstance(cfg, _StubCfg)
         plans.append(plan)
         return {"rows": 42, "bronze_table_name": "orders", "source_schema": "public", "source_table": "orders"}
@@ -381,8 +450,9 @@ def test_run_one_object_routes_an_oracle_driver_sql_connector_through_the_oracle
     oracle_calls = []
     pinned_calls = []
 
-    def fake_oracle_build_source(dial, secrets, source_objects):
+    def fake_oracle_build_source(dial, secrets, source_objects, table_adapter_callback=None):
         oracle_calls.append((dial, secrets, source_objects))
+        _reflect(table_adapter_callback)
         return type("R", (), {"source": iter(()), "resolved": f.ssrf_guard.ResolvedAddress("10.0.0.9", 1521, 2)})()
 
     monkeypatch.setattr(f.oracle_adapter, "build_source", fake_oracle_build_source)
@@ -953,7 +1023,7 @@ def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> 
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
     registered = []
     monkeypatch.setattr(
         f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
@@ -981,7 +1051,7 @@ def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkey
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
 
     def _broken(*a, **k):
         raise RuntimeError("clickhouse is down")
@@ -1016,7 +1086,7 @@ def test_run_ingest_reports_each_objects_measured_rows_as_a_materialization(monk
 
     _stub_env(monkeypatch)
     rows_by_object = {"orders": 42, "sheet": None}
-    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj: rows_by_object[obj["name"]])
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: rows_by_object[obj["name"]])
     connector = {
         "id": "conn-pg",
         "adapter": "sql",
@@ -1078,7 +1148,7 @@ def test_three_objects_yield_three_mapped_steps_with_their_keys(monkeypatch) -> 
     _stub_env(monkeypatch)
     monkeypatch.setattr(
         f, "_run_one_object",
-        lambda connector, obj: {"orders": 7, "customers": 3, "invoices": 1}[obj["name"]],
+        lambda connector, obj, run_id=None: {"orders": 7, "customers": 3, "invoices": 1}[obj["name"]],
     )
     connector = _batch_connector(["orders", "customers", "invoices"])
     monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
@@ -1128,7 +1198,8 @@ def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monk
             self.rows = rows
 
     class _FakeAdapter:
-        def build_source(self, dial, secrets, objs):
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            _reflect(table_adapter_callback)
             if objs[0]["name"] == "customers":
                 raise f.UnknownAdapter("adapter=something-not-real")
             return _FakeResult(rows={"orders": 11, "invoices": 5}[objs[0]["name"]])
@@ -1217,7 +1288,7 @@ def test_oracle_tls_config_error_from_a_mapped_step_is_wrapped_in_a_non_retryabl
 
     import dispar_orchestrate.ingest_factory as f
 
-    def fake_run_one_object(_connector, obj):
+    def fake_run_one_object(_connector, obj, run_id=None):
         raise f.oracle_adapter.OracleTlsConfigError(
             f"oracle tls config rejected for {obj.get('target')!r}"
         )
@@ -1357,3 +1428,253 @@ def test_no_dynamic_output_value_contains_a_resolved_secret(monkeypatch) -> None
         # invariant is closing.
         for field in ("password", "token", "api_key", "secret"):
             assert field not in payload["connector"], f"{field!r} leaked into DynamicOutput payload"
+
+
+# --- SRC-8 task 6: observe a batch SQL table before it loads ------------------
+#
+# Every test drives the real `_run_one_object` with a fake adapter that
+# "reflects" the way `sql_database` does (`_reflect`), a fake sink, and the
+# `observations` fixture standing in for `lakehouse-api`.
+
+
+def _mysql_connector() -> dict:
+    return {
+        "id": "conn-mysql",
+        "adapter": "sql",
+        "dial": {"driver": "mysql", "host": "db.internal", "port": 3306, "database": "shop", "user": "u"},
+        "secretRef": "env:CONNECTOR_MYSQL_PASSWORD",
+        "secretRefSecondary": None,
+    }
+
+
+def _wire_mysql(monkeypatch, *, loads: list, builds: list, table=None):
+    """Fake the generic SQL adapter and the sink; `loads` gets one entry per
+    row load, `builds` the column names each build left selected."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f, "_host_of", lambda dial: None)
+
+    class _Adapter:
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            fake_table = table or _FakeTable()
+            _reflect(table_adapter_callback, fake_table)
+            builds.append([c.name for c in fake_table._columns])
+            return type("R", (), {"source": object(), "resolved": None})()
+
+    monkeypatch.setitem(f._ADAPTERS, "sql", _Adapter())
+
+    def fake_load(source, target, sink_config, plan):
+        loads.append(target)
+        return f.sink_adapter.SinkResult(rows=5, has_failed_jobs=False, load_info_str="")
+
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", fake_load)
+    return recorded
+
+
+def test_the_observation_is_posted_before_any_row_is_loaded(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    seen_at_load: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    original = f.sink_adapter.load_via_sink
+
+    def load_after_checking(*args, **kwargs):
+        seen_at_load.append(len(observations.calls))  # observations made by the time rows move
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", load_after_checking)
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"}, run_id="run-7")
+
+    assert seen_at_load == [1]
+    [call] = observations.calls
+    assert call["phase"] == "before_load"
+    assert call["object"] == "shop.orders"
+    assert call["run_id"] == "run-7"
+    assert [(c.name, c.type_name, c.nullable) for c in call["columns"]] == [
+        ("id", "INTEGER", False),
+        ("note", "VARCHAR(40)", True),
+    ]
+    assert call["primary_key"] == ["id"]
+    assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+def test_a_wait_answer_loads_nothing_records_waiting_and_does_not_raise(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[{"kind": "type_changed"}])
+
+    rows = f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    assert rows is None
+    assert loads == []
+    assert [(r["status"], r["rows"], r["object_name"]) for r in recorded] == [("waiting", None, "shop.orders")]
+    assert "schema change" in recorded[0]["error"]
+    # A waiting table is not registered in the catalog either: it did not load.
+
+
+def test_a_wait_answer_for_a_postgres_table_loads_nothing_and_records_waiting(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    gates: list = []
+
+    def fake_run_bronze_ingest(cfg, plan, gate=None):
+        gates.append(gate(_reflected_table()))
+        return {"rows": None, "waiting": True}
+
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", fake_run_bronze_ingest)
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[])
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "pg.internal", "port": 5432, "database": "d", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+    }
+
+    assert f._run_one_object(connector, {"name": "public.orders", "target": "orders"}, run_id="r") is None
+
+    assert [(r["status"], r["rows"]) for r in recorded] == [("waiting", None)]
+    assert gates[0].action == "wait"
+    assert observations.calls[0]["object"] == "public.orders"
+    assert observations.calls[0]["run_id"] == "r"
+
+
+def _reflected_table():
+    from dispar_orchestrate import schema_observer
+
+    return schema_observer.ReflectedTable(
+        columns=(schema_observer.ReflectedColumn("id", "integer", False),), primary_key=("id",)
+    )
+
+
+def test_a_wait_answer_for_an_oracle_table_loads_nothing_and_records_waiting(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    def fake_oracle(dial, secrets, objs, table_adapter_callback=None):
+        _reflect(table_adapter_callback)
+        return type("R", (), {"source": iter(()), "resolved": None})()
+
+    monkeypatch.setattr(f.oracle_adapter, "build_source", fake_oracle)
+    monkeypatch.setattr(
+        f.sink_adapter, "load_via_sink", lambda *a, **k: pytest.fail("a waiting table must not be loaded")
+    )
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[])
+    connector = {
+        "id": "conn-ora",
+        "adapter": "sql",
+        "dial": {"driver": "oracle", "host": "ora.internal", "port": 1521, "database": "O", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+    }
+    assert f._run_one_object(connector, {"name": "S.ORDERS", "target": "orders"}) is None
+    assert [r["status"] for r in recorded] == ["waiting"]
+
+
+def test_a_column_list_in_the_answer_rebuilds_the_source_with_only_those_columns(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    builds: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=builds)
+    observations.answer = f.schema_observer.Decision(action="load", columns=["id"], changes=[])
+
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    # First build reflects and keeps everything (nothing is removed yet); the
+    # second, after the answer, was built keeping `id` only.
+    assert builds == [["id", "note"], ["id"]]
+    assert loads == ["orders"]
+    assert [r["status"] for r in recorded] == ["succeeded"]
+    assert len(observations.calls) == 1  # observed once, not once per build
+
+
+def test_no_column_list_loads_with_a_single_build(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    builds: list = []
+    _wire_mysql(monkeypatch, loads=[], builds=builds)
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert builds == [["id", "note"]]
+
+
+def test_an_api_that_cannot_be_reached_fails_the_object_and_loads_nothing(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    observations.answer = f.schema_observer.ObservationUnreachable("the API could not be reached (ConnectionError)")
+
+    with pytest.raises(f.schema_observer.ObservationUnreachable):
+        f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    assert loads == []
+    assert [r["status"] for r in recorded] == ["failed"]
+
+
+def test_a_source_build_that_reflects_no_table_is_refused_rather_than_loaded_unchecked(
+    monkeypatch, observations
+) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+
+    class _SilentAdapter:
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            return type("R", (), {"source": object(), "resolved": None})()  # never calls the callback
+
+    monkeypatch.setitem(f._ADAPTERS, "sql", _SilentAdapter())
+    with pytest.raises(f.schema_observer.ReflectionMissing):
+        f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert loads == [] and observations.calls == []
+    assert [r["status"] for r in recorded] == ["rejected"]
+
+
+def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> None:
+    from dagster import Failure, build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    payload = {"connector": {"id": "c"}, "obj": {"name": "orders", "target": "orders"}}
+
+    def raises(exc):
+        def fake(_connector, _obj, run_id=None):
+            raise exc
+
+        return fake
+
+    monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationUnreachable("down")))
+    with pytest.raises(Failure) as unreachable:
+        f.ingest_source_object(build_op_context(), payload)
+    assert unreachable.value.allow_retries is True  # DEFAULT_RETRY_POLICY keeps retrying a transient failure
+
+    monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationRefused("HTTP 403")))
+    with pytest.raises(Failure) as refused:
+        f.ingest_source_object(build_op_context(), payload)
+    assert refused.value.allow_retries is False
+
+
+def test_the_op_sends_its_dagster_run_id_with_the_observation(monkeypatch) -> None:
+    from dagster import build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    seen: list = []
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: seen.append(run_id) or None)
+    context = build_op_context()
+    f.ingest_source_object(context, {"connector": {"id": "c"}, "obj": {"name": "o", "target": "o"}})
+    assert seen == [context.run_id]

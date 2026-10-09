@@ -30,7 +30,11 @@ mechanism its own connection API actually offers:
   `pinned_resolution` wrap gets FULL pinning with no compensating code
   in this module. Verified by absence in
   `test_build_source_needs_no_extra_pinning_for_pymysql`:
-  no `engine_kwargs` at all for this driver.
+  no `engine_kwargs` at all for this driver. One exception (SRC-8):
+  `sql_database` REFLECTS the tables while it is called, which is a dial
+  that happens inside `build_source`, before any caller can wrap the load;
+  `build_source` therefore wraps that one call in
+  `ssrf_guard.pinned_resolution` itself.
 - **`mssql` (Microsoft ODBC Driver 18, `pyodbc`):** connects via a raw
   ODBC connection string built by `_mssql_connection_string` below,
   carrying `Server=tcp:<checked-ip>,<port>` directly -- it never calls a
@@ -187,9 +191,18 @@ def build_source(
     source_objects: list[dict],
     *,
     resolve_checked: Callable[[str, int], ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+    table_adapter_callback: Callable[[Any], None] | None = None,
 ) -> AdapterBuildResult:
     """Build a dlt `sql_database` source for `spec['driver']`
     (`mysql`/`mariadb`/`mssql`), SSRF-checked and pinned per-driver.
+
+    `table_adapter_callback` (SRC-8, `schema_observer.py`) is handed to
+    `sql_database`, which calls it with each REFLECTED table while the source
+    is being built -- so the reflection `dlt` does anyway is also how the
+    caller reads the columns (to observe them, or to hold some back), with no
+    connection of this module's own. That reflection is a dial: for
+    `mssql` it goes through the pinned ODBC string, for `mysql`/`mariadb`
+    it runs inside `ssrf_guard.pinned_resolution` (below).
 
     `resolve_checked` runs BEFORE any credential is built -- a blocked
     host never gets as far as `sql_database` being called at all (see
@@ -218,7 +231,7 @@ def build_source(
 
     if driver == "mssql":
         credentials: Any = _mssql_connection_string(spec, secrets, resolved)
-        source = sql_database(credentials=credentials, table_names=table_names)
+        source = sql_database(credentials=credentials, table_names=table_names, **_callback(table_adapter_callback))
         return AdapterBuildResult(source=source, resolved=resolved)
 
     drivername = _DRIVERNAMES.get(driver)
@@ -237,5 +250,18 @@ def build_source(
     # ssrf_guard.pinned_resolution wrap gets FULL pinning here with no
     # compensating engine_kwargs (see the module docstring's per-driver
     # pinning list).
-    source = sql_database(credentials=credentials, table_names=table_names)
+    # SRC-8 (SSRF, plan "Task 6"): `sql_database` REFLECTS the tables as it is
+    # called, i.e. it dials here, not only when the rows are read later.
+    # Before SRC-8 that dial ran by NAME, outside any pin, between
+    # `resolve_checked` and the caller's `pinned_resolution` around the load;
+    # the reflection is now also the source of the observation, so it runs
+    # inside the same pin the load gets.
+    with ssrf_guard.pinned_resolution(spec["host"], resolved):
+        source = sql_database(credentials=credentials, table_names=table_names, **_callback(table_adapter_callback))
     return AdapterBuildResult(source=source, resolved=resolved)
+
+
+def _callback(table_adapter_callback: Callable[[Any], None] | None) -> dict[str, Any]:
+    """The keyword for `sql_database`, only when there is a callback (so a
+    call without one is byte-for-byte what it was before SRC-8)."""
+    return {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}

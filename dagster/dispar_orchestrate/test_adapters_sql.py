@@ -200,3 +200,49 @@ def test_build_source_refuses_an_unknown_driver(monkeypatch) -> None:
             source_objects=[],
             resolve_checked=lambda host, port: ResolvedAddress(ip="10.0.0.9", port=port, family=2),
         )
+
+
+# SRC-8 task 6: the reflection that feeds the schema observation is a dial.
+def test_the_mysql_reflection_runs_inside_the_pinned_resolution(monkeypatch) -> None:
+    """`sql_database` reflects the tables as it is CALLED, so for pymysql that
+    dial must already see only the checked address; before SRC-8 it ran by
+    name, outside any pin, until the caller wrapped the load."""
+    import socket
+
+    seen = {}
+
+    def fake_sql_database(**kwargs):
+        seen["resolved"] = socket.getaddrinfo("db.internal", 3306)[0][4][0]
+        return "src"
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sql.sql_database", fake_sql_database)
+    build_source(
+        {"driver": "mysql", "host": "db.internal", "port": 3306, "database": "d", "user": "u"},
+        secrets={"password": "x"},
+        source_objects=[{"name": "d.orders", "target": "orders"}],
+        resolve_checked=lambda host, port: ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+    )
+    assert seen["resolved"] == "10.0.0.9"
+
+
+@pytest.mark.parametrize("driver", ["mysql", "mariadb", "mssql"])
+def test_the_table_adapter_callback_reaches_sql_database_and_is_left_out_when_absent(monkeypatch, driver) -> None:
+    captured = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.adapters.sql.sql_database", lambda **kwargs: captured.append(kwargs) or "src"
+    )
+    spec = {"driver": driver, "host": "db.internal", "port": 3306, "database": "d", "user": "u"}
+
+    def callback(table):
+        return None
+
+    for cb in (callback, None):
+        build_source(
+            spec,
+            secrets={"password": "x"},
+            source_objects=[{"name": "d.orders", "target": "orders"}],
+            resolve_checked=lambda host, port: ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+            table_adapter_callback=cb,
+        )
+    assert captured[0]["table_adapter_callback"] is callback
+    assert "table_adapter_callback" not in captured[1]
