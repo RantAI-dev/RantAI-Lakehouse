@@ -10,6 +10,17 @@ on:
     # unverified.
     branches: [main, 'lakehouse/**']
 
+# Read-only token for every job. Nothing here writes to the repository, a
+# package registry or a PR: the image artifacts and the layer cache go
+# through the Actions runtime credentials, which a job gets whatever
+# `permissions:` says. Declaring it for the whole workflow means every run,
+# not only a fork PR's, uses the token a fork PR is handed, so a step that
+# quietly needs a write scope fails here instead of on the first fork PR
+# (CI-SPEED-PLAN §2 constraint 5). A job that ever needs more must say so
+# on its own `permissions:` block.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -393,6 +404,107 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p g2ci down -v
+
+  # ── Images: build each shared image ONCE per run ────────────────────
+  # CI-SPEED-PLAN §4.2. Before this job, six acceptance jobs and the Docker
+  # workflow each built `lakehouse-api` from source (a release build of
+  # ~500 crates, 8-12 minutes each) and four of them rebuilt the Dagster
+  # image too. Now they are built here and handed to every consumer as a
+  # workflow artifact; the consumers `docker load` it and start the stack
+  # with `up -d --no-build`, so a missing image fails the job instead of
+  # triggering a silent rebuild.
+  #
+  # Artifacts, not GHCR: publishing images is a separate decision
+  # (docs/CI.md), and an artifact needs no registry credential, so it works
+  # on a fork PR's read-only token too.
+  #
+  # Same `if:` as the acceptance jobs: it builds what they run.
+  images:
+    name: Images · build lakehouse-api + dagster once
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # `GIT_SHA` is deliberately NOT passed to either build, here or in the
+      # acceptance jobs' compose calls: `ARG GIT_SHA` sits near the top of
+      # `dagster/Dockerfile`, so a per-commit value would invalidate every
+      # layer below it and the cache would never hit. Both images are built
+      # with `GIT_SHA=unknown` exactly as the per-job builds were.
+      #
+      # Layer cache: READ on every run, WRITTEN only from a push to `main`.
+      # The repository's Actions cache is capped at 10 GB and was at 9.9 GB
+      # when this was written (2026-10-09, `gh api
+      # repos/.../actions/cache/usage`); a cache written by a PR is readable
+      # by that PR alone, so letting PRs write only evicts `main`'s entries.
+      # One `scope` per image so the two never overwrite each other.
+      #
+      # `CARGO_TARGET_DIR=/build/target-layer` moves cargo's `target/` out of
+      # the Dockerfile's cache mount (which this cache cannot store) and into
+      # the image layer (which it can): see the ARG comment in
+      # rust/Dockerfile. `pipeline_src` is the second build context
+      # docker-compose.yml's `additional_contexts` gives this build; without
+      # it buildx would look for an image of that name on Docker Hub.
+      - name: Build lakehouse-api image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+          tags: rantai-lakehouse-api:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-api.tar
+          cache-from: type=gha,scope=api-image
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=api-image' || '' }}
+
+      - name: Build dagster image
+        uses: docker/build-push-action@v7
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          tags: rantai-lakehouse-dagster:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-dagster.tar
+          cache-from: type=gha,scope=dagster-image
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=dagster-image' || '' }}
+
+      # zstd here, and `compression-level: 0` on the upload: the artifact
+      # service would otherwise deflate an already-compressed file a second
+      # time for nothing. The sizes are printed so a regression in artifact
+      # size (and so in every consumer's download time) is visible in the log.
+      - name: Compress image archives
+        run: |
+          cd "$RUNNER_TEMP"
+          zstd -T0 -3 --rm lakehouse-api.tar lakehouse-dagster.tar
+          ls -l lakehouse-api.tar.zst lakehouse-dagster.tar.zst
+
+      # One artifact per image, so Gold export and G8 (API image only) do
+      # not download the larger Dagster image. One-day retention: these are
+      # per-run scratch files, not build outputs anyone should fetch later.
+      - name: Upload lakehouse-api image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-lakehouse-api
+          path: ${{ runner.temp }}/lakehouse-api.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload dagster image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-lakehouse-dagster
+          path: ${{ runner.temp }}/lakehouse-dagster.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
   # ── G3a acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3) — dlt,
   # running inside Dagster, reads a real Postgres table and writes it to
