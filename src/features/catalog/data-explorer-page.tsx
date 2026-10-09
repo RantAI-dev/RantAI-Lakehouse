@@ -244,7 +244,7 @@ export function DataExplorerPage() {
       // `id` stays available in the column menu, filters and the row
       // context menu; it is just noise as a column, since Name and
       // Namespace together already identify the asset.
-      columnVisibility: { id: false },
+      columnVisibility: { id: false, certification: false },
       // Keeps the ⋮ button reachable while the rest of the table scrolls
       // sideways — the actions are useless if you have to scroll to them.
       columnPinning: { right: ["actions"] },

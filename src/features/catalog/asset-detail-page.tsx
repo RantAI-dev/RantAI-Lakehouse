@@ -8,6 +8,7 @@ import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import {
+  CertificationBadge,
   ClassificationBadge,
   HealthBadge,
   TierBadge,
@@ -116,6 +117,7 @@ export function AssetDetailPage() {
         title={a.name}
         titleAccessory={
           <>
+            <CertificationBadge certification={a.certification} />
             <TierBadge tier={a.tier} title={tierTitle(a)} />
             <ClassificationBadge
               classification={a.classification}
