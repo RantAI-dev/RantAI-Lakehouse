@@ -1091,13 +1091,19 @@ def step_source_schema_changes() -> None:
             f"SRC-8 step 4: the catalog detail of {slug!r} never listed qty ({exc}); is the table registered "
             "in the catalog (look for 'could not be registered in the catalog' in the code location's log)?"
         ) from exc
-    marked = {c["name"]: c.get("inactiveSince") for c in schema}
-    others = {name: since for name, since in marked.items() if name != "qty" and since}
-    if not marked.get("qty") or others:
+    # Judged on EVERY entry, not on a dict keyed by name: a column listed twice
+    # (the registry is an unmerged ReplacingMergeTree, `PR #101 CI run 2`) must
+    # not hide an unmarked copy behind a marked one, nor the reverse. The
+    # failure text carries the raw list for the same reason.
+    names = [c.get("name") for c in schema]
+    qty_marks = [c.get("inactiveSince") for c in schema if c.get("name") == "qty"]
+    others = [c for c in schema if c.get("name") != "qty" and c.get("inactiveSince")]
+    if not qty_marks or not all(qty_marks) or others or len(set(names)) != len(names):
         raise G6Failure(
-            f"SRC-8 step 4: expected inactiveSince on qty and on no other column of the catalog detail, got {marked!r}"
+            "SRC-8 step 4: expected one entry per column, inactiveSince on qty and on no other column of the "
+            f"catalog detail, got {[(c.get('name'), c.get('inactiveSince')) for c in schema]!r}"
         )
-    print(f"[g6] SRC-8 step 4: catalog detail of {slug} marks qty inactiveSince {marked['qty']}, no other column")
+    print(f"[g6] SRC-8 step 4: catalog detail of {slug} marks qty inactiveSince {qty_marks[0]}, no other column")
 
 
 def step_column_gate_rejects_an_unsupported_column() -> None:
@@ -1275,6 +1281,13 @@ def step_sheets_reports_unsupported() -> None:
 
 
 def main() -> int:
+    # Line-buffered, so the progress lines and the failure line below reach the
+    # job log in order and a crash cannot take buffered lines with it: before
+    # this, every "[g6]" line of a failed run carried the timestamp of the
+    # process exit (`PR #101 CI run 2`), which also made the phase timings
+    # unreadable.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     try:
         step_wait_for_services()
         step_login()
@@ -1288,6 +1301,10 @@ def main() -> int:
         step_sheets_reports_unsupported()
     except G6Failure as exc:
         print(f"[g6] FAILED: {exc}", file=sys.stderr)
+        return 1
+    except Exception:  # noqa: BLE001 -- any other error is a failure of the gate and must be named as one
+        import traceback
+        print(f"[g6] FAILED: unexpected error, not a G6Failure:\n{traceback.format_exc()}", file=sys.stderr)
         return 1
     print("[g6] PASS")
     return 0

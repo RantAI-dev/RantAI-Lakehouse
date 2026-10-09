@@ -1880,9 +1880,15 @@ async fn bronze_asset_detail_body(
     };
 
     let cols_sql = format!(
-        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={escaped_id}
-       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={escaped_id}"
+        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` FINAL WHERE slug={escaped_id}
+       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL WHERE slug={escaped_id}"
     );
+    // `PR #101 CI run 2` (G6, SRC-8 step 4): `FINAL`, because the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and ClickHouse merges
+    // the copies only in the background. Without it a table loaded by three
+    // runs listed each column three times, `col_count` said 3x the columns,
+    // and a mark set on one copy left the others unmarked.
     let mut cols = ch.rows(&cols_sql, None).await?;
 
     let table = str_col(sync, "table_name");
@@ -2063,13 +2069,16 @@ async fn mark_inactive_columns(state: &AppState, table: &str, schema: &mut [Valu
         }
     };
     for (loaded_name, since) in marks {
-        let found = schema
+        // Every entry of that name, not the first: the registry can still hold
+        // a column twice (a merge not yet run on a replica); a reader keyed
+        // by name must see the mark whichever copy it reads (`PR #101 CI run 2`).
+        for column in schema
             .iter_mut()
             .filter_map(Value::as_object_mut)
-            .find(|column| {
+            .filter(|column| {
                 column.get("name").and_then(Value::as_str) == Some(loaded_name.as_str())
-            });
-        if let Some(column) = found {
+            })
+        {
             column.insert("inactiveSince".to_owned(), json!(since.as_str()));
         }
     }
@@ -4503,6 +4512,29 @@ mod tests {
             let mut other = self::schema();
             mark_inactive_columns(&state, "customers_raw", &mut other).await;
             assert!(other.iter().all(|c| c["inactiveSince"].is_null()));
+        }
+
+        /// `PR #101 CI run 2` (G6 SRC-8 step 4): a column the registry lists
+        /// more than once is marked in every copy, so a reader keyed by name
+        /// sees the mark whichever copy it reads.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_column_listed_twice_is_marked_in_every_copy(pool: lakehouse_store::PgPool) {
+            seed(&pool).await;
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            schema.push(
+                json!({"name": "order_date", "dataType": "String", "inactiveSince": Value::Null}),
+            );
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+
+            let marked: Vec<&Value> = schema
+                .iter()
+                .filter(|c| c["name"] == "order_date")
+                .map(|c| &c["inactiveSince"])
+                .collect();
+            assert_eq!(marked.len(), 2);
+            assert!(marked.iter().all(|m| !m.is_null()), "{marked:?}");
         }
 
         /// A failed lookup leaves the columns as they were: the detail still

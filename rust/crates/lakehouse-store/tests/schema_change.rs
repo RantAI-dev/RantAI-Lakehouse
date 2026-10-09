@@ -1128,3 +1128,94 @@ async fn the_inactive_columns_of_a_bronze_table_are_found_by_target_and_loaded_n
         Some("order_date")
     );
 }
+
+/// `PR #101 CI run 2` (G6 SRC-8 step 4): the whole life of the gate's table.
+/// Baseline, an added column accepted (the baseline MOVES), the column
+/// dropped (the table waits), approval: the loaded name of the removed column
+/// must come from the moved baseline, and the catalog's query must return it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_column_removed_after_an_added_column_keeps_its_loaded_name_through_approval(
+    pool: PgPool,
+) {
+    use lakehouse_store::schema_change::inactive_columns_of_table;
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    let loaded = |name: &str, type_name: &str| {
+        let mut c = col(name, type_name);
+        c.loaded_name = Some(name.to_owned());
+        c
+    };
+    let record = |observed: Vec<ObservedColumn>, changes: Vec<NewChange>, accept: bool| {
+        let pool = pool.clone();
+        let id = id.clone();
+        async move {
+            let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
+            tx.record(&ObservationWrite {
+                observed_columns: &observed,
+                observed_primary_key: &["id".to_owned()],
+                changes: &changes,
+                accept_observed: accept,
+                pause_connector: false,
+                run_id: None,
+                now: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+    };
+    // 1. baseline: id, name, qty
+    record(
+        vec![
+            loaded("id", "int"),
+            loaded("name", "varchar(50)"),
+            loaded("qty", "int"),
+        ],
+        vec![],
+        true,
+    )
+    .await;
+    // 2. `note` added and applied: the accepted shape moves.
+    record(
+        vec![
+            loaded("id", "int"),
+            loaded("name", "varchar(50)"),
+            loaded("qty", "int"),
+            loaded("note", "varchar(50)"),
+        ],
+        vec![NewChange {
+            kind: ChangeKind::ColumnAdded,
+            column_name: "note".to_owned(),
+            before_value: None,
+            after_value: Some("varchar(50)".to_owned()),
+            breaking: false,
+            status: ChangeStatus::Applied,
+        }],
+        true,
+    )
+    .await;
+    // 3. `qty` dropped: waits (the baseline stays).
+    record(
+        vec![
+            loaded("id", "int"),
+            loaded("name", "varchar(50)"),
+            loaded("note", "varchar(50)"),
+        ],
+        vec![removed("qty", ChangeStatus::Pending)],
+        false,
+    )
+    .await;
+    // 4. approve.
+    approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    let listed = list_inactive_columns(&pool, &id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].column_name, "qty");
+    assert_eq!(listed[0].loaded_name.as_deref(), Some("qty"));
+    let marks = inactive_columns_of_table(&pool, "t_orders").await.unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0].0, "qty");
+}
