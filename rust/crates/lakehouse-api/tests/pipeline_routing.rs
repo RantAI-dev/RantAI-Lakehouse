@@ -86,6 +86,32 @@ async fn app_with_two_distinct_dagster_responses() -> (TestApp, String, wiremock
         .expect(1)
         .mount(&server)
         .await;
+    // F2.1 (PR #59 review): `enforce_run_id_pipeline_scope` calls
+    // `pipeline_run_pipeline_name` BEFORE `run_steps`'s own
+    // `run_steps`. The mock returns the run's `pipelineName` so the
+    // scope check can map it back to a `pl-` id. The mock fires for
+    // every `/runs/{runId}/...` request that reaches `run_steps`,
+    // `run_logs`, `retry_run`, or `cancel_run` — the `.expect` is
+    // sized to the number of per-run calls in this test (1).
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains(
+            "pipelineRunOrError",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "pipelineRunOrError": {
+                    "__typename": "Run",
+                    "runId": "r-real",
+                    "pipelineName": "gold_export_job",
+                    "rootRunId": "r-real",
+                    "runConfig": {},
+                    "stepStats": []
+                } }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let mut overrides = HashMap::new();
     overrides.insert(

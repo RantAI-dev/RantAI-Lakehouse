@@ -1338,11 +1338,22 @@ pub async fn late_decision(
 /// * `Source(String)` — a classified error from the [`LateSource`]
 ///   implementation (the message is already classified by the source
 ///   before this crate sees it).
+///
+/// F2.7: `ListRules` previously used `#[error(transparent)]`, which
+/// forwarded the upstream `ClickHouse` error body (`ChError::Server`)
+/// into `routes::alerts`'s `format!("{err}")` — a leak of upstream text
+/// into the 500 response. The route layer's `format!("{err}")` (lines
+/// 757 / 793) now sees the FIXED display, never `ChError`'s Display —
+/// the upstream detail remains available via `tracing::error!(source
+/// = %err, ...)` (or by inspecting `err` at the route layer) and is
+/// not echoed in the HTTP body.
 #[derive(Debug, Error)]
 pub enum PipelineLateError {
     /// `ClickHouse` unreachable while listing alert rules (mirrors the
-    /// sibling functions' `ChError` return).
-    #[error(transparent)]
+    /// sibling functions' `ChError` return). F2.7: `Display` is a
+    /// FIXED classified string — the upstream `ClickHouse` body is
+    /// NOT echoed through `Display` here (AGENTS.md principle 4).
+    #[error("database error")]
     ListRules(#[from] ChError),
     /// A classified error from the [`LateSource`] implementation — the
     /// message is already classified by the source before this crate
@@ -1894,6 +1905,41 @@ mod tests {
     fn late_is_false_when_gap_is_exactly_the_threshold() {
         // Strict `>`: gap == threshold is NOT late.
         assert_eq!(late(Some(1_000.0), Some(800.0), Some(200)), Some(false));
+    }
+
+    // ── F2.7: `PipelineLateError::ListRules` Display ────────────────────
+    //
+    // The route layer at `routes/alerts.rs:757,793` formats the error
+    // with `format!("{err}")`. Pre-fix that carried `ChError`'s body
+    // verbatim (e.g. `Code: 47. Unknown identifier: nope`) into the 500
+    // response. The sentinel text MUST NOT survive Display; the route
+    // layer's output MUST be the fixed `"database error"` classified
+    // string (AGENTS.md principle 4: classify before surfacing).
+
+    #[test]
+    fn pipeline_late_error_list_rules_display_does_not_forward_clickhouse_body() {
+        const SENTINEL: &str = "ALERTS_LIST_RULES_SENTINEL_999111";
+        let err: PipelineLateError =
+            ChError::Server(format!("Code: 47. Unknown identifier — {SENTINEL}")).into();
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "`PipelineLateError::ListRules` Display MUST NOT forward `ChError`'s body, got {rendered:?}",
+        );
+        assert_eq!(
+            rendered, "database error",
+            "`PipelineLateError::ListRules` Display MUST be the fixed \"database error\" classified string",
+        );
+    }
+
+    #[test]
+    fn pipeline_late_error_source_display_carries_the_supplied_string() {
+        // Sanity: the `Source(String)` variant stays untouched by the F2
+        // fix — the doc comment promises it is ALREADY classified by
+        // the LateSource implementation, so it is safe to forward
+        // verbatim.
+        let err = PipelineLateError::Source("classified at the source".to_owned());
+        assert_eq!(format!("{err}"), "classified at the source");
     }
 
     // ── SqlGate ──────────────────────────────────────────────────────────
