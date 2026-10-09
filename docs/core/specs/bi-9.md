@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `BI-9` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
+| Module | Dashboards |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -37,10 +36,9 @@ Metabase: minute, hour, day, week, month, quarter, year, plus hour-of-day, day-o
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A line chart of daily rows switches to monthly from the dashboard
-- [ ] Day-of-week shows seven bars Monday to Sunday
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-9-AC1` A line chart of daily rows switches to monthly from the dashboard
+- `BI-9-AC2` Day-of-week shows seven bars Monday to Sunday
+- `BI-9-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `QS-2` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Query Studio |
-| Who builds it | Query Studio, with Security (SEC-21) |
+| Module | Query Studio |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -38,11 +37,10 @@ Databricks SQL editor: results up to 64,000 rows or 10 MB, filters and column pr
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A 100,000-row result shows 64,000 rows and says it was cut
-- [ ] Downloading it as Parquet gives all 100,000 rows
-- [ ] Pressing stop on a long query frees the engine (visible in system.processes)
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `QS-2-AC1` A 100,000-row result shows 64,000 rows and says it was cut
+- `QS-2-AC2` Downloading it as Parquet gives all 100,000 rows
+- `QS-2-AC3` Pressing stop on a long query frees the engine (visible in system.processes)
+- `QS-2-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

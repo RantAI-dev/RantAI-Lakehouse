@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-14` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec corrected against the code 2026-10-09. Not planned, not built |
@@ -38,11 +37,10 @@ Snowflake (Ent+): system metric functions (nulls, duplicates, freshness, row cou
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Adding a 'no nulls' check on a column with nulls opens an incident
-- [ ] A load with 10% of the usual rows is flagged as a volume anomaly
-- [ ] The quality page lists the incident until it is resolved
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-14-AC1` Adding a 'no nulls' check on a column with nulls opens an incident
+- `DATA-14-AC2` A load with 10% of the usual rows is flagged as a volume anomaly
+- `DATA-14-AC3` The quality page lists the incident until it is resolved
+- `DATA-14-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

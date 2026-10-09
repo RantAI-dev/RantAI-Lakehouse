@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-8` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with BI-17 |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-17`](bi-17.md) (BI phase 3, 6) |
@@ -41,8 +40,7 @@ BI-17.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request applies all three changes
+- `AI-8-AC1` The quoted request applies all three changes
 
 ## Not included
 
