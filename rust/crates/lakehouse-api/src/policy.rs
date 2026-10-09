@@ -577,6 +577,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // the handler adds the `run_failed_event` check: a service identity or an
     // unrestricted administrator only. No new permission was invented.
     ("POST", "/api/connectors/{id}/schema-observations", Policy::RequiresPermission("ingest:read")),
+    // `SRC-8` decision D2: the orchestrator reports tables that appeared in a
+    // schema the connector loads from (policy `apply_all` only). Same gate and
+    // the same handler-side service check as the route above.
+    ("POST", "/api/connectors/{id}/schema-observations/tables", Policy::RequiresPermission("ingest:read")),
     // A person reads what changed at the source and approves what waits
     // (`SRC-8` decision D6). The tenant gate is the route layer.
     ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),

@@ -82,6 +82,15 @@ describe("ingest panel helpers", () => {
     expect(defaultTarget("Northwind DB!", "public.Order Details")).toBe("northwind_db_order_details")
     expect(defaultTarget("2024 sales", "t")).toBe("t_2024_sales_t")
   })
+  // The edge cases below are pinned by `default_bronze_target`'s Rust test as
+  // well (`lakehouse-store/src/ingest_spec.rs`): both rules must agree.
+  it("falls back the way the Rust rule does when a part has nothing usable", () => {
+    expect(defaultTarget("!!!", "dbo.Orders")).toBe("orders")
+    expect(defaultTarget("shop", "public.")).toBe("shop")
+    expect(defaultTarget("", "...")).toBe("table")
+    expect(defaultTarget("shop", "orders")).toBe("shop_orders")
+    expect(defaultTarget("  a--b  ", "s.__x__y__")).toBe("a_b_x_y")
+  })
   it("refuses targets that are not identifiers or land twice", () => {
     expect(targetProblem("northwind_orders", [])).toBeNull()
     expect(targetProblem("Orders", [])).not.toBeNull()

@@ -444,35 +444,16 @@ impl<'p> ObservationTx<'p> {
         change: &NewChange,
         write: &ObservationWrite<'_>,
     ) -> Result<(SchemaChange, bool), StoreError> {
-        const COLUMNS: &str = "id, object_name, kind, column_name, before_value, after_value, \
-                               breaking, status, run_id, detected_at, decided_by, decided_at";
-        // The conflict target is the pending-identity index; an `applied`
-        // row never conflicts with it. `xmax = 0` is true only for a row
-        // this statement inserted, false for the pending row it updated.
-        let sql = format!(
-            "INSERT INTO connector_schema_change \
-               (id, connector_id, object_name, kind, column_name, before_value, after_value, \
-                breaking, status, run_id, detected_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (connector_id, object_name, kind, column_name) WHERE status = 'pending' \
-             DO UPDATE SET after_value = EXCLUDED.after_value, breaking = EXCLUDED.breaking \
-             RETURNING {COLUMNS}, (xmax = 0) AS inserted"
-        );
-        let row: SchemaChangeInserted = sqlx::query_as(&sql)
-            .bind(id)
-            .bind(&self.connector_id)
-            .bind(&self.object_name)
-            .bind(change.kind.as_str())
-            .bind(&change.column_name)
-            .bind(change.before_value.as_deref())
-            .bind(change.after_value.as_deref())
-            .bind(change.breaking)
-            .bind(change.status.as_str())
-            .bind(write.run_id)
-            .bind(write.now)
-            .fetch_one(&mut *self.tx)
-            .await?;
-        Ok((row.change, row.inserted))
+        insert_change_row(
+            &mut self.tx,
+            &self.connector_id,
+            &self.object_name,
+            id,
+            change,
+            write.run_id,
+            write.now,
+        )
+        .await
     }
 
     async fn write_baseline(
@@ -551,6 +532,206 @@ impl<'p> ObservationTx<'p> {
         self.tx.commit().await?;
         Ok(())
     }
+}
+
+/// Insert one change row, or update the same pending one in place; the bool
+/// is `true` for a row this call inserted.
+async fn insert_change_row(
+    conn: &mut sqlx::PgConnection,
+    connector_id: &str,
+    object_name: &str,
+    id: &str,
+    change: &NewChange,
+    run_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(SchemaChange, bool), StoreError> {
+    const COLUMNS: &str = "id, object_name, kind, column_name, before_value, after_value, \
+                           breaking, status, run_id, detected_at, decided_by, decided_at";
+    // The conflict target is the pending-identity index; an `applied`
+    // row never conflicts with it. `xmax = 0` is true only for a row
+    // this statement inserted, false for the pending row it updated.
+    let sql = format!(
+        "INSERT INTO connector_schema_change \
+           (id, connector_id, object_name, kind, column_name, before_value, after_value, \
+            breaking, status, run_id, detected_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (connector_id, object_name, kind, column_name) WHERE status = 'pending' \
+         DO UPDATE SET after_value = EXCLUDED.after_value, breaking = EXCLUDED.breaking \
+         RETURNING {COLUMNS}, (xmax = 0) AS inserted"
+    );
+    let row: SchemaChangeInserted = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(connector_id)
+        .bind(object_name)
+        .bind(change.kind.as_str())
+        .bind(&change.column_name)
+        .bind(change.before_value.as_deref())
+        .bind(change.after_value.as_deref())
+        .bind(change.breaking)
+        .bind(change.status.as_str())
+        .bind(run_id)
+        .bind(now)
+        .fetch_one(conn)
+        .await?;
+    Ok((row.change, row.inserted))
+}
+
+/// Why a table that appeared at the source was not added to the connector
+/// (`SRC-8` task 8). The texts are fixed: they are stored as the change's
+/// `after_value`, returned by the API and shown by the console, and never
+/// carry a name from the source or from an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRefusal {
+    /// Another connector or another table of this connector lands in the
+    /// Bronze table the new one would get.
+    TargetTaken,
+    /// Uploaded files reserved the Bronze table name (ADR 0014, decision 5).
+    ReservedForUploads,
+}
+
+impl TableRefusal {
+    /// The fixed text.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TargetTaken => {
+                "Not added: its Bronze table name is already used by another table. \
+                 Add it by hand with a different target."
+            }
+            Self::ReservedForUploads => {
+                "Not added: its Bronze table name is reserved for uploaded files. \
+                 Add it by hand with a different target."
+            }
+        }
+    }
+}
+
+/// A table that appeared at the source, with the Bronze target it would
+/// get and any reason it must not be added that the caller already found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCandidate {
+    /// `<schema>.<table>`.
+    pub name: String,
+    /// The derived Bronze table.
+    pub target: String,
+    /// Refused before the store was asked (a target another connector uses,
+    /// or one uploads reserved).
+    pub refusal: Option<TableRefusal>,
+}
+
+/// What [`record_table_additions`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableAdditions {
+    /// Names appended to the connector's tables, in request order.
+    pub added: Vec<String>,
+    /// Names refused, with the reason, in request order.
+    pub not_added: Vec<(String, TableRefusal)>,
+    /// The `table_added` rows written or seen again; `is_new` marks those
+    /// this call inserted.
+    pub changes: Vec<RecordedChange>,
+}
+
+/// Add the new tables of a schema the connector already loads from
+/// (`SRC-8` decision D2, policy `apply_all`) and list each as a
+/// `table_added` change, in ONE transaction.
+///
+/// - Appended: the connector's `source_objects` gains `{name, target,
+///   loadMode: "replace"}` through `connectors::append_source_objects_in`, and
+///   the change is `applied` with `after_value` = the target.
+/// - Refused (a candidate's own `refusal`, or a target another table of the
+///   connector took under the row lock): not appended; the change is
+///   `pending` with `after_value` = [`TableRefusal::reason`]. Seeing the same
+///   refusal again updates that pending row in place and reports it as NOT
+///   new (identity: connector, table, kind, empty column), so a schedule that
+///   asks every run raises one alert, not one per run.
+/// - A name the connector already selects: skipped, nothing recorded, which
+///   is what makes a second identical request add nothing.
+///
+/// # Errors
+///
+/// As `connectors::append_source_objects_in`, plus
+/// [`StoreError::Database`]; nothing is written then.
+pub async fn record_table_additions(
+    pool: &PgPool,
+    connector_id: &str,
+    candidates: &[TableCandidate],
+    run_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<TableAdditions, StoreError> {
+    use crate::connectors::{AdditionOutcome, SourceObjectAddition, append_source_objects_in};
+
+    let mut tx = pool.begin().await?;
+    let eligible: Vec<SourceObjectAddition> = candidates
+        .iter()
+        .filter(|c| c.refusal.is_none())
+        .map(|c| SourceObjectAddition {
+            name: c.name.clone(),
+            target: c.target.clone(),
+        })
+        .collect();
+    let mut outcomes = if eligible.is_empty() {
+        Vec::new()
+    } else {
+        append_source_objects_in(&mut tx, connector_id, &eligible).await?
+    }
+    .into_iter();
+
+    let mut result = TableAdditions {
+        added: Vec::new(),
+        not_added: Vec::new(),
+        changes: Vec::new(),
+    };
+    for candidate in candidates {
+        let (status, after, refusal) = match candidate.refusal {
+            Some(refusal) => (
+                ChangeStatus::Pending,
+                refusal.reason().to_owned(),
+                Some(refusal),
+            ),
+            None => match outcomes.next() {
+                Some(AdditionOutcome::Added) => {
+                    (ChangeStatus::Applied, candidate.target.clone(), None)
+                }
+                Some(AdditionOutcome::TargetTaken) => (
+                    ChangeStatus::Pending,
+                    TableRefusal::TargetTaken.reason().to_owned(),
+                    Some(TableRefusal::TargetTaken),
+                ),
+                // Already selected: nothing to record. `None` cannot happen
+                // (one outcome per eligible candidate) and is skipped too.
+                Some(AdditionOutcome::AlreadySelected) | None => continue,
+            },
+        };
+        let change = NewChange {
+            kind: ChangeKind::TableAdded,
+            column_name: String::new(),
+            before_value: None,
+            after_value: Some(after),
+            breaking: false,
+            status,
+        };
+        let id = format!("chg-{}", Uuid::new_v4());
+        let (row, is_new) = insert_change_row(
+            &mut tx,
+            connector_id,
+            &candidate.name,
+            &id,
+            &change,
+            run_id,
+            now,
+        )
+        .await?;
+        result.changes.push(RecordedChange {
+            change: row,
+            is_new,
+        });
+        match refusal {
+            Some(refusal) => result.not_added.push((candidate.name.clone(), refusal)),
+            None => result.added.push(candidate.name.clone()),
+        }
+    }
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// A [`SchemaChange`] row plus the `inserted` flag, decoded together.

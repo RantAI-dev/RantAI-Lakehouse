@@ -202,6 +202,33 @@ def _parse_decision(body: Any) -> Decision:
     return Decision(action=body["action"], columns=columns, changes=changes)
 
 
+def _post_json(cfg: ObserverConfig, path: str, payload: dict[str, Any], what: str) -> Any:
+    """POST `payload` to the API with the ingest service token and return the
+    parsed body. `what` names the call in the (fixed) error messages.
+
+    # Errors
+
+    As [`post_observation`].
+    """
+    if not cfg.service_token:
+        raise ObservationRefused(f"INGEST_SERVICE_TOKEN is unset, so {what} cannot be sent")
+    try:
+        resp = requests.post(f"{cfg.api_url}{path}", json=payload, headers=cfg.headers(), timeout=_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            raise ObservationRefused(f"the API refused the {what} (HTTP {status})") from None
+        raise ObservationUnreachable(f"the API failed on the {what} (HTTP {status})") from None
+    except ValueError:
+        # `resp.json()` on a body that is not JSON. Listed BEFORE
+        # `RequestException`: `requests.JSONDecodeError` is both.
+        raise ObservationRefused(f"the answer to the {what} was not JSON") from None
+    except requests.RequestException as exc:
+        raise ObservationUnreachable(f"the API could not be reached ({type(exc).__name__})") from None
+
+
 def post_observation(
     cfg: ObserverConfig,
     connector_id: str,
@@ -222,8 +249,6 @@ def post_observation(
     """
     if phase not in PHASES:
         raise ValueError(f"phase must be one of {', '.join(PHASES)}, got {phase!r}")
-    if not cfg.service_token:
-        raise ObservationRefused("INGEST_SERVICE_TOKEN is unset, so schema changes cannot be checked")
     payload: dict[str, Any] = {
         "object": object_name,
         "columns": [c.to_wire() for c in columns],
@@ -232,24 +257,45 @@ def post_observation(
     }
     if run_id:
         payload["runId"] = run_id
-    try:
-        resp = requests.post(
-            f"{cfg.api_url}/api/connectors/{connector_id}/schema-observations",
-            json=payload,
-            headers=cfg.headers(),
-            timeout=_TIMEOUT,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-    except requests.HTTPError as exc:
-        status = getattr(exc.response, "status_code", None)
-        if isinstance(status, int) and 400 <= status < 500:
-            raise ObservationRefused(f"the API refused the schema observation (HTTP {status})") from None
-        raise ObservationUnreachable(f"the API failed on the schema observation (HTTP {status})") from None
-    except ValueError:
-        # `resp.json()` on a body that is not JSON. Listed BEFORE
-        # `RequestException`: `requests.JSONDecodeError` is both.
-        raise ObservationRefused("the schema-observation answer was not JSON") from None
-    except requests.RequestException as exc:
-        raise ObservationUnreachable(f"the API could not be reached ({type(exc).__name__})") from None
+    body = _post_json(cfg, f"/api/connectors/{connector_id}/schema-observations", payload, "schema observation")
     return _parse_decision(body)
+
+
+# Most table names one request carries: the API refuses more (`MAX_TABLES` in
+# `routes/schema_changes.rs`). Keep both in step.
+MAX_TABLES_PER_REQUEST = 2000
+
+
+@dataclass(frozen=True)
+class NewTablesAnswer:
+    """`added` are the tables now selected by the connector; `not_added` are
+    `{"table", "reason"}` objects (the API's fixed texts)."""
+
+    added: list[str]
+    not_added: list[dict[str, Any]]
+
+
+def post_new_tables(
+    cfg: ObserverConfig, connector_id: str, tables: Sequence[str], run_id: str | None
+) -> NewTablesAnswer:
+    """Tell the API about tables that appeared in a schema the connector
+    already loads from (`SRC-8` decision D2, policy `apply_all`) and return
+    which it added to the connector.
+
+    # Errors
+
+    As [`post_observation`]; also `ValueError` for more than
+    `MAX_TABLES_PER_REQUEST` names (the caller sends them in chunks).
+    """
+    if len(tables) > MAX_TABLES_PER_REQUEST:
+        raise ValueError(f"at most {MAX_TABLES_PER_REQUEST} tables per request, got {len(tables)}")
+    payload: dict[str, Any] = {"tables": list(tables)}
+    if run_id:
+        payload["runId"] = run_id
+    body = _post_json(cfg, f"/api/connectors/{connector_id}/schema-observations/tables", payload, "new-table report")
+    added, not_added = (body.get("added"), body.get("notAdded")) if isinstance(body, dict) else (None, None)
+    if not (isinstance(added, list) and all(isinstance(t, str) for t in added)) or not (
+        isinstance(not_added, list) and all(isinstance(n, dict) for n in not_added)
+    ):
+        raise ObservationRefused("the answer to the new-table report was not an added/notAdded list")
+    return NewTablesAnswer(added=added, not_added=not_added)

@@ -401,6 +401,79 @@ def _observe_after_load(
         )
 
 
+def _schemas_loaded(source_objects: list[dict]) -> list[str]:
+    """The schemas a connector already loads at least one table from, in the
+    order they first appear: the part of each `<schema>.<table>` name before
+    its first dot (the split `BronzeIngestConfig.from_dial` makes). A name
+    with no dot has no schema to list."""
+    schemas: list[str] = []
+    for obj in source_objects:
+        schema, dot, _ = obj["name"].partition(".")
+        if dot and schema and schema not in schemas:
+            schemas.append(schema)
+    return schemas
+
+
+def _discover_new_tables(connector: dict, run_id: str | None) -> bool:
+    """Tell the API about tables that appeared in a schema this connector
+    already loads from, once per run and only under the policy that asks for
+    it (`SRC-8` decision D2: `apply_all`; PostgreSQL, MySQL/MariaDB and SQL
+    Server only). Returns whether the API added any, so the caller re-reads
+    the connector and loads them in THIS run.
+
+    The listing is a connection of its own, guarded like the loads
+    (`adapters/sql.py::list_tables`). It never stops the run: nothing is
+    loaded unchecked because of it, and the tables already selected must keep
+    loading even when a listing fails (a timeout, a revoked privilege on
+    `information_schema`), so a failure is a warning that names the exception
+    type (or an observer error's fixed message), never a secret, and the new
+    tables are asked for again on the next run.
+    """
+    dial = connector.get("dial") or {}
+    driver = dial.get("driver")
+    if (
+        connector.get("adapter") != "sql"
+        or connector.get("schemaChangePolicy") != "apply_all"
+        or driver not in sql_adapter.LISTABLE_DRIVERS
+    ):
+        return False
+    objects = connector.get("sourceObjects") or []
+    schemas = _schemas_loaded(objects)
+    if not schemas:
+        return False
+    try:
+        secrets = _resolve_object_secrets(connector, "sql", dial)
+        listed = sql_adapter.list_tables(dial, secrets, schemas)
+        selected = {obj["name"] for obj in objects}
+        new = [
+            f"{schema}.{table}"
+            for schema in schemas
+            for table in listed.get(schema, [])
+            if f"{schema}.{table}" not in selected
+        ]
+        if not new:
+            return False
+        cfg = schema_observer.ObserverConfig.from_env()
+        size = schema_observer.MAX_TABLES_PER_REQUEST
+        added = False
+        for start in range(0, len(new), size):
+            answer = schema_observer.post_new_tables(cfg, connector["id"], new[start : start + size], run_id)
+            added = added or bool(answer.added)
+        return added
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        detail = (
+            str(exc)
+            if isinstance(exc, (schema_observer.ObservationRefused, schema_observer.ObservationUnreachable))
+            else _classify_exception(exc)
+        )
+        logger.warning(
+            "new tables of connector %r could not be looked for (the tables it already has still load): %s",
+            connector.get("id"),
+            detail,
+        )
+        return False
+
+
 # What an `ingest_run` row says when a table waits for a schema-change
 # decision (SRC-8, D7). Fixed text: nothing from the source or the API.
 _WAITING_MESSAGE = "waiting for a decision on a schema change at the source"
@@ -873,6 +946,12 @@ def run_ingest(context) -> Any:
     body via the existing `_resolve_object_secrets`/`secret_resolver`
     path; the fan-out's payload never crosses that line.
 
+    Before the fan-out, a connector on the `apply_all` schema-change policy
+    asks the API to add the tables that appeared in a schema it already
+    loads (`_discover_new_tables`, `SRC-8` decision D2). Tables the API adds
+    are loaded in this same run: the connector is read again after the add, so
+    the fan-out sees them. A failure of that step never stops the run.
+
     Two source objects whose sanitized targets collide raise
     `Failure(allow_retries=False)` -- they would otherwise collapse
     into one mapped step doing two objects' work, which Dagster's
@@ -896,6 +975,11 @@ def run_ingest(context) -> Any:
         # build_source() call per sourceObjects entry.
         _run_stream_connector(connector, run_id=context.run_id)
         return
+    if _discover_new_tables(connector, context.run_id):
+        # Added in this run, loaded in this run: the API wrote them to the
+        # connector's tables, so one more read of the connector (the same call
+        # that started this run) fans out over the new list.
+        connector = _fetch_one_connector(cfg, connector_id)
     seen: dict[str, str] = {}
     for obj in connector.get("sourceObjects", []):
         target = obj["target"]

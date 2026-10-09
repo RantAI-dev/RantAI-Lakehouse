@@ -241,3 +241,42 @@ def test_keep_only_leaves_the_unlisted_column_out_of_the_rows_that_would_load(tm
     )
     rows = [row for batch in source.resources["src"] for row in (batch if isinstance(batch, list) else [batch])]
     assert rows == [{"a": 1, "b": "x"}]
+
+
+# --- the new-table report (SRC-8 task 8) --------------------------------------
+
+
+def test_new_tables_are_posted_to_the_tables_route_and_the_answer_is_parsed(monkeypatch) -> None:
+    calls = _post(
+        monkeypatch,
+        _Resp(body={"added": ["public.b"], "notAdded": [{"table": "public.a", "reason": "Not added: ..."}]}),
+    )
+    answer = so.post_new_tables(_cfg(), "conn-a", ["public.a", "public.b"], "run-1")
+    assert calls[0]["url"] == "http://api.test/api/connectors/conn-a/schema-observations/tables"
+    assert calls[0]["json"] == {"tables": ["public.a", "public.b"], "runId": "run-1"}
+    assert calls[0]["headers"] == {"Authorization": f"Bearer {TOKEN}"}
+    assert calls[0]["timeout"] == 10
+    assert answer == so.NewTablesAnswer(
+        added=["public.b"], not_added=[{"table": "public.a", "reason": "Not added: ..."}]
+    )
+
+
+def test_a_409_on_the_tables_route_is_refused_and_a_5xx_is_unreachable(monkeypatch) -> None:
+    _post(monkeypatch, _Resp(status=409))
+    with pytest.raises(so.ObservationRefused, match="409"):
+        so.post_new_tables(_cfg(), "conn-a", ["a.b"], None)
+    _post(monkeypatch, _Resp(status=503))
+    with pytest.raises(so.ObservationUnreachable):
+        so.post_new_tables(_cfg(), "conn-a", ["a.b"], None)
+
+
+@pytest.mark.parametrize("body", [None, {}, {"added": "x", "notAdded": []}, {"added": [], "notAdded": ["x"]}])
+def test_an_answer_that_is_not_an_added_and_not_added_list_is_refused(monkeypatch, body) -> None:
+    _post(monkeypatch, _Resp(body=body))
+    with pytest.raises(so.ObservationRefused):
+        so.post_new_tables(_cfg(), "conn-a", ["a.b"], None)
+
+
+def test_more_tables_than_the_api_accepts_in_one_request_is_a_programming_error() -> None:
+    with pytest.raises(ValueError):
+        so.post_new_tables(_cfg(), "conn-a", [f"s.t{i}" for i in range(so.MAX_TABLES_PER_REQUEST + 1)], None)

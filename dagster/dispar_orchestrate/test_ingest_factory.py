@@ -1897,3 +1897,185 @@ def test_a_failing_post_never_fails_a_kafka_micro_batch(monkeypatch, observation
         consumer=_FakeStreamConsumer(),
     )
     assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+# --- SRC-8 task 8: new tables under "apply all" (decision D2) -----------------
+
+
+def _apply_all_connector(driver: str = "postgres", policy: str = "apply_all", names=("public.orders", "sales.items")):
+    return {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "schemaChangePolicy": policy,
+        "dial": {"driver": driver, "host": "db.internal", "port": 5432, "database": "shop", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+        "sourceObjects": [{"name": n, "target": n.replace(".", "_")} for n in names],
+    }
+
+
+class _Discovery:
+    def __init__(self) -> None:
+        self.listed: list = []
+        self.posts: list = []
+        self.tables = {"public": ["orders", "customers"], "sales": ["items", "returns"]}
+        self.answer_added = True
+
+
+@pytest.fixture
+def discovery(monkeypatch):
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import schema_observer
+
+    d = _Discovery()
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    def fake_list_tables(spec, secrets, schemas, **kwargs):
+        d.listed.append((spec["driver"], secrets, list(schemas)))
+        return {schema: d.tables[schema] for schema in schemas}
+
+    def fake_post_new_tables(cfg, connector_id, tables, run_id):
+        d.posts.append((connector_id, list(tables), run_id))
+        return schema_observer.NewTablesAnswer(added=list(tables) if d.answer_added else [], not_added=[])
+
+    monkeypatch.setattr(f.sql_adapter, "list_tables", fake_list_tables)
+    monkeypatch.setattr(f.schema_observer, "post_new_tables", fake_post_new_tables)
+    return d
+
+
+def test_the_tables_of_each_schema_already_loaded_are_listed_and_the_new_ones_posted(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    added = f._discover_new_tables(_apply_all_connector(), "run-3")
+
+    assert added is True
+    assert discovery.listed == [("postgres", {"password": "s3cret"}, ["public", "sales"])]
+    # Only tables not already selected, in schema order, with the run id.
+    assert discovery.posts == [("conn-pg", ["public.customers", "sales.returns"], "run-3")]
+
+
+@pytest.mark.parametrize("driver", ["postgres", "mysql", "mariadb", "mssql"])
+def test_apply_all_connectors_of_the_four_listable_drivers_are_looked_at(discovery, driver) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    assert f._discover_new_tables(_apply_all_connector(driver), None) is True
+    assert discovery.listed[0][0] == driver
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        _apply_all_connector(policy="apply_non_breaking"),
+        _apply_all_connector(policy="ask_first"),
+        _apply_all_connector(policy="pause"),
+        _apply_all_connector("oracle"),
+        {**_apply_all_connector(), "adapter": "files"},
+        {k: v for k, v in _apply_all_connector().items() if k != "schemaChangePolicy"},
+        _apply_all_connector(names=("orders",)),  # no schema to list
+    ],
+)
+def test_nothing_is_listed_for_any_other_policy_driver_adapter_or_schemaless_tables(discovery, connector) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    assert f._discover_new_tables(connector, None) is False
+    assert discovery.listed == [] and discovery.posts == []
+
+
+def test_nothing_is_posted_when_every_listed_table_is_already_selected(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.tables = {"public": ["orders"], "sales": ["items"]}
+    assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert discovery.posts == []
+
+
+def test_a_batch_larger_than_the_api_accepts_is_sent_in_chunks(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.tables = {"public": [f"t{i:05d}" for i in range(4500)], "sales": []}
+    f._discover_new_tables(_apply_all_connector(names=("public.orders",)), None)
+    assert [len(tables) for _, tables, _ in discovery.posts] == [2000, 2000, 500]
+
+
+def test_the_api_adding_nothing_means_the_run_goes_on_with_the_tables_it_has(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.answer_added = False
+    assert f._discover_new_tables(_apply_all_connector(), None) is False
+
+
+def test_a_failing_listing_or_post_never_stops_the_run_and_logs_only_a_safe_text(
+    monkeypatch, discovery, caplog
+) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(
+        f.sql_adapter, "list_tables", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("db.internal:5432 s3cret"))
+    )
+    with caplog.at_level(logging.WARNING):
+        assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert "ConnectionError" in caplog.text and "the tables it already has still load" in caplog.text
+    assert "s3cret" not in caplog.text and "db.internal" not in caplog.text
+
+
+def test_a_refused_new_table_report_never_stops_the_run_either(monkeypatch, discovery, caplog) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f.sql_adapter, "list_tables", lambda spec, secrets, schemas, **k: {s: ["new"] for s in schemas})
+
+    def refused(*args, **kwargs):
+        raise f.schema_observer.ObservationRefused("the API refused the new-table report (HTTP 409)")
+
+    monkeypatch.setattr(f.schema_observer, "post_new_tables", refused)
+    with caplog.at_level(logging.WARNING):
+        assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert "HTTP 409" in caplog.text
+
+
+def test_tables_the_api_added_are_loaded_in_the_same_run(monkeypatch, discovery) -> None:
+    """After the add, `run_ingest` reads the connector again, so the fan-out
+    covers the new tables: three mapped steps, not two."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    before = _apply_all_connector(names=("public.orders",))
+    after = {
+        **before,
+        "sourceObjects": before["sourceObjects"]
+        + [{"name": "public.customers", "target": "bronze_customers", "loadMode": "replace"}],
+    }
+    reads: list = []
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: reads.append(cid) or (before if len(reads) == 1 else after))
+    discovery.tables = {"public": ["orders", "customers"]}
+    ran: list = []
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: ran.append(obj["name"]) or 1)
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+
+    assert result.success
+    assert reads == ["conn-pg", "conn-pg"]
+    assert sorted(ran) == ["public.customers", "public.orders"]
+
+
+def test_a_connector_that_gained_no_tables_is_read_once(monkeypatch, discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    discovery.answer_added = False
+    reads: list = []
+    connector = _apply_all_connector(names=("public.orders",))
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: reads.append(cid) or connector)
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: 1)
+    discovery.tables = {"public": ["orders", "customers"]}
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+    assert result.success and reads == ["conn-pg"]

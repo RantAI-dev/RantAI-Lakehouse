@@ -554,6 +554,10 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/schema-observations",
             axum::routing::post(schema_changes::observe),
         )
+        .route(
+            "/api/connectors/{id}/schema-observations/tables",
+            axum::routing::post(schema_changes::new_tables),
+        )
         .merge(per_connector)
 }
 

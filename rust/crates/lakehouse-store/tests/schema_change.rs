@@ -9,14 +9,16 @@
 
 use lakehouse_test_support as _;
 
+use lakehouse_store::StoreError;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, UpdateConnectorInput,
-    create_connector, delete_connector, get_connector, list_ingestible_connectors,
-    update_connector,
+    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
+    UpdateConnectorInput, create_connector, delete_connector, get_connector, get_ingest_spec,
+    list_ingestible_connectors, set_ingest_spec, update_connector,
 };
 use lakehouse_store::schema_change::{
     ChangeKind, ChangeStatus, NewChange, ObservationTx, ObservationWrite, ObservedColumn,
-    SCHEMA_CHANGE_PAUSE_REASON, approve_object, list_inactive_columns, list_pending, list_recent,
+    SCHEMA_CHANGE_PAUSE_REASON, TableCandidate, TableRefusal, approve_object,
+    list_inactive_columns, list_pending, list_recent, record_table_additions,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -383,4 +385,273 @@ async fn deleting_a_connector_removes_its_schema_rows(pool: PgPool) -> sqlx::Res
         assert_eq!(count, 0, "{table}");
     }
     Ok(())
+}
+
+// --- SRC-8 task 8: tables that appear at the source (decision D2) -------------
+
+/// A connector with an ingest spec: a `PostgreSQL` dial and one table.
+async fn connector_with_spec(pool: &PgPool) -> String {
+    let id = connector(pool).await;
+    set_ingest_spec(
+        pool,
+        &id,
+        &IngestSpecInput {
+            adapter: "sql".to_owned(),
+            ingest_mode: "batch".to_owned(),
+            dial: serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "shop", "user": "reader",
+            }),
+            source_objects: serde_json::json!([
+                {"name": "public.orders", "target": "schema_change_test_orders", "loadMode": "append"}
+            ]),
+            schedule_cron: Some("0 2 * * *".to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    id
+}
+
+fn candidate(name: &str, target: &str, refusal: Option<TableRefusal>) -> TableCandidate {
+    TableCandidate {
+        name: name.to_owned(),
+        target: target.to_owned(),
+        refusal,
+    }
+}
+
+async fn objects(pool: &PgPool, id: &str) -> serde_json::Value {
+    get_ingest_spec(pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .source_objects
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_added_table_joins_the_connectors_tables_with_load_mode_replace_and_is_listed_as_applied(
+    pool: PgPool,
+) {
+    let id = connector_with_spec(&pool).await;
+    let before = get_ingest_spec(&pool, &id).await.unwrap().unwrap();
+
+    let result = record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.customers",
+            "schema_change_test_customers",
+            None,
+        )],
+        Some("run-1"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.added, ["public.customers"]);
+    assert!(result.not_added.is_empty());
+    assert_eq!(
+        objects(&pool, &id).await,
+        serde_json::json!([
+            {"name": "public.orders", "target": "schema_change_test_orders", "loadMode": "append"},
+            {"name": "public.customers", "target": "schema_change_test_customers", "loadMode": "replace"},
+        ])
+    );
+    // Everything else of the spec is written back as it was: SEC-14's
+    // re-point rule saw the same target identity.
+    let after = get_ingest_spec(&pool, &id).await.unwrap().unwrap();
+    assert_eq!(after.dial, before.dial);
+    assert_eq!(after.adapter, before.adapter);
+    assert_eq!(after.schedule_cron, before.schedule_cron);
+
+    let [change] = &result.changes[..] else {
+        panic!("one change")
+    };
+    assert!(change.is_new);
+    assert_eq!(change.change.kind, "table_added");
+    assert_eq!(change.change.object_name, "public.customers");
+    assert_eq!(change.change.status, "applied");
+    assert_eq!(
+        change.change.after_value.as_deref(),
+        Some("schema_change_test_customers")
+    );
+    assert_eq!(change.change.run_id.as_deref(), Some("run-1"));
+    assert!(!change.change.breaking);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_identical_request_adds_nothing_and_writes_no_row(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    let ask = [candidate(
+        "public.customers",
+        "schema_change_test_customers",
+        None,
+    )];
+    record_table_additions(&pool, &id, &ask, None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let stored = objects(&pool, &id).await;
+
+    let again = record_table_additions(&pool, &id, &ask, None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    assert!(again.added.is_empty() && again.not_added.is_empty() && again.changes.is_empty());
+    assert_eq!(objects(&pool, &id).await, stored);
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM connector_schema_change WHERE connector_id = $1 AND kind = 'table_added'",
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_table_the_caller_refused_is_not_added_and_waits_with_the_fixed_reason(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    let stored = objects(&pool, &id).await;
+
+    let result = record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.files",
+            "taken_elsewhere",
+            Some(TableRefusal::ReservedForUploads),
+        )],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.added.is_empty());
+    assert_eq!(
+        result.not_added,
+        [("public.files".to_owned(), TableRefusal::ReservedForUploads)]
+    );
+    assert_eq!(objects(&pool, &id).await, stored, "nothing was appended");
+    let [change] = &result.changes[..] else {
+        panic!("one change")
+    };
+    assert_eq!(change.change.status, "pending");
+    assert_eq!(
+        change.change.after_value.as_deref(),
+        Some(TableRefusal::ReservedForUploads.reason())
+    );
+    // The same refusal, seen again, is the same pending row and is not new.
+    let again = record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.files",
+            "taken_elsewhere",
+            Some(TableRefusal::ReservedForUploads),
+        )],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert!(!again.changes[0].is_new);
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_target_one_of_the_connectors_own_tables_already_uses_is_refused_under_the_lock(
+    pool: PgPool,
+) {
+    let id = connector_with_spec(&pool).await;
+
+    let result = record_table_additions(
+        &pool,
+        &id,
+        &[
+            // Same target as the stored `public.orders`.
+            candidate("archive.orders", "schema_change_test_orders", None),
+            // Two new tables that would land together: the first wins.
+            candidate("public.a", "shared", None),
+            candidate("public.b", "shared", None),
+        ],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.added, ["public.a"]);
+    assert_eq!(
+        result.not_added,
+        [
+            ("archive.orders".to_owned(), TableRefusal::TargetTaken),
+            ("public.b".to_owned(), TableRefusal::TargetTaken),
+        ]
+    );
+    let names: Vec<String> = objects(&pool, &id)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["public.orders", "public.a"]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_connector_without_an_ingest_spec_cannot_take_tables_and_nothing_is_written(
+    pool: PgPool,
+) {
+    let id = connector(&pool).await;
+    let err = record_table_additions(
+        &pool,
+        &id,
+        &[candidate("public.customers", "t", None)],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)), "got {err:?}");
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM connector_schema_change WHERE connector_id = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_connector_is_not_found(pool: PgPool) {
+    let err = record_table_additions(
+        &pool,
+        "conn-nope",
+        &[candidate("public.customers", "t", None)],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ingestible_list_carries_the_schema_change_policy(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    sqlx::query("UPDATE connector SET schema_change_policy = 'apply_all' WHERE id = $1")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let listed = list_ingestible_connectors(&pool).await.unwrap();
+    let mine = listed.iter().find(|c| c.id == id).unwrap();
+    assert_eq!(mine.schema_change_policy, "apply_all");
+    assert_eq!(
+        serde_json::to_value(mine).unwrap()["schemaChangePolicy"],
+        "apply_all"
+    );
 }

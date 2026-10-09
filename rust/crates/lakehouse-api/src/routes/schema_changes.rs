@@ -44,11 +44,14 @@ use lakehouse_alerts::AlertKind;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::audit as store_audit;
+use lakehouse_store::connectors as store_connectors;
+use lakehouse_store::ingest_spec::default_bronze_target;
 use lakehouse_store::schema_change::{
     self, InactiveColumn, ObservationTx, ObservationWrite, ObservedColumn, RecordedChange,
-    SchemaChange, SchemaChangePolicy,
+    SchemaChange, SchemaChangePolicy, TableCandidate, TableRefusal,
 };
 use lakehouse_store::schema_diff::{Action, Decision, TableShape, evaluate};
+use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -73,6 +76,19 @@ const MAX_RUN_ID_LEN: usize = 128;
 const RECENT_CHANGES: i64 = 50;
 /// The `source` label of the `alert_instance` written for a schema change.
 const SCHEMA_SOURCE: &str = "Schema changes";
+
+/// Most table names one `POST .../schema-observations/tables` may carry.
+const MAX_TABLES: usize = 2000;
+
+/// Fixed 409 text: the connector's policy is not `apply_all` (decision D2),
+/// so the orchestrator should not have asked.
+const NOT_APPLY_ALL: &str = "This connector's schema-change policy is not \"Apply all changes\", \
+     so new tables are not added on their own.";
+
+/// Fixed 409 text: only batch SQL sources the orchestrator can list the tables
+/// of (`PostgreSQL`, `MySQL`/`MariaDB`, SQL Server) take new tables on their own.
+const TABLES_NOT_SUPPORTED: &str =
+    "New tables are added on their own only for PostgreSQL, MySQL, MariaDB and SQL Server sources.";
 
 /// Fixed 500 text for a stored policy this code does not know.
 const UNKNOWN_POLICY: &str = "the connector's schema-change policy is not one this version knows";
@@ -116,6 +132,38 @@ pub struct ObservationResponse {
     /// The changes of this observation: those applied now and those that
     /// wait (a still-waiting change is listed again, not as new).
     changes: Vec<SchemaChange>,
+}
+
+/// The `POST .../schema-observations/tables` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NewTablesBody {
+    /// `<schema>.<table>` of tables that appeared in a schema the connector
+    /// already loads from and that it does not select yet.
+    tables: Vec<String>,
+    /// The run that found them.
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+/// A table that was not added, and why (a fixed text).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotAdded {
+    /// `<schema>.<table>`.
+    table: String,
+    /// One of the fixed texts of `TableRefusal::reason`.
+    reason: &'static str,
+}
+
+/// The answer to `POST .../schema-observations/tables`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewTablesResponse {
+    /// Tables now selected by the connector (load mode `replace`).
+    added: Vec<String>,
+    /// Tables left out, each with the reason.
+    not_added: Vec<NotAdded>,
 }
 
 /// `GET .../schema-changes`.
@@ -237,6 +285,19 @@ fn shape_for_phase(
     }
 }
 
+/// `ingest:read` is also a user's permission; only the orchestrator (or an
+/// unrestricted administrator) reports what a source looks like.
+fn require_orchestrator(principal: &Principal) -> Result<(), ApiError> {
+    if matches!(principal.id, PrincipalId::Service(_))
+        || crate::routes::catalog::is_unrestricted(principal)
+    {
+        return Ok(());
+    }
+    Err(ApiError::PermissionDenied(
+        "only the orchestrator's service identity reports source schemas".to_owned(),
+    ))
+}
+
 /// `POST /api/connectors/{id}/schema-observations` -- see the module doc.
 ///
 /// # Errors
@@ -251,16 +312,7 @@ pub async fn observe(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<ObservationResponse>> {
-    // `ingest:read` is also a user's permission; only the orchestrator (or
-    // an unrestricted administrator) reports what a source looks like.
-    if !matches!(principal.id, PrincipalId::Service(_))
-        && !crate::routes::catalog::is_unrestricted(&principal)
-    {
-        return Err(ApiError::PermissionDenied(
-            "only the orchestrator's service identity reports source schemas".to_owned(),
-        )
-        .into());
-    }
+    require_orchestrator(&principal)?;
     let req: ObservationBody = parse_body(&body)?;
     validate(&req)?;
     let pool = pool(&state)?;
@@ -316,6 +368,182 @@ pub async fn observe(
     )
     .await;
     Ok(ApiJson(response(&decision, recorded)))
+}
+
+/// Bound and sanity-check a list of new tables, dropping repeats and keeping
+/// the order. Pure: unit-tested below.
+///
+/// # Errors
+///
+/// 400 for an empty list, more than 2,000 names, a blank, oversize or
+/// control-character name, or a bad run id.
+fn validate_tables(body: &NewTablesBody) -> Result<Vec<&str>, ApiError> {
+    if body.tables.is_empty() {
+        return Err(ApiError::BadRequest(
+            "tables must not be empty: there is nothing to add".to_owned(),
+        ));
+    }
+    if body.tables.len() > MAX_TABLES {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_TABLES} tables can be added in one request"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::with_capacity(body.tables.len());
+    for table in &body.tables {
+        check_name("table", table, MAX_NAME_LEN)?;
+        if seen.insert(table.as_str()) {
+            names.push(table.as_str());
+        }
+    }
+    if let Some(run_id) = &body.run_id {
+        check_name("runId", run_id, MAX_RUN_ID_LEN)?;
+    }
+    Ok(names)
+}
+
+/// Whether the dial's driver is one whose tables the orchestrator lists
+/// (`adapters/sql.py::list_tables`): `PostgreSQL`, `MySQL` (which also carries
+/// `MariaDB`: there is no `mariadb` driver value, `SqlDriver`) and SQL Server.
+fn lists_tables(adapter: Option<&str>, dial: &serde_json::Value) -> bool {
+    adapter == Some("sql")
+        && matches!(
+            dial.get("driver").and_then(serde_json::Value::as_str),
+            Some("postgres" | "mysql" | "mssql")
+        )
+}
+
+/// `POST /api/connectors/{id}/schema-observations/tables` -- add the tables
+/// that appeared in a schema the connector already loads from (`SRC-8`
+/// decision D2). Only for a connector on the `apply_all` policy; the
+/// orchestrator asks once per run.
+///
+/// Each new table gets the Bronze target the console's table picker would
+/// give it (`default_bronze_target`) and load mode `replace`, and is appended
+/// to the connector's tables through the store's ingest-spec write, so every
+/// check a person's save goes through (and `SEC-14`'s re-point rule, which
+/// sees an unchanged target) applies. A table whose target another connector
+/// or another table uses, or which uploads reserved, is NOT added: it is
+/// listed as a `table_added` change that waits, with a fixed reason, and
+/// answered under `notAdded`. A table the connector already selects is left
+/// out of both lists, so a second identical request adds nothing. One alert
+/// for the batch.
+///
+/// # Errors
+///
+/// 403 for a caller that is neither the orchestrator's service identity nor an
+/// unrestricted administrator; 400 for an invalid body; 404 for an unknown
+/// connector; 409 with a fixed text when the connector's policy is not
+/// `apply_all` or its source is not one the orchestrator lists tables of;
+/// 503/500 as the store reports.
+pub async fn new_tables(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<NewTablesResponse>> {
+    require_orchestrator(&principal)?;
+    let req: NewTablesBody = parse_body(&body)?;
+    let names = validate_tables(&req)?;
+    let pool = pool(&state)?;
+    let detail = store_connectors::get_connector(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let Some(policy) = SchemaChangePolicy::parse(&detail.connector.schema_change_policy) else {
+        tracing::error!(connector_id = %id, "connector has an unknown schema-change policy");
+        return Err(ApiError::Internal(UNKNOWN_POLICY.to_owned()).into());
+    };
+    if policy != SchemaChangePolicy::ApplyAll {
+        return Err(ApiError::Conflict(NOT_APPLY_ALL.to_owned()).into());
+    }
+    let spec = store_connectors::get_ingest_spec(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    if !lists_tables(spec.adapter.as_deref(), &spec.dial) {
+        return Err(ApiError::Conflict(TABLES_NOT_SUPPORTED.to_owned()).into());
+    }
+    let selected: std::collections::HashSet<&str> = spec
+        .source_objects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+
+    let mut candidates = Vec::with_capacity(names.len());
+    for name in names.into_iter().filter(|name| !selected.contains(name)) {
+        let target = default_bronze_target(&detail.connector.name, name);
+        // The same two questions `ingest_spec_put` asks of a target
+        // (`refuse_uploaded_targets` and the connector-to-connector rule),
+        // answered per table here instead of failing the whole request.
+        let refusal = if uploads::table_claimed(pool, &target).await? {
+            Some(TableRefusal::ReservedForUploads)
+        } else if store_connectors::any_connector_targets(pool, &target).await? {
+            Some(TableRefusal::TargetTaken)
+        } else {
+            None
+        };
+        candidates.push(TableCandidate {
+            name: name.to_owned(),
+            target,
+            refusal,
+        });
+    }
+    let outcome = schema_change::record_table_additions(
+        pool,
+        &id,
+        &candidates,
+        req.run_id.as_deref(),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    announce_tables(&state, pool, &id, &detail.connector.name, &outcome).await;
+    Ok(ApiJson(NewTablesResponse {
+        added: outcome.added,
+        not_added: outcome
+            .not_added
+            .into_iter()
+            .map(|(table, refusal)| NotAdded {
+                table,
+                reason: refusal.reason(),
+            })
+            .collect(),
+    }))
+}
+
+/// One `connector_schema_change` alert for a batch of tables, when any of its
+/// changes is new (a refusal seen again raises nothing). Names and counts
+/// only; best effort like [`announce`].
+async fn announce_tables(
+    state: &AppState,
+    pool: &lakehouse_store::PgPool,
+    connector_id: &str,
+    connector_name: &str,
+    outcome: &schema_change::TableAdditions,
+) {
+    let new = outcome.changes.iter().filter(|r| r.is_new).count();
+    if new == 0 {
+        return;
+    }
+    let text = format!(
+        "Connector {connector_name} ({connector_id}): {new} new table(s) appeared at the source, \
+         {} added, {} not added. View: /connectors/{connector_id}",
+        outcome.added.len(),
+        outcome.not_added.len(),
+    );
+    if let Err(err) = deliver_event(
+        state,
+        pool,
+        AlertKind::ConnectorSchemaChange,
+        connector_id,
+        "Source schema changed",
+        &text,
+        Some(SCHEMA_SOURCE),
+    )
+    .await
+    {
+        tracing::warn!(?err, connector_id, "new-table alert was not delivered");
+    }
 }
 
 fn response(decision: &Decision, recorded: Vec<RecordedChange>) -> ObservationResponse {
@@ -1203,5 +1431,317 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    // --- SRC-8 task 8: new tables under "apply all" (decision D2) -----------
+
+    /// Give connector `id` an ingest spec: a `PostgreSQL` dial and one table.
+    async fn with_spec(h: &Harness, id: &str, adapter: &str, driver: &str) {
+        let pool = h.state.pg.as_deref().expect("pool");
+        lakehouse_store::connectors::set_ingest_spec(
+            pool,
+            id,
+            &lakehouse_store::connectors::IngestSpecInput {
+                adapter: adapter.to_owned(),
+                ingest_mode: "batch".to_owned(),
+                dial: json!({
+                    "driver": driver, "host": "db.internal", "port": 5432,
+                    "database": "shop", "user": "reader",
+                }),
+                source_objects: json!([{"name": "public.orders", "target": "taken_by_orders"}]),
+                schedule_cron: None,
+            },
+        )
+        .await
+        .expect("an ingest spec");
+    }
+
+    async fn post_tables(
+        h: &Harness,
+        who: &Principal,
+        id: &str,
+        tables: Value,
+    ) -> (StatusCode, Value) {
+        call(
+            h,
+            who,
+            "POST",
+            &format!("/api/connectors/{id}/schema-observations/tables"),
+            Some(json!({ "tables": tables, "runId": "run-t" })),
+        )
+        .await
+    }
+
+    async fn selected(pool: &sqlx::PgPool, id: &str) -> Vec<(String, String)> {
+        lakehouse_store::connectors::get_ingest_spec(pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .source_objects
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                (
+                    o["name"].as_str().unwrap().to_owned(),
+                    o["target"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Spec "Per-connector policy" (D2): a table that appeared joins the
+    /// connector with the console picker's target and is listed as applied.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_new_table_is_added_with_the_pickers_target_and_listed_as_applied(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "Shop DB", "apply_all").await;
+        with_spec(&h, &id, "sql", "postgres").await;
+
+        let (status, answer) = post_tables(
+            &h,
+            &service(),
+            &id,
+            json!(["public.orders", "public.Order Details", "public.customers"]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        // `public.orders` is already selected: in neither list.
+        assert_eq!(
+            answer,
+            json!({
+                "added": ["public.Order Details", "public.customers"],
+                "notAdded": [],
+            })
+        );
+        assert_eq!(
+            selected(&pool, &id).await,
+            [
+                ("public.orders".to_owned(), "taken_by_orders".to_owned()),
+                (
+                    "public.Order Details".to_owned(),
+                    "shop_db_order_details".to_owned()
+                ),
+                (
+                    "public.customers".to_owned(),
+                    "shop_db_customers".to_owned()
+                ),
+            ]
+        );
+        let (status, listed) = call(
+            &h,
+            &user(&[h.tenant]),
+            "GET",
+            &format!("/api/connectors/{id}/schema-changes"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let recent = listed["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        for change in recent {
+            assert_eq!(change["kind"], "table_added");
+            assert_eq!(change["status"], "applied");
+            assert_eq!(change["runId"], "run-t");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_taken_target_is_listed_as_not_added_with_the_reason(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "Shop DB", "apply_all").await;
+        with_spec(&h, &id, "sql", "postgres").await;
+        // Another connector already lands in `shop_db_customers`.
+        let other = connector(&h, "Other", "apply_all").await;
+        with_spec(&h, &other, "sql", "postgres").await;
+        sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+            .bind(&other)
+            .bind(json!([{"name": "s.c", "target": "shop_db_customers"}]))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (status, answer) = post_tables(
+            &h,
+            &service(),
+            &id,
+            json!(["public.customers", "public.invoices"]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["added"], json!(["public.invoices"]));
+        assert_eq!(answer["notAdded"][0]["table"], "public.customers");
+        assert_eq!(
+            answer["notAdded"][0]["reason"],
+            TableRefusal::TargetTaken.reason()
+        );
+        assert_eq!(
+            selected(&pool, &id).await.len(),
+            2,
+            "orders and invoices only"
+        );
+        let pending: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT object_name, status, after_value FROM connector_schema_change \
+             WHERE connector_id = $1 AND status = 'pending'",
+        )
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending,
+            [(
+                "public.customers".to_owned(),
+                "pending".to_owned(),
+                Some(TableRefusal::TargetTaken.reason().to_owned())
+            )]
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_target_reserved_for_uploads_is_not_added(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "Shop DB", "apply_all").await;
+        with_spec(&h, &id, "sql", "postgres").await;
+        sqlx::query("INSERT INTO upload_table_claim (bronze_table, upload_id) VALUES ('shop_db_files', 'up-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (status, answer) = post_tables(&h, &service(), &id, json!(["public.files"])).await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["added"], json!([]));
+        assert_eq!(
+            answer["notAdded"][0]["reason"],
+            TableRefusal::ReservedForUploads.reason()
+        );
+        assert_eq!(selected(&pool, &id).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_second_identical_post_adds_nothing_and_alerts_once(pool: sqlx::PgPool) {
+        let h0 = harness(&pool, &[]).await;
+        let id = connector(&h0, "Shop DB", "apply_all").await;
+        let h = harness(&pool, &[("al-t", "connector_schema_change", &id)]).await;
+        with_spec(&h, &id, "sql", "postgres").await;
+        let tables = json!(["public.customers", "public.invoices"]);
+
+        let (_, first) = post_tables(&h, &service(), &id, tables.clone()).await;
+        let stored = selected(&pool, &id).await;
+        let (status, second) = post_tables(&h, &service(), &id, tables).await;
+
+        assert_eq!(first["added"].as_array().unwrap().len(), 2);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second, json!({"added": [], "notAdded": []}));
+        assert_eq!(selected(&pool, &id).await, stored);
+        let alerts = posts(&h, "al-t").await;
+        assert_eq!(
+            alerts.len(),
+            1,
+            "one alert for the batch, none for the repeat"
+        );
+        for needle in [
+            "Shop DB",
+            id.as_str(),
+            "2 new table(s)",
+            "2 added",
+            "/connectors/",
+        ] {
+            assert!(
+                alerts[0].contains(needle),
+                "{needle} missing from {}",
+                alerts[0]
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_policy_other_than_apply_all_gets_409_and_nothing_is_added(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        for policy in ["apply_non_breaking", "ask_first", "pause"] {
+            let id = connector(&h, &format!("p {policy}"), policy).await;
+            with_spec(&h, &id, "sql", "postgres").await;
+            let (status, answer) =
+                post_tables(&h, &service(), &id, json!(["public.customers"])).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{policy}");
+            assert_eq!(answer["error"], NOT_APPLY_ALL, "{policy}");
+            assert_eq!(selected(&pool, &id).await.len(), 1);
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_source_whose_tables_the_orchestrator_does_not_list_gets_409(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        // Oracle is not listed; a connector with no ingest spec has no tables.
+        let oracle = connector(&h, "ora", "apply_all").await;
+        with_spec(&h, &oracle, "sql", "oracle").await;
+        let none = connector(&h, "none", "apply_all").await;
+        for id in [&oracle, &none] {
+            let (status, answer) = post_tables(&h, &service(), id, json!(["a.b"])).await;
+            assert!(
+                status == StatusCode::CONFLICT || status == StatusCode::NOT_FOUND,
+                "{status} {answer}"
+            );
+        }
+        let (status, answer) = post_tables(&h, &service(), &oracle, json!(["a.b"])).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(answer["error"], TABLES_NOT_SUPPORTED);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn only_the_orchestrator_may_add_tables_and_a_bad_body_is_a_400(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "Shop DB", "apply_all").await;
+        with_spec(&h, &id, "sql", "postgres").await;
+
+        // A user holding `ingest:read` and `connector:manage` is refused.
+        let (status, _) =
+            post_tables(&h, &user(&[h.tenant]), &id, json!(["public.customers"])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let many: Vec<String> = (0..=MAX_TABLES).map(|i| format!("s.t{i}")).collect();
+        for bad in [json!([]), json!(many), json!([""]), json!(["a\nb"])] {
+            let (status, _) = post_tables(&h, &service(), &id, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (status, _) = call(
+            &h,
+            &service(),
+            "POST",
+            &format!("/api/connectors/{id}/schema-observations/tables"),
+            Some(json!({"tables": ["a.b"], "extra": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post_tables(&h, &service(), "conn-nope", json!(["a.b"])).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(selected(&pool, &id).await.len(), 1);
+    }
+
+    #[test]
+    fn the_table_list_drops_repeats_and_keeps_the_order() {
+        let body = NewTablesBody {
+            tables: vec!["b.t".to_owned(), "a.t".to_owned(), "b.t".to_owned()],
+            run_id: None,
+        };
+        assert_eq!(validate_tables(&body).unwrap(), ["b.t", "a.t"]);
+    }
+
+    #[test]
+    fn the_orchestrator_lists_tables_of_postgres_mysql_and_sql_server_sql_connectors_only() {
+        for driver in ["postgres", "mysql", "mssql"] {
+            assert!(
+                lists_tables(Some("sql"), &json!({"driver": driver})),
+                "{driver}"
+            );
+        }
+        assert!(!lists_tables(Some("sql"), &json!({"driver": "oracle"})));
+        assert!(!lists_tables(Some("cdc"), &json!({"driver": "postgres"})));
+        assert!(!lists_tables(None, &json!({})));
     }
 }

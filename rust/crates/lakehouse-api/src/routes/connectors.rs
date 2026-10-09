@@ -4887,6 +4887,7 @@ mod tests {
             secret_ref: format!("file:/run/secrets/connector_managed_{id}_password"),
             secret_ref_secondary: None,
             paused: false,
+            schema_change_policy: "apply_non_breaking".to_owned(),
         }
     }
 

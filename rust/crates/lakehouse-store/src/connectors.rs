@@ -1203,6 +1203,22 @@ async fn save_ingest_spec(
     spec: &IngestSpecInput,
     swaps: Option<&[SecretRefSwap<'_>]>,
 ) -> Result<IngestSpec, StoreError> {
+    let mut tx = pool.begin().await?;
+    let saved = save_ingest_spec_in(&mut tx, id, spec, swaps).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// [`save_ingest_spec`] inside a transaction the caller owns (and commits):
+/// the same validation, the same `SEC-14` comparison under the row lock and
+/// the same `UPDATE`. `append_source_objects_in` uses it so that adding
+/// tables passes through exactly the checks a person's save does.
+async fn save_ingest_spec_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: Option<&[SecretRefSwap<'_>]>,
+) -> Result<IngestSpec, StoreError> {
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
 
@@ -1215,14 +1231,12 @@ async fn save_ingest_spec(
             ))
         })?;
 
-    let mut tx = pool.begin().await?;
-
     // The stored target, read under a row lock so the comparison below and
     // the write stay one decision (SEC-14).
     let (stored_adapter, stored_dial): (Option<String>, serde_json::Value) =
         sqlx::query_as("SELECT adapter, dial FROM connector WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .ok_or(StoreError::NotFound)?;
 
@@ -1240,7 +1254,7 @@ async fn save_ingest_spec(
         }
     }
     if let Some(swaps) = swaps {
-        apply_swaps(&mut tx, id, swaps).await?;
+        apply_swaps(tx, id, swaps).await?;
     }
 
     // Read the connector's OWN declared secret-ref count before writing —
@@ -1252,7 +1266,7 @@ async fn save_ingest_spec(
         "SELECT secret_ref_secondary FROM connector WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or(StoreError::NotFound)?;
 
@@ -1277,13 +1291,125 @@ async fn save_ingest_spec(
     .bind(&spec.dial)
     .bind(&spec.source_objects)
     .bind(&spec.schedule_cron)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
         return Err(StoreError::NotFound);
     };
-    tx.commit().await?;
     Ok(ingest_spec_from_row(row))
+}
+
+/// One table [`append_source_objects_in`] is asked to add to a connector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObjectAddition {
+    /// `<schema>.<table>`, the source object's `name`.
+    pub name: String,
+    /// The Bronze table it lands in.
+    pub target: String,
+}
+
+/// What [`append_source_objects_in`] did with one addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdditionOutcome {
+    /// Appended, with load mode `replace`.
+    Added,
+    /// The connector already loads a source object of this name: nothing to do.
+    AlreadySelected,
+    /// Another source object of this connector already lands in the target
+    /// (decided under the row lock, so two racing callers cannot both take it).
+    TargetTaken,
+}
+
+/// Append tables to a connector's `source_objects` in a transaction the
+/// caller owns (`SRC-8` task 8, decision D2), one outcome per addition, in
+/// order.
+///
+/// The row is locked (`FOR UPDATE`), the new list is the stored one plus the
+/// additions that are neither already selected nor land in a target the
+/// connector already uses, and it is written through
+/// [`save_ingest_spec_in`]: the very `UPDATE` and checks a person's save
+/// goes through. The dial and the adapter are written back unchanged, so
+/// `SEC-14`'s re-point comparison finds the target identity the same and
+/// passes; the load mode is `replace` (the default of a source object that
+/// names none), so a table added without a person is never appended to twice.
+///
+/// Nothing is written when nothing is appended.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] for an unknown connector;
+/// [`StoreError::Validation`] when the connector has no ingest spec yet or
+/// its stored `source_objects` is not an array; otherwise as
+/// [`set_ingest_spec`].
+pub(crate) async fn append_source_objects_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    additions: &[SourceObjectAddition],
+) -> Result<Vec<AdditionOutcome>, StoreError> {
+    type Locked = (
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+        Option<String>,
+    );
+    let (adapter, ingest_mode, dial, source_objects, schedule_cron): Locked = sqlx::query_as(
+        "SELECT adapter, ingest_mode, dial, source_objects, schedule_cron FROM connector \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    let (Some(adapter), Some(ingest_mode)) = (adapter, ingest_mode) else {
+        return Err(StoreError::Validation(
+            "the connector has no ingest spec yet".to_owned(),
+        ));
+    };
+    let serde_json::Value::Array(mut objects) = source_objects else {
+        return Err(StoreError::Validation(
+            "the connector's source objects are not a list".to_owned(),
+        ));
+    };
+    let text = |object: &serde_json::Value, key: &str| -> Option<String> {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut names: std::collections::HashSet<String> =
+        objects.iter().filter_map(|o| text(o, "name")).collect();
+    let mut targets: std::collections::HashSet<String> =
+        objects.iter().filter_map(|o| text(o, "target")).collect();
+
+    let mut outcomes = Vec::with_capacity(additions.len());
+    for addition in additions {
+        if names.contains(&addition.name) {
+            outcomes.push(AdditionOutcome::AlreadySelected);
+        } else if targets.contains(&addition.target) {
+            outcomes.push(AdditionOutcome::TargetTaken);
+        } else {
+            names.insert(addition.name.clone());
+            targets.insert(addition.target.clone());
+            objects.push(serde_json::json!({
+                "name": addition.name,
+                "target": addition.target,
+                "loadMode": "replace",
+            }));
+            outcomes.push(AdditionOutcome::Added);
+        }
+    }
+    if outcomes.contains(&AdditionOutcome::Added) {
+        let input = IngestSpecInput {
+            adapter,
+            ingest_mode,
+            dial,
+            source_objects: serde_json::Value::Array(objects),
+            schedule_cron,
+        };
+        save_ingest_spec_in(tx, id, &input, None).await?;
+    }
+    Ok(outcomes)
 }
 
 /// Persist the outcome of a real connectivity probe and, when the probe
@@ -1660,12 +1786,17 @@ pub struct IngestibleConnector {
     /// the unfiltered list still carries it, so the orchestrator's own
     /// single fetch of a connector keeps working.
     pub paused: bool,
+    /// The connector's `schema_change_policy` (`SRC-8`): the orchestrator
+    /// asks for the tables that appeared in a schema it loads only when this
+    /// is `apply_all` (decision D2). Sent as stored; the API re-checks it on
+    /// the route that adds tables.
+    pub schema_change_policy: String,
 }
 
 /// The raw tuple shape [`list_ingestible_connectors`] decodes from its
-/// `SELECT`, naming the same nine columns in the same order: `id,
+/// `SELECT`, naming the same ten columns in the same order: `id,
 /// adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref,
-/// secret_ref_secondary, paused`. A module-level alias rather than an
+/// secret_ref_secondary, paused, schema_change_policy`. A module-level alias rather than an
 /// inline type, same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
 type IngestibleConnectorRow = (
     String,
@@ -1677,6 +1808,7 @@ type IngestibleConnectorRow = (
     String,
     Option<String>,
     bool,
+    String,
 );
 
 /// List every connector that has ever had an ingest spec set
@@ -1692,7 +1824,8 @@ pub async fn list_ingestible_connectors(
 ) -> Result<Vec<IngestibleConnector>, StoreError> {
     let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
         "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
-         secret_ref_secondary, paused_at IS NOT NULL FROM connector WHERE adapter IS NOT NULL",
+         secret_ref_secondary, paused_at IS NOT NULL, schema_change_policy FROM connector \
+         WHERE adapter IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -1709,6 +1842,7 @@ pub async fn list_ingestible_connectors(
                 secret_ref,
                 secret_ref_secondary,
                 paused,
+                schema_change_policy,
             )| {
                 // `adapter IS NOT NULL` is the query's own WHERE clause, so
                 // this `?` never actually short-circuits in practice — it
@@ -1728,6 +1862,7 @@ pub async fn list_ingestible_connectors(
                     secret_ref,
                     secret_ref_secondary,
                     paused,
+                    schema_change_policy,
                 })
             },
         )

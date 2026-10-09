@@ -104,6 +104,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import sqlalchemy
 from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import ssrf_guard
@@ -265,3 +266,87 @@ def _callback(table_adapter_callback: Callable[[Any], None] | None) -> dict[str,
     """The keyword for `sql_database`, only when there is a callback (so a
     call without one is byte-for-byte what it was before SRC-8)."""
     return {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+
+
+# Drivers whose tables `list_tables` can list (SRC-8 decision D2). `mariadb`
+# is the MySQL driver under another name here; the API's dial only knows
+# `mysql` (`SqlDriver`), so both spellings reach the same arm.
+LISTABLE_DRIVERS = ("postgres", "postgresql", "mysql", "mariadb", "mssql")
+
+# Seconds. Reflection through `sql_database` sets none; a listing that hangs on
+# a host that accepted the connection and then said nothing would hold the
+# whole run, so the two drivers that take one are given one.
+_LIST_CONNECT_TIMEOUT = 10
+
+
+def _inspect_table_names(engine: Any, schema: str) -> list[str]:
+    return list(sqlalchemy.inspect(engine).get_table_names(schema=schema))
+
+
+def list_tables(
+    spec: dict,
+    secrets: dict[str, str],
+    schemas: list[str],
+    *,
+    resolve_checked: Callable[[str, int], ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+    create_engine: Callable[..., Any] = sqlalchemy.create_engine,
+    table_names: Callable[[Any, str], list[str]] = _inspect_table_names,
+) -> dict[str, list[str]]:
+    """The base tables of each of `schemas` (SRC-8 decision D2: find the tables
+    that appeared in a schema a connector already loads from), through the
+    SAME pin each driver gets everywhere else. This is a connection of its
+    own, so it is guarded exactly like the loads:
+
+    - **postgres:** `hostaddr` carries the checked IP in `connect_args`
+      (libpq does not resolve through `socket.getaddrinfo`; the same pin as
+      `dlt_pipeline.run_bronze_ingest`, whose credentials this mirrors).
+      Deliberately NOT added to `build_source`, which refuses this driver.
+    - **mysql / mariadb:** the whole listing runs inside
+      `ssrf_guard.pinned_resolution` (pymysql resolves through
+      `socket.getaddrinfo`).
+    - **mssql:** the pinned ODBC connection string `build_source` uses
+      (`_mssql_connection_string`), which names the checked IP directly.
+
+    `resolve_checked` runs first, before any credential is built, and a blocked
+    host raises `ssrf_guard.SsrfBlocked`. The engine is disposed on the way
+    out. Views are not listed (`get_table_names` returns base tables).
+
+    # Errors
+
+    `ValueError` for a driver outside `LISTABLE_DRIVERS`,
+    `ssrf_guard.SsrfBlocked` for a blocked host, and whatever the driver
+    raises for a refused connection or an unknown schema.
+    """
+    driver = spec["driver"]
+    if driver not in LISTABLE_DRIVERS:
+        raise ValueError(f"cannot list the tables of driver {driver!r}")
+    resolved = resolve_checked(spec["host"], spec["port"])
+
+    if driver == "mssql":
+        engine = create_engine(_mssql_connection_string(spec, secrets, resolved))
+        return _list_with(engine, schemas, table_names)
+
+    is_postgres = driver in ("postgres", "postgresql")
+    url = sqlalchemy.engine.URL.create(
+        "postgresql" if is_postgres else "mysql+pymysql",
+        username=spec["user"],
+        password=secrets["password"],
+        host=spec["host"],
+        port=spec["port"],
+        database=spec["database"],
+    )
+    if is_postgres:
+        engine = create_engine(
+            url, connect_args={"hostaddr": resolved.ip, "connect_timeout": _LIST_CONNECT_TIMEOUT}
+        )
+        return _list_with(engine, schemas, table_names)
+    with ssrf_guard.pinned_resolution(spec["host"], resolved):
+        engine = create_engine(url, connect_args={"connect_timeout": _LIST_CONNECT_TIMEOUT})
+        return _list_with(engine, schemas, table_names)
+
+
+def _list_with(engine: Any, schemas: list[str], table_names: Callable[[Any, str], list[str]]) -> dict[str, list[str]]:
+    try:
+        return {schema: sorted(table_names(engine, schema)) for schema in schemas}
+    finally:
+        engine.dispose()

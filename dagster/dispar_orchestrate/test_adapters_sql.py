@@ -246,3 +246,144 @@ def test_the_table_adapter_callback_reaches_sql_database_and_is_left_out_when_ab
         )
     assert captured[0]["table_adapter_callback"] is callback
     assert "table_adapter_callback" not in captured[1]
+
+
+# --- SRC-8 task 8: listing the tables of the schemas a connector loads ---------
+
+
+class _FakeEngine:
+    def __init__(self, args, kwargs) -> None:
+        self.args, self.kwargs, self.disposed = args, kwargs, False
+
+    def dispose(self) -> None:
+        self.disposed = True
+
+
+def _lister(engines: list, tables: dict, resolved_during: list | None = None):
+    import socket
+
+    def create_engine(*args, **kwargs):
+        engine = _FakeEngine(args, kwargs)
+        engines.append(engine)
+        return engine
+
+    def table_names(engine, schema):
+        if resolved_during is not None:
+            resolved_during.append(socket.getaddrinfo("db.internal", 3306)[0][4][0])
+        return tables[schema]
+
+    return create_engine, table_names
+
+
+def _resolve(host, port):
+    return ResolvedAddress(ip="10.0.0.9", port=port, family=2)
+
+
+def test_list_tables_pins_postgres_with_hostaddr_and_disposes_the_engine() -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    engines: list = []
+    create_engine, table_names = _lister(engines, {"public": ["orders", "customers"], "sales": ["x"]})
+    got = list_tables(
+        {"driver": "postgres", "host": "db.internal", "port": 5432, "database": "shop", "user": "u"},
+        {"password": "s3cret"},
+        ["public", "sales"],
+        resolve_checked=_resolve,
+        create_engine=create_engine,
+        table_names=table_names,
+    )
+    assert got == {"public": ["customers", "orders"], "sales": ["x"]}  # sorted
+    [engine] = engines
+    assert engine.kwargs["connect_args"]["hostaddr"] == "10.0.0.9"
+    assert engine.kwargs["connect_args"]["connect_timeout"] == 10
+    url = engine.args[0]
+    assert (url.drivername, url.host, url.username, url.password) == ("postgresql", "db.internal", "u", "s3cret")
+    assert engine.disposed
+
+
+@pytest.mark.parametrize("driver", ["mysql", "mariadb"])
+def test_list_tables_runs_mysql_inside_the_pinned_resolution(driver) -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    engines: list = []
+    seen: list = []
+    create_engine, table_names = _lister(engines, {"shop": ["orders"]}, resolved_during=seen)
+    got = list_tables(
+        {"driver": driver, "host": "db.internal", "port": 3306, "database": "shop", "user": "u"},
+        {"password": "x"},
+        ["shop"],
+        resolve_checked=_resolve,
+        create_engine=create_engine,
+        table_names=table_names,
+    )
+    assert got == {"shop": ["orders"]}
+    assert seen == ["10.0.0.9"]  # the name resolved to the checked address while it listed
+    assert engines[0].args[0].drivername == "mysql+pymysql"
+    assert engines[0].disposed
+
+
+def test_list_tables_dials_sql_server_by_the_checked_ip_in_the_odbc_string() -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    engines: list = []
+    create_engine, table_names = _lister(engines, {"dbo": ["Orders"]})
+    list_tables(
+        {"driver": "mssql", "host": "db.internal", "port": 1433, "database": "shop", "user": "u"},
+        {"password": "x"},
+        ["dbo"],
+        resolve_checked=_resolve,
+        create_engine=create_engine,
+        table_names=table_names,
+    )
+    connection_string = urllib.parse.unquote_plus(engines[0].args[0])
+    assert "SERVER=tcp:10.0.0.9,1433" in connection_string
+    assert "HostNameInCertificate=db.internal" in connection_string
+
+
+def test_list_tables_checks_the_host_before_any_engine_exists() -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    def blocked(host, port):
+        raise SsrfBlocked("refused")
+
+    with pytest.raises(SsrfBlocked):
+        list_tables(
+            {"driver": "postgres", "host": "169.254.169.254", "port": 5432, "database": "d", "user": "u"},
+            {"password": "x"},
+            ["public"],
+            resolve_checked=blocked,
+            create_engine=lambda *a, **k: pytest.fail("no engine for a blocked host"),
+        )
+
+
+def test_list_tables_refuses_a_driver_it_cannot_list() -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    with pytest.raises(ValueError):
+        list_tables(
+            {"driver": "oracle", "host": "h", "port": 1, "database": "d", "user": "u"},
+            {"password": "x"},
+            ["S"],
+            resolve_checked=_resolve,
+        )
+
+
+def test_the_engine_is_disposed_even_when_listing_fails() -> None:
+    from dispar_orchestrate.adapters.sql import list_tables
+
+    engines: list = []
+    create_engine, _ = _lister(engines, {})
+
+    def boom(engine, schema):
+        raise RuntimeError("no such schema")
+
+    with pytest.raises(RuntimeError):
+        list_tables(
+            {"driver": "postgres", "host": "h", "port": 5432, "database": "d", "user": "u"},
+            {"password": "x"},
+            ["nope"],
+            resolve_checked=_resolve,
+            create_engine=create_engine,
+            table_names=boom,
+        )
+    assert engines[0].disposed

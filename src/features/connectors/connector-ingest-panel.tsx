@@ -49,6 +49,11 @@ function slug(text: string): string {
  * `<connector>_<table>`. Every connector writes into the same flat `bronze`
  * namespace, so two connectors that both have an `orders` table would
  * otherwise append into one `bronze.orders`.
+ *
+ * Rust has the same rule: `default_bronze_target` in
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs` names the target of a table
+ * `lakehouse-api` adds on its own (`SRC-8`, policy "apply all"). Change one,
+ * change the other; both tests pin the same examples.
  */
 export function defaultTarget(connectorName: string, objectName: string): string {
   const table = slug(objectName.split(".").pop() ?? objectName)
