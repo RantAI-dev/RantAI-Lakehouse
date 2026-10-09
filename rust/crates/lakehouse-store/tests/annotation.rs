@@ -282,7 +282,11 @@ async fn a_certified_mark_round_trips(pool: PgPool) -> sqlx::Result<()> {
 async fn a_deprecated_mark_keeps_its_note_and_replacement(pool: PgPool) -> sqlx::Result<()> {
     set_certification(
         &pool,
-        &mark("deprecated", Some("Superseded"), Some("silver.mart_orders_v2")),
+        &mark(
+            "deprecated",
+            Some("Superseded"),
+            Some("silver.mart_orders_v2"),
+        ),
     )
     .await
     .expect("set");

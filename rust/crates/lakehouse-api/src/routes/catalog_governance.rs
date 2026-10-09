@@ -397,6 +397,23 @@ pub(crate) async fn use_by_asset(
 /// How many audit events an asset's Change history shows.
 const CHANGE_HISTORY_LIMIT: i64 = 50;
 
+/// The history line of a certified / deprecated mark action (`DATA-12` F6).
+/// The note's text is not in it: the history says that a mark was set, not
+/// what the person wrote.
+fn mark_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+    match action {
+        "catalog.certify" => "Marked certified".to_owned(),
+        "catalog.deprecate" => arg("replacementAssetId").map_or_else(
+            || "Marked deprecated".to_owned(),
+            |replacement| format!("Marked deprecated: use {replacement}"),
+        ),
+        _ => match arg("was") {
+            Some(was @ ("certified" | "deprecated")) => format!("Removed the {was} mark"),
+            _ => "Removed the certified / deprecated mark".to_owned(),
+        },
+    }
+}
+
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
@@ -429,6 +446,9 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
             arg("column").map_or_else(|| "the asset".to_owned(), |c| format!("column {c}")),
             arg("classification").unwrap_or("unspecified"),
         ),
+        "catalog.certify" | "catalog.deprecate" | "catalog.uncertify" => {
+            mark_summary(event.action.as_str(), arg)
+        }
         "catalog.sla_remove" => "Removed the freshness target".to_owned(),
         "catalog.sla_set" => event
             .args
@@ -1389,6 +1409,47 @@ mod tests {
         ] {
             let entry = change_entry(&audit_event(action, args));
             assert_eq!(entry["summary"], summary, "{action}");
+        }
+    }
+
+    /// `DATA-12` F6: each mark action has its sentence, and the note's text
+    /// is never part of it.
+    #[test]
+    fn change_entries_say_what_mark_was_set_or_removed() {
+        for (action, args, summary) in [
+            ("catalog.certify", json!({}), "Marked certified"),
+            (
+                "catalog.deprecate",
+                json!({ "note": "Superseded by the monthly mart", "replacementAssetId": null }),
+                "Marked deprecated",
+            ),
+            (
+                "catalog.deprecate",
+                json!({ "note": "Superseded by the monthly mart", "replacementAssetId": "silver.orders_v2" }),
+                "Marked deprecated: use silver.orders_v2",
+            ),
+            (
+                "catalog.uncertify",
+                json!({ "was": "certified" }),
+                "Removed the certified mark",
+            ),
+            (
+                "catalog.uncertify",
+                json!({ "was": "deprecated" }),
+                "Removed the deprecated mark",
+            ),
+            (
+                "catalog.uncertify",
+                json!({}),
+                "Removed the certified / deprecated mark",
+            ),
+        ] {
+            let entry = change_entry(&audit_event(action, args));
+            assert_eq!(entry["summary"], summary, "{action}");
+            assert!(
+                !entry["summary"].as_str().unwrap().contains("Superseded"),
+                "the note's text must not be in the history line"
+            );
         }
     }
 

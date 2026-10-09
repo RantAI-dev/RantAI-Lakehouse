@@ -1476,6 +1476,27 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
     if !annotation.tags.is_empty() {
         o.insert("tags".to_owned(), json!(annotation.tags));
     }
+    // DATA-12 F4: the mark rides the same overlay, so it reaches the live
+    // list, `/api/catalog/query`, the search copy and the detail body. Absent
+    // when there is no mark, as `tags` is.
+    if let Some(certification) = set(annotation.certification.as_ref()) {
+        o.insert("certification".to_owned(), json!(certification));
+        if let Some(note) = set(annotation.certification_note.as_ref()) {
+            o.insert("certificationNote".to_owned(), json!(note));
+        }
+        if let Some(replacement) = set(annotation.replacement_asset_id.as_ref()) {
+            o.insert("replacementAssetId".to_owned(), json!(replacement));
+        }
+        if let Some(by) = set(annotation.certified_by.as_ref()) {
+            o.insert("certifiedBy".to_owned(), json!(by));
+        }
+        if let Some(at) = annotation.certified_at.and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        }) {
+            o.insert("certifiedAt".to_owned(), json!(at));
+        }
+    }
 }
 
 /// [`apply_annotation`] over every row of a list body. They decorate the
@@ -2675,9 +2696,7 @@ const CERTIFIED_BY_MAX_LEN: usize = 128;
 
 /// A trimmed text field, with blank read as absent.
 fn trimmed_or_none(value: Option<&String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty())
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
 /// The body of [`put_certification`] after the checks that need no store:
@@ -2782,7 +2801,9 @@ pub async fn put_certification(
         // write; a failed read refuses rather than storing an unchecked id.
         let snapshot = search_snapshot(&state).await.map_err(|err| {
             tracing::warn!(%err, "catalog read failed while checking a replacement");
-            ApiError::Unavailable("the catalog could not be read to check the replacement".to_owned())
+            ApiError::Unavailable(
+                "the catalog could not be read to check the replacement".to_owned(),
+            )
         })?;
         let exists = snapshot
             .assets
@@ -2794,52 +2815,49 @@ pub async fn put_certification(
             )
             .into());
         }
-        let replacement_row = lakehouse_store::annotation::get_annotation(pool, replacement).await?;
+        let replacement_row =
+            lakehouse_store::annotation::get_annotation(pool, replacement).await?;
         if replacement_row.is_some_and(|r| r.certification.as_deref() == Some("deprecated")) {
-            return Err(ApiError::BadRequest(
-                "the replacement is itself deprecated".to_owned(),
-            )
-            .into());
+            return Err(
+                ApiError::BadRequest("the replacement is itself deprecated".to_owned()).into(),
+            );
         }
     }
     let before = lakehouse_store::annotation::get_annotation(pool, &id)
         .await?
         .and_then(|r| r.certification);
-    let (action, args) = match change.status {
-        Some(status) => {
-            lakehouse_store::annotation::set_certification(
-                pool,
-                &lakehouse_store::annotation::CertificationInput {
-                    asset_id: id.clone(),
-                    status: status.to_owned(),
-                    note: change.note.clone(),
-                    replacement_asset_id: change.replacement_asset_id.clone(),
-                    certified_by: principal
-                        .display_name
-                        .chars()
-                        .take(CERTIFIED_BY_MAX_LEN)
-                        .collect(),
-                },
-            )
-            .await?;
-            if status == "deprecated" {
-                (
-                    Some("catalog.deprecate"),
-                    json!({ "note": change.note, "replacementAssetId": change.replacement_asset_id }),
-                )
-            } else {
-                (Some("catalog.certify"), json!({}))
-            }
-        }
-        None => {
-            lakehouse_store::annotation::clear_certification(pool, &id).await?;
-            // Clearing an asset that had no mark changed nothing and records
-            // nothing, as a details save that changes nothing does.
+    let (action, args) = if let Some(status) = change.status {
+        lakehouse_store::annotation::set_certification(
+            pool,
+            &lakehouse_store::annotation::CertificationInput {
+                asset_id: id.clone(),
+                status: status.to_owned(),
+                note: change.note.clone(),
+                replacement_asset_id: change.replacement_asset_id.clone(),
+                certified_by: principal
+                    .display_name
+                    .chars()
+                    .take(CERTIFIED_BY_MAX_LEN)
+                    .collect(),
+            },
+        )
+        .await?;
+        if status == "deprecated" {
             (
-                before.as_ref().map(|_| "catalog.uncertify"),
-                json!({ "was": before }),
+                Some("catalog.deprecate"),
+                json!({ "note": change.note, "replacementAssetId": change.replacement_asset_id }),
             )
+        } else {
+            (Some("catalog.certify"), json!({}))
         }
+    } else {
+        lakehouse_store::annotation::clear_certification(pool, &id).await?;
+        // Clearing an asset that had no mark changed nothing and records
+        // nothing, as a details save that changes nothing does.
+        (
+            before.as_ref().map(|_| "catalog.uncertify"),
+            json!({ "was": before }),
+        )
     };
     state.catalog_search_cache.invalidate().await;
     if let Some(action) = action {
@@ -3397,6 +3415,37 @@ mod tests {
         assert_eq!(row["description"], registry_description);
         assert_eq!(row["tags"], json!(["pii"]));
         assert!(row.get("steward").is_none());
+    }
+
+    /// `DATA-12` F4: a marked row carries the five fields, an unmarked row
+    /// none of them.
+    #[test]
+    fn a_mark_is_overlaid_on_the_row_and_an_unmarked_row_has_none() {
+        let mut unmarked = silver_catalog_row("orders", "MergeTree", 0, None);
+        apply_annotation(&mut unmarked, &annotation(Some("Data Platform"), None, &[]));
+        for key in [
+            "certification",
+            "certificationNote",
+            "replacementAssetId",
+            "certifiedBy",
+            "certifiedAt",
+        ] {
+            assert!(unmarked.get(key).is_none(), "{key}");
+        }
+
+        let mut marked = silver_catalog_row("orders", "MergeTree", 0, None);
+        let mut row = annotation(None, None, &[]);
+        row.certification = Some("deprecated".to_owned());
+        row.certification_note = Some("Superseded".to_owned());
+        row.replacement_asset_id = Some("silver.orders_v2".to_owned());
+        row.certified_by = Some("Rina".to_owned());
+        row.certified_at = time::OffsetDateTime::from_unix_timestamp(1_790_000_000).ok();
+        apply_annotation(&mut marked, &row);
+        assert_eq!(marked["certification"], json!("deprecated"));
+        assert_eq!(marked["certificationNote"], json!("Superseded"));
+        assert_eq!(marked["replacementAssetId"], json!("silver.orders_v2"));
+        assert_eq!(marked["certifiedBy"], json!("Rina"));
+        assert_eq!(marked["certifiedAt"], json!("2026-09-21T14:13:20Z"));
     }
 
     /// The audit trail names the fields an edit changed, and a save that
@@ -4315,7 +4364,10 @@ mod tests {
                 Ok(_) => Ok(()),
                 Err(rejection) => {
                     let (status, body) = response_json(rejection.into_response()).await;
-                    Err((status, body["error"].as_str().unwrap_or_default().to_owned()))
+                    Err((
+                        status,
+                        body["error"].as_str().unwrap_or_default().to_owned(),
+                    ))
                 }
             }
         }
@@ -4346,18 +4398,38 @@ mod tests {
             prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y", "serving.old"])
                 .await;
             // A deprecated asset, to be refused as a replacement.
-            put_mark(&state, governor(TENANT_A), "serving.old", r#"{"status":"deprecated"}"#)
-                .await
-                .unwrap();
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.old",
+                r#"{"status":"deprecated"}"#,
+            )
+            .await
+            .unwrap();
             let long_note = format!(r#"{{"status":"deprecated","note":"{}"}}"#, "a".repeat(1001));
             let cases: [(&str, &str); 7] = [
                 (r#"{"status":"trusted"}"#, "status must be"),
-                (r#"{"status":"certified","note":"x"}"#, "only with the deprecated mark"),
-                (r#"{"status":null,"replacementAssetId":"serving.mart_y"}"#, "only with the deprecated mark"),
+                (
+                    r#"{"status":"certified","note":"x"}"#,
+                    "only with the deprecated mark",
+                ),
+                (
+                    r#"{"status":null,"replacementAssetId":"serving.mart_y"}"#,
+                    "only with the deprecated mark",
+                ),
                 (long_note.as_str(), "note must be at most 1000 characters"),
-                (r#"{"status":"deprecated","replacementAssetId":"serving.mart_x"}"#, "its own replacement"),
-                (r#"{"status":"deprecated","replacementAssetId":"serving.nope"}"#, "not an asset in the catalog"),
-                (r#"{"status":"deprecated","replacementAssetId":"serving.old"}"#, "itself deprecated"),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.mart_x"}"#,
+                    "its own replacement",
+                ),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.nope"}"#,
+                    "not an asset in the catalog",
+                ),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.old"}"#,
+                    "itself deprecated",
+                ),
             ];
             for (body, sentence) in cases {
                 let err = put_mark(&state, governor(TENANT_A), "serving.mart_x", body)
@@ -4383,9 +4455,14 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
-            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":"certified"}"#)
-                .await
-                .unwrap();
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap();
             let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
                 .await
                 .unwrap()
@@ -4394,9 +4471,14 @@ mod tests {
             assert_eq!(row.certified_by.as_deref(), Some("Test Principal"));
             assert!(row.certified_at.is_some());
 
-            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":null}"#)
-                .await
-                .unwrap();
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":null}"#,
+            )
+            .await
+            .unwrap();
             let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
                 .await
                 .unwrap()
@@ -4432,9 +4514,14 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
-            let err = put_mark(&state, governor(TENANT_B), "serving.mart_x", r#"{"status":"certified"}"#)
-                .await
-                .unwrap_err();
+            let err = put_mark(
+                &state,
+                governor(TENANT_B),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.0, StatusCode::FORBIDDEN);
             assert!(err.1.contains("CATALOG_TENANT_ID"), "{}", err.1);
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
@@ -4446,16 +4533,26 @@ mod tests {
         ) {
             let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
             prime_search_copy(&state).await;
-            put_mark(&state, governor(TENANT_B), "serving.mart_x", r#"{"status":"certified"}"#)
-                .await
-                .unwrap_err();
+            put_mark(
+                &state,
+                governor(TENANT_B),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap_err();
             assert!(
                 !next_read_rebuilds(&state).await,
                 "a refused write must not drop the copy"
             );
-            put_mark(&state, governor(TENANT_A), "serving.mart_x", r#"{"status":"certified"}"#)
-                .await
-                .unwrap();
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap();
             assert!(
                 next_read_rebuilds(&state).await,
                 "a mark must drop the copy so a search shows it at once"
