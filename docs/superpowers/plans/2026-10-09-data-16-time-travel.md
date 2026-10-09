@@ -174,8 +174,48 @@ on this machine for this task.
 
 ## Handoff
 
-*(developer)*
+### Developer, 2026-10-09 (tasks T1 to T4; T5 is the planner's)
+
+**Commits** (branch `fix/data-16-time-travel`, local only, nothing pushed):
+
+- `5973826` fix(query): say that past versions are ClickHouse-only when Trino refuses one (T1)
+- `fb9df43` feat(lib): one function writes the ClickHouse snapshot pin, and the retention text
+- `e1792f3` feat(frontend): the time-travel picker follows the engine and the Snapshots card shows retention (T3)
+- `18c844a` test(ops): a gate proving a past version of a governed Bronze table keeps its policy (T4)
+
+**Commands run and results**
+
+- Rust, from `rust/`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, `df -h /` 46G free before each: `cargo check -p lakehouse-api` clean. After `touch` of the crate sources: `cargo fmt --check` clean (it flagged only my own hunks first; `cargo fmt` fixed exactly those), `cargo clippy -p lakehouse-api --all-targets -- -D warnings` finished with no warnings (run again after the fmt change).
+- `bun install --frozen-lockfile` (772 packages, lockfile untouched). Full, foreground, on the final commit: `bun run typecheck && bun run lint && bun run test` exit 0; tests 922 pass, 1 skip, 0 fail, 923 tests in 101 files; lint 0 errors, 6 warnings, all in files this branch does not touch (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`, `open-format-card.test.tsx`, `use-data-table.ts`, `dashboard-specs.ts`).
+- `python3 ops/lint/check_intra_package_imports.py` OK; `python3 ops/lint/check_bare_iceberg_count.py` OK; `python3 -m py_compile ops/g8/g8_time_travel_test.py` OK.
+- `bash scripts/ci/tests/test_required_gate.sh`: 27 passed, 0 failed. `bash scripts/ci/tests/test_detect_change_scope.sh`: 32 passed, 0 failed.
+- `sg docker -c "docker compose --profile '*' config --quiet"` from the worktree with no `.env`: exit 0.
+
+**Not verified**
+
+- Rust tests (`cargo test` is not allowed here): the two new unit tests in `routes/query.rs` and every existing one are *not verified (first run is CI's)*. The wiring of `uses_past_version_clause` into `rewrite_sql_for_principal_inner` is covered by compile and clippy only; the helper is tested directly, the Trino-and-parse-failure branch is not exercised by a test (it needs `AppState`).
+- The gate `ops/g8/g8_time_travel_test.py`, the new compose service and the `g8-time-travel` job have never been run: no container was started. *Not verified*; the first real run is CI's.
+- The picker's Select interaction is tested with synthetic mouse events in `bun test`, not in a browser.
+
+**Deviations from the plan, and decisions the plan did not cover**
+
+1. `insertAsOfClause` is removed in T3, not T2 (T2 would not compile, because the picker still called it). T2 keeps it with a note; T3 removes it and its tests with the caller.
+2. The controls moved to their own file, `src/features/queries/time-travel-controls.tsx`, so they can be tested; there was no Query Studio page test to sit beside.
+3. `pinSnapshot` also returns `null` for an id that is not all digits (it is interpolated into SQL).
+4. Retention text: `No versions yet.` / `1 version, from <date>` / `N versions, the oldest from <date>`, the date from `formatDateTime`. The Snapshots card appends it to its description when the list is non-empty.
+5. Gate: `bronze_ingest_job` writes with the default `LoadPlan`, mode `append`, so each load adds the whole source as a new snapshot. The source is changed between the loads with `psql` (10 rows with customer `g8tt_late` inserted into `ingest_demo.orders`). Older version = newest snapshot after load 1, current = newest after load 2. The table is `BRONZE_TABLE_NAME` (default `g3a_orders`), not its own table, because the job's target table is fixed by the Dagster service's env.
+6. Policy shape: `{"roles":["Analyst"],"table":"bronze.<table>","mask":["customer"],"rowFilter":"id <= 1000"}`, kind `Row filter`, effect `Permit with obligation`.
+7. The gate also checks the admin's pinned count equals the snapshot's `summary.totalRecords` when the API reports one, and uses `WHERE`-qualified counts everywhere (R11).
+8. The subquery and CTE shapes accept `422` as "refused", like `g8_governance_test.py`; the docstring says this cannot tell the policy refusal from ClickHouse rejecting a `SETTINGS` clause there.
+9. Compose service `g8-time-travel-test-runner` also depends on `clickhouse-iceberg-init` (the `icecat_api` database; `lakehouse-api` does not depend on it) and installs `postgresql-client` and `argon2-cffi` like `g8-test-runner`. The CI job names `clickhouse-iceberg-init` in its `up` list, and the job is named `g8-time-travel` with result variable `G8_TIME_TRAVEL_RESULT` in `required_gate.sh`, its test (unset list, every base array, one new failing-job case) and the `ci-required` needs and env.
+10. `docs/CI.md` lists the acceptance jobs and still needs `g8-time-travel` (T5, planner).
+
+**Unsure**
+
+- Whether `icecat_api` sees the table the moment the second load ends, and whether the policy engine resolves `real_columns` for `icecat_api.`bronze.g3a_orders``: read from the code, not run.
+- Whether ClickHouse accepts `SETTINGS` inside a subquery or CTE through the rewrite; the gate passes either way (masked or 422).
 
 ## Review
+
 
 *(planner)*
