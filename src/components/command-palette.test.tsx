@@ -115,4 +115,20 @@ describe("CommandPalette catalog search", () => {
     await waitFor(() => expect(screen.getByText("Set CATALOG_TENANT_ID first.")).toBeTruthy())
     expect(screen.queryByText("Catalog search is unavailable")).toBeNull()
   })
+
+  it("lists See all results after every asset row, whatever is typed", async () => {
+    // DATA-11 review SHOULD-FIX 6: `cmdk` reorders rows by its own score of
+    // each row's `value`, and the term typed is in the See all row's value.
+    stubCatalog({ assets: [asset(1), asset(2), asset(3)] })
+    await search("table")
+    await screen.findByText("Table 3")
+    const rows = Array.from(document.querySelectorAll('[cmdk-item=""]'))
+    const at = (text: string) => rows.findIndex((r) => r.textContent?.includes(text))
+    const seeAll = at("See all results")
+    expect(seeAll).toBeGreaterThan(-1)
+    for (const name of ["Table 1", "Table 2", "Table 3"]) {
+      expect(at(name)).toBeGreaterThan(-1)
+      expect(at(name)).toBeLessThan(seeAll)
+    }
+  })
 })

@@ -18,6 +18,14 @@ import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
  * (WS2 §13). */
 const CATALOG_SEARCH_DEBOUNCE_MS = 250;
 
+/** The "See all results" row's `value`. `cmdk` reorders rows by its fuzzy
+ * score of each row's `value` against the typed text, so a value holding the
+ * typed words (or any letter a word could be a subsequence of) outranked the
+ * asset rows and put the row first. This one holds no letter or digit, so it
+ * scores zero for any typed word and, with equal scores keeping their order,
+ * stays after the assets (DATA-11 review SHOULD-FIX 6). */
+const SEE_ALL_VALUE = "\u2192";
+
 const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
 export function openCommandPalette() {
@@ -223,7 +231,7 @@ export function CommandPalette() {
               forceMount
               icon={Search}
               label="See all results"
-              value={`see all results ${search.trim()}`}
+              value={SEE_ALL_VALUE}
               onSelect={() => go(`/data?search=${encodeURIComponent(search.trim())}`)}
             />
           </Command.Group>
