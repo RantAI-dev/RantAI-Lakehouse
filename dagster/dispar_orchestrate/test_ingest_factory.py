@@ -688,7 +688,7 @@ def test_run_ingest_never_calls_run_one_object_for_a_stream_mode_connector(monke
     import dispar_orchestrate.ingest_factory as f
     from dagster import build_op_context
 
-    monkeypatch.setattr(f, "_run_stream_connector", lambda connector: None)
+    monkeypatch.setattr(f, "_run_stream_connector", lambda connector, run_id=None: None)
     monkeypatch.setattr(
         f, "_run_one_object", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("a stream-mode connector must never reach the batch per-object loop")
@@ -1190,6 +1190,7 @@ def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monk
     class _FakeOutcome:
         def __init__(self, rows: int) -> None:
             self.rows = rows
+            self.columns = ()  # a `SinkResult` always has them (SRC-8)
 
     class _FakeResult:
         def __init__(self, rows: int) -> None:
@@ -1349,7 +1350,7 @@ def test_stream_connector_yields_no_mapped_steps(monkeypatch) -> None:
     called = []
     monkeypatch.setattr(
         f, "_run_stream_connector",
-        lambda connector: called.append(connector["id"]),
+        lambda connector, run_id=None: called.append(connector["id"]),
     )
     result = f.ingest_job.execute_in_process(
         raise_on_error=False,
@@ -1678,3 +1679,221 @@ def test_the_op_sends_its_dagster_run_id_with_the_observation(monkeypatch) -> No
     context = build_op_context()
     f.ingest_source_object(context, {"connector": {"id": "c"}, "obj": {"name": "o", "target": "o"}})
     assert seen == [context.run_id]
+
+
+# --- SRC-8 task 7: observe after loading (files, rest, mongodb, sftp, kafka) --
+
+
+def _loaded(*columns: tuple[str, str]):
+    """A `SinkResult` for a load that produced these columns."""
+    from dispar_orchestrate.adapters.sink import LoadedColumn
+
+    return SinkResult(
+        rows=3,
+        has_failed_jobs=False,
+        load_info_str="",
+        columns=tuple(LoadedColumn(name, dtype, True) for name, dtype in columns),
+    )
+
+
+def _wire_files(monkeypatch, result) -> list:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f, "_host_of", lambda dial: None)
+
+    class _Adapter:
+        def build_source(self, dial, secrets, objs):
+            return type("R", (), {"source": object(), "resolved": None})()
+
+    monkeypatch.setitem(f._ADAPTERS, "files", _Adapter())
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: result)
+    return recorded
+
+
+_FILES_CONNECTOR = {
+    "id": "conn-files",
+    "adapter": "files",
+    "dial": {"endpoint": "https://files.internal"},
+    "secretRef": "env:X",
+    "secretRefSecondary": None,
+}
+_FILES_OBJECT = {"name": "exports/orders.csv", "target": "orders"}
+
+
+def test_the_columns_of_a_file_load_are_posted_after_the_load_succeeded(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = _wire_files(monkeypatch, _loaded(("id", "bigint"), ("note", "text")))
+    assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT, run_id="run-9") == 3
+
+    [call] = observations.calls
+    assert (call["phase"], call["object"], call["run_id"]) == ("after_load", "exports/orders.csv", "run-9")
+    assert [(c.name, c.type_name) for c in call["columns"]] == [("id", "bigint"), ("note", "text")]
+    # No key is observed for these sources.
+    assert call["primary_key"] == []
+    assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+def test_the_request_is_just_what_was_loaded_so_a_missing_column_is_not_reported_at_all(
+    monkeypatch, observations
+) -> None:
+    """Run 1 loaded `id` and `note`; run 2 loads a batch with `id` only. This
+    side reports `id` and says nothing about `note`: the API carries the
+    previous columns over for this phase (D4), so no removal can come from
+    here."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded(("id", "bigint"), ("note", "text")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+    _wire_files(monkeypatch, _loaded(("id", "bigint")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+
+    assert [c.name for c in observations.calls[1]["columns"]] == ["id"]
+    assert not any(key in observations.calls[1] for key in ("removed", "missing", "absent"))
+
+
+def test_dlts_bookkeeping_and_the_ingested_at_column_are_left_out_of_what_a_load_reports(monkeypatch) -> None:
+    """Tested where the columns are read (`sink._loaded_columns`) against a real
+    `dlt` schema: `_dlt_id`, `_dlt_load_id` and `_ingested_at` belong to the
+    pipeline, not to the source, so a first observation must not carry them."""
+    import dlt
+    from dlt.destinations import filesystem
+
+    from dispar_orchestrate.adapters import sink as sink_module
+
+    for name in (
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_NAME",
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE",
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pipeline = dlt.pipeline(
+            pipeline_name="after_load_columns",
+            pipelines_dir=f"{tmp}/p",
+            destination=filesystem(bucket_url=f"{tmp}/b"),
+            dataset_name="bronze",
+        )
+        rows = [{"id": 1, "note": "x", "_ingested_at": datetime.now(timezone.utc)}]
+        pipeline.run(rows, table_name="orders", write_disposition="append")
+        columns = sink_module._loaded_columns(pipeline, "orders")
+
+    assert [(c.name, c.data_type) for c in columns] == [("id", "bigint"), ("note", "text")]
+
+
+def test_a_failed_post_never_turns_a_successful_file_load_into_a_failed_run(monkeypatch, observations, caplog) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = _wire_files(monkeypatch, _loaded(("id", "bigint")))
+    observations.answer = f.schema_observer.ObservationUnreachable("the API could not be reached (ConnectionError)")
+    with caplog.at_level(logging.WARNING):
+        assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT) == 3
+    assert [r["status"] for r in recorded] == ["succeeded"]  # recorded once, as a success
+    assert "the data is in Bronze" in caplog.text
+    assert "ConnectionError" in caplog.text
+
+    # Even an exception the observer never raises on purpose is swallowed.
+    observations.answer = RuntimeError("secret-looking detail")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT) == 3
+    assert "RuntimeError" in caplog.text and "secret-looking detail" not in caplog.text
+
+
+def test_a_load_whose_columns_could_not_be_read_posts_nothing(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded())
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+    assert observations.calls == []
+
+
+def test_a_sheets_connector_is_not_observed_at_all(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    unsupported = type("R", (), {"supported": False, "reason": "not available", "source": None})()
+    monkeypatch.setattr(f.sheets_adapter, "build_source", lambda dial, secrets: unsupported)
+    connector = {"id": "c", "adapter": "sheets", "dial": {}, "secretRef": "env:X", "secretRefSecondary": None}
+    assert f._run_one_object(connector, {"name": "A1:B2", "target": "sheet"}) is None
+    assert [r["status"] for r in recorded] == ["unsupported"]
+    assert observations.calls == []
+
+
+def test_a_sql_load_is_observed_once_before_and_not_again_after(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    builds: list = []
+    _wire_mysql(monkeypatch, loads=[], builds=builds)
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: _loaded(("id", "bigint")))
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert [c["phase"] for c in observations.calls] == ["before_load"]
+
+
+def test_a_kafka_micro_batch_is_observed_after_it_loaded_and_committed(monkeypatch, observations) -> None:
+    order: list = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: order.append("load") or _loaded(("id", "bigint"), ("note", "text")),
+    )
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_offset", lambda *a, **k: order.append("offset"))
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_run", lambda **kw: order.append(kw["status"]))
+
+    class _Consumer(_FakeStreamConsumer):
+        def commit(self, offsets):
+            order.append("commit")
+
+    run_kafka_stream_batch(
+        connector_id="conn-k",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders", "target": "orders"}],
+        consumer=_Consumer(),
+        run_id="run-k",
+    )
+
+    [call] = observations.calls
+    assert (call["phase"], call["object"], call["run_id"], call["primary_key"]) == (
+        "after_load",
+        "orders",
+        "run-k",
+        [],
+    )
+    assert [c.name for c in call["columns"]] == ["id", "note"]
+    assert order == ["load", "commit", "offset", "succeeded"]
+
+
+def test_a_failing_post_never_fails_a_kafka_micro_batch(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.load_via_sink", lambda *a, **k: _loaded(("id", "bigint")))
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_offset", lambda *a, **k: None)
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_run", lambda **kw: recorded.append(kw))
+    observations.answer = f.schema_observer.ObservationRefused("HTTP 403")
+
+    run_kafka_stream_batch(
+        connector_id="conn-k",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders", "target": "orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    assert [r["status"] for r in recorded] == ["succeeded"]

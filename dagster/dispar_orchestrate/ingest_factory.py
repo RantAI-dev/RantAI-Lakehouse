@@ -123,6 +123,7 @@ values become -- NEVER an env var name derived from the connector id (see
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -170,6 +171,8 @@ from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 _POSTGRES_DRIVERS = ("postgres", "postgresql")
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownAdapter(Exception):
@@ -353,6 +356,49 @@ def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
             f"load mode 'incremental' is only available for SQL connectors, not adapter {adapter_name!r}"
         )
     return plan
+
+
+def _observe_after_load(
+    connector_id: str, object_name: str, columns: tuple[sink_adapter.LoadedColumn, ...], run_id: str | None
+) -> None:
+    """Tell the API what a non-SQL source's table looks like now that it has
+    loaded (SRC-8, decision D4: files, REST, `MongoDB`, SFTP and the Kafka
+    micro-batch cannot be read before they load).
+
+    What is sent is exactly what the load produced and nothing else: no
+    primary key (`[]`: these sources have none to observe), and no column the
+    load did not carry -- a column absent from a batch cannot be told from one
+    that is empty in it, so this side never reports a removal; the API
+    carries the previous columns over for this phase (`routes/schema_changes.rs`,
+    `shape_for_phase`).
+
+    THE ONE PLACE THE FAIL-CLOSED RULE DOES NOT APPLY (AGENTS.md principle 3):
+    the rows are already in Bronze and recorded as succeeded, and the API
+    never asks these sources to hold anything back, so whatever it answers
+    (or fails to answer) changes nothing here. A failed post must not turn a
+    successful load into a failed run; it is logged as a warning that names
+    the exception type (and, for the observer's own errors, their fixed
+    message), never a token or a response body.
+    """
+    if not columns:
+        return
+    try:
+        schema_observer.post_observation(
+            schema_observer.ObserverConfig.from_env(),
+            connector_id,
+            object_name,
+            [schema_observer.ReflectedColumn(c.name, c.data_type, c.nullable) for c in columns],
+            [],
+            "after_load",
+            run_id,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        detail = str(exc) if isinstance(exc, (schema_observer.ObservationRefused, schema_observer.ObservationUnreachable)) else type(exc).__name__
+        logger.warning(
+            "%r loaded, but its schema could not be reported to the API (the data is in Bronze): %s",
+            object_name,
+            detail,
+        )
 
 
 # What an `ingest_run` row says when a table waits for a schema-change
@@ -562,6 +608,10 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
         _register_in_catalog(connector_id, obj)
+        if adapter_name != "sql":
+            # files / rest / mongodb / sftp: observed AFTER the load (SRC-8,
+            # D4). sql was observed before it; sheets returned above.
+            _observe_after_load(connector_id, obj["name"], outcome.columns, run_id)
         return outcome.rows
     except (
         ssrf_guard.SsrfBlocked,
@@ -623,6 +673,7 @@ def run_kafka_stream_batch(
     secrets: dict,
     source_objects: list[dict],
     consumer: "KafkaConsumer | None" = None,
+    run_id: str | None = None,
 ) -> None:
     """One scheduled micro-batch for a `kafka`-adapter, `ingest_mode='stream'`
     connector. At-least-once, stated explicitly:
@@ -638,6 +689,8 @@ def run_kafka_stream_batch(
     call re-delivers the same batch on the next scheduled run -- a
     deliberate, documented at-least-once gap (`adapters/sink.py`'s Iceberg
     append path is not deduplicated), never a silent skip.
+
+    `run_id` is the Dagster run id sent with the after-load schema observation.
 
     A micro-batch that loaded also registers (or refreshes) its Bronze
     table in the console catalog (`_register_in_catalog`), like every batch
@@ -730,6 +783,11 @@ def run_kafka_stream_batch(
                 connector_id,
                 {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
             )
+            # SRC-8 (D4): a micro-batch is observed AFTER it loads, like every
+            # source whose columns cannot be read first. The offsets are
+            # already committed; a failed post changes nothing (see
+            # `_observe_after_load`).
+            _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
             raise
@@ -741,7 +799,7 @@ def run_kafka_stream_batch(
             consumer.close()
 
 
-def _run_stream_connector(connector: dict) -> None:
+def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
     """Dispatch a `kafka`-adapter, `ingest_mode="stream"` connector
     (`connector_ingest_mode_check`, widened to admit `"stream"` by
     `0043_ingest_tier2_adapters.sql`) to `run_kafka_stream_batch` -- the
@@ -768,6 +826,7 @@ def _run_stream_connector(connector: dict) -> None:
         spec=dial,
         secrets=secrets,
         source_objects=connector.get("sourceObjects", []),
+        run_id=run_id,
     )
 
 
@@ -835,7 +894,7 @@ def run_ingest(context) -> Any:
         # cannot run: a kafka connector's rows arrive from one bounded
         # consumer.poll() loop over the whole topic, not from a
         # build_source() call per sourceObjects entry.
-        _run_stream_connector(connector)
+        _run_stream_connector(connector, run_id=context.run_id)
         return
     seen: dict[str, str] = {}
     for obj in connector.get("sourceObjects", []):
