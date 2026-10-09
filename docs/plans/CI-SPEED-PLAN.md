@@ -1,6 +1,6 @@
 # CI Speed Plan and Spec
 
-Status: proposed, not started.
+Status: PR 1 merged (#88), PR 2 in review.
 Baseline measured on `origin/main` at `715d87b`, 2026-10-08.
 
 ## 1. Goal

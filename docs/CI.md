@@ -5,14 +5,17 @@ This repo's CI is split into four workflows under `.github/workflows/`:
 - **`ci.yml`** — change-scoped fast feedback and acceptance testing. Begins with
   a change scope detector (`changes`) and unconditional repo lints (`repo-lints`),
   runs selective frontend/Dagster/Rust/acceptance jobs based on modified paths,
-  and gates merges with a single summary gate (`ci-required`).
+  builds the `lakehouse-api` and Dagster images once (`images`) for the jobs
+  that need them, and gates merges with a single summary gate (`ci-required`).
 - **`security.yml`** — `cargo audit`, `cargo deny check all`, a working-tree
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
   full-git-history `history-scan` job, which is currently **RED for a real
   reason** (see below) and is deliberately excluded from required checks.
-- **`docker.yml`** — builds `rust/Dockerfile`, boots the container, and
-  asserts `/health` returns 200. A GHCR push job exists but is gated on tag
-  pushes and is currently inert (no registry login configured).
+- **`docker.yml`** — runs on `v*` tag pushes only: builds `rust/Dockerfile`
+  to check that a release tag still builds. A GHCR push job exists but is
+  gated on tag pushes and is currently inert (no registry login
+  configured). The `/health` smoke test that used to live here is the
+  `image-smoke` job in `ci.yml`.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
   for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
@@ -41,8 +44,84 @@ Downstream jobs execute according to scope:
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
 - **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`, `g8-governance`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
+
+`ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
+token a fork PR is given. Nothing in it needs more: image artifacts and the layer cache use
+the Actions runtime credentials, which every run gets.
 
 At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+
+## Images: built once per run
+
+Before CI-SPEED-PLAN PR 2, six acceptance jobs and the Docker workflow each built the
+`lakehouse-api` image from source (a release build of about 515 crates), and four of those
+jobs built the Dagster image as well. Now:
+
+- The **`images`** job builds both images once and uploads each as a workflow artifact
+  (`image-lakehouse-api`, `image-lakehouse-dagster`): `docker buildx` with
+  `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
+  compression by the artifact service. It prints each archive's size in the log.
+- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`,
+  `g8-governance`, `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
+  uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
+  `g8-governance` and `image-smoke` only use the API image and download only that one.
+  A missing image therefore fails the job, it never triggers a silent rebuild. The test
+  runner commands are unchanged.
+- `docker-compose.yml` names the images: `lakehouse-api` is
+  `${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}` and the five services built from
+  `./dagster` are `${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}`. CI sets both
+  variables to `…:ci` tags in the job `env:`. The `build:` blocks stay, so local
+  `docker compose up --build` is unchanged. The five Dagster-built services must keep
+  identical `build:` blocks (same `args:`), because a build of any one retags the image
+  all five use.
+- Two small fixture images are **not** shared: `oidc-mock` and `rest-stub-g6`. Each
+  acceptance job builds them with an explicit `docker compose … build` (same `-p`, `-f` and
+  `--profile` flags as its `up`) just before `up --no-build`, which would otherwise fail on
+  a service that has a `build:` block and no local image.
+- `g1-rustfs` and `g2-seaweedfs` do not use these artifacts: they never built the API image.
+- `GIT_SHA` is left unset in CI, so both images are built with `GIT_SHA=unknown` as before.
+  `ARG GIT_SHA` sits near the top of `dagster/Dockerfile`; a per-commit value would invalidate
+  every layer below it.
+- **`image-smoke`** is the `/health` smoke test that used to be `docker.yml`'s
+  `build-and-smoke-test`: it runs the shared API image standalone (no Postgres or
+  ClickHouse) and asserts `/health` returns 200. `ci-required` covers it, so it is no
+  longer a separate required check (see branch protection below).
+- If `images` fails, every job that needs it is skipped. `ci-required` treats `images`
+  and each consumer as required whenever the acceptance jobs are, so that still turns the
+  gate red (covered by `scripts/ci/tests/test_required_gate.sh`).
+
+### `rust/Dockerfile` and `CARGO_TARGET_DIR`
+
+The Dockerfile has a tools base (`sqlx-cli` and `cargo-chef`, both pinned and installed above
+every `COPY` of repo files), a planner (`cargo chef prepare`), and a builder that compiles the
+dependencies from `recipe.json` alone (`cargo chef cook --release --locked -p lakehouse-api`)
+before copying the sources. The dependency layer changes only when `Cargo.lock` or a
+`Cargo.toml` does.
+
+One build argument serves two audiences. `CARGO_TARGET_DIR` defaults to `/build/target`, the
+BuildKit cache mount: a local rebuild keeps compiled dependencies in the mount, exactly as
+before. A cache mount is not stored by the GitHub Actions layer cache, so CI passes
+`CARGO_TARGET_DIR=/build/target-layer`, a path outside every mount: `cook`'s output then lands
+in the image layer and can be restored from the cache. The mount stays at `/build/target` on
+both steps either way.
+
+## Caches
+
+The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 was written
+(2026-10-09). Two rules keep PRs from filling it:
+
+- **Image layer cache** (`type=gha`, scopes `api-image` and `dagster-image`): read on every
+  run, **written only on `push` to `main`** (`mode=max`). A cache written by a PR can only be
+  read by that PR, so letting PRs write only evicts `main`'s entries. `docker.yml`'s tag build
+  reads `api-image` and writes nothing.
+- **`Swatinem/rust-cache`**: every step in `ci.yml` has `save-if: github.ref ==
+  'refs/heads/main'`. PRs restore `main`'s cache and do not store their own (PR #88 stored a
+  980 MB copy of `build`'s). The `fmt` job has no cache step at all: `cargo fmt --check`
+  compiles nothing.
+
+If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
+evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
 
 ## MSRV
 
@@ -120,12 +199,16 @@ holding a local clone.
 
 ## Docker
 
-`docker.yml` builds the image and runs it standalone (no Postgres/ClickHouse
-containers), because `lakehouse-api` is designed to boot and serve its
-DB-independent routes — including `/health` — without either dependency
-(`entrypoint.api.sh` skips migrations when `DATABASE_URL` is unset; see
-`lakehouse_store::connect_lazy`'s doc comment). That's a real smoke test of
-the container's own boot path, not a substitute for `docker compose up`
+`docker.yml` runs on `v*` tag pushes only and builds `rust/Dockerfile` with the same build
+arguments as the `images` job, reading (never writing) its `api-image` layer cache. It no
+longer runs on pushes to `main` or on pull requests: the API image is built, shared and smoke
+tested by `ci.yml` (`images`, `image-smoke`).
+
+`image-smoke` runs the image standalone (no Postgres/ClickHouse containers), because
+`lakehouse-api` is designed to boot and serve its DB-independent routes — including
+`/health` — without either dependency (`entrypoint.api.sh` skips migrations when
+`DATABASE_URL` is unset; see `lakehouse_store::connect_lazy`'s doc comment). That's a real
+smoke test of the container's own boot path, not a substitute for `docker compose up`
 against the full stack.
 
 The `push-ghcr` job is gated on `startsWith(github.ref, 'refs/tags/')` and,
@@ -173,7 +256,6 @@ gh api \
   -f 'required_status_checks[checks][][context]=cargo audit (advisories)' \
   -f 'required_status_checks[checks][][context]=cargo deny check (all)' \
   -f 'required_status_checks[checks][][context]=gitleaks (working tree)' \
-  -f 'required_status_checks[checks][][context]=Build lakehouse-api image · smoke test /health' \
   -F 'enforce_admins=false' \
   -F 'required_pull_request_reviews=null' \
   -F 'restrictions=null' \
@@ -182,17 +264,21 @@ gh api \
 ```
 
 The check names above reflect the real `name:` values from
-`.github/workflows/{ci,security,docker}.yml` as of this writing — not
+`.github/workflows/{ci,security}.yml` as of this writing — not
 guessed. `ci-required` consolidates and enforces all scope-dependent tests
-in `ci.yml`. If a workflow's job names change, this list needs to be updated to
+in `ci.yml`, including the image build and `/health` smoke test
+(`images`, `image-smoke`). The check `Build lakehouse-api image · smoke test
+/health` that used to be listed here no longer reports on PRs (`docker.yml` is
+tag-only), so it must NOT be required: a required check that never reports
+blocks every merge under `strict` mode. If a workflow's job names change, this list needs to be updated to
 match, or `strict` mode will block merges on a check that no longer reports.
 
 Why each choice:
 
 - **Required checks are the honest-green ones only.** `ci-required` (enforcing
   all scope-required CI jobs), `Repo lints`, `cargo audit`, `cargo deny`,
-  `gitleaks (working tree)`, and the Docker smoke test are the jobs that
-  are expected to actually pass on a healthy `main`.
+  and `gitleaks (working tree)` are the jobs that are expected to actually pass
+  on a healthy `main`.
 - **`gitleaks (full git history)` is deliberately NOT in this list.** It is
   expected to stay red (see "Known exposure" in
   [SECURITY.md](../SECURITY.md) and the `history-scan`/history section
