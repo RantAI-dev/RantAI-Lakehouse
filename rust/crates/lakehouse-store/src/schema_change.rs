@@ -233,6 +233,60 @@ pub struct SchemaChange {
     pub decided_by: Option<String>,
     /// When it was approved, ISO 8601.
     pub decided_at: Option<IsoTime>,
+    /// Whether `POST .../schema-changes/approve` will take this change:
+    /// `false` for a change that is not pending and for every waiting change
+    /// of a table where one is a type change the existing column cannot hold
+    /// (decision 10: the route refuses the table as a whole). A pending
+    /// `table_added` notice is approvable: approving it means "seen". Not a
+    /// stored column; set by [`SchemaChange::with_can_approve`] and
+    /// [`mark_approvable`] (`SRC-8 review BLOCKER 2`).
+    #[sqlx(skip)]
+    pub can_approve: bool,
+}
+
+impl SchemaChange {
+    /// Whether this is a type change the Bronze column cannot hold, so the
+    /// load would fail for a SQL source (`SRC-8 review BLOCKER 2`, decision
+    /// 10). Such a row only exists for a table checked before loading:
+    /// after-load changes are never pending.
+    #[must_use]
+    pub fn cannot_be_loaded(&self) -> bool {
+        self.kind == ChangeKind::TypeChanged.as_str()
+            && matches!(
+                (self.before_value.as_deref(), self.after_value.as_deref()),
+                (Some(before), Some(after))
+                    if crate::schema_diff::classify_type(before, after)
+                        == Some(crate::schema_diff::TypeChange::Other)
+            )
+    }
+
+    /// Fill [`Self::can_approve`] from the row's own fields. A table-wide
+    /// block is applied by [`mark_approvable`].
+    #[must_use]
+    pub fn with_can_approve(mut self) -> Self {
+        self.can_approve =
+            self.status == ChangeStatus::Pending.as_str() && !self.cannot_be_loaded();
+        self
+    }
+}
+
+/// Set [`SchemaChange::can_approve`] on a list of changes: each row's own
+/// rule, then `false` for every waiting column-level change of a table that
+/// has a change the column cannot hold, because approval takes a table's
+/// waiting changes as a whole and the route refuses it (decision 10).
+/// Every place that returns changes goes through this or `with_can_approve`.
+pub fn mark_approvable(changes: &mut [SchemaChange]) {
+    let blocked: std::collections::HashSet<String> = changes
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Pending.as_str() && c.cannot_be_loaded())
+        .map(|c| c.object_name.clone())
+        .collect();
+    for change in changes {
+        let own = change.status == ChangeStatus::Pending.as_str() && !change.cannot_be_loaded();
+        change.can_approve = own
+            && (change.kind == ChangeKind::TableAdded.as_str()
+                || !blocked.contains(&change.object_name));
+    }
 }
 
 /// A time that serializes as ISO 8601 with milliseconds, like every other
@@ -397,6 +451,13 @@ impl<'p> ObservationTx<'p> {
                 change: row.0,
                 is_new: row.1,
             });
+        }
+        // All of the table's changes are in `recorded`, so the table-wide
+        // block of decision 10 can be decided here.
+        let mut rows: Vec<SchemaChange> = recorded.iter().map(|r| r.change.clone()).collect();
+        mark_approvable(&mut rows);
+        for (r, row) in recorded.iter_mut().zip(rows) {
+            r.change.can_approve = row.can_approve;
         }
 
         // Pending changes the source no longer shows are withdrawn.
@@ -573,7 +634,7 @@ async fn insert_change_row(
         .bind(now)
         .fetch_one(conn)
         .await?;
-    Ok((row.change, row.inserted))
+    Ok((row.change.with_can_approve(), row.inserted))
 }
 
 /// Why a table that appeared at the source was not added to the connector
@@ -702,6 +763,15 @@ pub async fn record_table_additions(
                 Some(AdditionOutcome::AlreadySelected) | None => continue,
             },
         };
+        // A refusal a person already dismissed (same connector, table and
+        // reason) is not recorded again and raises no alert; the table is
+        // still reported as not added.
+        if let Some(refusal) = refusal
+            && refusal_dismissed(&mut tx, connector_id, &candidate.name, refusal).await?
+        {
+            result.not_added.push((candidate.name.clone(), refusal));
+            continue;
+        }
         let change = NewChange {
             kind: ChangeKind::TableAdded,
             column_name: String::new(),
@@ -732,6 +802,26 @@ pub async fn record_table_additions(
     }
     tx.commit().await?;
     Ok(result)
+}
+
+/// Whether a person dismissed this refusal of this table before
+/// (`SRC-8 review SHOULD-FIX 3`, identity: connector, table, reason).
+async fn refusal_dismissed(
+    conn: &mut sqlx::PgConnection,
+    connector_id: &str,
+    object_name: &str,
+    refusal: TableRefusal,
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
+         WHERE connector_id = $1 AND object_name = $2 AND kind = 'table_added' \
+           AND status = 'approved' AND after_value = $3)",
+    )
+    .bind(connector_id)
+    .bind(object_name)
+    .bind(refusal.reason())
+    .fetch_one(conn)
+    .await?)
 }
 
 /// A [`SchemaChange`] row plus the `inserted` flag, decoded together.
@@ -772,11 +862,13 @@ pub async fn list_pending(
         "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
          WHERE connector_id = $1 AND status = 'pending' ORDER BY detected_at, id LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    let mut rows: Vec<SchemaChange> = sqlx::query_as(&sql)
         .bind(connector_id)
         .bind(PENDING_LIST_LIMIT)
         .fetch_all(pool)
-        .await?)
+        .await?;
+    mark_approvable(&mut rows);
+    Ok(rows)
 }
 
 /// The newest `limit` changes that no longer wait (applied or approved),
@@ -795,11 +887,14 @@ pub async fn list_recent(
          WHERE connector_id = $1 AND status <> 'pending' \
          ORDER BY detected_at DESC, id DESC LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    let mut rows: Vec<SchemaChange> = sqlx::query_as(&sql)
         .bind(connector_id)
         .bind(limit)
         .fetch_all(pool)
-        .await?)
+        .await?;
+    // None of these waits, so none is approvable; marked for one rule.
+    mark_approvable(&mut rows);
+    Ok(rows)
 }
 
 /// Every column of a connector marked inactive, by table then name.
@@ -853,41 +948,40 @@ pub struct Approval {
     pub pause_lifted: bool,
 }
 
-/// Approve every pending change of one table (`SRC-8` decision D5): they
-/// become `approved`, the baseline becomes the last OBSERVED shape, removed
-/// columns become inactive, and the connector's schema-change pause is
-/// lifted when nothing else waits. `Ok(None)` when nothing waits for the
-/// table.
-///
-/// # Errors
-///
-/// [`StoreError::Database`] if any statement fails (nothing is written).
-pub async fn approve_object(
-    pool: &PgPool,
+/// The answer of [`approve_object`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// What waited is now approved.
+    Approved(Approval),
+    /// Nothing is pending for the table.
+    NothingWaits,
+    /// What waits includes a type change the existing column cannot hold
+    /// (decision 10, `SRC-8 review BLOCKER 2`): approving it would resume a
+    /// table whose next load fails the same way. Nothing was written.
+    CannotBeLoaded,
+}
+
+impl ApproveOutcome {
+    /// The approval, when there was one.
+    #[must_use]
+    pub fn into_approval(self) -> Option<Approval> {
+        match self {
+            Self::Approved(approval) => Some(approval),
+            Self::NothingWaits | Self::CannotBeLoaded => None,
+        }
+    }
+}
+
+/// The state changes an approval of column-level changes makes: the observed
+/// shape becomes the baseline, approved removals become inactive columns,
+/// approved additions are active again.
+async fn accept_waiting_shape(
+    tx: &mut sqlx::PgConnection,
     connector_id: &str,
     object_name: &str,
-    decided_by: Option<&str>,
+    approved: &[SchemaChange],
     now: OffsetDateTime,
-) -> Result<Option<Approval>, StoreError> {
-    let mut tx = pool.begin().await?;
-    lock(&mut tx, connector_id, object_name).await?;
-    let sql = format!(
-        "UPDATE connector_schema_change SET status = 'approved', decided_by = $3, decided_at = $4 \
-         WHERE connector_id = $1 AND object_name = $2 AND status = 'pending' \
-         RETURNING {CHANGE_COLUMNS}"
-    );
-    let mut approved: Vec<SchemaChange> = sqlx::query_as(&sql)
-        .bind(connector_id)
-        .bind(object_name)
-        .bind(decided_by)
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
-    if approved.is_empty() {
-        return Ok(None);
-    }
-    approved.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.column_name.cmp(&b.column_name)));
-
+) -> Result<(), StoreError> {
     // The waiting shape is the last one observed; without it (it is always
     // set together with a pending row) the baseline simply stays.
     sqlx::query(
@@ -930,10 +1024,83 @@ pub async fn approve_object(
     .bind(&added)
     .execute(&mut *tx)
     .await?;
+    Ok(())
+}
+
+/// Approve every pending change of one table (`SRC-8` decision D5): they
+/// become `approved`, the baseline becomes the last OBSERVED shape, removed
+/// columns become inactive, and the connector's schema-change pause is
+/// lifted when nothing else waits.
+///
+/// Pending `table_added` rows (`SRC-8 review SHOULD-FIX 3`) are notices that
+/// a table could NOT be added, not a table that waits: they do not count as
+/// waiting and do not keep a pause. Approving the table name marks them
+/// `approved` ("seen", nothing is added), which is how a person dismisses
+/// them without a new route; the approved row is also what keeps
+/// [`record_table_additions`] from recording the same refusal again.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if any statement fails (nothing is written).
+pub async fn approve_object(
+    pool: &PgPool,
+    connector_id: &str,
+    object_name: &str,
+    decided_by: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<ApproveOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    lock(&mut tx, connector_id, object_name).await?;
+
+    // The check and the UPDATE share the lock, so a change cannot turn into
+    // an unloadable one between them.
+    let pending_sql = format!(
+        "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
+         WHERE connector_id = $1 AND object_name = $2 AND status = 'pending'"
+    );
+    let pending: Vec<SchemaChange> = sqlx::query_as(&pending_sql)
+        .bind(connector_id)
+        .bind(object_name)
+        .fetch_all(&mut *tx)
+        .await?;
+    if pending.is_empty() {
+        return Ok(ApproveOutcome::NothingWaits);
+    }
+    // Decision 10: refuse the table as a whole; nothing is written.
+    if pending.iter().any(SchemaChange::cannot_be_loaded) {
+        return Ok(ApproveOutcome::CannotBeLoaded);
+    }
+    let table_waits = pending
+        .iter()
+        .any(|c| c.kind != ChangeKind::TableAdded.as_str());
+
+    let sql = format!(
+        "UPDATE connector_schema_change SET status = 'approved', decided_by = $3, decided_at = $4 \
+         WHERE connector_id = $1 AND object_name = $2 AND status = 'pending' \
+         RETURNING {CHANGE_COLUMNS}"
+    );
+    let mut approved: Vec<SchemaChange> = sqlx::query_as(&sql)
+        .bind(connector_id)
+        .bind(object_name)
+        .bind(decided_by)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+    approved.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.column_name.cmp(&b.column_name)));
+    if !table_waits {
+        // Only notices: no baseline moves and no pause is touched.
+        tx.commit().await?;
+        return Ok(ApproveOutcome::Approved(Approval {
+            approved,
+            pause_lifted: false,
+        }));
+    }
+
+    accept_waiting_shape(&mut tx, connector_id, object_name, &approved, now).await?;
 
     let (others,): (bool,) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
-         WHERE connector_id = $1 AND status = 'pending')",
+         WHERE connector_id = $1 AND status = 'pending' AND kind <> 'table_added')",
     )
     .bind(connector_id)
     .fetch_one(&mut *tx)
@@ -953,7 +1120,7 @@ pub async fn approve_object(
             > 0
     };
     tx.commit().await?;
-    Ok(Some(Approval {
+    Ok(ApproveOutcome::Approved(Approval {
         approved,
         pause_lifted,
     }))

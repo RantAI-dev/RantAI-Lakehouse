@@ -16,8 +16,8 @@ use lakehouse_store::connectors::{
     list_ingestible_connectors, set_ingest_spec, update_connector,
 };
 use lakehouse_store::schema_change::{
-    ChangeKind, ChangeStatus, NewChange, ObservationTx, ObservationWrite, ObservedColumn,
-    SCHEMA_CHANGE_PAUSE_REASON, TableCandidate, TableRefusal, approve_object,
+    ApproveOutcome, ChangeKind, ChangeStatus, NewChange, ObservationTx, ObservationWrite,
+    ObservedColumn, SCHEMA_CHANGE_PAUSE_REASON, TableCandidate, TableRefusal, approve_object,
     list_inactive_columns, list_pending, list_recent, record_table_additions,
 };
 use sqlx::PgPool;
@@ -263,6 +263,7 @@ async fn approval_moves_the_baseline_marks_inactive_and_lifts_the_pause(
     )
     .await
     .unwrap()
+    .into_approval()
     .unwrap();
     assert_eq!(approval.approved.len(), 1);
     assert_eq!(approval.approved[0].status, "approved");
@@ -282,6 +283,7 @@ async fn approval_moves_the_baseline_marks_inactive_and_lifts_the_pause(
         approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
             .await
             .unwrap()
+            .into_approval()
             .is_none()
     );
     assert_eq!(list_recent(&pool, &id, 50).await.unwrap().len(), 1);
@@ -301,6 +303,7 @@ async fn approval_leaves_a_pause_with_another_reason_alone(pool: PgPool) -> sqlx
     let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
         .await
         .unwrap()
+        .into_approval()
         .unwrap();
     assert!(!approval.pause_lifted);
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
@@ -654,4 +657,270 @@ async fn the_ingestible_list_carries_the_schema_change_policy(pool: PgPool) {
         serde_json::to_value(mine).unwrap()["schemaChangePolicy"],
         "apply_all"
     );
+}
+
+fn type_change(column: &str, before: &str, after: &str) -> NewChange {
+    NewChange {
+        kind: ChangeKind::TypeChanged,
+        column_name: column.to_owned(),
+        before_value: Some(before.to_owned()),
+        after_value: Some(after.to_owned()),
+        breaking: true,
+        status: ChangeStatus::Pending,
+    }
+}
+
+async fn observe_changes(
+    pool: &PgPool,
+    id: &str,
+    observed: &[ObservedColumn],
+    changes: &[NewChange],
+) {
+    let mut tx = ObservationTx::begin(pool, id, "orders").await.unwrap();
+    tx.record(&ObservationWrite {
+        observed_columns: observed,
+        observed_primary_key: &["id".to_owned()],
+        changes,
+        accept_observed: false,
+        pause_connector: false,
+        run_id: Some("run-1"),
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// `SRC-8 review BLOCKER 2` (decision 10): a waiting type change the column
+/// cannot hold is not approvable, and it takes the table's other waiting
+/// changes with it, because approval accepts the observed shape as a whole.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_type_change_the_column_cannot_hold_is_refused_and_nothing_is_approved(pool: PgPool) {
+    let id = connector(&pool).await;
+    baseline(&pool, &id, &[col("id", "integer"), col("qty", "integer")]).await;
+    let observed = [
+        col("id", "integer"),
+        col("qty", "text"),
+        col("note", "text"),
+    ];
+    let added = NewChange {
+        kind: ChangeKind::ColumnAdded,
+        column_name: "note".to_owned(),
+        before_value: None,
+        after_value: Some("text".to_owned()),
+        breaking: false,
+        status: ChangeStatus::Pending,
+    };
+    observe_changes(
+        &pool,
+        &id,
+        &observed,
+        &[type_change("qty", "integer", "text"), added],
+    )
+    .await;
+
+    let pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending.iter().all(|c| !c.can_approve),
+        "the whole table is blocked: {pending:?}"
+    );
+
+    let outcome = approve_object(
+        &pool,
+        &id,
+        "orders",
+        Some("user-1"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ApproveOutcome::CannotBeLoaded);
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap().len(),
+        2,
+        "not even the added column was approved"
+    );
+    assert!(list_recent(&pool, &id, 50).await.unwrap().is_empty());
+}
+
+/// The same refusal, then the exact sequence the console tells the person to
+/// follow: integer to text is observed (waits), the source is put back, the
+/// next observation shows no change and nothing is pending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_leaves_the_waiting_state_when_the_source_is_put_back(pool: PgPool) {
+    let id = connector(&pool).await;
+    let original = [col("id", "integer"), col("qty", "integer")];
+    baseline(&pool, &id, &original).await;
+    observe_changes(
+        &pool,
+        &id,
+        &[col("id", "integer"), col("qty", "text")],
+        &[type_change("qty", "integer", "text")],
+    )
+    .await;
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+
+    observe_changes(&pool, &id, &original, &[]).await;
+
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        ApproveOutcome::NothingWaits
+    );
+}
+
+/// A narrowed type is breaking but loadable: it stays approvable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_narrowed_type_change_is_still_approvable(pool: PgPool) {
+    let id = connector(&pool).await;
+    baseline(&pool, &id, &[col("id", "integer"), col("qty", "bigint")]).await;
+    observe_changes(
+        &pool,
+        &id,
+        &[col("id", "integer"), col("qty", "integer")],
+        &[type_change("qty", "bigint", "integer")],
+    )
+    .await;
+    assert!(list_pending(&pool, &id).await.unwrap()[0].can_approve);
+    assert!(matches!(
+        approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        ApproveOutcome::Approved(_)
+    ));
+}
+
+/// `SRC-8 review SHOULD-FIX 3` (a), (b): a table that could not be added does
+/// not count as waiting, so an approval elsewhere still lifts the pause.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_table_that_could_not_be_added_does_not_keep_the_connector_paused(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    baseline(&pool, &id, &[col("id", "integer"), col("note", "text")]).await;
+    wait_for_removal(&pool, &id, &[col("id", "integer")], true).await;
+    record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.files",
+            "taken",
+            Some(TableRefusal::TargetTaken),
+        )],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+
+    let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    assert!(approval.pause_lifted, "the notice is not a waiting table");
+    let pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(pending.len(), 1, "the notice itself is still listed");
+    assert_eq!(pending[0].kind, "table_added");
+}
+
+/// `SRC-8 review SHOULD-FIX 3` (c), (d): approving the notice marks it seen
+/// and adds nothing; the same refusal then makes no row and no alert, while a
+/// different reason is a new row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dismissed_refusal_does_not_come_back_but_a_different_reason_does(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    let stored = objects(&pool, &id).await;
+    let refuse = |reason| vec![candidate("public.files", "taken", Some(reason))];
+    record_table_additions(
+        &pool,
+        &id,
+        &refuse(TableRefusal::TargetTaken),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+
+    let outcome = approve_object(
+        &pool,
+        &id,
+        "public.files",
+        Some("user-1"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    let ApproveOutcome::Approved(approval) = outcome else {
+        panic!("the notice is dismissed: {outcome:?}")
+    };
+    assert_eq!(approval.approved.len(), 1);
+    assert_eq!(approval.approved[0].status, "approved");
+    assert!(!approval.pause_lifted);
+    assert_eq!(objects(&pool, &id).await, stored, "nothing was added");
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+
+    let again = record_table_additions(
+        &pool,
+        &id,
+        &refuse(TableRefusal::TargetTaken),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert!(again.changes.is_empty(), "no new row, so no alert");
+    assert_eq!(again.not_added.len(), 1, "still reported as not added");
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+
+    let other = record_table_additions(
+        &pool,
+        &id,
+        &refuse(TableRefusal::ReservedForUploads),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other.changes.len(), 1);
+    assert!(other.changes[0].is_new);
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+}
+
+/// A table that was added (applied) is not affected by dismissals: it is
+/// selected now, so a later request skips it and records nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_added_table_is_never_recorded_again(pool: PgPool) {
+    let id = connector_with_spec(&pool).await;
+    let first = record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.invoices",
+            "schema_change_test_invoices",
+            None,
+        )],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.added.len(), 1);
+    let second = record_table_additions(
+        &pool,
+        &id,
+        &[candidate(
+            "public.invoices",
+            "schema_change_test_invoices",
+            None,
+        )],
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert!(second.changes.is_empty() && second.added.is_empty());
+    assert_eq!(list_recent(&pool, &id, 50).await.unwrap().len(), 1);
 }

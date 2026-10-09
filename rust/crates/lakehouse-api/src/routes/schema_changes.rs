@@ -47,8 +47,8 @@ use lakehouse_store::audit as store_audit;
 use lakehouse_store::connectors as store_connectors;
 use lakehouse_store::ingest_spec::default_bronze_target;
 use lakehouse_store::schema_change::{
-    self, InactiveColumn, ObservationTx, ObservationWrite, ObservedColumn, RecordedChange,
-    SchemaChange, SchemaChangePolicy, TableCandidate, TableRefusal,
+    self, ApproveOutcome, InactiveColumn, ObservationTx, ObservationWrite, ObservedColumn,
+    RecordedChange, SchemaChange, SchemaChangePolicy, TableCandidate, TableRefusal,
 };
 use lakehouse_store::schema_diff::{Action, Decision, TableShape, evaluate};
 use lakehouse_store::uploads;
@@ -89,6 +89,12 @@ const NOT_APPLY_ALL: &str = "This connector's schema-change policy is not \"Appl
 /// of (`PostgreSQL`, `MySQL`/`MariaDB`, SQL Server) take new tables on their own.
 const TABLES_NOT_SUPPORTED: &str =
     "New tables are added on their own only for PostgreSQL, MySQL, MariaDB and SQL Server sources.";
+
+/// Fixed 409 text: a type change the existing column cannot hold is waiting
+/// (`SRC-8` decision 10, review BLOCKER 2). No source text goes in.
+const CANNOT_BE_LOADED: &str = "This type change cannot be loaded into the existing column. \
+     Change the column back at the source, or remove the table from the connector \
+     and add it again under a new target.";
 
 /// Fixed 500 text for a stored policy this code does not know.
 const UNKNOWN_POLICY: &str = "the connector's schema-change policy is not one this version knows";
@@ -620,7 +626,9 @@ pub async fn list(
 /// # Errors
 ///
 /// 404 when nothing waits for that table or the connector is another
-/// tenant's or unknown, 400 for a bad body, 503/500 as the store reports.
+/// tenant's or unknown, 409 with a fixed text when what waits includes a type
+/// change the column cannot hold (decision 10), 400 for a bad body, 503/500 as
+/// the store reports.
 pub async fn approve(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -631,7 +639,11 @@ pub async fn approve(
     check_name("object", &req.object, MAX_NAME_LEN)?;
     let pool = pool(&state)?;
     let decided_by = principal.id.uuid().to_string();
-    let approval = schema_change::approve_object(
+    // A pending `table_added` row (a table that could not be added) is
+    // dismissed through this same route with the table's name: approving it
+    // means "seen" and adds nothing (`SRC-8 review SHOULD-FIX 3`). The wire
+    // shape is the same for both.
+    let approval = match schema_change::approve_object(
         pool,
         &id,
         &req.object,
@@ -639,7 +651,20 @@ pub async fn approve(
         OffsetDateTime::now_utc(),
     )
     .await?
-    .ok_or_else(|| ApiError::NotFound("No schema change is waiting for that table".to_owned()))?;
+    {
+        ApproveOutcome::Approved(approval) => approval,
+        ApproveOutcome::NothingWaits => {
+            return Err(ApiError::NotFound(
+                "No schema change is waiting for that table".to_owned(),
+            )
+            .into());
+        }
+        // Decision 10: nothing was approved, not even the table's other
+        // pending changes (approval accepts the observed shape as a whole).
+        ApproveOutcome::CannotBeLoaded => {
+            return Err(ApiError::Conflict(CANNOT_BE_LOADED.to_owned()).into());
+        }
+    };
     // Counts and the table name only: never a column value, never source data.
     let event = connector_audit_event(
         &principal,
@@ -1721,6 +1746,168 @@ mod tests {
         let (status, _) = post_tables(&h, &service(), "conn-nope", json!(["a.b"])).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(selected(&pool, &id).await.len(), 1);
+    }
+
+    const QTY_INTEGER: [(&str, &str); 2] = [("id", "integer"), ("qty", "integer")];
+    const QTY_TEXT: [(&str, &str); 2] = [("id", "integer"), ("qty", "text")];
+    const QTY_TEXT_NOTE: [(&str, &str); 3] = [("id", "integer"), ("qty", "text"), ("note", "text")];
+
+    async fn listed(h: &Harness, id: &str) -> Value {
+        let (status, listed) = call(
+            h,
+            &user(&[h.tenant]),
+            "GET",
+            &format!("/api/connectors/{id}/schema-changes"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        listed
+    }
+
+    async fn approve_orders(h: &Harness, id: &str, object: &str) -> (StatusCode, Value) {
+        call(
+            h,
+            &user(&[h.tenant]),
+            "POST",
+            &format!("/api/connectors/{id}/schema-changes/approve"),
+            Some(json!({ "object": object })),
+        )
+        .await
+    }
+
+    /// `SRC-8 review BLOCKER 2` (decision 10): a SQL type change the column
+    /// cannot hold waits under every policy, is shown as not approvable in
+    /// the observation answer and in the list, and approval is a 409 with the
+    /// fixed text that approves nothing, not even the table's other changes.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn approving_a_type_change_the_column_cannot_hold_is_a_409_that_approves_nothing(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[]).await;
+        for policy in ["apply_non_breaking", "apply_all", "ask_first", "pause"] {
+            let id = connector(&h, &format!("unloadable {policy}"), policy).await;
+            observe_as_service(&h, &id, &QTY_INTEGER, "before_load").await;
+            let answer = observe_as_service(&h, &id, &QTY_TEXT_NOTE, "before_load").await;
+            assert_eq!(answer["action"], "wait", "{policy}");
+            let changes = answer["changes"].as_array().unwrap();
+            assert_eq!(changes.len(), 2, "{policy}");
+            assert!(
+                changes.iter().all(|c| c["canApprove"] == false),
+                "{policy}: {answer}"
+            );
+
+            let list = listed(&h, &id).await;
+            assert!(
+                list["pending"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|c| c["canApprove"] == false),
+                "{policy}: {list}"
+            );
+
+            let (status, refused) = approve_orders(&h, &id, "orders").await;
+            assert_eq!(status, StatusCode::CONFLICT, "{policy}");
+            assert_eq!(refused["error"], CANNOT_BE_LOADED, "{policy}");
+            let list = listed(&h, &id).await;
+            assert_eq!(list["pending"].as_array().unwrap().len(), 2, "{policy}");
+            assert_eq!(list["recent"], json!([]), "{policy}");
+        }
+    }
+
+    /// The way out the 409 names: the source is put back, the next
+    /// observation shows no change, and the table loads with nothing pending.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_table_waiting_on_an_unloadable_type_change_loads_when_the_source_is_put_back(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "put back", "pause").await;
+        observe_as_service(&h, &id, &QTY_INTEGER, "before_load").await;
+        let waiting = observe_as_service(&h, &id, &QTY_TEXT, "before_load").await;
+        assert_eq!(waiting["action"], "wait");
+
+        let back = observe_as_service(&h, &id, &QTY_INTEGER, "before_load").await;
+
+        assert_eq!(back["action"], "load");
+        assert_eq!(back["changes"], json!([]));
+        let list = listed(&h, &id).await;
+        assert_eq!(list["pending"], json!([]));
+        let (status, _) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "nothing waits any more");
+    }
+
+    /// After the load (files, REST, `MongoDB`, Kafka, SFTP) such a change is
+    /// already in the table as a second column (`SRC-8-RESULT`), so it is
+    /// recorded as applied and never waits or blocks.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn after_the_load_an_unloadable_type_change_is_applied_and_never_waits(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "after type", "apply_non_breaking").await;
+        observe_as_service(&h, &id, &QTY_INTEGER, "after_load").await;
+
+        let answer = observe_as_service(&h, &id, &QTY_TEXT, "after_load").await;
+
+        assert_eq!(answer["action"], "load");
+        assert_eq!(answer["changes"][0]["kind"], "type_changed");
+        assert_eq!(answer["changes"][0]["status"], "applied");
+        assert_eq!(answer["changes"][0]["canApprove"], false);
+        assert_eq!(listed(&h, &id).await["pending"], json!([]));
+    }
+
+    /// A removal alone is approvable, and the flag says so.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_waiting_removal_is_marked_approvable(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "approvable", "apply_non_breaking").await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        let answer = observe_as_service(&h, &id, &WITHOUT_NOTE, "before_load").await;
+        assert_eq!(answer["changes"][0]["canApprove"], true);
+        assert_eq!(listed(&h, &id).await["pending"][0]["canApprove"], true);
+        let (_, approved) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(approved["approved"][0]["canApprove"], false);
+    }
+
+    /// `SRC-8 review SHOULD-FIX 3`: a table "apply all" could not add is
+    /// dismissed through the approve route with its name, adds nothing, and
+    /// the same refusal then raises no new row and no new alert.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_refused_table_is_dismissed_through_approve_and_its_alert_does_not_repeat(
+        pool: sqlx::PgPool,
+    ) {
+        let h0 = harness(&pool, &[]).await;
+        let id = connector(&h0, "Shop DB", "apply_all").await;
+        let h = harness(&pool, &[("al-d", "connector_schema_change", &id)]).await;
+        with_spec(&h, &id, "sql", "postgres").await;
+        let other = connector(&h, "Other", "apply_all").await;
+        with_spec(&h, &other, "sql", "postgres").await;
+        sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+            .bind(&other)
+            .bind(json!([{"name": "s.c", "target": "shop_db_customers"}]))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let tables = json!(["public.customers"]);
+        post_tables(&h, &service(), &id, tables.clone()).await;
+        assert_eq!(posts(&h, "al-d").await.len(), 1);
+        let list = listed(&h, &id).await;
+        assert_eq!(list["pending"][0]["kind"], "table_added");
+        assert_eq!(list["pending"][0]["canApprove"], true);
+
+        let (status, dismissed) = approve_orders(&h, &id, "public.customers").await;
+
+        assert_eq!(status, StatusCode::OK, "{dismissed}");
+        assert_eq!(dismissed["approved"][0]["status"], "approved");
+        assert_eq!(dismissed["pauseLifted"], false);
+        assert_eq!(selected(&pool, &id).await.len(), 1, "nothing was added");
+        let (status, again) = post_tables(&h, &service(), &id, tables).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["notAdded"][0]["table"], "public.customers");
+        assert_eq!(posts(&h, "al-d").await.len(), 1, "no second alert");
+        assert_eq!(listed(&h, &id).await["pending"], json!([]));
     }
 
     #[test]
