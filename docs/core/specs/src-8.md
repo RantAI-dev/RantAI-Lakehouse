@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-8` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -37,11 +36,10 @@ Airbyte: propagate field changes, propagate all, approve all, stop; breaking cha
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Add a column at the source: it appears after the next run and a notice lists it
-- [ ] Drop a column at the source: the table pauses, the column stays, the notice asks for a decision
-- [ ] Set 'pause': any change stops the load until approved
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-8-AC1` Add a column at the source: it appears after the next run and a notice lists it
+- `SRC-8-AC2` Drop a column at the source: the table pauses, the column stays, the notice asks for a decision
+- `SRC-8-AC3` Set 'pause': any change stops the load until approved
+- `SRC-8-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-18` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security |
+| Module | Administration & Security |
 | When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -34,10 +33,9 @@ Re-checked by the planner: docker-compose.yml.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] docker compose up on a clean project without the variables refuses to start with a clear message
-- [ ] A real up with them set works (rule 8)
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-18-AC1` docker compose up on a clean project without the variables refuses to start with a clear message
+- `SEC-18-AC2` A real up with them set works (rule 8)
+- `SEC-18-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

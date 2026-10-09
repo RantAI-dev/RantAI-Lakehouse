@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-9` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with BI-18 C |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-18`](bi-18.md) (BI phase 3) |
@@ -41,8 +40,7 @@ BI-18 part C.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request creates a tab with the map charts
+- `AI-9-AC1` The quoted request creates a tab with the map charts
 
 ## Not included
 

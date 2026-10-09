@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-5` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with each BI-16 part |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-16`](bi-16.md) (BI phase 1, 3, 6) |
@@ -41,9 +40,8 @@ BI-16.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request makes a pivot with totals
-- [ ] Each BI-16 part's PR includes the assistant schema change
+- `AI-5-AC1` The quoted request makes a pivot with totals
+- `AI-5-AC2` Each BI-16 part's PR includes the assistant schema change
 
 ## Not included
 

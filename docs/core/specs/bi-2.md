@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `BI-2` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
+| Module | Dashboards |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -37,10 +36,9 @@ Metabase metrics and segments (all plans). Tableau Pulse metrics.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A metric 'Revenue' used on three dashboards changes on all three when its formula is edited
-- [ ] Asking the assistant for revenue uses the metric
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-2-AC1` A metric 'Revenue' used on three dashboards changes on all three when its formula is edited
+- `BI-2-AC2` Asking the assistant for revenue uses the metric
+- `BI-2-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

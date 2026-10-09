@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-2` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with BI-18 A |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-18`](bi-18.md) (BI phase 1) |
@@ -42,9 +41,8 @@ BI-18 part A defines the filter types.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request sets a year and a province filter
-- [ ] The next viewer's dashboard is unchanged
+- `AI-2-AC1` The quoted request sets a year and a province filter
+- `AI-2-AC2` The next viewer's dashboard is unchanged
 
 ## Not included
 

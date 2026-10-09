@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-9` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -35,10 +34,9 @@ Includes the connector half of VER-1.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] CI shows one passing gate per connector type in the picker
-- [ ] Breaking a connector's code turns its gate red
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-9-AC1` CI shows one passing gate per connector type in the picker
+- `SRC-9-AC2` Breaking a connector's code turns its gate red
+- `SRC-9-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

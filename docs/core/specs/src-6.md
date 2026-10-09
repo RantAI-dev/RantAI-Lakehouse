@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-6` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next, ready now |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,10 +35,9 @@ Bugs found by reading the code during the Data audit.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Each connector type in the picker can be created, tested and edited on a real deployment
-- [ ] Google Sheets shows 'not supported yet'
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-6-AC1` Each connector type in the picker can be created, tested and edited on a real deployment
+- `SRC-6-AC2` Google Sheets shows 'not supported yet'
+- `SRC-6-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

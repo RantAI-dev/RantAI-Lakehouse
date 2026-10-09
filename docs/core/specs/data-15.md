@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-15` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec corrected against the code 2026-10-09. Not planned, not built |
@@ -37,11 +36,10 @@ Databricks Catalog Explorer: sample data about 1,000 rows, Insights over 30 days
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Preview shows 1,000 rows with masked columns masked
-- [ ] Usage covers 30 days
-- [ ] A dropped table is restored from its page within 7 days
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-15-AC1` Preview shows 1,000 rows with masked columns masked
+- `DATA-15-AC2` Usage covers 30 days
+- `DATA-15-AC3` A dropped table is restored from its page within 7 days
+- `DATA-15-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

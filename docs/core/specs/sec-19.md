@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-19` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with Query Studio |
+| Module | Administration & Security |
 | When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -34,9 +33,8 @@ From the Data audit; not re-checked.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] An estimate of SELECT * FROM url('http://...') is refused without contacting the URL
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-19-AC1` An estimate of SELECT * FROM url('http://...') is refused without contacting the URL
+- `SEC-19-AC2` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
