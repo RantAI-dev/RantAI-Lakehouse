@@ -181,7 +181,8 @@ const ALL_SCOPE_DENIED: &str =
 /// - a connector id must pass
 ///   [`crate::routes::connectors::ensure_connector_in_tenants`], which
 ///   answers a connector outside the caller's tenants exactly as an unknown
-///   one (404), so the answer is no oracle for which ids exist.
+///   one (404), so the answer is no oracle for which ids exist. An
+///   unrestricted caller needs only the connector to exist.
 ///
 /// Any other kind is not checked here (unchanged behaviour). A missing
 /// connector is left to `save_rule`'s own validation (400). With no
@@ -217,6 +218,22 @@ pub(crate) async fn authorise_rule_scope(
             Ok(())
         } else {
             Err(ApiError::PermissionDenied(ALL_SCOPE_DENIED.to_owned()))
+        };
+    }
+    if crate::routes::catalog::is_unrestricted(principal) {
+        // PR #101 CI (`an_administrator_may_save_a_rule_for_all_connectors_and_for_uploads`):
+        // an administrator who sees every tenant is a member of none in
+        // particular, so the tenant-membership test below refused a real
+        // connector of another tenant. Existence is all that is left to
+        // check, and an unknown id gets the same 404 as everywhere else.
+        let pool = crate::routes::connectors::pool(state)?;
+        return if lakehouse_store::connectors::get_connector(pool, scope)
+            .await?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(ApiError::NotFound(format!("Connector {scope} not found")))
         };
     }
     crate::routes::connectors::ensure_connector_in_tenants(state, Some(principal), scope).await
@@ -2001,6 +2018,16 @@ mod rule_scope_authorisation {
         )
         .await
         .unwrap();
+        // Still an existing connector only: an unknown id is the same 404.
+        let err = create_as(
+            &state,
+            Some(admin()),
+            "connector_failure",
+            Some("conn-ghost"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND.as_u16());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
