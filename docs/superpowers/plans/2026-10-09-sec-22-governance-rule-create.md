@@ -97,8 +97,38 @@ then `bun run typecheck && bun run lint && bun run test` in full.
 
 ## Handoff
 
-*(developer)*
+*(developer, Sonnet 5.5, 2026-10-09)*
+
+**Commits** (branch `fix/sec-22-governance-rule-create`, local only):
+
+- `0ba42e5` fix(api): adding a governance rule needs governance:write (T1)
+- `2ca4fc2` fix(api): the assistant needs governance:write to add a governance rule (T2)
+- `09dd137` fix(console): show the add-rule buttons only with governance:write (T3)
+
+**Commands run**
+
+- Rust, from `rust/` with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, `df -h /` first (49-53G free):
+  `cargo check -p lakehouse-api --tests` (clean, after T1);
+  after `touch` of the crate sources, `cargo fmt --check` (exit 0) and
+  `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean, no warnings), run again on the final Rust state.
+- TypeScript: `bun install --frozen-lockfile` (lockfile unchanged), then
+  `bun run typecheck && bun run lint && bun run test`: typecheck and lint clean, `920 pass, 1 skip, 0 fail`, 2319 expect() calls, 921 tests in 102 files.
+  The new page tests alone, with `asset-detail-tabs.test.tsx`: 108 pass, 0 fail.
+
+**Not verified.** No `cargo test` was run (machine limit): the new unit tests in `policy.rs` and `routes/ai/gate.rs`, the changed `registry.rs` expectations, the schema snapshot test, and the new `tests/route_auth.rs` test (needs Postgres via `sqlx::test`) are *not verified (first run is CI's)*. Nothing was run in a browser.
+
+**What changed against the plan**
+
+- T1: the route test is `adding_a_governance_rule_without_governance_write_is_refused_and_stores_nothing` in `tests/route_auth.rs`; it uses a principal with `catalog:read,catalog:write,policy:read,policy:write,query:read,pipeline:write` (not literally every permission) and counts rows in `quality_rule`, `classification_rule`, `residency_rule`.
+- T2: the mechanism that exists is `ToolSpec.permission` in `registry.rs`, enforced by `gate::decide` at every chat and `POST /api/ai/tool` dispatch (and used to filter the tools offered). Both tools now declare `governance:write` there. The refusal text is therefore the gate's existing `refused: this user lacks the 'governance:write' permission this tool needs`, not the plan's fixed text "You do not have permission to add governance rules.": adding that would have been a second check (rule 4). Tests sit in `gate.rs` and `registry.rs`, not `tools/governance.rs`, because the refusal happens in the gate, before the tool runs. The tool schema JSON is untouched.
+- T3: no residency page with an add button exists. The button tests are in `asset-detail-tabs.test.tsx` (Quality and Access tabs) and two new files, `data-quality-page.test.tsx` and `classification-page.test.tsx`. Two existing tests clicked the buttons synchronously; they now `await findBy…` because `hasPermission` is false until the session loads.
+
+**Open for the reviewer**
+
+- The headless agent-run path (`routes/agents.rs`, `run_tool` at the scheduled and approved-run call sites) does not call `gate::decide` for the permission check, so an agent employee that has these tools can still add a rule. This is outside the plan's scope and untouched; it may need its own backlog item.
+- The "hidden without the permission" page tests wait 50 ms after the session answered, so that "no button" is not just "not loaded yet".
 
 ## Review
+
 
 *(planner)*
