@@ -5,7 +5,7 @@
 | Module | Data (Catalog) |
 | Backlog | `DATA-11` |
 | Spec | `docs/core/specs/data-11.md` (one *(proposed)* number, signed under Decisions 1) |
-| Status | Draft. Decisions not signed; the build uses the defaults below, at the product owner's instruction of 2026-10-09 to start phase 2 |
+| Status | Decisions signed 2026-10-09. In build |
 | Plan | `docs/superpowers/plans/2026-10-09-data-11-catalog-search.md` |
 
 ## Problem
@@ -53,18 +53,18 @@ not changed by this work.
 
 ## Decisions
 
-Not signed. Until signed, the default is used.
+All eight defaults signed by the product owner on 2026-10-09 ("run as proposed").
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Speed target *(proposed)*. No competitor publishes a number. | Results within 500 ms for a catalog of 10,000 tables, measured and written to `docs/plans/DATA-11-RESULT.md`. If the measurement misses it, that is reported, not hidden. | |
-| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. | |
-| 3 | How forgiving a typo is. | One wrong, missing, extra or swapped letter, in a word of four letters or more. Shorter words must match exactly. | |
-| 4 | What "ranked by use" means. | Relevance decides the order. Between two equally good matches, the table read by more queries in the last 7 days comes first. This is the count the asset page already shows; it covers Query Studio and assistant queries, not dashboard reads. | |
-| 5 | The spec says "only assets the user may see appear". The product has no per-table visibility: whoever may open the catalog sees every table in it. | Search shows exactly what the Data Explorer list shows to the same user, never more. Hiding single tables from single users is not built here; it becomes a backlog item of its own. | |
-| 6 | The certification filter and tag keys and values. | Both wait for `DATA-12`. | |
-| 7 | How many tables the ⌘K box lists. | Eight, as today, with a row "See all results" that opens the Data Explorer with the same words. | |
-| 8 | Phones. The search box in the top bar is hidden on narrow screens and ⌘K needs a keyboard. | Left as it is. On a phone, search from the Data Explorer page. | |
+| 1 | Speed target *(proposed)*. No competitor publishes a number. | Results within 500 ms for a catalog of 10,000 tables, measured and written to `docs/plans/DATA-11-RESULT.md`. If the measurement misses it, that is reported, not hidden. | 2026-10-09 |
+| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. | 2026-10-09 |
+| 3 | How forgiving a typo is. | One wrong, missing, extra or swapped letter, in a word of four letters or more. Shorter words must match exactly. | 2026-10-09 |
+| 4 | What "ranked by use" means. | Relevance decides the order. Between two equally good matches, the table read by more queries in the last 7 days comes first. This is the count the asset page already shows; it covers Query Studio and assistant queries, not dashboard reads. | 2026-10-09 |
+| 5 | The spec says "only assets the user may see appear". The product has no per-table visibility: whoever may open the catalog sees every table in it. | Search shows exactly what the Data Explorer list shows to the same user, never more. Hiding single tables from single users is not built here; it becomes a backlog item of its own. | 2026-10-09 |
+| 6 | The certification filter and tag keys and values. | Both wait for `DATA-12`. | 2026-10-09 |
+| 7 | How many tables the ⌘K box lists. | Eight, as today, with a row "See all results" that opens the Data Explorer with the same words. | 2026-10-09 |
+| 8 | Phones. The search box in the top bar is hidden on narrow screens and ⌘K needs a keyboard. | Left as it is. On a phone, search from the Data Explorer page. | 2026-10-09 |
 
 ## Limits to tell a customer
 

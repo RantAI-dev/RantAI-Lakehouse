@@ -1,9 +1,8 @@
 # `DATA-11` Search that finds columns and tags — Implementation Plan
 
-**Status:** ready to build on the feature page's defaults. Decisions 1–8 are
-**not signed**; the product owner asked on 2026-10-09 for phase 2 to start
-with this task. A decision signed differently later changes the task that
-cites it.
+**Status:** built and reviewed; waits for the product owner's check in the
+console. Decisions 1–8 on the feature page were signed by the product owner
+on 2026-10-09, all as proposed.
 Written 2026-10-09 by the planner (Claude Opus) for a developer agent, under
 the role split in `AGENTS.md`.
 

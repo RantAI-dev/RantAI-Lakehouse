@@ -29,7 +29,6 @@ Quality checked automatically, with a clear list of what is wrong.
 | Anomaly detection | Freshness against a set target only. Volume: an optional alert per pipeline when a run loads under half the median of earlier runs; fixed, per pipeline, not per table | Automatic volume and freshness anomalies learned from at least 14 days of history *(proposed)* |
 | Overview | A Data Quality page lists every rule with its latest result. No incidents, no grouping by table. Every run is stored but only the latest is shown, and editing a rule deletes its runs | A quality page listing open incidents by table, with history |
 | Alerts | None | Through SRC-7's channels |
-| Who may add a rule | Any signed-in user; editing and deleting need `governance:write` | Adding a rule needs the permission editing one needs |
 
 ## Benchmark
 
