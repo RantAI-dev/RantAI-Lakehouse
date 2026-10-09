@@ -7,11 +7,11 @@
 | Who builds it | Data |
 | When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | Spec corrected against the code and a running instance 2026-10-09. Feature page [`time-travel.md`](../features/time-travel.md), decisions signed 2026-10-09. Plan written. Trino is split off as `DATA-21` |
 
 ## Why
 
-The version picker is built but no test proves a past-version query still applies masking and row filters.
+Querying a past version works on ClickHouse, but no test proves it still applies masking and row filters. On Trino it does not work at all: the API refuses the query before it reaches Trino.
 
 ## What users get
 
@@ -19,13 +19,15 @@ Querying a past version of a table is trusted to apply masking.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `a78ad62`, read from the code on 2026-10-09; rows marked *run* were run against a live API and ClickHouse that day. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Masking gate test | None | A gate test proves past-version queries on both engines pass the masking and row-filter rewrite |
-| Picker | Built, unproven | Works for ClickHouse and Trino; versions listed with time and operation |
-| Retention shown | Not stated | The page states how far back versions exist on this install |
+| Masking gate test | None | A gate test proves past-version queries pass the masking and row-filter rewrite. This task: ClickHouse. Trino: `DATA-21` |
+| ClickHouse | *Run:* `SETTINGS iceberg_snapshot_id = <id>` returns the table as it was (14, 28, 42, 56 rows across four versions of one table), also through a subquery shaped like the masking rewrite. One setting pins every Iceberg table in the query, so a join of two tables at one version fails | Works, proven by the gate; the limit on joins is stated where the version is chosen |
+| Trino | *Run:* `FOR VERSION AS OF <id>` is answered 422 "policy cannot be evaluated" before Trino is called; the SQL parser the masking rewrite uses cannot read the clause. By reading, not run: the masking rewrite writes ClickHouse-only functions, so a table with a masking policy cannot be read on Trino at any version | This task: refused with a plain message saying past versions are available on ClickHouse. Working on Trino: `DATA-21` |
+| Picker | Two exist. The asset page's "Query this version" writes the ClickHouse form and lists time and operation. Query Studio's picker writes only the Trino form, whichever engine is chosen, and lists the version id and operation without the time | One behaviour: writes the form of the chosen engine, lists time and operation, and is switched off with the reason when the engine is Trino |
+| Retention shown | Not stated. A "Snapshots to keep" setting exists on the Lakehouse table page; version clean-up is skipped on this ClickHouse version | Where versions are listed and chosen, the page states how many versions the table has and the date of the oldest |
 
 ## Benchmark
 
@@ -36,12 +38,14 @@ Supersedes DATA-7. Snowflake: Time Travel 1 day on all editions, up to 90 days o
 Run on a running console by the product owner. A step not performed is never a pass.
 
 - [ ] Every Target row above works as written
-- [ ] A masked column stays masked when queried at an older version, on both engines
+- [ ] A masked column stays masked when queried at an older version on ClickHouse
+- [ ] A past-version query on Trino is refused with a plain message
 - [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
-- Anything not in the Target table.
+- Past versions on Trino, and masking on Trino: `DATA-21`.
+- Pinning two tables to two different versions in one query.
 
 ## Asking the assistant
 
