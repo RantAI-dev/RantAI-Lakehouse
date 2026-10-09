@@ -21,6 +21,7 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`SEC-19`](sec-19.md) | The query cost estimate runs only safe SQL | Next | S |
 | [`SEC-20`](sec-20.md) | Queries are scoped to the tenant | Next | M |
 | [`SEC-21`](sec-21.md) | Downloads and big results are safe | Next | S |
+| [`SEC-22`](sec-22.md) | Adding a governance rule needs the permission changing one needs | Now | S |
 
 ### Dashboards (BI)
 

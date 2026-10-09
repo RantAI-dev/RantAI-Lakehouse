@@ -115,6 +115,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SEC-18` | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Security | `docker-compose.yml` |
 | `SEC-19` | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text | Security | `routes/query.rs` |
 | `SEC-20` | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Security | `routes/query.rs` |
+| `SEC-22` | Adding a quality, classification or residency rule asked only for a login; now `governance:write`, in the API, the assistant and the console. **Built; waiting for the product owner to run the acceptance checklist** | Security | `features/governance-rule-create.md` |
 | `SEC-21` | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Security | `routes/query.rs` |
 | `SEC-12` | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Security | `lakehouse-embed` |
 
@@ -205,6 +206,7 @@ builds it (`AGENTS.md`).
 | [`SEC-19`](specs/sec-19.md) | The query cost estimate runs only safe SQL | Next | S |
 | [`SEC-20`](specs/sec-20.md) | Queries are scoped to the tenant | Next | M |
 | [`SEC-21`](specs/sec-21.md) | Downloads and big results are safe | Next | S |
+| [`SEC-22`](specs/sec-22.md) | Adding a governance rule needs the permission changing one needs | Now | S |
 
 ### Dashboards (BI)
 
