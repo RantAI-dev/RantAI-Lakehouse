@@ -1919,6 +1919,11 @@ mod tests {
             steward: None,
             tags: Vec::new(),
             description: Some(description.to_owned()),
+            certification: None,
+            certification_note: None,
+            replacement_asset_id: None,
+            certified_by: None,
+            certified_at: None,
         }
     }
 
