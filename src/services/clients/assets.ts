@@ -30,9 +30,10 @@ function errorFor(status: number, message: string): ServiceError {
 /**
  * AssetService is real — the data catalog from the lakehouse (bronze_meta +
  * silver) via the server route `/api/catalog`. The free-text term (`q`) is
- * filtered server-side (`rust/crates/lakehouse-api/src/routes/catalog.rs`'s
- * `filter_assets_by_query`) rather than in the browser, so there is one
- * implementation of the term match, not two (WS2 §13). Facet filters
+ * matched server-side (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`,
+ * the one matcher the Data Explorer's `search` also uses, `DATA-11`) rather
+ * than in the browser, so there is one implementation of the term match, not
+ * two (WS2 §13). The server's rank order is kept. Facet filters
  * (`tier`/`layer`/`type`/`classification`) stay client-side, applied to the
  * returned list below.
  */
