@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `BI-8` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
+| Module | Dashboards |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -39,11 +38,10 @@ Metabase custom expressions: about 100 functions (maths, text, date, logic, aggr
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Profit as revenue minus cost appears as a field and charts correctly
-- [ ] A running total line matches the cumulative sum
-- [ ] A formula with a typo shows the error and cannot be saved
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-8-AC1` Profit as revenue minus cost appears as a field and charts correctly
+- `BI-8-AC2` A running total line matches the cumulative sum
+- `BI-8-AC3` A formula with a typo shows the error and cannot be saved
+- `BI-8-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `QS-5` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Query Studio |
-| Who builds it | Query Studio, with the dashboards team |
+| Module | Query Studio |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -38,11 +37,10 @@ Metabase: variables of type text, number, date and field filter that become dash
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A query with a date-range parameter added to a dashboard is driven by the dashboard's date filter
-- [ ] A parameter value containing a quote cannot change the SQL
-- [ ] A chart is created from a result without saving a SQL source
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `QS-5-AC1` A query with a date-range parameter added to a dashboard is driven by the dashboard's date filter
+- `QS-5-AC2` A parameter value containing a quote cannot change the SQL
+- `QS-5-AC3` A chart is created from a result without saving a SQL source
+- `QS-5-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -325,5 +325,5 @@ store tests) and migration `0061` on PostgreSQL; the g6 steps. `cargo test`
 and the gates are not run on this machine. Their first run is CI's, on the
 pull request. Nothing was opened in a browser.
 
-B5 (planner): `CHANGELOG.md` entry extended; `SRC-14` added to
+B5 (planner): `CHANGELOG.md` entry extended; `SRC-5` added to
 `docs/core/BACKLOG.md` for a connection test that runs in the orchestrator.

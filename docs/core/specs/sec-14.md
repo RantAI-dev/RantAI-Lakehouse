@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-14` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with the Data stream |
+| Module | Administration & Security |
 | When | Now |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,11 +35,10 @@ Re-checked by the planner: lakehouse-store connectors.rs set_ingest_spec keeps s
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Re-pointing the seeded connector without new credentials returns 409
-- [ ] A test against a server that asks for clear-text password authentication never sends the password
-- [ ] A regression test reproduces the attack and now fails
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-14-AC1` Re-pointing the seeded connector without new credentials returns 409
+- `SEC-14-AC2` A test against a server that asks for clear-text password authentication never sends the password
+- `SEC-14-AC3` A regression test reproduces the attack and now fails
+- `SEC-14-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -14,6 +14,7 @@ mod catalog;
 mod catalog_governance;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_search;
 mod catalog_source;
 mod connectors;
 mod dashboard;

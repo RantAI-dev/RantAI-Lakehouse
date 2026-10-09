@@ -3,15 +3,14 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-12` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | Spec corrected against the code 2026-10-09. Not planned, not built |
 
 ## Why
 
-Nothing marks a table as trusted or deprecated, and tags are free text.
+Nothing marks a table as trusted or deprecated, and a tag is any single word anyone with edit rights types.
 
 ## What users get
 
@@ -19,14 +18,15 @@ Trusted tables are marked, deprecated ones warn, and tags follow agreed values.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `c338862`, re-read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
 | Certified and deprecated marks | None | Set by a data owner or admin; shown in search, on the asset page, in the chart builder's table picker and in Query Studio |
 | Deprecation | None | A note and an optional replacement table; users of a deprecated table see a warning |
-| Governed tags | Free-text tags | Admin-defined tag keys with allowed values; only admins create keys |
+| Governed tags | A table carries up to 20 tags, each one lowercase word; no keys, no allowed values. Anyone with `catalog:write` sets them | Admin-defined tag keys with allowed values; only admins create keys |
 | Inheritance | None | A tag on a schema applies to its tables (Snowflake behaviour) |
+| Where tags show | Only on the asset page's About card. Search matches them without showing them; the Data Explorer list, the chart builder's table picker and Query Studio show none | With the marks: in search results, the Data Explorer list, the asset page, the chart builder's table picker and Query Studio |
 
 ## Benchmark
 
@@ -36,11 +36,10 @@ Databricks: certified and deprecated system tags, governed tags with allowed val
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A certified table shows its mark in search and in the chart builder
-- [ ] Setting a tag value outside the allowed list is refused
-- [ ] A user without the owner role cannot certify
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-12-AC1` A certified table shows its mark in search and in the chart builder
+- `DATA-12-AC2` Setting a tag value outside the allowed list is refused
+- `DATA-12-AC3` A user without the owner role cannot certify
+- `DATA-12-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

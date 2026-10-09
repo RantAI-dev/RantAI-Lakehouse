@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-7` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with BI-2 |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-2`](bi-2.md) (BI phase 2) |
@@ -41,8 +40,7 @@ BI-2.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request uses the Revenue metric and names it in the answer
+- `AI-7-AC1` The quoted request uses the Revenue metric and names it in the answer
 
 ## Not included
 

@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `RPT-1` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
+| Module | Dashboards |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -38,11 +37,10 @@ Metabase dashboard subscriptions: hourly, daily, weekly, monthly; CSV and XLSX a
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A weekly Monday 08:00 PDF arrives with the dashboard's charts
-- [ ] A subscription filtered to Bali shows only Bali
-- [ ] With 'skip when empty', no email is sent for an empty result
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `RPT-1-AC1` A weekly Monday 08:00 PDF arrives with the dashboard's charts
+- `RPT-1-AC2` A subscription filtered to Bali shows only Bali
+- `RPT-1-AC3` With 'skip when empty', no email is sent for an empty result
+- `RPT-1-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

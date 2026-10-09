@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-15` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with the Data stream |
+| Module | Administration & Security |
 | When | Now |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -37,10 +36,9 @@ Re-checked by the planner: docker-compose.yml CONNECTOR_PROBE_ALLOW_INTERNAL_HOS
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A REST test against a public URL that redirects to 169.254.169.254 is refused
-- [ ] A fresh compose install refuses a test against 127.0.0.1
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-15-AC1` A REST test against a public URL that redirects to 169.254.169.254 is refused
+- `SEC-15-AC2` A fresh compose install refuses a test against 127.0.0.1
+- `SEC-15-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

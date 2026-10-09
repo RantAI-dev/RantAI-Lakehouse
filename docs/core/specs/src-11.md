@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-11` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -37,11 +36,10 @@ Airbyte: retries with backoff, auto-disable after 30 consecutive failures, per-a
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A transient failure (database briefly down) succeeds on retry without anyone acting
-- [ ] The run log shows each attempt
-- [ ] Deselecting a column removes it from the next load
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-11-AC1` A transient failure (database briefly down) succeeds on retry without anyone acting
+- `SRC-11-AC2` The run log shows each attempt
+- `SRC-11-AC3` Deselecting a column removes it from the next load
+- `SRC-11-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

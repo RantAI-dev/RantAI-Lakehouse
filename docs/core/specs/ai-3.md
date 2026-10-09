@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `AI-3` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
+| Module | AI Copilot |
 | When | Next, with BI-9 |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-9`](bi-9.md) (BI phase 1) |
@@ -40,8 +39,7 @@ BI-9.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request switches a daily chart to monthly
+- `AI-3-AC1` The quoted request switches a daily chart to monthly
 
 ## Not included
 

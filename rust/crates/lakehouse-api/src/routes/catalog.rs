@@ -58,6 +58,7 @@ use crate::json::ApiJson;
 use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::routes::catalog_governance;
 use crate::routes::catalog_query;
+use crate::routes::catalog_search;
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::schema_versions;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
@@ -189,10 +190,16 @@ pub(crate) async fn catalog_tenant_refusal(
     Ok((active != Some(catalog_tenant_id)).then_some(CATALOG_TENANT_REFUSAL_NOT_OWNER))
 }
 
-/// `GET /api/catalog` — the full asset registry, grouped into namespaces,
-/// optionally narrowed by `?q=` to assets whose `name`/`description`/`id`
-/// (or, when Postgres is configured, whose annotation `description`/`tags`)
-/// contain the term.
+/// `GET /api/catalog` — the full asset registry, grouped into namespaces.
+///
+/// With a non-empty `?q=` it is a search instead (`DATA-11`): the assets
+/// that match every word of the term, ranked by [`super::catalog_search`]
+/// — over name, id, namespace, owner, tags, description and the columns'
+/// names and descriptions — each with `matchedOn`, read from the 30-second
+/// search copy ([`search_snapshot`]) rather than rebuilt per request. When
+/// a column query was cut at its row limit the body also says
+/// `"columnSearch": "partial"`. Without a term nothing changes: the
+/// registry is assembled live.
 ///
 /// # Tenant scoping
 ///
@@ -223,28 +230,53 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
-    match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
-        Ok((mut body, bronze_pairs)) => {
-            apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-            enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-            let annotations = apply_annotations(&state, &mut body).await;
-            apply_badges(&state, &mut body, &bronze_pairs).await;
-            if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty())
-                && let Some(assets) = body.get("assets").and_then(Value::as_array)
-            {
-                let filtered = filter_assets_by_query(assets, q, &annotations);
-                body["assets"] = Value::Array(filtered);
+    if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        return match search_snapshot(&state).await {
+            Ok(snapshot) => {
+                let assets = catalog_search::search(
+                    &snapshot.assets,
+                    &snapshot.columns,
+                    &snapshot.usage,
+                    term,
+                );
+                let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
+                if snapshot.column_search_partial {
+                    body["columnSearch"] = json!("partial");
+                }
+                (StatusCode::OK, ApiJson(body)).into_response()
             }
-            (StatusCode::OK, ApiJson(body)).into_response()
-        }
-        // `catch (e) { return NextResponse.json({ error: String(e), assets:
-        // [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
-        )
-            .into_response(),
+            Err(err) => list_unavailable(err),
+        };
     }
+    match assemble_catalog(&state).await {
+        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(err) => list_unavailable(err),
+    }
+}
+
+/// The catalog as `list` serves it: [`list_body`] and the four enrichment
+/// steps, none of which takes a `Principal`. The one assembly behind the
+/// live list, the live `query`, and the search copy
+/// ([`build_search_snapshot`]); also hands back the Bronze `(slug,
+/// table_name)` pairs the use ranking needs.
+async fn assemble_catalog(state: &AppState) -> Result<(Value, Vec<(String, String)>), ChError> {
+    let (mut body, bronze_pairs) =
+        list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await?;
+    apply_sla_targets(state, &mut body, &bronze_pairs).await;
+    enrich_bronze_assets(state, &mut body, bronze_pairs.clone()).await;
+    apply_annotations(state, &mut body).await;
+    apply_badges(state, &mut body, &bronze_pairs).await;
+    Ok((body, bronze_pairs))
+}
+
+/// `catch (e) { return NextResponse.json({ error: String(e), assets:
+/// [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
+fn list_unavailable(err: ChError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ApiJson(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
+    )
+        .into_response()
 }
 
 /// Query string for [`query`]. Mirrors the params the Advanced Data Table
@@ -337,40 +369,52 @@ pub async fn query(
     let group_by = catalog_query::parse_group_by(params.group_by.as_deref())?;
     let join = catalog_query::JoinOperator::parse(params.join_operator.as_deref());
 
-    let listed = list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await;
-    let (mut body, bronze_pairs) = match listed {
-        Ok(v) => v,
-        // Matches `list`'s contract: the catalog being unreachable is a
-        // 503 with an empty result, not a 500.
-        Err(err) => {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({
-                    "error": js_error(err),
-                    "items": [],
-                    "totalItems": 0,
-                    "totalPages": 0,
-                    "page": page,
-                    "pageSize": page_size,
-                })),
-            )
-                .into_response());
-        }
+    // A non-empty `search` reads the 30-second copy and comes back ranked
+    // (DATA-11); without one the catalog is assembled live, as before.
+    let term = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Matches `list`'s contract: the catalog being unreachable is a 503
+    // with an empty result, not a 500.
+    let unavailable = |err: ChError| {
+        Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({
+                "error": js_error(err),
+                "items": [],
+                "totalItems": 0,
+                "totalPages": 0,
+                "page": page,
+                "pageSize": page_size,
+            })),
+        )
+            .into_response())
     };
-    apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-    enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-    apply_annotations(&state, &mut body).await;
-    apply_badges(&state, &mut body, &bronze_pairs).await;
+    let (searched, column_search_partial) = if let Some(term) = term {
+        match search_snapshot(&state).await {
+            Ok(snapshot) => (
+                catalog_search::search(&snapshot.assets, &snapshot.columns, &snapshot.usage, term),
+                snapshot.column_search_partial,
+            ),
+            Err(err) => return unavailable(err),
+        }
+    } else {
+        let body = match assemble_catalog(&state).await {
+            Ok((body, _bronze_pairs)) => body,
+            Err(err) => return unavailable(err),
+        };
+        let assets = body
+            .get("assets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        (assets, false)
+    };
 
-    let assets = body
-        .get("assets")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let searched = catalog_query::apply_search(&assets, params.search.as_deref().unwrap_or(""));
     let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
-    catalog_query::apply_sort(&mut filtered, &sort);
+    order_results(&mut filtered, term.is_some(), &sort);
 
     let (ordered, summaries) = match group_by.as_deref() {
         Some(field) => catalog_query::apply_grouping(&filtered, field),
@@ -398,64 +442,32 @@ pub async fn query(
         summaries
     };
 
-    Ok((
-        StatusCode::OK,
-        ApiJson(catalog_query::build_response(
-            page_items,
-            total_items,
-            page,
-            page_size,
-            group_by.as_deref(),
-            &summaries,
-            keys,
-        )),
-    )
-        .into_response())
+    let mut response = catalog_query::build_response(
+        page_items,
+        total_items,
+        page,
+        page_size,
+        group_by.as_deref(),
+        &summaries,
+        keys,
+    );
+    if column_search_partial {
+        // Principle 2: a caller can see column search was cut short.
+        response["columnSearch"] = json!("partial");
+    }
+    Ok((StatusCode::OK, ApiJson(response)).into_response())
 }
 
-/// Case-insensitive substring match over each asset's `name`, `description`,
-/// and `id` — the SAME fields and case rule
-/// `src/services/clients/assets.ts`'s `clickhouseAssetService.listAssets`
-/// used to apply in the browser, moved here so there is one implementation
-/// (WS2 §13). Case folding uses `to_lowercase()`, not `to_ascii_lowercase()`,
-/// because the browser's JavaScript `toLowerCase()` is Unicode-aware and a
-/// faithful port must match it for non-ASCII text in descriptions and
-/// annotations. Widened by `annotations`: an asset also matches when its own
-/// annotation row's `description` or any `tags` entry contains the term. An
-/// empty `q` matches everything.
-fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRow]) -> Vec<Value> {
-    let needle = q.trim().to_lowercase();
-    if needle.is_empty() {
-        return assets.to_vec();
+/// Orders the rows of [`query`] before grouping and paging.
+///
+/// DATA-11 F4: `apply_sort` falls back to ordering by `id` even for an
+/// empty sort, which would throw away a search's ranking. A search with no
+/// requested sort therefore keeps its rank order; a search with a sort
+/// obeys the sort; without a search, behaviour is as before.
+fn order_results(rows: &mut [Value], searched: bool, sort: &[catalog_query::SortSpec]) {
+    if !searched || !sort.is_empty() {
+        catalog_query::apply_sort(rows, sort);
     }
-    let by_id: HashMap<&str, &AnnotationRow> = annotations
-        .iter()
-        .map(|row| (row.asset_id.as_str(), row))
-        .collect();
-    assets
-        .iter()
-        .filter(|asset| {
-            let id = asset["id"].as_str().unwrap_or_default();
-            let name = asset["name"].as_str().unwrap_or_default().to_lowercase();
-            let description = asset["description"]
-                .as_str()
-                .unwrap_or_default()
-                .to_lowercase();
-            if name.contains(&needle)
-                || description.contains(&needle)
-                || id.to_lowercase().contains(&needle)
-            {
-                return true;
-            }
-            by_id.get(id).is_some_and(|row| {
-                row.description
-                    .as_deref()
-                    .is_some_and(|d| d.to_lowercase().contains(&needle))
-                    || row.tags.iter().any(|t| t.to_lowercase().contains(&needle))
-            })
-        })
-        .cloned()
-        .collect()
 }
 
 #[allow(
@@ -640,6 +652,149 @@ async fn list_body(
         json!({ "assets": assets, "namespaces": namespaces }),
         bronze_pairs,
     ))
+}
+
+/// How long the search copy is trusted before one request rebuilds it
+/// (`DATA-11` D2). Thirty seconds is the age a new table or a fresh row
+/// count may lag in a search result; the list a person opens without a
+/// term is still live. A console annotation edit does not wait for it
+/// (`put_annotation` drops the copy).
+const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+/// The search copy: what `list` assembles for a request, plus the columns
+/// and the use counts, rebuilt at most once per [`SEARCH_SNAPSHOT_TTL`] by
+/// one request at a time (`DATA-11` D2).
+///
+/// Nothing in it depends on the caller: the four enrichment steps take the
+/// shared [`AppState`] and no `Principal`, and the tenant check runs per
+/// request before this is called.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of the catalog read, like [`list_body`]; the
+/// routes answer it as they do today (`503`, the fixed shape).
+async fn search_snapshot(
+    state: &AppState,
+) -> Result<Arc<crate::catalog_search_cache::CatalogSearchSnapshot>, ChError> {
+    state
+        .catalog_search_cache
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || {
+            build_search_snapshot(state)
+        })
+        .await
+}
+
+/// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
+/// what `list` serves, then the columns and the use counts.
+async fn build_search_snapshot(
+    state: &AppState,
+) -> Result<crate::catalog_search_cache::CatalogSearchSnapshot, ChError> {
+    let (body, bronze_pairs) = assemble_catalog(state).await?;
+    let (columns, column_search_partial) = search_column_index(&state.clickhouse).await?;
+    let assets = body
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ids: Vec<String> = assets
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
+        assets,
+        namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
+        columns,
+        usage,
+        column_search_partial,
+    })
+}
+
+/// Most rows each of the two column queries of [`search_column_index`]
+/// reads. A catalog of 10,000 tables at 20 columns is 200,000 rows; this
+/// leaves room for 2.5 times that, and bounds the memory the search copy
+/// can take whatever the registry holds. A query that returns exactly this
+/// many was cut, and search says so (`DATA-11` F2, principle 2).
+const SEARCH_COLUMN_ROWS_MAX: usize = 500_000;
+
+/// Column names and descriptions per asset id for the search copy
+/// (`DATA-11` F2): Bronze `slug, key_asli, deskripsi` from both
+/// `dataset_column` registries, and `silver` / `serving` from
+/// `system.columns`. Run only when the copy is rebuilt, never per search.
+///
+/// The `bool` is true when either query hit [`SEARCH_COLUMN_ROWS_MAX`]:
+/// column search is then partial, and a warning is logged.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of whichever query failed; the caller treats it
+/// as the catalog being unreachable.
+async fn search_column_index(
+    ch: &ChClient,
+) -> Result<(crate::routes::catalog_search::ColumnIndex, bool), ChError> {
+    // `SEARCH_COLUMN_ROWS_MAX` is a constant integer, not caller input.
+    let bronze_sql = format!(
+        "SELECT slug, key_asli, deskripsi FROM (
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column`
+           UNION ALL
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column`
+         ) LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let system_sql = format!(
+        "SELECT database db, table, name, comment FROM system.columns
+         WHERE database IN ('silver','serving') LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let (bronze, system) =
+        tokio::try_join!(ch.rows(&bronze_sql, None), ch.rows(&system_sql, None))?;
+    let partial = bronze.len() >= SEARCH_COLUMN_ROWS_MAX || system.len() >= SEARCH_COLUMN_ROWS_MAX;
+    if partial {
+        tracing::warn!(
+            limit = SEARCH_COLUMN_ROWS_MAX,
+            "catalog search: a column query reached its row limit; column search is partial"
+        );
+    }
+    Ok((collect_columns(&bronze, &system), partial))
+}
+
+/// The asset id the row builders give a `system.columns` table: Silver
+/// `silver.<name>` ([`silver_catalog_row`]), Gold `serving.<name>`
+/// ([`gold_catalog_row`]). `None` for any other database.
+fn system_column_key(db: &str, table: &str) -> Option<String> {
+    matches!(db, "silver" | "serving").then(|| format!("{db}.{table}"))
+}
+
+/// [`search_column_index`]'s rows as `asset id -> [(name, description)]`.
+/// A Bronze row is keyed by its slug, which is the asset id
+/// ([`bronze_catalog_row`]); a row with no name is skipped.
+fn collect_columns(
+    bronze: &[Map<String, Value>],
+    system: &[Map<String, Value>],
+) -> crate::routes::catalog_search::ColumnIndex {
+    let mut index = crate::routes::catalog_search::ColumnIndex::new();
+    for row in bronze {
+        let (slug, name) = (str_col(row, "slug"), str_col(row, "key_asli"));
+        if slug.is_empty() || name.is_empty() {
+            continue;
+        }
+        index
+            .entry(slug.to_owned())
+            .or_default()
+            .push((name.to_owned(), str_col(row, "deskripsi").to_owned()));
+    }
+    for row in system {
+        let (name, table) = (str_col(row, "name"), str_col(row, "table"));
+        let Some(key) = system_column_key(str_col(row, "db"), table) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        index
+            .entry(key)
+            .or_default()
+            .push((name.to_owned(), str_col(row, "comment").to_owned()));
+    }
+    index
 }
 
 // WS2 — filling Bronze `sizeBytes`/`freshnessLagSeconds` from Iceberg.
@@ -1323,22 +1478,23 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
     }
 }
 
-/// [`apply_annotation`] over every row of a list body, and the annotations
-/// themselves for the caller's search. They decorate the list; they never
-/// gate it — a store failure is logged and leaves the registry's values.
-async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<AnnotationRow> {
+/// [`apply_annotation`] over every row of a list body. They decorate the
+/// list; they never gate it — a store failure is logged and leaves the
+/// registry's values. (`DATA-11` F1: the annotations are no longer handed
+/// back for a second matcher; the tags and the description are on the rows.)
+async fn apply_annotations(state: &AppState, body: &mut Value) {
     let Some(pool) = state.pg.as_deref() else {
-        return Vec::new();
+        return;
     };
     let annotations = match lakehouse_store::annotation::list_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(%err, "asset_annotation lookup failed; the catalog list shows registry values");
-            return Vec::new();
+            return;
         }
     };
     if annotations.is_empty() {
-        return annotations;
+        return;
     }
     let by_id: HashMap<&str, &AnnotationRow> = annotations
         .iter()
@@ -1352,7 +1508,6 @@ async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<Annotation
             }
         }
     }
-    annotations
 }
 
 /// The detail page's share of the same: the overlay, plus the raw
@@ -2510,6 +2665,9 @@ pub async fn put_annotation(
         },
     )
     .await?;
+    // DATA-11 D2: a search must show the edit at once, not after the copy's
+    // age. Dropped only after the write succeeded.
+    state.catalog_search_cache.invalidate().await;
     // The asset's Change history reads this. Best-effort, like every other
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.
@@ -2813,63 +2971,106 @@ mod tests {
         assert_eq!(table, "martDROPTABLEx");
     }
 
-    #[test]
-    fn filter_assets_by_query_matches_name_description_or_id_case_insensitively() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        let filtered = filter_assets_by_query(&assets, "ORDER", &[]);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], json!("bronze.orders"));
+    fn row(pairs: &[(&str, &str)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect()
+    }
 
-        let by_id = filter_assets_by_query(&assets, "bronze.users", &[]);
-        assert_eq!(by_id.len(), 1);
-        assert_eq!(by_id[0]["id"], json!("bronze.users"));
+    // DATA-11 R2: the three id shapes the row builders give.
+    #[test]
+    fn collect_columns_keys_bronze_by_slug_and_silver_and_gold_by_database() {
+        let bronze = vec![
+            row(&[
+                ("slug", "orders"),
+                ("key_asli", "total"),
+                ("deskripsi", "Order total"),
+            ]),
+            row(&[("slug", "orders"), ("key_asli", "buyer"), ("deskripsi", "")]),
+            row(&[("slug", ""), ("key_asli", "orphan"), ("deskripsi", "")]),
+        ];
+        let system = vec![
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", "amount"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "serving"),
+                ("table", "mart_x"),
+                ("name", "visitors"),
+                ("comment", "Visitors"),
+            ]),
+            row(&[
+                ("db", "lake"),
+                ("table", "other"),
+                ("name", "ignored"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", ""),
+                ("comment", ""),
+            ]),
+        ];
+        let index = collect_columns(&bronze, &system);
+        assert_eq!(
+            index.get("orders"),
+            Some(&vec![
+                ("total".to_owned(), "Order total".to_owned()),
+                ("buyer".to_owned(), String::new()),
+            ])
+        );
+        assert_eq!(
+            index.get("silver.clean"),
+            Some(&vec![("amount".to_owned(), String::new())])
+        );
+        assert_eq!(
+            index.get("serving.mart_x"),
+            Some(&vec![("visitors".to_owned(), "Visitors".to_owned())])
+        );
+        // The empty slug, the other database and the unnamed column add nothing.
+        assert_eq!(index.len(), 3);
+    }
+
+    fn rows_in(order: &[&str]) -> Vec<Value> {
+        order
+            .iter()
+            .map(|id| json!({ "id": id, "name": id }))
+            .collect()
+    }
+
+    fn row_ids(rows: &[Value]) -> Vec<&str> {
+        rows.iter().filter_map(|r| r["id"].as_str()).collect()
+    }
+
+    // DATA-11 R4 / F4.
+    #[test]
+    fn a_search_with_no_sort_keeps_its_rank_order() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        order_results(&mut rows, true, &[]);
+        assert_eq!(row_ids(&rows), vec!["b", "c", "a"]);
     }
 
     #[test]
-    fn filter_assets_by_query_matches_via_an_annotation_tag() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        let annotations = vec![AnnotationRow {
-            asset_id: "bronze.users".to_owned(),
-            owner: None,
-            steward: None,
-            tags: vec!["pii".to_owned()],
-            description: None,
+    fn a_search_with_a_sort_obeys_the_sort() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        let sort = [catalog_query::SortSpec {
+            id: "name".to_owned(),
+            desc: true,
         }];
-        let filtered = filter_assets_by_query(&assets, "pii", &annotations);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], json!("bronze.users"));
+        order_results(&mut rows, true, &sort);
+        assert_eq!(row_ids(&rows), vec!["c", "b", "a"]);
     }
 
     #[test]
-    fn filter_assets_by_query_empty_q_returns_everything() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        assert_eq!(filter_assets_by_query(&assets, "", &[]).len(), 2);
-        assert_eq!(filter_assets_by_query(&assets, "   ", &[]).len(), 2);
-    }
-
-    #[test]
-    fn filter_assets_by_query_matches_non_ascii_case_unicode_aware() {
-        // `Ö`/`ö` are distinct bytes under `to_ascii_lowercase` (ASCII
-        // lowercasing only touches `A`-`Z`, so a non-ASCII byte never
-        // changes and the two never compare equal) but fold to the same
-        // code point under `to_lowercase`, matching the browser's
-        // Unicode-aware JavaScript `toLowerCase()`.
-        let assets = vec![json!({
-            "id": "bronze.orders",
-            "name": "Orders",
-            "description": "Umsatz nach Übersee"
-        })];
-        let filtered = filter_assets_by_query(&assets, "übersee", &[]);
-        assert_eq!(filtered.len(), 1);
+    fn without_a_search_the_rows_still_order_by_id() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        order_results(&mut rows, false, &[]);
+        assert_eq!(row_ids(&rows), vec!["a", "b", "c"]);
     }
 
     #[test]
@@ -3713,6 +3914,58 @@ mod tests {
             );
         }
 
+        /// DATA-11 R4: a refused caller who sends a search term gets the same
+        /// `supported: false` answer, and the search copy is never read: the
+        /// mock `ClickHouse` receives no request at all.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_refused_caller_searching_gets_supported_false_and_the_copy_is_not_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:read");
+
+            let resp = list(
+                State(state.clone()),
+                Extension(outsider.clone()),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    q: Some("revenue".to_owned()),
+                }),
+            )
+            .await;
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["supported"], json!(false));
+
+            let resp = query(
+                State(state),
+                Extension(outsider),
+                HeaderMap::new(),
+                axum::extract::Query(CatalogQuery {
+                    page: None,
+                    page_size: None,
+                    search: Some("revenue".to_owned()),
+                    sort: None,
+                    filters: None,
+                    join_operator: None,
+                    group_by: None,
+                    skip_list_meta: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["supported"], json!(false));
+            assert_eq!(body["totalItems"], json!(0));
+
+            assert!(
+                ch.received_requests().await.unwrap().is_empty(),
+                "a refused caller must not cause a catalog read"
+            );
+        }
+
         #[sqlx::test(migrations = "../../migrations")]
         async fn list_refuses_when_catalog_tenant_id_is_unset_and_more_than_one_tenant_exists(
             pool: lakehouse_store::PgPool,
@@ -3887,6 +4140,88 @@ mod tests {
             };
             assert_eq!(body, json!({ "ok": true }));
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
+        }
+
+        fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
+            crate::catalog_search_cache::CatalogSearchSnapshot {
+                assets: Vec::new(),
+                namespaces: Value::Null,
+                columns: std::collections::HashMap::new(),
+                usage: std::collections::HashMap::new(),
+                column_search_partial: false,
+            }
+        }
+
+        /// `DATA-11` review `SHOULD-FIX 3`: put a copy in the cache, so a
+        /// test can tell whether the next read rebuilds it.
+        async fn prime_search_copy(state: &AppState) {
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Whether the next read of the copy runs its build.
+        async fn next_read_rebuilds(state: &AppState) -> bool {
+            let rebuilt = std::sync::atomic::AtomicBool::new(false);
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    rebuilt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+            rebuilt.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_annotation_drops_the_search_copy_so_the_next_search_rebuilds(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_ok(), "a member's write must succeed");
+            assert!(
+                next_read_rebuilds(&state).await,
+                "an edit must drop the copy so a search shows it at once"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_refused_put_annotation_leaves_the_search_copy_in_place(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(outsider),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_err(), "a refused write must be an error");
+            assert!(
+                !next_read_rebuilds(&state).await,
+                "a write that stored nothing must not drop the copy"
+            );
         }
     }
 

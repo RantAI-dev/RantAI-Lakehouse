@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-10` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security |
+| Module | Administration & Security |
 | When | Now |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,10 +35,9 @@ Re-checked by the planner: lakehouse-notify.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A webhook to 127.0.0.1, 10.0.0.0/8, 169.254.169.254 or a name resolving there is refused with a fixed message
-- [ ] A public URL answering 302 to an internal address is not followed
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-10-AC1` A webhook to 127.0.0.1, 10.0.0.0/8, 169.254.169.254 or a name resolving there is refused with a fixed message
+- `SEC-10-AC2` A public URL answering 302 to an internal address is not followed
+- `SEC-10-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

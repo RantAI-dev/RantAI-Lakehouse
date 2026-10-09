@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `BI-5` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
+| Module | Dashboards |
 | When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,10 +35,9 @@ Both competitors: configurable query timeouts and row limits.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Lowering the timeout to 10 s stops a slow tile at 10 s with a clear message
-- [ ] Stop frees the engine
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-5-AC1` Lowering the timeout to 10 s stops a slow tile at 10 s with a clear message
+- `BI-5-AC2` Stop frees the engine
+- `BI-5-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

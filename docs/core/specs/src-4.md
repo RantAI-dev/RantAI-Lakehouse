@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-4` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -39,12 +38,11 @@ Databricks Lakeflow Connect: change capture for SQL Server (GA), MySQL and Postg
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] For each database in the Target table, a table loads and a later insert, update and delete at the source show up in the lakehouse
-- [ ] Stopping change capture for an hour and restarting it catches up without gaps or duplicates
-- [ ] A source missing a required setting fails the connection test with a message naming that setting
-- [ ] Each database has a passing gate in CI
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-4-AC1` For each database in the Target table, a table loads and a later insert, update and delete at the source show up in the lakehouse
+- `SRC-4-AC2` Stopping change capture for an hour and restarting it catches up without gaps or duplicates
+- `SRC-4-AC3` A source missing a required setting fails the connection test with a message naming that setting
+- `SRC-4-AC4` Each database has a passing gate in CI
+- `SRC-4-AC5` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

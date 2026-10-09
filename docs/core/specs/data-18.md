@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-18` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Upload) |
-| Who builds it | Data |
+| Module | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,10 +35,9 @@ Databricks: infers types, column names and types editable, 50-row preview. Snowf
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A file with a date column loads it as a date
-- [ ] Changing a column to integer when it holds text shows the failing rows before loading
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-18-AC1` A file with a date column loads it as a date
+- `DATA-18-AC2` Changing a column to integer when it holds text shows the failing rows before loading
+- `DATA-18-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

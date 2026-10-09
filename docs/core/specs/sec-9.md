@@ -3,8 +3,7 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-9` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, shared with the AI team (their code) |
+| Module | Administration & Security |
 | When | Now |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Status | Spec. Not planned, not built |
@@ -36,11 +35,10 @@ Re-checked by the planner: routes/agent.rs, policy.rs. Both competitors run AI q
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A user without access to a masked column asks for it in plain language and gets the masked value
-- [ ] A user without query:read gets 403 from both endpoints
-- [ ] A prompt asking for url('http://169.254.169.254/') is refused before reaching ClickHouse
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-9-AC1` A user without access to a masked column asks for it in plain language and gets the masked value
+- `SEC-9-AC2` A user without query:read gets 403 from both endpoints
+- `SEC-9-AC3` A prompt asking for url('http://169.254.169.254/') is refused before reaching ClickHouse
+- `SEC-9-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
