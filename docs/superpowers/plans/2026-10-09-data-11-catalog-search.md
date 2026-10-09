@@ -653,3 +653,34 @@ sideways scroll at 1280, 1440 and 1536 px with the sidebar open, hiding Tags
 first, then Owner; cap the Owner cell's width with a truncation and the full
 value as its title, as the Name cell does.
 
+### `SHOULD-FIX` 4 to 7, reviewed 2026-10-09 at `89afb60`
+
+No `BLOCKER`, no open `SHOULD-FIX`. All four are fixed as written
+(`f8c8c90`, `796bd5e`, `f0e3fc2`, `0dd2b2e`).
+
+**Checked and correct.**
+- 4: a `403` reads "You do not have access to the catalog", a `supported:
+  false` answer shows the API's reason, anything else "Catalog search is
+  unavailable"; no upstream text reaches the box. The reason travels as a
+  `ServiceError` with status 200, a convention of this client, said in a
+  comment there.
+- 5: live, `id_customer` finds `customer_id` with `approximate: false`,
+  `custmer_id` with `true`.
+- 6: live, "See all results" is the last row for the term `customer`.
+- 7: live in a headless browser with the sidebar open, the table has no
+  sideways scroll at 1280, 1440, 1536 and 1920 px. Owner shows from 1500 px
+  and Tags from 1760 px, so on a common laptop screen both columns are
+  hidden and their filters with them (as Type and Layer already behave).
+  The page measures the window, not the table; unchanged.
+
+**Verification, by the planner.** The developer's counts at `89afb60`
+(`cargo fmt --check` exit 0, clippy clean, typecheck exit 0, lint 0 errors,
+`bun run test` 932 pass, 1 skip, 0 fail) were not re-run by the planner
+after this round; the planner rebuilt the API from this commit, restarted
+the separate instance and ran the live checks above. The planner's full
+re-run happens after `main` is merged in, before the pull request.
+
+**Not verified.** No Rust test has run (CI first). D1, the 500 ms target on
+10,000 tables, is not measured. The product owner has not yet tried the
+console.
+
