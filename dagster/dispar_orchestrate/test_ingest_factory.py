@@ -84,7 +84,8 @@ def _reflect(callback, table=None) -> None:
 def observations(monkeypatch):
     """Every test here runs with an API that answers `load` for every
     schema observation (SRC-8) and records what was asked. A test of the
-    observation itself replaces the answer through `observations.answer`."""
+    observation itself replaces the answer through `observations.answer`: a
+    decision, an exception to raise, or a function of the object's name."""
     import dispar_orchestrate.ingest_factory as f
     from dispar_orchestrate import schema_observer
 
@@ -106,9 +107,10 @@ def observations(monkeypatch):
                 "run_id": run_id,
             }
         )
-        if isinstance(recorder.answer, Exception):
-            raise recorder.answer
-        return recorder.answer
+        answer = recorder.answer(object_name) if callable(recorder.answer) else recorder.answer
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     monkeypatch.setattr(f.schema_observer, "post_observation", fake_post)
     return recorder
@@ -2079,3 +2081,54 @@ def test_a_connector_that_gained_no_tables_is_read_once(monkeypatch, discovery) 
         run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
     )
     assert result.success and reads == ["conn-pg"]
+
+
+# --- SRC-8 task 9: a waiting table is not a failure (decision D7) -------------
+
+
+def test_a_run_where_one_table_waits_and_another_loads_ends_without_raising_from_either_step(
+    monkeypatch, observations
+) -> None:
+    """The real job graph and the real `_run_one_object`: `shop.orders` is
+    told to wait, `shop.items` loads. Both mapped steps SUCCEED, so the run
+    does, which is what keeps the run-success sensor from stamping a failure
+    and the repeated-failure streak from growing (D7). The waiting table is
+    recorded as `waiting`, loads nothing, and is not a materialization."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    connector = {
+        **_mysql_connector(),
+        "sourceObjects": [
+            {"name": "shop.orders", "target": "orders"},
+            {"name": "shop.items", "target": "items"},
+        ],
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+    observations.answer = lambda name: f.schema_observer.Decision(
+        action="wait" if name == "shop.orders" else "load", columns=None, changes=[]
+    )
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-mysql"}}}},
+    )
+
+    assert result.success
+    failed = {e.step_key for e in result.all_events if e.event_type_value == "STEP_FAILURE"}
+    succeeded = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+    assert failed == set()
+    assert {"ingest_source_object[orders]", "ingest_source_object[items]"} <= succeeded
+    assert {r["object_name"]: r["status"] for r in recorded} == {
+        "shop.orders": "waiting",
+        "shop.items": "succeeded",
+    }
+    assert loads == ["items"]
+    materialized = [
+        e.event_specific_data.materialization.asset_key.to_user_string()
+        for e in result.all_events
+        if e.event_type_value == "ASSET_MATERIALIZATION"
+    ]
+    assert materialized == ["bronze/items"]

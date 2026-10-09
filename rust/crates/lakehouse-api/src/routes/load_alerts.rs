@@ -718,6 +718,70 @@ mod tests {
         assert!(h.posts_to("al-other").await.is_empty());
     }
 
+    /// `SRC-8` decision D7: a table that waits for a schema-change decision
+    /// is not a failure. The orchestrator records such a table as `waiting`
+    /// and the mapped step and the run both SUCCEED
+    /// (`test_ingest_factory.py`), so what reaches this route is a SUCCESS
+    /// event like any other. Only a FAILURE-status run stamps a failure: this
+    /// pins that the pending change changes nothing here (no
+    /// `connector_failure`, no repeated-failure, no failure streak, a
+    /// `success` event row and no `failure` one), and that the change keeps
+    /// waiting for a person.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_success_run_of_a_connector_with_a_waiting_schema_change_is_a_success_and_never_a_failure(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-f", "connector_failure", CONNECTOR),
+                ("al-r", "connector_repeated_failure", CONNECTOR),
+                ("al-s", "connector_success", CONNECTOR),
+            ],
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO connector_schema_change \
+               (id, connector_id, object_name, kind, column_name, before_value, breaking, status, detected_at) \
+             VALUES ('chg-waiting', $1, 'public.orders', 'column_removed', 'note', 'text', true, 'pending', now())",
+        )
+        .bind(CONNECTOR)
+        .execute(&pool)
+        .await
+        .unwrap();
+        h.knows_run("run-1", Some(CONNECTOR), "SUCCESS").await;
+
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-1", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+
+        assert_eq!(resp["matched"], 1, "only the success rule matched");
+        assert_eq!(h.posts_to("al-s").await.len(), 1);
+        assert!(h.posts_to("al-f").await.is_empty());
+        assert!(h.posts_to("al-r").await.is_empty());
+        assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
+        let kinds: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, count(*) FROM pipeline_run_event \
+             WHERE pipeline_id = 'connector:conn-pg-lakehouse' GROUP BY kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kinds, [("success".to_owned(), 1)]);
+        let (still_waiting,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM connector_schema_change WHERE id = 'chg-waiting' AND status = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_waiting, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_success_with_no_success_rule_sends_nothing(pool: sqlx::PgPool) {
         let h = harness(&pool, &[("al-f", "connector_failure", "*")]).await;
