@@ -1361,25 +1361,24 @@ mod table_substitution {
             out
         };
 
+        // A derived alias the rewrite invents has `explicit: false`, which
+        // sqlparser prints without `AS`; only a user-written `AS o` keeps it.
         let no_alias = run("SELECT count() n FROM icecat_api.`bronze.orders` WHERE 1");
-        assert!(
-            no_alias.contains(") AS `bronze.orders` WHERE 1"),
-            "{no_alias}"
-        );
+        assert!(no_alias.contains(") `bronze.orders` WHERE 1"), "{no_alias}");
 
         let aliased = run("SELECT o.id FROM icecat_api.`bronze.orders` AS o WHERE 1");
         assert!(aliased.contains(") AS o WHERE 1"), "{aliased}");
 
         let pinned = run("SELECT count() n FROM icecat_api.`bronze.orders` WHERE 1 \
              SETTINGS iceberg_snapshot_id = 1");
-        assert!(pinned.contains(") AS `bronze.orders` WHERE 1"), "{pinned}");
+        assert!(pinned.contains(") `bronze.orders` WHERE 1"), "{pinned}");
         assert!(
             pinned.ends_with("SETTINGS iceberg_snapshot_id = 1"),
             "{pinned}"
         );
 
         let plain = run_plain("SELECT * FROM silver.customers");
-        assert!(plain.contains(") AS customers"), "{plain}");
+        assert!(plain.contains(") customers"), "{plain}");
     }
 
     fn run_plain(sql: &str) -> String {
