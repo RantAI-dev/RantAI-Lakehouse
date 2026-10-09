@@ -4082,6 +4082,88 @@ mod tests {
             assert_eq!(body, json!({ "ok": true }));
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
         }
+
+        fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
+            crate::catalog_search_cache::CatalogSearchSnapshot {
+                assets: Vec::new(),
+                namespaces: Value::Null,
+                columns: std::collections::HashMap::new(),
+                usage: std::collections::HashMap::new(),
+                column_search_partial: false,
+            }
+        }
+
+        /// `DATA-11` review `SHOULD-FIX 3`: put a copy in the cache, so a
+        /// test can tell whether the next read rebuilds it.
+        async fn prime_search_copy(state: &AppState) {
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Whether the next read of the copy runs its build.
+        async fn next_read_rebuilds(state: &AppState) -> bool {
+            let rebuilt = std::sync::atomic::AtomicBool::new(false);
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    rebuilt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+            rebuilt.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_annotation_drops_the_search_copy_so_the_next_search_rebuilds(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_ok(), "a member's write must succeed");
+            assert!(
+                next_read_rebuilds(&state).await,
+                "an edit must drop the copy so a search shows it at once"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_refused_put_annotation_leaves_the_search_copy_in_place(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(outsider),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_err(), "a refused write must be an error");
+            assert!(
+                !next_read_rebuilds(&state).await,
+                "a write that stored nothing must not drop the copy"
+            );
+        }
     }
 
     /// The detail route's sample rows are data, so they must go through
