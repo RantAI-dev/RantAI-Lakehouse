@@ -39,7 +39,7 @@ async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
 
 /// Every `supported = false` row other than Google Sheets has
 /// `adapter = NULL` — there is no `Dial::parse` shape yet for a type this
-/// build cannot dial. Google Sheets (`SRC-6` F5, `0061`) keeps its adapter
+/// build cannot dial. Google Sheets (`SRC-6` F5, `0062`) keeps its adapter
 /// so existing connectors still open; the assertion that used to cover it
 /// was narrowed by name, not loosened for other rows.
 #[sqlx::test(migrations = "../../migrations")]
@@ -75,7 +75,7 @@ async fn supported_rows_name_an_adapter(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// `0061` (`SRC-6` F5): Google Sheets is listed, unsupported, with a
+/// `0062` (`SRC-6` F5): Google Sheets is listed, unsupported, with a
 /// reason, and keeps its `sheets` adapter.
 #[sqlx::test(migrations = "../../migrations")]
 async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> sqlx::Result<()> {
@@ -98,7 +98,7 @@ async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> s
     Ok(())
 }
 
-/// `0061`: only Google Sheets carries a reason; the other roadmap rows keep
+/// `0062`: only Google Sheets carries a reason; the other roadmap rows keep
 /// the generic "Not available yet" in the console, and supported rows have
 /// none.
 #[sqlx::test(migrations = "../../migrations")]

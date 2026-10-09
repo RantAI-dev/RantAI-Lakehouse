@@ -8,7 +8,7 @@
 //! honest message, never a fabricated success). Most `supported = false`
 //! rows have `adapter = NULL`, since there is no
 //! [`crate::ingest_spec::Dial`] shape yet for a type this build cannot
-//! dial. Google Sheets is the exception (`SRC-6` F5, migration `0061`): it
+//! dial. Google Sheets is the exception (`SRC-6` F5, migration `0062`): it
 //! keeps `adapter = 'sheets'` so connectors already created with it still
 //! open, and carries an `unsupported_reason` the wizard shows.
 

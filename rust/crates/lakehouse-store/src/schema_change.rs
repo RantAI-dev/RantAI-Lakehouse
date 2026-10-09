@@ -1,7 +1,7 @@
 //! What a connector's source tables looked like at the last run, and the
 //! changes found since (`SRC-8`; tables `connector_source_schema`,
 //! `connector_schema_change`, `connector_inactive_column`, migration
-//! `0063_connector_schema_changes.sql` -- read its header for the shape
+//! `0064_connector_schema_changes.sql` -- read its header for the shape
 //! of each).
 //!
 //! # Why this lives in the store and not in a handler
