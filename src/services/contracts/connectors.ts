@@ -20,7 +20,19 @@ export type Connector = {
   lastRunFailureAt: string | null
   /** Failed runs since the last success; 0 after a success (`SRC-7`). */
   failureStreak: number
+  /** What a non-breaking source schema change does (`SRC-8`, D1). */
+  schemaChangePolicy: SchemaChangePolicy
+  /** Why the connector is held back from loading; `null` when not paused (`SRC-8`). */
+  pausedReason: string | null
+  /** When the pause began; `null` when not paused. */
+  pausedAt: string | null
 }
+
+export type SchemaChangePolicy =
+  | "apply_non_breaking"
+  | "apply_all"
+  | "ask_first"
+  | "pause"
 
 export type ConnectorDependent = {
   id: string

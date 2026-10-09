@@ -56,6 +56,9 @@ const CONNECTORS = [
     lastRunSuccessAt: null,
     lastRunFailureAt: null,
     failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
     capabilities: [],
     owner: "admin",
   },
@@ -72,6 +75,9 @@ const CONNECTORS = [
     lastRunSuccessAt: null,
     lastRunFailureAt: null,
     failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
     capabilities: [],
     owner: "admin",
   },
@@ -216,6 +222,9 @@ describe("ConnectorsPage run health", () => {
     lastRunSuccessAt: "2026-10-03T02:00:00Z",
     lastRunFailureAt: "2026-10-02T02:00:00Z",
     failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
   }
 
   it("shows the later of the last success and the last failure, and how many failed in a row", async () => {

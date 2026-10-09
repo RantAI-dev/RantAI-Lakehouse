@@ -111,6 +111,16 @@ pub struct Connector {
     /// Failed runs since the last success; `0` after a success (`SRC-7` F4,
     /// decision D2).
     pub failure_streak: i32,
+    /// What a non-breaking source schema change does: `"apply_non_breaking"`
+    /// (the default), `"apply_all"`, `"ask_first"` or `"pause"` (`SRC-8`
+    /// decision D1; a breaking change waits under every value).
+    pub schema_change_policy: String,
+    /// Why the connector is held back from loading, or `None` when it is
+    /// not paused (`SRC-8` F6). Written with [`Self::paused_at`]; the
+    /// policy `"pause"` sets it and an approval lifts it.
+    pub paused_reason: Option<String>,
+    /// When the pause began, ISO 8601; `None` when not paused.
+    pub paused_at: Option<String>,
 }
 
 /// A dependent pipeline, derived (never stored) from `pipeline_definition`
@@ -244,6 +254,11 @@ struct ConnectorRow {
     last_run_success_at: Option<OffsetDateTime>,
     last_run_failure_at: Option<OffsetDateTime>,
     failure_streak: i32,
+    /// `SRC-8` F2/F6: written by [`update_connector`] (the policy) and by
+    /// `schema_change.rs` (the pause).
+    schema_change_policy: String,
+    paused_reason: Option<String>,
+    paused_at: Option<OffsetDateTime>,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -271,6 +286,9 @@ impl std::fmt::Debug for ConnectorRow {
             .field("last_run_success_at", &self.last_run_success_at)
             .field("last_run_failure_at", &self.last_run_failure_at)
             .field("failure_streak", &self.failure_streak)
+            .field("schema_change_policy", &self.schema_change_policy)
+            .field("paused_reason", &self.paused_reason)
+            .field("paused_at", &self.paused_at)
             .finish()
     }
 }
@@ -294,6 +312,9 @@ impl From<ConnectorRow> for Connector {
             last_run_success_at: iso_opt(row.last_run_success_at),
             last_run_failure_at: iso_opt(row.last_run_failure_at),
             failure_streak: row.failure_streak,
+            schema_change_policy: row.schema_change_policy,
+            paused_reason: row.paused_reason,
+            paused_at: iso_opt(row.paused_at),
         }
     }
 }
@@ -303,7 +324,8 @@ impl From<ConnectorRow> for Connector {
 // to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
      secret_ref, last_test_at, capabilities, owner, residency, tenant_id, \
-     last_run_success_at, last_run_failure_at, failure_streak";
+     last_run_success_at, last_run_failure_at, failure_streak, \
+     schema_change_policy, paused_reason, paused_at";
 
 /// Optional narrowing for [`list_connectors`] for tenant isolation: a
 /// caller must never see a connector outside its own tenant.
@@ -1633,13 +1655,18 @@ pub struct IngestibleConnector {
     /// combination that needs two (`secret_map.secret_field_names`,
     /// Dagster-side; `ingest_spec::secret_field_names`, Rust-side).
     pub secret_ref_secondary: Option<String>,
+    /// Whether the connector is paused (`connector.paused_at IS NOT NULL`,
+    /// `SRC-8` F6). The schedule's due list leaves a paused connector out;
+    /// the unfiltered list still carries it, so the orchestrator's own
+    /// single fetch of a connector keeps working.
+    pub paused: bool,
 }
 
 /// The raw tuple shape [`list_ingestible_connectors`] decodes from its
-/// `SELECT`, naming the same eight columns in the same order: `id,
+/// `SELECT`, naming the same nine columns in the same order: `id,
 /// adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref,
-/// secret_ref_secondary`. A module-level alias rather than an inline type,
-/// same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
+/// secret_ref_secondary, paused`. A module-level alias rather than an
+/// inline type, same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
 type IngestibleConnectorRow = (
     String,
     Option<String>,
@@ -1649,6 +1676,7 @@ type IngestibleConnectorRow = (
     Option<String>,
     String,
     Option<String>,
+    bool,
 );
 
 /// List every connector that has ever had an ingest spec set
@@ -1664,7 +1692,7 @@ pub async fn list_ingestible_connectors(
 ) -> Result<Vec<IngestibleConnector>, StoreError> {
     let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
         "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
-         secret_ref_secondary FROM connector WHERE adapter IS NOT NULL",
+         secret_ref_secondary, paused_at IS NOT NULL FROM connector WHERE adapter IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -1680,6 +1708,7 @@ pub async fn list_ingestible_connectors(
                 schedule_cron,
                 secret_ref,
                 secret_ref_secondary,
+                paused,
             )| {
                 // `adapter IS NOT NULL` is the query's own WHERE clause, so
                 // this `?` never actually short-circuits in practice — it
@@ -1698,6 +1727,7 @@ pub async fn list_ingestible_connectors(
                     schedule_cron,
                     secret_ref,
                     secret_ref_secondary,
+                    paused,
                 })
             },
         )
@@ -1819,6 +1849,11 @@ pub struct UpdateConnectorInput {
     /// New connection target label — kept in step with `dial` by the
     /// console, since the legacy probe and CDC deprovisioning still read it.
     pub host: Option<String>,
+    /// New `SRC-8` schema-change policy (one of
+    /// [`crate::schema_change::SchemaChangePolicy`]'s wire values; the
+    /// column's CHECK refuses anything else). Changing it never lifts an
+    /// existing pause -- only an approval does.
+    pub schema_change_policy: Option<String>,
 }
 
 impl UpdateConnectorInput {
@@ -1830,6 +1865,7 @@ impl UpdateConnectorInput {
             && self.environment.is_none()
             && self.residency.is_none()
             && self.host.is_none()
+            && self.schema_change_policy.is_none()
     }
 }
 
@@ -1852,7 +1888,8 @@ pub async fn update_connector(
            direction = COALESCE($3, direction), \
            environment = COALESCE($4, environment), \
            residency = COALESCE($5, residency), \
-           host = COALESCE($6, host) \
+           host = COALESCE($6, host), \
+           schema_change_policy = COALESCE($7, schema_change_policy) \
          WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
     );
     let row: Option<ConnectorRow> = sqlx::query_as(&sql)
@@ -1862,6 +1899,7 @@ pub async fn update_connector(
         .bind(input.environment.as_deref())
         .bind(input.residency.as_deref())
         .bind(input.host.as_deref())
+        .bind(input.schema_change_policy.as_deref())
         .fetch_optional(pool)
         .await?;
     row.map(Connector::from).ok_or(StoreError::NotFound)
@@ -1957,6 +1995,9 @@ mod tests {
             last_run_success_at: None,
             last_run_failure_at: Some("2026-01-02T00:00:00.000Z".to_owned()),
             failure_streak: 1,
+            schema_change_policy: "apply_non_breaking".to_owned(),
+            paused_reason: None,
+            paused_at: None,
         };
         let value = serde_json::to_value(&connector).unwrap();
         for key in [
@@ -2003,6 +2044,9 @@ mod tests {
                 last_run_success_at: None,
                 last_run_failure_at: None,
                 failure_streak: 0,
+                schema_change_policy: "apply_non_breaking".to_owned(),
+                paused_reason: None,
+                paused_at: None,
             },
             discovered_assets: 0,
             discovered_schemas: vec![],
@@ -2055,6 +2099,9 @@ mod tests {
             last_run_success_at: None,
             last_run_failure_at: None,
             failure_streak: 0,
+            schema_change_policy: "apply_non_breaking".to_owned(),
+            paused_reason: None,
+            paused_at: None,
         };
         let debug = format!("{row:?}");
         assert!(!debug.contains("super-secret-internal-host"));

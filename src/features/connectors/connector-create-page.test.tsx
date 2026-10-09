@@ -138,6 +138,9 @@ describe("ConnectorCreatePage", () => {
             lastRunSuccessAt: null,
             lastRunFailureAt: null,
             failureStreak: 0,
+            schemaChangePolicy: "apply_non_breaking",
+            pausedReason: null,
+            pausedAt: null,
             capabilities: [],
             owner: "Current user",
             credential: {

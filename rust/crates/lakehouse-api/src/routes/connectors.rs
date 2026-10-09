@@ -233,13 +233,16 @@ fn due_window(
 }
 
 /// A `cdc` connector streams through its own Debezium service and is never
-/// launched on a schedule, whatever its row says.
+/// launched on a schedule, whatever its row says. A paused connector is never
+/// due either (`SRC-8` F6): only this DUE list filters, the unfiltered list
+/// the orchestrator reads for one connector still carries it.
 fn is_due(
     connector: &connectors::IngestibleConnector,
     after: time::OffsetDateTime,
     until: time::OffsetDateTime,
 ) -> bool {
     connector.adapter != "cdc"
+        && !connector.paused
         && connector
             .schedule_cron
             .as_deref()
@@ -332,6 +335,9 @@ fn update_input(body: UpdateConnectorBody) -> Result<connectors::UpdateConnector
         environment: non_blank("environment", body.environment)?,
         residency: non_blank("residency", body.residency)?,
         host: non_blank("host", body.host)?,
+        // SRC-8: the body field and its validation arrive with the route
+        // work (task 5); until then the store input carries no policy.
+        schema_change_policy: None,
     };
     if input.is_empty() {
         return Err(ApiError::BadRequest("nothing to update".to_owned()));
@@ -4835,6 +4841,7 @@ mod tests {
             schedule_cron: cron.map(str::to_owned),
             secret_ref: format!("file:/run/secrets/connector_managed_{id}_password"),
             secret_ref_secondary: None,
+            paused: false,
         }
     }
 
@@ -4861,6 +4868,18 @@ mod tests {
             until
         ));
         assert!(!is_due(&ingestible("d", "sql", None), after, until));
+    }
+
+    /// `SRC-8` F6: a paused connector is left out of the due list even when
+    /// its cron fires in the window.
+    #[test]
+    fn is_due_leaves_out_a_paused_connector() {
+        let until = time::macros::datetime!(2026 - 09 - 30 02:00:00 UTC);
+        let after = until - time::Duration::minutes(1);
+        let mut paused = ingestible("p", "sql", Some("0 2 * * *"));
+        assert!(is_due(&paused, after, until));
+        paused.paused = true;
+        assert!(!is_due(&paused, after, until));
     }
 
     #[test]
