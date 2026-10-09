@@ -18,10 +18,14 @@ import {
   headerRowDisplay,
   headerRowFromDisplay,
   isUploadedTable,
+  rawTableFullName,
   retryInput,
   statusLabel,
   suggestTableName,
+  tableNameFault,
   tableNameProblem,
+  uploadFileKind,
+  uploadFileLabel,
 } from "./uploads"
 
 test("MAX_UPLOAD_BYTES is the API's cap, 50 MiB", () => {
@@ -289,31 +293,39 @@ test("retryInput repeats what the load was told, and replaces after a registrati
   assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
 })
 
-test("fileKindProblem refuses a workbook or an archive by its name, in the API's words, and says to save as CSV", () => {
-  for (const name of ["a.xls", "a.xlsx", "a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsx"]) {
+test("fileKindProblem refuses a workbook the API does not read, or an archive, by its name, in the API's words", () => {
+  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsm"]) {
     const problem = fileKindProblem(name)
-    assert.ok(problem?.startsWith(`${name} looks like an Excel workbook or a zip archive.`), name)
-    assert.ok(problem?.includes("save the sheet as CSV first"), name)
+    assert.ok(problem?.startsWith(`${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file.`), name)
+    assert.ok(problem?.includes("Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."), name)
   }
 })
 
-test("fileKindProblem refuses Parquet and other binaries, each in its own sentence", () => {
-  assert.equal(
-    fileKindProblem("a.parquet"),
-    "a.parquet looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded."
-  )
+test("fileKindProblem lets an .xls or .xlsx through: the API opens it, and refuses one that does not open", () => {
+  for (const name of ["a.xls", "a.xlsx", "DATA.XLS", "Data.XlsX", "report.final.xlsx", "a.csv.xlsx"]) {
+    assert.equal(fileKindProblem(name), null, name)
+  }
+})
+
+test("fileKindProblem lets a .parquet through: the API opens it, and refuses one that does not open", () => {
+  for (const name of ["a.parquet", "DATA.PARQUET", "report.final.parquet", "a.csv.parquet"]) {
+    assert.equal(fileKindProblem(name), null, name)
+  }
+})
+
+test("fileKindProblem refuses other binaries in the API's sentence, which now names Parquet too", () => {
   for (const name of ["a.pdf", "a.docx", "a.avro", "a.orc", "a.sqlite"]) {
     assert.equal(
       fileKindProblem(name),
-      `${name} is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.`
+      `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
     )
   }
 })
 
 test("fileKindProblem ignores the case of the extension", () => {
-  assert.ok(fileKindProblem("DATA.XLS")?.includes("Excel workbook"))
-  assert.ok(fileKindProblem("Data.XlsX")?.includes("Excel workbook"))
-  assert.ok(fileKindProblem("DATA.PARQUET")?.includes("Parquet"))
+  assert.ok(fileKindProblem("DATA.XLSM")?.includes("not an .xls or .xlsx file"))
+  assert.ok(fileKindProblem("Data.OdS")?.includes("not an .xls or .xlsx file"))
+  assert.equal(fileKindProblem("DATA.PARQUET"), null)
 })
 
 test("fileKindProblem lets through delimited text, unknown extensions and names with no extension", () => {
@@ -323,7 +335,62 @@ test("fileKindProblem lets through delimited text, unknown extensions and names 
 })
 
 test("fileProblem gives the kind first, then the size, and null for an acceptable file", () => {
-  assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("Excel workbook"))
+  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("not an .xls or .xlsx file"))
   assert.ok(fileProblem("a.csv", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
+  assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
+  assert.equal(fileProblem("a.xlsx", 1024), null)
+})
+
+test("rawTableFullName puts the table in the bronze namespace, as Data Explorer names it", () => {
+  assert.equal(rawTableFullName("stock"), "bronze.stock")
+})
+
+test("uploadFileKind tells a workbook from delimited text by the name alone, whatever the case", () => {
+  assert.equal(uploadFileKind("a.xlsx"), "workbook")
+  assert.equal(uploadFileKind("A.XLS"), "workbook")
+  assert.equal(uploadFileKind("a.csv"), "delimited")
+  assert.equal(uploadFileKind("a.TSV"), "delimited")
+  assert.equal(uploadFileKind("a.parquet"), "parquet")
+  assert.equal(uploadFileKind("A.PARQUET"), "parquet")
+  for (const name of ["a.txt", "a.dat", "export", ".csv", "a.", "a.xlsm"]) assert.equal(uploadFileKind(name), "other", name)
+})
+
+test("uploadFileLabel is the extension in capitals, or null when there is none or it is too long", () => {
+  assert.equal(uploadFileLabel("a.xls"), "XLS")
+  assert.equal(uploadFileLabel("a.XLSX"), "XLSX")
+  assert.equal(uploadFileLabel("a.csv"), "CSV")
+  assert.equal(uploadFileLabel("a.Tsv"), "TSV")
+  assert.equal(uploadFileLabel("a.parquet"), "PARQUET")
+  assert.equal(uploadFileLabel("a.txt"), "TXT")
+  assert.equal(uploadFileLabel("export"), null)
+  assert.equal(uploadFileLabel(".csv"), null)
+  assert.equal(uploadFileLabel("a."), null)
+  assert.equal(uploadFileLabel("a.verylongext"), null)
+  assert.equal(uploadFileLabel("a.b c"), null)
+})
+
+test("tableNameFault names the specific break and is null exactly when tableNameProblem is", () => {
+  const cases: [string, string][] = [
+    ["Orders", "Upper-case"],
+    ["orders 2025", "Spaces"],
+    ["2025_orders", "start with a digit"],
+    ["_orders", "start with an underscore"],
+    ["orders_", "end with an underscore"],
+    ["orders__raw", "two in a row"],
+    ["orders-raw", '"-" is not allowed'],
+    ["a".repeat(MAX_TABLE_NAME_CHARS + 1), "129 characters"],
+    ["orders\n", "Spaces"],
+  ]
+  for (const [name, part] of cases) {
+    assert.ok(tableNameFault(name)?.includes(part), `${JSON.stringify(name)} -> ${tableNameFault(name)}`)
+  }
+  for (const name of ["stock", "stock_2025", "a", "a".repeat(MAX_TABLE_NAME_CHARS), "x_1_y"]) {
+    assert.equal(tableNameProblem(name), null)
+    assert.equal(tableNameFault(name), null)
+  }
+  for (const name of ["", "A", "_", "a_", "é", "a b", "a\n"]) {
+    assert.notEqual(tableNameProblem(name), null, name)
+    assert.notEqual(tableNameFault(name), null, name)
+  }
 })

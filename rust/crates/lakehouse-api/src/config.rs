@@ -695,9 +695,11 @@ pub struct Config {
     pub ai_default_reply_language: Option<ReplyLanguage>,
     /// Whether the semantic layer is on (`AI_SEMANTIC_LAYER`): the
     /// background pass that drafts a description of each table and column,
-    /// and the copilot's DATA MAP reading those descriptions. `true` when
-    /// unset or empty, and for `"true"`; `false` only for `"false"`. The
-    /// routes that read and correct the descriptions answer either way.
+    /// and the copilot's DATA MAP reading those descriptions. When on, the
+    /// chat's system prompt also gets the rules for counting in a table
+    /// grouped by several columns. `true` when unset or empty, and for
+    /// `"true"`; `false` only for `"false"`. The routes that read and correct
+    /// the descriptions answer either way.
     pub ai_semantic_layer: bool,
     /// Whether the chat may ask the user which reading of an unclear word
     /// they mean (`AI_ASK_BACK`): the `ask_user` tool, the rules that tell

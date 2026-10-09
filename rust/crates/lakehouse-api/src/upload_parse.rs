@@ -80,7 +80,9 @@ pub enum Kind {
     /// decision 4). A zip that is not a workbook is also reported here: the
     /// first bytes cannot tell them apart.
     Workbook,
-    /// A Parquet file. Refused.
+    /// A Parquet file. The routes accept it when it is also named `.parquet`
+    /// and refuse it otherwise; `upload_parquet` converts it (ADR 0014,
+    /// amendment of 2026-10-08).
     Parquet,
     /// Another binary format (a PDF, a gzip stream), or bytes that are not
     /// text (NUL bytes in something that is not UTF-16). Refused.
@@ -1263,6 +1265,9 @@ mod tests {
         fixture!("cr_only", "csv"),
         fixture!("latin1_bytes_in_utf8", "csv"),
         fixture!("malformed_quotes", "csv"),
+        // What `upload_workbook` writes for the `Quirks` sheet of the
+        // workbooks in `ops/fixtures/workbooks/` (X1 of the Excel plan).
+        fixture!("converted_sheet", "csv"),
     ];
 
     struct Expected {

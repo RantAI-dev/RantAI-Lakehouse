@@ -2,9 +2,10 @@
 
 This repo's CI is split into four workflows under `.github/workflows/`:
 
-- **`ci.yml`** — fast-feedback correctness: frontend lint/typecheck/test/build,
-  the parity-corpus secret-shape check, and Rust `fmt` / `clippy` / `build` /
-  `test` (the last as a matrix over `stable` and the declared MSRV).
+- **`ci.yml`** — change-scoped fast feedback and acceptance testing. Begins with
+  a change scope detector (`changes`) and unconditional repo lints (`repo-lints`),
+  runs selective frontend/Dagster/Rust/acceptance jobs based on modified paths,
+  and gates merges with a single summary gate (`ci-required`).
 - **`security.yml`** — `cargo audit`, `cargo deny check all`, a working-tree
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
   full-git-history `history-scan` job, which is currently **RED for a real
@@ -14,7 +15,34 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   pushes and is currently inert (no registry login configured).
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
-  for Phase 6's release attachment).
+  for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
+  only to avoid spending ~30 runner minutes per PR run when no PR checks consume
+  the artifact.
+
+## Change Scopes and the Single Gate (`ci-required`)
+
+To reduce CI feedback latency on targeted changes (such as docs-only or frontend-only PRs),
+`ci.yml` classifies changes in the `changes` job into six scopes:
+
+| Scope | Triggered By |
+|---|---|
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
+| `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
+| `dagster` | `dagster/**` |
+| `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
+| `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
+| `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
+
+On a `push` to `main`, all jobs run unconditionally.
+
+Downstream jobs execute according to scope:
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the four static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports) into one fast job.
+- **`verify`**: Runs if `frontend` or `all` is true.
+- **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
+- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`, `g8-governance`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+
+At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
 ## MSRV
 
@@ -23,14 +51,16 @@ This repo's CI is split into four workflows under `.github/workflows/`:
 against 1.85.0 fails because `testcontainers`/`testcontainers-modules`
 require rustc 1.88, `time`/`time-core`/`time-macros` require 1.88.0,
 `etcetera` requires 1.87.0, and `ferroid` requires 1.85.1. Building against
-1.88.0 succeeds. `ci.yml`'s `test` job runs a `stable` / `1.88.0` matrix so a
-future dependency bump that raises the real floor again fails CI honestly
-instead of silently drifting past the declared MSRV.
+1.88.0 succeeds.
+
+In CI, the `msrv` job runs a dedicated `cargo check --workspace --all-targets --locked`
+under toolchain `1.88.0` to verify compatibility without duplicating test run
+times, while the full test suite runs under `stable`.
 
 `rust-toolchain.toml` pins `1.96.1` — intentionally newer than the MSRV. That
 file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
-with; the MSRV matrix leg in `test` exists specifically to catch MSRV
-regressions that the day-to-day toolchain wouldn't.
+with; the MSRV check job exists specifically to catch MSRV regressions that the
+day-to-day toolchain wouldn't.
 
 ## `history-scan`: currently RED, and correctly so
 
@@ -138,13 +168,8 @@ gh api \
   -H "Accept: application/vnd.github+json" \
   repos/RantAI-dev/RantAI-Lakehouse/branches/main/protection \
   -f 'required_status_checks[strict]=true' \
-  -f 'required_status_checks[checks][][context]=Frontend · Lint · Typecheck · Test · Build' \
-  -f 'required_status_checks[checks][][context]=Parity corpus · no leaked credentials' \
-  -f 'required_status_checks[checks][][context]=Rust · fmt' \
-  -f 'required_status_checks[checks][][context]=Rust · clippy' \
-  -f 'required_status_checks[checks][][context]=Rust · build' \
-  -f 'required_status_checks[checks][][context]=Rust · test (stable)' \
-  -f 'required_status_checks[checks][][context]=Rust · test (1.88.0)' \
+  -f 'required_status_checks[checks][][context]=ci-required' \
+  -f 'required_status_checks[checks][][context]=Repo lints' \
   -f 'required_status_checks[checks][][context]=cargo audit (advisories)' \
   -f 'required_status_checks[checks][][context]=cargo deny check (all)' \
   -f 'required_status_checks[checks][][context]=gitleaks (working tree)' \
@@ -156,15 +181,16 @@ gh api \
   -F 'allow_deletions=false'
 ```
 
-The check names above are the real `name:` values from
+The check names above reflect the real `name:` values from
 `.github/workflows/{ci,security,docker}.yml` as of this writing — not
-guessed. If a workflow's job names change, this list needs to be updated to
+guessed. `ci-required` consolidates and enforces all scope-dependent tests
+in `ci.yml`. If a workflow's job names change, this list needs to be updated to
 match, or `strict` mode will block merges on a check that no longer reports.
 
 Why each choice:
 
-- **Required checks are the honest-green ones only.** `Frontend...Build`,
-  `Parity corpus...`, all `Rust ·` jobs, `cargo audit`, `cargo deny`,
+- **Required checks are the honest-green ones only.** `ci-required` (enforcing
+  all scope-required CI jobs), `Repo lints`, `cargo audit`, `cargo deny`,
   `gitleaks (working tree)`, and the Docker smoke test are the jobs that
   are expected to actually pass on a healthy `main`.
 - **`gitleaks (full git history)` is deliberately NOT in this list.** It is

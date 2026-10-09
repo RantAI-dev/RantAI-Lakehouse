@@ -50,7 +50,9 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 - A table is drafted once at boot or when the background pass runs; a draft for a column added later is not created.
 - Descriptions are at most 400 characters for a table, 200 for a column.
 - Synonyms are at most 6, each 1 to 40 characters.
-- A column can be marked as a `measure`, `dimension`, `time` or `key` role, or left unset.
+- A column can be marked with one of six roles, `measure`, `dimension`, `time`, `key`, `flag` or `non_additive`, or left unset. The chat reads a role from a draft as well as from a confirmed entry.
+- A `flag` column holds 0/1 or yes/no values, and a `non_additive` column holds a number that must not be added up across rows, such as a distinct count, an average, a rate, a percentage or a price. In the chat's data map, a `flag` column is marked `[0/1 flag]` and a `non_additive` column `[never SUM across rows]`, and the table's summary of measures leaves out any column with a `flag`, `non_additive`, `key`, `dimension` or `time` role. A `flag` or `non_additive` column that would otherwise be a measure (a number whose name does not look like a key, such as a year, a month or an id) is also not part of the row's grain. Any other `flag` or `non_additive` column, such as a text or boolean one, still is. When the table has a `non_additive` column, the summary says which columns are not additive, so the chat does not total them.
+- When the switch is on, which is the default, the chat's system prompt also says that a count in a table grouped by several columns can overlap between rows, so the copilot counts distinct things in a detail table or gives a figure per row, and does not add the count up.
 - When the switch is off, the chat reads neither the semantic entries nor the table descriptions saved in the Catalog, and the drafting pass does nothing. The three `/api/semantic` routes still answer.
 
 ## Acceptance checklist
