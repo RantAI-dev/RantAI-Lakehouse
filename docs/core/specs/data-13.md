@@ -7,7 +7,7 @@
 | Who builds it | Data, with the pipelines stream |
 | When | Next |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | Spec corrected against the code 2026-10-09. Not planned, not built |
 
 ## Why
 
@@ -19,14 +19,16 @@ See which source columns feed a Gold column, and what breaks if a source column 
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `c338862`, re-read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Column mappings | Always empty | Recorded automatically for every pipeline, Gold build and saved SQL source |
-| View | Hidden | Column lineage on the asset's Lineage tab, upstream and downstream |
-| Impact | None | From a source column, list every downstream column, chart and dashboard |
-| Retention | n/a | 1 year (both competitors) |
+| Column mappings | Always empty. No lineage is stored: the table-level map is rebuilt on every request. Pipelines already record their rename, cast and select steps, but lineage does not read them | Recorded automatically for every pipeline, Gold build and saved SQL source |
+| View | The Lineage tab shows the table-level map. A column list is coded but shows only when there are mappings, so never | Column lineage on the asset's Lineage tab, upstream and downstream |
+| Impact | Table level only: downstream tables, and the saved queries and dashboards that read the table directly (not those reached through a Silver or Gold table). Dashboards are listed with a chart count, not chart by chart. Nothing starts from a column | From a source column, list every downstream column, chart and dashboard |
+| Retention | n/a: nothing is stored. Build links are read from the last 180 days of the ClickHouse query log | 1 year (both competitors) |
+
+Found while re-reading, not run: the lineage gate (`ops/g3a/g3a_test.py`, `RECORDED_LINEAGE_EDGE_KINDS`) does not list the `build` link kind that `routes/lineage/builds.rs` emits, and fails on any kind it does not list. The plan for this task checks it.
 
 ## Benchmark
 
