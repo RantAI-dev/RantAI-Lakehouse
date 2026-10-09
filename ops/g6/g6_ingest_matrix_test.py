@@ -774,7 +774,17 @@ def step_wait_for_run_failure(run_id: str) -> float:
             return True
         return False
 
-    _wait_for(f"run {run_id} FAILURE", check, 150, interval_s=3.0)
+    # PR #101 CI: a wrong password is a refused credential, which
+    # `ingest_factory.ingest_source_object` fails at once with
+    # `allow_retries=False` (`_is_authentication_refusal`), so the run ends
+    # in about 15 s (two steps, a few seconds each to start). Before that fix
+    # `DEFAULT_RETRY_POLICY` retried it twice (30 s, then ~60 s, each with
+    # jitter) and the run took 2m23s, which the old 150 s window missed by
+    # one second. 90 s is generous for the fast path and shorter than the
+    # retried run that was measured, so a return of the retries is meant to
+    # fail here rather than pass by waiting them out (the jitter makes a
+    # retried run's length vary, so this is a tripwire, not a proof).
+    _wait_for(f"run {run_id} FAILURE", check, 90, interval_s=3.0)
     if seen["end_time"] is None:
         print("[g6] SRC-7 note: Dagster reported no endTime; measuring from when the gate first saw FAILURE")
         return seen["seen_at"]
