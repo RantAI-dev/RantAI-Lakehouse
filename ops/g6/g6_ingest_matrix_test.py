@@ -936,8 +936,13 @@ def step_source_schema_changes() -> None:
     this gate cannot receive, as for SRC-7); the other policies, a type
     change, a primary-key change (route and store tests cover them; the
     gate has one MySQL fixture and a type change that cannot be loaded
-    needs a table re-added under a new target); the Schema tab mark of an
-    inactive column (task 11 was not built)."""
+    needs a table re-added under a new target).
+
+    Step 4 also reads the Bronze table's catalog detail the way the console's
+    Schema tab does (`GET /api/catalog/{slug}`, slug = target with `_` as `-`)
+    and asserts the mark of task 11: `qty` carries a non-null `inactiveSince`
+    and no other column does. The gate's session is the bootstrap admin, which
+    the catalog's tenant gate never refuses."""
     _src8_mysql(
         f"DROP TABLE IF EXISTS {SRC8_TABLE}",
         f"CREATE TABLE {SRC8_TABLE} (id INT PRIMARY KEY, name VARCHAR(50), qty INT)",
@@ -1055,6 +1060,34 @@ def step_source_schema_changes() -> None:
         f"[g6] SRC-8 step 4: approved, run loaded ({rows_before} -> {rows_loaded} rows), "
         f"bronze columns {columns} (qty kept), inactiveColumns lists qty since {inactive[0]['inactiveSince']}"
     )
+
+    # SRC-8 task 11: the Schema tab's mark, from the catalog detail. The
+    # registry entry is written by the run itself (best effort,
+    # `ingest_factory._register_in_catalog`), so poll for it.
+    slug = SRC8_BRONZE.replace("_", "-")
+
+    def _catalog_columns() -> list[dict] | None:
+        resp = API.get(f"{API_URL}/api/catalog/{slug}", timeout=10)
+        if not resp.ok:
+            return None
+        detail = resp.json()
+        schema = detail.get("schema") if isinstance(detail, dict) else None
+        return schema if schema and any(c.get("name") == "qty" for c in schema) else None
+
+    try:
+        schema = _wait_for(f"catalog detail of {slug} lists qty", _catalog_columns, 45, interval_s=3.0)
+    except G6Failure as exc:
+        raise G6Failure(
+            f"SRC-8 step 4: the catalog detail of {slug!r} never listed qty ({exc}); is the table registered "
+            "in the catalog (look for 'could not be registered in the catalog' in the code location's log)?"
+        ) from exc
+    marked = {c["name"]: c.get("inactiveSince") for c in schema}
+    others = {name: since for name, since in marked.items() if name != "qty" and since}
+    if not marked.get("qty") or others:
+        raise G6Failure(
+            f"SRC-8 step 4: expected inactiveSince on qty and on no other column of the catalog detail, got {marked!r}"
+        )
+    print(f"[g6] SRC-8 step 4: catalog detail of {slug} marks qty inactiveSince {marked['qty']}, no other column")
 
 
 def step_column_gate_rejects_an_unsupported_column() -> None:
