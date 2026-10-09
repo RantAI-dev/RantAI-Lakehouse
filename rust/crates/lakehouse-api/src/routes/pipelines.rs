@@ -1769,6 +1769,11 @@ pub async fn run_failed_event(
                 .await?,
         ));
     }
+    if load_alerts::is_upload_job(&req.job_name) {
+        return Ok(ApiJson(
+            load_alerts::upload_run_failed(&state, pool, &req).await?,
+        ));
+    }
     // Reverse the `authored_pipelines::job_name` mapping to find the
     // pipeline id behind `jobName`. The store owns the only authoritative
     // list of runnable pipelines, so we ask it and match by `job_name`

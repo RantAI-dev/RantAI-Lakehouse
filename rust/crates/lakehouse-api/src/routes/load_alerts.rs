@@ -46,12 +46,13 @@ use lakehouse_store::PgPool;
 use lakehouse_store::connectors::{self, REPEATED_FAILURE_STREAK};
 use lakehouse_store::overview::{self, FiredRule};
 use lakehouse_store::pipelines;
+use lakehouse_store::uploads;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::pipelines::RunFailedBody;
 use crate::routes::alerts::{ApiSilenceSource, smtp_config};
-use crate::routes::connectors as connector_routes;
+use crate::routes::{connectors as connector_routes, uploads as upload_routes};
 use crate::state::AppState;
 
 /// Shown for any orchestrator failure; the cause is logged, not returned.
@@ -61,6 +62,8 @@ const RULES_UNAVAILABLE: &str = "the alert rules could not be read";
 
 /// The `source` label of an `alert_instance` written for a connector event.
 const CONNECTOR_SOURCE: &str = "Connector runs";
+/// The `source` label of an `alert_instance` written for an upload event.
+const UPLOAD_SOURCE: &str = "File uploads";
 
 /// Which half of the run sensors an event came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -337,9 +340,66 @@ pub(super) async fn connector_run_event(
     Ok(json!({ "matched": matched }))
 }
 
+/// A failed `file_ingest_job` run: settle the upload as failed (nobody has to
+/// open it), then deliver `upload_failure`.
+///
+/// The upload is settled through the same path a reader uses
+/// (`routes::uploads::Settler`), so its failure reason is one of the API's
+/// fixed texts. The dedupe row is written only after the upload is `failed`:
+/// if the orchestrator or `ClickHouse` could not be asked, the upload stays
+/// `ingesting`, nothing is recorded, and the sensor's retry tries again.
+///
+/// # Errors
+///
+/// As [`connector_run_event`].
+pub(super) async fn upload_run_failed(
+    state: &AppState,
+    pool: &PgPool,
+    req: &RunFailedBody,
+) -> Result<Value, ApiError> {
+    let Some(row) = uploads::get_by_run_id(pool, &req.run_id).await? else {
+        return Ok(skipped("no upload owns this run"));
+    };
+    confirm_status(state, &req.run_id, Outcome::Failure).await?;
+    let settled = upload_routes::settle_loading_upload(state, pool, row).await;
+    if settled.status != "failed" {
+        return Ok(skipped("the upload is not settled as failed; retry later"));
+    }
+    let first_seen = pipelines::record_pipeline_run_event(
+        pool,
+        &req.run_id,
+        &format!("upload:{}", settled.id),
+        Outcome::Failure.event_kind(),
+    )
+    .await?;
+    if !first_seen {
+        return Ok(skipped("run already alerted; sensor retry ignored"));
+    }
+    let text = format!(
+        "File {} (upload {}) failed to load in run {}. View: /connectors/upload?id={}",
+        settled.original_filename, settled.id, req.run_id, settled.id
+    );
+    let matched = deliver_event(
+        state,
+        pool,
+        AlertKind::UploadFailure,
+        &settled.id,
+        "Upload failed",
+        &text,
+        Some(UPLOAD_SOURCE),
+    )
+    .await?;
+    Ok(json!({ "matched": matched }))
+}
+
 /// Whether `job_name` is the one job every connector's ingest runs as.
 pub(super) fn is_connector_job(job_name: &str) -> bool {
     job_name == connector_routes::INGEST_JOB
+}
+
+/// Whether `job_name` is the upload loader's job.
+pub(super) fn is_upload_job(job_name: &str) -> bool {
+    job_name == upload_routes::FILE_INGEST_JOB
 }
 
 #[cfg(test)]
@@ -437,6 +497,15 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "meta": [], "rows": data.len(), "data": data })),
+            )
+            .mount(&ch)
+            .await;
+        // An upload's recorded result (`bronze_meta.ingest_run`): none.
+        Mock::given(method("POST"))
+            .and(body_string_contains("ingest_run"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "rows": 0, "data": [] })),
             )
             .mount(&ch)
             .await;
@@ -721,5 +790,123 @@ mod tests {
         let text = format!("{:?}", err.0);
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains(ORCHESTRATOR_UNAVAILABLE), "{text}");
+    }
+
+    // ── uploads (SRC-7 task 5) ──────────────────────────────────────────
+
+    const SEED_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+    /// An upload whose load was started under `run_id`, as the ingest route
+    /// leaves it: `ingesting`, never read since.
+    async fn loading_upload(pool: &sqlx::PgPool, id: &str, run_id: &str) {
+        use lakehouse_store::uploads::{LoadMode, NewUpload, insert, mark_ingesting};
+        insert(
+            pool,
+            &NewUpload {
+                id,
+                original_filename: "stock.csv",
+                storage_key: &format!("uploads/{id}.csv"),
+                content_type: "text/csv",
+                size_bytes: 10,
+                sha256: "",
+                uploaded_by: "Test User",
+                tenant_id: SEED_TENANT.parse().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        mark_ingesting(
+            pool,
+            id,
+            &json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 }),
+            "stock_raw",
+            LoadMode::Replace,
+            Some(run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    async fn upload_status(pool: &sqlx::PgPool, id: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error FROM file_upload WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// An upload still `ingesting` whose run failed becomes `failed` with
+    /// the API's own fixed reason and one alert goes out, with nobody having
+    /// read it. The message names the file and the upload and links to the
+    /// upload page; a sensor retry delivers nothing more.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_upload_run_settles_the_upload_and_delivers_one_alert(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("al-u", "upload_failure", "*")]).await;
+        loading_upload(&pool, "up-1", "run-up").await;
+        h.knows_run("run-up", None, "FAILURE").await;
+
+        let resp = run_failed_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-up", "file_ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 1);
+        let (status, error) = upload_status(&pool, "up-1").await;
+        assert_eq!(status, "failed");
+        assert_eq!(
+            error.as_deref(),
+            Some("The load stopped before it recorded a result.")
+        );
+        let posts = h.posts_to("al-u").await;
+        assert_eq!(posts.len(), 1);
+        for needle in ["stock.csv", "up-1", "run-up", "/connectors/upload?id=up-1"] {
+            assert!(
+                posts[0].contains(needle),
+                "{needle} missing from {}",
+                posts[0]
+            );
+        }
+        assert!(
+            !posts[0].contains("recorded a result"),
+            "no reason text in the alert"
+        );
+        let (instances,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM alert_instance WHERE rule_id = 'al-u'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(instances, 1);
+
+        let retry = run_failed_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-up", "file_ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(retry["matched"], 0);
+        assert_eq!(h.posts_to("al-u").await.len(), 1);
+    }
+
+    /// A run no upload owns is `{"matched": 0}` with a reason, not an error.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_of_no_upload_answers_matched_zero(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("al-u", "upload_failure", "*")]).await;
+        let resp = run_failed_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-nobody", "file_ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 0);
+        assert!(resp["reason"].is_string());
+        assert!(h.webhook.received_requests().await.unwrap().is_empty());
     }
 }
