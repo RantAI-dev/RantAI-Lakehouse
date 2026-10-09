@@ -63,10 +63,33 @@ fn removed(column: &str, status: ChangeStatus) -> NewChange {
     }
 }
 
-/// Write the first observation of `orders` as the baseline.
+/// Write the first observation of `orders` as the baseline. Valid once per
+/// connector: it asserts no accepted shape exists yet (`PR #101 CI run 3`);
+/// a repeated observation goes through [`observe_again`].
 async fn baseline(pool: &PgPool, id: &str, columns: &[ObservedColumn]) {
     let mut tx = ObservationTx::begin(pool, id, "orders").await.unwrap();
     assert!(tx.accepted().await.unwrap().is_none());
+    tx.record(&ObservationWrite {
+        observed_columns: columns,
+        observed_primary_key: &["id".to_owned()],
+        changes: &[],
+        accept_observed: true,
+        pause_connector: false,
+        run_id: None,
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Observe `orders` again through the product path (`ObservationTx` and a
+/// write with no changes), after a baseline exists: the accepted shape is
+/// read first, as the ingest does before it diffs. `PR #101 CI run 3`.
+async fn observe_again(pool: &PgPool, id: &str, columns: &[ObservedColumn]) {
+    let mut tx = ObservationTx::begin(pool, id, "orders").await.unwrap();
+    let accepted = tx.accepted().await.unwrap().expect("a baseline exists");
+    assert_eq!(accepted.columns, columns);
     tx.record(&ObservationWrite {
         observed_columns: columns,
         observed_primary_key: &["id".to_owned()],
@@ -161,7 +184,9 @@ async fn a_second_identical_observation_writes_nothing(pool: PgPool) -> sqlx::Re
             .bind(&id)
             .fetch_one(&pool)
             .await?;
-    baseline(&pool, &id, &columns).await;
+    // `PR #101 CI run 3`: `baseline` asserts "no accepted shape yet", true
+    // only on its first call; the repeat is a plain observation.
+    observe_again(&pool, &id, &columns).await;
     let second: (OffsetDateTime,) =
         sqlx::query_as("SELECT observed_at FROM connector_source_schema WHERE connector_id = $1")
             .bind(&id)
@@ -359,12 +384,27 @@ async fn the_ingestible_list_says_which_connector_is_paused(pool: PgPool) -> sql
     .bind(&id)
     .execute(&pool)
     .await?;
-    assert!(!list_ingestible_connectors(&pool).await.unwrap()[0].paused);
+    // `PR #101 CI run 3`: the migrations seed connectors that have an
+    // adapter, and the list has no ORDER BY, so `[0]` is not this connector;
+    // find it by id, and check a seeded one stays unpaused.
+    let paused_of = |listed: Vec<lakehouse_store::connectors::IngestibleConnector>, id: &str| {
+        listed.into_iter().find(|c| c.id == id).map(|c| c.paused)
+    };
+    assert_eq!(
+        paused_of(list_ingestible_connectors(&pool).await.unwrap(), &id),
+        Some(false)
+    );
     sqlx::query("UPDATE connector SET paused_reason = 'r', paused_at = now() WHERE id = $1")
         .bind(&id)
         .execute(&pool)
         .await?;
-    assert!(list_ingestible_connectors(&pool).await.unwrap()[0].paused);
+    let listed = list_ingestible_connectors(&pool).await.unwrap();
+    let seeded = listed
+        .iter()
+        .find(|c| c.id == "conn-pg-lakehouse")
+        .expect("a seeded connector with an adapter");
+    assert!(!seeded.paused);
+    assert_eq!(paused_of(listed, &id), Some(true));
     Ok(())
 }
 
