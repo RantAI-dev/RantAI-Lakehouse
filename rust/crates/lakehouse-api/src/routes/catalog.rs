@@ -642,6 +642,67 @@ async fn list_body(
     ))
 }
 
+/// How long the search copy is trusted before one request rebuilds it
+/// (`DATA-11` D2). Thirty seconds is the age a new table or a fresh row
+/// count may lag in a search result; the list a person opens without a
+/// term is still live. A console annotation edit does not wait for it
+/// (`put_annotation` drops the copy).
+const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+/// The search copy: what `list` assembles for a request, plus the columns
+/// and the use counts, rebuilt at most once per [`SEARCH_SNAPSHOT_TTL`] by
+/// one request at a time (`DATA-11` D2).
+///
+/// Nothing in it depends on the caller: the four enrichment steps take the
+/// shared [`AppState`] and no `Principal`, and the tenant check runs per
+/// request before this is called.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of the catalog read, like [`list_body`]; the
+/// routes answer it as they do today (`503`, the fixed shape).
+async fn search_snapshot(
+    state: &AppState,
+) -> Result<Arc<crate::catalog_search_cache::CatalogSearchSnapshot>, ChError> {
+    state
+        .catalog_search_cache
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || {
+            build_search_snapshot(state)
+        })
+        .await
+}
+
+/// The rebuild behind [`search_snapshot`]: `list`'s assembly, exactly as
+/// `list` runs it, then the columns and the use counts.
+async fn build_search_snapshot(
+    state: &AppState,
+) -> Result<crate::catalog_search_cache::CatalogSearchSnapshot, ChError> {
+    let (mut body, bronze_pairs) =
+        list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await?;
+    apply_sla_targets(state, &mut body, &bronze_pairs).await;
+    enrich_bronze_assets(state, &mut body, bronze_pairs.clone()).await;
+    apply_annotations(state, &mut body).await;
+    apply_badges(state, &mut body, &bronze_pairs).await;
+    let (columns, column_search_partial) = search_column_index(&state.clickhouse).await?;
+    let assets = body
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ids: Vec<String> = assets
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
+        assets,
+        namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
+        columns,
+        usage,
+        column_search_partial,
+    })
+}
+
 /// Most rows each of the two column queries of [`search_column_index`]
 /// reads. A catalog of 10,000 tables at 20 columns is 200,000 rows; this
 /// leaves room for 2.5 times that, and bounds the memory the search copy
@@ -2538,6 +2599,9 @@ pub async fn put_annotation(
         },
     )
     .await?;
+    // DATA-11 D2: a search must show the edit at once, not after the copy's
+    // age. Dropped only after the write succeeded.
+    state.catalog_search_cache.invalidate().await;
     // The asset's Change history reads this. Best-effort, like every other
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.

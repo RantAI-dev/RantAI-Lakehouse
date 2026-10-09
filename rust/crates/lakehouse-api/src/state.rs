@@ -25,6 +25,7 @@ use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
+use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::ConnectorSecretStore;
 use crate::gold_lock::MartLocks;
@@ -143,6 +144,12 @@ pub struct AppState {
     /// populated (same pattern as [`Self::gold_export_locks`]): it needs
     /// no external dependency, just an in-process map.
     pub bronze_stats_cache: Arc<BronzeStatsCache>,
+    /// The copy of the assembled catalog that `GET /api/catalog?q=` and
+    /// `GET /api/catalog/query?search=` read instead of rebuilding it per
+    /// search (`DATA-11` D2) — see [`crate::catalog_search_cache`]. Always
+    /// populated, like [`Self::bronze_stats_cache`]; holds nothing per
+    /// caller.
+    pub catalog_search_cache: Arc<SearchSnapshotCache>,
     /// `Trino` `/v1/statement` client for `routes::query::run`'s
     /// `engine: "trino"` path (WS2 §4). Always present, like
     /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
@@ -591,6 +598,7 @@ impl AppState {
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
+            catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),

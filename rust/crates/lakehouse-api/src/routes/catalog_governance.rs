@@ -257,7 +257,7 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
 const DEFAULT_BOARD: &str = "default";
 
 /// The window [`usage`] looks back over.
-const USAGE_DAYS: i32 = 7;
+pub(crate) const USAGE_DAYS: i32 = 7;
 /// How many of the caller's own recent queries [`usage`] returns.
 const RECENT_QUERIES: usize = 5;
 
@@ -335,6 +335,36 @@ pub(crate) async fn usage(
         Err(err) => {
             tracing::warn!(?err, "catalog detail: query history unavailable");
             (Value::Null, Vec::new())
+        }
+    }
+}
+
+/// How many of the newest queries the catalog's use ranking reads
+/// (`DATA-11` D4). A busier deployment under-counts its oldest queries of
+/// the window, which only softens the tie-break; it never changes which
+/// assets match.
+const USE_RANKING_ROWS: i64 = 5000;
+
+/// Queries per asset id over the last [`USAGE_DAYS`] days, for the search
+/// copy's tie-break. Without Postgres, or when the history cannot be read,
+/// every count is 0 and a warning is logged: ranking is then by relevance
+/// alone, not an error (`DATA-11` D4).
+pub(crate) async fn use_by_asset(
+    state: &AppState,
+    asset_ids: &[String],
+    bronze_pairs: &[(String, String)],
+) -> HashMap<String, u32> {
+    let Some(pg) = state.pg.as_deref() else {
+        return HashMap::new();
+    };
+    match lakehouse_store::queries::history_recent(pg, USAGE_DAYS, USE_RANKING_ROWS).await {
+        Ok(sqls) => use_counts(&sqls, &use_keys(asset_ids, bronze_pairs)),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "catalog search: query history unavailable; ranking without use"
+            );
+            HashMap::new()
         }
     }
 }
