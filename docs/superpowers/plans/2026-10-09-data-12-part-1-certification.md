@@ -226,4 +226,63 @@ Unsure: (1) the expected `certifiedAt` string in the overlay test (`2026-09-21T1
 
 ## Review
 
-*(planner)*
+### Reviewed 2026-10-09 at `bf58146`
+
+No `BLOCKER`. One small `SHOULD-FIX`, left open until the product owner has
+tried the console, to be fixed with whatever that finds.
+
+**SHOULD-FIX 1. The deprecation notice runs the note into the next
+sentence, and names the replacement by its id.** Seen in a browser: "This
+table is deprecated. Old load, use the customers table Use
+northwind-customers instead." *Fix:* the note is its own sentence or line
+(a full stop is added when the note has none), and the link shows the
+replacement's name with the id as its title. The name is on the search
+copy: `put_certification` already reads it to check the replacement, so
+`apply_annotation`'s caller can add `replacementName` to the row from the
+assembled list; if the replacement is gone, the id is shown.
+
+**Run by the planner on a live build of this commit** (a separate API and
+Postgres database, a dev ClickHouse; migration `0062` applied to a database
+that already held annotations):
+- Admin: certify one table, deprecate another with a note and the first as
+  its replacement: `200`.
+- Each refusal answers `400` with its sentence and stores nothing: a
+  replacement not in the catalog, the table itself, a note with `certified`,
+  a body with no `status`, a replacement that is itself deprecated.
+- A login without `governance:write`: `403`.
+- Rows of `GET /api/catalog?q=` carry the five fields; the filter
+  `certification inArray [deprecated]` returns the one table.
+- Saving the certified table's details left its mark; its history reads
+  "Edited description", "Marked certified". Clearing the other's mark:
+  "Removed the deprecated mark".
+- In a headless browser at 1536 px: the Data Explorer shows "Certified" and
+  "Deprecated" beside the names; the deprecated table's page shows the
+  badge, the notice with its link, and the Certification button.
+
+**Checked and correct.**
+- The mark has its own store statement and route; `upsert_annotation` still
+  names its four columns. `AnnotationInput` did not need to change (the
+  plan said it would; the developer's `CertificationInput` is right).
+- Order in the handler: tenant check, id, body, validation, then the
+  catalog read; the search copy is dropped after the write.
+- The unknown-catalog case answers `503` with a fixed sentence; no upstream
+  text reaches a response.
+- `certification` is in the three field lists; the hidden filter column
+  follows the hidden `id` column.
+- Nothing was added to `GET …/annotation`.
+
+**Verification, by the planner, at `bf58146`.** After `touch` of the crate
+sources: `cargo fmt --check` exit 0; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean in 1m27s. `bun run typecheck` exit 0;
+`bun run lint` 0 errors, 6 warnings, none in a changed file; `bun run test`
+952 pass, 1 skip, 0 fail.
+
+**Not verified.**
+- No Rust test has run; CI runs them first. The developer names two whose
+  expected text was not derived from a run (`certifiedAt`'s form, the
+  grouping order); live, `certifiedAt` carries fractional seconds
+  (`2026-10-09T09:09:32.572576Z`), so the first of those may fail in CI and
+  be corrected there.
+- The Certification dialog was not operated in a browser (only its unit
+  tests); the product owner's check covers it.
+- `tests/route_auth.rs` against the seeded multi-tenant app.
