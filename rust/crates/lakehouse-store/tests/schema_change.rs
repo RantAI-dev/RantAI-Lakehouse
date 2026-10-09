@@ -924,3 +924,129 @@ async fn an_added_table_is_never_recorded_again(pool: PgPool) {
     assert!(second.changes.is_empty() && second.added.is_empty());
     assert_eq!(list_recent(&pool, &id, 50).await.unwrap().len(), 1);
 }
+
+// --- SRC-8 review BLOCKER 3b: removing a table clears what waits for it -------
+
+/// A connector selecting `orders` and `customers`, through the one write of
+/// the selection.
+async fn connector_selecting_orders_and_customers(pool: &PgPool) -> String {
+    let id = connector(pool).await;
+    select_tables(pool, &id, &["orders", "customers"]).await;
+    id
+}
+
+async fn select_tables(pool: &PgPool, id: &str, names: &[&str]) {
+    let objects: Vec<_> = names
+        .iter()
+        .map(|n| serde_json::json!({"name": n, "target": format!("t_{n}"), "loadMode": "replace"}))
+        .collect();
+    set_ingest_spec(
+        pool,
+        id,
+        &IngestSpecInput {
+            adapter: "sql".to_owned(),
+            ingest_mode: "batch".to_owned(),
+            dial: serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "shop", "user": "reader",
+            }),
+            source_objects: serde_json::Value::Array(objects),
+            schedule_cron: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Observe `object`: the baseline when `changes` is empty, else a waiting
+/// removal of `note`; `pause` as the decision said.
+async fn observe_object(pool: &PgPool, id: &str, object: &str, waits: bool, pause: bool) {
+    let mut tx = ObservationTx::begin(pool, id, object).await.unwrap();
+    let observed = if waits {
+        vec![col("id", "integer")]
+    } else {
+        vec![col("id", "integer"), col("note", "text")]
+    };
+    let changes = if waits {
+        vec![removed("note", ChangeStatus::Pending)]
+    } else {
+        vec![]
+    };
+    tx.record(&ObservationWrite {
+        observed_columns: &observed,
+        observed_primary_key: &["id".to_owned()],
+        changes: &changes,
+        accept_observed: !waits,
+        pause_connector: pause,
+        run_id: None,
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Removing the only waiting table from the selection clears its pending
+/// change, its waiting shape and baseline and its inactive columns, lifts the
+/// schema-change pause, and adding it back starts from a fresh baseline.
+#[sqlx::test(migrations = "../../migrations")]
+async fn removing_a_table_clears_what_waits_for_it_and_lifts_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    observe_object(&pool, &id, "orders", false, false).await;
+    observe_object(&pool, &id, "orders", true, true).await;
+    sqlx::query(
+        "INSERT INTO connector_inactive_column (connector_id, object_name, column_name, \
+         inactive_since) VALUES ($1, 'orders', 'old_col', now())",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+
+    select_tables(&pool, &id, &["customers"]).await;
+
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_at, None, "the pause went with the table");
+    assert_eq!(after.paused_reason, None);
+    // Adding the table again: a baseline observation, no change to compare.
+    select_tables(&pool, &id, &["customers", "orders"]).await;
+    let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
+    assert!(tx.accepted().await.unwrap().is_none());
+}
+
+/// Removing one table leaves another table's pending change, and so the
+/// pause it set, where they are; a pause with another reason is also left.
+#[sqlx::test(migrations = "../../migrations")]
+async fn removing_one_table_leaves_another_tables_pending_change_and_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    observe_object(&pool, &id, "orders", false, false).await;
+    observe_object(&pool, &id, "orders", true, true).await;
+    observe_object(&pool, &id, "customers", false, false).await;
+    observe_object(&pool, &id, "customers", true, true).await;
+
+    select_tables(&pool, &id, &["customers"]).await;
+
+    let pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].object_name, "customers");
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        after.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+
+    // Only the schema-change reason is lifted: another reason stays when the
+    // last waiting table is removed.
+    sqlx::query("UPDATE connector SET paused_reason = 'other' WHERE id = $1")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    select_tables(&pool, &id, &["orders"]).await;
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_reason.as_deref(), Some("other"));
+}

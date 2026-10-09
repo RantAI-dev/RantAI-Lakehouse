@@ -1027,6 +1027,87 @@ async fn accept_waiting_shape(
     Ok(())
 }
 
+/// Lift the connector's schema-change pause when no table waits for a
+/// decision any more. Only a pause whose reason is
+/// [`SCHEMA_CHANGE_PAUSE_REASON`] is lifted, so a pause set for another
+/// reason (`SRC-11`) stays. The one copy of this logic: an approval and the
+/// removal of a table from the connector's selection
+/// ([`clear_removed_tables_in`]) both end here. Pending `table_added` rows
+/// are notices, not waiting tables (`SRC-8 review SHOULD-FIX 3`).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if a statement fails.
+async fn lift_pause_if_nothing_waits(
+    tx: &mut sqlx::PgConnection,
+    connector_id: &str,
+) -> Result<bool, StoreError> {
+    let (others,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
+         WHERE connector_id = $1 AND status = 'pending' AND kind <> 'table_added')",
+    )
+    .bind(connector_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if others {
+        return Ok(false);
+    }
+    Ok(sqlx::query(
+        "UPDATE connector SET paused_reason = NULL, paused_at = NULL \
+         WHERE id = $1 AND paused_reason = $2",
+    )
+    .bind(connector_id)
+    .bind(SCHEMA_CHANGE_PAUSE_REASON)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// A table left the connector's selection (`SRC-8 review BLOCKER 3b`): drop
+/// everything that waited for it and lift the schema-change pause when
+/// nothing else waits. Runs in the transaction that writes the new
+/// selection, so a half-cleared state is never visible.
+///
+/// Without it a table that waits on a type change nobody can approve (the
+/// console says "remove the table") would keep the connector stuck: its
+/// pending row and the pause would outlive the table. Everything of the
+/// table goes: the pending changes, the waiting shape, the accepted baseline
+/// and the inactive columns. The baseline goes too, so that adding the table
+/// again starts from a fresh baseline observation (no change) instead of
+/// being compared with a shape from before it was removed. History rows
+/// (`applied`, `approved`) stay as the connector's record.
+///
+/// Returns whether a pause was lifted.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if a statement fails.
+pub(crate) async fn clear_removed_tables_in(
+    tx: &mut sqlx::PgConnection,
+    connector_id: &str,
+    removed: &[String],
+) -> Result<bool, StoreError> {
+    if removed.is_empty() {
+        return Ok(false);
+    }
+    for sql in [
+        "DELETE FROM connector_schema_change \
+         WHERE connector_id = $1 AND object_name = ANY($2) AND status = 'pending'",
+        "DELETE FROM connector_source_schema \
+         WHERE connector_id = $1 AND object_name = ANY($2)",
+        "DELETE FROM connector_inactive_column \
+         WHERE connector_id = $1 AND object_name = ANY($2)",
+    ] {
+        sqlx::query(sql)
+            .bind(connector_id)
+            .bind(removed)
+            .execute(&mut *tx)
+            .await?;
+    }
+    lift_pause_if_nothing_waits(tx, connector_id).await
+}
+
 /// Approve every pending change of one table (`SRC-8` decision D5): they
 /// become `approved`, the baseline becomes the last OBSERVED shape, removed
 /// columns become inactive, and the connector's schema-change pause is
@@ -1098,27 +1179,7 @@ pub async fn approve_object(
 
     accept_waiting_shape(&mut tx, connector_id, object_name, &approved, now).await?;
 
-    let (others,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
-         WHERE connector_id = $1 AND status = 'pending' AND kind <> 'table_added')",
-    )
-    .bind(connector_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let pause_lifted = if others {
-        false
-    } else {
-        sqlx::query(
-            "UPDATE connector SET paused_reason = NULL, paused_at = NULL \
-             WHERE id = $1 AND paused_reason = $2",
-        )
-        .bind(connector_id)
-        .bind(SCHEMA_CHANGE_PAUSE_REASON)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0
-    };
+    let pause_lifted = lift_pause_if_nothing_waits(&mut tx, connector_id).await?;
     tx.commit().await?;
     Ok(ApproveOutcome::Approved(Approval {
         approved,

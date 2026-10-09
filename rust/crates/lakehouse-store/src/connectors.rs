@@ -1233,12 +1233,17 @@ async fn save_ingest_spec_in(
 
     // The stored target, read under a row lock so the comparison below and
     // the write stay one decision (SEC-14).
-    let (stored_adapter, stored_dial): (Option<String>, serde_json::Value) =
-        sqlx::query_as("SELECT adapter, dial FROM connector WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+    let (stored_adapter, stored_dial, stored_objects): (
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT adapter, dial, source_objects FROM connector WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
 
     // SEC-14: a change of target needs the credentials in the same write.
     // `set_ingest_spec` has none to offer, so it refuses; `repoint_ingest_spec`
@@ -1296,7 +1301,30 @@ async fn save_ingest_spec_in(
     let Some(row) = row else {
         return Err(StoreError::NotFound);
     };
+    // `SRC-8 review BLOCKER 3b`: the one place the selection is written (a
+    // person's save, a re-point and "apply all" all come through here), so
+    // the tables that just left it are cleared in the same transaction.
+    let removed = removed_object_names(&stored_objects, &spec.source_objects);
+    crate::schema_change::clear_removed_tables_in(tx, id, &removed).await?;
     Ok(ingest_spec_from_row(row))
+}
+
+/// Names (`source_objects[].name`) in `before` and not in `after`. Pure.
+fn removed_object_names(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    let kept = names(after);
+    names(before)
+        .into_iter()
+        .filter(|name| !kept.contains(name))
+        .collect()
 }
 
 /// One table [`append_source_objects_in`] is asked to add to a connector.
@@ -2110,6 +2138,17 @@ mod tests {
         assert_eq!(credential_kind_of_ref("env:SOMETHING_ELSE"), None);
     }
     use uuid::Uuid;
+
+    /// `SRC-8 review BLOCKER 3b`: only names that left the selection are
+    /// cleared; a malformed entry never counts as a name.
+    #[test]
+    fn only_the_names_that_left_the_selection_are_removed() {
+        let before = serde_json::json!([{"name": "a.t"}, {"name": "b.t"}, {"nope": 1}]);
+        let after = serde_json::json!([{"name": "b.t"}, {"name": "c.t"}]);
+        assert_eq!(super::removed_object_names(&before, &after), ["a.t"]);
+        assert!(super::removed_object_names(&before, &before).is_empty());
+        assert!(super::removed_object_names(&serde_json::Value::Null, &after).is_empty());
+    }
 
     #[test]
     fn connector_serializes_without_host_or_secret_ref() {
