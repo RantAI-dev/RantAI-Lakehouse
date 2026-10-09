@@ -7,11 +7,11 @@
 | Who builds it | Data |
 | When | Next |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | Spec corrected against the code 2026-10-09. Feature page [`catalog-search.md`](../features/catalog-search.md) drafted, decisions signed 2026-10-09. Built, not merged |
 
 ## Why
 
-Catalog search matches table names by substring only; a column name or tag finds nothing.
+Catalog search looks for the typed text as one piece, in names, descriptions and tags. A column name finds nothing, one wrong letter finds nothing, and results come back in no useful order.
 
 ## What users get
 
@@ -19,16 +19,16 @@ Find a table by a column name, a description or a tag, from anywhere.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `c338862`, re-read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| What is searched | Table names | Names, descriptions, column names, column descriptions, tag keys and values (Databricks' list) |
-| Filters | None | Type, owner, layer (Bronze/Silver/Gold), tag, certification |
-| Matching | Substring | Tolerant: any word order, one-typo tolerance, ranked by relevance and use |
-| Where | Data Explorer only | A search box reachable from every page (keyboard shortcut) |
-| Speed | Not measured | Results within 500 ms for a catalog of 10,000 tables *(proposed)* |
-| Permissions | n/a | Only assets the user may see appear |
+| What is searched | Data Explorer: id, name, namespace, description, owner. The ⌘K box: name, id, description, tags. Column names and column descriptions: nowhere | Names, descriptions, column names, column descriptions, tag keys and values (Databricks' list). A tag is one word until `DATA-12` gives tags keys and values |
+| Filters | Data Explorer filters on type, layer, tier, name, namespace, freshness and size. The API also accepts owner; the page does not offer it. No tag filter. Certification does not exist | Type, owner, layer (Bronze/Silver/Gold), tag, certification. The certification filter **Waits for `DATA-12`**, which creates the mark |
+| Matching | The whole typed text as one substring, any letter case. No ranking | Tolerant: any word order, one-typo tolerance, ranked by relevance and use |
+| Where | Data Explorer, and a ⌘K / Ctrl+K box on every signed-in page. By reading the code, the ⌘K box hides a table matched only by its description or tag (not run) | A search box reachable from every page (keyboard shortcut), showing every match and why it matched |
+| Speed | Not measured. Every search rebuilds the whole catalog from six ClickHouse queries | Results within 500 ms for a catalog of 10,000 tables *(proposed)* |
+| Permissions | Search needs `catalog:read` and passes the catalog's tenant check, which admits or refuses the whole catalog. The product has no per-table visibility: whoever may open the catalog sees every table in it | Only assets the user may see appear. This task keeps both checks on every search path; per-table visibility is not built here (feature page, decision 5) |
 
 ## Benchmark
 

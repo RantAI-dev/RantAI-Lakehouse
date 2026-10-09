@@ -8,15 +8,18 @@ import {
   HardDrive,
   Layers,
   Tag,
+  Tags,
   Text,
+  User,
 } from "lucide-react"
 
 import { Copyable } from "@/components/copyable"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { AssetRowActions } from "./data-explorer-actions"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { TierBadge } from "@/components/patterns/status-badge"
+import { Pill, TierBadge } from "@/components/patterns/status-badge"
 import { formatBytes } from "@/lib/format"
+import { matchedOnLabel } from "@/lib/palette-search"
 import {
   DATA_LAYER_LABEL,
   STORAGE_TIER_LABEL,
@@ -58,6 +61,13 @@ const typeOptions = Object.entries(ASSET_TYPE_LABEL).map(([value, label]) => ({
   value,
 }))
 
+/** The reason line under a name; nothing when the server sent none. */
+export function MatchedOnLine({ matchedOn }: { matchedOn: Asset["matchedOn"] }) {
+  const reason = matchedOnLabel(matchedOn)
+  if (!reason) return null
+  return <span className="truncate text-xs text-muted-foreground">{reason}</span>
+}
+
 /**
  * Built as a function rather than a constant because the `actions` column
  * needs to navigate, and the router only exists inside the component.
@@ -79,18 +89,24 @@ export function getDataExplorerColumns({
       // second copy only widened the row and gave the same value two places
       // to be copied from.
       cell: ({ row }) => (
-        // Capped and truncated: asset names run long ("Kunjungan Daya
-        // Tarik Wisata"), and left to itself this column took ~270px —
-        // enough to push the last columns off a narrow screen on its own.
-        // The full name is still available on hover and on the detail page.
-        <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
-          <span
-            className="truncate font-medium tracking-tight text-foreground"
-            title={row.original.name}
-          >
-            {row.original.name}
-          </span>
-        </Copyable>
+        <div className="flex flex-col">
+          {/* Capped and truncated: asset names run long ("Kunjungan Daya
+              Tarik Wisata"), and left to itself this column took ~270px —
+              enough to push the last columns off a narrow screen on its own.
+              The full name is still available on hover and on the detail
+              page. */}
+          <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
+            <span
+              className="truncate font-medium tracking-tight text-foreground"
+              title={row.original.name}
+            >
+              {row.original.name}
+            </span>
+          </Copyable>
+          {/* Why a search returned this row (DATA-11); only a search with a
+              term sends it, and a match on the name needs no reason. */}
+          <MatchedOnLine matchedOn={row.original.matchedOn} />
+        </div>
       ),
       enableColumnFilter: true,
       meta: {
@@ -118,6 +134,60 @@ export function getDataExplorerColumns({
         variant: "text",
         icon: Boxes,
         enableGrouping: true,
+      },
+    },
+    {
+      id: "owner",
+      accessorKey: "owner",
+      header: ({ column }) => <DataTableColumnHeader column={column} label="Owner" />,
+      cell: ({ row }) => (
+        // Capped and truncated like the Name cell, with the full value as
+        // its title: an owner is free text and can be an address (DATA-11
+        // review SHOULD-FIX 7).
+        <span
+          className="block max-w-[10rem] truncate text-sm"
+          title={row.original.owner || undefined}
+        >
+          {row.original.owner || "—"}
+        </span>
+      ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Owner",
+        placeholder: "Search owner…",
+        variant: "text",
+        icon: User,
+      },
+    },
+    {
+      // Not sortable: the server refuses `tags` as a sort field (a list has
+      // no order to sort by), so the header must not offer it. The filter
+      // sends `iLike`, which matches when any tag contains the text.
+      id: "tags",
+      accessorFn: (asset) => asset.tags ?? [],
+      header: ({ column }) => <DataTableColumnHeader column={column} label="Tags" />,
+      cell: ({ row }) => {
+        const tags = row.original.tags ?? []
+        if (tags.length === 0) return <span className="text-muted-foreground">—</span>
+        return (
+          // Capped so a long list wraps inside the column instead of widening
+          // the table (DATA-11 review SHOULD-FIX 7).
+          <span className="flex max-w-[14rem] flex-wrap gap-1">
+            {tags.map((tag) => (
+              <Pill key={tag} tone="neutral">
+                {tag}
+              </Pill>
+            ))}
+          </span>
+        )
+      },
+      enableSorting: false,
+      enableColumnFilter: true,
+      meta: {
+        label: "Tags",
+        placeholder: "Search tags…",
+        variant: "text",
+        icon: Tags,
       },
     },
     {

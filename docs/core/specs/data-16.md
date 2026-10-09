@@ -7,11 +7,11 @@
 | Who builds it | Data |
 | When | Next |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Status | Spec corrected against the code 2026-10-09. Not planned, not built |
 
 ## Why
 
-The version picker is built but no test proves a past-version query still applies masking and row filters.
+The version picker is built but no test proves a past-version query still applies masking and row filters, and by reading the code the Trino form does not run at all.
 
 ## What users get
 
@@ -19,13 +19,13 @@ Querying a past version of a table is trusted to apply masking.
 
 ## Target specs
 
-"Today" is `main` at `f3a3196`, read from the code, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `c338862`, re-read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
 | Masking gate test | None | A gate test proves past-version queries on both engines pass the masking and row-filter rewrite |
-| Picker | Built, unproven | Works for ClickHouse and Trino; versions listed with time and operation |
-| Retention shown | Not stated | The page states how far back versions exist on this install |
+| Picker | Two exist. The asset page's "Query this version" writes the ClickHouse form and lists time and operation. Query Studio's picker writes only the Trino form, whichever engine is chosen, and lists the version id and operation without the time. By reading the code (not run): the Trino form is refused as unparseable before it reaches Trino, and if it parsed, a table with a masking policy would be read at its current version | Works for ClickHouse and Trino; versions listed with time and operation |
+| Retention shown | Not stated. A "Snapshots to keep" setting exists on the Lakehouse table page; version clean-up is skipped on this ClickHouse version | The page states how far back versions exist on this install |
 
 ## Benchmark
 
