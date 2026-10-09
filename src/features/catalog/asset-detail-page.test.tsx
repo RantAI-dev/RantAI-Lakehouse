@@ -15,7 +15,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -64,9 +64,14 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 }
 
-function stubApi(asset: Partial<AssetDetail>, permissions = ["catalog:read"]) {
-  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+function stubApi(
+  asset: Partial<AssetDetail>,
+  permissions = ["catalog:read"],
+  certification: () => Response = () => json({ ok: true })
+) {
+  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
+    if (init?.method === "PUT" && path.endsWith("/certification")) return certification()
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Reader", email: null, roles: [], permissions, tenants: [] })
     }
@@ -102,3 +107,92 @@ describe("AssetDetailPage certification", () => {
     expect(screen.queryByText("Deprecated")).toBeNull()
   })
 })
+
+/** The `[method, path, body]` of every write the page sent. */
+function writes(fetchSpy: ReturnType<typeof stubApi>) {
+  return fetchSpy.mock.calls
+    .filter((c) => (c[1]?.method ?? "GET") !== "GET")
+    .map((c) => [c[1]?.method, String(c[0]), c[1]?.body ? JSON.parse(String(c[1].body)) : undefined])
+}
+
+const GOVERNOR = ["catalog:read", "governance:write"]
+
+describe("AssetDetailPage deprecation notice", () => {
+  it("says the table is deprecated, with the note and a link to the replacement", async () => {
+    stubApi({
+      certification: "deprecated",
+      certificationNote: "Superseded by the monthly mart.",
+      replacementAssetId: "serving.monthly_orders",
+    })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).toContain("This table is deprecated.")
+    expect(notice.textContent).toContain("Superseded by the monthly mart.")
+    const link = screen.getByRole("link", { name: "serving.monthly_orders" })
+    expect(link.getAttribute("href")).toBe("/data/assets/serving.monthly_orders")
+  })
+
+  it("shows no notice for a certified table or one without a mark", async () => {
+    stubApi({ certification: "certified" })
+    renderPage()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
+    expect(screen.queryByRole("note")).toBeNull()
+  })
+})
+
+describe("AssetDetailPage certification control", () => {
+  it("offers no control without governance:write", async () => {
+    stubApi({}, ["catalog:read", "catalog:write"])
+    renderPage()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
+    // The permission list arrives after the asset; wait for it to settle.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Certification" })).toBeNull())
+  })
+
+  it("sends the note and the replacement when the mark is deprecated, then reloads the asset", async () => {
+    const fetchSpy = stubApi({}, GOVERNOR)
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    fireEvent.click(screen.getByLabelText("Deprecated"))
+    fireEvent.change(screen.getByLabelText("Note"), { target: { value: " Superseded " } })
+    fireEvent.change(screen.getByLabelText("Replacement asset id"), {
+      target: { value: "serving.monthly_orders" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(writes(fetchSpy)).toHaveLength(1))
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "PUT",
+        "/api/catalog/silver.orders/certification",
+        { status: "deprecated", note: "Superseded", replacementAssetId: "serving.monthly_orders" },
+      ],
+    ])
+    const loads = () => fetchSpy.mock.calls.filter((c) => String(c[0]) === "/api/catalog/silver.orders")
+    await waitFor(() => expect(loads().length).toBeGreaterThan(1))
+  })
+
+  it("sends status null when the choice is no mark", async () => {
+    const fetchSpy = stubApi({ certification: "certified" }, GOVERNOR)
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    // The dialog opens on the saved mark.
+    expect((screen.getByLabelText("Certified") as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByLabelText("No mark"))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(writes(fetchSpy)).toHaveLength(1))
+    expect(writes(fetchSpy)).toEqual([["PUT", "/api/catalog/silver.orders/certification", { status: null }]])
+  })
+
+  it("shows the API's sentence and keeps the dialog open on a refusal", async () => {
+    stubApi({}, GOVERNOR, () => json({ error: "the replacement is itself deprecated" }, 400))
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    fireEvent.click(screen.getByLabelText("Deprecated"))
+    fireEvent.change(screen.getByLabelText("Replacement asset id"), { target: { value: "serving.old" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    expect(await screen.findByText("the replacement is itself deprecated")).toBeTruthy()
+    expect(screen.getByLabelText("Replacement asset id")).toBeTruthy()
+  })
+})
+

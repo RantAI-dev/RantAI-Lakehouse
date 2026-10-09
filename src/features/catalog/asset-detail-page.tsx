@@ -41,6 +41,7 @@ import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
+import { CertificationAction, DeprecationNotice } from "./asset-certification"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 
 /**
@@ -124,6 +125,9 @@ export function AssetDetailPage() {
               title={classificationTitle(a)}
             />
             <HealthBadge health={a.health} title={healthTitle(a)} />
+            {hasPermission("governance:write") ? (
+              <CertificationAction asset={a} onChanged={state.reload} />
+            ) : null}
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
                 Request access
@@ -133,6 +137,7 @@ export function AssetDetailPage() {
         }
         description={a.description}
       />
+      <DeprecationNotice asset={a} />
       <MetadataList
         density="compact"
         columns={3}
