@@ -70,7 +70,7 @@ const settle = () =>
 
 function renderPanel(props: Partial<React.ComponentProps<typeof ConnectorSchemaChangesPanel>> = {}) {
   const onChanged = mock(() => {})
-  const onWaiting = mock((_tables: Set<string>, _groups: number) => {})
+  const onWaiting = mock<(tables: Set<string>, groups: number) => void>(() => {})
   render(
     <ConnectorSchemaChangesPanel
       connectorId="conn-a"
