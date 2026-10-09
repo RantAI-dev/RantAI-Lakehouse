@@ -234,10 +234,14 @@ function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onCha
       title="Classification"
       description={classificationTitle(a)}
       action={
-        <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>
-          <Tag />
-          Classify
-        </Button>
+        // SEC-22 (F4): adding a classification rule needs governance:write,
+        // the same grant as removing one (`canRemove`).
+        canRemove ? (
+          <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>
+            <Tag />
+            Classify
+          </Button>
+        ) : null
       }
     >
       <ul className="divide-y divide-border text-sm">

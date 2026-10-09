@@ -168,10 +168,14 @@ export function DataQualityPage() {
         title="Data Quality"
         description="Rules, dimensions, thresholds, and remediation signals."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
-            <PlusIcon data-icon="inline-start" />
-            Add Quality Rule
-          </Button>
+          // SEC-22 (F4): the API now refuses adding a rule without
+          // governance:write, like editing and deleting one.
+          hasPermission("governance:write") ? (
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <PlusIcon data-icon="inline-start" />
+              Add Quality Rule
+            </Button>
+          ) : null
         }
       />
 

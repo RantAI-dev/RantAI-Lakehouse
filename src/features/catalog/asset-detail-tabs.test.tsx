@@ -474,7 +474,8 @@ describe("Quality tab", () => {
     url.search = "tab=quality"
     renderTabs(BRONZE, reloaded)
 
-    fireEvent.click(screen.getByText("Add rule"))
+    // The button waits for the session: it shows only with governance:write (SEC-22).
+    fireEvent.click(await screen.findByText("Add rule"))
     fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
     expect(screen.getByText("id unique")).toBeTruthy()
@@ -691,7 +692,8 @@ describe("Health and classification", () => {
 
     const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
     expect(within(card).getByText(/The default level/)).toBeTruthy()
-    fireEvent.click(within(card).getByText("Classify"))
+    // The button waits for the session: it shows only with governance:write (SEC-22).
+    fireEvent.click(await within(card).findByText("Classify"))
     fireEvent.change(screen.getByLabelText("Applies to"), { target: { value: "amount" } })
     fireEvent.change(screen.getByLabelText("Classification"), { target: { value: "confidential" } })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
@@ -732,6 +734,49 @@ describe("Quality tab: deleting a rule", () => {
 
     await screen.findByText("email_complete")
     await waitFor(() => expect(screen.queryByLabelText("Delete rule email_complete")).toBeNull())
+  })
+})
+
+// SEC-22 (F4): the API refuses adding a rule without governance:write, so the
+// buttons that add one show only with it, as Edit and Delete beside them do.
+describe("Quality and Access tabs: adding a rule needs governance:write", () => {
+  const without = ["catalog:read", "query:read", "policy:read"]
+  const runnableRule: AssetDetail["qualityChecks"] = [
+    { id: "q2", name: "email_complete", dimension: "completeness", status: null, lastRun: null, threshold: "email not null", origin: "rule", evaluable: true },
+  ]
+
+  it("hides Add rule on the Quality tab without governance:write, and shows it with", async () => {
+    stubApi({ permissions: without })
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: runnableRule })
+
+    // Run checks needs query:read, so it appearing proves the session loaded.
+    await screen.findByRole("button", { name: "Run checks" })
+    expect(screen.queryByRole("button", { name: "Add rule" })).toBeNull()
+    cleanup()
+    mock.restore()
+
+    stubApi({ permissions: [...without, "governance:write"] })
+    renderTabs({ ...BRONZE, qualityChecks: runnableRule })
+    expect(await screen.findByRole("button", { name: "Add rule" })).toBeTruthy()
+  })
+
+  it("hides Classify on the Access tab without governance:write, and shows it with", async () => {
+    stubApi({ permissions: without })
+    url.search = "tab=access"
+    renderTabs(BRONZE)
+
+    // "Your access" reads the same session, so a Granted pill proves it loaded.
+    await screen.findAllByText("Granted")
+    const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).queryByText("Classify")).toBeNull()
+    cleanup()
+    mock.restore()
+
+    stubApi({ permissions: [...without, "governance:write"] })
+    renderTabs(BRONZE)
+    const again = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(await within(again).findByText("Classify")).toBeTruthy()
   })
 })
 

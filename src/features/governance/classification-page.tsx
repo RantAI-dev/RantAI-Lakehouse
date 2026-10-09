@@ -22,6 +22,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatPercent } from "@/lib/format"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import type { Classification } from "@/lib/status"
@@ -46,6 +47,7 @@ export function ClassificationPage() {
     React.useState<Classification>("internal")
   const [maskingRule, setMaskingRule] = React.useState("")
   const tableUrlState = useTableUrlState()
+  const { hasPermission } = useAuth()
 
   const create = useServiceAction(
     withNotify(
@@ -128,10 +130,14 @@ export function ClassificationPage() {
         title="Classification & Masking"
         description="Classification taxonomy, confidence, and column masking rules."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
-            <PlusIcon data-icon="inline-start" />
-            Add Rule
-          </Button>
+          // SEC-22 (F4): the API now refuses adding a rule without
+          // governance:write, like removing one.
+          hasPermission("governance:write") ? (
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <PlusIcon data-icon="inline-start" />
+              Add Rule
+            </Button>
+          ) : null
         }
       />
 

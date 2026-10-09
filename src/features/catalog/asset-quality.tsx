@@ -455,10 +455,13 @@ export function AssetQuality({
               {running ? "Running…" : "Run checks"}
             </Button>
           ) : null}
-          <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
-            <Plus />
-            Add rule
-          </Button>
+          {/* SEC-22 (F4): adding a rule needs governance:write, like editing and deleting one. */}
+          {canWrite ? (
+            <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
+              <Plus />
+              Add rule
+            </Button>
+          ) : null}
           <Button size="sm" variant="ghost" render={<Link href="/governance/data-quality" />}>
             Open data quality
           </Button>
