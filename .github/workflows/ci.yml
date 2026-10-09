@@ -191,10 +191,9 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
+      # No `rust-cache` step: `cargo fmt --check` compiles nothing, so its
+      # cache held 107 MB per ref of an empty `target/` (measured 2026-10-09)
+      # while the repository's Actions cache sat at 9.9 GB of its 10 GB cap.
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -215,10 +214,17 @@ jobs:
         with:
           components: clippy
 
+      # Restore on every run, SAVE only on `main`. Measured 2026-10-09: PR #88
+      # stored its own 980 MB `build` cache next to `main`'s identical one,
+      # and the repository's Actions cache sat at 9.9 GB of its 10 GB cap,
+      # where eviction starts taking the image layer cache too (CI-SPEED-PLAN
+      # §4.2, §9). A PR still restores `main`'s cache; it just no longer adds
+      # its own copy.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -237,10 +243,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo build --locked
         run: cargo build --locked
@@ -260,10 +268,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: stable
 
       # Needed by lakehouse-bi's specs_match_typescript drift guard, which
@@ -300,10 +310,12 @@ jobs:
         with:
           toolchain: "1.88.0"
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv-1.88.0
 
       - name: cargo check --workspace --all-targets --locked
