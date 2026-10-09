@@ -349,4 +349,76 @@ Deviations and choices the plan did not spell out:
 
 ## Review
 
-*(planner)*
+### Rust slice (R1–R5), reviewed 2026-10-09 at `4b61231`
+
+No `BLOCKER`. Three `SHOULD-FIX`, the first a mistake in this plan.
+
+**SHOULD-FIX 1. A typed word with punctuation is never matched
+approximately (plan error, section 3).** The plan split the term on
+whitespace only, and compared the whole word with the field's tokens, which
+never contain punctuation. `custmer_id` therefore cannot find `customer_id`:
+the word has an underscore, no token has one. *Fix, in `best_hit`
+(`R/catalog_search.rs`):* when the word is not contained in the field, split
+the word the way fields are split (`tokens`). The field matches
+approximately when every word token is either contained in the field or, at
+4 characters or more, one edit from one of the field's tokens. A word with
+no letter or digit matches nothing. Tests: `custmer_id` finds a column
+`customer_id` (approximate); `silver.ordrs` finds `silver.orders`;
+`custmer_xx` does not find `customer_id`.
+
+**SHOULD-FIX 2. Use is counted under a different table name than the asset
+page counts it.** `use_keys` (`R/catalog_governance.rs`) gives a Bronze
+dataset the one key `bronze.<table>`. The asset page counts a dataset's
+queries under `bronze.<table>` and under the key of the table its page
+reads (`source.policy_key`, `R/catalog.rs:2165-2170`), which is
+`silver.<table>` on a deployment that cannot read Bronze. There, search
+ranks every Bronze dataset as unused, and D4 ("the count the asset page
+already shows") does not hold. *Fix:* when `Config::iceberg_query_db` is
+unset, `use_keys` also maps `silver.<table>` to the dataset, unless a listed
+asset already has that id. Test for both settings.
+
+**SHOULD-FIX 3. Nothing tests that an annotation edit drops the search
+copy.** The drop is one line in `put_annotation`, tested only at the cache.
+*Fix:* a `sqlx::test` beside the existing `put_annotation_*` tests: put a
+copy in the cache, call `put_annotation` as a member, assert the next
+`get_or_build` runs its build; and one asserting a refused write leaves the
+copy in place.
+
+**Checked and correct.**
+- One matcher: `filter_assets_by_query`, `apply_search` and
+  `SEARCHABLE_FIELDS` are gone; every old search test is carried into
+  `catalog_search.rs`, none weakened.
+- The weight table, the 4-character rule, the 8-word cap and the ordering
+  match section 3. `within_one_edit` is correct for substitution, insertion,
+  deletion and adjacent swap, on `char`s.
+- Both routes run `catalog_tenant_refusal` before the copy is read. No route
+  was added; `POLICY_TABLE` is untouched. No dependency was added.
+- The copy holds nothing per caller: `assemble_catalog` takes `AppState`
+  only. Single-flight is the `tokio` mutex held across the rebuild. A failed
+  rebuild caches nothing.
+- An empty term runs the live assembly on both routes.
+- `tags` filters with the any/none rules, is refused as a sort or group
+  field, and a test pins the sortable list to the filterable one.
+- SQL: `history_recent` binds both values; the two column queries
+  interpolate only the constant limit.
+- The developer's own changes to the plan are accepted: the cache is its own
+  module `catalog_search_cache.rs` (a private route module cannot be named
+  from `state.rs`); `assemble_catalog` removes the duplicated assembly.
+
+**Carried, not caused.** The `503` body of both routes still passes
+`js_error(err)`, upstream text, as before this branch (principle 4). The
+search path reuses that one response; no new handler leaks. Backlog `SEC-6`.
+
+**Not a finding, for T4.** `search` lower-cases every field of every asset
+on each call. If the measurement shows the matcher is where the time goes,
+the lower-cased text moves into the copy; not before it is measured.
+
+**Verification, by the planner, at `4b61231`.** From `rust/`, with the
+shared target dir and two jobs, after `touch` of the crate sources:
+`cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api -p lakehouse-store
+--all-targets -- -D warnings` finished clean in 1m14s.
+
+**Not verified.** No Rust test has been run by anyone (`cargo test` is not
+run on this machine); their first run is CI's. The two column queries have
+never run against a ClickHouse. The workspace-wide clippy and the 500 ms
+target (T4) are open.
