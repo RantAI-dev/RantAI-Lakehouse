@@ -99,7 +99,7 @@ class PostRunFailedTests(unittest.TestCase):
                 "Authorization": "Bearer tok-pf",
                 "x-run-token": "tok-pf",
             },
-            timeout=30,
+            timeout=pipeline_events.POST_TIMEOUT,
         )
 
     def test_unset_token_posts_nothing(self) -> None:
@@ -128,7 +128,7 @@ class PostRunFinishedTests(unittest.TestCase):
                 "Authorization": "Bearer tok-pf",
                 "x-run-token": "tok-pf",
             },
-            timeout=30,
+            timeout=pipeline_events.POST_TIMEOUT,
         )
 
     def test_unset_token_posts_nothing(self) -> None:
@@ -160,7 +160,7 @@ class SensorEvaluationTests(unittest.TestCase):
         self.assertEqual(
             kwargs["json"], {"runId": "run-1", "jobName": "authored__pl_orders"}
         )
-        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["timeout"], pipeline_events.POST_TIMEOUT)
 
     def test_an_unset_token_logs_and_posts_nothing(self) -> None:
         context = _FakeContext("run-1", "authored__pl_orders")
@@ -179,13 +179,14 @@ class SensorEvaluationTests(unittest.TestCase):
         with mock.patch.dict(
             "os.environ", {"PIPELINE_RUN_TOKEN": "tok-pf"}, clear=False
         ):
-            with mock.patch.object(
+            with mock.patch.object(pipeline_events, "_sleep"), mock.patch.object(
                 pipeline_events.requests,
                 "post",
                 side_effect=requests.ConnectionError("network down"),
             ):
-                # Must not raise — Dagster will retry the tick, and the
-                # API's `(run_id, kind)` dedupe makes the retry safe.
+                # Must not raise: Dagster does not retry either way (the
+                # cursor moves past the run), so the sensor logs and returns
+                # after the in-tick attempts.
                 evaluate_failed_run(context)
         context.log.warning.assert_called_once()
         # Dagster's logger takes the format string and the values
@@ -220,7 +221,7 @@ class FinishedSensorEvaluationTests(unittest.TestCase):
         self.assertEqual(
             kwargs["json"], {"runId": "run-2", "jobName": "authored__pl_orders"}
         )
-        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["timeout"], pipeline_events.POST_TIMEOUT)
 
     def test_an_unset_token_logs_and_posts_nothing(self) -> None:
         context = _FakeContext("run-2", "authored__pl_orders")
@@ -239,18 +240,108 @@ class FinishedSensorEvaluationTests(unittest.TestCase):
         with mock.patch.dict(
             "os.environ", {"PIPELINE_RUN_TOKEN": "tok-pf"}, clear=False
         ):
-            with mock.patch.object(
+            with mock.patch.object(pipeline_events, "_sleep"), mock.patch.object(
                 pipeline_events.requests,
                 "post",
                 side_effect=requests.ConnectionError("network down"),
             ):
-                # Must not raise — Dagster will retry the tick, and the
-                # API's `(run_id, kind)` dedupe makes the retry safe.
+                # Must not raise; see the failure sensor's test.
                 evaluate_finished_run(context)
         context.log.warning.assert_called_once()
         args = context.log.warning.call_args.args
         self.assertIn("run-2", args)
         self.assertIn("authored__pl_orders", args)
+
+
+def _ok() -> mock.Mock:
+    response = mock.Mock(spec=requests.Response)
+    response.raise_for_status.return_value = None
+    return response
+
+
+def _http_error(status: int) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    return requests.HTTPError(f"{status} from the API", response=response)
+
+
+class BoundedRetryTests(unittest.TestCase):
+    """`SRC-7` review SHOULD-FIX 4: Dagster's run sensor moves past a run
+    whether the function raised or not, so the only retry is the bounded one
+    inside the tick. `requests.post` and the pause are replaced: no network,
+    no real sleeping."""
+
+    def _run(self, post_fn, side_effect):
+        with mock.patch.object(pipeline_events, "_sleep") as sleep, mock.patch.object(
+            pipeline_events.requests, "post", side_effect=side_effect
+        ) as mocked_post:
+            error = None
+            try:
+                post_fn(_cfg(), "run-1", "ingest_job")
+            except requests.RequestException as err:
+                error = err
+        return mocked_post, sleep, error
+
+    def test_a_connection_error_is_retried_and_the_second_try_succeeds(self) -> None:
+        for post_fn in (post_run_failed, post_run_finished):
+            mocked_post, sleep, error = self._run(
+                post_fn, [requests.ConnectionError("down"), _ok()]
+            )
+            self.assertIsNone(error)
+            self.assertEqual(mocked_post.call_count, 2)
+            sleep.assert_called_once_with(pipeline_events.POST_PAUSE_SECONDS)
+
+    def test_a_timeout_is_retried(self) -> None:
+        mocked_post, _, error = self._run(
+            post_run_failed, [requests.ReadTimeout("slow"), _ok()]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(mocked_post.call_count, 2)
+
+    def test_a_5xx_answer_is_retried(self) -> None:
+        failing = mock.Mock(spec=requests.Response)
+        failing.raise_for_status.side_effect = _http_error(503)
+        mocked_post, _, error = self._run(post_run_finished, [failing, _ok()])
+        self.assertIsNone(error)
+        self.assertEqual(mocked_post.call_count, 2)
+
+    def test_a_4xx_answer_is_never_retried(self) -> None:
+        for status in (400, 401, 403, 409):
+            refused = mock.Mock(spec=requests.Response)
+            refused.raise_for_status.side_effect = _http_error(status)
+            mocked_post, sleep, error = self._run(post_run_failed, [refused, _ok()])
+            self.assertIsInstance(error, requests.HTTPError)
+            self.assertEqual(mocked_post.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_three_failed_attempts_give_up_with_two_pauses_and_raise(self) -> None:
+        mocked_post, sleep, error = self._run(
+            post_run_failed, requests.ConnectionError("down")
+        )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(mocked_post.call_count, pipeline_events.POST_ATTEMPTS)
+        self.assertEqual(sleep.call_count, pipeline_events.POST_ATTEMPTS - 1)
+
+    def test_the_worst_case_for_one_run_fits_inside_the_default_sensor_limit(self) -> None:
+        connect, read = pipeline_events.POST_TIMEOUT
+        worst = (
+            pipeline_events.POST_ATTEMPTS * (connect + read)
+            + (pipeline_events.POST_ATTEMPTS - 1) * pipeline_events.POST_PAUSE_SECONDS
+        )
+        self.assertLessEqual(worst, 60)
+
+    def test_a_sensor_that_gave_up_logs_that_the_alert_is_not_sent(self) -> None:
+        context = _FakeContext("run-9", "ingest_job")
+        with mock.patch.dict("os.environ", {"PIPELINE_RUN_TOKEN": "tok-pf"}, clear=False):
+            with mock.patch.object(pipeline_events, "_sleep"), mock.patch.object(
+                pipeline_events.requests,
+                "post",
+                side_effect=requests.ConnectionError("down"),
+            ) as mocked_post:
+                evaluate_failed_run(context)
+        self.assertEqual(mocked_post.call_count, pipeline_events.POST_ATTEMPTS)
+        context.log.warning.assert_called_once()
+        self.assertIn("not sent", context.log.warning.call_args.args[0])
 
 
 if __name__ == "__main__":

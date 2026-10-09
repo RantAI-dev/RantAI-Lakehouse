@@ -27,6 +27,15 @@
 //! 4. Record the run on the connector (`connectors::record_run_result`) and
 //!    deliver through `lakehouse_alerts::evaluate_connector_event`.
 //!
+//! Retries, stated once (`SRC-7` review SHOULD-FIX 4). Dagster's run status
+//! sensor moves past a run whether its function raised or returned, so
+//! nothing asks again after the tick. The sensor posts up to three times
+//! inside the tick (connection error, timeout or 5xx only; never 4xx,
+//! `pipeline_events.py`). So: a 5xx from here may be retried within about
+//! ten seconds; one report per run is all there is; and if this API is
+//! unreachable for that whole window the alert for that run is not sent and
+//! the connector's health catches up at its next run.
+//!
 //! A cancelled run is neither a failure nor a success and leaves the
 //! connector row alone: the orchestrator's `run_failure_sensor` fires on
 //! `FAILURE` only and the success sensor on `SUCCESS` only, so a cancelled
@@ -345,13 +354,19 @@ pub(super) async fn connector_run_event(
 ///
 /// The upload is settled through the same path a reader uses
 /// (`routes::uploads::Settler`), so its failure reason is one of the API's
-/// fixed texts. The dedupe row is written only after the upload is `failed`:
-/// if the orchestrator or `ClickHouse` could not be asked, the upload stays
-/// `ingesting`, nothing is recorded, and the sensor's retry tries again.
+/// fixed texts. The dedupe row is written only after the upload is `failed`.
+/// If the orchestrator or `ClickHouse` could not be asked, the upload stays
+/// `ingesting`, nothing is recorded, and the answer is a 503 with fixed text
+/// (`SRC-7` review SHOULD-FIX 4): the sensor retries a 5xx a few times inside
+/// its tick (`pipeline_events.py`, `_post_event`). That is the whole retry:
+/// Dagster's run sensor does not ask again after the tick, so an upload
+/// still unsettled when the attempts end is not alerted here, and stays
+/// `ingesting` until somebody opens it.
 ///
 /// # Errors
 ///
-/// As [`connector_run_event`].
+/// As [`connector_run_event`]; 503 when the upload could not be settled as
+/// failed yet.
 pub(super) async fn upload_run_failed(
     state: &AppState,
     pool: &PgPool,
@@ -363,7 +378,11 @@ pub(super) async fn upload_run_failed(
     confirm_status(state, &req.run_id, Outcome::Failure).await?;
     let settled = upload_routes::settle_loading_upload(state, pool, row).await;
     if settled.status != "failed" {
-        return Ok(skipped("the upload is not settled as failed; retry later"));
+        // A 5xx, not `{"matched": 0}` with 200: the sensor retries a 5xx
+        // inside its tick and takes a 200 as final.
+        return Err(ApiError::Unavailable(
+            "the upload could not be settled as failed yet".to_owned(),
+        ));
     }
     let first_seen = pipelines::record_pipeline_run_event(
         pool,
