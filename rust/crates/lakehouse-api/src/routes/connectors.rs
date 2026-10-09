@@ -3216,7 +3216,7 @@ pub async fn ingest_run(
 
 /// The one Dagster job every connector's ingest runs as
 /// (`dagster/dispar_orchestrate/ingest_factory.py`).
-const INGEST_JOB: &str = "ingest_job";
+pub(super) const INGEST_JOB: &str = "ingest_job";
 
 /// How many of `ingest_job`'s most recent runs, across every connector,
 /// are searched for one connector's runs.

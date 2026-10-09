@@ -27,6 +27,7 @@ mod identity;
 mod knowledge;
 mod lakehouse;
 mod lineage;
+mod load_alerts;
 mod notifications;
 mod ops;
 mod overview;
