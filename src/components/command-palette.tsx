@@ -11,7 +11,7 @@ import {
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
 import { assetService } from "@/services";
 import type { Asset } from "@/services/contracts/assets";
-import { capPaletteAssetResults } from "@/lib/palette-search";
+import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -42,6 +42,9 @@ export function CommandPalette() {
   const [recents, setRecents] = React.useState<Recent[]>([]);
   const [search, setSearch] = React.useState("");
   const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
+  // A failed search is said out loud (principle 2); an empty list would
+  // read as "nothing matches".
+  const [searchFailed, setSearchFailed] = React.useState(false);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -52,12 +55,14 @@ export function CommandPalette() {
   // Debounced 250ms and abortable on every keystroke so a slow
   // response for an earlier term can never clobber a later one's result —
   // `cancelled` guards state updates from a request whose signal already
-  // aborted or whose debounce timer never fired. A failed request shows no
-  // results rather than a spinner that never resolves.
+  // aborted or whose debounce timer never fired. A failed request shows
+  // "Catalog search is unavailable", not a spinner that never resolves and
+  // not an empty list (DATA-11 T2).
   React.useEffect(() => {
     const term = search.trim();
     if (!term) {
       setAssetResults([]);
+      setSearchFailed(false);
       return;
     }
     let cancelled = false;
@@ -65,8 +70,16 @@ export function CommandPalette() {
     const timer = setTimeout(() => {
       assetService
         .listAssets({ search: term }, controller.signal)
-        .then((assets) => { if (!cancelled) setAssetResults(capPaletteAssetResults(assets)); })
-        .catch(() => { if (!cancelled) setAssetResults([]); });
+        .then((assets) => {
+          if (cancelled) return;
+          setSearchFailed(false);
+          setAssetResults(capPaletteAssetResults(assets));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setAssetResults([]);
+          setSearchFailed(true);
+        });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
       cancelled = true;
@@ -132,9 +145,18 @@ export function CommandPalette() {
       </div>
 
       <Command.List className="max-h-[54vh] overflow-y-auto p-1.5">
-        <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
-          No results.
-        </Command.Empty>
+        {/* Not while the server has results: they are force-mounted, so
+            cmdk's own count would say "No results." under them. */}
+        {assetResults.length === 0 ? (
+          <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
+            No results.
+          </Command.Empty>
+        ) : null}
+        {searchFailed ? (
+          <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
+            Catalog search is unavailable
+          </div>
+        ) : null}
 
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
@@ -166,18 +188,30 @@ export function CommandPalette() {
           </Command.Group>
         ) : null}
 
-        {/* Catalog assets — server-side search, WS2 §13 */}
+        {/* Catalog assets — server-side search, WS2 §13. forceMount: the
+            server already decided these match (by description, tag or
+            column, which are not in the item's value), so cmdk's own
+            filter must not hide them (DATA-11 F6). */}
         {assetResults.length ? (
-          <Command.Group heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+          <Command.Group forceMount heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
             {assetResults.map((a) => (
               <PaletteItem
                 key={a.id}
+                forceMount
                 icon={Database}
                 label={a.name}
+                detail={matchedOnLabel(a.matchedOn)}
                 value={`asset ${a.id} ${a.name}`}
                 onSelect={() => go(`/data/assets/${a.id}`)}
               />
             ))}
+            <PaletteItem
+              forceMount
+              icon={Search}
+              label="See all results"
+              value={`see all results ${search.trim()}`}
+              onSelect={() => go(`/data?search=${encodeURIComponent(search.trim())}`)}
+            />
           </Command.Group>
         ) : null}
 
@@ -199,21 +233,28 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, value, onSelect,
+  icon: Icon, label, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
+  /** A second, smaller line under the label. */
+  detail?: string | null;
   value: string;
+  forceMount?: boolean;
   onSelect: () => void;
 }) {
   return (
     <Command.Item
       value={value}
+      forceMount={forceMount}
       onSelect={onSelect}
       className="flex cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-sm text-foreground data-[selected=true]:bg-accent data-[selected=true]:text-accent-foreground"
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
-      <span className="flex-1 truncate">{label}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{label}</span>
+        {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
+      </span>
     </Command.Item>
   );
 }
