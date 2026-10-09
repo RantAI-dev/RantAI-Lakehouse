@@ -24,7 +24,6 @@
 
 use lakehouse_alerts::AlertRuleInput;
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::ChClient;
 use lakehouse_notify::EmailSender;
 use serde_json::{Map, Value, json};
 
@@ -101,12 +100,21 @@ pub(super) async fn update_alert_rule(
     }
 }
 
-pub(super) async fn delete_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn delete_alert_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    match lakehouse_alerts::delete_rule(ch, &id).await {
+    // `SRC-7` review BLOCKER 2: as `DELETE /api/alerts`; the copilot would
+    // otherwise delete another tenant's connector rule.
+    if let Err(err) = crate::routes::alerts::authorise_existing_rule(state, principal, &id).await {
+        return json!({ "error": err.to_string() });
+    }
+    match lakehouse_alerts::delete_rule(&state.clickhouse, &id).await {
         Ok(()) => json!({ "ok": true }),
         Err(err) => json!({ "error": err.to_string() }),
     }
@@ -174,7 +182,6 @@ mod tests {
 
     #[tokio::test]
     async fn update_delete_and_run_require_id() {
-        let ch = &state().clickhouse;
         // SRC-7 task 6: `update_alert_rule` takes the state and the caller's
         // principal now (the same scope check as the HTTP route); the
         // assertion is unchanged.
@@ -182,8 +189,11 @@ mod tests {
             update_alert_rule(&state(), None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
+        // `SRC-7` review BLOCKER 2: `delete_alert_rule` takes the state and
+        // the principal for the same check as the route; expected value
+        // unchanged.
         assert_eq!(
-            delete_alert_rule(ch, &Map::new()).await,
+            delete_alert_rule(&state(), None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
         let s = state();

@@ -219,13 +219,32 @@ pub(crate) async fn authorise_rule_update(
         input.connector.as_deref(),
     )
     .await?;
+    authorise_existing_rule(state, principal, id).await
+}
+
+/// The check on a stored rule that an update or a delete acts on (`SRC-7`
+/// D7; review BLOCKER 2 for delete): a rule of the six kinds must be one the
+/// caller could have created, [`authorise_rule_scope`] on what is stored. An
+/// unrestricted caller may touch any, so the rule is not even read for them;
+/// an unknown id passes (the write is then a no-op or a validation error, as
+/// before).
+///
+/// # Errors
+///
+/// As [`authorise_rule_scope`]; 503 with a fixed message when the stored
+/// rule cannot be read.
+pub(crate) async fn authorise_existing_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
     if principal.is_some_and(crate::routes::catalog::is_unrestricted) {
         return Ok(());
     }
     let existing = lakehouse_alerts::get_rule(&state.clickhouse, id)
         .await
         .map_err(|err| {
-            tracing::warn!(%err, "an alert rule could not be read before an update");
+            tracing::warn!(%err, "an alert rule could not be read before a change");
             ApiError::Unavailable("the alert rules could not be read".to_owned())
         })?;
     match existing {
@@ -306,18 +325,26 @@ pub struct DeleteQuery {
 
 /// `DELETE /api/alerts?id=` — soft-delete a rule.
 ///
+/// A rule of the `SRC-7` kinds is deleted only by a caller who could have
+/// saved it ([`authorise_existing_rule`]); otherwise any `alert:write`
+/// holder could silence another tenant's failure alerts (`SRC-7` review
+/// BLOCKER 2). Other kinds, and an unknown id, behave as before.
+///
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] when `id` is missing, or a 500
 /// [`ApiError::Internal`] on a `ClickHouse` failure — matching the
-/// `TypeScript`'s pre-`try` `id` check (400) vs. its `catch` (500).
+/// `TypeScript`'s pre-`try` `id` check (400) vs. its `catch` (500). For the
+/// `SRC-7` kinds, a 401, 403 or 404 from [`authorise_existing_rule`].
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<DeleteQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = query.id else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
+    authorise_existing_rule(&state, principal.as_ref().map(|Extension(p)| p), &id).await?;
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -2027,6 +2054,19 @@ mod rule_scope_authorisation {
             .map_err(|rejection| rejection.0)
     }
 
+    async fn deleted_as(state: &AppState, principal: Option<Principal>) -> Result<(), ApiError> {
+        delete(
+            State(state.clone()),
+            principal.map(Extension),
+            Query(DeleteQuery {
+                id: Some("al_x".to_owned()),
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
     /// `SRC-7` review BLOCKER 1: the list shows a non-administrator only the
     /// connector rules of their tenants.
     #[sqlx::test(migrations = "../../migrations")]
@@ -2069,6 +2109,41 @@ mod rule_scope_authorisation {
         }
         let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
         assert_eq!(listed_as(&state, None).await.unwrap_err().status(), 401);
+    }
+
+    /// `SRC-7` review BLOCKER 2: a delete needs the check an update applies to
+    /// the stored rule, with the same answer for another tenant's connector
+    /// as for an unknown one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_applies_the_scope_check_to_the_stored_rule(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        deleted_as(&state, Some(engineer())).await.unwrap();
+
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let other = deleted_as(&state, Some(engineer())).await.unwrap_err();
+        let (state, _ch) = setup(&pool, ("connector_failure", "conn-gone")).await;
+        let unknown = deleted_as(&state, Some(engineer())).await.unwrap_err();
+        assert_eq!(other.status(), 404);
+        assert_eq!(unknown.status(), 404);
+        assert_eq!(
+            other.to_string().replace(OTHER_CONNECTOR, "X"),
+            unknown.to_string().replace("conn-gone", "X")
+        );
+
+        for existing in [("connector_failure", "*"), ("upload_failure", "*")] {
+            let (state, _ch) = setup(&pool, existing).await;
+            assert_eq!(
+                deleted_as(&state, Some(engineer()))
+                    .await
+                    .unwrap_err()
+                    .status(),
+                403
+            );
+            deleted_as(&state, Some(admin())).await.unwrap();
+        }
+        // Other kinds delete as before.
+        let (state, _ch) = setup(&pool, ("pipeline_failure", "")).await;
+        deleted_as(&state, Some(engineer())).await.unwrap();
     }
 }
 
