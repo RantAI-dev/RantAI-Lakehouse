@@ -78,6 +78,16 @@ services:
     restart: unless-stopped
 
   lakehouse-api:
+    # CI-SPEED-PLAN §4.2: a name for the image, so the `images` job in
+    # .github/workflows/ci.yml can build it ONCE per run, hand it to the
+    # acceptance jobs as a workflow artifact, and let them start the stack
+    # with `up -d --no-build`. CI sets LAKEHOUSE_API_IMAGE to
+    # `rantai-lakehouse-api:ci`; the default is what a local
+    # `docker compose up --build` builds and tags, so local use is unchanged
+    # apart from the image having a stable name instead of
+    # `<project>-lakehouse-api`. The `build:` block below stays: without
+    # `--no-build`, compose still builds this image from source.
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
     build:
       context: ./rust
       dockerfile: Dockerfile
@@ -1671,6 +1681,17 @@ services:
   # Lakekeeper catalog, the RustFS/SeaweedFS S3 endpoint, and ClickHouse.
   dagster-code-location:
     profiles: ["dagster"]
+    # One image for every service built from `./dagster` (this one,
+    # `dagster-webserver`, `dagster-daemon`, `backup-job`, `g6-test-runner`):
+    # they already shared a Dockerfile and build args, so they were the same
+    # image built up to five times. CI-SPEED-PLAN §4.2: the `images` job in
+    # .github/workflows/ci.yml builds it once and sets LAKEHOUSE_DAGSTER_IMAGE
+    # to `rantai-lakehouse-dagster:ci`; the default is what a local
+    # `up --build` tags. All five `build:` blocks MUST stay identical (same
+    # `args:`): with one shared name, a build of any of them retags the image
+    # for all of them, so a block without `GIT_SHA` would bake `unknown`
+    # into the image the code location runs (see the `GIT_SHA` comment below).
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -1922,9 +1943,18 @@ services:
   # an automatic in-process Dagster schedule.
   backup-job:
     profiles: ["backups"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` as `dagster-code-location`'s build: all five
+      # services built from `./dagster` share one image name, so this block
+      # must not differ from the others (see the `image:` comment on
+      # `dagster-code-location`).
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       postgres:
         condition: service_healthy
@@ -1950,6 +1980,9 @@ services:
   # the host.
   dagster-webserver:
     profiles: ["dagster"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -1988,6 +2021,9 @@ services:
   # change again in P4.
   dagster-daemon:
     profiles: ["dagster"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -3073,9 +3109,18 @@ services:
   # so this test runner needs no separate driver install of its own.
   g6-test-runner:
     profiles: ["g6"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` as `dagster-code-location`'s build: all five
+      # services built from `./dagster` share one image name, so this block
+      # must not differ from the others (see the `image:` comment on
+      # `dagster-code-location`).
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     working_dir: /work
     volumes:
       - ./ops/g6:/work

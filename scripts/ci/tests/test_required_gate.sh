@@ -39,7 +39,8 @@ expect() {
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
-          G4_CDC_RESULT G6_INGEST_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT
+          G4_CDC_RESULT G6_INGEST_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT \
+          IMAGES_RESULT IMAGE_SMOKE_RESULT
     export "$@"
     bash "$SCRIPT" >/dev/null 2>&1
   ) || got=$?
@@ -62,6 +63,7 @@ base_docs_green=(
   DAGSTER_TESTS_RESULT=skipped G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped
   G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped
   G6_INGEST_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
 )
 
 base_frontend_green=(
@@ -72,6 +74,7 @@ base_frontend_green=(
   G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
   G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G6_INGEST_RESULT=skipped
   GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
 )
 
 base_rust_green=(
@@ -82,6 +85,7 @@ base_rust_green=(
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
 base_dagster_green=(
@@ -92,6 +96,7 @@ base_dagster_green=(
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
 base_stack_green=(
@@ -102,6 +107,7 @@ base_stack_green=(
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
 base_all_green=(
@@ -112,6 +118,7 @@ base_all_green=(
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
 base_push_green=(
@@ -122,6 +129,7 @@ base_push_green=(
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
 # 1. Happy path cases
@@ -152,6 +160,27 @@ expect 1 "Skipped dagster unit test blocks dagster PR" "${base_dagster_green[@]}
 expect 1 "Failing acceptance blocks stack PR" "${base_stack_green[@]}" G4_CDC_RESULT=failure
 expect 1 "Cancelled job blocks gate" "${base_rust_green[@]}" RUST_TEST_RESULT=cancelled
 expect 1 "Skipped job on push blocks gate" "${base_push_green[@]}" RUST_TEST_RESULT=skipped
+expect 1 "Failing images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=failure
+expect 1 "Cancelled images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=cancelled
+expect 1 "Skipped images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=skipped
+expect 1 "Failing image smoke test blocks rust PR" "${base_rust_green[@]}" IMAGE_SMOKE_RESULT=failure
+expect 1 "Skipped image smoke test blocks rust PR" "${base_rust_green[@]}" IMAGE_SMOKE_RESULT=skipped
+expect 1 "Failing images job blocks dagster PR" "${base_dagster_green[@]}" IMAGES_RESULT=failure
+expect 1 "Failing images job blocks stack PR" "${base_stack_green[@]}" IMAGES_RESULT=failure
+expect 1 "Skipped image smoke test blocks push" "${base_push_green[@]}" IMAGE_SMOKE_RESULT=skipped
+# A failed `images` job makes every job that `needs: images` report
+# `skipped`, not `failure`. The gate must still be red: both `images` itself
+# and each skipped consumer are errors for a PR that required them.
+expect 1 "Failed images job with every consumer skipped blocks rust PR" "${base_rust_green[@]}" \
+  IMAGES_RESULT=failure IMAGE_SMOKE_RESULT=skipped G3A_DAGSTER_RESULT=skipped \
+  G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G6_INGEST_RESULT=skipped \
+  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+# The consumers alone are enough to turn the gate red, even if `images`
+# itself were (wrongly) reported as success.
+expect 1 "Skipped consumers alone block rust PR even when images reports success" "${base_rust_green[@]}" \
+  G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped \
+  G6_INGEST_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+expect 0 "Images and smoke skipped is fine for a docs-only PR" "${base_docs_green[@]}"
 
 # 3. Workflow & Gate structure consistency checks (SHOULD-FIX 6)
 CI_YML="${SCRIPT_DIR}/../../../.github/workflows/ci.yml"

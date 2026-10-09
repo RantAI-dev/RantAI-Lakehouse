@@ -1,23 +1,22 @@
 name: Docker
 
+# Tag pushes only. On pushes to `main` and on pull requests the API image is
+# built, smoke-tested and shared by `ci.yml` (`images` and `image-smoke`
+# jobs, CI-SPEED-PLAN §4.2), so building it here as well was a second,
+# 12-minute copy of the same release build on every PR. What is left is the
+# one thing `ci.yml` does not do: check that a release tag still builds, and
+# hold the (inert) GHCR job below.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-    # `lakehouse/**` as well as main: the lakehouse foundation work ships as a
-    # stack of PRs that target each other rather than main, so a `[main]`-only
-    # filter means every PR above the first gets ZERO check runs and merges
-    # unverified.
-    branches: [main, 'lakehouse/**']
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-smoke-test:
-    name: Build lakehouse-api image · smoke test /health
+  build-image:
+    name: Build lakehouse-api image (tags only)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -27,6 +26,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # Same build arguments and contexts as `ci.yml`'s `images` job, so the
+      # `api-image` layer cache that job writes from `main` is a hit here;
+      # a different `CARGO_TARGET_DIR` would be a different layer and a cold
+      # 10-minute build. This workflow only READS that cache: a tag build
+      # writing its own would add to the repository's Actions cache, which
+      # is at its 10 GB cap (docs/CI.md, "Caches").
+      #
+      # `cacheonly` because nothing here consumes the image: the build is the
+      # check. The `/health` smoke test it used to run now lives in `ci.yml`
+      # (`image-smoke`), which runs it on every push to `main`.
       - name: Build image
         uses: docker/build-push-action@v7
         with:
@@ -38,50 +47,11 @@ jobs:
           # image on Docker Hub and the build fails.
           build-contexts: |
             pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
           push: false
-          load: true
-          tags: lakehouse-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # No DATABASE_URL: the entrypoint skips migrations when it's unset,
-      # and lakehouse-api is designed to boot and serve its
-      # Postgres/ClickHouse-independent routes (including /health) even
-      # without either dependency running — see entrypoint.api.sh and
-      # lakehouse_store::connect_lazy's doc comment. This intentionally
-      # smoke-tests the container's own boot path, not the full
-      # docker-compose stack.
-      - name: Run container
-        run: |
-          docker run -d --name lakehouse-api -p 8080:8080 lakehouse-api:ci
-          for i in $(seq 1 30); do
-            if docker inspect -f '{{.State.Running}}' lakehouse-api 2>/dev/null | grep -q true; then
-              break
-            fi
-            sleep 1
-          done
-
-      - name: Wait for /health and assert 200
-        run: |
-          for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/health || echo "000")
-            if [ "$code" = "200" ]; then
-              echo "got 200 from /health"
-              exit 0
-            fi
-            echo "attempt $i: got $code, retrying..."
-            sleep 2
-          done
-          echo "::error::/health never returned 200"
-          exit 1
-
-      - name: Container logs (always, for debugging)
-        if: always()
-        run: docker logs lakehouse-api || true
-
-      - name: Stop container
-        if: always()
-        run: docker rm -f lakehouse-api || true
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=api-image
 
   # Not run today: gated on tags only, and inert even then — no registry
   # credentials are configured, so a tag push would fail loudly at
@@ -91,7 +61,7 @@ jobs:
   push-ghcr:
     name: Push to GHCR (tags only — currently inert)
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build-and-smoke-test
+    needs: build-image
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

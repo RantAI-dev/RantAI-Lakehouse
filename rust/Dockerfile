@@ -11,7 +11,16 @@
 # lockfile, this pins the exact toolchain the workspace already commits to
 # in `rust-toolchain.toml` (`channel = "1.96.1"`), so the Docker build and
 # local dev/CI builds are guaranteed to use the same compiler.
-FROM rust:1.96.1-slim AS builder
+#
+# Three build stages share one tools base, so the two `cargo install`s below
+# are compiled once and stay above every `COPY` of repo files (their layer
+# changes only when a pin here changes):
+#
+#   tools    apt packages, `sqlx-cli`, `cargo-chef`
+#   planner  copies the manifests + sources, writes `recipe.json`
+#   builder  compiles the dependencies from `recipe.json` alone (`cook`),
+#            then copies the sources and compiles the workspace
+FROM rust:1.96.1-slim AS tools
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 # `sqlx-cli`, pinned to the same version as the workspace's `sqlx`
@@ -20,12 +29,53 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 # `main.rs`), so this is belt-and-suspenders: whichever runs first wins,
 # `sqlx migrate run` is idempotent, and neither path is fatal on failure.
 #
-# Installed BEFORE the sources are copied in: it depends on nothing in this
-# repo, so its layer stays cached across code changes instead of being
-# recompiled from scratch after every edit.
+# `cargo-chef` (exact pin, `--locked`; CI-SPEED-PLAN §4.2) is what makes the
+# ~500 dependency crates a layer of their own: `prepare` reduces the
+# workspace to a `recipe.json` that changes only when `Cargo.lock` or a
+# `Cargo.toml` changes, and `cook` compiles exactly that. No `latest` tag and
+# no third-party base image: it is built from source here, like `sqlx-cli`.
+#
+# Both are installed BEFORE any repo file is copied in: they depend on
+# nothing in this repo, so their layer stays cached across code changes
+# instead of being recompiled from scratch after every edit.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
+    cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked \
+    && cargo install cargo-chef --version 0.1.78 --locked
+
+FROM tools AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# `recipe.json` holds the manifests and the lockfile, not the sources, so a
+# source-only change re-runs this (cheap) step and produces a byte-identical
+# recipe: the `cook` layer below stays a cache hit.
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM tools AS builder
+# Where cargo writes `target/`. The default is the cache mount below, exactly
+# as before this stage was split: a local `docker compose up --build` keeps
+# its compiled dependencies in the mount between builds, so a one-line source
+# change recompiles only the crates that changed, which is what makes a local
+# rebuild fast.
+#
+# A cache mount is not part of the image and is NOT restored by the GitHub
+# Actions layer cache, so with the default the `cook` step below would be
+# recompiled from scratch on every CI run. CI passes
+# `CARGO_TARGET_DIR=/build/target-layer` instead: that path is outside every
+# mount, so `cook`'s output lands in the image layer, and `cache-from:
+# type=gha` can restore it (.github/workflows/ci.yml, `images` job). The mount
+# stays at the fixed path `/build/target` on both steps either way; with the
+# CI value it is simply unused.
+ARG CARGO_TARGET_DIR=/build/target
+ENV CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+COPY --from=planner /build/recipe.json recipe.json
+# Dependencies only, `-p lakehouse-api` and the same `--release --locked` as
+# the build below so cargo reuses every artifact (a different package set or
+# profile would change feature unification and recompile them).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo chef cook --release --locked -p lakehouse-api --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # `sqlx::migrate!("../../migrations")` (lakehouse-store/src/lib.rs) embeds
@@ -33,18 +83,16 @@ COPY crates ./crates
 # must exist in the build context before `cargo build` runs, or the build
 # fails outright.
 COPY migrations ./migrations
-# Any source change invalidates this layer, so without the cache mounts
-# every rebuild compiled all ~600 dependencies again in release mode. The
-# mounts keep the crate registry and `target/` between local builds, so a
-# rebuild recompiles only the crates that changed. `target/` is a cache,
-# not part of the image, hence the binary is copied out in the same step.
-# (CI's GHA layer cache does not persist cache mounts; there it behaves as
-# before.)
+# Any source change invalidates this layer, but not `cook` above, so only the
+# workspace's own crates are compiled here. The mounts keep the crate registry
+# and (with the default `CARGO_TARGET_DIR`) `target/` between local builds.
+# `target/` is a cache, not part of the image, hence the binary is copied out
+# in the same step.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p lakehouse-api \
-    && cp target/release/lakehouse-api /usr/local/bin/lakehouse-api
+    && cp "$CARGO_TARGET_DIR/release/lakehouse-api" /usr/local/bin/lakehouse-api
 
 # `debian:trixie-slim`, not `bookworm-slim`: `rust:1.96.1-slim` builds on
 # Debian 13 (trixie), whose glibc is newer than bookworm's. A bookworm
