@@ -27,10 +27,13 @@
 //! # Type classification (D3)
 //!
 //! One table of widenings, in [`classify_type`]: a larger integer, a float
-//! to a double, a longer text, more decimal digits, anything to unbounded
-//! text. The reverse of each is narrowed. Everything else that differs is
+//! to a double, a longer text or text to unbounded text (text to text
+//! only). The reverse of each is narrowed. Everything else that differs is
 //! [`TypeChange::Other`] and counts as breaking: an unknown change is
-//! never assumed safe (fail closed).
+//! never assumed safe (fail closed). `SRC-8 review BLOCKER 1`: a non-text
+//! type becoming text and any change to a decimal's precision or scale are
+//! `Other`, because the load of such a change fails for a SQL source
+//! (`docs/plans/SRC-8-RESULT.md`).
 
 use crate::schema_change::{
     AcceptedSchema, ChangeKind, ChangeStatus, NewChange, ObservedColumn, SchemaChangePolicy,
@@ -448,20 +451,24 @@ fn canonical_text_base(base: &str) -> String {
 
 /// How `before` became `after`; `None` when the type did not change.
 ///
-/// The ONE table of widenings (D3), read top to bottom:
+/// The ONE table of widenings (D3), read top to bottom. `SRC-8 review
+/// BLOCKER 1`: `docs/plans/SRC-8-RESULT.md` measured that the load of an
+/// integer column that became text FAILS for a SQL source (Iceberg refuses
+/// `long -> string`) and keeps failing, so only changes the existing column
+/// can hold are widenings:
 ///
 /// | before | after | result |
 /// | --- | --- | --- |
 /// | integer family | a larger one (`tinyint` < `smallint` < `mediumint` < `int` < `bigint`) | widened |
 /// | `real`/`float4` | `double precision`/`float8`/`double` | widened |
-/// | `varchar(n)`/`char(n)`/`nvarchar(n)` | a larger `n`, or unbounded text | widened |
-/// | `numeric(p,s)`/`decimal(p,s)` | `p'` >= `p` and `s'` >= `s`, one larger; or unconstrained | widened |
-/// | anything | unbounded text (`text`, `varchar`, `(max)`) | widened |
+/// | `varchar(n)`/`char(n)`/`nvarchar(n)`/`nchar(n)` | a larger `n`, or unbounded text (text to text only) | widened |
 ///
-/// The reverse of a row is narrowed; every other difference is other.
+/// The reverse of a row is narrowed; every other difference is other
+/// (breaking), a decimal's precision or scale and any type that becomes
+/// text included.
 #[must_use]
 pub fn classify_type(before: &str, after: &str) -> Option<TypeChange> {
-    use Parsed::{BoundedText, Float, Integer, Numeric, UnboundedText};
+    use Parsed::{BoundedText, Float, Integer, UnboundedText};
     let (old, new) = (parse_type(before), parse_type(after));
     if old == new {
         return None;
@@ -479,18 +486,10 @@ pub fn classify_type(before: &str, after: &str) -> Option<TypeChange> {
                 std::cmp::Ordering::Equal => TypeChange::Other,
             }
         }
-        (
-            Numeric {
-                precision: p1,
-                scale: s1,
-            },
-            Numeric {
-                precision: p2,
-                scale: s2,
-            },
-        ) => classify_numeric((*p1, *s1), (*p2, *s2)),
-        (_, UnboundedText) => TypeChange::Widened,
-        (UnboundedText, _) => TypeChange::Narrowed,
+        // `SRC-8 review BLOCKER 1`: no rule for decimals; any change of
+        // precision or scale falls to `Other` below.
+        (BoundedText { .. }, UnboundedText) => TypeChange::Widened,
+        (UnboundedText, BoundedText { .. }) => TypeChange::Narrowed,
         _ => TypeChange::Other,
     })
 }
@@ -500,28 +499,6 @@ fn ordered(old: u8, new: u8) -> Option<TypeChange> {
         std::cmp::Ordering::Less => Some(TypeChange::Widened),
         std::cmp::Ordering::Greater => Some(TypeChange::Narrowed),
         std::cmp::Ordering::Equal => None,
-    }
-}
-
-fn classify_numeric(
-    old: (Option<u32>, Option<u32>),
-    new: (Option<u32>, Option<u32>),
-) -> TypeChange {
-    match (old.0, new.0) {
-        // Unconstrained holds any constrained value.
-        (Some(_), None) => TypeChange::Widened,
-        (None, Some(_)) => TypeChange::Narrowed,
-        (None, None) => TypeChange::Other,
-        (Some(p1), Some(p2)) => {
-            let (s1, s2) = (old.1.unwrap_or(0), new.1.unwrap_or(0));
-            if p2 >= p1 && s2 >= s1 && (p2 > p1 || s2 > s1) {
-                TypeChange::Widened
-            } else if p2 <= p1 && s2 <= s1 && (p2 < p1 || s2 < s1) {
-                TypeChange::Narrowed
-            } else {
-                TypeChange::Other
-            }
-        }
     }
 }
 
@@ -709,30 +686,44 @@ mod tests {
         );
     }
 
+    /// `SRC-8 review BLOCKER 1`: replaces `more_decimal_digits_widen` and
+    /// `decimal_digits_moving_in_opposite_directions_are_other`. Any change
+    /// of a decimal's precision or scale is breaking; the same type in
+    /// another spelling is still no change.
     #[test]
-    fn more_decimal_digits_widen() {
-        widened("numeric(10,2)", "numeric(12,2)");
-        widened("decimal(10,2)", "decimal(10,4)");
-        widened("numeric(10,2)", "numeric(12,4)");
-        widened("numeric(10)", "numeric(12)");
-        widened("numeric(10,2)", "numeric");
+    fn any_change_to_a_decimals_precision_or_scale_is_other() {
+        for (a, b) in [
+            ("numeric(10,2)", "numeric(12,2)"),
+            ("numeric(12,2)", "numeric(10,2)"),
+            ("numeric(10,2)", "numeric(10,4)"),
+            ("decimal(10,2)", "decimal(10,4)"),
+            ("numeric(10)", "numeric(12)"),
+            ("numeric(10,2)", "numeric"),
+            ("numeric(10,4)", "numeric(12,2)"),
+        ] {
+            assert_eq!(classify_type(a, b), Some(TypeChange::Other), "{a} -> {b}");
+        }
         assert_eq!(classify_type("numeric(10, 2)", "decimal(10,2)"), None);
     }
 
+    /// `SRC-8 review BLOCKER 1`: replaces
+    /// `anything_widens_to_text_and_text_back_is_narrowed`. A non-text type
+    /// becoming text, and text becoming a non-text type, cannot be loaded
+    /// into the existing column.
     #[test]
-    fn decimal_digits_moving_in_opposite_directions_are_other() {
-        assert_eq!(
-            classify_type("numeric(10,4)", "numeric(12,2)"),
-            Some(TypeChange::Other)
-        );
-    }
-
-    #[test]
-    fn anything_widens_to_text_and_text_back_is_narrowed() {
-        widened("integer", "text");
-        widened("timestamp", "text");
-        widened("numeric(10,2)", "varchar");
-        widened("boolean", "longtext");
+    fn a_non_text_type_becoming_text_is_other_and_so_is_text_becoming_a_number() {
+        for (a, b) in [
+            ("integer", "text"),
+            ("text", "integer"),
+            ("integer", "varchar(20)"),
+            ("varchar(20)", "integer"),
+            ("timestamp", "text"),
+            ("numeric(10,2)", "varchar"),
+            ("boolean", "longtext"),
+            ("longtext", "boolean"),
+        ] {
+            assert_eq!(classify_type(a, b), Some(TypeChange::Other), "{a} -> {b}");
+        }
     }
 
     #[test]
