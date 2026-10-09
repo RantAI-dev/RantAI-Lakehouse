@@ -126,15 +126,23 @@ fn referenced(sql: &str) -> Option<Vec<String>> {
 /// (`bronze_pairs` are the `(slug, table_name)` rows of the registry), and
 /// a Silver or Gold asset is its own `silver.<name>` / `serving.<name>`
 /// id. `DATA-11` D4.
+///
+/// `DATA-11` review `SHOULD-FIX 2`: the asset page counts a dataset's
+/// queries under `bronze.<table>` and under the key of the table its page
+/// reads (`ReadSource::policy_key`), which is `silver.<table>` where the
+/// deployment has no Iceberg query database. `silver_fallback` is true then
+/// (`Config::iceberg_query_db` unset) and a dataset also owns
+/// `silver.<table>`, unless a listed asset has that id itself.
 pub(crate) fn use_keys(
     asset_ids: &[String],
     bronze_pairs: &[(String, String)],
+    silver_fallback: bool,
 ) -> HashMap<String, String> {
     let table_of: HashMap<&str, &str> = bronze_pairs
         .iter()
         .map(|(slug, table)| (slug.as_str(), table.as_str()))
         .collect();
-    asset_ids
+    let mut keys: HashMap<String, String> = asset_ids
         .iter()
         .filter_map(|id| match table_of.get(id.as_str()) {
             Some(table) if !table.is_empty() => Some((format!("bronze.{table}"), id.clone())),
@@ -143,7 +151,17 @@ pub(crate) fn use_keys(
             Some(_) | None => None,
         })
         .map(|(key, id)| (key.to_lowercase(), id))
-        .collect()
+        .collect();
+    if silver_fallback {
+        // Second pass, so a listed Silver asset keeps its own key.
+        for id in asset_ids {
+            if let Some(table) = table_of.get(id.as_str()).filter(|t| !t.is_empty()) {
+                keys.entry(format!("silver.{table}").to_lowercase())
+                    .or_insert_with(|| id.clone());
+            }
+        }
+    }
+    keys
 }
 
 /// How many of `sqls` read each asset, by asset id: a query that reads two
@@ -358,7 +376,14 @@ pub(crate) async fn use_by_asset(
         return HashMap::new();
     };
     match lakehouse_store::queries::history_recent(pg, USAGE_DAYS, USE_RANKING_ROWS).await {
-        Ok(sqls) => use_counts(&sqls, &use_keys(asset_ids, bronze_pairs)),
+        Ok(sqls) => use_counts(
+            &sqls,
+            &use_keys(
+                asset_ids,
+                bronze_pairs,
+                state.config.iceberg_query_db.is_none(),
+            ),
+        ),
         Err(err) => {
             tracing::warn!(
                 ?err,
@@ -1080,6 +1105,7 @@ mod tests {
                 "stray",
             ]),
             &pairs,
+            false,
         );
         assert_eq!(
             keys.get("bronze.commerce_orders").map(String::as_str),
@@ -1099,10 +1125,41 @@ mod tests {
     }
 
     #[test]
+    fn a_dataset_also_owns_its_silver_table_only_where_bronze_cannot_be_read() {
+        // DATA-11 review SHOULD-FIX 2.
+        let pairs = vec![
+            ("orders".to_owned(), "commerce_orders".to_owned()),
+            ("users".to_owned(), "app_users".to_owned()),
+        ];
+        let ids = id_list(&["orders", "users", "silver.app_users"]);
+        let with = use_keys(&ids, &pairs, true);
+        assert_eq!(
+            with.get("silver.commerce_orders").map(String::as_str),
+            Some("orders")
+        );
+        // A listed Silver asset keeps its own key.
+        assert_eq!(
+            with.get("silver.app_users").map(String::as_str),
+            Some("silver.app_users")
+        );
+        assert_eq!(
+            with.get("bronze.app_users").map(String::as_str),
+            Some("users")
+        );
+        let without = use_keys(&ids, &pairs, false);
+        assert!(!without.contains_key("silver.commerce_orders"));
+        assert_eq!(without.len(), 3);
+        // A query on the Silver table counts for the dataset.
+        let counts = use_counts(&id_list(&["SELECT * FROM silver.commerce_orders"]), &with);
+        assert_eq!(counts.get("orders"), Some(&1));
+    }
+
+    #[test]
     fn use_counts_counts_a_query_once_per_asset_it_reads() {
         let keys = use_keys(
             &id_list(&["orders", "silver.clean", "serving.mart_x"]),
             &[("orders".to_owned(), "commerce_orders".to_owned())],
+            false,
         );
         let sqls = id_list(&[
             "SELECT * FROM silver.clean",
@@ -1119,7 +1176,7 @@ mod tests {
 
     #[test]
     fn use_counts_ignores_sql_that_does_not_parse_and_tables_nobody_lists() {
-        let keys = use_keys(&id_list(&["silver.clean"]), &[]);
+        let keys = use_keys(&id_list(&["silver.clean"]), &[], false);
         let sqls = id_list(&["silver.clean, please", "SELECT * FROM silver.other"]);
         assert!(use_counts(&sqls, &keys).is_empty());
     }
