@@ -52,6 +52,7 @@ pub mod overview;
 pub mod pipelines;
 pub mod queries;
 pub mod schema_change;
+pub mod schema_diff;
 pub mod semantic;
 pub mod sessions;
 pub mod storage;
