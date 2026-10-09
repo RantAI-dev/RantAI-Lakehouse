@@ -196,3 +196,44 @@ describe("ConnectorsPage list", () => {
     expect(pushed).toEqual([])
   })
 })
+
+// SRC-7 task 9: run health from the run reports, not from a manual Test.
+describe("ConnectorsPage run health", () => {
+  function rowOf(name: string): HTMLElement {
+    return screen.getByRole("link", { name }).closest("tr") as HTMLElement
+  }
+
+  const failing = {
+    ...CONNECTORS[0],
+    health: "degraded",
+    lastRunSuccessAt: "2026-10-01T02:00:00Z",
+    lastRunFailureAt: "2026-10-02T02:00:00Z",
+    failureStreak: 2,
+  }
+  const recovered = {
+    ...CONNECTORS[1],
+    health: "healthy",
+    lastRunSuccessAt: "2026-10-03T02:00:00Z",
+    lastRunFailureAt: "2026-10-02T02:00:00Z",
+    failureStreak: 0,
+  }
+
+  it("shows the later of the last success and the last failure, and how many failed in a row", async () => {
+    stubFetch([failing, recovered])
+    renderPage()
+    await screen.findByRole("link", { name: "db demo" })
+    const bad = within(rowOf("db demo"))
+    expect(bad.getByText("Failed")).toBeDefined()
+    expect(bad.getByText("2 failed in a row")).toBeDefined()
+    const good = within(rowOf("events"))
+    expect(good.getByText("Succeeded")).toBeDefined()
+    expect(good.queryByText(/failed in a row/)).toBeNull()
+  })
+
+  it("says there are no runs yet when a connector has neither a success nor a failure", async () => {
+    stubFetch([CONNECTORS[0]])
+    renderPage()
+    await screen.findByRole("link", { name: "db demo" })
+    expect(within(rowOf("db demo")).getByText("No runs yet")).toBeDefined()
+  })
+})
