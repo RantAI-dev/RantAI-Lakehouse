@@ -492,6 +492,31 @@ Notes:
   `happy-dom` and a stubbed `fetch`.
 - The workspace-wide Rust block and the Python lines.
 
+### Review fix SHOULD-FIX 8, developer, 2026-10-09
+
+Commit `0b547ac` fix(api): show the reason from the first word the name does
+not explain. `search` (`R/catalog_search.rs`) keeps the first word, in typed
+order, whose best field is not the name as the source of `matchedOn`; none
+when every word's best field is the name. Module doc, `search` doc and the
+`matchedOn` comment in `src/services/contracts/assets.ts` updated (the
+feature page has no "first word" wording; grep of `docs/core` found none).
+`the_reason_comes_from_the_first_word` renamed to
+`..._the_name_does_not_explain` with a comment saying why; two tests added
+(`northwind customer` on `Northwind Orders` + column `customer_id`; on
+`Northwind Customers` no `matchedOn`).
+
+Commands run (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target`,
+`CARGO_BUILD_JOBS=2`, `df -h /` first: 46G free):
+
+- `touch rust/crates/*/src/lib.rs rust/crates/lakehouse-store/src/*.rs`, then
+  from `rust/`: `cargo fmt --check` clean; `cargo clippy -p lakehouse-api -p
+  lakehouse-store --all-targets -- -D warnings` finished, no warnings.
+- `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings (not in
+  touched files); `bun run test` 932 pass, 1 skip, 0 fail (933 tests, 102 files).
+
+Not verified: Rust tests (first run is CI's), including the two new ones and
+the renamed one.
+
 ## Review
 
 ### Rust slice (R1–R5), reviewed 2026-10-09 at `4b61231`
