@@ -292,6 +292,66 @@ def _classify_exception(exc: Exception) -> str:
     return f"{type(exc).__module__}.{type(exc).__name__}"
 
 
+# SQLSTATE a driver reports for a refused login (class 28, "invalid
+# authorization specification"); SQL Server's error 18456 carries it.
+_SQLSTATE_LOGIN_REFUSED = "28000"
+# `pymysql.constants.ER.ACCESS_DENIED_ERROR` / Oracle `ORA-01017`.
+_MYSQL_ACCESS_DENIED = 1045
+_ORACLE_LOGON_DENIED = "ORA-01017"
+# Bounded walk: SQLAlchemy's `.orig`, `raise ... from` and implicit contexts
+# are chains of a few links; the bound only guards against a cycle.
+_MAX_CAUSE_DEPTH = 8
+
+
+def _is_authentication_refusal(exc: BaseException) -> bool:
+    """Whether `exc`, or anything it wraps, is a database driver telling us
+    the source REFUSED THE CREDENTIAL (a wrong user or password).
+
+    That answer does not change between attempts, so retrying it only burns
+    `DEFAULT_RETRY_POLICY`'s two backed-off retries (a measured 2m23s run in
+    the G6 gate, PR #101 CI) before the same refusal and delays the failure
+    alert. Decided by the driver's exception TYPE and error CODE, never by
+    matching message text (which is localised, version-dependent and can
+    carry a host or user name):
+
+    - `pymysql` (mysql/mariadb): `OperationalError` with `args[0] == 1045`
+      (`ER_ACCESS_DENIED_ERROR`).
+    - `pyodbc` (mssql): any `pyodbc.Error` whose `args[0]` (the SQLSTATE) is
+      `28000`, what SQL Server's "Login failed" (18456) maps to.
+    - `oracledb` (oracle): a `DatabaseError` whose first argument is the
+      driver's error object with `full_code == "ORA-01017"`.
+
+    The drivers are recognised by their module so this file imports none of
+    them (`pyodbc` needs a system ODBC library to import at all).
+
+    NOT covered, deliberately: `psycopg2` (postgres). Checked against the
+    pinned `psycopg2` 2.9.10 with a refused login: `pgcode` and
+    `diag.sqlstate` are `None` for an error raised while connecting (libpq
+    gives no SQLSTATE there), so the only signal is the message text, which
+    this function will not read. A Postgres credential failure therefore
+    still retries until a verifiable signal exists.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    for _ in range(_MAX_CAUSE_DEPTH):
+        if not pending:
+            break
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        root = type(current).__module__.split(".")[0]
+        first = current.args[0] if current.args else None
+        if root == "pymysql" and first == _MYSQL_ACCESS_DENIED:
+            return True
+        if root == "pyodbc" and first == _SQLSTATE_LOGIN_REFUSED:
+            return True
+        if root == "oracledb" and getattr(first, "full_code", None) == _ORACLE_LOGON_DENIED:
+            return True
+        pending.extend([getattr(current, "orig", None), current.__cause__, current.__context__])
+    return False
+
+
 def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> dict[str, str]:
     """Resolve `connector["secretRef"]`/`connector["secretRefSecondary"]`
     through the allowlisted resolver ONLY -- never an env var name derived
@@ -1075,6 +1135,17 @@ PART D: a config-shaped failure retries with the same input and
     ) as exc:
         raise Failure(
             description=f"ingest of {obj.get('target')!r}: {exc}",
+            allow_retries=False,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless it is a refused credential
+        if not _is_authentication_refusal(exc):
+            raise
+        # PR #101 CI (G6 `g6-mysql-wrong-password`): the source said the
+        # credential is wrong. Retrying cannot change that answer, and the
+        # two retries turned a 10-second failure into a 2m23s one. Fixed
+        # text: nothing from the driver (it names user and client address).
+        raise Failure(
+            description=f"ingest of {obj.get('target')!r}: the source refused the connector's credential",
             allow_retries=False,
         ) from exc
     if isinstance(rows, int):

@@ -1671,6 +1671,111 @@ def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> Non
     assert refused.value.allow_retries is False
 
 
+# --- PR #101 CI: a refused credential is not a transient failure ---------
+
+
+def _driver_error(module: str, *args):
+    """An exception of a class that claims `module` as its home, like the
+    real driver's, without importing that driver (`pyodbc` cannot be
+    imported without a system ODBC library)."""
+    return type("OperationalError", (Exception,), {"__module__": module})(*args)
+
+
+def _wrapped_like_sqlalchemy(driver_error: Exception) -> Exception:
+    import sqlalchemy.exc
+
+    return sqlalchemy.exc.OperationalError("SELECT 1", {}, driver_error)
+
+
+def test_a_refused_credential_is_recognised_by_driver_error_code_for_mysql_sql_server_and_oracle() -> None:
+    import oracledb
+    import pymysql.err
+    from oracledb.errors import _Error
+
+    import dispar_orchestrate.ingest_factory as f
+
+    mysql = pymysql.err.OperationalError(1045, "Access denied for user 'u'@'h' (using password: YES)")
+    oracle = oracledb.DatabaseError(_Error(message="ORA-01017: logon denied", code=1017))
+    mssql = _driver_error("pyodbc", "28000", "[28000] Login failed for user 'u'. (18456)")
+
+    assert f._is_authentication_refusal(mysql)
+    assert f._is_authentication_refusal(_wrapped_like_sqlalchemy(mysql))  # SQLAlchemy's `.orig`
+    assert f._is_authentication_refusal(oracle)
+    assert f._is_authentication_refusal(mssql)
+    assert f._is_authentication_refusal(_wrapped_like_sqlalchemy(mssql))
+
+
+def test_a_refusal_wrapped_with_raise_from_is_still_found() -> None:
+    import pymysql.err
+
+    import dispar_orchestrate.ingest_factory as f
+
+    try:
+        try:
+            raise pymysql.err.OperationalError(1045, "x")
+        except Exception as inner:
+            raise RuntimeError("pipeline step failed") from inner
+    except RuntimeError as outer:
+        assert f._is_authentication_refusal(outer)
+
+
+def test_failures_that_are_not_a_refused_credential_are_not_recognised() -> None:
+    import oracledb
+    import pymysql.err
+    from oracledb.errors import _Error
+
+    import dispar_orchestrate.ingest_factory as f
+
+    # The same driver, other codes: unreachable host (2003), lock wait (1205),
+    # SQL Server timeout (HYT00), Oracle "invalid identifier" (ORA-00904).
+    assert not f._is_authentication_refusal(pymysql.err.OperationalError(2003, "Can't connect"))
+    assert not f._is_authentication_refusal(pymysql.err.OperationalError(1205, "Lock wait timeout"))
+    assert not f._is_authentication_refusal(_driver_error("pyodbc", "HYT00", "Login timeout expired"))
+    assert not f._is_authentication_refusal(
+        oracledb.DatabaseError(_Error(message="ORA-00904: invalid identifier", code=904))
+    )
+    # The code alone is not enough: another module's `1045` is not MySQL's.
+    assert not f._is_authentication_refusal(_driver_error("requests", 1045))
+    # The message is never read: text that looks like a refusal does not count.
+    assert not f._is_authentication_refusal(RuntimeError("Access denied for user 'u' (1045)"))
+    assert not f._is_authentication_refusal(ConnectionError("connection reset"))
+    # A cycle in the cause chain ends the walk.
+    cyclic = RuntimeError("a")
+    cyclic.__cause__ = cyclic
+    assert not f._is_authentication_refusal(cyclic)
+
+
+def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driver_errors(monkeypatch) -> None:
+    import pymysql.err
+    from dagster import Failure, build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    payload = {"connector": {"id": "c"}, "obj": {"name": "orders", "target": "orders"}}
+
+    def raises(exc):
+        def fake(_connector, _obj, run_id=None):
+            raise exc
+
+        return fake
+
+    denied = _wrapped_like_sqlalchemy(
+        pymysql.err.OperationalError(1045, "Access denied for user 'g6_reader'@'172.18.0.5'")
+    )
+    monkeypatch.setattr(f, "_run_one_object", raises(denied))
+    with pytest.raises(Failure) as refused:
+        f.ingest_source_object(build_op_context(), payload)
+    assert refused.value.allow_retries is False  # the policy must not retry it
+    assert refused.value.__cause__ is denied
+    # Nothing the driver said (user, client address) reaches the Failure.
+    assert "g6_reader" not in str(refused.value.description) and "172.18" not in str(refused.value.description)
+
+    unreachable = _wrapped_like_sqlalchemy(pymysql.err.OperationalError(2003, "Can't connect to MySQL server"))
+    monkeypatch.setattr(f, "_run_one_object", raises(unreachable))
+    with pytest.raises(type(unreachable)):  # propagates as it did: the retry policy handles it
+        f.ingest_source_object(build_op_context(), payload)
+
+
 def test_the_op_sends_its_dagster_run_id_with_the_observation(monkeypatch) -> None:
     from dagster import build_op_context
 
