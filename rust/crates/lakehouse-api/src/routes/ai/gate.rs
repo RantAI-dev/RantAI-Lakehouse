@@ -683,6 +683,28 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:write"));
     }
 
+    /// SEC-22 (F3): the copilot was a second way to add a governance rule
+    /// without `governance:write`. `POST /api/governance/{kind}` now needs
+    /// it, and so do both rule-drafting tools: an Analyst is refused before
+    /// `run_tool` runs, so nothing is stored; a principal with the grant
+    /// reaches the confirmation step as before.
+    #[test]
+    fn analyst_cannot_draft_a_governance_rule_the_console_would_refuse() {
+        let analyst = analyst_perms();
+        let writer = PermissionSet::parse("governance:write");
+        for name in ["draft_classification_rule", "draft_quality_rule"] {
+            let refused = decide(true, Some(&analyst), spec(name), &confirmed_args())
+                .expect("an Analyst must not be able to add a rule via the copilot");
+            assert_eq!(refused["reason"], json!("permission"), "{name}");
+            assert_eq!(refused["required"], json!("governance:write"), "{name}");
+            assert_eq!(
+                decide(true, Some(&writer), spec(name), &confirmed_args()),
+                None,
+                "{name} must run for a governance:write holder"
+            );
+        }
+    }
+
     /// Absent-principal case (fail closed): with no principal at all,
     /// every tool with a non-empty permission is refused, even in build
     /// mode.
