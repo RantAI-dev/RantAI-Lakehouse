@@ -15,8 +15,8 @@ can observe; how it is built belongs in the engineering plan.
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist. Must not be the Owner; for a feature the owner built, a second person. Held in the base. |
 | Plan | `docs/superpowers/plans/<date>-<slug>.md` |
-| Started | <date work began> (base) |
-| Shipped | <date merged to `main`> (base) |
+| Started | <date of the plan>; also in `BACKLOG.md` Dates |
+| Shipped | <merge date of the delivering PR>; also in `BACKLOG.md` Dates |
 | Evidence | The PR(s), and a link to the accepted build or its checklist run |
 
 ## Problem
@@ -79,5 +79,6 @@ Exceptions, each with an owner and a date:
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
 - [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] The base row updated to match (status, Shipped, Acceptor, QA-case results)
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read
