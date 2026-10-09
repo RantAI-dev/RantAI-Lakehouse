@@ -42,6 +42,16 @@ describe("Data Explorer columns", () => {
     expect(screen.queryByText(/column|tag|description|approximate/)).toBeNull()
   })
 
+  it("truncates a long owner and keeps the full value as its title", () => {
+    // DATA-11 review SHOULD-FIX 7: the Owner cell may not widen the table.
+    const owner = "a-very-long-owner-address@example.invalid"
+    render(<>{cellOf("owner", { owner })}</>)
+    const cell = screen.getByText(owner)
+    expect(cell.getAttribute("title")).toBe(owner)
+    expect(cell.className).toContain("truncate")
+    expect(cell.className).toContain("max-w-")
+  })
+
   it("shows each tag as a pill, and a dash when there are none", () => {
     render(<>{cellOf("tags", { tags: ["finance", "pii"] })}</>)
     expect(screen.getByText("finance")).toBeTruthy()

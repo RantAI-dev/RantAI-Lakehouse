@@ -141,7 +141,15 @@ export function getDataExplorerColumns({
       accessorKey: "owner",
       header: ({ column }) => <DataTableColumnHeader column={column} label="Owner" />,
       cell: ({ row }) => (
-        <span className="text-sm">{row.original.owner || "—"}</span>
+        // Capped and truncated like the Name cell, with the full value as
+        // its title: an owner is free text and can be an address (DATA-11
+        // review SHOULD-FIX 7).
+        <span
+          className="block max-w-[10rem] truncate text-sm"
+          title={row.original.owner || undefined}
+        >
+          {row.original.owner || "—"}
+        </span>
       ),
       enableColumnFilter: true,
       meta: {
@@ -162,7 +170,9 @@ export function getDataExplorerColumns({
         const tags = row.original.tags ?? []
         if (tags.length === 0) return <span className="text-muted-foreground">—</span>
         return (
-          <span className="flex flex-wrap gap-1">
+          // Capped so a long list wraps inside the column instead of widening
+          // the table (DATA-11 review SHOULD-FIX 7).
+          <span className="flex max-w-[14rem] flex-wrap gap-1">
             {tags.map((tag) => (
               <Pill key={tag} tone="neutral">
                 {tag}

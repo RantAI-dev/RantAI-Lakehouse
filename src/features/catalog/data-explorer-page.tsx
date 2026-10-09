@@ -173,8 +173,21 @@ export function DataExplorerPage() {
     const hidden: string[] = []
     // Tags and Owner (DATA-11) are the widest new columns and go first;
     // they stay filterable only while shown, like Type and Layer below.
-    if (width < 1400) hidden.push("tags")
-    if (width < 1280) hidden.push("owner")
+    //
+    // DATA-11 review SHOULD-FIX 7: derived like the figures above, from the
+    // window minus the open sidebar (~296px of content lost, 900 -> 604).
+    // Without Tags and Owner the table needs at most ~960px (Name at its
+    // `xl` cap of 22rem plus the ~605px the other columns took), so it
+    // already fills a 1280px window (984px of content). Owner is capped at
+    // 10rem (~190px with padding) and Tags at 14rem (~255px), and each is
+    // shown only when the content area has ~55px to spare beyond the table
+    // plus the column: Owner from 1500px (1204px of content for ~1150px),
+    // Tags from 1760px (1464px for ~1405px). At 1280, 1440 and 1536px the
+    // table therefore fits with the sidebar open, and Tags goes before Owner.
+    // These are estimates from the column caps, not measurements, and they
+    // follow the window width, not the table's container.
+    if (width < 1760) hidden.push("tags")
+    if (width < 1500) hidden.push("owner")
     if (width < 1280) hidden.push("sizeBytes")
     if (width < 1100) hidden.push("freshnessLagSeconds")
     if (width < 950) hidden.push("type")
