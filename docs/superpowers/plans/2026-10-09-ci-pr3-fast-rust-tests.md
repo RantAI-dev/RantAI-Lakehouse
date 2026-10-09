@@ -14,19 +14,34 @@ this file wins and says why.
 
 ## Decisions already made
 
-1. **The API binary has tests of its own, so `test = false` alone would
-   delete tests.** `rust/crates/lakehouse-api/src/main.rs:774` opens a
-   `mod tests` with about 35 router tests (`health_returns_200_ok`,
-   `*_route_is_registered`, `router_exposes_all_twenty_nine_route_paths`,
-   …). They exercise `routes::router`, `Config` and `AppState`, all public
-   through `lib.rs`. Move that module, unchanged apart from its imports,
-   to `rust/crates/lakehouse-api/tests/router_registration.rs`, importing
-   from `lakehouse_api::…`. Then set `test = false` on the `[[bin]]`.
-   If any of those tests uses an item that is private to `main.rs`, stop
-   and report; do not widen visibility or drop the test.
+1. **The binary stops re-declaring the library's modules; its own tests
+   stay where they are.** (Revised 2026-10-09; see "Plan correction"
+   below.) `main.rs:10-42` declares with `mod` the same 32 modules that
+   `lib.rs:26-58` declares with `pub mod`, so every module, and every
+   unit test in it, is compiled twice. Delete those `mod` lines from
+   `main.rs` and import what `main.rs` uses from the library instead
+   (`use lakehouse_api::{config, policy, routes, state, …};`), keeping the
+   names `main.rs` and its tests already use (`routes::router`,
+   `config::Config`, `Config`, `AppState`, `policy::POLICY_TABLE`, …).
+   - `main.rs`'s own `mod tests` (46 tests: 31 router tests and the 15 in
+     `agent_run_service_bootstrap`, which call functions private to
+     `main.rs`) is **not moved and not edited**. The `[[bin]]` keeps
+     compiling tests; do **not** set `test = false`.
+   - No function body changes. No item moves between files.
+   - If an item `main.rs` uses is `pub(crate)` or private in the library,
+     change it to `pub`, add the `# Errors` / doc lines `AGENTS.md`
+     requires for a public item if it lacks them, and list every such
+     item in the handoff. Widen nothing that `main.rs` does not use.
+   - If the library then reports an item as unused, or the change needs
+     anything beyond imports and visibility, stop and report.
+   This is the "thin bin, real lib" split `lib.rs`'s own module doc
+   describes as the intent. It also halves the workspace compile in the
+   release image build, which currently builds these modules in both
+   targets.
 2. **No test stops running.** The only names allowed to disappear are the
-   duplicates the binary compiled from the shared modules. Proven by a
-   name diff (T1).
+   copies the binary compiled from the shared modules. Every name under
+   the binary's own `tests::` (all 46) must still be listed by the
+   binary. Proven by a name diff (T1).
 3. **`cargo-nextest`, pinned, no retries.** `taiki-e/install-action` with
    an exact `nextest@<version>`. `rust/.config/nextest.toml` sets
    `retries = 0` with a comment: a flaky test is fixed or pinned to a
@@ -63,15 +78,15 @@ this file wins and says why.
    `specs_match_typescript` needs it).
 9. **Out of scope:** the `Cache cargo` step of the `test` job (PR 2 owns
    it), every other job, `coverage.yml` (it keeps `cargo llvm-cov`),
-   merging integration test files (parent plan 4.6), any change to test
-   bodies other than the import lines in decision 1.
+   merging integration test files (parent plan 4.6), any change to a test
+   body.
 
 ## Anchors
 
 | What | Where (`a78ad62`) |
 | --- | --- |
-| Binary target, no `test` key | `rust/crates/lakehouse-api/Cargo.toml:12-14` |
-| Binary's own tests | `rust/crates/lakehouse-api/src/main.rs:774-end` |
+| Binary's own tests (46; do not move) | `rust/crates/lakehouse-api/src/main.rs:774-end`, nested `agent_run_service_bootstrap` from `:1105` |
+| Functions those 15 call, private to `main.rs` | `main.rs:238-272` (constants), `:344-606` |
 | Modules declared twice | `main.rs:10-42`, `lib.rs:26-58` |
 | `lib.rs` says `main.rs` is untouched | `lib.rs:18-23` (update: it no longer carries tests) |
 | Shared Postgres, label, reuse | `rust/crates/lakehouse-test-support/src/lib.rs:88-92`, `140` |
@@ -93,17 +108,22 @@ cargo test -p lakehouse-api --lib --locked -- --list | grep ': test$' | sort > /
 cargo test -p lakehouse-api --bin lakehouse-api --locked -- --list | grep ': test$' | sort > /tmp/before-bin.txt
 ```
 
-Show that every name in `before-bin` that is not in `before-lib` belongs
-to `main.rs`'s own `tests::` module. Then apply decision 1.
+Then apply decision 1 and update `lib.rs`'s module doc (`lib.rs:1-23`
+says the binary keeps its own private `mod` declarations; that stops
+being true).
 
 Acceptance:
-- The names in the new `router_registration` binary equal, one for one,
-  the `tests::` names the binary had.
-- `comm` of before and after over the whole workspace shows only the
-  binary's duplicates gone. Quote the three counts.
-- `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D warnings`
+- After the change the binary lists exactly the names under its own
+  `tests::` module, 46 of them, and each was in `before-bin`.
+- Every name in `before-bin` that the binary no longer lists is in
+  `before-lib` (it was a copy, and the library still runs it). Quote the
+  counts: before-bin, after-bin, removed, removed-and-in-lib.
+- `after-lib` equals `before-lib`.
+- `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings`
   and `cargo test -p lakehouse-api` pass; quote the counts.
 - `tests/parity.rs` still finds the binary (`CARGO_BIN_EXE_lakehouse-api`).
+- `sg docker -c 'docker build …'` of `rust/Dockerfile` still succeeds
+  (the release build of the binary is the product). One build, quoted.
 
 ### T2. nextest in the `test` job
 
@@ -123,11 +143,13 @@ Acceptance, all local, quoted in the handoff:
 
 ### T3. `docs/CI.md`
 
-Describe the test job as it now stands, including why the binary target
-has `test = false`, where its tests went, and the no-retry rule. Update
+Describe the test job as it now stands, including that the binary now
+imports the library instead of compiling its modules a second time, and
+the no-retry rule. Update
 the status line of `docs/plans/CI-SPEED-PLAN.md`, and correct its 3.3
 cause 3 ("the tests compile into both targets") to say the binary also
-had tests of its own.
+had 46 tests of its own, 15 of them on functions private to `main.rs`,
+and its 4.3 step 1 to say what was done instead of `test = false`.
 
 ## Verification before handoff
 
@@ -149,6 +171,22 @@ The machine has 6 cores and 7 GB of memory: one heavy build at a time,
 CI: the job's time on a runner (target 8 minutes or less), five
 consecutive green runs, and the debug-info setting's effect on runner
 disk. The planner measures those on the PR and records them under Review.
+
+## Plan correction (planner, 2026-10-09)
+
+The first version of decision 1 said to move `main.rs`'s `mod tests` to
+`tests/router_registration.rs` and set `test = false` on the binary. The
+planner had read only the first tests in that module. The developer
+stopped, correctly, before writing anything: 15 of the 46 tests sit in a
+nested `agent_run_service_bootstrap` module and call six `bootstrap_*`
+functions and six constants that are private to `main.rs`, and nothing
+else covers them. `test = false` would have deleted them.
+
+Decision 1 above replaces it. The duplicate compile is removed at its
+cause (the binary re-declaring the library's modules) instead of by
+switching the binary's tests off, so no test moves and none is lost.
+Decision 9's "any change to test bodies" is now simply "no test body
+changes".
 
 ## Handoff
 
