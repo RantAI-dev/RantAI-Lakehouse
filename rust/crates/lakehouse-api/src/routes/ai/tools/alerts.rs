@@ -23,6 +23,7 @@
 //! check for this call, not the cron door.
 
 use lakehouse_alerts::AlertRuleInput;
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_notify::EmailSender;
 use serde_json::{Map, Value, json};
@@ -48,21 +49,48 @@ pub(super) async fn list_alert_rules(ch: &ChClient) -> Value {
     }
 }
 
-pub(super) async fn create_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn create_alert_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let input = parse_input(args);
-    match lakehouse_alerts::save_rule(ch, &input, None).await {
+    // `SRC-7` D7: the copilot saves through `save_rule` directly, so it must
+    // pass the same scope check the HTTP route does; otherwise it would be a
+    // way around it.
+    if let Err(err) = crate::routes::alerts::authorise_rule_scope(
+        state,
+        principal,
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await
+    {
+        return json!({ "error": err.to_string() });
+    }
+    match lakehouse_alerts::save_rule(&state.clickhouse, &input, None).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
         Err(err) => json!({ "error": err.to_string() }),
     }
 }
 
-pub(super) async fn update_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn update_alert_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
     let input = parse_input(args);
-    match lakehouse_alerts::save_rule(ch, &input, Some(&id)).await {
+    // `SRC-7` D7: as in `create_alert_rule`.
+    if let Err(err) =
+        crate::routes::alerts::authorise_rule_update(state, principal, &id, &input).await
+    {
+        return json!({ "error": err.to_string() });
+    }
+    match lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id)).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
         Err(err) => json!({ "error": err.to_string() }),
     }
@@ -142,8 +170,11 @@ mod tests {
     #[tokio::test]
     async fn update_delete_and_run_require_id() {
         let ch = &state().clickhouse;
+        // SRC-7 task 6: `update_alert_rule` takes the state and the caller's
+        // principal now (the same scope check as the HTTP route); the
+        // assertion is unchanged.
         assert_eq!(
-            update_alert_rule(ch, &Map::new()).await,
+            update_alert_rule(&state(), None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
         assert_eq!(

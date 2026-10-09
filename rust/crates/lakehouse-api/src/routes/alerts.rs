@@ -66,15 +66,127 @@ fn parse_body(body: &Bytes) -> Result<AlertRuleInput, ApiError> {
         .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))
 }
 
+/// The refusal for a rule scoped to every connector or to uploads, by
+/// someone who does not see every tenant (`SRC-7` D7).
+const ALL_SCOPE_DENIED: &str =
+    "only an administrator who sees every tenant can save a rule for all connectors or for uploads";
+
+/// Who may save a rule of the `SRC-7` kinds (decision D7, finding F7). Rules
+/// are one list for the installation, so a rule for all connectors, or for
+/// uploads, would carry every tenant's connector and file names:
+///
+/// - scope `"*"` (and every `upload_failure`, which is always `"*"`) needs
+///   [`crate::routes::catalog::is_unrestricted`];
+/// - a connector id must pass
+///   [`crate::routes::connectors::ensure_connector_in_tenants`], which
+///   answers a connector outside the caller's tenants exactly as an unknown
+///   one (404), so the answer is no oracle for which ids exist.
+///
+/// Any other kind is not checked here (unchanged behaviour). A missing
+/// connector is left to `save_rule`'s own validation (400). With no
+/// principal the `SRC-7` kinds fail closed (401); the HTTP routes always
+/// have one, and the copilot's alert tools pass theirs.
+///
+/// # Errors
+///
+/// 401, 403 or 404 as above; 503 if no pool is configured; 500 on a
+/// database failure.
+pub(crate) async fn authorise_rule_scope(
+    state: &AppState,
+    principal: Option<&Principal>,
+    kind: Option<&str>,
+    connector: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(kind) = kind.and_then(AlertKind::parse_connector_kind) else {
+        return Ok(());
+    };
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    let scope = if kind == AlertKind::UploadFailure {
+        "*"
+    } else {
+        connector.map_or("", str::trim)
+    };
+    if scope.is_empty() {
+        return Ok(());
+    }
+    if scope == "*" {
+        return if crate::routes::catalog::is_unrestricted(principal) {
+            Ok(())
+        } else {
+            Err(ApiError::PermissionDenied(ALL_SCOPE_DENIED.to_owned()))
+        };
+    }
+    crate::routes::connectors::ensure_connector_in_tenants(state, Some(principal), scope).await
+}
+
+/// [`authorise_rule_scope`] for `input`, and for the rule `id` it replaces:
+/// an update must not let a caller take over, or move, a rule they could not
+/// have created (`SRC-7` D7). An unrestricted caller may do both, so the
+/// stored rule is not even read for them.
+///
+/// # Errors
+///
+/// As [`authorise_rule_scope`]; 503 with a fixed message when the stored
+/// rule cannot be read.
+pub(crate) async fn authorise_rule_update(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+    input: &AlertRuleInput,
+) -> Result<(), ApiError> {
+    authorise_rule_scope(
+        state,
+        principal,
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await?;
+    if principal.is_some_and(crate::routes::catalog::is_unrestricted) {
+        return Ok(());
+    }
+    let existing = lakehouse_alerts::get_rule(&state.clickhouse, id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, "an alert rule could not be read before an update");
+            ApiError::Unavailable("the alert rules could not be read".to_owned())
+        })?;
+    match existing {
+        Some(rule) => {
+            authorise_rule_scope(
+                state,
+                principal,
+                Some(rule.kind.as_str()),
+                rule.connector.as_deref(),
+            )
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
 /// `POST /api/alerts` — create a rule.
 ///
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] on an unparseable body or a
 /// validation failure (see `lakehouse_alerts::save_rule`) — matching the
-/// `TypeScript`'s single `catch` around both.
-pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+/// `TypeScript`'s single `catch` around both. For the `SRC-7` rule kinds, a
+/// 401, 403 or 404 from [`authorise_rule_scope`].
+pub async fn create(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
+    authorise_rule_scope(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, None)
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -86,12 +198,24 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<Api
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] on an unparseable body, a missing
-/// `id`, or a validation failure — matching the `TypeScript`.
-pub async fn update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+/// `id`, or a validation failure — matching the `TypeScript`. For the
+/// `SRC-7` rule kinds, a 401, 403 or 404 from [`authorise_rule_update`].
+pub async fn update(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
     let Some(id) = input.id.clone() else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
+    authorise_rule_update(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &id,
+        &input,
+    )
+    .await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id))
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -1526,5 +1650,297 @@ mod sql_gate_enforcement {
         assert!(!err.contains("example.com"), "{err}");
         assert!(server.received_requests().await.unwrap().is_empty());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rule_scope_authorisation {
+    //! `SRC-7` D7/F7: who may save a rule of the connector and upload kinds.
+    //! A real ephemeral Postgres (connector tenants) and a wiremock
+    //! `ClickHouse` that answers every rule read with one configured row.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::http::StatusCode;
+    use lakehouse_auth::PermissionSet;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    const OWN_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+    const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+    const OWN_CONNECTOR: &str = "conn-pg-lakehouse";
+    const OTHER_CONNECTOR: &str = "conn-s3-warehouse";
+
+    /// A Data Engineer: `alert:write`, member of [`OWN_TENANT`] only.
+    fn engineer() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(7)),
+            tenant_ids: vec![OWN_TENANT.parse().unwrap()],
+            display_name: "Data Engineer".to_owned(),
+            permissions: PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// An administrator who sees every tenant (`*:*`).
+    fn admin() -> Principal {
+        Principal {
+            permissions: PermissionSet::parse("*:*"),
+            ..engineer()
+        }
+    }
+
+    /// `existing` is the `(type, connector)` of the one rule the rule store
+    /// answers every read with.
+    async fn setup(pool: &sqlx::PgPool, existing: (&str, &str)) -> (AppState, MockServer) {
+        for (id, tenant) in [(OWN_CONNECTOR, OWN_TENANT), (OTHER_CONNECTOR, OTHER_TENANT)] {
+            sqlx::query("UPDATE connector SET tenant_id = $2 WHERE id = $1")
+                .bind(id)
+                .bind(Uuid::parse_str(tenant).unwrap())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let ch = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "rows": 1,
+                "data": [{
+                    "id": "al_x", "name": "Rule", "type": existing.0,
+                    "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "0",
+                    "board": "", "channel": "webhook", "target": "https://hooks.example.com/x",
+                    "enabled": "1", "created_at": "", "severity": "", "pipeline": "",
+                    "connector": existing.1,
+                }]
+            })))
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ch)
+            .await;
+        let options = pool.connect_options();
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch.uri());
+        (
+            AppState::new(Config::from_map(&env).expect("a valid test Config")),
+            ch,
+        )
+    }
+
+    fn rule_body(kind: &str, connector: Option<&str>, id: Option<&str>) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": id, "name": "Load failed", "type": kind, "connector": connector,
+                "channel": "webhook", "target": "https://hooks.example.com/x",
+                "pipeline": "pl-x",
+            }))
+            .unwrap(),
+        )
+    }
+
+    async fn create_as(
+        state: &AppState,
+        principal: Option<Principal>,
+        kind: &str,
+        connector: Option<&str>,
+    ) -> Result<(), ApiError> {
+        create(
+            State(state.clone()),
+            principal.map(Extension),
+            rule_body(kind, connector, None),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    async fn update_as(
+        state: &AppState,
+        principal: Principal,
+        kind: &str,
+        connector: Option<&str>,
+    ) -> Result<(), ApiError> {
+        update(
+            State(state.clone()),
+            Some(Extension(principal)),
+            rule_body(kind, connector, Some("al_x")),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_may_save_a_rule_for_a_connector_of_their_own_tenant(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        for kind in [
+            "connector_failure",
+            "connector_repeated_failure",
+            "connector_success",
+        ] {
+            create_as(&state, Some(engineer()), kind, Some(OWN_CONNECTOR))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_who_does_not_see_every_tenant_cannot_save_a_rule_for_all_or_for_uploads(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        for (kind, connector) in [
+            ("connector_failure", Some("*")),
+            ("connector_disabled", Some("*")),
+            ("upload_failure", None),
+            ("upload_failure", Some(OWN_CONNECTOR)),
+        ] {
+            let err = create_as(&state, Some(engineer()), kind, connector)
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), 403, "{kind} {connector:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("permission_denied: {ALL_SCOPE_DENIED}")
+            );
+        }
+    }
+
+    /// A connector of another tenant is answered exactly as an unknown one
+    /// (same status, same text but for the id the caller sent): no oracle.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn another_tenants_connector_is_refused_like_an_unknown_one(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let other = create_as(
+            &state,
+            Some(engineer()),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap_err();
+        let unknown = create_as(
+            &state,
+            Some(engineer()),
+            "connector_failure",
+            Some("conn-ghost"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(other.status(), StatusCode::NOT_FOUND.as_u16());
+        assert_eq!(other.status(), unknown.status());
+        assert_eq!(
+            other.to_string().replace(OTHER_CONNECTOR, "ID"),
+            unknown.to_string().replace("conn-ghost", "ID")
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_administrator_may_save_a_rule_for_all_connectors_and_for_uploads(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", "*")).await;
+        create_as(&state, Some(admin()), "connector_failure", Some("*"))
+            .await
+            .unwrap();
+        create_as(&state, Some(admin()), "upload_failure", None)
+            .await
+            .unwrap();
+        create_as(
+            &state,
+            Some(admin()),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_new_kinds_fail_closed_with_no_principal_and_other_kinds_are_unchanged(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let err = create_as(&state, None, "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 401);
+        // A pipeline kind is not checked: the engineer saves it as before.
+        create_as(&state, Some(engineer()), "pipeline_failure", None)
+            .await
+            .unwrap();
+    }
+
+    /// An update may not take over or move a rule the caller could not have
+    /// created: not to `*`, not off a `*` rule, not onto another tenant's
+    /// connector.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_update_cannot_move_a_rule_the_caller_could_not_have_created(pool: sqlx::PgPool) {
+        // The stored rule is for all connectors.
+        let (state, _ch) = setup(&pool, ("connector_failure", "*")).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403, "taking over an all-connectors rule");
+        // The stored rule is for another tenant's connector.
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 404, "taking over another tenant's rule");
+        // The stored rule is the caller's own; moving it to `*` or to another
+        // tenant's connector is refused, moving it within their tenant is not.
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some("*"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403);
+        let err = update_as(
+            &state,
+            engineer(),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), 404);
+        update_as(
+            &state,
+            engineer(),
+            "connector_repeated_failure",
+            Some(OWN_CONNECTOR),
+        )
+        .await
+        .unwrap();
+        // Turning a connector rule into a pipeline kind does not escape the
+        // check on what it was.
+        let (state, _ch) = setup(&pool, ("upload_failure", "*")).await;
+        let err = update_as(&state, engineer(), "pipeline_failure", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403);
+        // An administrator may do all of it.
+        update_as(&state, admin(), "connector_failure", Some("*"))
+            .await
+            .unwrap();
     }
 }
