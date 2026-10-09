@@ -214,8 +214,14 @@ fn within_one_edit(a: &[char], b: &[char]) -> bool {
 /// token of the word must be contained in the field or, at
 /// `MIN_APPROX_CHARS` characters or more, one edit from one of its tokens. A
 /// word with no letter or digit has no token and matches nothing.
-fn approximately_in(word: &str, field: &str) -> bool {
+///
+/// `DATA-11` review `SHOULD-FIX 5`: the answer says whether any part needed an
+/// edit. `None` is no match; `Some(false)` is every part contained in the
+/// field (`id_customer` in `customer_id`: right letters, wrong order), which
+/// is not a typo and must not be shown as one; `Some(true)` is a typo.
+fn approximately_in(word: &str, field: &str) -> Option<bool> {
     let mut any = false;
+    let mut edited = false;
     for part in tokens(word) {
         any = true;
         if field.contains(part) {
@@ -228,10 +234,11 @@ fn approximately_in(word: &str, field: &str) -> bool {
                 within_one_edit(&t, &part_chars)
             })
         {
-            return false;
+            return None;
         }
+        edited = true;
     }
-    any
+    any.then_some(edited)
 }
 
 fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
@@ -247,8 +254,10 @@ fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
                 },
                 false,
             )
-        } else if approximately_in(word, &c.lower) {
-            (c.field.weights().1, true)
+        } else if let Some(edited) = approximately_in(word, &c.lower) {
+            // The approximate weight either way (the order was wrong or a
+            // letter was); only a letter makes the hit "approximate".
+            (c.field.weights().1, edited)
         } else {
             continue;
         };
@@ -533,6 +542,42 @@ mod tests {
         assert!(search(&assets, &columns, &UsageIndex::new(), "custmer_xx").is_empty());
         // No letter or digit: nothing to match.
         assert!(find(&assets, "___").is_empty());
+    }
+
+    #[test]
+    fn a_word_whose_parts_all_match_exactly_is_not_marked_approximate() {
+        // DATA-11 review SHOULD-FIX 5: `id_customer` has no wrong letter in
+        // `customer_id`; the order is wrong, so the hit has the approximate
+        // weight (below the table whose column is `id_customer`) but is not
+        // flagged as a typo.
+        let assets = vec![
+            json!({ "id": "silver.swapped", "name": "Swapped" }),
+            json!({ "id": "silver.exact", "name": "Exact" }),
+        ];
+        let columns: ColumnIndex = [
+            (
+                "silver.swapped".to_owned(),
+                vec![("customer_id".to_owned(), String::new())],
+            ),
+            (
+                "silver.exact".to_owned(),
+                vec![("id_customer".to_owned(), String::new())],
+            ),
+        ]
+        .into();
+        let hits = search(&assets, &columns, &UsageIndex::new(), "id_customer");
+        assert_eq!(ids(&hits), ["silver.exact", "silver.swapped"]);
+        assert_eq!(
+            hits[1]["matchedOn"],
+            json!({ "field": "column", "value": "customer_id", "approximate": false })
+        );
+        // A real typo is still flagged.
+        let typo = search(&assets, &columns, &UsageIndex::new(), "custmer_id");
+        assert!(
+            typo.iter()
+                .all(|h| h["matchedOn"]["approximate"] == json!(true))
+        );
+        assert!(!typo.is_empty());
     }
 
     #[test]
