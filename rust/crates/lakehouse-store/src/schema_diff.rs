@@ -187,7 +187,8 @@ pub struct Decision {
     pub action: Action,
     /// With `Load`: the columns to load, or `None` for all of them.
     pub columns: Option<Vec<String>>,
-    /// Whether the connector as a whole is paused (policy `pause`).
+    /// Whether the connector as a whole is paused (policy `pause`), except
+    /// when a change waits that Approve refuses (`SRC-8 review BLOCKER 3a`).
     pub pause_connector: bool,
     /// The changes with their status.
     pub changes: Vec<ClassifiedChange>,
@@ -290,10 +291,24 @@ pub fn decide(
         };
     }
     if changes.iter().any(Change::is_breaking) {
+        // `SRC-8 review BLOCKER 3a`: a type change the existing column
+        // cannot hold is refused by Approve, so only the source putting the
+        // column back clears it, and that is seen only by a connector that
+        // keeps running. Pausing it would leave it stuck for good: the table
+        // waits, the rest of the connector runs.
+        let cannot_be_approved = changes.iter().any(|c| {
+            matches!(
+                c,
+                Change::TypeChanged {
+                    change: TypeChange::Other,
+                    ..
+                }
+            )
+        });
         return Decision {
             action: Action::Wait,
             columns: None,
-            pause_connector,
+            pause_connector: pause_connector && !cannot_be_approved,
             changes: classify(ChangeStatus::Pending),
         };
     }
@@ -908,5 +923,39 @@ mod tests {
         .to_new_change();
         assert_eq!(row.column_name, "");
         assert_eq!(row.before_value.as_deref(), Some("a, b"));
+    }
+
+    /// `SRC-8 review BLOCKER 3a`: under `pause`, a type change the column
+    /// cannot hold makes the table wait but never pauses the connector, so a
+    /// later run can see the column put back; every other policy is as before.
+    #[test]
+    fn a_type_change_that_cannot_be_approved_never_pauses_the_connector() {
+        let other = shape(&[("id", "timestamp"), ("note", "text")], &["id"]);
+        // `Other` together with an added column: still not pausable.
+        let other_and_added = shape(
+            &[("id", "timestamp"), ("note", "text"), ("qty", "integer")],
+            &["id"],
+        );
+        for observed in [other, other_and_added] {
+            for policy in POLICIES {
+                let d = evaluate(policy, true, Some(&base()), &observed);
+                assert_eq!(d.action, Action::Wait, "{policy:?}");
+                assert!(!d.pause_connector, "{policy:?}");
+                assert!(d.changes.iter().all(|c| c.status == ChangeStatus::Pending));
+            }
+        }
+    }
+
+    /// The other breaking changes still pause under `pause`: a removed
+    /// column, a narrowed type and a changed key can all be approved.
+    #[test]
+    fn a_breaking_change_that_can_be_approved_still_pauses_under_pause() {
+        let narrowed = shape(&[("id", "smallint"), ("note", "text")], &["id"]);
+        let rekeyed = shape(&[("id", "integer"), ("note", "text")], &["note"]);
+        for observed in [with_removed(), narrowed, rekeyed] {
+            let d = evaluate(SchemaChangePolicy::Pause, true, Some(&base()), &observed);
+            assert_eq!(d.action, Action::Wait);
+            assert!(d.pause_connector);
+        }
     }
 }

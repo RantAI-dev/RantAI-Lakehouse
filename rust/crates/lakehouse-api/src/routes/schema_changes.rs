@@ -1838,6 +1838,29 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "nothing waits any more");
     }
 
+    /// `SRC-8 review BLOCKER 3a`: under policy `pause`, a type change the
+    /// column cannot hold makes the table wait but does NOT pause the
+    /// connector, so a later run observes the column put back and the table
+    /// loads, with nothing pending.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn under_pause_an_unloadable_type_change_waits_without_pausing_and_clears_when_put_back(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "stuck", "pause").await;
+        observe_as_service(&h, &id, &QTY_INTEGER, "before_load").await;
+
+        let waiting = observe_as_service(&h, &id, &QTY_TEXT, "before_load").await;
+
+        assert_eq!(waiting["action"], "wait");
+        assert!(!paused(&pool, &id).await, "the connector keeps running");
+
+        let back = observe_as_service(&h, &id, &QTY_INTEGER, "before_load").await;
+
+        assert_eq!(back["action"], "load");
+        assert_eq!(listed(&h, &id).await["pending"], json!([]));
+    }
+
     /// After the load (files, REST, `MongoDB`, Kafka, SFTP) such a change is
     /// already in the table as a second column (`SRC-8-RESULT`), so it is
     /// recorded as applied and never waits or blocks.
