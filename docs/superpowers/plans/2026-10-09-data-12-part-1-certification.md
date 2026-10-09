@@ -188,7 +188,41 @@ run lint && bun run test` in full.
 
 ## Handoff
 
-*(developer)*
+Developer: Claude Sonnet 5.5. Tasks R1, R2, R3, T1, T2, T3 (T4 is the planner's).
+
+Commits (before this docs commit):
+
+- `905d4ad` docs(data): spec, feature page and plan for DATA-12 part 1
+- `5090041` feat(store): certified and deprecated mark on asset_annotation
+- `61b2eb8` feat(api): PUT /api/catalog/{id}/certification behind governance:write
+- `59a8dfa` feat(api): the mark on every catalog row, as a filter, and in the history
+- `e1e0107` feat(services): certification fields and setCertification on the asset client
+- `b132044` feat(frontend): show the certified and deprecated mark
+- `54cb2b4` feat(frontend): deprecation notice and the Certification dialog
+
+Commands run, from `/home/hv/lakehouse-data12`:
+
+- Rust (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, `df -h /` 42G free before each):
+  `cargo check -p lakehouse-store -p lakehouse-api --tests` finished clean after R1 and after R2.
+  After R3: `touch rust/crates/*/src/lib.rs rust/crates/lakehouse-store/src/*.rs`, then `cargo fmt --check` (clean, after one `cargo fmt` that only touched my own lines) and `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` (clean, finished in 2m 16s after fixing two findings of the first run: `single_match_else` in `put_certification` and `too_many_lines` in `change_entry`, whose mark arms moved to `mark_summary`).
+- TypeScript: `bun install --frozen-lockfile` (772 packages, lockfile unchanged), then in the foreground `bun run typecheck && bun run lint && bun run test`: typecheck clean; lint 0 errors, 6 warnings (the same 6 without my files); tests 952 pass, 0 fail, 953 tests in 105 files.
+
+Not verified: no Rust test was run (no `cargo test` on this machine). The new `sqlx::test`s in `lakehouse-store/tests/annotation.rs` (7), the handler tests in `routes/catalog.rs` (5 plus the overlay test), `catalog_query.rs` (1), `catalog_governance.rs` (1), `policy.rs` (1) and `tests/route_auth.rs` (1, named; the two table-driven loops cover the new `POLICY_TABLE` row by construction) are type-checked and clippy-clean only. First run is CI's. No migration was applied to a database here.
+
+Deviations and decisions the plan did not cover:
+
+- `AnnotationInput` is unchanged: the mark has its own `CertificationInput`, so only the two `AnnotationRow` literals (`routes/catalog.rs` test helper, `routes/ai/data_map.rs` test helper) needed updating; `routes/ai/mod.rs` builds an `AnnotationInput` and needed nothing.
+- `status` is a required key of the body (a `serde_json::Value`): `{}` is a 400, only an explicit `null` clears.
+- A note or replacement with `status: null` is refused with the same sentence as with `certified`. Blank note and replacement count as absent (trimmed).
+- Clearing an asset that had no mark succeeds and writes no audit event (as a details save that changes nothing records nothing). The `catalog.uncertify` args carry `was`.
+- The replacement's existence is checked against `search_snapshot`; a failed catalog read answers 503 with a fixed sentence (fail closed). "Itself deprecated" is read from `asset_annotation` through `get_annotation`, not from the copy's rows.
+- `certified_by` is the caller's display name cut to 128 characters.
+- The notice links the replacement by its asset id (the page has no name for it without another request), not by its name.
+- A "Certification" filter column is hidden by default through `columnVisibility: { id: false, certification: false }` in `data-explorer-page.tsx`.
+- Added a client test file `src/services/clients/assets.test.ts` and a page test `asset-detail-page.test.tsx` (the plan named neither).
+
+Unsure: (1) the expected `certifiedAt` string in the overlay test (`2026-09-21T14:13:20Z` for Unix 1_790_000_000) is from Python's UTC conversion; the `time` crate's RFC 3339 output for a whole second UTC should be identical, but it has not run. (2) The group-order assertion in `certification_filters_sorts_and_groups` assumes `apply_grouping` keeps first-appearance order, as its doc says. (3) The 503 path for an unreadable catalog has no test.
+
 
 ## Review
 
