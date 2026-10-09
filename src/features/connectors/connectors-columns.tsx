@@ -5,7 +5,7 @@ import type { ColumnDef } from "@tanstack/react-table"
 import { MoreHorizontal } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
-import { HealthBadge } from "@/components/patterns/status-badge"
+import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -123,6 +123,9 @@ export function getConnectorColumns(): ColumnDef<Connector>[] {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
             <HealthBadge health={row.original.health} />
             {streak ? <span className="text-xs text-destructive">{streak}</span> : null}
+            {row.original.pausedReason ? (
+              <Pill tone="warning">Paused: {row.original.pausedReason}</Pill>
+            ) : null}
           </div>
         )
       },

@@ -7,6 +7,7 @@ import {
   CircleCheckIcon,
   CircleXIcon,
   DatabaseIcon,
+  GitCompareArrowsIcon,
   InfoIcon,
   LayoutGridIcon,
   PlugZapIcon,
@@ -30,14 +31,16 @@ import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
 import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
+import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
 import { DIRECTION_LABEL } from "./connectors-columns"
 
-type ConnectorTab = "overview" | "ingest" | "tests"
+type ConnectorTab = "overview" | "ingest" | "schema" | "tests"
 
-/** The three tabs, in order. `?tab=` names any but the first. */
+/** The four tabs, in order. `?tab=` names any but the first. */
 const TABS: { value: ConnectorTab; label: string; icon: LucideIcon }[] = [
   { value: "overview", label: "Overview", icon: LayoutGridIcon },
   { value: "ingest", label: "Ingest", icon: DatabaseIcon },
+  { value: "schema", label: "Schema changes", icon: GitCompareArrowsIcon },
   { value: "tests", label: "Connection tests", icon: PlugZapIcon },
 ]
 
@@ -147,7 +150,8 @@ function SourcesLink() {
  * header carries the status and the actions, with a row of facts under it
  * (plan section 10, U1-U2, U6); below that, one tab each for the overview, what
  * the connector ingests (kept mounted, so tables picked but not yet saved
- * survive a look at another tab) and its connection tests. The open tab lives
+ * survive a look at another tab), its schema changes (kept mounted too: the
+ * Ingest tab marks the tables that wait) and its connection tests. The open tab lives
  * in `?tab=`, so a refresh or a shared link lands on it. The Ingest tab carries
  * the number of saved tables, and Connection tests a red `1` while the latest
  * test failed.
@@ -196,6 +200,14 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // mounted from the start (`keepMounted`) and already reads the spec, so the
   // count costs no request of its own.
   const [savedTables, setSavedTables] = useState<number | null>(null)
+  // Which tables wait for a schema decision (`SRC-8`), from the one list the
+  // Schema changes tab reads; the Ingest tab marks them without a request of
+  // its own, and the tab carries how many there are.
+  const [waiting, setWaiting] = useState<{ tables: ReadonlySet<string>; groups: number }>({
+    tables: new Set(),
+    groups: 0,
+  })
+  const onWaiting = useCallback((tables: Set<string>, groups: number) => setWaiting({ tables, groups }), [])
   const tabsRootRef = useRef<HTMLDivElement>(null)
 
   const selectTab = useCallback(
@@ -241,6 +253,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const counts: Record<ConnectorTab, LineTab["count"]> = {
     overview: null,
     ingest: savedTables === null ? null : { count: savedTables },
+    schema: waiting.groups > 0 ? { count: waiting.groups, tone: "warning" } : null,
     tests: latest && !latest.ok ? { count: 1, tone: "danger" } : null,
   }
   const stripTabs: LineTab[] = TABS.map((t) => ({ ...t, count: counts[t.value] }))
@@ -259,6 +272,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           <>
             <HealthBadge health={c.health} />
             <Pill tone="neutral">{DIRECTION_LABEL[c.direction]}</Pill>
+            {c.pausedReason ? <Pill tone="warning">Paused: {c.pausedReason}</Pill> : null}
             {c.environment ? <Pill tone="neutral">{c.environment}</Pill> : null}
           </>
         }
@@ -333,6 +347,17 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               connectorName={c.name}
               layout="page"
               onTableCount={setSavedTables}
+              pausedReason={c.pausedReason}
+              waitingTables={waiting.tables}
+            />
+          </TabsContent>
+          <TabsContent value="schema" keepMounted>
+            <ConnectorSchemaChangesPanel
+              connectorId={id}
+              connectorType={c.type}
+              policy={c.schemaChangePolicy}
+              onChanged={state.reload}
+              onWaiting={onWaiting}
             />
           </TabsContent>
           <TabsContent value="tests">

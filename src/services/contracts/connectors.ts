@@ -34,6 +34,74 @@ export type SchemaChangePolicy =
   | "ask_first"
   | "pause"
 
+/**
+ * `GET /api/connectors/{id}/schema-changes` and the approve answer mirror
+ * Rust `lakehouse_store::schema_change::SchemaChange` (`SRC-8`). `kind` and
+ * `status` are widened with `| string` so a value this build does not know
+ * still renders.
+ */
+export type SchemaChangeKind =
+  | "column_added"
+  | "column_removed"
+  | "type_changed"
+  | "primary_key_changed"
+  | "table_added"
+
+export type SchemaChangeStatus = "applied" | "pending" | "approved"
+
+export type SchemaChange = {
+  id: string
+  /** The source table (`<schema>.<table>` for SQL sources). */
+  objectName: string
+  kind: SchemaChangeKind | string
+  /** Empty for `primary_key_changed` and `table_added`. */
+  columnName: string
+  /** For `table_added`: `null`. For `type_changed`: the type before. */
+  beforeValue: string | null
+  /**
+   * For `type_changed`: the type after. For `table_added`: the target Bronze
+   * table when status is `applied`, or the fixed "Not added: ..." reason
+   * when `pending`.
+   */
+  afterValue: string | null
+  breaking: boolean
+  status: SchemaChangeStatus | string
+  runId: string | null
+  detectedAt: string
+  decidedBy: string | null
+  decidedAt: string | null
+  /**
+   * Whether the approve route will take this change. `false` for a change
+   * that does not wait and for every waiting change of a table that has a
+   * SQL type change its column cannot hold (decision 10).
+   */
+  canApprove: boolean
+}
+
+/** A column kept in the Bronze table after the source dropped it. */
+export type InactiveColumn = {
+  objectName: string
+  columnName: string
+  inactiveSince: string
+}
+
+export type SchemaChangeList = {
+  /** What waits for a decision, oldest first. */
+  pending: SchemaChange[]
+  /** The newest changes that no longer wait. */
+  recent: SchemaChange[]
+  inactiveColumns: InactiveColumn[]
+}
+
+/** `POST .../schema-changes/approve` body. For a `table_added` notice, `object` is the table's name and approving only marks it seen. */
+export type ApproveSchemaChangeRequest = { object: string }
+
+export type ApproveSchemaChangeResponse = {
+  object: string
+  approved: SchemaChange[]
+  pauseLifted: boolean
+}
+
 export type ConnectorDependent = {
   id: string
   name: string
@@ -226,6 +294,8 @@ export type UpdateConnectorInput = {
   environment?: string
   residency?: string
   host?: string
+  /** What a non-breaking source schema change does (`SRC-8`, decision 1). */
+  schemaChangePolicy?: SchemaChangePolicy
 }
 
 /**
@@ -778,6 +848,18 @@ export interface ConnectorService {
   ): Promise<SetConnectorCredentialResponse>
   /** `PATCH /api/connectors/{id}` — see `UpdateConnectorInput`. */
   updateConnector(id: string, input: UpdateConnectorInput, signal?: AbortSignal): Promise<Connector>
+  /** `GET /api/connectors/{id}/schema-changes` (`SRC-8`): what waits, the recent changes, the inactive columns. */
+  listSchemaChanges(id: string, signal?: AbortSignal): Promise<SchemaChangeList>
+  /**
+   * `POST /api/connectors/{id}/schema-changes/approve` (`SRC-8`): approve
+   * what waits for one table. 409 with a plain message when what waits
+   * includes a type change the column cannot hold (decision 10).
+   */
+  approveSchemaChanges(
+    id: string,
+    body: ApproveSchemaChangeRequest,
+    signal?: AbortSignal
+  ): Promise<ApproveSchemaChangeResponse>
   /**
    * `DELETE /api/connectors/{id}` — removes the connector and its managed
    * credential files. Refused (409) while a pipeline still reads from it,

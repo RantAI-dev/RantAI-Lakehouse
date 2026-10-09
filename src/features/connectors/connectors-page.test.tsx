@@ -246,3 +246,16 @@ describe("ConnectorsPage run health", () => {
     expect(within(rowOf("db demo")).getByText("No runs yet")).toBeDefined()
   })
 })
+
+// SRC-8 task 10: a paused connector says so in the list, with the reason.
+describe("ConnectorsPage paused connectors", () => {
+  it("marks a paused connector's row with the reason and no other row", async () => {
+    const reason = "A schema change at the source is waiting for approval."
+    stubFetch([{ ...CONNECTORS[0], pausedReason: reason, pausedAt: "2026-10-09T01:00:00Z" }, CONNECTORS[1]])
+    renderPage()
+    const row = (await screen.findByRole("link", { name: "db demo" })).closest("tr") as HTMLElement
+    expect(within(row).getByText(`Paused: ${reason}`)).toBeDefined()
+    const other = screen.getByRole("link", { name: "events" }).closest("tr") as HTMLElement
+    expect(within(other).queryByText(/Paused/)).toBeNull()
+  })
+})
