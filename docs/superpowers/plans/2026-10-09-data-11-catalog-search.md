@@ -673,12 +673,13 @@ No `BLOCKER`, no open `SHOULD-FIX`. All four are fixed as written
   hidden and their filters with them (as Type and Layer already behave).
   The page measures the window, not the table; unchanged.
 
-**Verification, by the planner.** The developer's counts at `89afb60`
-(`cargo fmt --check` exit 0, clippy clean, typecheck exit 0, lint 0 errors,
-`bun run test` 932 pass, 1 skip, 0 fail) were not re-run by the planner
-after this round; the planner rebuilt the API from this commit, restarted
-the separate instance and ran the live checks above. The planner's full
-re-run happens after `main` is merged in, before the pull request.
+**Verification, by the planner, at `89afb60`.** After `touch` of the crate
+sources: `cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api -p
+lakehouse-store --all-targets -- -D warnings` clean in 2m14s. `bun run
+typecheck` exit 0; `bun run lint` 0 errors, 6 warnings; `bun run test` 932
+pass, 1 skip, 0 fail. The API was rebuilt from this commit and the separate
+instance restarted for the live checks above. The full block runs again
+after `main` is merged in, before the pull request.
 
 **Not verified.** No Rust test has run (CI first). D1, the 500 ms target on
 10,000 tables, is not measured. The product owner has not yet tried the
