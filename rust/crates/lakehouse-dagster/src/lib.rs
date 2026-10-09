@@ -1952,6 +1952,36 @@ impl DgClient {
         Ok(steps)
     }
 
+    /// The config `run_id` was launched with, by id (`SRC-7` F5): every
+    /// connector's ingest runs the same `ingest_job`, told apart only by
+    /// `ops.run_ingest.config.connector_id`, and
+    /// [`DgClient::list_runs_for_job_with_config`] can only find a run by
+    /// listing the job's recent runs. A run that does not exist
+    /// (`__typename` other than `"Run"`) is `Ok(None)`, the posture of
+    /// [`DgClient::pipeline_run_status`]; a run without a config comes back
+    /// as `Some(Value::Null)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    pub async fn run_config(&self, run_id: &str) -> Result<Option<Value>, DgError> {
+        let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
+                      ... on Run { runConfig } } }";
+        let body = json!({ "query": query, "variables": { "rid": run_id } });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let text = resp.text().await?;
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        let Some(run) = parsed.pointer("/data/runOrError") else {
+            return Ok(None);
+        };
+        if run.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(None);
+        }
+        Ok(Some(run.get("runConfig").cloned().unwrap_or(Value::Null)))
+    }
+
     /// Fetch up to `limit` log lines for `run_id`, matching `logsForRun(runId,
     /// afterCursor, limit) { __typename ... on EventConnection { events {
     /// __typename ... on MessageEvent { message timestamp level stepKey }
@@ -4089,6 +4119,39 @@ mod tests {
         let client = DgClient::new(format!("{}/graphql", server.uri()));
         let steps = client.run_steps("nope").await.unwrap();
         assert!(steps.is_empty());
+    }
+
+    /// `SRC-7` task 2: a run's config is read by id, and an unknown run is
+    /// `None` rather than an error.
+    #[tokio::test]
+    async fn run_config_returns_the_config_of_a_run_and_none_for_an_unknown_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "Run", "runConfig": {
+                    "ops": { "run_ingest": { "config": { "connector_id": "conn-x" } } } } } }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "RunNotFoundError",
+                    "message": "Pipeline run nope could not be found." } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let cfg = client.run_config("r1").await.unwrap().unwrap();
+        assert_eq!(
+            cfg.pointer("/ops/run_ingest/config/connector_id")
+                .and_then(Value::as_str),
+            Some("conn-x")
+        );
+        assert!(client.run_config("nope").await.unwrap().is_none());
     }
 
     // ── WS4 item A2: job_graph ──────────────────────────────────────────
