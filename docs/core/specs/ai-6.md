@@ -4,10 +4,9 @@
 | --- | --- |
 | Backlog | `AI-6` in [BACKLOG.md](../BACKLOG.md) |
 | Module | AI Copilot |
-| When | Next, with each BI phase-2 item |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-6`](bi-6.md) (BI phase 2), [`BI-7`](bi-7.md) (BI phase 2), [`BI-10`](bi-10.md) (BI phase 2), [`BI-11`](bi-11.md) (BI phase 2), [`BI-13`](bi-13.md) (BI phase 2) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
