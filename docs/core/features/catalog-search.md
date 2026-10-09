@@ -87,24 +87,34 @@ A step not performed is never Pass. Steps needing a terminal are marked
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Press ⌘K (Ctrl+K) on three different pages; type a table's name | The table is listed first | |
-| 2 | Type a column name that is in no table name | Every table with that column is listed, each saying "column <name>" | |
-| 3 | Type a tag that is in no table name | The tagged tables are listed, each saying "tag <name>" | |
-| 4 | Type two words of a table's description in the opposite order | The table is listed | |
-| 5 | Type `revnue` where a table or column is named `revenue` | It is found, and the result shows it is an approximate match | |
-| 6 | Type the same words in the Data Explorer search box | The same tables, in the same order | |
-| 7 | In the ⌘K box, choose "See all results" | The Data Explorer opens with the words filled in | |
-| 8 | In the Data Explorer, filter by owner, then by tag, then by layer | Each filter narrows the list; together they combine | |
-| 9 | Edit a table's tags, then search the new tag straight away | The table is found | |
-| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | |
-| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | |
-| 12 | Type words that match nothing | "No results", not an error and not every table | |
-| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | |
-| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | |
+| 1 | Press ⌘K (Ctrl+K) on three different pages; type a table's name | The table is listed first | Pass 2026-10-09 |
+| 2 | Type a column name that is in no table name | Every table with that column is listed, each saying "column <name>" | Pass 2026-10-09 |
+| 3 | Type a tag that is in no table name | The tagged tables are listed, each saying "tag <name>" | Pass 2026-10-09 |
+| 4 | Type two words of a table's description in the opposite order | The table is listed | Pass 2026-10-09 |
+| 5 | Type `revnue` where a table or column is named `revenue` | It is found, and the result shows it is an approximate match | Pass 2026-10-09 |
+| 6 | Type the same words in the Data Explorer search box | The same tables, in the same order | Pass 2026-10-09 |
+| 7 | In the ⌘K box, choose "See all results" | The Data Explorer opens with the words filled in | Pass 2026-10-09 |
+| 8 | In the Data Explorer, filter by owner, then by tag, then by layer | Each filter narrows the list; together they combine | Pass 2026-10-09 |
+| 9 | Edit a table's tags, then search the new tag straight away | The table is found | Pass 2026-10-09 |
+| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | Not run |
+| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Not run |
+| 12 | Type words that match nothing | "No results", not an error and not every table | Pass 2026-10-09 |
+| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Not run |
+| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Not run |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
+The product owner checked rows 1 to 9 and 12 on 2026-10-09, on a separate
+instance of branch `feat/data-11-catalog-search` at `a020540` (29 assets),
+and reported them passed. Not yet accepted: rows 10, 11, 13 and 14 were not
+run.
+
 Exceptions, each with an owner and a date:
+
+- Row 14, the speed measurement on 10,000 tables: not run; needs a
+  throwaway stack outside the build machine. Owner: planner.
+- Rows 10, 11 and 13: need a second user, a second tenant and a stopped
+  ClickHouse. Owner: product owner, on staging.
 
 ## After acceptance
 
