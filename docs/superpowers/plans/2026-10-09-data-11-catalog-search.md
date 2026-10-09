@@ -685,3 +685,22 @@ after `main` is merged in, before the pull request.
 10,000 tables, is not measured. The product owner has not yet tried the
 console.
 
+### From the product owner's check, 2026-10-09
+
+**SHOULD-FIX 8. A result found through its second word shows no reason
+(plan error, section 3).** The product owner typed `northwind customer` in
+the ⌘K box. `Northwind Orders` is listed, correctly: `northwind` is in its
+name and `customer` is in its column `customer_id`. But it shows no reason
+line, because the plan took `matchedOn` from the first word only, and the
+first word matched the name. The reader cannot tell why Orders is there.
+*Fix, in `search` (`R/catalog_search.rs`):* `matchedOn` comes from the first
+word, in typed order, whose best field is not the name. When every word's
+best field is the name, there is no `matchedOn`, as today. Update the module
+doc, the doc comment of `search`, the contract comment in
+`src/services/contracts/assets.ts` and the feature page wording if it says
+"first word". Tests: `northwind customer` on an asset named `Northwind
+Orders` with a column `customer_id` gives `{field: "column", value:
+"customer_id", approximate: false}`; on `Northwind Customers` gives no
+`matchedOn`; the existing test `the_reason_comes_from_the_first_word` is
+changed to the new rule, with the reason in a comment (rule 2).
+
