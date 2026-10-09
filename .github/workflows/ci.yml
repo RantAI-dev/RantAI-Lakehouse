@@ -542,6 +542,7 @@ jobs:
           MONGO_G6_ROOT_USER=ci-mongo-root-not-real
           MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF

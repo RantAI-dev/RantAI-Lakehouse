@@ -750,6 +750,122 @@ def step_ingest_matrix() -> None:
         print(f"[g6] bronze.{bronze_table}: {count} rows, _ingested_at null count: {null_ingested_at}")
 
 
+def step_wait_for_run_failure(run_id: str) -> float:
+    """Poll Dagster until the run is FAILURE and return its `endTime` (epoch
+    seconds, the orchestrator's own clock on the same host as this runner).
+    The mirror image of `step_wait_for_run_success`: here SUCCESS is the
+    failure of the gate. `endTime` is the start of the interval SRC-7 is
+    measured over; if Dagster has none, the time this gate first saw the
+    FAILURE stands in for it and the printed line says so."""
+    query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename ... on Run { status endTime } } }"
+    seen: dict = {}
+
+    def check() -> bool:
+        resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+        resp.raise_for_status()
+        run = resp.json().get("data", {}).get("pipelineRunOrError", {})
+        status = run.get("status")
+        print(f"[g6] run {run_id} status={status}")
+        if status == "SUCCESS":
+            raise G6Failure(f"run {run_id} SUCCEEDED but its credential was wrong: the run must fail")
+        if status == "FAILURE":
+            seen["end_time"] = run.get("endTime")
+            seen["seen_at"] = time.time()
+            return True
+        return False
+
+    _wait_for(f"run {run_id} FAILURE", check, 150, interval_s=3.0)
+    if seen["end_time"] is None:
+        print("[g6] SRC-7 note: Dagster reported no endTime; measuring from when the gate first saw FAILURE")
+        return seen["seen_at"]
+    return float(seen["end_time"])
+
+
+# SRC-7 spec: a failed load must be reflected "within 5 minutes" of the run
+# ending (decision D1). The step fails if the connector's row is not there by
+# then, and prints the measured seconds either way.
+SRC7_WITHIN_SECONDS = 300
+
+
+def step_failed_run_updates_connector_health() -> None:
+    """SRC-7 tasks 4 and 10: a real failed run reaches the connector's row
+    without anyone pressing Test.
+
+    A SQL connector whose password is wrong (the `g6-mysql` fixture with a
+    credential value that is not its password) is registered, given its ingest
+    spec, and run. Once Dagster says the run FAILED, the orchestrator's
+    `pipeline_run_failed_sensor` posts it to `POST /api/pipelines/events/
+    run-failed` (needs `PIPELINE_RUN_TOKEN` on `lakehouse-api` and
+    `dagster-code-location`, written to the g6 job's CI-only `.env`), and the
+    API stamps the connector. This polls `GET /api/connectors/{id}` until it
+    shows `failureStreak == 1`, `health == "degraded"` and a `lastRunFailureAt`,
+    and prints how many seconds after the run ended that took (the planner
+    copies the line into `docs/plans/SRC-7-RESULT.md`).
+
+    NOT asserted here, on purpose: that the failure is listed by
+    `GET /api/overview/alerts` and that a webhook arrives. That needs a
+    `connector_failure` rule whose webhook target the gate can receive, and
+    `ops/g6/rest_stub.py` answers `GET` only (`BaseHTTPRequestHandler` has no
+    `do_POST`, so the webhook POST would get a 501); giving it a POST handler
+    is a change outside this test file. The alert rule path is covered by the
+    API's own route tests. This step proves the half the CI can prove today:
+    the sensor -> API -> connector row path with a real Dagster run."""
+    wrong_password = "g6-wrong-" + secrets.token_hex(4)
+    body = _create_connector(
+        name="g6-mysql-wrong-password", kind="MySQL", host="mysql-g6:3306",
+        credential={"source": "file", "primary": "password"},
+    )
+    connector_id = body["id"]
+    derived = (body.get("credential") or {}).get("primary")
+    if not derived:
+        raise G6Failure(f"create response for g6-mysql-wrong-password carried no derived credential name: {body}")
+    _write_credential_file(derived, wrong_password)
+    spec_resp = API.put(
+        f"{API_URL}/api/connectors/{connector_id}/ingest-spec",
+        json={
+            "adapter": "sql", "ingestMode": "batch",
+            "dial": {"driver": "mysql", "host": "mysql-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
+            "sourceObjects": [{"name": "orders", "target": "g6_mysql_wrong_password_orders"}],
+        },
+        timeout=10,
+    )
+    if not spec_resp.ok:
+        raise G6Failure(f"set ingest-spec for g6-mysql-wrong-password failed: {spec_resp.status_code} {spec_resp.text}")
+
+    run_id = _post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise G6Failure("ingest/run for g6-mysql-wrong-password returned no runId")
+    print(f"[g6] launched run {run_id} for 'g6-mysql-wrong-password' (wrong credential; it must fail)")
+    ended_at = step_wait_for_run_failure(run_id)
+
+    last: dict = {}
+    deadline = ended_at + SRC7_WITHIN_SECONDS
+    while time.time() < deadline:
+        resp = API.get(f"{API_URL}/api/connectors/{connector_id}", timeout=10)
+        if not resp.ok:
+            raise G6Failure(f"GET /api/connectors/{connector_id} failed: {resp.status_code} {resp.text[:300]}")
+        last = resp.json()
+        if (
+            last.get("failureStreak") == 1
+            and last.get("health") == "degraded"
+            and last.get("lastRunFailureAt") is not None
+        ):
+            seconds = time.time() - ended_at
+            print(
+                f"[g6] SRC-7 failed run {run_id} -> connector failureStreak=1 health=degraded "
+                f"lastRunFailureAt={last['lastRunFailureAt']} {seconds:.1f}s after the run ended "
+                "(polled every 3s)"
+            )
+            return
+        time.sleep(3.0)
+    raise G6Failure(
+        f"SRC-7: {SRC7_WITHIN_SECONDS}s after run {run_id} ended, the connector shows "
+        f"failureStreak={last.get('failureStreak')!r} health={last.get('health')!r} "
+        f"lastRunFailureAt={last.get('lastRunFailureAt')!r}; expected 1, 'degraded' and a time. "
+        "Is PIPELINE_RUN_TOKEN set on lakehouse-api and dagster-code-location?"
+    )
+
+
 def step_column_gate_rejects_an_unsupported_column() -> None:
     """A real, asserted FAILURE -- calls column_gate.reject_unsupported_column_types
     inside the REAL shipped image (not a mocked unit test), asserting it
@@ -930,6 +1046,7 @@ def main() -> int:
         step_login()
         step_ensure_tenant()
         step_ingest_matrix()
+        step_failed_run_updates_connector_health()
         step_column_gate_rejects_an_unsupported_column()
         step_cdc_reports_unsupported_not_a_launch()
         step_cdc_mongo_debezium_properties()
