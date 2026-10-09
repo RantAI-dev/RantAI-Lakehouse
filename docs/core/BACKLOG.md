@@ -93,12 +93,13 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SRC-12` | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-13` | Table discovery for every source type, not only databases | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-4` | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07) | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-11` | Catalog search that finds columns and tags, with tolerant matching | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-11` | Catalog search that finds columns and tags, with tolerant matching. **Built on `feat/data-11-catalog-search`, not merged: no Rust test has run yet, the speed is not measured, the decisions are not signed.** The certification filter waits for `DATA-12` | Data | `features/catalog-search.md` |
+| `DATA-20` | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data, Governance | `features/catalog-search.md` |
 | `DATA-12` | Certified and deprecated marks; governed tags with allowed values | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-13` | Column-level lineage | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-14` | Data quality in depth: a library of ready checks, freshness and volume anomaly detection, an incidents overview | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-13` | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-14` | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, alerts on a failed check, and adding a rule made to need the permission editing one needs | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-15` | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-16` | Time travel proven safe: a gate test that past-version queries pass the masking rewrite | Data | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-16` | Time travel proven safe: a gate test that past-version queries pass the masking rewrite. By reading the code, the Trino form of a past-version query is refused before it reaches Trino, so this is also a fix (`specs/data-16.md`) | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-17` | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Column types on upload, with names and types editable before loading | Data | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Uploaded tables can feed pipelines and so reach dashboards | Data | `reference/competitive-comparison.md` (Data matrix) |

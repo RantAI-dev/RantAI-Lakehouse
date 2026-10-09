@@ -509,3 +509,55 @@ shared target dir and two jobs, after `touch` of the crate sources:
 run on this machine); their first run is CI's. The two column queries have
 never run against a ClickHouse. The workspace-wide clippy and the 500 ms
 target (T4) are open.
+
+### Review fixes, console and benchmark, reviewed 2026-10-09 at `f1c4931`
+
+No `BLOCKER`. `SHOULD-FIX` 1 to 3 are fixed as written (`71184f6`,
+`fe4d136`, `46f5f6e`). Two new `SHOULD-FIX`, both small, left open until the
+product owner has tried the console, so that they are fixed with whatever
+that finds.
+
+**SHOULD-FIX 4. A user without `catalog:read` reads "Catalog search is
+unavailable" in the ⌘K box.** The `403` makes `loadCatalog`
+(`src/services/clients/assets.ts`) throw the same error as an outage. *Fix:*
+the palette tells a refusal (`403`) from a failure and says "You do not have
+access to the catalog" for the first. Likewise, a `supported: false` answer
+shows the API's `reason`, not "No results.".
+
+**SHOULD-FIX 5. A word whose parts all match exactly is marked
+approximate.** `id_customer` finds `customer_id` through `approximately_in`
+and is shown as "approximate match" though no letter is wrong. *Fix:*
+`approximately_in` reports whether any part needed an edit; with none, the
+hit keeps the approximate weight (the order was wrong) and `approximate` is
+false.
+
+**Checked and correct.**
+- T1: `matchedOn` is on the contract only; no mock gained a field.
+- T2: the asset group and items are force-mounted; the reason line, "See
+  all results" (`/data?search=`), the placeholder and the failure line are
+  as planned; the wording is one function shared with the Data Explorer.
+- T3: Owner and Tags columns reuse `Pill`; Tags is not sortable; the page
+  sends no default sort, so a search keeps its rank order.
+- T4: the script refuses `seed` without `BENCH_THROWAWAY_CATALOG=true` and
+  takes every address and credential from the environment.
+
+**Verification, by the planner, at `f1c4931`.** After `touch` of the crate
+sources: `cargo fmt --check` exit 0; `cargo clippy -p lakehouse-api -p
+lakehouse-store --all-targets -- -D warnings` clean in 1m17s. `bun run
+typecheck` exit 0; `bun run lint` 0 errors, 6 warnings, none in a changed
+file; `bun run test` 928 pass, 1 skip, 0 fail, 929 tests in 102 files.
+`check_intra_package_imports.py` and `check_bare_iceberg_count.py` OK.
+
+**Not verified.**
+- No Rust test has been run by anyone; CI runs them first.
+- The workspace-wide clippy and `cargo test --workspace`.
+- Nothing has been tried in a browser or against a running API and
+  ClickHouse: the two column queries, the tag filter and the ⌘K box are
+  proven only by unit tests with stubs.
+- The benchmark has not run. The 500 ms target (D1) is open and
+  `docs/plans/DATA-11-RESULT.md` does not exist.
+
+**Before the pull request.** The product owner tries the console (feature
+page, acceptance rows 1 to 12) and signs or changes decisions 1 to 8; `main`
+is merged into the branch; then the planner pushes and opens the pull
+request, and CI gives the Rust tests their first run.
