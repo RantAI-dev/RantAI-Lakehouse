@@ -2414,6 +2414,49 @@ mod typed_filters {
         assert!(body["results"]["c_a"].get("filtersSkipped").is_none());
     }
 
+    /// `SEC` review finding from BI-18·A: filter values holding backslashes
+    /// and quotes reach `ClickHouse` as the literals they were, after the role
+    /// rewrite, and the tile statement keeps its shape.
+    #[tokio::test]
+    async fn awkward_filter_values_survive_the_rewrite_on_every_tile() {
+        let server = MockServer::start().await;
+        mount_board(&server).await;
+        answer_rest(&server).await;
+        // A literal as the rewrite writes it: `\\` for a backslash, `\'` for a quote.
+        let written = |v: &str| format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'"));
+        let values = ["x\\", "\\'", "a\\\\'b", "50%\\_"];
+        let filters = json!([
+            { "column": "kab", "values": values },
+            { "column": "kab", "op": "contains", "text": "q\\" },
+        ])
+        .to_string();
+        let _ = dashboard(&server, &filters).await;
+
+        let list = values
+            .iter()
+            .map(|v| written(v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let contains = written("q\\");
+        let sent = statements(&server).await;
+        let tiles: Vec<&String> = sent
+            .iter()
+            .filter(|s| s.contains("GROUP BY kab") && s.contains("WHERE kab IN"))
+            .collect();
+        assert!(!tiles.is_empty());
+        for sql in tiles {
+            assert!(sql.contains(&format!("kab IN ({list})")), "{sql}");
+            assert!(
+                sql.contains(&format!(
+                    "positionCaseInsensitiveUTF8(toString(kab), {contains}) > 0"
+                )),
+                "{sql}"
+            );
+            assert_eq!(sql.matches("GROUP BY").count(), 1, "{sql}");
+            assert_eq!(sql.matches("kab IN (").count(), 1, "{sql}");
+        }
+    }
+
     #[tokio::test]
     async fn a_filter_that_does_not_fit_the_column_type_is_reported_as_wrong_type() {
         let server = MockServer::start().await;
@@ -2524,9 +2567,11 @@ mod typed_filters {
         let server = MockServer::start().await;
         mount_marts_with(&server, &["mart_a"]).await;
         answer(&server, "DISTINCT", &["v"], vec![json!({ "v": "50%_x" })]).await;
-        // No backslash here: the role rewrite re-renders string literals and
-        // loses one (see the handoff); the builder's own tests cover `\`.
-        let needle = "50%_'x";
+        // Covers a search text holding `%`, `_`, a quote and backslashes (one
+        // before the quote, one at the end): the text reaches ClickHouse as
+        // one literal with its value intact after the role rewrite, and the
+        // statement keeps its shape (`SEC` review finding from BI-18·A).
+        let needle = "50%_\\'x\\";
         let body = run_values(
             &server,
             ValuesQuery {
@@ -2537,12 +2582,18 @@ mod typed_filters {
         .await
         .unwrap();
         assert_eq!(body["values"], json!(["50%_x"]));
-        let literal = lakehouse_core::ident::SqlLiteral::from(needle).to_string();
+        // The rewrite writes a literal in its own escaping (`\\` and `\'`).
+        let literal = "'50%_\\\\\\'x\\\\'";
         let reads = value_reads(&server).await;
         assert!(!reads.is_empty());
         for sql in &reads {
             assert!(sql.contains("positionCaseInsensitiveUTF8"), "{sql}");
-            assert!(sql.contains(&literal), "{sql} lacks {literal}");
+            assert!(sql.contains(literal), "{sql} lacks {literal}");
+            assert_eq!(
+                sql.matches("positionCaseInsensitiveUTF8").count(),
+                1,
+                "{sql}"
+            );
             assert!(!sql.contains("LIKE"), "no wildcard matching: {sql}");
         }
     }

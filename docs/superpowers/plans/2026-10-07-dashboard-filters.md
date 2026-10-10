@@ -228,6 +228,24 @@ Look at closely in the browser: (a) opening a dashboard with `?f=` and without, 
 - wrapped with a relative date (`visit_date > subtractDays(today(), 30) AND ...`) plus the measure filter: 10 rows.
 - values shape `SELECT DISTINCT toString(provinsi) AS v FROM (SELECT * FROM T WHERE visitors >= 2) AS flt`: 26 values = direct 26.
 
+### Rewriter literal round-trip fix (developer, 2026-10-10)
+
+Closes the `SEC` review finding from BI-18·A (detail intentionally not recorded here; the repo is public). Nothing committed.
+
+**Files.** `rust/crates/lakehouse-api/src/sql_rewrite.rs` (fix and unit tests), `rust/crates/lakehouse-api/src/routes/dashboard.rs` (route-level tests; the values-search test's comment and data updated).
+
+**Root cause.** The rewriter parses with `ClickHouseDialect`, which decodes backslash escapes, then re-serialises with sqlparser's `Display`, which is not an encoder for that dialect: it never re-escapes a backslash and doubles a quote only when it judges it "not already escaped". The decoded value therefore did not survive. Fix at the render step: `substitute_governed_tables` re-encodes the single-quoted literals of the caller's parsed statement (`ReEncodeLiterals`, a `VisitorMut`, only for dialects that decode backslashes) into the form `Display` writes unchanged and ClickHouse decodes to the same value. Policy-authored expressions (parsed separately, inserted afterwards) are deliberately not re-encoded, so existing policy behaviour is unchanged. No filter value is stripped or rejected; no escaping happens downstream; no dependency change.
+
+**Tests.** `sql_rewrite`: `a_literal_value_survives_the_rewrite_unchanged` (21 values: backslash alone, doubled, tripled, quote, doubled quote, each before/after/around a quote, mid and end of value, with `%` and `_`, non-ASCII, control characters, empty; asserts decoded literals equal the input, exactly one statement, same literal count, and that rewriting the output is a fixed point), `a_literal_value_survives_a_governed_rewrite_unchanged` (substitution path). `dashboard.rs`: `awkward_filter_values_survive_the_rewrite_on_every_tile` (filter path, in-list and contains, one GROUP BY, one `IN`), and the values-search test now uses a text with `%`, `_`, quote and backslashes (comment rewritten).
+
+**Real ClickHouse 26.8 (read-only, `docker exec lakehouse-clickhouse-1 clickhouse-client -q`, `serving.mart_demo_map_points`, 237 rows):** four rewritten shapes (trailing backslash in an `IN`, backslash plus quote, search text form, full tile shape with GROUP BY) each returned `0` rows and no error; a decode check (`'a\\' = concat('a', char(92))`) returned `1` for the escapes used.
+
+**Paths checked.** Every caller reaches the single rewriter `sql_rewrite::enforce` via `policy_engine::rewrite_sql_for_roles`: Query Studio (`routes/query.rs`), tiles and SQL sources (`routes/support.rs` `run_spec_sql`, `dashboard_sources.rs`), the dashboard and values endpoints (`routes/dashboard.rs`), alert evaluation (`routes/alerts.rs`), Gold export (`gold_export.rs`), the chat `run_sql` and `run_saved_query` tools (they delegate to the shared paths). `Parser::parse_sql` is used for rendering only in `sql_rewrite.rs`, so one fix covers them. Not separately route-tested: Query Studio, alerts, export (covered by the rewriter unit tests).
+
+**Commands (CARGO_BUILD_JOBS=2, memory and disk checked first).** `cargo fmt --check` clean; `cargo clippy -p lakehouse-api -p lakehouse-bi -p lakehouse-alerts --all-targets --all-features --locked -- -D warnings` clean (crate sources touched first); `cargo test -p lakehouse-api --lib` 1504 passed, 0 failed, 1 ignored; `cargo test -p lakehouse-bi` 101 + 1 passed; `cargo test -p lakehouse-alerts` 69 passed; `--test route_auth` 30 passed; `--test security_regressions` 10 passed.
+
+**Not verified.** Other integration targets (`parity`, `query_download`, connector targets) not run; the browser path; mask/row-filter expressions authored by admins containing backslashes (unchanged by design).
+
 ## 8. Review (planner appends findings per PR)
 
 ### BI-18·A — T1–T7 (reviewer, 2026-10-07)
@@ -280,3 +298,29 @@ Carried forward, not part of this change:
   is recorded here on purpose.
 - Tile errors still carry `ClickHouse` text (`SEC-11`).
 - The reviewer changed one doc comment in `builder.rs` for `doc_markdown`.
+
+### Rewriter literal round-trip fix (reviewer, 2026-10-10)
+
+The owner decided on 2026-10-10 to fix the carried-forward finding in this
+PR. Reviewed the change in `sql_rewrite.rs`: literals the caller wrote are
+re-encoded before the statement is re-serialised, nothing is stripped or
+rejected, and no second escaping step was added downstream.
+
+- **No open BLOCKER.**
+- **SHOULD-FIX, not done here:** admin-authored mask and row-filter
+  expressions are inserted after the re-encoding and are not covered by
+  it. They are written by a privileged role, so this is a correctness
+  follow-up, not the finding itself. Needs a backlog item.
+
+Verified by the reviewer after the merge of `main` and this fix:
+`cargo fmt --check` clean; `cargo test -p lakehouse-api --lib` 1504 passed,
+1 ignored. On the rebuilt dev API against the dev `ClickHouse`, through
+`GET /api/dashboard`: values containing a quote, a backslash, or both match
+no row and return no error on all six tiles; such a value listed beside a
+real one returns exactly the real value's rows (1, 6, 6, 1, 6, 1, the same
+as the control); the ordinary filters return what they did before. The
+values search with such text returns an empty list and no error.
+
+*Not verified:* `cargo test --workspace`, and the `parity`,
+`query_download` and connector test targets; CI runs them on the PR.
+

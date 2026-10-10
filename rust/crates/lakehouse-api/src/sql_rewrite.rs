@@ -512,6 +512,16 @@ pub fn substitute_governed_tables(
     let mut statements = Parser::parse_sql(dialect, sql).map_err(|_| RewriteError::Unparseable)?;
     let touched = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
     let mut substituted = HashSet::new();
+    // `SEC` review finding from BI-18·A: the statement is re-serialised below
+    // with `Display`, which is not a faithful encoder for a literal in a
+    // backslash dialect (see `ReEncodeLiterals`). Re-encoding the literals
+    // the caller wrote, before anything else is inserted, makes a literal's
+    // value survive the rewrite unchanged.
+    if dialect.supports_string_literal_backslash_escape() {
+        for stmt in &mut statements {
+            let _ = sqlparser::ast::VisitMut::visit(stmt, &mut ReEncodeLiterals);
+        }
+    }
     for stmt in &mut statements {
         substitute_in_statement(stmt, dialect, obligations, placeholders, &mut substituted)?;
     }
@@ -527,6 +537,31 @@ pub fn substitute_governed_tables(
         .map(Statement::to_string)
         .collect::<Vec<_>>()
         .join("; "))
+}
+
+/// Re-encodes every single-quoted literal of the parsed caller statement
+/// into the form this dialect decodes back to the same value: `\\` for a
+/// backslash and `\'` for a quote.
+///
+/// `Display` on a string literal is not an encoder for a backslash dialect:
+/// it writes the decoded text back, doubling a quote only when it judges the
+/// quote "not already escaped" (a quote after a backslash, or next to
+/// another quote, is left alone), and never re-escapes a backslash. Handing
+/// it text in which every quote is already preceded by its own backslash
+/// makes that heuristic a no-op, so the output is exactly this encoding.
+struct ReEncodeLiterals;
+
+impl sqlparser::ast::VisitorMut for ReEncodeLiterals {
+    type Break = ();
+
+    fn post_visit_value(&mut self, value: &mut ValueWithSpan) -> std::ops::ControlFlow<()> {
+        if let Value::SingleQuotedString(text) = &mut value.value
+            && text.contains(['\\', '\''])
+        {
+            *text = text.replace('\\', "\\\\").replace('\'', "\\'");
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 fn substitute_in_statement(
@@ -2522,6 +2557,117 @@ mod enforce_tests {
 
         fn has_any_obligation(&self, _roles: &[String]) -> bool {
             self.any
+        }
+    }
+
+    /// Every single-quoted literal of `sql`, as the dialect decodes it.
+    fn literal_values(sql: &str) -> Vec<String> {
+        struct Collect(Vec<String>);
+        impl sqlparser::ast::Visitor for Collect {
+            type Break = ();
+            fn post_visit_value(
+                &mut self,
+                v: &sqlparser::ast::ValueWithSpan,
+            ) -> std::ops::ControlFlow<()> {
+                if let sqlparser::ast::Value::SingleQuotedString(t) = &v.value {
+                    self.0.push(t.clone());
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        let stmts = sqlparser::parser::Parser::parse_sql(&ClickHouseDialect {}, sql).unwrap();
+        let mut c = Collect(Vec::new());
+        for s in &stmts {
+            let _ = sqlparser::ast::Visit::visit(s, &mut c);
+        }
+        assert_eq!(stmts.len(), 1, "one statement in, one statement out: {sql}");
+        c.0
+    }
+
+    /// `SEC` review finding from BI-18·A: a literal's value survives the
+    /// rewrite unchanged, for every byte pattern in the table.
+    #[test]
+    fn a_literal_value_survives_the_rewrite_unchanged() {
+        use lakehouse_core::ident::SqlLiteral;
+        let bs = "\\";
+        let values: Vec<String> = vec![
+            bs.to_owned(),
+            format!("{bs}{bs}"),
+            format!("{bs}{bs}{bs}"),
+            "'".to_owned(),
+            "''".to_owned(),
+            format!("{bs}'"),
+            format!("'{bs}"),
+            format!("a{bs}"),
+            format!("{bs}a"),
+            format!("a{bs}b"),
+            format!("{bs}'{bs}"),
+            format!("a{bs}'b"),
+            format!("a'{bs}b"),
+            format!("x{bs}{bs}"),
+            format!("50%{bs}_x"),
+            format!("{bs}%"),
+            format!("{bs}_"),
+            "caf\u{e9} \u{65e5}\u{672c}".to_owned(),
+            format!("\u{65e5}{bs}"),
+            "a\nb\tc".to_owned(),
+            String::new(),
+        ];
+        let src = FakeObligations { any: false };
+        for v in &values {
+            let lit = SqlLiteral::from(v.clone()).to_string();
+            let sql = format!("SELECT a FROM serving.t WHERE c IN ({lit}, 'z') AND d = {lit}");
+            let out = enforce(
+                &sql,
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert_eq!(
+                literal_values(&out),
+                vec![v.clone(), "z".to_owned(), v.clone()],
+                "value changed by the rewrite: in={sql} out={out}"
+            );
+            // Rewriting its own output is a fixed point: nothing drifts.
+            let again = enforce(
+                &out,
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert_eq!(literal_values(&again), literal_values(&out));
+            assert_eq!(again, out);
+        }
+    }
+
+    /// The same guarantee when the statement is rewritten for a governed
+    /// table (the substitution path, not the pass-through one).
+    #[test]
+    fn a_literal_value_survives_a_governed_rewrite_unchanged() {
+        use lakehouse_core::ident::SqlLiteral;
+        let src = FakeObligations { any: true };
+        for v in ["\\", "a\\", "\\'", "\\\\'x", "50%\\_"] {
+            let lit = SqlLiteral::from(v).to_string();
+            let sql = format!("SELECT id FROM silver.customers WHERE id = {lit} AND email != 'q'");
+            let out = enforce(
+                &sql,
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert!(out.contains("replaceRegexpOne"), "{out}");
+            let lits = literal_values(&out);
+            assert!(lits.contains(&v.to_owned()), "{out}");
+            assert!(lits.contains(&"q".to_owned()), "{out}");
         }
     }
 
