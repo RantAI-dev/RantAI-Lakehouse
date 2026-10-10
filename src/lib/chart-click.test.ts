@@ -124,3 +124,38 @@ test("a KPI, a gauge, a table and a text tile have no value but all but text lis
   assert.equal(offersTileRecords("text"), false)
   assert.equal(offersTileRecords("bar"), false)
 })
+
+// ── BI-9: a grouped chart's axis shows labels; a click maps back to the bucket ──
+
+test("a click on a month label stands for the bucket the server returned", () => {
+  const spec: ClickSpec = { kind: "line", source: "ui", dimension: "visit_date", y: "visitors" }
+  const rows = [{ visit_date: "2026-02-01", visitors: 1 }, { visit_date: "2026-03-01", visitors: 2 }]
+  const labelledRows = [{ visit_date: "Feb 2026", visitors: 1 }, { visit_date: "Mar 2026", visitors: 2 }]
+  assert.deepEqual(
+    drillTarget(spec, { name: "Mar 2026" }, { grain: "month", rows, labelledRows }),
+    { column: "visit_date", value: "2026-03-01", grain: "month", label: "Mar 2026" },
+  )
+})
+
+test("a click on an empty bucket or a label no row has stands for nothing", () => {
+  const spec: ClickSpec = { kind: "bar", source: "ui", dimension: "d", y: "v" }
+  const rows = [{ d: null, v: 1 }]
+  const labelledRows = [{ d: "No date", v: 1 }]
+  assert.equal(drillTarget(spec, { name: "No date" }, { grain: "month", rows, labelledRows }), null)
+  assert.equal(drillTarget(spec, { name: "Jan 2020" }, { grain: "month", rows, labelledRows }), null)
+})
+
+test("a weekday label maps back to its number so the tile can say a part has no records", () => {
+  const spec: ClickSpec = { kind: "bar", source: "ui", dimension: "d", y: "v" }
+  const rows = [{ d: 1, v: 3 }, { d: 2, v: 4 }]
+  const labelledRows = [{ d: "Mon", v: 3 }, { d: "Tue", v: 4 }]
+  assert.deepEqual(
+    drillTarget(spec, { name: "Tue" }, { grain: "day_of_week", rows, labelledRows }),
+    { column: "d", value: "2", grain: "day_of_week", label: "Tue" },
+  )
+})
+
+test("a chart with no grain keeps reading the clicked name as the stored value", () => {
+  const spec: ClickSpec = { kind: "bar", source: "ui", dimension: "kab", y: "v" }
+  assert.deepEqual(drillTarget(spec, { name: "Bandung" }), { column: "kab", value: "Bandung" })
+})

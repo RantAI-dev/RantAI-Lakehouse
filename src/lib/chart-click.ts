@@ -14,6 +14,7 @@
  */
 
 import { toBoxplot } from "@/lib/chart-transforms"
+import type { Grain } from "@/lib/time-grain"
 import type { ChartKind, ChartSource } from "@/lib/dashboard-specs"
 
 type Row = Record<string, unknown>
@@ -48,11 +49,27 @@ export type ClickContext = {
   rows?: Row[]
   /** Map feature → the distinct stored spellings joined to it (a choropleth). */
   regionNames?: ReadonlyMap<string, readonly string[]>
+  /**
+   * BI-9: the tile's category axis shows buckets of this grain as labels
+   * ("Mar 2026"). `labelledRows` are the rows as drawn (the dimension holds
+   * the label) and `rows` as the server sent them (the dimension holds the
+   * bucket), so a clicked label is mapped back to the bucket it stands for.
+   */
+  grain?: Grain
+  labelledRows?: Row[]
 }
 
 export type ChartClickHandler = (hit: ChartHit, pos: { x: number; y: number }, ctx: ClickContext) => void
 
-export type DrillValue = { column: string; value: string }
+export type DrillValue = {
+  column: string
+  /** The stored value; for a grouped chart, the bucket as the server returned it ("2026-03-01"). */
+  value: string
+  /** Set when `value` is a bucket of a grouped chart (BI-9). */
+  grain?: Grain
+  /** The label the person clicked ("Mar 2026"). */
+  label?: string
+}
 
 /**
  * Kinds whose marks are not one value of a column. A geo heat map is drawn
@@ -141,6 +158,14 @@ export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = 
       return typeof index === "number" && index >= 0 && index < categories.length ? named(categories[index]) : null
     }
     default:
-      return named(hit.name)
+      return ctx.grain ? bucketTarget(column, ctx.grain, hit.name, ctx) : named(hit.name)
   }
+}
+
+/** A clicked axis label of a grouped chart → the bucket it stands for; null for the empty bucket or a label no row has. */
+function bucketTarget(column: string, grain: Grain, label: string, ctx: ClickContext): DrillValue | null {
+  const index = (ctx.labelledRows ?? []).findIndex((r) => String(r[column] ?? "") === label)
+  const raw = index >= 0 ? ctx.rows?.[index]?.[column] : undefined
+  if (raw === null || raw === undefined || raw === "") return null
+  return { column, value: String(raw), grain, label }
 }

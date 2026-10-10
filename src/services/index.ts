@@ -19,6 +19,7 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { settingsService as settingsClientService } from "./clients/settings"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import * as authClient from "./clients/auth"
 
@@ -90,6 +91,9 @@ export const uploadService = uploadClientService
 // `/api/home/layout`; honest `supported: false` when no Postgres pool is
 // configured. No mock ever existed for this domain.
 export const homeService = homeClientService
+// The deployment's report time zone and first day of the week over
+// `/api/settings/reporting` (BI-9).
+export const settingsService = settingsClientService
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

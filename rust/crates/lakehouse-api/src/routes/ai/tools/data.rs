@@ -645,7 +645,20 @@ pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> V
         .filter(|c| is_numeric_type(c.get("type").and_then(Value::as_str).unwrap_or("")))
         .filter_map(|c| c.get("name").and_then(Value::as_str))
         .collect();
-    json!({ "mart": mart, "dimensions": dimensions, "measures": measures })
+    // BI-9: each column's kind (number, date, datetime, text), so the
+    // assistant can tell which dimensions take a `grain`.
+    let columns: Vec<Value> = cols
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?;
+            let ty = c.get("type").and_then(Value::as_str).unwrap_or("");
+            Some(json!({
+                "name": name,
+                "kind": lakehouse_bi::filters::ColumnKind::from_clickhouse_type(ty),
+            }))
+        })
+        .collect();
+    json!({ "mart": mart, "dimensions": dimensions, "measures": measures, "columns": columns })
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::filters::{
     ColumnKind, FilterDef, FilterOp, RelativeAnchor, RelativeUnit, parse_iso_date, parse_number,
 };
+use crate::grain::{self, Grain, TimeContext, WeekStart};
 use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
 
@@ -66,6 +67,24 @@ pub enum Relation {
         /// Complete SQL fragments, joined with `AND`.
         predicates: Vec<String>,
     },
+    /// `base` with the grained dimension replaced by its bucket
+    /// (`BI-9`): `SELECT <bucket> AS <dimension>, <carried columns> FROM
+    /// base`. Only the columns the chart reads are carried, so the outer
+    /// query is the ordinary one over a column that is already the bucket.
+    /// Dashboard filters are applied to the raw column *inside* `base`
+    /// ([`Relation::Filtered`]), so the alias can never shadow the column in
+    /// a `WHERE`. Only [`grained_sql`] creates it; every value in it is a
+    /// validated identifier or an expression from [`Grain::bucket_expr`].
+    Bucketed {
+        /// What is bucketed (already filtered when predicates apply).
+        base: Box<Relation>,
+        /// The dimension's name, kept as the result column.
+        dimension: String,
+        /// The bucket expression over the raw column.
+        expr: String,
+        /// The other columns the chart reads (breakdown, measures).
+        carried: Vec<String>,
+    },
 }
 
 impl Relation {
@@ -82,6 +101,22 @@ impl Relation {
                 base.render(),
                 predicates.join(" AND ")
             ),
+            Self::Bucketed {
+                base,
+                dimension,
+                expr,
+                carried,
+            } => {
+                let rest = carried.iter().fold(String::new(), |mut acc, c| {
+                    acc.push_str(", ");
+                    acc.push_str(c);
+                    acc
+                });
+                format!(
+                    "(SELECT {expr} AS {dimension}{rest} FROM {}) AS bkt",
+                    base.render()
+                )
+            }
         }
     }
 
@@ -91,7 +126,7 @@ impl Relation {
         match self {
             Self::Mart(_) => "",
             Self::Sql(_) => SQL_SOURCE_SETTINGS,
-            Self::Filtered { base, .. } => base.settings(),
+            Self::Filtered { base, .. } | Self::Bucketed { base, .. } => base.settings(),
         }
     }
 }
@@ -112,6 +147,7 @@ pub struct QueryBuilder<S> {
     limit: u32,
     breakdown: Option<Ident>,
     where_clauses: Vec<String>,
+    grain: Option<(Grain, WeekStart)>,
     _state: PhantomData<S>,
 }
 
@@ -136,6 +172,7 @@ impl QueryBuilder<NeedsProjection> {
             limit: 20,
             breakdown: None,
             where_clauses: Vec::new(),
+            grain: None,
             _state: PhantomData,
         }
     }
@@ -176,6 +213,17 @@ impl QueryBuilder<NeedsProjection> {
         self
     }
 
+    /// Mark the dimension as a grain bucket (`BI-9`). The relation must be a
+    /// [`Relation::Bucketed`] so the dimension already is the bucket; this
+    /// only changes how the result is ordered and cut: by bucket (day of week
+    /// from the first day of the week), keeping the latest buckets when the
+    /// order is by bucket.
+    #[must_use]
+    pub fn grain(mut self, grain: Grain, week_start: WeekStart) -> Self {
+        self.grain = Some((grain, week_start));
+        self
+    }
+
     /// Supply the measure columns, completing the projection and unlocking
     /// [`QueryBuilder::filter_in`]/[`QueryBuilder::build`].
     #[must_use]
@@ -189,6 +237,7 @@ impl QueryBuilder<NeedsProjection> {
             limit: self.limit,
             breakdown: self.breakdown,
             where_clauses: self.where_clauses,
+            grain: self.grain,
             _state: PhantomData,
         }
     }
@@ -230,6 +279,19 @@ impl QueryBuilder<Ready> {
             .dimension
             .as_ref()
             .map_or_else(String::new, ToString::to_string);
+        // BI-9: a grained chart ordered by bucket keeps the LATEST buckets
+        // and asks for one more than its limit, so the caller can tell a cut
+        // from a result that fits (`grain::trim_to_latest`).
+        // BI-9 review fix (BLOCKER) R1: a part of the date is never cut to
+        // its latest buckets (the limit it carries is its whole range).
+        let latest = self
+            .grain
+            .is_some_and(|(g, _)| grain::cuts_to_latest(g, &self.order));
+        let bucket_limit = self.limit + u32::from(latest);
+        let key = self.grain.map_or_else(
+            || dimension.clone(),
+            |(g, week_start)| g.order_key(&dimension, week_start),
+        );
 
         if let Some(breakdown) = &self.breakdown {
             let Some(measure) = self.measures.first() else {
@@ -246,17 +308,20 @@ impl QueryBuilder<Ready> {
             } else {
                 format!("WHERE {} AND", self.where_clauses.join(" AND "))
             };
-            let order_expr = if self.agg == Aggregate::Count {
-                "count()".to_owned()
+            // Which buckets are kept: the biggest by value, or (grained and
+            // ordered by bucket) the latest.
+            let keep_by = if latest {
+                format!("{key} DESC")
+            } else if self.agg == Aggregate::Count {
+                "count() DESC".to_owned()
             } else {
-                format!("{}({measure})", self.agg)
+                format!("{}({measure}) DESC", self.agg)
             };
             return format!(
                 "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
                  {outer} {dimension} IN (SELECT {dimension} FROM {from} {inner}\
-                 GROUP BY {dimension} ORDER BY {order_expr} DESC LIMIT {limit}) \
-                 GROUP BY {dimension}, {breakdown} ORDER BY {dimension}, {breakdown}{settings}",
-                limit = self.limit,
+                 GROUP BY {dimension} ORDER BY {keep_by} LIMIT {bucket_limit}) \
+                 GROUP BY {dimension}, {breakdown} ORDER BY {key}, {breakdown}{settings}",
             );
         }
 
@@ -267,7 +332,7 @@ impl QueryBuilder<Ready> {
             .collect::<Vec<_>>()
             .join(", ");
         let order_clause = if self.order == "none" {
-            dimension.clone()
+            key.clone()
         } else {
             let Some(first) = self.measures.first() else {
                 return String::new();
@@ -277,6 +342,12 @@ impl QueryBuilder<Ready> {
                 if self.order == "asc" { "ASC" } else { "DESC" }
             )
         };
+        if latest {
+            return format!(
+                "SELECT * FROM (SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} \
+                 ORDER BY {key} DESC LIMIT {bucket_limit}) ORDER BY {key}{settings}",
+            );
+        }
         format!(
             "SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} ORDER BY {order_clause} LIMIT {limit}{settings}",
             limit = self.limit,
@@ -364,7 +435,7 @@ pub fn point_limit(from: &Relation) -> u32 {
     match from {
         Relation::Mart(_) => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
-        Relation::Filtered { base, .. } => point_limit(base),
+        Relation::Filtered { base, .. } | Relation::Bucketed { base, .. } => point_limit(base),
     }
 }
 
@@ -448,6 +519,67 @@ pub struct FilteredSql {
     pub sql: String,
     /// Active filters left out of `sql`.
     pub skipped: Vec<SkippedFilter>,
+    /// A dashboard grain switch this chart could not take (BI-9): it kept its
+    /// own grain and the tile says so.
+    pub grain_skipped: Option<Grain>,
+    /// The grain `sql` was built with (the chart's own, or the dashboard's
+    /// switch where it applied), so the tile can label its buckets.
+    pub grain: Option<Grain>,
+    /// The kind of the grained dimension (`Date` or `DateTime`), so a
+    /// dashboard switch knows whether hour and minute are on offer.
+    pub grain_column: Option<ColumnKind>,
+    /// `Some(limit)` when `sql` keeps the latest `limit` buckets and was
+    /// built to return one more, so the caller trims the surplus with
+    /// [`grain::trim_to_latest`] and marks the tile `truncated`.
+    pub latest_limit: Option<u32>,
+}
+
+/// How a chart is read right now (BI-9): the deployment's time context, and
+/// the grain the dashboard asked for in place of the charts' own
+/// truncations.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadContext<'a> {
+    /// Report time zone and first day of the week.
+    pub time: &'a TimeContext,
+    /// The dashboard's grain switch, if any.
+    pub grain: Option<Grain>,
+}
+
+impl<'a> ReadContext<'a> {
+    /// No dashboard switch: every chart keeps its own grain.
+    #[must_use]
+    pub fn new(time: &'a TimeContext) -> Self {
+        Self { time, grain: None }
+    }
+}
+
+/// A chart's grain right now and what to build with it.
+struct Grained {
+    grain: Grain,
+    column: ColumnKind,
+    latest_limit: Option<u32>,
+}
+
+/// Resolve `spec`'s grain against the relation's columns.
+fn grained<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    cols: &RelationColumns<H>,
+    read: &ReadContext<'_>,
+) -> (Option<Grained>, Option<Grain>) {
+    let def: &ChartInput = &spec.def;
+    let column = cols.get(&def.dimension).copied();
+    let r = grain::resolve(def.grain.as_deref(), spec.spec.kind, column, read.grain);
+    let g = r.effective.zip(column).map(|(grain, column)| {
+        let order = def.order.as_deref().unwrap_or("none");
+        let limit =
+            grain::effective_limit(grain, order, grain::clamp_limit(spec.spec.kind, def.limit));
+        Grained {
+            grain,
+            column,
+            latest_limit: grain::cuts_to_latest(grain, order).then_some(limit),
+        }
+    });
+    (g, r.skipped)
 }
 
 /// SQL for a stored spec with runtime filters applied (year filter + the
@@ -461,12 +593,13 @@ pub fn sql_with_filters<HMap, HCols>(
     years: &[i64],
     filters: &[FilterDef],
     mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+    read: &ReadContext<'_>,
 ) -> String
 where
     HMap: std::hash::BuildHasher,
     HCols: std::hash::BuildHasher + Default,
 {
-    sql_with_filters_report(spec, years, filters, mart_cols).sql
+    sql_with_filters_report(spec, years, filters, mart_cols, read).sql
 }
 
 /// [`sql_with_filters`] plus the filters that were left out.
@@ -486,13 +619,17 @@ where
 ///   keeps them out.
 /// - If no predicates accumulate at all, the spec's stored `sql` is returned
 ///   unchanged (not a WHERE-less rebuild — this preserves the exact stored
-///   SQL byte-for-byte when no filter applies).
+///   SQL byte-for-byte when no filter applies). BI-9: except a chart that
+///   carries a grain, which is always rebuilt, because its SQL depends on the
+///   deployment's time settings (and the dashboard's grain switch), which can
+///   change after the chart was saved.
 #[must_use]
 pub fn sql_with_filters_report<HMap, HCols>(
     spec: &StoredChartSpec,
     years: &[i64],
     filters: &[FilterDef],
     mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+    read: &ReadContext<'_>,
 ) -> FilteredSql
 where
     HMap: std::hash::BuildHasher,
@@ -501,11 +638,19 @@ where
     let unfiltered = |skipped| FilteredSql {
         sql: spec.spec.sql.clone(),
         skipped,
+        grain_skipped: None,
+        grain: None,
+        grain_column: None,
+        latest_limit: None,
     };
     if spec.spec.kind == crate::specs::ChartKind::Text {
         return FilteredSql {
             sql: String::new(),
             skipped: Vec::new(),
+            grain_skipped: None,
+            grain: None,
+            grain_column: None,
+            latest_limit: None,
         };
     }
     let def: &ChartInput = &spec.def;
@@ -518,8 +663,8 @@ where
         predicates,
         skipped,
         columns,
-    } = filter_predicates(cols, years, filters);
-    if predicates.is_empty() {
+    } = filter_predicates(cols, years, filters, read.time);
+    if predicates.is_empty() && def.grain.is_none() {
         return unfiltered(skipped);
     }
     // `mart` was already validated as a well-formed identifier when the
@@ -530,9 +675,25 @@ where
     let Ok(mart) = Ident::new(def.mart.clone()) else {
         return unfiltered(skipped);
     };
-    let sql = rebuild(spec, &Relation::Mart(mart), predicates, &columns)
-        .unwrap_or_else(|| spec.spec.sql.clone());
-    FilteredSql { sql, skipped }
+    let (g, grain_skipped) = grained(spec, cols, read);
+    let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
+    let sql = rebuild(
+        spec,
+        &Relation::Mart(mart),
+        predicates,
+        &columns,
+        read,
+        g.as_ref(),
+    )
+    .unwrap_or_else(|| spec.spec.sql.clone());
+    FilteredSql {
+        sql,
+        skipped,
+        grain_skipped,
+        grain: g.as_ref().map(|g| g.grain),
+        grain_column: g.as_ref().map(|g| g.column),
+        latest_limit,
+    }
 }
 
 /// SQL for a stored chart built on a dashboard SQL source, with runtime
@@ -552,11 +713,12 @@ pub fn sql_for_sql_source<HCols>(
     source_cols: &RelationColumns<HCols>,
     years: &[i64],
     filters: &[FilterDef],
+    read: &ReadContext<'_>,
 ) -> Option<String>
 where
     HCols: std::hash::BuildHasher,
 {
-    sql_for_sql_source_report(spec, source_sql, source_cols, years, filters).map(|f| f.sql)
+    sql_for_sql_source_report(spec, source_sql, source_cols, years, filters, read).map(|f| f.sql)
 }
 
 /// [`sql_for_sql_source`] plus the filters that were left out.
@@ -567,6 +729,7 @@ pub fn sql_for_sql_source_report<HCols>(
     source_cols: &RelationColumns<HCols>,
     years: &[i64],
     filters: &[FilterDef],
+    read: &ReadContext<'_>,
 ) -> Option<FilteredSql>
 where
     HCols: std::hash::BuildHasher,
@@ -575,20 +738,35 @@ where
         return Some(FilteredSql {
             sql: String::new(),
             skipped: Vec::new(),
+            grain_skipped: None,
+            grain: None,
+            grain_column: None,
+            latest_limit: None,
         });
     }
     let FilterOutcome {
         predicates,
         skipped,
         columns,
-    } = filter_predicates(source_cols, years, filters);
+    } = filter_predicates(source_cols, years, filters, read.time);
+    let (g, grain_skipped) = grained(spec, source_cols, read);
+    let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
     let sql = rebuild(
         spec,
         &Relation::Sql(source_sql.to_owned()),
         predicates,
         &columns,
+        read,
+        g.as_ref(),
     )?;
-    Some(FilteredSql { sql, skipped })
+    Some(FilteredSql {
+        sql,
+        skipped,
+        grain_skipped,
+        grain: g.as_ref().map(|g| g.grain),
+        grain_column: g.as_ref().map(|g| g.column),
+        latest_limit,
+    })
 }
 
 /// The statements behind a records list (drill-down, BI-18·B): one page of
@@ -601,6 +779,26 @@ pub struct RecordsSql {
     pub count: String,
     /// Active filters the relation could not honour, as on the tile.
     pub skipped: Vec<SkippedFilter>,
+}
+
+/// What a records list is narrowed to.
+#[derive(Debug, Clone, Copy)]
+pub enum RecordsValue<'a> {
+    /// Rows whose column equals the clicked text.
+    Equals(&'a Ident, &'a str),
+    /// Rows whose date column falls in the clicked bucket of a grained chart
+    /// (BI-9): the bucket is computed by the server in the report zone and
+    /// compared as the text the tile carries.
+    Bucket {
+        /// The raw dimension column.
+        column: &'a Ident,
+        /// Its kind.
+        kind: ColumnKind,
+        /// The chart's grain.
+        grain: Grain,
+        /// The bucket as printed by the tile.
+        text: &'a str,
+    },
 }
 
 /// SQL for the rows behind a clicked value, or behind a whole tile when
@@ -620,9 +818,10 @@ pub fn records_sql<HCols>(
     from: &Relation,
     cols: &RelationColumns<HCols>,
     filters: &[FilterDef],
-    value: Option<(&Ident, &str)>,
+    value: Option<RecordsValue<'_>>,
     limit: u32,
     offset: u64,
+    time: &TimeContext,
 ) -> RecordsSql
 where
     HCols: std::hash::BuildHasher,
@@ -631,9 +830,27 @@ where
         mut predicates,
         skipped,
         ..
-    } = filter_predicates(cols, &[], filters);
-    if let Some((column, value)) = value {
-        predicates.insert(0, format!("{column} = {}", SqlLiteral::from(value)));
+    } = filter_predicates(cols, &[], filters, time);
+    match value {
+        Some(RecordsValue::Equals(column, value)) => {
+            predicates.insert(0, format!("{column} = {}", SqlLiteral::from(value)));
+        }
+        Some(RecordsValue::Bucket {
+            column,
+            kind,
+            grain,
+            text,
+        }) => {
+            // A grain that does not fit the column matches nothing rather
+            // than everything: an honest empty list.
+            predicates.insert(
+                0,
+                grain
+                    .records_predicate(column, kind, time, text)
+                    .unwrap_or_else(|| "0".to_owned()),
+            );
+        }
+        None => {}
     }
     let where_sql = if predicates.is_empty() {
         String::new()
@@ -669,6 +886,7 @@ pub fn filter_predicates<HCols>(
     cols: &RelationColumns<HCols>,
     years: &[i64],
     filters: &[FilterDef],
+    time: &TimeContext,
 ) -> FilterOutcome
 where
     HCols: std::hash::BuildHasher,
@@ -695,7 +913,7 @@ where
             out.skipped.push(skip(SkipReason::NoColumn));
             continue;
         };
-        match filter_predicate(f, &column, *kind) {
+        match filter_predicate(f, &column, *kind, time) {
             Some(p) => {
                 out.predicates.push(p);
                 out.columns.push(f.column.clone());
@@ -708,7 +926,12 @@ where
 
 /// One filter's predicate over `column` of `kind`, or `None` when the op
 /// does not fit that kind.
-fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<String> {
+fn filter_predicate(
+    f: &FilterDef,
+    column: &Ident,
+    kind: ColumnKind,
+    time: &TimeContext,
+) -> Option<String> {
     match f.op {
         // Kind-agnostic on purpose: it is what filters did before BI-18, and
         // a value list over a number column compares as the server coerces it.
@@ -722,12 +945,12 @@ fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<S
             let keyword = if f.op == FilterOp::In { "IN" } else { "NOT IN" };
             Some(format!("{column} {keyword} ({list})"))
         }
-        FilterOp::Between => between_predicate(f, column, kind),
+        FilterOp::Between => between_predicate(f, column, kind, time),
         FilterOp::Relative => {
             if !kind.is_temporal() {
                 return None;
             }
-            relative_predicate(f, &date_expr(column, kind))
+            relative_predicate(f, &time.day_expr(column, kind), time)
         }
         FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith | FilterOp::NotContains => {
             if kind != ColumnKind::Text {
@@ -757,27 +980,23 @@ fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<S
     }
 }
 
-/// The column as a `Date`: a `DateTime` compares by its calendar day.
-fn date_expr(column: &Ident, kind: ColumnKind) -> String {
-    if kind == ColumnKind::DateTime {
-        format!("toDate({column})")
-    } else {
-        column.to_string()
-    }
-}
-
 /// `col >= min AND col <= max` over a number or date column, either end
 /// optional. Ends are inclusive unless `min_exclusive` / `max_exclusive`
 /// turn that side into `>` / `<` (BI-18 round two: "after", "before",
 /// "greater than", "less than" must not include the named value).
-fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<String> {
+fn between_predicate(
+    f: &FilterDef,
+    column: &Ident,
+    kind: ColumnKind,
+    time: &TimeContext,
+) -> Option<String> {
     let (subject, render): (String, fn(&str) -> Option<String>) = match kind {
         ColumnKind::Number => (column.to_string(), |raw| {
             parse_number(raw).map(|v| v.to_string())
         }),
         // `toDate32`, not `toDate`: the validated range starts in 1900, which
         // `Date` cannot hold.
-        ColumnKind::Date | ColumnKind::DateTime => (date_expr(column, kind), |raw| {
+        ColumnKind::Date | ColumnKind::DateTime => (time.day_expr(column, kind), |raw| {
             parse_iso_date(raw).map(|(y, m, d)| format!("toDate32('{y:04}-{m:02}-{d:02}')"))
         }),
         ColumnKind::Text => return None,
@@ -797,37 +1016,48 @@ fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<
     }
 }
 
-/// A date range relative to `today()` over the date expression `d`. Only
-/// closed enums and the bounded `n` reach the SQL.
+/// A date range relative to today over the date expression `d`. Only closed
+/// enums and the bounded `n` reach the SQL.
 ///
 /// `last n unit` is the `n` units ending today, both ends included
-/// (`d > today() - n units`); `next n unit` is the `n` units starting
-/// tomorrow (`d > today() AND d <= today() + n units`); `this` and `previous` are calendar periods
-/// (weeks start on Monday). `today()` is the `ClickHouse` server's clock.
-fn relative_predicate(f: &FilterDef, d: &str) -> Option<String> {
+/// (`d > today - n units`); `next n unit` is the `n` units starting
+/// tomorrow (`d > today AND d <= today + n units`); `this` and `previous` are
+/// calendar periods. BI-9: "today" is the date in the report time zone
+/// ([`TimeContext::today_expr`]) and a week starts on the configured first
+/// day, not on the `ClickHouse` server's clock and Monday.
+fn relative_predicate(f: &FilterDef, d: &str, time: &TimeContext) -> Option<String> {
     let (unit, anchor) = (f.unit?, f.anchor?);
+    let today = time.today_expr();
     let (subtract, add, start) = match unit {
-        RelativeUnit::Day => ("subtractDays", "addDays", "toDate(today())"),
-        RelativeUnit::Week => ("subtractWeeks", "addWeeks", "toStartOfWeek(today(), 1)"),
-        RelativeUnit::Month => ("subtractMonths", "addMonths", "toStartOfMonth(today())"),
+        RelativeUnit::Day => ("subtractDays", "addDays", today.clone()),
+        RelativeUnit::Week => ("subtractWeeks", "addWeeks", time.week_start_expr()),
+        RelativeUnit::Month => (
+            "subtractMonths",
+            "addMonths",
+            format!("toStartOfMonth({today})"),
+        ),
         RelativeUnit::Quarter => (
             "subtractQuarters",
             "addQuarters",
-            "toStartOfQuarter(today())",
+            format!("toStartOfQuarter({today})"),
         ),
-        RelativeUnit::Year => ("subtractYears", "addYears", "toStartOfYear(today())"),
+        RelativeUnit::Year => (
+            "subtractYears",
+            "addYears",
+            format!("toStartOfYear({today})"),
+        ),
     };
     Some(match anchor {
         RelativeAnchor::Last => {
             let n =
                 f.n.filter(|n| (1..=crate::filters::MAX_RELATIVE_N).contains(n))?;
-            format!("({d} > {subtract}(today(), {n}) AND {d} <= today())")
+            format!("({d} > {subtract}({today}, {n}) AND {d} <= {today})")
         }
         // The mirror of `last`: tomorrow through `n` units ahead, today out.
         RelativeAnchor::Next => {
             let n =
                 f.n.filter(|n| (1..=crate::filters::MAX_RELATIVE_N).contains(n))?;
-            format!("({d} > today() AND {d} <= {add}(today(), {n}))")
+            format!("({d} > {today} AND {d} <= {add}({today}, {n}))")
         }
         RelativeAnchor::This => format!("({d} >= {start} AND {d} < {add}({start}, 1))"),
         RelativeAnchor::Previous => format!("({d} >= {subtract}({start}, 1) AND {d} < {start})"),
@@ -842,8 +1072,14 @@ fn rebuild(
     from: &Relation,
     where_clauses: Vec<String>,
     where_columns: &[String],
+    read: &ReadContext<'_>,
+    grained: Option<&Grained>,
 ) -> Option<String> {
     let def: &ChartInput = &spec.def;
+    if let Some(g) = grained {
+        let chart = GrainedChart::from_def(def, spec.spec.kind, g.grain)?;
+        return grained_sql(from, where_clauses, &chart, g.column, read.time);
+    }
     // BI-18·A review BLOCKER 1: a predicate on a column that the SELECT also
     // names as an alias would resolve to the alias (an aggregate) in WHERE.
     // Only then are the predicates moved into an inner relation; otherwise
@@ -871,7 +1107,7 @@ fn rebuild(
                 base: Box::new(from.clone()),
                 predicates: where_clauses,
             };
-            return rebuild(spec, &wrapped, Vec::new(), &[]);
+            return rebuild(spec, &wrapped, Vec::new(), &[], read, None);
         }
     }
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
@@ -947,6 +1183,105 @@ fn rebuild(
         builder = builder.raw_where(clause);
     }
     Some(builder.build())
+}
+
+/// The parts of a chart definition a grained query reads, as validated
+/// identifiers.
+#[derive(Debug)]
+pub struct GrainedChart {
+    /// The grain applied to the dimension.
+    pub grain: Grain,
+    /// The date or timestamp dimension.
+    pub dimension: Ident,
+    /// The optional second dimension.
+    pub breakdown: Option<Ident>,
+    /// The measure columns.
+    pub measures: Vec<Ident>,
+    /// The aggregate.
+    pub agg: Aggregate,
+    /// `"none"` (by bucket), `"asc"` or `"desc"` (by value).
+    pub order: String,
+    /// The bucket limit.
+    pub limit: u32,
+}
+
+impl GrainedChart {
+    /// Read the identifiers out of a stored definition. `None` when one no
+    /// longer validates (data corruption).
+    #[must_use]
+    pub fn from_def(def: &ChartInput, kind: crate::specs::ChartKind, grain: Grain) -> Option<Self> {
+        let mut measures = Vec::with_capacity(def.measures.len());
+        for m in &def.measures {
+            measures.push(Ident::new(m.clone()).ok()?);
+        }
+        let order = def.order.clone().unwrap_or_else(|| "none".to_owned());
+        let limit = grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit));
+        Some(Self {
+            grain,
+            dimension: Ident::new(def.dimension.clone()).ok()?,
+            breakdown: def
+                .breakdown
+                .as_ref()
+                .and_then(|b| Ident::new(b.clone()).ok()),
+            measures,
+            agg: Aggregate::from_str_lossy(def.aggregate.as_deref().unwrap_or("sum")),
+            order,
+            limit,
+        })
+    }
+}
+
+/// The SQL of a grained chart over `from` with `predicates` applied to the
+/// raw rows (BI-9). The predicates go into an inner relation
+/// ([`Relation::Filtered`]) under the bucketing one ([`Relation::Bucketed`]),
+/// so a filter on the dimension's own column reads the raw column, never the
+/// bucket that carries its name. `None` when the grain does not apply to
+/// `column`.
+#[must_use]
+pub fn grained_sql(
+    from: &Relation,
+    predicates: Vec<String>,
+    chart: &GrainedChart,
+    column: ColumnKind,
+    time: &TimeContext,
+) -> Option<String> {
+    let expr = chart.grain.bucket_expr(&chart.dimension, column, time)?;
+    let base = if predicates.is_empty() {
+        from.clone()
+    } else {
+        Relation::Filtered {
+            base: Box::new(from.clone()),
+            predicates,
+        }
+    };
+    let mut carried: Vec<String> = Vec::new();
+    for name in chart
+        .breakdown
+        .iter()
+        .chain(chart.measures.iter())
+        .map(ToString::to_string)
+    {
+        if name != chart.dimension.as_str() && !carried.contains(&name) {
+            carried.push(name);
+        }
+    }
+    let bucketed = Relation::Bucketed {
+        base: Box::new(base),
+        dimension: chart.dimension.to_string(),
+        expr,
+        carried,
+    };
+    Some(
+        QueryBuilder::over(bucketed)
+            .dimension(chart.dimension.clone())
+            .aggregate(chart.agg)
+            .order(chart.order.clone())
+            .limit(chart.limit)
+            .breakdown(chart.breakdown.clone())
+            .grain(chart.grain, time.week_start())
+            .measures(chart.measures.clone())
+            .build(),
+    )
 }
 
 impl QueryBuilder<Ready> {
@@ -1060,6 +1395,90 @@ mod tests {
 
     use super::*;
     use crate::specs::ChartKind;
+
+    // BI-9: the public builders now take the time settings. The tests that
+    // predate it call these shims, which pass the default context
+    // (`Asia/Jakarta`, Monday) and no dashboard grain switch; the grain tests
+    // call the real functions.
+    static DEFAULT_TIME: std::sync::LazyLock<TimeContext> =
+        std::sync::LazyLock::new(TimeContext::default);
+
+    fn read() -> ReadContext<'static> {
+        ReadContext::new(&DEFAULT_TIME)
+    }
+
+    fn sql_with_filters<HMap, HCols>(
+        spec: &StoredChartSpec,
+        years: &[i64],
+        filters: &[FilterDef],
+        mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+    ) -> String
+    where
+        HMap: std::hash::BuildHasher,
+        HCols: std::hash::BuildHasher + Default,
+    {
+        super::sql_with_filters(spec, years, filters, mart_cols, &read())
+    }
+
+    fn sql_with_filters_report<HMap, HCols>(
+        spec: &StoredChartSpec,
+        years: &[i64],
+        filters: &[FilterDef],
+        mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+    ) -> FilteredSql
+    where
+        HMap: std::hash::BuildHasher,
+        HCols: std::hash::BuildHasher + Default,
+    {
+        super::sql_with_filters_report(spec, years, filters, mart_cols, &read())
+    }
+
+    fn sql_for_sql_source<HCols: std::hash::BuildHasher>(
+        spec: &StoredChartSpec,
+        source_sql: &str,
+        source_cols: &RelationColumns<HCols>,
+        years: &[i64],
+        filters: &[FilterDef],
+    ) -> Option<String> {
+        super::sql_for_sql_source(spec, source_sql, source_cols, years, filters, &read())
+    }
+
+    fn sql_for_sql_source_report<HCols: std::hash::BuildHasher>(
+        spec: &StoredChartSpec,
+        source_sql: &str,
+        source_cols: &RelationColumns<HCols>,
+        years: &[i64],
+        filters: &[FilterDef],
+    ) -> Option<FilteredSql> {
+        super::sql_for_sql_source_report(spec, source_sql, source_cols, years, filters, &read())
+    }
+
+    fn filter_predicates<HCols: std::hash::BuildHasher>(
+        cols: &RelationColumns<HCols>,
+        years: &[i64],
+        filters: &[FilterDef],
+    ) -> FilterOutcome {
+        super::filter_predicates(cols, years, filters, &DEFAULT_TIME)
+    }
+
+    fn records_sql<HCols: std::hash::BuildHasher>(
+        from: &Relation,
+        cols: &RelationColumns<HCols>,
+        filters: &[FilterDef],
+        value: Option<(&Ident, &str)>,
+        limit: u32,
+        offset: u64,
+    ) -> RecordsSql {
+        super::records_sql(
+            from,
+            cols,
+            filters,
+            value.map(|(c, v)| RecordsValue::Equals(c, v)),
+            limit,
+            offset,
+            &DEFAULT_TIME,
+        )
+    }
 
     /// Every column is `Text`: the legacy `in` filters these tests exercise
     /// do not depend on a column's kind.
@@ -1590,7 +2009,7 @@ mod tests {
         );
         assert_eq!(
             one_predicate(&[("d", ColumnKind::DateTime)], json),
-            "(toDate(d) >= toDate32('2024-01-05') AND toDate(d) <= toDate32('2024-12-31'))"
+            "(toDate32(toTimeZone(d, 'Asia/Jakarta')) >= toDate32('2024-01-05') AND toDate32(toTimeZone(d, 'Asia/Jakarta')) <= toDate32('2024-12-31'))"
         );
     }
 
@@ -1653,42 +2072,42 @@ mod tests {
                 &cols,
                 r#"{"column":"d","op":"relative","anchor":"last","n":30,"unit":"day"}"#
             ),
-            "(d > subtractDays(today(), 30) AND d <= today())"
+            "(d > subtractDays(toDate(now('Asia/Jakarta')), 30) AND d <= toDate(now('Asia/Jakarta')))"
         );
         assert_eq!(
             one_predicate(
                 &cols,
                 r#"{"column":"d","op":"relative","anchor":"last","n":3,"unit":"quarter"}"#
             ),
-            "(d > subtractQuarters(today(), 3) AND d <= today())"
+            "(d > subtractQuarters(toDate(now('Asia/Jakarta')), 3) AND d <= toDate(now('Asia/Jakarta')))"
         );
         assert_eq!(
             one_predicate(
                 &cols,
                 r#"{"column":"d","op":"relative","anchor":"this","unit":"month"}"#
             ),
-            "(d >= toStartOfMonth(today()) AND d < addMonths(toStartOfMonth(today()), 1))"
+            "(d >= toStartOfMonth(toDate(now('Asia/Jakarta'))) AND d < addMonths(toStartOfMonth(toDate(now('Asia/Jakarta'))), 1))"
         );
         assert_eq!(
             one_predicate(
                 &cols,
                 r#"{"column":"d","op":"relative","anchor":"this","unit":"week"}"#
             ),
-            "(d >= toStartOfWeek(today(), 1) AND d < addWeeks(toStartOfWeek(today(), 1), 1))"
+            "(d >= toStartOfWeek(toDate(now('Asia/Jakarta')), 1) AND d < addWeeks(toStartOfWeek(toDate(now('Asia/Jakarta')), 1), 1))"
         );
         assert_eq!(
             one_predicate(
                 &cols,
                 r#"{"column":"d","op":"relative","anchor":"previous","unit":"year"}"#
             ),
-            "(d >= subtractYears(toStartOfYear(today()), 1) AND d < toStartOfYear(today()))"
+            "(d >= subtractYears(toStartOfYear(toDate(now('Asia/Jakarta'))), 1) AND d < toStartOfYear(toDate(now('Asia/Jakarta'))))"
         );
         assert_eq!(
             one_predicate(
                 &[("t", ColumnKind::DateTime)],
                 r#"{"column":"t","op":"relative","anchor":"this","unit":"day"}"#
             ),
-            "(toDate(t) >= toDate(today()) AND toDate(t) < addDays(toDate(today()), 1))"
+            "(toDate32(toTimeZone(t, 'Asia/Jakarta')) >= toDate(now('Asia/Jakarta')) AND toDate32(toTimeZone(t, 'Asia/Jakarta')) < addDays(toDate(now('Asia/Jakarta')), 1))"
         );
     }
 
@@ -1707,7 +2126,9 @@ mod tests {
             );
             assert_eq!(
                 one_predicate(&cols, &json),
-                format!("(d > today() AND d <= {add}(today(), 7))")
+                format!(
+                    "(d > toDate(now('Asia/Jakarta')) AND d <= {add}(toDate(now('Asia/Jakarta')), 7))"
+                )
             );
         }
         assert_eq!(
@@ -1715,7 +2136,7 @@ mod tests {
                 &[("t", ColumnKind::DateTime)],
                 r#"{"column":"t","op":"relative","anchor":"next","n":3,"unit":"day"}"#
             ),
-            "(toDate(t) > today() AND toDate(t) <= addDays(today(), 3))"
+            "(toDate32(toTimeZone(t, 'Asia/Jakarta')) > toDate(now('Asia/Jakarta')) AND toDate32(toTimeZone(t, 'Asia/Jakarta')) <= addDays(toDate(now('Asia/Jakarta')), 3))"
         );
         // `next` without `n` is not valid and never reaches SQL.
         let f = filter(r#"{"column":"d","op":"relative","anchor":"next","unit":"day"}"#);
@@ -1758,7 +2179,7 @@ mod tests {
         );
         assert_eq!(
             one_predicate(&[("d", ColumnKind::DateTime)], json),
-            "toDate(d) > toDate32('2026-10-03')"
+            "toDate32(toTimeZone(d, 'Asia/Jakarta')) > toDate32('2026-10-03')"
         );
         assert_eq!(
             one_predicate(
@@ -2125,5 +2546,327 @@ mod tests {
         );
         assert_eq!(got.skipped.len(), 1);
         assert!(!got.rows.contains("WHERE"), "{}", got.rows);
+    }
+
+    // ── BI-9: time grain ────────────────────────────────────────────────
+
+    fn grained_spec(kind: ChartKind, grain: &str, order: &str) -> StoredChartSpec {
+        let mut spec = stored_spec(kind, "mart_x", "d", &["v"]);
+        spec.def.grain = Some(grain.to_owned());
+        spec.def.order = Some(order.to_owned());
+        spec
+    }
+
+    fn dated(kind: ColumnKind) -> HashMap<String, RelationColumns> {
+        let mut cols: RelationColumns = RelationColumns::default();
+        cols.insert("d".to_owned(), kind);
+        cols.insert("v".to_owned(), ColumnKind::Number);
+        cols.insert("g".to_owned(), ColumnKind::Text);
+        HashMap::from([("mart_x".to_owned(), cols)])
+    }
+
+    fn read_with(time: &TimeContext, grain: Option<Grain>) -> ReadContext<'_> {
+        ReadContext { time, grain }
+    }
+
+    #[test]
+    fn a_grained_chart_buckets_the_dimension_in_an_inner_relation_and_keeps_the_latest() {
+        let spec = grained_spec(ChartKind::Line, "month", "none");
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert_eq!(
+            got.sql,
+            "SELECT * FROM (SELECT d, round(sum(v)) AS v FROM \
+             (SELECT date_trunc('month', d) AS d, v FROM serving.mart_x) AS bkt \
+             GROUP BY d ORDER BY d DESC LIMIT 21) ORDER BY d"
+        );
+        assert_eq!(got.latest_limit, Some(20));
+        assert_eq!(got.grain_skipped, None);
+    }
+
+    #[test]
+    fn a_grained_chart_is_never_served_from_the_stored_sql() {
+        let spec = grained_spec(ChartKind::Line, "month", "none");
+        let got = sql_with_filters(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert_ne!(got, "SELECT 1");
+        // The same chart with no grain still gets its stored SQL byte for byte.
+        let mut plain = spec;
+        plain.def.grain = None;
+        assert_eq!(
+            sql_with_filters(&plain, &[], &[], &dated(ColumnKind::Date)),
+            "SELECT 1"
+        );
+    }
+
+    #[test]
+    fn every_grain_builds_on_a_date_and_on_a_timestamp_and_the_refused_ones_fall_back_to_the_raw_column()
+     {
+        for grain in crate::grain::ALL_GRAINS {
+            for (kind, fits) in [
+                (ColumnKind::Date, !grain.needs_time()),
+                (ColumnKind::DateTime, true),
+            ] {
+                let spec = grained_spec(ChartKind::Bar, grain.as_str(), "none");
+                let sql = sql_with_filters(&spec, &[], &[], &dated(kind));
+                if fits {
+                    assert!(sql.contains(") AS bkt "), "{grain:?} {kind:?}: {sql}");
+                    assert!(sql.contains(" AS d"), "{grain:?} {kind:?}: {sql}");
+                } else {
+                    // A Date has no hour: the chart is rebuilt without the
+                    // grain, never from the stored SQL that carries it.
+                    assert!(!sql.contains("bkt"), "{grain:?} {kind:?}: {sql}");
+                    assert!(sql.starts_with("SELECT d, "), "{grain:?} {kind:?}: {sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dashboard_filter_on_the_grained_column_reads_the_raw_column() {
+        let spec = grained_spec(ChartKind::Line, "month", "none");
+        let f = filter(r#"{"column":"d","op":"between","min":"2026-01-01","max":"2026-03-31"}"#);
+        let sql = sql_with_filters(&spec, &[], &[f], &dated(ColumnKind::Date));
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT d, round(sum(v)) AS v FROM \
+             (SELECT date_trunc('month', d) AS d, v FROM \
+             (SELECT * FROM serving.mart_x WHERE (d >= toDate32('2026-01-01') AND d <= toDate32('2026-03-31'))) AS flt) AS bkt \
+             GROUP BY d ORDER BY d DESC LIMIT 21) ORDER BY d"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_an_aggregated_column_still_filters_rows_before_the_aggregate() {
+        let spec = grained_spec(ChartKind::Line, "week", "none");
+        let f = filter(r#"{"column":"v","op":"between","min":"5"}"#);
+        let sql = sql_with_filters(&spec, &[], &[f], &dated(ColumnKind::Date));
+        assert!(
+            sql.contains("(SELECT * FROM serving.mart_x WHERE v >= 5) AS flt"),
+            "{sql}"
+        );
+        assert!(!sql.contains("HAVING"), "{sql}");
+    }
+
+    #[test]
+    fn a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series() {
+        let mut spec = grained_spec(ChartKind::Line, "quarter", "none");
+        spec.def.breakdown = Some("g".to_owned());
+        spec.def.limit = Some(8);
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
+        assert_eq!(
+            got.sql,
+            "SELECT d, g, round(sum(v)) AS v FROM \
+             (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
+             WHERE d IN (SELECT d FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
+             GROUP BY d ORDER BY d DESC LIMIT 9) GROUP BY d, g ORDER BY d, g"
+        );
+        assert_eq!(got.latest_limit, Some(8));
+    }
+
+    #[test]
+    fn a_value_order_is_the_editors_choice_and_keeps_the_top_buckets_not_the_latest() {
+        let spec = grained_spec(ChartKind::Bar, "month", "desc");
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert_eq!(
+            got.sql,
+            "SELECT d, round(sum(v)) AS v FROM \
+             (SELECT date_trunc('month', d) AS d, v FROM serving.mart_x) AS bkt \
+             GROUP BY d ORDER BY v DESC LIMIT 20"
+        );
+        assert_eq!(got.latest_limit, None);
+    }
+
+    #[test]
+    fn day_of_week_is_ordered_from_the_configured_first_day() {
+        let spec = grained_spec(ChartKind::Bar, "day_of_week", "none");
+        let cols = dated(ColumnKind::Date);
+        let monday = TimeContext::new("Asia/Jakarta", WeekStart::Monday).unwrap();
+        let sunday = TimeContext::new("Asia/Jakarta", WeekStart::Sunday).unwrap();
+        let m = super::sql_with_filters(&spec, &[], &[], &cols, &read_with(&monday, None));
+        let s = super::sql_with_filters(&spec, &[], &[], &cols, &read_with(&sunday, None));
+        // BI-9 review fix (BLOCKER) R1: a part is never cut to its latest buckets.
+        assert!(m.ends_with("GROUP BY d ORDER BY d LIMIT 64"), "{m}");
+        assert!(s.ends_with("GROUP BY d ORDER BY d % 7 LIMIT 64"), "{s}");
+        assert!(m.contains("toDayOfWeek(d) AS d") && s.contains("toDayOfWeek(d) AS d"));
+    }
+
+    #[test]
+    fn the_dashboard_switch_replaces_a_truncation_only_and_reports_a_chart_that_cannot_take_it() {
+        let cols = dated(ColumnKind::Date);
+        let time = TimeContext::default();
+        let line = grained_spec(ChartKind::Line, "day", "none");
+        let got = super::sql_with_filters_report(
+            &line,
+            &[],
+            &[],
+            &cols,
+            &read_with(&time, Some(Grain::Month)),
+        );
+        assert!(
+            got.sql.contains("date_trunc('month', d) AS d"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.grain_skipped, None);
+
+        let part = grained_spec(ChartKind::Bar, "day_of_week", "none");
+        let got = super::sql_with_filters_report(
+            &part,
+            &[],
+            &[],
+            &cols,
+            &read_with(&time, Some(Grain::Month)),
+        );
+        assert!(
+            got.sql.contains("toDayOfWeek(d) AS d"),
+            "a part ignores the switch"
+        );
+        assert_eq!(got.grain_skipped, None);
+
+        // `hour` on a plain date: the chart keeps its own grain, and says so.
+        let got = super::sql_with_filters_report(
+            &line,
+            &[],
+            &[],
+            &cols,
+            &read_with(&time, Some(Grain::Hour)),
+        );
+        assert_eq!(got.grain_skipped, Some(Grain::Hour));
+        assert!(got.sql.contains("bkt"), "{}", got.sql);
+
+        let plain = stored_spec(ChartKind::Bar, "mart_x", "g", &["v"]);
+        let got = super::sql_with_filters_report(
+            &plain,
+            &[],
+            &[],
+            &cols,
+            &read_with(&time, Some(Grain::Month)),
+        );
+        assert_eq!(got.sql, "SELECT 1", "a chart without a grain is untouched");
+    }
+
+    #[test]
+    fn a_calendar_takes_day_only_and_up_to_a_thousand_buckets() {
+        let mut spec = grained_spec(ChartKind::Calendar, "day", "none");
+        spec.def.limit = Some(900);
+        let sql = sql_with_filters(&spec, &[], &[], &dated(ColumnKind::DateTime));
+        assert!(
+            sql.contains("toDate32(toTimeZone(d, 'Asia/Jakarta')) AS d"),
+            "{sql}"
+        );
+        assert!(sql.contains("LIMIT 901"), "{sql}");
+    }
+
+    #[test]
+    fn a_sql_source_chart_is_grained_inside_the_capped_statement() {
+        let mut spec = source_spec(ChartKind::Line, "d", &["v"]);
+        spec.def.grain = Some("month".to_owned());
+        spec.def.order = Some("none".to_owned());
+        let mut cols: RelationColumns = RelationColumns::default();
+        cols.insert("d".to_owned(), ColumnKind::Date);
+        cols.insert("v".to_owned(), ColumnKind::Number);
+        let got = sql_for_sql_source_report(&spec, SOURCE_SQL, &cols, &[], &[]).unwrap();
+        assert!(
+            got.sql
+                .contains(&format!("FROM (\n{SOURCE_SQL}\n) AS src) AS bkt")),
+            "{}",
+            got.sql
+        );
+        assert!(got.sql.ends_with(SQL_SOURCE_SETTINGS), "{}", got.sql);
+        assert_eq!(got.latest_limit, Some(20));
+    }
+
+    #[test]
+    fn records_for_a_clicked_bucket_compare_the_bucket_in_the_report_zone() {
+        let ts = Ident::new("ts").unwrap();
+        let mut cols: RelationColumns = RelationColumns::default();
+        cols.insert("ts".to_owned(), ColumnKind::DateTime);
+        let from = Relation::Mart(Ident::new("mart_x").unwrap());
+        let sunday = TimeContext::new("Europe/Berlin", WeekStart::Sunday).unwrap();
+        let got = super::records_sql(
+            &from,
+            &cols,
+            &[],
+            Some(RecordsValue::Bucket {
+                column: &ts,
+                kind: ColumnKind::DateTime,
+                grain: Grain::Week,
+                text: "2026-03-01",
+            }),
+            50,
+            0,
+            &sunday,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.mart_x WHERE toString(date_trunc('week', \
+             toTimeZone(ts, 'Europe/Berlin') + toIntervalDay(1)) - toIntervalDay(1)) = '2026-03-01' \
+             ORDER BY ALL LIMIT 50 OFFSET 0"
+        );
+        // A grain the column cannot take matches nothing, not everything.
+        let got = super::records_sql(
+            &from,
+            &cols,
+            &[],
+            Some(RecordsValue::Bucket {
+                column: &ts,
+                kind: ColumnKind::Date,
+                grain: Grain::Hour,
+                text: "x",
+            }),
+            50,
+            0,
+            &sunday,
+        );
+        assert!(got.rows.contains("WHERE 0 "), "{}", got.rows);
+    }
+
+    #[test]
+    fn relative_filters_follow_the_zone_and_the_first_day_of_the_week() {
+        let sunday = TimeContext::new("Europe/Berlin", WeekStart::Sunday).unwrap();
+        let f = filter(r#"{"column":"t","op":"relative","anchor":"this","unit":"week"}"#);
+        let out =
+            super::filter_predicates(&typed(&[("t", ColumnKind::DateTime)]), &[], &[f], &sunday);
+        let day = "toDate32(toTimeZone(t, 'Europe/Berlin'))";
+        let start = "toStartOfWeek(toDate(now('Europe/Berlin')), 0)";
+        assert_eq!(
+            out.predicates,
+            [format!(
+                "({day} >= {start} AND {day} < addWeeks({start}, 1))"
+            )]
+        );
+    }
+
+    /// BI-9 review fix (BLOCKER) R1: `hour_of_day` ordered by bucket returned
+    /// hours 4 to 23 because the latest-N rule dropped 0 to 3.
+    #[test]
+    fn a_part_ordered_by_bucket_returns_its_whole_range_whatever_the_limit() {
+        for limit in [1, 5, 20, 1000] {
+            for grain in ["hour_of_day", "day_of_month", "week_of_year", "day_of_week"] {
+                let mut spec = grained_spec(ChartKind::Bar, grain, "none");
+                spec.def.limit = Some(limit);
+                let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
+                assert_eq!(got.latest_limit, None, "{grain} {limit}");
+                assert!(got.sql.contains("LIMIT 64"), "{grain} {limit}: {}", got.sql);
+                assert!(
+                    !got.sql.contains("DESC LIMIT"),
+                    "{grain} {limit}: {}",
+                    got.sql
+                );
+                assert!(!got.sql.starts_with("SELECT * FROM (SELECT"), "{}", got.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_with_a_value_order_keeps_the_editors_top_n_and_a_truncation_keeps_latest_n() {
+        let mut spec = grained_spec(ChartKind::Bar, "hour_of_day", "desc");
+        spec.def.limit = Some(5);
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
+        assert!(got.sql.contains("ORDER BY v DESC LIMIT 5"), "{}", got.sql);
+        let mut month = grained_spec(ChartKind::Bar, "month", "none");
+        month.def.limit = Some(5);
+        let got = sql_with_filters_report(&month, &[], &[], &dated(ColumnKind::Date));
+        assert_eq!(got.latest_limit, Some(5));
+        assert!(got.sql.contains("LIMIT 6"), "{}", got.sql);
     }
 }

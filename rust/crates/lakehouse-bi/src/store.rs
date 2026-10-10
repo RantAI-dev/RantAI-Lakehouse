@@ -29,6 +29,8 @@ use thiserror::Error;
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
 use crate::click::ClickAction;
 use crate::embed_access::{self, EmbedAccess};
+use crate::filters::ColumnKind;
+use crate::grain::{Grain, TimeContext};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
@@ -326,6 +328,13 @@ pub struct ChartInput {
     /// [`ClickAction::validate`] when the chart is built.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub click: Option<ClickAction>,
+    /// How the date or timestamp `dimension` is grouped (`BI-9`): one of the
+    /// thirteen names in [`crate::grain::Grain`], absent on every chart saved
+    /// before it existed. A `String` and not the enum so a wrong value is
+    /// refused at save with a plain message instead of a generic "body JSON is
+    /// invalid"; read back through [`crate::grain::Grain::parse`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grain: Option<String>,
 }
 
 /// A dashboard.
@@ -363,6 +372,11 @@ pub struct Board {
     /// a board saved before the column existed serialises without the key.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub refresh_seconds: Option<u32>,
+    /// The grain an editor saved for the board's time-grouped charts (`BI-9`;
+    /// one of the truncations in [`crate::grain::Grain`]). `None` when none
+    /// was saved: each chart then uses its own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grain: Option<String>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -520,6 +534,13 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // BI-9: the time grain a dashboard opens with, `''` meaning "each chart's
+    // own". A constant default for the same reason as the columns above.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS grain String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -630,7 +651,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -684,6 +705,7 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         refresh_seconds: Some(row_u64(row, "refresh_seconds"))
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| *n > 0),
+        grain: Some(row_str(row, "grain").to_owned()).filter(|g| !g.is_empty()),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -772,6 +794,7 @@ pub async fn create_board(
         layout: Some(LayoutMap::new()),
         filters: Some(Vec::new()),
         refresh_seconds: None,
+        grain: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -796,6 +819,7 @@ async fn upsert_board(
     folder_id: &str,
     embed_access: &EmbedAccess,
     refresh_seconds: u32,
+    grain: &str,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -807,8 +831,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -824,6 +848,8 @@ async fn upsert_board(
         // Carried on every save like the embed state above: an unrelated
         // edit must not reset the board's saved refresh (BI-18·B).
         refresh_seconds,
+        // Carried on every save like the refresh above (BI-9).
+        SqlLiteral::from(grain),
     );
     ch.exec(&sql, None).await
 }
@@ -872,6 +898,7 @@ async fn save_board_patch(
     let refresh_seconds = patch
         .refresh_seconds
         .unwrap_or_else(|| board.refresh_seconds.unwrap_or(0));
+    let grain = patch.grain.or(board.grain.as_deref()).unwrap_or("");
     upsert_board(
         ch,
         &board.id,
@@ -885,6 +912,7 @@ async fn save_board_patch(
         folder_id,
         embed_access,
         refresh_seconds,
+        grain,
     )
     .await
 }
@@ -903,6 +931,7 @@ struct BoardPatch<'a> {
     folder_id: Option<&'a str>,
     embed_access: Option<&'a EmbedAccess>,
     refresh_seconds: Option<u32>,
+    grain: Option<&'a str>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -999,6 +1028,7 @@ pub async fn update_board_layout(
         layout: None,
         filters: None,
         refresh_seconds: None,
+        grain: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1037,6 +1067,7 @@ pub async fn update_board_filters(
         layout: None,
         filters: None,
         refresh_seconds: None,
+        grain: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1074,6 +1105,7 @@ pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Resu
         layout: None,
         filters: None,
         refresh_seconds: None,
+        grain: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1086,6 +1118,50 @@ pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Resu
         &board,
         BoardPatch {
             refresh_seconds: Some(seconds),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save the grain a dashboard opens with (`BI-9`), or clear it with `""`.
+/// Same fallback as [`update_board_layout`] for the built-in board's row.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when `grain` is neither empty nor a
+/// truncation (`minute` to `year`: a part of the date cannot replace every
+/// chart's grain), or [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<(), BiError> {
+    if !grain.is_empty() && !Grain::parse(grain).is_some_and(Grain::is_truncation) {
+        return Err(BiError::Validation(
+            "grain must be one of minute, hour, day, week, month, quarter, year, or empty."
+                .to_owned(),
+        ));
+    }
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
+        id: id.to_owned(),
+        name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
+        layout: None,
+        filters: None,
+        refresh_seconds: None,
+        grain: None,
+        created_at: None,
+        updated_at: None,
+        public_token: None,
+        embed_enabled: None,
+        folder_id: None,
+        embed_access: EmbedAccess::default(),
+    });
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            grain: Some(grain),
             ..Default::default()
         },
     )
@@ -1488,6 +1564,7 @@ fn empty_chart_input() -> ChartInput {
         caption: None,
         target: None,
         click: None,
+        grain: None,
     }
 }
 
@@ -1498,7 +1575,7 @@ fn empty_chart_input() -> ChartInput {
 async fn validated_mart_columns(
     ch: &ChClient,
     mart: &str,
-) -> Result<std::collections::HashSet<String>, BiError> {
+) -> Result<std::collections::HashMap<String, ColumnKind>, BiError> {
     let exists_sql = format!(
         "SELECT toString(count()) AS n FROM system.tables WHERE database='serving' AND name={} AND name NOT LIKE '%\\_baru'",
         SqlLiteral::from(mart)
@@ -1519,16 +1596,22 @@ async fn validated_mart_columns(
         )));
     }
     let cols_sql = format!(
-        "SELECT name FROM system.columns WHERE database='serving' AND table={}",
+        "SELECT name, type FROM system.columns WHERE database='serving' AND table={}",
         SqlLiteral::from(mart)
     );
     let cols_rows = ch
         .rows(&cols_sql, None)
         .await
         .map_err(BiError::Clickhouse)?;
+    // The kind comes from the type, never the name (BI-9 needs it to decide
+    // whether a grain fits the dimension).
     Ok(cols_rows
         .iter()
-        .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?;
+            let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
+            Some((name.to_owned(), ColumnKind::from_clickhouse_type(ty)))
+        })
         .collect())
 }
 
@@ -1604,6 +1687,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         caption: caption.clone(),
         target,
         click: None,
+        grain: None,
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
@@ -1694,6 +1778,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         caption: None,
         target: None,
         click: None,
+        grain: None,
     };
     let spec = ChartSpec {
         id: new_id,
@@ -1746,7 +1831,11 @@ struct ChartCtx<'a> {
     has_year: bool,
     created_by: &'a str,
     cols: std::collections::HashSet<String>,
+    /// The kind of each column in `cols`, for the grain check (BI-9).
+    kinds: std::collections::HashMap<String, ColumnKind>,
     geo: GeoFields,
+    grain: Option<Grain>,
+    time: &'a TimeContext,
 }
 
 /// `map`/`lat`/`lon` of a chart input once their shape is checked: trimmed,
@@ -1988,6 +2077,51 @@ fn build_chart_sql(
         .build())
 }
 
+/// What [`grained_chart_sql`] needs, all already checked against the
+/// relation's columns.
+struct GrainedInput<'a> {
+    column: ColumnKind,
+    dimension: &'a str,
+    measures: &'a [String],
+    agg: &'a str,
+    order: &'a str,
+    limit: u32,
+    breakdown: Option<&'a str>,
+}
+
+/// The stored SQL of a grained chart (`BI-9`): the same statement the
+/// dashboard rebuilds at read time, without dashboard filters. It is run once
+/// when the chart is saved (the smoke test) and by the builder's preview, and
+/// is never served to a dashboard, which rebuilds it with the current time
+/// settings.
+fn grained_chart_sql(
+    from: &Relation,
+    grain: Grain,
+    input: &GrainedInput<'_>,
+    time: &TimeContext,
+) -> Result<String, BiError> {
+    let ident = |name: &str, what: &str| {
+        Ident::new(name)
+            .map_err(|_| BiError::Validation(format!("invalid or missing {what} column '{name}'.")))
+    };
+    let chart = crate::builder::GrainedChart {
+        grain,
+        dimension: ident(input.dimension, "dimension")?,
+        breakdown: input.breakdown.map(|b| ident(b, "breakdown")).transpose()?,
+        measures: input
+            .measures
+            .iter()
+            .map(|m| ident(m, "measure"))
+            .collect::<Result<_, _>>()?,
+        agg: Aggregate::from_str_lossy(input.agg),
+        order: input.order.to_owned(),
+        limit: crate::grain::effective_limit(grain, input.order, input.limit),
+    };
+    crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
+        BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
+    })
+}
+
 /// Re-validate the columns of a point map as [`Ident`]s and build its SQL
 /// ([`crate::builder::build_points_sql`]). Split out of `build_chart_sql`,
 /// which already takes as many arguments as clippy allows.
@@ -2025,8 +2159,17 @@ fn build_point_chart_sql(
 /// cell per day, so up to a year of rows; a point map has its own fixed cap
 /// ([`crate::builder::point_limit`]); every other kind keeps the Top-N range
 /// the builder offers (1-100).
-fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32, String) {
-    let limit = if kind == ChartKind::Calendar {
+fn limit_and_order(
+    kind: ChartKind,
+    input: &ChartInput,
+    from: &Relation,
+    grained: bool,
+) -> (u32, String) {
+    // BI-9: a grained chart may ask for up to a thousand buckets and, unless
+    // the editor chose a value order, is ordered by bucket.
+    let limit = if grained {
+        crate::grain::clamp_limit(kind, input.limit)
+    } else if kind == ChartKind::Calendar {
         input.limit.unwrap_or(366).clamp(1, 366)
     } else if is_point_kind(kind) {
         crate::builder::point_limit(from)
@@ -2034,10 +2177,12 @@ fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32
         input.limit.unwrap_or(20).clamp(1, 100)
     };
     let order = input.order.clone().unwrap_or_else(|| {
-        if matches!(
-            kind,
-            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
-        ) {
+        if grained
+            || matches!(
+                kind,
+                ChartKind::Line | ChartKind::Area | ChartKind::Calendar
+            )
+        {
             "none".to_owned()
         } else {
             "desc".to_owned()
@@ -2049,6 +2194,13 @@ fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32
 /// Assemble the `table`/chart branch of `specFromInput` (grouped, needs a
 /// dimension; validates `stacked`/`scatter`/`combo`/`bubble` measure-count
 /// rules and the optional breakdown column).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line assembly of the stored definition, its SQL and \
+              its render spec from one destructured context; BI-9 added the \
+              grain check and branch, and splitting them out would pass the \
+              same fifteen values through another function"
+)]
 fn spec_from_chart_input(
     input: &ChartInput,
     ctx: ChartCtx<'_>,
@@ -2069,14 +2221,22 @@ fn spec_from_chart_input(
         has_year,
         created_by,
         cols,
+        kinds,
         geo,
+        grain,
+        time,
     } = ctx;
 
     let dimension = input.dimension.clone();
-    let (limit, order) = limit_and_order(kind, input, &from);
+    let (limit, order) = limit_and_order(kind, input, &from, grain.is_some());
     let breakdown = input.breakdown.clone().unwrap_or_default();
     validate_chart_shape(kind, &dimension, &measures, &breakdown, &cols)?;
     validate_point_columns(&geo, &dimension, &measures, &cols)?;
+    if let Some(g) = grain {
+        // BI-9: the dimension's column type decides whether the grain fits.
+        g.validate(kind, kinds.get(&dimension).copied())
+            .map_err(BiError::Validation)?;
+    }
 
     let breakdown_opt = if breakdown.is_empty() {
         None
@@ -2104,10 +2264,23 @@ fn spec_from_chart_input(
         caption: None,
         target: None,
         click: None,
+        grain: grain.map(|g| g.as_str().to_owned()),
     };
 
     let sql = if is_point_kind(kind) {
         build_point_chart_sql(&from, &geo, &dimension, &measures, &agg)?
+    } else if let Some(g) = grain {
+        let column = kinds.get(&dimension).copied().unwrap_or(ColumnKind::Text);
+        let input = GrainedInput {
+            column,
+            dimension: &dimension,
+            measures: &measures,
+            agg: &agg,
+            order: &order,
+            limit,
+            breakdown: breakdown_opt.as_deref(),
+        };
+        grained_chart_sql(&from, g, &input, time)?
     } else {
         build_chart_sql(
             kind,
@@ -2220,6 +2393,7 @@ struct Resolved {
     sql_source: Option<String>,
     from: Relation,
     cols: std::collections::HashSet<String>,
+    kinds: std::collections::HashMap<String, ColumnKind>,
 }
 
 /// The `sqlSource` id a spec built over [`InlineSql`] carries. It marks the
@@ -2246,11 +2420,13 @@ pub struct InlineSql<'a> {
 /// when it was saved.
 fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
     let cols = source.column_names();
+    let kinds = source.column_kinds();
     Resolved {
         mart: String::new(),
         sql_source: Some(source.id),
         from: Relation::Sql(source.sql),
         cols,
+        kinds,
     }
 }
 
@@ -2273,6 +2449,11 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
         sql_source: Some(UNSAVED_SOURCE_ID.to_owned()),
         from: Relation::Sql(inline.sql.to_owned()),
         cols: inline.columns.iter().map(|c| c.name.clone()).collect(),
+        kinds: inline
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), ColumnKind::from_clickhouse_type(&c.ty)))
+            .collect(),
     })
 }
 
@@ -2302,12 +2483,14 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         .to_owned();
     let mart_ident = Ident::new(mart.as_str())
         .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
-    let cols = validated_mart_columns(ch, &mart).await?;
+    let kinds = validated_mart_columns(ch, &mart).await?;
+    let cols = kinds.keys().cloned().collect();
     Ok(Resolved {
         mart,
         sql_source: None,
         from: Relation::Mart(mart_ident),
         cols,
+        kinds,
     })
 }
 
@@ -2373,16 +2556,48 @@ pub async fn spec_from_input(
     source: ChartSource,
     created_by: &str,
     id: Option<String>,
+    time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
     let click = validated_click(input)?;
+    let grain = validated_grain(input)?;
     let (common, geo) = match spec_before_relation(input, source, created_by, id)? {
         Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     // ── kpi/table/chart need a mart OR a SQL source ─────────────────
     let resolved = resolve_relation(ch, input).await?;
-    spec_from_resolved(input, source, created_by, common, geo, resolved)
-        .map(|spec| with_click(spec, click))
+    spec_from_resolved(
+        input,
+        source,
+        created_by,
+        common,
+        geo,
+        resolved,
+        GrainCtx { grain, time },
+    )
+    .map(|spec| with_click(spec, click))
+}
+
+/// The grain of `input` once its name and its chart kind are checked (`BI-9`).
+/// Whether the dimension column fits it is checked later, against the
+/// relation's column types. A kind without a dimension to group (`text`,
+/// `kpi`, ...) refuses a grain here, before any schema lookup, like `click`.
+fn validated_grain(input: &ChartInput) -> Result<Option<Grain>, BiError> {
+    let Some(raw) = input.grain.as_deref() else {
+        return Ok(None);
+    };
+    let grain = Grain::parse(raw).ok_or_else(|| {
+        BiError::Validation(format!(
+            "invalid grain '{raw}': use one of {}.",
+            crate::grain::ALL_GRAINS.map(Grain::as_str).join(", ")
+        ))
+    })?;
+    // The column kind is unknown here; `DateTime` is the permissive one, so
+    // this only refuses on the chart kind.
+    grain
+        .validate(input.kind, Some(ColumnKind::DateTime))
+        .map_err(BiError::Validation)?;
+    Ok(Some(grain))
 }
 
 /// The click setting of `input` once its shape is checked (`BI-18`·B).
@@ -2425,15 +2640,34 @@ pub fn spec_from_inline_sql(
     inline: InlineSql<'_>,
     source: ChartSource,
     created_by: &str,
+    time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
     let click = validated_click(input)?;
+    let grain = validated_grain(input)?;
     let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
         Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     let resolved = resolved_from_inline(input, inline)?;
-    spec_from_resolved(input, source, created_by, common, geo, resolved)
-        .map(|spec| with_click(spec, click))
+    spec_from_resolved(
+        input,
+        source,
+        created_by,
+        common,
+        geo,
+        resolved,
+        GrainCtx { grain, time },
+    )
+    .map(|spec| with_click(spec, click))
+}
+
+/// The grain a chart is saved with and the time settings its SQL is built
+/// with (`BI-9`); bundled to keep [`spec_from_resolved`] within clippy's
+/// argument limit.
+#[derive(Clone, Copy)]
+struct GrainCtx<'a> {
+    grain: Option<Grain>,
+    time: &'a TimeContext,
 }
 
 /// The part of [`spec_from_input`] that follows relation resolution, shared
@@ -2446,7 +2680,9 @@ fn spec_from_resolved(
     common: CommonFields,
     geo: GeoFields,
     resolved: Resolved,
+    when: GrainCtx<'_>,
 ) -> Result<StoredChartSpec, BiError> {
+    let GrainCtx { grain, time } = when;
     let CommonFields {
         title,
         kind,
@@ -2460,6 +2696,7 @@ fn spec_from_resolved(
         sql_source,
         from,
         cols,
+        kinds,
     } = resolved;
     let has_year = cols.contains("tahun");
     let agg = input
@@ -2527,7 +2764,10 @@ fn spec_from_resolved(
             has_year,
             created_by,
             cols,
+            kinds,
             geo,
+            grain,
+            time,
         },
     )
 }
@@ -2649,6 +2889,7 @@ impl StoredChartSpec {
                 caption: None,
                 target: None,
                 click: None,
+                grain: None,
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -2665,6 +2906,35 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    // BI-9: the builders take the time settings; the tests that predate it
+    // call these shims, which pass the default context and no grain.
+    static DEFAULT_TIME: std::sync::LazyLock<TimeContext> =
+        std::sync::LazyLock::new(TimeContext::default);
+
+    fn spec_from_inline_sql(
+        input: &ChartInput,
+        inline: InlineSql<'_>,
+        source: ChartSource,
+        created_by: &str,
+    ) -> Result<StoredChartSpec, BiError> {
+        super::spec_from_inline_sql(input, inline, source, created_by, &DEFAULT_TIME)
+    }
+
+    fn spec_from_resolved(
+        input: &ChartInput,
+        source: ChartSource,
+        created_by: &str,
+        common: CommonFields,
+        geo: GeoFields,
+        resolved: Resolved,
+    ) -> Result<StoredChartSpec, BiError> {
+        let when = GrainCtx {
+            grain: validated_grain(input)?,
+            time: &DEFAULT_TIME,
+        };
+        super::spec_from_resolved(input, source, created_by, common, geo, resolved, when)
+    }
 
     fn client(url: &str) -> ChClient {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
@@ -2697,10 +2967,11 @@ mod tests {
         // test — every later call is free — is unchanged. 16 = those 13 plus
         // the three SEC-12 `bi_board` columns (`embed_revoked_before`,
         // `embed_revoked_jti_json`, `embed_origins_json`). 17 = those 16 plus
-        // the BI-18·B `bi_board.refresh_seconds` column.
+        // the BI-18·B `bi_board.refresh_seconds` column. 18 = those 17 plus
+        // the BI-9 `bi_board.grain` column.
         assert_eq!(
-            first_call_requests, 17,
-            "first call should issue all 17 DDL statements"
+            first_call_requests, 18,
+            "first call should issue all 18 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -3067,6 +3338,7 @@ mod tests {
             layout: None,
             filters: None,
             refresh_seconds: None,
+            grain: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -3393,5 +3665,139 @@ mod tests {
         let mut row = serde_json::Map::new();
         row.insert("id".to_owned(), serde_json::json!("b_1"));
         assert_eq!(row_to_board(&row).refresh_seconds, None);
+    }
+
+    // ── BI-9: grain at save ──────────────────────────────────────────────
+
+    fn grain_cols() -> Vec<crate::sources::SourceColumn> {
+        source_columns(&[
+            ("day", "Date"),
+            ("seen_at", "Nullable(DateTime64(3, 'UTC'))"),
+            ("place", "String"),
+            ("visitors", "UInt64"),
+        ])
+    }
+
+    fn grain_build(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = grain_cols();
+        let input = inline_chart(extra);
+        spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: "SELECT day, seen_at, place, visitors FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    fn refusal(extra: &serde_json::Value) -> String {
+        match grain_build(extra) {
+            Err(BiError::Validation(m)) => m,
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_grain_is_saved_in_the_definition_with_a_bucket_order_and_a_thousand_bucket_limit() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "line", "dimension": "day", "grain": "month", "limit": 800,
+        }))
+        .unwrap();
+        assert_eq!(spec.def.grain.as_deref(), Some("month"));
+        assert_eq!(spec.def.limit, Some(800));
+        assert_eq!(spec.def.order.as_deref(), Some("none"));
+        assert!(
+            spec.spec.sql.contains("date_trunc('month', day) AS day"),
+            "{}",
+            spec.spec.sql
+        );
+        // Without a grain the same limit is still capped at 100.
+        let plain = grain_build(&serde_json::json!({
+            "kind": "line", "dimension": "day", "limit": 800,
+        }))
+        .unwrap();
+        assert_eq!(plain.def.limit, Some(100));
+        assert_eq!(plain.def.grain, None);
+        // A bar defaults to the value order, a grained bar to bucket order.
+        let bar = grain_build(&serde_json::json!({"kind": "bar", "dimension": "place"})).unwrap();
+        assert_eq!(bar.def.order.as_deref(), Some("desc"));
+        let grained_bar =
+            grain_build(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "year"}))
+                .unwrap();
+        assert_eq!(grained_bar.def.order.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_grain_on_a_timestamp_uses_the_report_zone() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "seen_at", "grain": "hour_of_day",
+        }))
+        .unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("toHour(toTimeZone(seen_at, 'Asia/Jakarta')) AS seen_at"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    #[test]
+    fn an_unknown_grain_is_refused_with_the_list_of_valid_ones() {
+        let m =
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "fortnight"}));
+        assert!(
+            m.starts_with("invalid grain 'fortnight': use one of minute, hour, day,"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn a_grain_on_a_text_column_or_a_date_without_time_is_refused_in_plain_words() {
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "place", "grain": "month"})),
+            "a grain needs a date or timestamp dimension."
+        );
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "hour"})),
+            "hour needs a timestamp column; this column has no time."
+        );
+    }
+
+    #[test]
+    fn only_the_listed_chart_kinds_take_a_grain_and_a_calendar_takes_day_only() {
+        for kind in [
+            "scatter", "table", "kpi", "gauge", "text", "boxplot", "geomap",
+        ] {
+            let m = refusal(&serde_json::json!({
+                "kind": kind, "dimension": "day", "grain": "month", "title": "t",
+            }));
+            assert_eq!(m, "this chart type cannot group dates.", "{kind}");
+        }
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "calendar", "dimension": "day", "grain": "month"})),
+            "a calendar chart can only group by day."
+        );
+        assert!(
+            grain_build(
+                &serde_json::json!({"kind": "calendar", "dimension": "seen_at", "grain": "day"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_boards_saved_grain_reads_back_and_an_empty_one_is_none() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        assert_eq!(row_to_board(&row).grain, None);
+        row.insert("grain".to_owned(), serde_json::json!(""));
+        assert_eq!(row_to_board(&row).grain, None);
+        row.insert("grain".to_owned(), serde_json::json!("month"));
+        let board = row_to_board(&row);
+        assert_eq!(board.grain.as_deref(), Some("month"));
+        assert_eq!(serde_json::to_value(&board).unwrap()["grain"], "month");
     }
 }

@@ -4,6 +4,7 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import Image from "next/image";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
+import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
@@ -15,6 +16,8 @@ type Payload = {
   layout: LayoutMap;
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
+  /** The zone and first weekday the buckets were cut with (BI-9). */
+  reporting?: { timeZone: string; weekStart: string };
 };
 
 /**
@@ -77,6 +80,7 @@ export function PublicDashboard({ token }: { token: string }) {
   }));
 
   return (
+    <ReportingProvider reporting={data?.reporting}>
     <div className="min-h-screen bg-muted/25">
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
@@ -115,6 +119,7 @@ export function PublicDashboard({ token }: { token: string }) {
         Powered by Rantai Lake — Enterprise Lakehouse Console
       </footer>
     </div>
+    </ReportingProvider>
   );
 }
 

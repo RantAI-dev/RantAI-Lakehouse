@@ -9,6 +9,7 @@ pub mod click;
 pub mod embed_access;
 pub mod filters;
 pub mod folders;
+pub mod grain;
 pub mod sources;
 pub mod specs;
 pub mod store;

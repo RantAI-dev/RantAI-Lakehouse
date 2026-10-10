@@ -35,6 +35,7 @@ mod pipelines;
 mod quality;
 mod query;
 pub(crate) mod schema_versions;
+mod settings;
 mod storage;
 pub(crate) mod support;
 mod uploads;
@@ -848,6 +849,12 @@ pub fn router(state: AppState) -> Router {
             get(home::get_layout)
                 .put(home::put_layout)
                 .delete(home::delete_layout),
+        )
+        // Deployment-wide report time zone and first day of the week
+        // (`BI-9`); see `routes::settings`.
+        .route(
+            "/api/settings/reporting",
+            get(settings::get_reporting).put(settings::put_reporting),
         )
         // Phase 2 identity domain.
         .merge(identity_router())

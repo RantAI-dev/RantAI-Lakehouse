@@ -9,9 +9,12 @@ import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, fmtInt } from "./chart-option";
 import { GeoChart } from "./geo-chart";
+import { useReporting } from "./reporting-context";
+import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
+import type { Rows } from "./tile-dialogs";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
-function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<string, unknown>[] } {
+type Cell = Rows | TileFailure;
+function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
 }
 
@@ -32,6 +35,7 @@ export function TileBody({
    */
   hideLegend?: boolean;
 }) {
+  const reporting = useReporting();
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
@@ -71,11 +75,16 @@ export function TileBody({
 
   // chart
   if (hasRows(cell) && cell.rows.length) {
-    const option = buildOption(spec, cell.rows, dark);
-    const rows = cell.rows;
+    // BI-9: a grouped chart's buckets arrive as dates or numbers; the axis,
+    // tooltip and legend read them as "Mar 2026", "Q1 2026", "Mon". A click
+    // maps the label back through `rawRows` (the rows as the server sent them).
+    const rawRows = cell.rows;
+    const grain = isGrain(cell.grain) ? cell.grain : null;
+    const rows = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
+    const option = buildOption(spec, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) });
     return (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
-        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows }) : undefined} />
+        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined }) : undefined} />
     );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;

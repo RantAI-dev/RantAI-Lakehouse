@@ -17,8 +17,9 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::builder::{FilteredSql, RelationColumns};
+use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
+use lakehouse_bi::grain::{Grain, TimeContext};
 use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
 use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
@@ -48,6 +49,62 @@ pub struct DashboardQuery {
     year: Option<String>,
     #[serde(default)]
     filters: Option<String>,
+    /// BI-9: replaces the grain of every chart whose own grain is a
+    /// truncation (`minute` to `year`). Absent: the board's saved grain, or
+    /// each chart's own.
+    #[serde(default)]
+    grain: Option<String>,
+}
+
+/// What the caller asked of the dashboard's grain switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GrainRequest {
+    /// No `grain` parameter: the board's saved grain applies, if any.
+    #[default]
+    Saved,
+    /// `grain=own`: each chart keeps its own grain, saved default or not.
+    Own,
+    /// One of the truncations.
+    Switch(Grain),
+}
+
+impl From<Option<Grain>> for GrainRequest {
+    fn from(g: Option<Grain>) -> Self {
+        g.map_or(Self::Saved, Self::Switch)
+    }
+}
+
+/// The `grain` query of `GET /api/dashboard`: absent or blank, `own`, or a
+/// truncation.
+///
+/// # Errors
+///
+/// 400 with our message for any other text, a part of the date included.
+fn parse_grain_request(raw: Option<&str>) -> Result<GrainRequest, ApiError> {
+    if raw.map(str::trim) == Some("own") {
+        return Ok(GrainRequest::Own);
+    }
+    parse_grain_param(raw).map(GrainRequest::from)
+}
+
+/// A `grain` query value as a dashboard switch: one of the truncations.
+///
+/// # Errors
+///
+/// 400 with our message for any other text, a part of the date included (a
+/// part cannot replace every chart's grain).
+fn parse_grain_param(raw: Option<&str>) -> Result<Option<Grain>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    Grain::parse(raw)
+        .filter(|g| g.is_truncation())
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "grain must be one of minute, hour, day, week, month, quarter, year.".to_owned(),
+            )
+        })
 }
 
 /// `GET /api/dashboard` — the combined tile data + metadata payload the
@@ -78,6 +135,14 @@ pub async fn get(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    let requested = match parse_grain_request(q.grain.as_deref()) {
+        Ok(g) => g,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let time = match crate::routes::settings::time_context(&state).await {
+        Ok(t) => t,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let obligations = PolicyEngineObligations::from_state(&state);
     match get_body(
         &state.clickhouse,
@@ -86,6 +151,7 @@ pub async fn get(
         &principal.role_names,
         &placeholders,
         &obligations,
+        (&time, requested),
     )
     .await
     {
@@ -112,6 +178,7 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
+    (time, requested_grain): (&TimeContext, GrainRequest),
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -153,6 +220,21 @@ async fn get_body(
     let filters = param_filters
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
+    // BI-9: the caller's switch wins; otherwise the board's saved grain; a
+    // stored value that is not a truncation is ignored, not trusted.
+    let saved_grain = board_obj
+        .and_then(|b| b.grain.as_deref())
+        .and_then(Grain::parse)
+        .filter(|g| g.is_truncation());
+    let applied_grain = match requested_grain {
+        GrainRequest::Switch(g) => Some(g),
+        GrainRequest::Own => None,
+        GrainRequest::Saved => saved_grain,
+    };
+    let read = ReadContext {
+        time,
+        grain: applied_grain,
+    };
 
     // The built-in tiles are served only when this tenant's
     // BUILTIN_DASHBOARD_SPEC actually loaded a non-empty catalog — see
@@ -190,16 +272,24 @@ async fn get_body(
     }
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     for c in &stored_for_board {
-        let FilteredSql { sql, skipped } =
-            match stored_chart_sql(c, &years, &filters, &cols, &sources) {
-                Ok(filtered) => filtered,
-                Err(msg) => {
-                    results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                    continue;
-                }
-            };
-        let (id, mut val) =
-            run_spec_sql(ch, &c.spec.id, &sql, roles, placeholders, obligations).await;
+        let filtered = match stored_chart_sql(c, &years, &filters, &cols, &sources, &read) {
+            Ok(filtered) => filtered,
+            Err(msg) => {
+                results.insert(c.spec.id.clone(), json!({ "error": msg }));
+                continue;
+            }
+        };
+        let (id, mut val) = run_spec_sql(
+            ch,
+            &c.spec.id,
+            &filtered.sql,
+            roles,
+            placeholders,
+            obligations,
+        )
+        .await;
+        let skipped = &filtered.skipped;
+        crate::routes::support::annotate_grain(&mut val, &filtered, c);
         // The tile still renders; this only lets it say which active filters
         // its data cannot honour (no such column, or a type that does not fit).
         if !skipped.is_empty()
@@ -261,6 +351,15 @@ async fn get_body(
         // The saved default, which `filters` is not when the caller passed
         // its own: the console compares the two to offer Save and Reset.
         "defaultFilters": board_obj.and_then(|b| b.filters.clone()).unwrap_or_default(),
+        // BI-9: the grain an editor saved for the board (`""` when none), the
+        // one this response applied, and the zone and first day it used, so
+        // the console labels buckets the way the server cut them.
+        "grain": saved_grain.map_or("", Grain::as_str),
+        "appliedGrain": applied_grain.map(Grain::as_str),
+        "reporting": {
+            "timeZone": time.zone(),
+            "weekStart": time.week_start().as_str(),
+        },
         // BI-18·B: the interval an editor saved; 0 when none, so the
         // console starts from "off" without a second request.
         "refreshSeconds": board_obj.and_then(|b| b.refresh_seconds).unwrap_or(0),
@@ -379,9 +478,17 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 /// failure, matching the `TypeScript`'s single `catch` around both.
 pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
     let input = parse_chart_input(&body)?;
-    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
-        .await
-        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    let time = crate::routes::settings::time_context(&state).await?;
+    let spec = store::spec_from_input(
+        &state.clickhouse,
+        &input,
+        ChartSource::Ui,
+        "ui",
+        None,
+        &time,
+    )
+    .await
+    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     store::insert_chart(&state.clickhouse, &spec)
         .await
         .map_err(|err| {
@@ -410,9 +517,17 @@ pub async fn specs_preview(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let input = parse_chart_input(&body)?;
-    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
-        .await
-        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    let time = crate::routes::settings::time_context(&state).await?;
+    let spec = store::spec_from_input(
+        &state.clickhouse,
+        &input,
+        ChartSource::Ui,
+        "ui",
+        None,
+        &time,
+    )
+    .await
+    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -422,7 +537,7 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
-    let (_, result) = run_spec_sql(
+    let (_, mut result) = run_spec_sql(
         &state.clickhouse,
         &spec.spec.id,
         &spec.spec.sql,
@@ -431,6 +546,7 @@ pub async fn specs_preview(
         &obligations,
     )
     .await;
+    crate::routes::support::annotate_saved_grain(&mut result, &spec);
     Ok(ApiJson(json!({
         "spec": render_stored_spec(&spec.spec, ChartSource::Ui),
         "result": result,
@@ -468,9 +584,17 @@ pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResu
     };
     let input: ChartInput = serde_json::from_value(raw)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
-    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", Some(id))
-        .await
-        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    let time = crate::routes::settings::time_context(&state).await?;
+    let spec = store::spec_from_input(
+        &state.clickhouse,
+        &input,
+        ChartSource::Ui,
+        "ui",
+        Some(id),
+        &time,
+    )
+    .await
+    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     store::insert_chart(&state.clickhouse, &spec)
         .await
         .map_err(|err| {
@@ -668,6 +792,10 @@ struct BoardEditBody {
     /// the parser's.
     #[serde(default, rename = "refreshSeconds")]
     refresh_seconds: Option<i64>,
+    /// The board's saved time grain (`BI-9`): a truncation from `minute` to
+    /// `year`, or `""` to go back to each chart's own.
+    #[serde(default)]
+    grain: Option<String>,
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -777,6 +905,11 @@ pub async fn boards_update(
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
     let refresh = checked_refresh(parsed.refresh_seconds)?;
+    if let Some(grain) = &parsed.grain
+        && !grain.trim().is_empty()
+    {
+        parse_grain_param(Some(grain))?;
+    }
     if let Some(name) = &parsed.name {
         store::rename_board(ch, &id, name)
             .await
@@ -800,6 +933,11 @@ pub async fn boards_update(
     }
     if let Some(seconds) = refresh {
         store::update_board_refresh(ch, &id, seconds)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    if let Some(grain) = &parsed.grain {
+        store::update_board_grain(ch, &id, grain.trim())
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
@@ -1021,6 +1159,11 @@ pub struct RecordsQuery {
     /// so the list agrees with the number that was clicked.
     #[serde(default)]
     filters: Option<String>,
+    /// BI-9: with `column` and `value`, `value` is a bucket of a chart
+    /// grouped by this grain (a truncation), and the rows are those whose raw
+    /// `column` falls in it, in the report time zone.
+    #[serde(default)]
+    grain: Option<String>,
 }
 
 /// Rows per page: the default and the maximum (BI-18·B; the owner confirms 50
@@ -1067,12 +1210,14 @@ pub async fn records(
             .collect(),
     };
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let time = crate::routes::settings::time_context(&state).await?;
     records_for_roles(
         &state.clickhouse,
         q,
         &principal.role_names,
         &placeholders,
         &obligations,
+        &time,
     )
     .await
     .map(ApiJson)
@@ -1173,6 +1318,44 @@ fn records_number(raw: Option<&str>, name: &str, default: u64) -> Result<u64, Ap
     }
 }
 
+/// What the records list is narrowed to (BI-9). With a `grain` the value is a
+/// bucket the tile printed, and the rows are those whose raw column falls in
+/// it, computed here in the report zone. A grain on a column it does not fit
+/// (a plain date has no hour, a text column no date), or one that is a part
+/// of the date, is refused, never read as "everything".
+fn records_value<'a>(
+    drill: Option<&'a (lakehouse_core::ident::Ident, &'a str)>,
+    cols: &RelationColumns,
+    grain: Option<&str>,
+) -> Result<Option<lakehouse_bi::builder::RecordsValue<'a>>, ApiError> {
+    use lakehouse_bi::builder::RecordsValue;
+    let bucket_grain = parse_grain_param(grain)?;
+    match (drill, bucket_grain) {
+        (Some((ident, text)), Some(grain)) => {
+            let kind = cols
+                .get(ident.as_str())
+                .copied()
+                .unwrap_or(ColumnKind::Text);
+            if !grain.supports(ChartKind::Line, Some(kind)) {
+                return Err(ApiError::BadRequest(
+                    "grain does not fit this column".to_owned(),
+                ));
+            }
+            Ok(Some(RecordsValue::Bucket {
+                column: ident,
+                kind,
+                grain,
+                text,
+            }))
+        }
+        (None, Some(_)) => Err(ApiError::BadRequest(
+            "grain needs a column and a value".to_owned(),
+        )),
+        (Some((ident, text)), None) => Ok(Some(RecordsValue::Equals(ident, text))),
+        (None, None) => Ok(None),
+    }
+}
+
 /// [`records`]' body, taking the principal's roles and placeholders
 /// explicitly so the enforcement path can be tested against a mock
 /// `ClickHouse` and a real policy row.
@@ -1187,6 +1370,7 @@ async fn records_for_roles(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
+    time: &TimeContext,
 ) -> Result<Value, ApiError> {
     let limit = u32::try_from(records_number(
         q.limit.as_deref(),
@@ -1225,13 +1409,15 @@ async fn records_for_roles(
         }
         None => None,
     };
+    let value = records_value(drill.as_ref(), &relation.cols, q.grain.as_deref())?;
     let sql = lakehouse_bi::builder::records_sql(
         &relation.from,
         &relation.cols,
         &filters,
-        drill.as_ref().map(|(ident, value)| (ident, *value)),
+        value,
         limit,
         offset,
+        time,
     );
 
     let rewrite = |statement: String| async move {
@@ -1336,12 +1522,14 @@ pub async fn values(
             .collect(),
     };
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let time = crate::routes::settings::time_context(&state).await?;
     values_for_roles(
         &state.clickhouse,
         q,
         &principal.role_names,
         &placeholders,
         &obligations,
+        &time,
     )
     .await
     .map(ApiJson)
@@ -1404,6 +1592,7 @@ async fn board_value_selects(
     column: &str,
     search: Option<&str>,
     other_filters: &[FilterDef],
+    time: &TimeContext,
 ) -> Result<(Vec<String>, bool), ApiError> {
     let charts = store::list_stored_charts(ch)
         .await
@@ -1451,7 +1640,7 @@ async fn board_value_selects(
             continue;
         }
         has_source |= c.def.sql_source.is_some();
-        let outcome = lakehouse_bi::builder::filter_predicates(&cols, &[], other_filters);
+        let outcome = lakehouse_bi::builder::filter_predicates(&cols, &[], other_filters, time);
         selects.push(values_select(
             column,
             &from,
@@ -1472,6 +1661,7 @@ async fn values_for_roles(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
+    time: &TimeContext,
 ) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
@@ -1489,7 +1679,7 @@ async fn values_for_roles(
     let (selects, settings) = if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let (selects, has_source) =
-            board_value_selects(ch, board, &column, search, &others).await?;
+            board_value_selects(ch, board, &column, search, &others, time).await?;
         let settings = if has_source {
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         } else {
@@ -1759,6 +1949,11 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
             }
             if let Some(order) = &def.order {
                 out.push(("order", json!(order)));
+            }
+            // BI-9: only grained charts, so the exported shape of every
+            // earlier chart does not change.
+            if let Some(grain) = &def.grain {
+                out.push(("grain", json!(grain)));
             }
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
@@ -2131,6 +2326,7 @@ mod records_enforcement {
             &["Analyst".to_owned()],
             &PlaceholderValues::none(),
             &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
         )
         .await
         .expect("a masked drill-down still answers");
@@ -2196,6 +2392,7 @@ mod records_enforcement {
             &[],
             &PlaceholderValues::none(),
             &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
         )
         .await
         .expect_err("a failing row query is an error");
@@ -2299,6 +2496,7 @@ mod values_enforcement {
             &["Analyst".to_owned()],
             &PlaceholderValues::none(),
             &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
         )
         .await
         .expect("masked values still answer");
@@ -2393,6 +2591,7 @@ mod values_enforcement {
             &["Analyst".to_owned()],
             &PlaceholderValues::none(),
             &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
         )
         .await
         .expect("masked values still answer");
@@ -2509,7 +2708,8 @@ mod typed_filters {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        DashboardQuery, ValuesQuery, get_body, parse_filters_param, values_for_roles, values_select,
+        DashboardQuery, GrainRequest, ValuesQuery, get_body, parse_filters_param, values_for_roles,
+        values_select,
     };
     use crate::policy_engine::PolicyEngineObligations;
     use crate::sql_rewrite::PlaceholderValues;
@@ -2640,6 +2840,7 @@ mod typed_filters {
             board: Some("b1".to_owned()),
             year: None,
             filters: Some(filters.to_owned()),
+            grain: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         get_body(
@@ -2649,6 +2850,10 @@ mod typed_filters {
             &[],
             &PlaceholderValues::none(),
             &obligations,
+            (
+                &lakehouse_bi::grain::TimeContext::default(),
+                GrainRequest::Saved,
+            ),
         )
         .await
         .expect("the payload builds")
@@ -2734,7 +2939,8 @@ mod typed_filters {
                 .cloned()
                 .unwrap_or_else(|| panic!("no statement for {needle}: {sent:?}"))
         };
-        let range = "(day > subtractDays(today(), 30) AND day <= today())";
+        // BI-9: "today" is the date in the report time zone, not the server's.
+        let range = "(day > subtractDays(toDate(now('Asia/Jakarta')), 30) AND day <= toDate(now('Asia/Jakarta')))";
         let mart_a = tile("FROM serving.mart_a WHERE");
         assert!(mart_a.contains("visitors >= 100"), "{mart_a}");
         assert!(mart_a.contains(range), "{mart_a}");
@@ -2878,7 +3084,15 @@ mod typed_filters {
     async fn run_values(server: &MockServer, q: ValuesQuery) -> Result<Value, ApiError> {
         let ch = client(server);
         let obligations = PolicyEngineObligations::new(None, &ch);
-        values_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations).await
+        values_for_roles(
+            &ch,
+            q,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
     }
 
     /// The statements that read values (`DISTINCT`), after the role rewrite.
@@ -3186,7 +3400,15 @@ mod records_pages {
     async fn run(server: &MockServer, q: RecordsQuery) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
-        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations).await
+        records_for_roles(
+            &ch,
+            q,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -3382,5 +3604,435 @@ mod records_pages {
                 .iter()
                 .all(|s| !s.contains("ORDER BY ALL"))
         );
+    }
+}
+
+#[cfg(test)]
+mod time_grain {
+    //! BI-9: the dashboard's grain switch, the board's saved grain, the
+    //! `truncated` and `grainSkipped` tile marks, and records by bucket. A
+    //! wiremock `ClickHouse` answers the store reads and records every
+    //! statement it is sent (no Postgres, so no governance policy applies).
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_bi::grain::{Grain, TimeContext, WeekStart};
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_core::ApiError;
+    use serde_json::{Value, json};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{
+        DashboardQuery, GrainRequest, RecordsQuery, get_body, parse_grain_param, records_for_roles,
+    };
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    async fn answer(
+        server: &MockServer,
+        statement_has: &str,
+        meta: &[(&str, &str)],
+        data: Vec<Value>,
+    ) {
+        let meta: Vec<Value> = meta
+            .iter()
+            .map(|(n, t)| json!({ "name": n, "type": t }))
+            .collect();
+        let rows = data.len();
+        Mock::given(method("POST"))
+            .and(body_string_contains(statement_has))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": meta, "data": data, "rows": rows })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn chart_row(id: &str, grain: &str, kind: &str, dimension: &str) -> Value {
+        let spec = json!({
+            "id": id, "title": id, "kind": kind, "mart": "mart_a",
+            "sql": "SELECT stored", "x": dimension, "y": "visitors"
+        });
+        let def = json!({
+            "title": id, "mart": "mart_a", "kind": kind, "dimension": dimension,
+            "measures": ["visitors"], "limit": 3, "order": "none", "grain": grain,
+        });
+        json!({
+            "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        })
+    }
+
+    /// Board `b1` with a day-grained line, a month-grained bar on a plain
+    /// date, and a day-of-week bar; `mart_a` has a `Date` `day` and a
+    /// `DateTime` `seen_at`.
+    async fn mount_board(server: &MockServer, board_grain: &str) {
+        let col = |n: &str| (n.to_owned(), "String".to_owned());
+        let _ = col;
+        answer(
+            server,
+            "FROM console.bi_chart FINAL",
+            &[
+                ("id", "String"),
+                ("board", "String"),
+                ("created_by", "String"),
+                ("created_at", "String"),
+                ("spec_json", "String"),
+            ],
+            vec![
+                chart_row("c_line", "day", "line", "day"),
+                chart_row("c_month", "month", "bar", "day"),
+                chart_row("c_dow", "day_of_week", "bar", "day"),
+            ],
+        )
+        .await;
+        answer(
+            server,
+            "FROM console.bi_board FINAL",
+            &[("id", "String")],
+            vec![json!({
+                "id": "b1", "name": "B", "description": "", "created_by": "", "layout_json": "{}",
+                "filters_json": "[]", "public_token": "", "embed_enabled": 0, "folder_id": "",
+                "embed_revoked_before": "0", "embed_revoked_jti_json": "[]",
+                "embed_origins_json": "[]", "refresh_seconds": 0, "grain": board_grain,
+                "created_at": "2026-01-01 00:00:00",
+            })],
+        )
+        .await;
+        answer(
+            server,
+            "SELECT table, name, type FROM system.columns",
+            &[("table", "String"), ("name", "String"), ("type", "String")],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "seen_at", "type": "DateTime"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+        // The tiles: every grained statement carries `AS bkt`; three buckets
+        // more than the limit of 3 come back (the builder asked for 4).
+        answer(
+            server,
+            "AS bkt",
+            &[("day", "Date"), ("visitors", "UInt64")],
+            vec![
+                json!({"day": "2026-01-01", "visitors": "1"}),
+                json!({"day": "2026-02-01", "visitors": "2"}),
+                json!({"day": "2026-03-01", "visitors": "3"}),
+                json!({"day": "2026-04-01", "visitors": "4"}),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn statements(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    async fn dashboard(server: &MockServer, requested: Option<Grain>, time: &TimeContext) -> Value {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let q = DashboardQuery {
+            board: Some("b1".to_owned()),
+            year: None,
+            filters: None,
+            grain: requested.map(|g| g.as_str().to_owned()),
+        };
+        get_body(
+            &ch,
+            &q,
+            None,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            (time, requested.into()),
+        )
+        .await
+        .expect("the payload builds")
+    }
+
+    fn tile_statement(all: &[String], needle: &str) -> String {
+        all.iter()
+            .find(|s| s.contains("AS bkt") && s.contains(needle))
+            .unwrap_or_else(|| panic!("no tile statement with {needle}: {all:#?}"))
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn the_switch_regroups_every_truncated_chart_and_leaves_a_part_alone() {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let body = dashboard(&server, Some(Grain::Quarter), &TimeContext::default()).await;
+        let sent = statements(&server).await;
+        // c_line (own: day) and c_month (own: month) follow the switch.
+        let quarter = sent
+            .iter()
+            .filter(|s| s.contains("date_trunc('quarter', day)"))
+            .count();
+        assert_eq!(quarter, 2, "{sent:#?}");
+        // c_dow (a part of the date) does not.
+        let dow = tile_statement(&sent, "toDayOfWeek(day)");
+        assert!(!dow.contains("date_trunc('quarter'"), "{dow}");
+        assert_eq!(body["appliedGrain"], json!("quarter"));
+        assert_eq!(body["grain"], json!(""));
+        assert_eq!(body["reporting"]["timeZone"], json!("Asia/Jakarta"));
+        assert_eq!(body["reporting"]["weekStart"], json!("monday"));
+    }
+
+    #[tokio::test]
+    async fn without_a_switch_the_boards_saved_grain_applies_and_is_returned() {
+        let server = MockServer::start().await;
+        mount_board(&server, "year").await;
+        let body = dashboard(&server, None, &TimeContext::default()).await;
+        let sent = statements(&server).await;
+        assert!(
+            sent.iter().any(|s| s.contains("date_trunc('year', day)")),
+            "{sent:#?}"
+        );
+        assert_eq!(body["grain"], json!("year"));
+        assert_eq!(body["appliedGrain"], json!("year"));
+
+        // The caller's own switch wins over the saved one.
+        let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
+        assert_eq!(body["appliedGrain"], json!("month"));
+    }
+
+    #[tokio::test]
+    async fn own_sets_the_saved_grain_aside_for_this_view() {
+        let server = MockServer::start().await;
+        mount_board(&server, "year").await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let q = DashboardQuery {
+            board: Some("b1".to_owned()),
+            year: None,
+            filters: None,
+            grain: Some("own".to_owned()),
+        };
+        let body = get_body(
+            &ch,
+            &q,
+            None,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            (&TimeContext::default(), super::GrainRequest::Own),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body["grain"],
+            json!("year"),
+            "the saved default is still reported"
+        );
+        assert_eq!(body["appliedGrain"], Value::Null);
+        let sent = statements(&server).await;
+        assert!(
+            sent.iter().all(|s| !s.contains("date_trunc('year'")),
+            "{sent:#?}"
+        );
+        assert_eq!(
+            super::parse_grain_request(Some("own")).unwrap(),
+            GrainRequest::Own
+        );
+        assert_eq!(
+            super::parse_grain_request(None).unwrap(),
+            GrainRequest::Saved
+        );
+        assert!(super::parse_grain_request(Some("hour_of_day")).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_grained_tile_reports_the_grain_it_was_cut_with_and_its_columns_kind() {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let body = dashboard(&server, Some(Grain::Quarter), &TimeContext::default()).await;
+        assert_eq!(body["results"]["c_line"]["grain"], json!("quarter"));
+        assert_eq!(body["results"]["c_line"]["grainColumn"], json!("date"));
+        assert_eq!(body["results"]["c_dow"]["grain"], json!("day_of_week"));
+    }
+
+    #[tokio::test]
+    async fn a_chart_that_cannot_take_the_switch_keeps_its_own_and_says_so() {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        // `hour` on a plain date.
+        let body = dashboard(&server, Some(Grain::Hour), &TimeContext::default()).await;
+        assert_eq!(body["results"]["c_line"]["grainSkipped"], json!("hour"));
+        assert_eq!(body["results"]["c_month"]["grainSkipped"], json!("hour"));
+        assert!(
+            body["results"]["c_dow"].get("grainSkipped").is_none(),
+            "a part is not offered the switch, so it has nothing to skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_longer_than_the_limit_keeps_the_latest_buckets_and_is_marked() {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let body = dashboard(&server, None, &TimeContext::default()).await;
+        let tile = &body["results"]["c_month"];
+        assert_eq!(tile["truncated"], json!(true), "{tile}");
+        let days: Vec<&str> = tile["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["day"].as_str().unwrap())
+            .collect();
+        assert_eq!(days, ["2026-02-01", "2026-03-01", "2026-04-01"]);
+    }
+
+    #[tokio::test]
+    async fn the_report_zone_and_week_start_reach_the_statements() {
+        let server = MockServer::start().await;
+        mount_board(&server, "week").await;
+        let time = TimeContext::new("Europe/Berlin", WeekStart::Sunday).unwrap();
+        dashboard(&server, None, &time).await;
+        let sent = statements(&server).await;
+        assert!(
+            sent.iter()
+                .any(|s| s.contains("date_trunc('week', day + toIntervalDay(1))")),
+            "{sent:#?}"
+        );
+    }
+
+    #[test]
+    fn the_grain_query_value_must_be_a_truncation() {
+        assert_eq!(parse_grain_param(None).unwrap(), None);
+        assert_eq!(parse_grain_param(Some(" ")).unwrap(), None);
+        assert_eq!(
+            parse_grain_param(Some("month")).unwrap(),
+            Some(Grain::Month)
+        );
+        for bad in ["fortnight", "day_of_week", "Month", "month;--"] {
+            assert!(
+                matches!(parse_grain_param(Some(bad)), Err(ApiError::BadRequest(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    async fn records(
+        server: &MockServer,
+        q: RecordsQuery,
+        time: &TimeContext,
+    ) -> Result<Value, ApiError> {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations, time).await
+    }
+
+    fn bucket_query(column: &str, value: &str, grain: &str) -> RecordsQuery {
+        RecordsQuery {
+            mart: Some("mart_a".to_owned()),
+            column: Some(column.to_owned()),
+            value: Some(value.to_owned()),
+            grain: Some(grain.to_owned()),
+            ..RecordsQuery::default()
+        }
+    }
+
+    async fn mount_records(server: &MockServer) {
+        answer(
+            server,
+            "FROM system.columns",
+            &[("name", "String"), ("type", "String")],
+            vec![
+                json!({"name": "day", "type": "Date"}),
+                json!({"name": "seen_at", "type": "DateTime"}),
+                json!({"name": "place", "type": "String"}),
+            ],
+        )
+        .await;
+        answer(
+            server,
+            "count()",
+            &[("n", "UInt64")],
+            vec![json!({"n": "2"})],
+        )
+        .await;
+        answer(
+            server,
+            "ORDER BY ALL",
+            &[("day", "Date")],
+            vec![json!({"day": "2026-03-04"}), json!({"day": "2026-03-20"})],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn records_for_a_clicked_month_are_selected_by_the_bucket_in_the_report_zone() {
+        let server = MockServer::start().await;
+        mount_records(&server).await;
+        let time = TimeContext::new("Europe/Berlin", WeekStart::Monday).unwrap();
+        let body = records(
+            &server,
+            bucket_query("seen_at", "2026-03-01", "month"),
+            &time,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["total"], json!(2));
+        let sent = statements(&server).await;
+        let rows = sent.iter().find(|s| s.contains("ORDER BY ALL")).unwrap();
+        assert!(
+            rows.contains(
+                "toString(date_trunc('month', toTimeZone(seen_at, 'Europe/Berlin'))) = '2026-03-01'"
+            ),
+            "{rows}"
+        );
+        let count = sent.iter().find(|s| s.contains("count()")).unwrap();
+        assert!(
+            count.contains("date_trunc('month'"),
+            "the total counts the same bucket: {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bucket_on_a_column_that_is_not_a_date_or_without_a_value_is_refused() {
+        let server = MockServer::start().await;
+        mount_records(&server).await;
+        let t = TimeContext::default();
+        let err = records(&server, bucket_query("place", "x", "month"), &t)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        let err = records(&server, bucket_query("day", "x", "hour"), &t)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "a plain date has no hour: {err:?}"
+        );
+        let err = records(&server, bucket_query("day", "x", "day_of_week"), &t)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "a part has no records: {err:?}"
+        );
+        let q = RecordsQuery {
+            mart: Some("mart_a".to_owned()),
+            grain: Some("month".to_owned()),
+            ..RecordsQuery::default()
+        };
+        let err = records(&server, q, &t).await.unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
     }
 }

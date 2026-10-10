@@ -73,6 +73,22 @@ pub struct ToolSpec {
     pub permission: &'static str,
 }
 
+/// The thirteen values of a chart's `grain` (`BI-9`), shared by
+/// [`create_chart_schema`] and [`update_chart_schema`]. Read from
+/// [`lakehouse_bi::grain::ALL_GRAINS`] so the schema cannot drift from what
+/// the server accepts.
+fn grain_enum() -> Value {
+    json!(
+        lakehouse_bi::grain::ALL_GRAINS
+            .iter()
+            .map(|g| g.as_str())
+            .collect::<Vec<_>>()
+    )
+}
+
+/// The description of the `grain` property, the same on both chart tools.
+const GRAIN_DESCRIPTION: &str = "how to group a date or timestamp `dimension` (the column's kind is in describe_mart / list_sql_sources `columns`): minute, hour, day, week, month, quarter, year; or a part of the date: hour_of_day, day_of_week, day_of_month, week_of_year, month_of_year, quarter_of_year. Not for number or text columns; minute, hour and hour_of_day need a datetime column; a calendar chart takes day only; only bar, hbar, line, area, stacked, combo, waterfall, heatmap, pie, rose, funnel, treemap, radar and calendar charts take one. Omit for no grouping.";
+
 /// The `chart_kind_enum` JSON array shared by [`create_chart_schema`] and
 /// [`update_chart_schema`] — factored out only because the two schemas
 /// are otherwise identical lists; not shared with any other tool.
@@ -178,7 +194,7 @@ fn get_build_status_schema() -> Value {
 
 fn describe_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "describe_mart",
-        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Call this before create_chart.",
+        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Each column also has a kind (number, date, datetime, text); a date or datetime dimension can take a grain. Call this before create_chart.",
         "parameters": { "type": "object", "properties": {
             "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
@@ -200,6 +216,7 @@ fn create_chart_schema() -> Value {
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
             "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } })
 }
@@ -221,6 +238,7 @@ fn update_chart_schema() -> Value {
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
             "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } })
 }

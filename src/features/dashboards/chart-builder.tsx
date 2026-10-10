@@ -36,8 +36,12 @@ import { ClickSetting } from "./click-setting";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
+import { previewKey } from "@/lib/preview-key";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
+import {
+  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+} from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
@@ -45,7 +49,8 @@ import { TileBody } from "./tile-body";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
-type Fields = { dimensions: string[]; measures: string[] };
+/** `kinds`: each column's kind, from its type, so the grain picker knows which dimensions are dates (BI-9). */
+type Fields = { dimensions: string[]; measures: string[]; kinds?: Record<string, ColumnKind> };
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
@@ -54,6 +59,8 @@ export type ChartDef = {
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
   /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
   click?: ChartClick;
+  /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
+  grain?: string;
 };
 type BoardOpt = { id: string; name: string };
 type Preview = {
@@ -125,6 +132,12 @@ const ORDER_LABELS: Record<string, string> = {
   desc: "Highest first", asc: "Lowest first", none: "Natural (by dimension)",
 };
 const NO_BREAKDOWN = "__none__";
+const NO_GRAIN = "__no_grain__";
+const GRAIN_ITEMS: Record<string, string> = { [NO_GRAIN]: "No grouping", ...GRAIN_LABELS };
+/** Column name → kind, from the `{ name, type }` list a fields response or a SQL run returns. */
+function kindsOf(columns: readonly { name: string; type: string }[]): Record<string, ColumnKind> {
+  return Object.fromEntries(columns.map((c) => [c.name, columnKindOfType(c.type)]));
+}
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
@@ -265,6 +278,11 @@ export function ChartBuilder({
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
   const [click, setClick] = React.useState<ChartClick | undefined>(undefined);
+  // How a date or timestamp dimension is grouped (BI-9); "" = as stored.
+  const [grain, setGrain] = React.useState<Grain | "">("");
+  // Whether the person (or a saved chart) set the limit, so choosing a grain
+  // only replaces the untouched default (BI-9 review fix R2).
+  const [limitTouched, setLimitTouched] = React.useState(false);
   const isText = kind === "text";
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
@@ -279,14 +297,36 @@ export function ChartBuilder({
   const effectiveMap = mapId || (isChoropleth ? DEFAULT_CHOROPLETH_MAP : DEFAULT_POINT_MAP);
   const isBoxplot = kind === "boxplot";
   const isCalendar = kind === "calendar";
-  // A calendar is one cell per day, so up to a year of rows.
-  const maxLimit = isCalendar ? 366 : 100;
+  // The grains this dimension and chart kind allow; empty hides the picker.
+  const dimensionKind = fields?.kinds?.[dimension];
+  const grainOptions = React.useMemo(() => grainChoices(kind, dimensionKind), [kind, dimensionKind]);
+  // A calendar on a timestamp groups by day: the server would otherwise keep one value per day silently.
+  const grainRequired = isCalendar && dimensionKind === "datetime";
+  // A calendar is one cell per day, so up to a year of rows; a grouped chart
+  // may show up to a thousand buckets (the server keeps the latest).
+  const maxLimit = grain ? 1000 : isCalendar ? 366 : 100;
   // Switching to a calendar starts from a full year; leaving it brings the
   // Top-N back inside 1–100.
   React.useEffect(() => {
+    if (grain) return;
     if (isCalendar) setLimit((l) => (l === 20 ? 366 : l));
     else setLimit((l) => Math.min(l, 100));
-  }, [isCalendar]);
+  }, [isCalendar, grain]);
+  // A grain the chosen column or chart kind does not allow is dropped; a
+  // calendar on a timestamp is set to day. Waits for the columns to load so
+  // an edit's saved grain is not cleared before its kinds are known.
+  React.useEffect(() => {
+    if (!fields?.kinds) return;
+    if (grainRequired) { setGrain("day"); return; }
+    setGrain((g) => (g && !grainOptions.includes(g) ? "" : g));
+  }, [fields, grainOptions, grainRequired]);
+  function pickGrain(next: Grain | "") {
+    // A grouped chart reads best in date order; the editor can still change it.
+    if (next && !grain && order === "desc") setOrder("none");
+    // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
+    setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
+    setGrain(next);
+  }
   // Latitude and longitude can be any column the source returns (numbers are
   // listed as measures, but a coordinate stored as text is still pickable).
   const coordinateColumns = React.useMemo(() => [...(fields?.measures ?? []), ...(fields?.dimensions ?? [])], [fields]);
@@ -314,7 +354,7 @@ export function ChartBuilder({
   // Fields and picks follow the columns of the latest successful Run, and a
   // column a re-run no longer returns is dropped rather than kept dangling.
   function applyRunColumns(columns: SqlSourceColumn[]) {
-    const f = fieldsFromColumns(columns);
+    const f: Fields = { ...fieldsFromColumns(columns), kinds: kindsOf(columns) };
     const any = [...f.measures, ...f.dimensions];
     setFields(f);
     setDimension((v) => keepIfOffered(v, f.dimensions));
@@ -374,7 +414,7 @@ export function ChartBuilder({
     const picked = decodeSourceChoice(value);
     if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
     const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
-    const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
+    const f: Fields = { dimensions: j.dimensions ?? [], measures: j.measures ?? [], kinds: kindsOf(j.columns ?? []) };
     setFields(f);
     return f;
   }
@@ -401,8 +441,10 @@ export function ChartBuilder({
       setText(initial.text ?? "");
       setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
       setLimit(initial.limit ?? 20);
+      setLimitTouched(true);
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
+      setGrain(isGrain(initial.grain) ? initial.grain : "");
       const m = sourceValueFromDef(initial);
       setSource(m);
       if (m) {
@@ -423,8 +465,8 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
-    setTargetBoard(board); setClick(undefined); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20); setLimitTouched(false);
+    setTargetBoard(board); setClick(undefined); setGrain(""); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
   }
 
@@ -472,6 +514,8 @@ export function ChartBuilder({
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
         order: isCalendar ? "none" : isPoints ? undefined : order, limit: isPoints ? undefined : Math.min(limit, maxLimit),
+        // Only a grain the column and kind allow is sent (BI-9); the server checks again.
+        grain: grain && grainOptions.includes(grain) ? grain : undefined,
       };
     }
     // A chart without marks to click (text, KPI, gauge, table, density map)
@@ -484,6 +528,10 @@ export function ChartBuilder({
     return payload;
   }
 
+  const previewInputsKey = previewKey({
+    title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon,
+    aggregate, span, caption, target, text, order, limit, targetBoard, grain,
+  });
   React.useEffect(() => {
     if (!open) return;
     if (isText) {
@@ -525,9 +573,10 @@ export function ChartBuilder({
       }).finally(() => { if (!controller.signal.aborted) setPreviewBusy(false); });
     }, 450);
     return () => { window.clearTimeout(timer); controller.abort(); };
-    // Every field below affects the generated SQL or render spec.
+    // BI-9 review fix (BLOCKER) R3: `previewInputsKey` holds every field that affects the
+    // generated SQL or render spec, `grain` included (lib/preview-key.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon, aggregate, span, caption, target, text, order, limit, targetBoard, heldPreview, previewSql]);
+  }, [open, previewInputsKey, heldPreview, previewSql]);
 
   async function save() {
     setError(null);
@@ -725,6 +774,18 @@ export function ChartBuilder({
                     <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
+                {grainOptions.length > 0 ? (
+                  <div className="mt-1 grid gap-1.5">
+                    <Label>Group by</Label>
+                    <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
+                      <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {grainRequired ? null : <SelectItem value={NO_GRAIN}>No grouping</SelectItem>}
+                        {grainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ) : null}
               </div>
               {canBreakdown ? (
                 <div className="grid gap-1.5">
@@ -842,10 +903,10 @@ export function ChartBuilder({
                   </Select>
                 </div>
               )}
-              <div className="grid gap-1.5">
-                <Label>{isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20)))} />
-              </div>
+              {limitHasEffect(grain, isCalendar ? "none" : order) ? <div className="grid gap-1.5">
+                <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+              </div> : null}
             </div>
           )}
 

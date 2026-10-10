@@ -18,6 +18,8 @@ export type RecordsRequest = {
   /** Together or not at all: neither lists the whole tile. */
   column?: string;
   value?: string;
+  /** With `column` and `value`: `value` is a bucket of a chart grouped by this grain (BI-9), and the rows are those that fall in it. */
+  grain?: string;
   /** The dashboard's active filters, so the list agrees with the number clicked. */
   filters: FilterDef[];
 };
@@ -39,6 +41,7 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
   if (req.column !== undefined && req.value !== undefined) {
     q.set("column", req.column);
     q.set("value", req.value);
+    if (req.grain) q.set("grain", req.grain);
   }
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));

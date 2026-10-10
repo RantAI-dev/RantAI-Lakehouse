@@ -10,7 +10,13 @@ import { useService } from "@/hooks/use-service";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { fetchRecordsPage, hasNextPage, pageRange, splitReference, type RecordsRequest } from "./records";
 
-export type DrillTarget = { name: string; column: string; mart: string; sqlSource?: string; x: number; y: number };
+export type DrillTarget = {
+  name: string; column: string; mart: string; sqlSource?: string; x: number; y: number;
+  /** A grouped chart's bucket as the person read it ("Mar 2026"); `name` then holds the stored bucket (BI-9). */
+  label?: string;
+  /** The grain of `name`, when it is a bucket (BI-9). */
+  grain?: string;
+};
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
 export function DrillMenu({
@@ -40,7 +46,7 @@ export function DrillMenu({
         style={{ left: Math.min(drill.x, w - 250), top: Math.min(drill.y, h - 130) }}
       >
         <p className="truncate px-2 py-1 text-[11px] text-muted-foreground">
-          {drill.column}: <span className="font-medium text-foreground">{drill.name}</span>
+          {drill.column}: <span className="font-medium text-foreground">{drill.label ?? drill.name}</span>
         </p>
         {onFilter ? (
           <button role="menuitem" onClick={onFilter} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">

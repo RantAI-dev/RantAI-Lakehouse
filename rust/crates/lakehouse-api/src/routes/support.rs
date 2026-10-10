@@ -326,10 +326,11 @@ pub(crate) fn stored_chart_sql(
     filters: &[store::FilterDef],
     mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+    read: &lakehouse_bi::builder::ReadContext<'_>,
 ) -> Result<FilteredSql, &'static str> {
     let Some(id) = chart.def.sql_source.as_deref() else {
         return Ok(lakehouse_bi::builder::sql_with_filters_report(
-            chart, years, filters, mart_cols,
+            chart, years, filters, mart_cols, read,
         ));
     };
     let source = sources
@@ -341,8 +342,78 @@ pub(crate) fn stored_chart_sql(
         &source.column_kinds(),
         years,
         filters,
+        read,
     )
     .ok_or("this chart's definition is invalid")
+}
+
+/// [`annotate_grain`] for a chart that is not on a dashboard (the builder's
+/// preview): its own grain, no dashboard switch, no filters.
+pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartSpec) {
+    let Some(grain) = chart
+        .def
+        .grain
+        .as_deref()
+        .and_then(lakehouse_bi::grain::Grain::parse)
+    else {
+        return;
+    };
+    let order = chart.def.order.as_deref().unwrap_or("none");
+    let filtered = FilteredSql {
+        sql: String::new(),
+        skipped: Vec::new(),
+        grain_skipped: None,
+        grain: Some(grain),
+        grain_column: None,
+        latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
+            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
+    };
+    annotate_grain(tile, &filtered, chart);
+}
+
+/// What a grained chart's tile carries beyond its rows (`BI-9`): the grain it
+/// was bucketed with (`grain`), the grain a dashboard switch could not apply (`grainSkipped`, like `filtersSkipped`)
+/// and, when the chart keeps its latest buckets, the surplus bucket dropped
+/// and `truncated: true` if any bucket was cut off. The query asked for one
+/// bucket more than the chart's limit exactly so this can tell "the limit
+/// cut the result" from "it fits".
+///
+/// A tile that carries an error (no `rows`) is left alone.
+pub(crate) fn annotate_grain(
+    tile: &mut Value,
+    filtered: &FilteredSql,
+    chart: &store::StoredChartSpec,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    // The grain the rows were bucketed with, so the console labels them.
+    if let Some(grain) = filtered.grain {
+        tile.insert("grain".to_owned(), json!(grain.as_str()));
+    }
+    if let Some(kind) = filtered.grain_column {
+        tile.insert("grainColumn".to_owned(), json!(kind));
+    }
+    if let Some(grain) = filtered.grain_skipped {
+        tile.insert("grainSkipped".to_owned(), json!(grain.as_str()));
+    }
+    let Some(limit) = filtered.latest_limit else {
+        return;
+    };
+    let Some(Value::Array(rows)) = tile.get_mut("rows") else {
+        return;
+    };
+    let mut objects: Vec<Map<String, Value>> =
+        rows.iter().filter_map(|r| r.as_object().cloned()).collect();
+    if objects.len() != rows.len() {
+        return;
+    }
+    let cut =
+        lakehouse_bi::grain::trim_to_latest(&mut objects, &chart.def.dimension, limit as usize);
+    if cut {
+        *rows = objects.into_iter().map(Value::Object).collect();
+        tile.insert("truncated".to_owned(), json!(true));
+    }
 }
 
 /// `SELECT table, name, type FROM system.columns WHERE database='serving'`,

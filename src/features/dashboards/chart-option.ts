@@ -22,6 +22,19 @@ const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
 const fmtCompact = formatCompactNumber;
 
 type Row = Record<string, unknown>;
+
+/**
+ * BI-9 review fix (SHOULD-FIX) R5: a line with more points than this draws no
+ * point markers (1000 hourly points read as a solid block). The hover marker
+ * and tooltip still work: ECharts shows the symbol under the axis pointer even
+ * with `showSymbol: false`.
+ */
+export const MARKER_LIMIT = 60;
+
+/** Whether a chart of `kind` with `points` category points draws a marker on each. */
+export function showsPointMarkers(kind: string, points: number): boolean {
+  return kind === "line" && points <= MARKER_LIMIT;
+}
 const num = (v: unknown) => Number(v ?? 0);
 const str = (v: unknown) => String(v ?? "");
 
@@ -29,6 +42,8 @@ export function buildOption(
   spec: Renderable,
   rows: Row[],
   dark: boolean,
+  /** `firstDay`: the calendar's first weekday (0 Sunday, 1 Monday), from the Settings (BI-9). */
+  opts: { firstDay?: 0 | 1 } = {},
 ): EChartsOption {
   const axis = dark ? "#a1a1aa" : "#71717a";
   const split = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
@@ -305,7 +320,7 @@ export function buildOption(
       calendar: range ? { range, top: 24, left: 36, right: 12, bottom: 44, cellSize: ["auto", "auto"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, color: dark ? "#18181b" : "#fafafa" },
         splitLine: { show: false }, yearLabel: { show: false },
-        dayLabel: { color: axis, fontSize: 9, firstDay: 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
+        dayLabel: { color: axis, fontSize: 9, firstDay: opts.firstDay ?? 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
       series: range ? [{ type: "heatmap", coordinateSystem: "calendar", data }] : [],
       title: range ? undefined : { text: "No dated rows to show", left: "center", top: "middle", textStyle: { color: axis, fontSize: 12, fontWeight: "normal" } },
     } as EChartsOption;
@@ -355,7 +370,7 @@ export function buildOption(
       type: isLine ? "line" : "bar",
       stack: stack ? "total" : undefined,
       smooth: isLine,
-      showSymbol: spec.kind === "line",
+      showSymbol: showsPointMarkers(spec.kind, orderedCats.length),
       symbolSize: 5,
       areaStyle: spec.kind === "area" ? { opacity: 0.15 } : undefined,
       emphasis: { focus: "series" },
@@ -409,7 +424,7 @@ export function buildOption(
         data: values,
         barMaxWidth: 34,
         smooth: isLine,
-        showSymbol: spec.kind === "line",
+        showSymbol: showsPointMarkers(spec.kind, values.length),
         symbolSize: 6,
         lineStyle: isLine ? { width: 2 } : undefined,
         areaStyle:

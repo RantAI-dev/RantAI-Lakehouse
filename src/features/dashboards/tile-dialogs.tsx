@@ -15,6 +15,14 @@ export type Rows = {
   rows: Record<string, unknown>[];
   /** Active filters this tile's data could not honour (BI-18). */
   filtersSkipped?: FilterSkip[];
+  /** The grain the rows were bucketed with, when the chart has one (BI-9). */
+  grain?: string;
+  /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */
+  grainColumn?: string;
+  /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
+  grainSkipped?: string;
+  /** More buckets existed than the chart's limit; the latest are shown (BI-9). */
+  truncated?: boolean;
 };
 export type Cell = Rows | TileFailure;
 

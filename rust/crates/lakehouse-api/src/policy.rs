@@ -57,6 +57,14 @@
 //! `agent:approve`, `dashboard:read`) match `identity:*` under those
 //! semantics — see `identity_permissions_require_no_seed_change` below.
 //!
+//! # `settings:write`
+//!
+//! Introduced for `PUT /api/settings/reporting` (`BI-9`) by the same rules as
+//! `identity:*` and `storage:restore`: the string is listed in the table
+//! below, no seeded role is granted it (so no migration touches the role
+//! rows), and Platform Admin's `*:*` satisfies it by the resource-wildcard
+//! rule. Reading the settings stays `RequiresAuth`.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -452,6 +460,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
     ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
+
+    // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
+    //    the console needs the zone and the first day to label every date
+    //    axis, whoever is viewing. Changing them moves every date on every
+    //    dashboard, so it is its own permission, `settings:write`, introduced
+    //    by the same rules as `identity:*` and `storage:restore` above: no
+    //    seed grant, so only a `*:*` holder (Platform Admin) has it until an
+    //    operator grants it to a role; see
+    //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
+    ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
+    ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
@@ -880,6 +899,46 @@ mod tests {
         assert!(
             platform_admin.has(required),
             "a Platform Admin (*:*) must be allowed through POST /api/identity/roles"
+        );
+    }
+
+    /// `BI-9`: `settings:write` follows the rules for introducing a permission
+    /// string at the top of this file: it is satisfied by Platform Admin's
+    /// `*:*` and by none of the seeded roles' grants, so it needs no seed
+    /// migration, and the read route stays open to any signed-in caller.
+    #[test]
+    fn settings_write_needs_no_seed_change_and_no_seeded_role_has_it() {
+        use lakehouse_auth::PermissionSet;
+
+        let non_admin_roles = [
+            ("Analyst", "query:read, catalog:read, lineage:read"),
+            ("Approver", "agent:approve, policy:review"),
+            ("Governance Admin", "policy:*, residency:*, audit:read"),
+            (
+                "Data Engineer",
+                "pipeline:*, catalog:write, connector:manage",
+            ),
+            ("Data Scientist", "query:read, feature:write, notebook:run"),
+            ("Dashboard Viewer", "dashboard:read"),
+        ];
+        for (name, raw) in non_admin_roles {
+            assert!(
+                !PermissionSet::parse(raw).has("settings:write"),
+                "{name} unexpectedly grants settings:write"
+            );
+        }
+        // Holding `dashboard:write` is not enough either.
+        assert_denied_then_allowed(
+            "PUT",
+            "/api/settings/reporting",
+            &PermissionSet::parse("dashboard:write, dashboard:read"),
+            "an editor with dashboard:write",
+            &PermissionSet::parse("*:*"),
+            "a Platform Admin (*:*)",
+        );
+        assert_eq!(
+            policy_for("GET", "/api/settings/reporting"),
+            Some(Policy::RequiresAuth)
         );
     }
 
