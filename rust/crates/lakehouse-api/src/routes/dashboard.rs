@@ -261,6 +261,9 @@ async fn get_body(
         // The saved default, which `filters` is not when the caller passed
         // its own: the console compares the two to offer Save and Reset.
         "defaultFilters": board_obj.and_then(|b| b.filters.clone()).unwrap_or_default(),
+        // BI-18·B: the interval an editor saved; 0 when none, so the
+        // console starts from "off" without a second request.
+        "refreshSeconds": board_obj.and_then(|b| b.refresh_seconds).unwrap_or(0),
         "boards": boards_out,
         "kpis": kpis_out,
         "charts": charts_out,
@@ -660,6 +663,11 @@ struct BoardEditBody {
     /// Move the board to this folder (`""` = root).
     #[serde(default, rename = "folderId")]
     folder_id: Option<String>,
+    /// The board's saved auto-refresh in seconds (`BI-18`·B; `0` = off).
+    /// Held as a signed number so `-1` is refused with our message, not by
+    /// the parser's.
+    #[serde(default, rename = "refreshSeconds")]
+    refresh_seconds: Option<i64>,
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -679,6 +687,22 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
         }
         Some(_) => true,
     }
+}
+
+/// A board edit's `refreshSeconds` as a checked interval (`BI-18`·B).
+///
+/// # Errors
+///
+/// 400 with our message when it is not one of
+/// [`lakehouse_bi::click::REFRESH_SECONDS`] (a negative or huge number
+/// included).
+fn checked_refresh(raw: Option<i64>) -> Result<Option<u32>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let seconds = u32::try_from(raw).unwrap_or(u32::MAX);
+    lakehouse_bi::click::validate_refresh_seconds(seconds).map_err(ApiError::BadRequest)?;
+    Ok(Some(seconds))
 }
 
 /// The `SEC-12` part of [`boards_update`]: withdraw every embed token of the
@@ -752,6 +776,7 @@ pub async fn boards_update(
     if let Some(filters) = &parsed.filters {
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
+    let refresh = checked_refresh(parsed.refresh_seconds)?;
     if let Some(name) = &parsed.name {
         store::rename_board(ch, &id, name)
             .await
@@ -772,6 +797,11 @@ pub async fn boards_update(
                     upstream_error::FailedAs::BadRequest,
                 )
             })?;
+    }
+    if let Some(seconds) = refresh {
+        store::update_board_refresh(ch, &id, seconds)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     if let Some(filters) = &parsed.filters {
         // BI-18 review round 1: a save cleans the row of filters that filter
@@ -968,22 +998,34 @@ async fn fields_body(
 // ── /api/dashboard/records ──────────────────────────────────────────────
 
 /// Query parameters for `GET /api/dashboard/records`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RecordsQuery {
     #[serde(default)]
     mart: Option<String>,
-    /// Set by a tile built on a dashboard SQL source. Drill-down over a
-    /// source is not supported yet (plan §3.4); answered honestly instead of
-    /// being treated as a missing mart.
-    #[serde(default)]
-    source: Option<String>,
+    /// The id of the dashboard SQL source a tile is built on, read instead
+    /// of `mart` (BI-18·B: records over a SQL source).
+    #[serde(default, rename = "sqlSource", alias = "source")]
+    sql_source: Option<String>,
+    /// With `value`: the clicked column. Without both, the whole tile's rows.
     #[serde(default)]
     column: Option<String>,
     #[serde(default)]
     value: Option<String>,
+    /// Rows per page, at most [`RECORDS_PAGE_MAX`].
     #[serde(default)]
     limit: Option<String>,
+    /// Rows to skip, for the next page.
+    #[serde(default)]
+    offset: Option<String>,
+    /// The dashboard's active filters (JSON list, as for `GET /api/dashboard`),
+    /// so the list agrees with the number that was clicked.
+    #[serde(default)]
+    filters: Option<String>,
 }
+
+/// Rows per page: the default and the maximum (BI-18·B; the owner confirms 50
+/// at QA).
+const RECORDS_PAGE_MAX: u32 = 50;
 
 /// `/^[a-zA-Z_][a-zA-Z0-9_]*$/` — the exact `IDENT` pattern used by
 /// `records/route.ts` (distinct from the strip-only pattern in
@@ -1054,9 +1096,91 @@ fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError 
     upstream_error::ch_error(&DASHBOARD_QUERY, err)
 }
 
+/// The relation a records list reads, with its columns.
+struct RecordsRelation {
+    from: lakehouse_bi::builder::Relation,
+    cols: RelationColumns,
+    /// What the response names it by: `("mart", name)` or `("sqlSource", id)`.
+    label: (&'static str, String),
+}
+
+/// The relation named by `q`: a `serving` mart, or a SQL source passed
+/// through the same `check_sql_source` gate it passed when saved.
+async fn records_relation(ch: &ChClient, q: &RecordsQuery) -> Result<RecordsRelation, ApiError> {
+    use lakehouse_bi::builder::Relation;
+    if let Some(id) = q.sql_source.as_deref().filter(|s| !s.trim().is_empty()) {
+        let source = lakehouse_bi::sources::get_source(ch, id)
+            .await
+            .map_err(|err| classify_dashboard_ch_error(&err))?
+            .ok_or_else(|| {
+                ApiError::NotFound("this chart's SQL source no longer exists".to_owned())
+            })?;
+        let sql = check_sql_source(&source.sql).map_err(|_| {
+            ApiError::Unprocessable(
+                "this chart's SQL source no longer passes the SQL check".to_owned(),
+            )
+        })?;
+        return Ok(RecordsRelation {
+            from: Relation::Sql(sql),
+            cols: source.column_kinds(),
+            label: ("sqlSource", source.id),
+        });
+    }
+    let mart_raw = q.mart.clone().unwrap_or_default();
+    let mart = mart_raw
+        .strip_prefix("serving.")
+        .unwrap_or(&mart_raw)
+        .to_owned();
+    if !is_strict_ident(&mart) {
+        return Err(ApiError::BadRequest("invalid mart/column".to_owned()));
+    }
+    let cols_sql = format!(
+        "SELECT name, type FROM system.columns WHERE database='serving' AND table='{}'",
+        esc(&mart)
+    );
+    let rows = ch
+        .rows(&cols_sql, None)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    if rows.is_empty() {
+        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")));
+    }
+    let cols: RelationColumns = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?;
+            let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
+            Some((name.to_owned(), ColumnKind::from_clickhouse_type(ty)))
+        })
+        .collect();
+    let ident = lakehouse_core::ident::Ident::new(mart.clone())
+        .map_err(|_| ApiError::BadRequest("invalid mart/column".to_owned()))?;
+    Ok(RecordsRelation {
+        from: Relation::Mart(ident),
+        cols,
+        label: ("mart", mart),
+    })
+}
+
+/// A page size or offset: absent means `default`; text that is not a
+/// non-negative whole number is a 400 of ours.
+fn records_number(raw: Option<&str>, name: &str, default: u64) -> Result<u64, ApiError> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(default),
+        Some(t) => t.parse::<u64>().map_err(|_| {
+            ApiError::BadRequest(format!("{name} must be a non-negative whole number"))
+        }),
+    }
+}
+
 /// [`records`]' body, taking the principal's roles and placeholders
 /// explicitly so the enforcement path can be tested against a mock
 /// `ClickHouse` and a real policy row.
+///
+/// BI-18·B: the statements come from [`lakehouse_bi::builder::records_sql`],
+/// the builder's own relation and filter machinery, so a mart and a SQL
+/// source share one path; both the page and the total go through the role
+/// rewrite.
 async fn records_for_roles(
     ch: &ChClient,
     q: RecordsQuery,
@@ -1064,80 +1188,100 @@ async fn records_for_roles(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
 ) -> Result<Value, ApiError> {
-    if q.source.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-        return Ok(json!({
-            "supported": false,
-            "message": "Drill-down is not available yet for charts built on a SQL source.",
-            "columns": [],
-            "rows": [],
-        }));
-    }
-    let mart_raw = q.mart.unwrap_or_default();
-    let mart = mart_raw
-        .strip_prefix("serving.")
-        .unwrap_or(&mart_raw)
-        .to_owned();
-    let column = q.column.unwrap_or_default();
-    let value = q.value.unwrap_or_default();
-    let limit: i64 = q
-        .limit
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|n| *n != 0)
-        .unwrap_or(50)
-        .clamp(1, 200);
+    let limit = u32::try_from(records_number(
+        q.limit.as_deref(),
+        "limit",
+        u64::from(RECORDS_PAGE_MAX),
+    )?)
+    .unwrap_or(RECORDS_PAGE_MAX)
+    .clamp(1, RECORDS_PAGE_MAX);
+    let offset = records_number(q.offset.as_deref(), "offset", 0)?;
+    let filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
 
-    if !is_strict_ident(&mart) || !is_strict_ident(&column) {
-        return Err(ApiError::BadRequest("invalid mart/column".to_owned()));
-    }
-
-    let cols_sql = format!(
-        "SELECT name FROM system.columns WHERE database='serving' AND table='{}'",
-        esc(&mart)
+    // A drill is a column and a value together; neither is the whole tile.
+    let drill = match (
+        q.column.as_deref().filter(|c| !c.is_empty()),
+        q.value.as_deref(),
+    ) {
+        (Some(column), Some(value)) => Some((column, value)),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "column and value go together".to_owned(),
+            ));
+        }
+    };
+    let relation = records_relation(ch, &q).await?;
+    let drill = match drill {
+        Some((column, value)) => {
+            let ident = lakehouse_core::ident::Ident::new(column.to_owned())
+                .map_err(|_| ApiError::BadRequest("invalid mart/column".to_owned()))?;
+            if !relation.cols.contains_key(column) {
+                return Err(ApiError::BadRequest(format!(
+                    "column '{column}' does not exist"
+                )));
+            }
+            Some((ident, value))
+        }
+        None => None,
+    };
+    let sql = lakehouse_bi::builder::records_sql(
+        &relation.from,
+        &relation.cols,
+        &filters,
+        drill.as_ref().map(|(ident, value)| (ident, *value)),
+        limit,
+        offset,
     );
-    let cols = ch
-        .rows(&cols_sql, None)
+
+    let rewrite = |statement: String| async move {
+        crate::policy_engine::rewrite_sql_for_roles(
+            &statement,
+            &sqlparser::dialect::ClickHouseDialect {},
+            roles,
+            placeholders,
+            obligations,
+        )
         .await
-        .map_err(|err| classify_dashboard_ch_error(&err))?;
-    if cols.is_empty() {
-        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")));
-    }
-    let has_column = cols
-        .iter()
-        .any(|c| c.get("name").and_then(Value::as_str) == Some(column.as_str()));
-    if !has_column {
-        return Err(ApiError::BadRequest(format!(
-            "column '{column}' does not exist"
-        )));
-    }
-
-    let sql = format!(
-        "SELECT * FROM serving.{mart} WHERE {column} = '{}' LIMIT {limit}",
-        esc(&value)
-    );
-    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
-        &sql,
-        &sqlparser::dialect::ClickHouseDialect {},
-        roles,
-        placeholders,
-        obligations,
-    )
-    .await
-    .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
-    })?;
+        .map_err(|err| {
+            ApiError::Unprocessable(
+                crate::policy_engine::enforcement_error_message(&err).to_owned(),
+            )
+        })
+    };
+    let rows_sql = rewrite(sql.rows).await?;
+    let count_sql = rewrite(sql.count).await?;
     let result = ch
-        .query(&rewritten, None)
+        .query(&rows_sql, None)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let counted = ch
+        .rows(&count_sql, None)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    // `count()` is a UInt64, which ClickHouse quotes in JSON; a count that is
+    // neither text nor number is not invented as 0.
+    let total = counted
+        .first()
+        .and_then(|r| r.get("n"))
+        .and_then(|n| {
+            n.as_u64()
+                .or_else(|| n.as_str().and_then(|t| t.parse().ok()))
+        })
+        .ok_or_else(|| ApiError::Internal("database error".to_owned()))?;
     let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
-    Ok(json!({
+    let mut body = json!({
         "columns": columns,
         "rows": result.data,
-        "mart": mart,
-        "column": column,
-        "value": value,
-    }))
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "column": drill.as_ref().map(|(c, _)| c.as_str()),
+        "value": drill.as_ref().map(|(_, v)| *v),
+        "filtersSkipped": sql.skipped,
+    });
+    body[relation.label.0] = json!(relation.label.1);
+    Ok(body)
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -1832,6 +1976,29 @@ mod tests {
     }
 
     #[test]
+    fn the_saved_refresh_is_a_listed_interval_or_a_400_of_ours() {
+        for ok in [0_u32, 60, 300, 600, 900, 1800, 3600] {
+            assert_eq!(checked_refresh(Some(i64::from(ok))).unwrap(), Some(ok));
+        }
+        assert_eq!(checked_refresh(None).unwrap(), None);
+        for bad in [-1, 1, 59, 3601, i64::MAX, i64::MIN] {
+            let err = checked_refresh(Some(bad)).unwrap_err();
+            assert!(
+                matches!(err, ApiError::BadRequest(ref m) if m.starts_with("refreshSeconds must be one of 0, 60, 300")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_built_in_board_may_save_a_refresh_as_it_may_save_a_layout() {
+        let body: BoardEditBody =
+            serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
+        assert!(board_edit_allowed(&body));
+        assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    #[test]
     fn yaml_board_omits_layout_when_absent() {
         let out = yaml_board("default", "Main", None);
         assert_eq!(out, "  - id: default\n    name: Main\n");
@@ -1881,27 +2048,36 @@ mod records_enforcement {
             mart: Some(mart.to_owned()),
             column: Some(column.to_owned()),
             value: Some(value.to_owned()),
-            limit: None,
-            source: None,
+            ..RecordsQuery::default()
         }
     }
 
     /// Answers both `system.columns` lookups the drill-down makes: the
-    /// route's own column check (reads `name`) and the policy engine's
-    /// column resolution (reads `name`/`default_*`).
+    /// route's own column check (reads `name`/`type`) and the policy engine's
+    /// column resolution (reads `name`/`default_*`), and the total (`count()`).
     async fn mount_mart_columns(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("count() AS n"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "n", "type": "UInt64"}],
+                "data": [{"n": "1"}],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
         Mock::given(method("POST"))
             .and(body_string_contains("system.columns"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": [
                     {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
                     {"name": "default_kind", "type": "String"},
                     {"name": "default_expression", "type": "String"},
                 ],
                 "data": [
-                    {"name": "id", "default_kind": "", "default_expression": ""},
-                    {"name": "email", "default_kind": "", "default_expression": ""},
-                    {"name": "region", "default_kind": "", "default_expression": ""},
+                    {"name": "id", "type": "UInt64", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "type": "String", "default_kind": "", "default_expression": ""},
+                    {"name": "region", "type": "String", "default_kind": "", "default_expression": ""},
                 ],
                 "rows": 3,
             })))
@@ -1979,26 +2155,21 @@ mod records_enforcement {
                 .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
             "every drill-down row query must be the masked rewrite, never the raw SELECT *: {row_queries:?}"
         );
-        Ok(())
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn drill_down_on_a_sql_source_tile_is_unsupported_and_never_queries(
-        pool: PgPool,
-    ) -> sqlx::Result<()> {
-        // No mocks: any ClickHouse request would fail the call.
-        let server = MockServer::start().await;
-        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
-        let mut q = drill("", "material_group", "x");
-        q.source = Some("s_1234abcd".to_owned());
-
-        let body = records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations)
-            .await
-            .expect("an honest unsupported answer, not an error");
-
-        assert_eq!(body["supported"], false);
-        assert!(server.received_requests().await.unwrap().is_empty());
+        // BI-18·B: the page order survives the rewrite, and the total is
+        // masked and row-filtered through the same path.
+        assert!(
+            row_queries
+                .iter()
+                .any(|b| b.contains("count() AS n") && b.contains("replaceRegexpOne")),
+            "{row_queries:?}"
+        );
+        assert!(
+            row_queries
+                .iter()
+                .filter(|b| !b.contains("count() AS n"))
+                .all(|b| b.contains("ORDER BY ALL")),
+            "{row_queries:?}"
+        );
         Ok(())
     }
 
@@ -2920,5 +3091,296 @@ mod typed_filters {
         .unwrap();
         assert_eq!(body["values"], json!([]));
         assert!(value_reads(&server).await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod records_pages {
+    //! BI-18·B: the records list is paged, counted, filtered and works on a
+    //! SQL source. A wiremock `ClickHouse` answers and records every
+    //! statement; there is no Postgres, so the masking test stays in
+    //! `records_enforcement`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_core::ApiError;
+    use serde_json::{Value, json};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{RecordsQuery, records_for_roles};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    async fn answer(server: &MockServer, statement_has: &str, data: Vec<Value>) {
+        let rows = data.len();
+        Mock::given(method("POST"))
+            .and(body_string_contains(statement_has))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "meta": [{"name": "n", "type": "String"}], "data": data, "rows": rows }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// Anything not matched above (the store's DDL): success, no rows.
+    async fn answer_rest(server: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// A mart `mart_x` (`region` text, `visitors` number) with a page of rows
+    /// and a total of 120; every other statement answers with no rows.
+    async fn mount_mart(server: &MockServer) {
+        answer(server, "count() AS n", vec![json!({ "n": "120" })]).await;
+        answer(
+            server,
+            "FROM serving.mart_x",
+            vec![json!({ "region": "north" }), json!({ "region": "north" })],
+        )
+        .await;
+        answer(
+            server,
+            "FROM system.columns",
+            vec![
+                json!({ "name": "region", "type": "String" }),
+                json!({ "name": "visitors", "type": "UInt32" }),
+            ],
+        )
+        .await;
+    }
+
+    async fn statements(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    /// The row statement and the count statement the route sent.
+    async fn page_and_count(server: &MockServer) -> (String, String) {
+        let all = statements(server).await;
+        let rows = all.iter().find(|s| s.contains("ORDER BY ALL")).unwrap();
+        let count = all.iter().find(|s| s.contains("count() AS n")).unwrap();
+        (rows.clone(), count.clone())
+    }
+
+    fn mart_query(column: Option<&str>, value: Option<&str>) -> RecordsQuery {
+        RecordsQuery {
+            mart: Some("mart_x".to_owned()),
+            column: column.map(ToOwned::to_owned),
+            value: value.map(ToOwned::to_owned),
+            ..RecordsQuery::default()
+        }
+    }
+
+    async fn run(server: &MockServer, q: RecordsQuery) -> Result<Value, ApiError> {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations).await
+    }
+
+    #[tokio::test]
+    async fn a_mart_answers_a_page_and_the_total_and_offset_moves_the_page() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            offset: Some("100".to_owned()),
+            ..mart_query(Some("region"), Some("north"))
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["total"], 120);
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 100);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+        let (rows, count) = page_and_count(&server).await;
+        assert!(rows.contains("LIMIT 50 OFFSET 100"), "{rows}");
+        assert!(rows.contains("region = 'north'"), "{rows}");
+        assert!(count.contains("region = 'north'"), "{count}");
+    }
+
+    #[tokio::test]
+    async fn a_limit_over_the_page_size_is_clamped() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            limit: Some("500".to_owned()),
+            ..mart_query(Some("region"), Some("north"))
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["limit"], 50);
+        let (rows, _) = page_and_count(&server).await;
+        assert!(rows.contains("LIMIT 50 OFFSET 0"), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn the_active_filters_are_in_both_the_row_and_the_count_statement() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            filters: Some(r#"[{"column":"visitors","op":"between","min":"7"}]"#.to_owned()),
+            ..mart_query(Some("region"), Some("north"))
+        };
+
+        run(&server, q).await.unwrap();
+
+        let (rows, count) = page_and_count(&server).await;
+        assert!(rows.contains("visitors >= 7"), "{rows}");
+        assert!(count.contains("visitors >= 7"), "{count}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_the_relation_cannot_honour_is_reported_not_applied() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            filters: Some(r#"[{"column":"absent","values":["a"]}]"#.to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["filtersSkipped"][0]["column"], "absent");
+        let (rows, _) = page_and_count(&server).await;
+        assert!(!rows.contains("absent"), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_tile_needs_no_column_or_value() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+
+        let body = run(&server, mart_query(None, None)).await.unwrap();
+
+        assert_eq!(body["total"], 120);
+        assert!(body["value"].is_null());
+        let (rows, _) = page_and_count(&server).await;
+        assert!(!rows.contains("WHERE"), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn a_column_without_a_value_is_a_400() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+
+        let err = run(&server, mart_query(Some("region"), None))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m == "column and value go together"));
+    }
+
+    #[tokio::test]
+    async fn a_column_the_relation_lacks_is_a_400_with_our_message() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+
+        let err = run(&server, mart_query(Some("nope"), Some("x")))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m == "column 'nope' does not exist"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offset_that_is_not_a_number_is_a_400() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            offset: Some("-1".to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.starts_with("offset ")));
+    }
+
+    #[tokio::test]
+    async fn a_value_with_a_quote_and_a_backslash_is_one_escaped_literal() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+
+        run(&server, mart_query(Some("region"), Some(r"a'b\c")))
+            .await
+            .unwrap();
+
+        let (rows, count) = page_and_count(&server).await;
+        // The policy rewrite re-prints the literal with ClickHouse's backslash
+        // escapes; `'a\'b\\c'` is the same value `a'b\c`.
+        assert!(rows.contains(r"region = 'a\'b\\c'"), "{rows}");
+        assert!(count.contains(r"region = 'a\'b\\c'"), "{count}");
+    }
+
+    #[tokio::test]
+    async fn a_sql_source_answers_a_page_and_a_total_through_its_own_guarded_sql() {
+        let server = MockServer::start().await;
+        answer(&server, "count() AS n", vec![json!({ "n": "9" })]).await;
+        answer(&server, "AS src", vec![json!({ "channel": "web" })]).await;
+        answer(
+            &server,
+            "FROM console.bi_source FINAL",
+            vec![json!({
+                "id": "s_1", "title": "src",
+                "sql": "SELECT channel FROM serving.mart_x",
+                "columns_json": json!([{"name": "channel", "type": "String"}]).to_string(),
+                "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00",
+            })],
+        )
+        .await;
+        answer_rest(&server).await;
+        let q = RecordsQuery {
+            sql_source: Some("s_1".to_owned()),
+            column: Some("channel".to_owned()),
+            value: Some("web".to_owned()),
+            ..RecordsQuery::default()
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["total"], 9);
+        assert_eq!(body["sqlSource"], "s_1");
+        let (rows, count) = page_and_count(&server).await;
+        assert!(rows.contains("channel = 'web'"), "{rows}");
+        // The source's cap rides on the count too.
+        assert!(count.contains("max_execution_time = 30"), "{count}");
+        assert!(rows.contains("max_execution_time = 30"), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sql_source_is_a_404_of_ours_and_runs_nothing_else() {
+        let server = MockServer::start().await;
+        answer(&server, "FROM console.bi_source FINAL", vec![]).await;
+        answer_rest(&server).await;
+        let q = RecordsQuery {
+            sql_source: Some("s_gone".to_owned()),
+            ..RecordsQuery::default()
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+        assert!(
+            statements(&server)
+                .await
+                .iter()
+                .all(|s| !s.contains("ORDER BY ALL"))
+        );
     }
 }

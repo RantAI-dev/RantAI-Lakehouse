@@ -29,6 +29,10 @@ import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
 import { dashboardService } from "@/services";
+import type { ChartClick } from "@/services/clients/bi-store";
+import { kindHasClickValue } from "@/lib/chart-click";
+import { clickProblem } from "@/lib/click-destination";
+import { ClickSetting } from "./click-setting";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
@@ -48,6 +52,8 @@ export type ChartDef = {
   map?: string; lat?: string; lon?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
+  /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
+  click?: ChartClick;
 };
 type BoardOpt = { id: string; name: string };
 type Preview = {
@@ -257,6 +263,8 @@ export function ChartBuilder({
   const [order, setOrder] = React.useState<"desc" | "asc" | "none">("desc");
   const [limit, setLimit] = React.useState(20);
   const [targetBoard, setTargetBoard] = React.useState(board);
+  // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
+  const [click, setClick] = React.useState<ChartClick | undefined>(undefined);
   const isText = kind === "text";
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
@@ -394,6 +402,7 @@ export function ChartBuilder({
       setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
       setLimit(initial.limit ?? 20);
       setTargetBoard(initial.board ?? board);
+      setClick(initial.click);
       const m = sourceValueFromDef(initial);
       setSource(m);
       if (m) {
@@ -415,7 +424,7 @@ export function ChartBuilder({
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
-    setTargetBoard(board); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setTargetBoard(board); setClick(undefined); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
   }
 
@@ -465,6 +474,12 @@ export function ChartBuilder({
         order: isCalendar ? "none" : isPoints ? undefined : order, limit: isPoints ? undefined : Math.min(limit, maxLimit),
       };
     }
+    // A chart without marks to click (text, KPI, gauge, table, density map)
+    // has no click setting; one left over from another kind is dropped.
+    const clickable = kindHasClickValue(kind);
+    const problem = clickable ? clickProblem(click) : null;
+    if (problem && !forPreview) throw new Error(problem);
+    if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
     return payload;
   }
@@ -659,9 +674,7 @@ export function ChartBuilder({
             {choice?.kind === "sql" && draft.mode !== "edit" ? (
               canWriteSql ? (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                  <p className="text-xs text-muted-foreground">
-                    Custom SQL source. Drill-down to records is not available for SQL sources yet.
-                  </p>
+                  <p className="text-xs text-muted-foreground">Custom SQL source.</p>
                   <Button
                     type="button" size="sm" variant="outline"
                     disabled={!sqlSources.some((s) => s.id === choice.id)}
@@ -672,7 +685,7 @@ export function ChartBuilder({
                 </div>
               ) : (
                 <p className="text-xs text-muted-foreground">
-                  Custom SQL source. You need the dashboard:sql permission to edit it. Drill-down to records is not available for SQL sources yet.
+                  Custom SQL source. You need the dashboard:sql permission to edit it.
                 </p>
               )
             ) : null}
@@ -835,6 +848,8 @@ export function ChartBuilder({
               </div>
             </div>
           )}
+
+          {kindHasClickValue(kind) ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
         </>
       )}
     </div>

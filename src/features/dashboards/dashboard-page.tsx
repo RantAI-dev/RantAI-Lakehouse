@@ -3,17 +3,22 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
+import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
+import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
+import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
+import { notifyFailure, notifyInfo } from "@/lib/notify";
 import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
-import type { LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
+import type { ChartClick, LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
@@ -29,7 +34,8 @@ import { FilterBar } from "./filters/filter-bar";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
-import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
+import { DrillMenu, RecordsDialog, type DrillTarget } from "./drill";
+import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
@@ -44,6 +50,8 @@ type Payload = {
   filters: FilterDef[];
   /** The board's saved default, which `filters` is not while the address overrides it. */
   defaultFilters?: FilterDef[];
+  /** The board's saved auto-refresh in seconds; 0 when none (BI-18·B). */
+  refreshSeconds?: number;
   filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
@@ -60,18 +68,28 @@ const NO_RESULTS: Record<string, Cell> = {};
 const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
 
+/** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
+function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
+  if (click.kind === "dashboard") return `open ${boards.find((b) => b.id === click.board)?.name ?? "another dashboard"}`;
+  if (click.kind === "query") return "open a saved query";
+  return "open a link";
+}
+
 /**
- * The column a click on this tile's data drills into, if any: category
- * charts only. Built-in tiles have no stored definition, but their `x` is a
- * real mart column — except on time series, whose axis is a derived period.
+ * What `lib/chart-click` needs to know about a tile. A stored chart's
+ * category column is its definition's `dimension`; a built-in tile has no
+ * definition, but its `x` is a real mart column (`canDrill` leaves out the
+ * built-in line and area, whose axis is a derived period).
  */
-function drillColumn(spec: ChartCard): string | undefined {
-  // Nodes, rings, distributions and days are not one category value to drill
-  // into, and neither is a map (points have no category, and a region click
-  // would drill into a name that was matched, not stored).
-  if (["geomap", "pointmap", "geoheat", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
-  if (spec.source !== "builtin") return spec.def?.dimension || undefined;
-  return ["line", "area"].includes(spec.kind) ? undefined : spec.x || undefined;
+function clickSpecOf(spec: ChartCard): ClickSpec {
+  const own = spec.source !== "builtin";
+  return {
+    kind: spec.kind,
+    source: spec.source,
+    dimension: (own ? spec.def?.dimension : spec.x) || undefined,
+    breakdown: (own ? spec.def?.breakdown : spec.series) || undefined,
+    y: spec.y,
+  };
 }
 
 /**
@@ -89,7 +107,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const isDefault = board === "default";
 
   const { resolvedTheme } = useTheme();
-  const dark = resolvedTheme === "dark";
+  const themeDark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
@@ -115,10 +133,21 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [shareOpen, setShareOpen] = React.useState(false);
   const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
-  const [autoSec, setAutoSec] = React.useState("0");
+  // Auto-refresh starts from the board's saved interval; a viewer's change is
+  // this session's only (null = follow the saved one) and is never written
+  // back unless an editor presses "Save as dashboard default" (BI-18·B).
+  const [sessionSec, setSessionSec] = React.useState<number | null>(null);
+  const [savingRefresh, setSavingRefresh] = React.useState(false);
+  // The dark choice of the full screen is remembered per browser; read after
+  // mount so the server-rendered page and the first client render agree.
+  const [fsDark, setFsDark] = React.useState(false);
+  React.useEffect(() => { setFsDark(readFullscreenDark()); }, []);
+  const dark = themeDark || (fullscreen && fsDark);
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
-  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; sqlSource: boolean }) | null>(null);
-  const [records, setRecords] = React.useState<RecordsState | null>(null);
+  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean }) | null>(null);
+  const [records, setRecords] = React.useState<RecordsRequest | null>(null);
+  // Tiles whose saved click destination the viewer set aside for the drill menu (this session only).
+  const [menuTiles, setMenuTiles] = React.useState<ReadonlySet<string>>(new Set());
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
@@ -159,14 +188,48 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const reloadFolders = foldersState.reload;
   useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); }, [load, reloadFolders]));
   // Periodic refresh for presenting; pauses while the tab is hidden.
-  useAutoRefresh(Number(autoSec) * 1000, load);
-  // Esc exits fullscreen.
+  const savedSec = listedInterval(data?.refreshSeconds);
+  const autoSec = effectiveRefresh(data?.refreshSeconds, sessionSec);
+  useAutoRefresh(autoSec * 1000, load);
+  // A different board starts from its own saved interval.
+  React.useEffect(() => { setSessionSec(null); }, [board]);
+  // Full screen: the page's own overlay is always applied; the browser's
+  // real full screen is requested on top of it where it is allowed, and the
+  // viewer is told when it is not. Esc leaves the browser's full screen by
+  // itself (a `fullscreenchange`) and the overlay's on the keydown below.
+  const nativeFs = React.useRef(false);
+  const leaveFs = React.useCallback(() => {
+    setFullscreen(false);
+    if (nativeFs.current) { nativeFs.current = false; void leaveFullscreen(document); }
+  }, []);
+  const toggleFullscreen = React.useCallback(() => {
+    if (fullscreen) { leaveFs(); return; }
+    setFullscreen(true);
+    // Called from the click that asked for it, which the browser requires.
+    void enterFullscreen(document).then((outcome) => {
+      nativeFs.current = outcome === "native";
+      if (outcome === "in-page") notifyInfo("Showing the dashboard in the page", "The browser did not allow full screen here.");
+    });
+  }, [fullscreen, leaveFs]);
   React.useEffect(() => {
     if (!fullscreen) return;
-    const h = (e: KeyboardEvent) => { if (e.key === "Escape") setFullscreen(false); };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [fullscreen]);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") leaveFs(); };
+    const onChange = () => {
+      // The browser left its full screen (Esc, F11): the overlay goes too.
+      if (!document.fullscreenElement && nativeFs.current) leaveFs();
+    };
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("fullscreenchange", onChange);
+    };
+  }, [fullscreen, leaveFs]);
+  // Leaving the page (or the board) while in full screen leaves it too.
+  React.useEffect(() => () => {
+    if (nativeFs.current) { nativeFs.current = false; void leaveFullscreen(document); }
+  }, []);
+  const toggleFsDark = () => setFsDark((on) => { writeFullscreenDark(!on); return !on; });
 
   // Placeholders the pre-BI-18 bar stored (a column with no values) filter
   // nothing; dropped here so they neither draw a chip nor block the column.
@@ -227,19 +290,42 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     }
   }, [board, filters, writeAddress]);
 
+  // BI-18·B: an editor's choice becomes the dashboard's own default. Written
+  // through the board write path (`dashboard:write`); the session choice is
+  // dropped once it is the saved one.
+  const saveRefreshDefault = React.useCallback(async () => {
+    setSavingRefresh(true);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: board, refreshSeconds: autoSec }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not save the auto-refresh");
+      }
+      setData((prev) => (prev ? { ...prev, refreshSeconds: autoSec } : prev));
+      setSessionSec(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingRefresh(false);
+    }
+  }, [board, autoSec]);
+
   // Cross-filter: toggle a value in a column → filters EVERY tile with that column.
   const crossFilter = React.useCallback((column: string, value: string) => {
     applyFilters(toggleValue(filters, column, value));
     setDrill(null);
   }, [applyFilters, filters]);
 
-  // Drill-down: show the raw Gold rows behind the clicked value.
-  const openRecords = React.useCallback(async (mart: string, column: string, value: string) => {
+  // Drill-down: the rows behind the clicked value (or behind a whole tile),
+  // for the filters in force so the list agrees with the number clicked. A
+  // built-in tile ignores dashboard filters, so its rows are not narrowed.
+  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean) => {
     setDrill(null);
-    setRecords({ columns: [], rows: [], value, loading: true });
-    const rows = await fetchRecords(mart, column, value);
-    setRecords({ ...rows, value, loading: false });
-  }, []);
+    setRecords({ ...request, filters: builtin ? NO_FILTERS : filters });
+  }, [filters]);
 
   // No "jump to the newest user dashboard" from the built-in board here.
   // That effect dated from when `/dashboards` was this page; it now is the
@@ -350,16 +436,67 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     return () => setPageContext(null);
   }, [board, dashName, charts, kpis, results, filters, setPageContext]);
 
+  // Carry out a chart's saved click destination (BI-18·B) for the clicked
+  // value. The server did not check that the target exists, so the console
+  // says so; a URL is checked against the rule again before it is followed.
+  const followClick = (click: ChartClick, value: string) => {
+    if (click.kind === "dashboard") {
+      if (!boards.some((b) => b.id === click.board)) {
+        notifyFailure("That dashboard no longer exists", "Choose another one in the chart's settings.");
+        return;
+      }
+      router.push(dashboardDestination(click.board, click.column, value));
+    } else if (click.kind === "query") {
+      router.push(queryDestination(click.id));
+    } else {
+      const dest = urlDestination(click.url, value);
+      if (!dest) {
+        notifyFailure("This chart's link is not allowed", "Only https, http or a path in the console can be opened.");
+      } else if (dest.external) {
+        window.open(dest.href, "_blank", "noopener,noreferrer");
+      } else {
+        router.push(dest.href);
+      }
+    }
+  };
+
+  // The chart's click, mapped to the column and stored value it stands for
+  // (lib/chart-click.ts); a click that stands for none does nothing. A saved
+  // destination replaces the drill menu unless the viewer set it aside.
+  const onChartClick = (spec: ChartCard, clickSpec: ClickSpec): ChartClickHandler => (hit, pos, ctx) => {
+    const target = drillTarget(clickSpec, hit, ctx);
+    if (!target) return;
+    const saved = spec.def?.click;
+    if (saved && !menuTiles.has(spec.id)) {
+      followClick(saved, target.value);
+      return;
+    }
+    setDrill({ name: target.value, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
+  };
+  const toggleMenuTile = (id: string) => setMenuTiles((prev) => {
+    const next = new Set(prev);
+    if (!next.delete(id)) next.add(id);
+    return next;
+  });
+
   // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
-    const dim = edit ? undefined : drillColumn(spec);
-    const drillable = !!dim;
+    const clickSpec = clickSpecOf(spec);
+    const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
     const menu: TileMenuItem[] = [
       { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
       { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      // The drill menu stays reachable on a chart that opens somewhere else.
+      ...(spec.def?.click && drillable
+        ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
+        : []),
+      // A KPI, gauge or table has no mark to click: its rows are one step away here.
+      ...(offersTileRecords(spec.kind) && (spec.mart || spec.sqlSource)
+        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource }, spec.source === "builtin") }]
+        : []),
       ...(hasRows(cell) && cell.rows.length
         ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
         : []),
@@ -385,8 +522,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           </TooltipTrigger>
           <TooltipContent>
             {spec.source === "builtin"
-              ? "Click a bar or slice in the chart to see its records"
-              : "Click a bar or slice in the chart to filter the dashboard or see its records"}
+              ? "Click a value in the chart to see its records"
+              : spec.def?.click && !menuTiles.has(spec.id)
+                ? `Click a value in the chart to ${clickVerb(spec.def.click, boards)}`
+                : "Click a value in the chart to filter the dashboard or see its records"}
           </TooltipContent>
         </Tooltip>
           ) : null}
@@ -407,7 +546,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       menu,
       body: (
         <TileBody spec={spec} cell={cell} dark={dark} loading={loading}
-          onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin", sqlSource: !!spec.sqlSource }) : undefined} />
+          onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };
   });
@@ -417,7 +556,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
 
   return (
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
+    // `dark` on the container themes the dashboard alone (the tokens and the
+    // `dark:` variants key off an ancestor with the class); the rest of the
+    // console, and anything portalled out of this element, keeps its theme.
+    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", fullscreen && fsDark && "dark")}>
       <PageHeader
         title={
           <BoardSwitcher
@@ -432,6 +574,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }
         actions={
           <span data-print-hide className="contents">
+            {fullscreen ? (
+              <Button variant="outline" size="sm" aria-pressed={fsDark} onClick={toggleFsDark}>
+                <Moon className="size-4" /> Dark
+              </Button>
+            ) : null}
             <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
               {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
             </Button>
@@ -439,10 +586,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               isDefault={isDefault}
               loading={loading}
               fullscreen={fullscreen}
-              autoSec={autoSec}
+              autoSec={String(autoSec)}
+              savedSec={String(savedSec)}
+              canSaveRefresh={refreshIsSaveable({ mayWrite: hasPermission("dashboard:write"), saved: savedSec, effective: autoSec })}
+              savingRefresh={savingRefresh}
               onRefresh={() => void load()}
-              onToggleFullscreen={() => setFullscreen((f) => !f)}
-              onAutoSec={setAutoSec}
+              onToggleFullscreen={toggleFullscreen}
+              onAutoSec={(v) => setSessionSec(Number(v))}
+              onSaveRefresh={() => void saveRefreshDefault()}
               onRename={() => setRenameOpen(true)}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
@@ -562,12 +713,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           drill={drill}
           onClose={() => setDrill(null)}
           onFilter={drill.builtin ? undefined : () => crossFilter(drill.column, drill.name)}
-          // Records drill-down over a SQL source is not supported yet (the API
-          // answers `supported: false`); offer only the cross-filter there.
-          onRecords={drill.sqlSource ? undefined : () => void openRecords(drill.mart, drill.column, drill.name)}
+          onRecords={() => openRecords({ title: drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name }, drill.builtin)}
         />
       ) : null}
-      <RecordsDialog records={records} onClose={() => setRecords(null)} />
+      <RecordsDialog request={records} onClose={() => setRecords(null)} />
 
       {tileDialog?.kind === "data" && dialogSpec ? (
         <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />

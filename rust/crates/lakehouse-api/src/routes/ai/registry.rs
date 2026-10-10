@@ -199,6 +199,7 @@ fn create_chart_schema() -> Value {
             "lon": { "type": "string", "description": "pointmap and geoheat only (required): the longitude column" },
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
+            "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } })
 }
@@ -219,6 +220,7 @@ fn update_chart_schema() -> Value {
             "target": { "type": "number" },
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
+            "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } })
 }

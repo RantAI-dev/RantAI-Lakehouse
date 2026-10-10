@@ -255,7 +255,9 @@ export function buildOption(
   if (spec.kind === "sunburst" && spec.series) {
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { treePathInfo: { name: string }[]; value: number }; return `${o.treePathInfo.map((t) => t.name).filter(Boolean).join(" › ")}<br/><b>${fmtInt(o.value)}</b>`; } },
-      series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined,
+      // `nodeClick: false`: by default a click zooms the ring in, and a click now
+      // opens the drill menu (BI-18·B); the two cannot share the gesture.
+      series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined, nodeClick: false,
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1.5 },
         label: { color: "#fff", fontSize: 10, minAngle: 10, rotate: "radial" },
         levels: [{}, { r0: "12%", r: "45%" }, { r0: "45%", r: "90%", label: { fontSize: 9 } }],

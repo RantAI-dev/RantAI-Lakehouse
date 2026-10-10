@@ -411,6 +411,7 @@ mod tests {
             text: None,
             caption: None,
             target: None,
+            click: None,
         }
     }
 

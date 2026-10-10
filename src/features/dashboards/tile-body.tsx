@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import type { ChartClickHandler } from "@/lib/chart-click";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -22,8 +23,8 @@ export function TileBody({
   cell: Cell | undefined;
   dark: boolean;
   loading: boolean;
-  /** Click a data point (bar/slice/point) → drill/cross-filter. */
-  onDataClick?: (name: string, pos: { x: number; y: number }) => void;
+  /** Click a data point (bar/slice/region/point/day/node/box) → drill/cross-filter. */
+  onDataClick?: ChartClickHandler;
   /**
    * Draw the chart without its legend: for a small preview, where a legend
    * of many entries takes the room and cannot be read. The tooltip still
@@ -65,13 +66,17 @@ export function TileBody({
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <GeoChart spec={spec} rows={cell.rows} dark={dark} />;
+    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} />;
   }
 
   // chart
   if (hasRows(cell) && cell.rows.length) {
     const option = buildOption(spec, cell.rows, dark);
-    return <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={onDataClick} />;
+    const rows = cell.rows;
+    return (
+      <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
+        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows }) : undefined} />
+    );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
 }

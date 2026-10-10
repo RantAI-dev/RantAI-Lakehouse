@@ -1,7 +1,7 @@
 import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { escapeHtml, pointLimit, pointSize, toPoints } from "@/lib/geo-points";
-import { matchRegionRows } from "@/lib/geo-regions";
+import { matchRegionRows, rawNamesByFeature } from "@/lib/geo-regions";
 import { ZOOM_MAX, ZOOM_MIN } from "@/lib/geo-view";
 import { fmtInt } from "./chart-option";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapEntry, mapFeatureNames } from "./echarts-maps";
@@ -19,6 +19,19 @@ type Row = Record<string, unknown>;
 /** The map a spec is drawn on: its own, else the default for its kind. */
 export function resolveMapId(spec: Pick<ChartSpec, "kind" | "map">): string {
   return spec.map || (spec.kind === "geomap" ? DEFAULT_CHOROPLETH_MAP : DEFAULT_POINT_MAP);
+}
+
+/**
+ * For a choropleth, each map feature with the distinct spellings the rows
+ * store for it (what a click drills into); undefined for the point kinds.
+ * Uses the same level and feature names as the drawing, so a click and the
+ * colour agree on which rows belong to a region.
+ */
+export function regionNamesFor(spec: GeoSpec, rows: Row[]): Map<string, string[]> | undefined {
+  if (spec.kind !== "geomap") return undefined;
+  const mapId = resolveMapId(spec);
+  const level = mapEntry(mapId)?.level ?? "province";
+  return rawNamesByFeature(rows.map((r) => String(r[spec.x] ?? "")), level, mapFeatureNames(mapId));
 }
 
 /** A cell as a number; a missing or non-numeric cell is NaN, never 0. */

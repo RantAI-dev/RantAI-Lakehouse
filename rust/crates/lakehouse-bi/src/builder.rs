@@ -591,6 +591,66 @@ where
     Some(FilteredSql { sql, skipped })
 }
 
+/// The statements behind a records list (drill-down, BI-18·B): one page of
+/// rows and the total number of rows they page through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordsSql {
+    /// `SELECT * ... ORDER BY ALL LIMIT .. OFFSET ..`.
+    pub rows: String,
+    /// `SELECT count() AS n ...` over the same relation and predicates.
+    pub count: String,
+    /// Active filters the relation could not honour, as on the tile.
+    pub skipped: Vec<SkippedFilter>,
+}
+
+/// SQL for the rows behind a clicked value, or behind a whole tile when
+/// `value` is `None` (BI-18·B).
+///
+/// The relation and the dashboard's active `filters` go through the same
+/// [`Relation::render`] and [`filter_predicates`] a tile uses, so a mart and
+/// a SQL source share this one path and a filter means here exactly what it
+/// means on the chart. The clicked value is a [`SqlLiteral`] and its column an
+/// [`Ident`]. A SQL source's `SETTINGS` cap rides on both statements: the
+/// count must not run an unbounded source either.
+///
+/// `ORDER BY ALL` makes `OFFSET` pages deterministic: without an order,
+/// `ClickHouse` may return the same rows on two pages and skip others.
+#[must_use]
+pub fn records_sql<HCols>(
+    from: &Relation,
+    cols: &RelationColumns<HCols>,
+    filters: &[FilterDef],
+    value: Option<(&Ident, &str)>,
+    limit: u32,
+    offset: u64,
+) -> RecordsSql
+where
+    HCols: std::hash::BuildHasher,
+{
+    let FilterOutcome {
+        mut predicates,
+        skipped,
+        ..
+    } = filter_predicates(cols, &[], filters);
+    if let Some((column, value)) = value {
+        predicates.insert(0, format!("{column} = {}", SqlLiteral::from(value)));
+    }
+    let where_sql = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+    let from_sql = from.render();
+    let settings = from.settings();
+    RecordsSql {
+        rows: format!(
+            "SELECT * FROM {from_sql}{where_sql} ORDER BY ALL LIMIT {limit} OFFSET {offset}{settings}"
+        ),
+        count: format!("SELECT count() AS n FROM {from_sql}{where_sql}{settings}"),
+        skipped,
+    }
+}
+
 /// The `tahun IN (...)` and dashboard-filter predicates that apply to a
 /// relation with columns `cols`, and the active filters that do not.
 ///
@@ -1992,5 +2052,78 @@ mod tests {
         );
         // The source cap stays on the statement.
         assert!(got.ends_with(SQL_SOURCE_SETTINGS), "{got}");
+    }
+
+    #[test]
+    fn records_sql_on_a_mart_has_value_filters_order_and_page() {
+        let cols = typed(&[("region", ColumnKind::Text), ("n", ColumnKind::Number)]);
+        let region = Ident::new("region".to_owned()).unwrap();
+        let got = records_sql(
+            &Relation::Mart(Ident::new("mart_x".to_owned()).unwrap()),
+            &cols,
+            &[filter(r#"{"column":"n","op":"between","min":"3"}"#)],
+            Some((&region, "o'brien\\")),
+            50,
+            100,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.mart_x WHERE region = 'o''brien\\\\' AND n >= 3 \
+             ORDER BY ALL LIMIT 50 OFFSET 100"
+        );
+        assert_eq!(
+            got.count,
+            "SELECT count() AS n FROM serving.mart_x WHERE region = 'o''brien\\\\' AND n >= 3"
+        );
+        assert!(got.skipped.is_empty());
+    }
+
+    #[test]
+    fn records_sql_for_a_whole_tile_has_no_where_when_nothing_is_active() {
+        let cols = typed(&[("region", ColumnKind::Text)]);
+        let got = records_sql(
+            &Relation::Mart(Ident::new("mart_x".to_owned()).unwrap()),
+            &cols,
+            &[],
+            None,
+            50,
+            0,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.mart_x ORDER BY ALL LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(got.count, "SELECT count() AS n FROM serving.mart_x");
+    }
+
+    #[test]
+    fn records_sql_over_a_sql_source_caps_the_count_as_well_as_the_rows() {
+        let cols = typed(&[("g", ColumnKind::Text)]);
+        let got = records_sql(
+            &Relation::Sql("SELECT g FROM serving.mart_x".to_owned()),
+            &cols,
+            &[],
+            None,
+            10,
+            0,
+        );
+        assert!(got.rows.ends_with(SQL_SOURCE_SETTINGS), "{}", got.rows);
+        assert!(got.count.ends_with(SQL_SOURCE_SETTINGS), "{}", got.count);
+        assert!(got.count.contains(") AS src"), "{}", got.count);
+    }
+
+    #[test]
+    fn records_sql_reports_a_filter_its_relation_cannot_honour() {
+        let cols = typed(&[("g", ColumnKind::Text)]);
+        let got = records_sql(
+            &Relation::Mart(Ident::new("mart_x".to_owned()).unwrap()),
+            &cols,
+            &[filter(r#"{"column":"absent","values":["a"]}"#)],
+            None,
+            50,
+            0,
+        );
+        assert_eq!(got.skipped.len(), 1);
+        assert!(!got.rows.contains("WHERE"), "{}", got.rows);
     }
 }

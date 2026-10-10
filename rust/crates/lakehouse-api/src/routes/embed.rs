@@ -450,6 +450,12 @@ async fn render_board_payload(
         let mut rendered = render_stored_spec(&c.spec, c.source);
         rendered["board"] = json!(c.board);
         rendered["def"] = serde_json::to_value(&c.def).unwrap_or_else(|_| json!({}));
+        // BI-18·B: embeds and public links have no click menu and no
+        // destinations, so the editor's click setting (a board id, a column
+        // or a URL) is not sent to someone who cannot use it.
+        if let Some(def) = rendered["def"].as_object_mut() {
+            def.remove("click");
+        }
         charts_out.push(rendered);
     }
 
@@ -543,7 +549,8 @@ mod typed_filters {
         });
         let def = json!({
             "title": "T", "mart": "mart_a", "kind": "bar",
-            "dimension": "kab", "measures": ["visitors"]
+            "dimension": "kab", "measures": ["visitors"],
+            "click": { "kind": "url", "url": "/somewhere/{value}" }
         });
         answer(
             &server,
@@ -585,6 +592,7 @@ mod typed_filters {
             created_by: None,
             layout: None,
             filters: Some(filters.clone()),
+            refresh_seconds: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -604,6 +612,9 @@ mod typed_filters {
         .unwrap();
 
         assert_eq!(body["board"]["id"], "b1");
+        // BI-18·B: the editor's click setting is not sent to an embed.
+        assert!(body["charts"][0]["def"].get("click").is_none());
+        assert_eq!(body["charts"][0]["def"]["dimension"], "kab");
         let sent: Vec<String> = server
             .received_requests()
             .await

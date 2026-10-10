@@ -1,27 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { Filter, Table2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Filter, Table2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { apiFetch } from "@/services/http";
+import { ErrorWithReference } from "@/components/error-reference";
 import { RowsTable } from "@/components/patterns/rows-table";
-import { type Rows } from "./tile-dialogs";
+import { useService } from "@/hooks/use-service";
+import { SkippedFiltersMarker } from "./filters/skipped-marker";
+import { fetchRecordsPage, hasNextPage, pageRange, splitReference, type RecordsRequest } from "./records";
 
-export type DrillTarget = { name: string; column: string; mart: string; x: number; y: number };
-export type RecordsState = Rows & { value: string; loading: boolean };
-
-/** Raw Gold rows behind one clicked value (up to 100). */
-export async function fetchRecords(mart: string, column: string, value: string): Promise<Rows> {
-  try {
-    const q = new URLSearchParams({ mart, column, value, limit: "100" });
-    const res = await apiFetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json?.error ?? "Failed to load records");
-    return { columns: json.columns ?? [], rows: json.rows ?? [] };
-  } catch {
-    return { columns: [], rows: [] };
-  }
-}
+export type DrillTarget = { name: string; column: string; mart: string; sqlSource?: string; x: number; y: number };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
 export function DrillMenu({
@@ -31,7 +20,7 @@ export function DrillMenu({
   readonly onClose: () => void;
   /** Absent for built-in tiles: dashboard filters don't apply to them. */
   readonly onFilter?: () => void;
-  /** Absent when records cannot be listed (a chart on a SQL source). */
+  /** Absent when the rows cannot be listed. */
   readonly onRecords?: () => void;
 }) {
   React.useEffect(() => {
@@ -68,29 +57,60 @@ export function DrillMenu({
   );
 }
 
+/**
+ * The rows behind a clicked value or a whole tile, a page at a time. It
+ * loads its own pages and starts on the first page each time it opens.
+ */
 export function RecordsDialog({
-  records, onClose,
+  request, onClose,
 }: {
-  readonly records: RecordsState | null;
+  readonly request: RecordsRequest | null;
   readonly onClose: () => void;
 }) {
   return (
-    <Dialog open={!!records} onOpenChange={(o) => { if (!o) onClose(); }}>
-      <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {records?.value}</DialogTitle>
-        </DialogHeader>
-        {records?.loading ? (
-          <div className="h-40 animate-pulse rounded bg-muted/40" />
-        ) : records && records.rows.length ? (
-          <>
-            <RowsTable columns={records.columns} rows={records.rows} />
-            <p className="text-[11px] text-muted-foreground">Showing up to 100 rows.</p>
-          </>
-        ) : (
-          <p className="py-8 text-center text-sm text-muted-foreground">No records found.</p>
-        )}
-      </DialogContent>
+    <Dialog open={!!request} onOpenChange={(o) => { if (!o) onClose(); }}>
+      {request ? <RecordsContent request={request} /> : null}
     </Dialog>
+  );
+}
+
+function RecordsContent({ request }: { readonly request: RecordsRequest }) {
+  const [offset, setOffset] = React.useState(0);
+  const state = useService((signal) => fetchRecordsPage(request, offset, signal), [request, offset]);
+  const page = state.data;
+  const failure = state.status === "error" ? splitReference(state.error.message) : null;
+  return (
+    <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
+      <DialogHeader>
+        <DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {request.title}</DialogTitle>
+      </DialogHeader>
+      {state.status === "loading" ? (
+        <div className="h-40 animate-pulse rounded bg-muted/40" />
+      ) : failure ? (
+        <p role="alert" className="py-8 text-center text-sm text-destructive">
+          <ErrorWithReference message={failure.message} errorId={failure.errorId} />
+        </p>
+      ) : page && page.rows.length ? (
+        <RowsTable columns={page.columns} rows={page.rows} />
+      ) : (
+        <p className="py-8 text-center text-sm text-muted-foreground">No records found.</p>
+      )}
+      {page ? (
+        <div className="flex items-center justify-between gap-2">
+          <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            {pageRange(page)}
+            {page.filtersSkipped.length ? <SkippedFiltersMarker skipped={page.filtersSkipped} /> : null}
+          </p>
+          <div className="flex gap-1.5">
+            <Button size="sm" variant="outline" disabled={page.offset === 0} onClick={() => setOffset(Math.max(0, page.offset - page.limit))}>
+              <ChevronLeft className="size-4" /> Previous
+            </Button>
+            <Button size="sm" variant="outline" disabled={!hasNextPage(page)} onClick={() => setOffset(page.offset + page.limit)}>
+              Next <ChevronRight className="size-4" />
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </DialogContent>
   );
 }

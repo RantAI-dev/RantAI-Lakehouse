@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import * as echarts from "echarts";
+import type { ChartHit } from "@/lib/chart-click";
 import { readView, withView } from "@/lib/geo-view";
 
 /**
@@ -19,8 +20,13 @@ export function EChart({
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
-  /** Click a data point (bar/slice/etc.) → drill/cross-filter. `pos` = screen coordinates. */
-  onDataClick?: (name: string, pos: { x: number; y: number }) => void;
+  /**
+   * Click a data point (bar/slice/region/day/node…) → drill/cross-filter.
+   * `pos` = screen coordinates. The whole hit is passed on, not just its
+   * name: a calendar day has none, and a box's name is a label (BI-18·B,
+   * lib/chart-click.ts maps each kind).
+   */
+  onDataClick?: (hit: ChartHit, pos: { x: number; y: number }) => void;
   /**
    * Maps only: when `option` changes (a data refresh, a theme switch) carry
    * the map's current pan and zoom over instead of letting `setOption` reset
@@ -47,12 +53,19 @@ export function EChart({
     chartRef.current = chart;
     chartCbRef.current?.(chart);
     chart.on("click", (p: unknown) => {
-      const o = p as { name?: string; event?: { event?: MouseEvent } };
-      const name = o?.name;
-      if (name && clickRef.current) {
-        const ev = o.event?.event;
-        clickRef.current(name, { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 });
-      }
+      const o = p as {
+        name?: string; value?: unknown; dataIndex?: number; seriesType?: string; dataType?: string;
+        treePathInfo?: { name?: string }[]; event?: { event?: MouseEvent };
+      };
+      if (!clickRef.current) return;
+      const ev = o.event?.event;
+      clickRef.current(
+        {
+          name: o.name ?? "", value: o.value, dataIndex: o.dataIndex, seriesType: o.seriesType, dataType: o.dataType,
+          treePathInfo: o.treePathInfo?.map((t) => ({ name: t.name ?? "" })),
+        },
+        { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 },
+      );
     });
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(elRef.current);

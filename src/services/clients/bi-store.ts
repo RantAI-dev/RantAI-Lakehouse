@@ -80,6 +80,17 @@ export type FilterField = { column: string; kind: FilterKind | string; tiles: nu
 /** A filter an active tile could not honour, so the tile can say so. */
 export type FilterSkip = { column: string; reason: "no_column" | "wrong_type" | string };
 
+/**
+ * What a click on a chart does instead of opening the drill menu (BI-18·B).
+ * Mirrors `lakehouse_bi::click::ClickAction`. Absent = the drill menu, which
+ * is what every chart saved before this existed does. The server checks the
+ * shape and the URL rule only, not that the board, column or query exists.
+ */
+export type ChartClick =
+  | { kind: "dashboard"; board: string; column: string }
+  | { kind: "query"; id: string }
+  | { kind: "url"; url: string };
+
 export type Board = {
   id: string;
   name: string;
@@ -91,6 +102,11 @@ export type Board = {
   folderId?: string | null;
   layout?: LayoutMap;
   filters?: FilterDef[];
+  /**
+   * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
+   * 1800, 3600). Absent when none was saved; BI-18·B.
+   */
+  refreshSeconds?: number;
   createdAt?: string;
   /**
    * Kapan board terakhir ditulis.

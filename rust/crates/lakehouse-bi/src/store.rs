@@ -27,6 +27,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
+use crate::click::ClickAction;
 use crate::embed_access::{self, EmbedAccess};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
@@ -196,6 +197,11 @@ pub struct ChartSpec {
         serialize_with = "serialize_js_number"
     )]
     pub target: Option<f64>,
+    /// What a click on the chart does instead of opening the drill menu
+    /// (`BI-18`·B). Absent on every chart saved before it existed, which the
+    /// console reads as the drill menu; that is why it defaults.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub click: Option<ClickAction>,
 }
 
 /// Serializes `Option<f64>` the way `JSON.stringify` renders a JS `number`:
@@ -316,6 +322,10 @@ pub struct ChartInput {
         serialize_with = "serialize_js_number"
     )]
     pub target: Option<f64>,
+    /// What a click on the chart does; see [`ChartSpec::click`]. Checked by
+    /// [`ClickAction::validate`] when the chart is built.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub click: Option<ClickAction>,
 }
 
 /// A dashboard.
@@ -347,6 +357,12 @@ pub struct Board {
     /// Dashboard-wide dimension filters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filters: Option<Vec<FilterDef>>,
+    /// The auto-refresh interval an editor saved for the board, in seconds
+    /// (`BI-18`·B; one of [`crate::click::REFRESH_SECONDS`]). `None` when
+    /// none was saved, which is also what a saved 0 ("off") reads back as, so
+    /// a board saved before the column existed serialises without the key.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refresh_seconds: Option<u32>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -469,6 +485,44 @@ pub async fn ensure_bi_table(ch: &ChClient) -> Result<(), ChError> {
         .map(drop)
 }
 
+/// The `bi_board` columns that hold state beyond the board's name, layout
+/// and filters: the signed-embed access state (`SEC-12`) and the saved
+/// auto-refresh (`BI-18`·B). Split out of [`ensure_bi_table_uncached`] to keep
+/// it under clippy's line limit.
+async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
+    // SEC-12: signed-embed access state kept with the board. `revoked_before`
+    // is a Unix-seconds instant ("withdraw all"), the two JSON columns hold
+    // the individually withdrawn tokens and the sites allowed to frame the
+    // embed (`crate::embed_access`). Constant defaults, like the columns
+    // above, so a row written before they existed reads as "nothing
+    // withdrawn, no site may frame".
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_before UInt64 DEFAULT 0",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_jti_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_origins_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    // BI-18·B: the auto-refresh a dashboard opens with, in seconds. A
+    // constant default like the columns above, so a board saved before it
+    // existed reads as "no saved interval". No Postgres migration: boards
+    // live in ClickHouse and this is the same `ALTER ... IF NOT EXISTS` idiom.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS refresh_seconds UInt32 DEFAULT 0",
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 /// The actual DDL bootstrap, run at most once per process by
 /// [`ensure_bi_table`].
 async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
@@ -541,27 +595,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
-    // SEC-12: signed-embed access state kept with the board. `revoked_before`
-    // is a Unix-seconds instant ("withdraw all"), the two JSON columns hold
-    // the individually withdrawn tokens and the sites allowed to frame the
-    // embed (`crate::embed_access`). Constant defaults, like the columns
-    // above, so a row written before they existed reads as "nothing
-    // withdrawn, no site may frame".
-    ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_before UInt64 DEFAULT 0",
-        None,
-    )
-    .await?;
-    ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_jti_json String DEFAULT '[]'",
-        None,
-    )
-    .await?;
-    ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_origins_json String DEFAULT '[]'",
-        None,
-    )
-    .await?;
+    ensure_board_state_columns(ch).await?;
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_folder (\n\
            id String, name String, parent_id String DEFAULT '',\n\
@@ -596,7 +630,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -646,6 +680,10 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         created_by: Some(row_str(row, "created_by").to_owned()),
         layout: Some(parse_layout(layout_json)),
         filters: Some(parse_filters(filters_json)),
+        // 0 is "off", the same as never saved.
+        refresh_seconds: Some(row_u64(row, "refresh_seconds"))
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -733,6 +771,7 @@ pub async fn create_board(
         created_by: Some(author.to_owned()),
         layout: Some(LayoutMap::new()),
         filters: Some(Vec::new()),
+        refresh_seconds: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -756,6 +795,7 @@ async fn upsert_board(
     embed_enabled: bool,
     folder_id: &str,
     embed_access: &EmbedAccess,
+    refresh_seconds: u32,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -767,8 +807,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -781,6 +821,9 @@ async fn upsert_board(
         embed_access.revoked_before,
         SqlLiteral::from(withdrawn_json),
         SqlLiteral::from(origins_json),
+        // Carried on every save like the embed state above: an unrelated
+        // edit must not reset the board's saved refresh (BI-18·B).
+        refresh_seconds,
     );
     ch.exec(&sql, None).await
 }
@@ -826,6 +869,9 @@ async fn save_board_patch(
     // back to the root.
     let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
     let embed_access = patch.embed_access.unwrap_or(&board.embed_access);
+    let refresh_seconds = patch
+        .refresh_seconds
+        .unwrap_or_else(|| board.refresh_seconds.unwrap_or(0));
     upsert_board(
         ch,
         &board.id,
@@ -838,6 +884,7 @@ async fn save_board_patch(
         embed_enabled,
         folder_id,
         embed_access,
+        refresh_seconds,
     )
     .await
 }
@@ -855,6 +902,7 @@ struct BoardPatch<'a> {
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
     embed_access: Option<&'a EmbedAccess>,
+    refresh_seconds: Option<u32>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -950,6 +998,7 @@ pub async fn update_board_layout(
         created_by: None,
         layout: None,
         filters: None,
+        refresh_seconds: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -987,6 +1036,7 @@ pub async fn update_board_filters(
         created_by: None,
         layout: None,
         filters: None,
+        refresh_seconds: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1003,6 +1053,44 @@ pub async fn update_board_filters(
         },
     )
     .await
+}
+
+/// Save a board's auto-refresh interval in seconds (`0` = off), same
+/// fallback as [`update_board_layout`] for the built-in board's row.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when `seconds` is not one of
+/// [`crate::click::REFRESH_SECONDS`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Result<(), BiError> {
+    crate::click::validate_refresh_seconds(seconds).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
+        id: id.to_owned(),
+        name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
+        layout: None,
+        filters: None,
+        refresh_seconds: None,
+        created_at: None,
+        updated_at: None,
+        public_token: None,
+        embed_enabled: None,
+        folder_id: None,
+        embed_access: EmbedAccess::default(),
+    });
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            refresh_seconds: Some(seconds),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Enable/disable the public read-only share link for a board. `enable =
@@ -1399,6 +1487,7 @@ fn empty_chart_input() -> ChartInput {
         text: None,
         caption: None,
         target: None,
+        click: None,
     }
 }
 
@@ -1514,6 +1603,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         text: None,
         caption: caption.clone(),
         target,
+        click: None,
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
@@ -1539,6 +1629,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         text: None,
         caption,
         target,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -1602,6 +1693,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         text: Some(text.clone()),
         caption: None,
         target: None,
+        click: None,
     };
     let spec = ChartSpec {
         id: new_id,
@@ -1622,6 +1714,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         text: Some(text),
         caption: None,
         target: None,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -2010,6 +2103,7 @@ fn spec_from_chart_input(
         text: None,
         caption: None,
         target: None,
+        click: None,
     };
 
     let sql = if is_point_kind(kind) {
@@ -2051,6 +2145,7 @@ fn spec_from_chart_input(
         text: None,
         caption: None,
         target: None,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -2279,13 +2374,41 @@ pub async fn spec_from_input(
     created_by: &str,
     id: Option<String>,
 ) -> Result<StoredChartSpec, BiError> {
+    let click = validated_click(input)?;
     let (common, geo) = match spec_before_relation(input, source, created_by, id)? {
-        Stage::Done(spec) => return Ok(*spec),
+        Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     // ── kpi/table/chart need a mart OR a SQL source ─────────────────
     let resolved = resolve_relation(ch, input).await?;
     spec_from_resolved(input, source, created_by, common, geo, resolved)
+        .map(|spec| with_click(spec, click))
+}
+
+/// The click setting of `input` once its shape is checked (`BI-18`·B).
+/// Checked before any schema lookup, and on every kind: a `text` tile has
+/// nothing to click, so a click on one is refused rather than stored and
+/// ignored.
+fn validated_click(input: &ChartInput) -> Result<Option<ClickAction>, BiError> {
+    let Some(click) = &input.click else {
+        return Ok(None);
+    };
+    if input.kind == ChartKind::Text {
+        return Err(BiError::Validation(
+            "a text tile has nothing to click.".to_owned(),
+        ));
+    }
+    click.validate().map_err(BiError::Validation)?;
+    Ok(Some(click.clone()))
+}
+
+/// `spec` with the validated click on both the render spec and the
+/// structured definition the editor prefills from. Applied after the
+/// per-kind assembly so no kind's builder has to carry it.
+fn with_click(mut spec: StoredChartSpec, click: Option<ClickAction>) -> StoredChartSpec {
+    spec.spec.click.clone_from(&click);
+    spec.def.click = click;
+    spec
 }
 
 /// [`spec_from_input`] over SQL that is not a stored source (see
@@ -2303,12 +2426,14 @@ pub fn spec_from_inline_sql(
     source: ChartSource,
     created_by: &str,
 ) -> Result<StoredChartSpec, BiError> {
+    let click = validated_click(input)?;
     let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
-        Stage::Done(spec) => return Ok(*spec),
+        Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     let resolved = resolved_from_inline(input, inline)?;
     spec_from_resolved(input, source, created_by, common, geo, resolved)
+        .map(|spec| with_click(spec, click))
 }
 
 /// The part of [`spec_from_input`] that follows relation resolution, shared
@@ -2499,6 +2624,7 @@ impl StoredChartSpec {
                 text: None,
                 caption: None,
                 target: None,
+                click: None,
             },
             source: ChartSource::Ui,
             board: "default".to_owned(),
@@ -2522,6 +2648,7 @@ impl StoredChartSpec {
                 text: None,
                 caption: None,
                 target: None,
+                click: None,
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -2569,10 +2696,11 @@ mod tests {
         // `bi_board.folder_id`) joining the bootstrap; the property under
         // test — every later call is free — is unchanged. 16 = those 13 plus
         // the three SEC-12 `bi_board` columns (`embed_revoked_before`,
-        // `embed_revoked_jti_json`, `embed_origins_json`).
+        // `embed_revoked_jti_json`, `embed_origins_json`). 17 = those 16 plus
+        // the BI-18·B `bi_board.refresh_seconds` column.
         assert_eq!(
-            first_call_requests, 16,
-            "first call should issue all 16 DDL statements"
+            first_call_requests, 17,
+            "first call should issue all 17 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -2938,6 +3066,7 @@ mod tests {
             created_by: Some("Bootstrap Admin".to_owned()),
             layout: None,
             filters: None,
+            refresh_seconds: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -3168,5 +3297,101 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("unsaved SQL"), "{err}");
         }
+    }
+
+    // ── the click setting and the saved refresh (BI-18·B) ────────────────
+
+    fn inline_spec(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = inline_cols();
+        spec_from_inline_sql(
+            &inline_chart(extra),
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    #[test]
+    fn a_chart_without_a_click_serialises_without_the_key_on_both_sides() {
+        let stored = inline_spec(&serde_json::json!({})).unwrap();
+        assert!(stored.spec.click.is_none() && stored.def.click.is_none());
+        let spec = serde_json::to_value(&stored.spec).unwrap();
+        let def = serde_json::to_value(&stored.def).unwrap();
+        assert!(spec.get("click").is_none() && def.get("click").is_none());
+    }
+
+    #[test]
+    fn a_chart_saved_before_the_click_existed_reads_back_with_none() {
+        let old = r#"{"title":"T","kind":"bar","mart":"mart_x","dimension":"d","measures":["m"]}"#;
+        let def: ChartInput = serde_json::from_str(old).unwrap();
+        assert!(def.click.is_none());
+    }
+
+    #[test]
+    fn a_valid_click_is_kept_on_the_spec_and_on_the_definition() {
+        let stored = inline_spec(&serde_json::json!({
+            "click": { "kind": "dashboard", "board": "b_1", "column": "place" }
+        }))
+        .unwrap();
+        let want = ClickAction::Dashboard {
+            board: "b_1".to_owned(),
+            column: "place".to_owned(),
+        };
+        assert_eq!(stored.spec.click.as_ref(), Some(&want));
+        assert_eq!(stored.def.click.as_ref(), Some(&want));
+    }
+
+    #[test]
+    fn a_click_with_a_refused_url_is_a_validation_error() {
+        let err = inline_spec(&serde_json::json!({
+            "click": { "kind": "url", "url": "javascript:alert(1)" }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, BiError::Validation(ref m) if m.contains("click URL")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_tile_cannot_have_a_click() {
+        let err = inline_spec(&serde_json::json!({
+            "kind": "text", "text": "hello",
+            "click": { "kind": "url", "url": "/x" }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, BiError::Validation(ref m) if m == "a text tile has nothing to click."),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_without_a_saved_refresh_serialises_without_the_key() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        row.insert("refresh_seconds".to_owned(), serde_json::json!(0));
+        let board = row_to_board(&row);
+        assert_eq!(board.refresh_seconds, None);
+        assert!(
+            serde_json::to_value(&board)
+                .unwrap()
+                .get("refreshSeconds")
+                .is_none()
+        );
+        row.insert("refresh_seconds".to_owned(), serde_json::json!(300));
+        let board = row_to_board(&row);
+        assert_eq!(board.refresh_seconds, Some(300));
+        assert_eq!(serde_json::to_value(&board).unwrap()["refreshSeconds"], 300);
+    }
+
+    #[test]
+    fn a_board_row_from_before_the_column_existed_reads_as_no_refresh() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        assert_eq!(row_to_board(&row).refresh_seconds, None);
     }
 }

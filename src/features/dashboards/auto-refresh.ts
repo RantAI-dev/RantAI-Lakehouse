@@ -3,30 +3,16 @@
 import * as React from "react";
 
 /**
- * Auto-refresh berkala untuk kanvas dashboard.
+ * Periodic auto-refresh for the dashboard canvas.
  *
- * BATASAN YANG DISENGAJA: ini penyegaran sisi-KLIEN, bukan penjadwalan
- * sungguhan. Backend Rust tidak menyediakan endpoint penjadwalan dashboard
- * (lihat tabel route di `rust/crates/lakehouse-api/src/routes/mod.rs` — ada
- * `/api/dashboard/{specs,boards,fields,records,values,export,embed-info}`,
- * tidak ada satu pun untuk jadwal), dan penjadwalan sejati butuh penyimpanan
- * jadwal plus scheduler yang jalan di server, bukan di tab browser.
- *
- * Konsekuensinya: interval hanya berlaku selama tab terbuka dan tidak
- * tersimpan antar sesi. Label di UI harus menyebutnya "Auto-refresh", bukan
- * "Schedule", supaya harapan penggunanya tidak keliru.
+ * DELIBERATE LIMIT: this is a CLIENT-side refresh, not a real schedule. The
+ * Rust backend has no dashboard scheduler, and a real one would need
+ * stored schedules plus a server-side runner rather than a browser tab.
+ * It only runs while the tab is open and visible. The interval an editor
+ * saves on a board (BI-18 part B, `lib/dashboard-refresh.ts`) is where the
+ * tab STARTS; it does not make anything refresh while nobody looks. The UI
+ * says "Auto-refresh", never "Schedule", so the expectation stays honest.
  */
-
-/**
- * Pilihan interval, dalam DETIK sebagai string agar cocok dengan nilai
- * `Select`. `"0"` berarti penyegaran manual.
- */
-export const REFRESH_INTERVALS = [
-  { value: "0", label: "Manual" },
-  { value: "30", label: "Every 30s" },
-  { value: "60", label: "Every 1m" },
-  { value: "300", label: "Every 5m" },
-] as const;
 
 /**
  * Memanggil `onRefresh` setiap `intervalMs`.
