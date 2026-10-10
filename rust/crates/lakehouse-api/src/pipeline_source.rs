@@ -9,8 +9,7 @@
 //!
 //! # Design
 //!
-//! 1. At first request (cached afterwards, in `AppState`, the same pattern
-//!    `EmbedSecretResolver` uses for its own resolved secret),
+//! 1. At first request (cached afterwards, in `AppState`),
 //!    [`build_allowlist`] walks the base directory ONCE, canonicalizing
 //!    every `.py` file it finds and keeping only the ones that
 //!    canonicalize to a path still inside the canonicalized base —

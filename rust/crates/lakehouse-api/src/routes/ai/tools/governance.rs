@@ -112,6 +112,7 @@ pub(super) async fn draft_policy(state: &AppState, args: &Map<String, Value>) ->
     body.insert("activate".to_owned(), Value::Bool(false));
     let bytes = match serde_json::to_vec(&Value::Object(body)) {
         Ok(bytes) => bytes,
+        // Serialising our own `Value` (infallible in practice): not an upstream error.
         Err(err) => return json!({ "error": err.to_string() }),
     };
     api_result_to_value(
@@ -134,6 +135,7 @@ pub(super) async fn draft_classification_rule(
     }
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
+        // Serialising our own `Value` (infallible in practice): not an upstream error.
         Err(err) => return json!({ "error": err.to_string() }),
     };
     api_result_to_value(
@@ -153,6 +155,7 @@ pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Valu
     }
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
+        // Serialising our own `Value` (infallible in practice): not an upstream error.
         Err(err) => return json!({ "error": err.to_string() }),
     };
     api_result_to_value(

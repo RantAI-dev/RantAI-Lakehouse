@@ -810,6 +810,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route(
+            "/api/embed/frame",
+            axum::routing::post(embed::frame_origins),
+        )
+        .route(
+            "/api/dashboard/embed-revoke",
+            axum::routing::post(embed::revoke_token),
+        )
+        .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
         )
