@@ -234,6 +234,13 @@ Per task: `cargo fmt --check`, `cargo clippy -p <crate> --all-targets -- -D warn
 8. A role with a masked column: the formulas show values derived from the masked text, never the clear value.
 9. Ask the assistant to add "running total of visitors" on the mart; the field it creates shows your name in `createdBy` (R3).
 
+### Fix handoff, R4 (developer, uncommitted)
+
+- Cause: the console formats every chart number as a whole number. `fmtInt` rounds (`Math.round`) and `formatCompactNumber` rounds below 1,000, and they feed the value axis, the tooltips and the other labels in `chart-option.ts`; the server's `format: "int"` is not what decides it. A share of 0.23 therefore drew correctly but read "0".
+- Chosen: a data-driven console formatter, no Rust change. `decimalsFor(values)` in `src/lib/chart-axis.ts` reads the values a chart draws (all its measure columns): all whole gives 0 (today's look), otherwise 3 decimals when the largest is under 1, 2 under 100, 1 under 1,000, none from 1,000 (compact form). `formatNumber` and `formatCompactNumber(v, decimals)` print at most that many (no trailing zeros). `buildOption` computes it once and uses it for the axes, tooltips and labels of every chart kind (cites R4). Chosen over guessing from the column type because a calculated field's type is only "number" and a plain `avg` is fractional too.
+- Tests: `chart-axis.test.ts` (whole data unchanged; shares 0 to 1; fractions under 10, under 1,000, large; negatives; non-finite) and `chart-option.test.ts` (a bar of shares has decimals on the axis and tooltip, a bar of whole numbers does not). `bun test src/features/dashboards src/lib` passes; `bun run typecheck` clean; `bun run lint` 0 errors, the same 6 warnings.
+- Rust did not change: no API rebuild needed. Not verified in a browser.
+
 ## 8. Review (planner appends)
 
 ### BI-8 part 1 — findings from the product owner's QA (reviewer, 2026-10-11)
@@ -260,3 +267,7 @@ The reviewer did not re-run the suites (owner's instruction). QA passed in a bro
 - `SHOULD-FIX` R4 — On the `Fixed` ratio chart every tick of the value axis reads "0": values between 0 and 1 are printed as whole numbers. The axis, tooltip and value labels of a chart whose measure is not a whole number must show enough decimals to tell the ticks apart (a calculated field's inferred type and the data both say so); whole-number measures keep today's formatting.
 - Not verified by anyone: a masked role in a browser, embeds and public links with these fields, speed on a large table (previous-period and `Fixed` statements read the source two to three times), the workspace-wide suites (CI).
 - Planner defaults standing until the owner says otherwise: the 10,000-group cap for table calculations; with a breakdown, kept buckets follow the dimension's order; a KPI in the alert digest follows a changed formula only after the chart is saved again.
+
+### BI-8 — R4 closed (reviewer, 2026-10-11)
+
+Confirmed by the product owner in a browser: the value axis of the `Fixed` ratio chart reads 0.05 to 0.35. No open finding on `BI-8`.

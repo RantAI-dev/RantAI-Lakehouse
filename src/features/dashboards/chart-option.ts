@@ -1,5 +1,5 @@
 import type { EChartsOption } from "echarts";
-import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
@@ -19,7 +19,6 @@ const PALETTE = [
 
 // English number format, matching the English UI (data values stay as-is).
 const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
-const fmtCompact = formatCompactNumber;
 
 type Row = Record<string, unknown>;
 
@@ -45,6 +44,12 @@ export function buildOption(
   /** `firstDay`: the calendar's first weekday (0 Sunday, 1 Monday), from the Settings (BI-9). */
   opts: { firstDay?: 0 | 1 } = {},
 ): EChartsOption {
+  // BI-8 review fix (SHOULD-FIX) R4: axis, tooltip and label numbers carry the
+  // decimals the drawn values need (none for whole numbers, as before).
+  const yColumns = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const decimals = decimalsFor(rows.flatMap((r) => yColumns.map((c) => num(r[c]))));
+  const fmtInt = (v: number) => formatNumber(v, decimals);
+  const fmtCompact = (v: number) => formatCompactNumber(v, decimals);
   const axis = dark ? "#a1a1aa" : "#71717a";
   const split = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
   const tooltipBg = dark ? "#18181b" : "#ffffff";

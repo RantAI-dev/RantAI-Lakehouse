@@ -32,3 +32,20 @@ test("a line with a breakdown counts its categories, not its series", () => {
   assert.equal(series.length, 2)
   assert.equal(series[0].showSymbol, false)
 })
+
+// BI-8 review fix (SHOULD-FIX) R4: a share between 0 and 1 is not drawn as "0".
+test("a bar of shares labels its value axis and tooltip with decimals, a bar of whole numbers does not", () => {
+  const axisOf = (rows: Record<string, unknown>[]) => {
+    const option = buildOption({ kind: "bar", x: "c", y: "v" }, rows, false)
+    const y = option.yAxis as { axisLabel: { formatter: (v: number) => string } }
+    const tip = option.tooltip as { valueFormatter: (v: number) => string }
+    return { tick: y.axisLabel.formatter, tip: tip.valueFormatter }
+  }
+  const shares = axisOf([{ c: "a", v: 0.23 }, { c: "b", v: 0.18 }, { c: "c", v: 0.32 }])
+  assert.equal(shares.tick(0.1), "0.1")
+  assert.equal(shares.tick(0.3), "0.3")
+  assert.equal(shares.tip(0.27), "0.27")
+  const whole = axisOf([{ c: "a", v: 12 }, { c: "b", v: 5 }])
+  assert.equal(whole.tick(10), "10")
+  assert.equal(whole.tip(1234), "1,234")
+})
