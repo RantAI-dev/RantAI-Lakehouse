@@ -43,7 +43,7 @@ text it was never given.
 | 1 | Scope is every route under `routes/`, not only the files the audit named | Planner default | Owner said to proceed with phase 0, 2026-10-10 |
 | 2 | The raw text goes to the log only, keyed by a reference id shown to the user | Spec | 2026-10-10 |
 | 3 | A guard test fails the build when a route builds a response from an upstream error's text | Spec `SEC-11-AC1` | 2026-10-10 |
-| 4 | Query Studio (run and cost estimate) shows the author the engine's diagnosis of their own statement. Nothing else does: tiles, public links, embeds, SQL sources, the assistant and saved-query runs stay closed. An unreachable or timed-out engine is still the fixed message. | Planner recommended it after the first build hid these errors | Owner, 2026-10-10 |
+| 4 | Query Studio (run and cost estimate) shows the author the engine's diagnosis of their own statement. Nothing else does: tiles, public links, embeds, SQL sources and saved-query runs stay closed. Correction, 2026-10-10: the assistant's `run_sql` tool is the Query Studio handler, called for a signed-in caller holding `query:read`, so it returns the same diagnosis to the model (seen on a running API while checking `SEC-9`); the assistant's other tools stay closed. An unreachable or timed-out engine is still the fixed message. | Planner recommended it after the first build hid these errors | Owner, 2026-10-10 |
 
 ## Limits to tell a customer
 
