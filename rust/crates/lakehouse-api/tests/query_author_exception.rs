@@ -201,13 +201,17 @@ async fn a_failing_tile_inside_a_signed_embed_is_the_fixed_message_with_a_refere
         .await;
     let secret = "test-embed-secret";
     let app = app_with(&[("CH_URL", ch.uri()), ("EMBED_SECRET", secret.to_owned())]).await;
+    let now = lakehouse_embed::unix_now().floor();
     let token = lakehouse_embed::sign_embed(
         &lakehouse_embed::EmbedClaims {
             resource: Some(lakehouse_embed::EmbedResource {
                 dashboard: Some("b_embed".to_owned()),
             }),
             params: None,
-            exp: None,
+            // SEC-12: a token must carry `iat` and `exp`.
+            exp: Some(now + 3600.0),
+            iat: Some(now),
+            jti: None,
         },
         secret,
     );

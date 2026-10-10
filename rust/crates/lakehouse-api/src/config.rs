@@ -98,6 +98,17 @@ pub enum ConfigError {
         "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiRelevantTables(String),
+    /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` was set to something that is not a
+    /// positive whole number (`SEC-12`).
+    ///
+    /// Fails config resolution rather than falling back to the default: a
+    /// typo such as `"24h"` would quietly keep the 24-hour limit for an
+    /// operator who meant a shorter one, and `0` or a negative number would
+    /// refuse every token with nothing in the logs to explain it.
+    #[error(
+        "EMBED_TOKEN_MAX_LIFETIME_SECONDS must be a positive whole number of seconds (unset or empty means 86400), got {0:?}"
+    )]
+    InvalidEmbedTokenMaxLifetime(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -235,11 +246,17 @@ pub struct Config {
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
     /// here).
     pub llm_key: String,
-    /// Embed JWT signing secret. `None` when unset (mirrors the truthy
-    /// check `if (process.env.EMBED_SECRET)` at `embed-jwt.ts:37`; the
-    /// TypeScript then falls back to a generated, `ClickHouse`-persisted
-    /// secret, which is out of scope for this chassis).
+    /// Embed JWT signing secret. `None` when unset or empty (truthy check).
+    /// `SEC-12`: this is the ONLY source. No secret is generated or stored
+    /// any more (the TypeScript and the earlier Rust fell back to a
+    /// plain-text `console.app_kv` row); `None` means signed embedding is
+    /// unavailable and says so, while the API still starts.
     pub embed_secret: Option<String>,
+    /// The longest lifetime (`exp - iat`) a signed embed token may have, in
+    /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
+    /// 86400. A value that is not a positive integer fails start-up
+    /// ([`ConfigError::InvalidEmbedTokenMaxLifetime`]).
+    pub embed_token_max_lifetime_seconds: u64,
     /// Shared token required to call `/api/alerts/run`. `None` when unset,
     /// meaning the endpoint requires no auth (`alerts/run/route.ts:16-19`,
     /// truthy check).
@@ -791,6 +808,10 @@ impl std::fmt::Debug for Config {
                 &self.embed_secret.as_ref().map(|_| REDACTED),
             )
             .field(
+                "embed_token_max_lifetime_seconds",
+                &self.embed_token_max_lifetime_seconds,
+            )
+            .field(
                 "alerts_run_token",
                 &self.alerts_run_token.as_ref().map(|_| REDACTED),
             )
@@ -1005,6 +1026,19 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .unwrap_or(default)
 }
 
+/// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` (`SEC-12`): unset or empty is the
+/// 24-hour default; anything else must be a positive whole number.
+fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, ConfigError> {
+    match truthy(env, "EMBED_TOKEN_MAX_LIFETIME_SECONDS") {
+        None => Ok(lakehouse_embed::DEFAULT_MAX_LIFETIME_SECONDS),
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or(ConfigError::InvalidEmbedTokenMaxLifetime(raw)),
+    }
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1102,6 +1136,7 @@ impl Config {
             llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
@@ -1389,6 +1424,7 @@ mod tests {
         assert_eq!(cfg.llm_model, "MiniMax-M3");
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
         assert_eq!(cfg.smtp_port, 587);
@@ -2190,6 +2226,32 @@ mod tests {
     fn ask_back_setting_false_means_off() {
         let cfg = Config::from_map(&env_with("AI_ASK_BACK", "false")).unwrap();
         assert!(!cfg.ai_ask_back);
+    }
+
+    #[test]
+    fn the_embed_token_lifetime_limit_defaults_to_24_hours_and_can_be_set() {
+        for unset in [None, Some("")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", v)
+            });
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
+        }
+        let cfg = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", "3600")).unwrap();
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 3600);
+    }
+
+    #[test]
+    fn an_embed_token_lifetime_limit_that_is_not_a_positive_integer_stops_the_api() {
+        // `SEC-12`: not a silent fallback to the default.
+        for bad in ["24h", "0", "-5", "1.5", " 60"] {
+            let err = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", bad))
+                .expect_err("only a positive whole number is accepted");
+            assert_eq!(
+                err,
+                ConfigError::InvalidEmbedTokenMaxLifetime(bad.to_owned())
+            );
+        }
     }
 
     #[test]

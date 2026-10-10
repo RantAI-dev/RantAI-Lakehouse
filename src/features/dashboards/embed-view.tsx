@@ -7,6 +7,7 @@ import { TileBody } from "./tile-body";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
 import type { TileFailure } from "@/services/contracts/dashboards";
+import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -28,6 +29,9 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   const dark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
+  // SEC-12: what a refused signed token reads. The public link keeps the
+  // plain line.
+  const [refusal, setRefusal] = React.useState(EMBED_UNAVAILABLE);
 
   // Data source: a public token (GET, read-only) OR a signed JWT embed (POST,
   // server-side locked filters). Public link: /embed/dashboard/<token>.
@@ -47,7 +51,16 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
             })
           : await fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}`, { cache: "no-store" });
         if (!alive) return;
-        if (res.status === 404 || res.status === 403 || res.status === 401) { setState("notfound"); return; }
+        if (res.status === 404 || res.status === 403 || res.status === 401) {
+          if (jwt) setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
+          setState("notfound");
+          return;
+        }
+        if (jwt && res.status === 503) {
+          setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
+          setState("error");
+          return;
+        }
         if (!res.ok) { setState("error"); return; }
         setData(await res.json());
         setState("ok");
@@ -57,7 +70,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   }, [token, jwt]);
 
   if (state === "notfound" || state === "error") {
-    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">Dashboard not available.</div>;
+    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">{refusal}</div>;
   }
 
   const charts = data?.charts ?? [];

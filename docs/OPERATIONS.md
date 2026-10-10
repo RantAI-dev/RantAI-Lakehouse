@@ -675,6 +675,64 @@ sender applies the same address policy as the connector tests above:
   not rewritten.
 - **Email (`SMTP`) is a separate item** and unchanged.
 
+### Signed dashboard embeds (`SEC-12`)
+
+A customer's server signs a short-lived token and the embed page presents it.
+What the operator needs to know:
+
+- **`EMBED_SECRET` is the only source of the signing secret.** The API no
+  longer generates one and keeps it in `console.app_kv`. Unset or empty: signed
+  embedding is unavailable (`POST /api/embed/data` answers `503` "embedding is
+  not configured", the Share dialog says so, and no sample token is offered),
+  and the rest of the product runs. Set it to a long random value and sign with
+  the same value. **An old `embed_secret` row in `console.app_kv` is no longer
+  read. Remove it** (`ALTER TABLE console.app_kv DELETE WHERE k = 'embed_secret'`
+  in `ClickHouse`); the API does not delete it for you. A deployment that relied
+  on the generated secret must read it once from that row and set `EMBED_SECRET`
+  to it, or issue new tokens with a new secret.
+- **`EMBED_TOKEN_MAX_LIFETIME_SECONDS`** (default `86400`) is the longest
+  `exp - iat` a token may have. It must be a positive whole number; anything
+  else stops the API at start. The Share dialog shows the value in force.
+- **Signing a token.** HS256, with these claims (placeholder values):
+
+  ```json
+  {
+    "resource": { "dashboard": "b_0123abcd" },
+    "params": { "region": "North" },
+    "iat": 1800000000,
+    "exp": 1800000600,
+    "jti": "7d1e8f3a-0000-0000-0000-000000000000"
+  }
+  ```
+
+  `iat` and `exp` are required numbers in Unix seconds; `exp - iat` must not
+  exceed the limit; `iat` may be at most 60 seconds ahead of the API's clock and
+  `exp` at most 60 seconds behind it. `jti` is optional (1 to 128 characters of
+  `A-Za-z0-9._-`) and is what makes one token withdrawable. `params` are filters
+  the viewer cannot change. Any other claim is ignored. A token that fails any
+  check is refused with the one message "embed token is invalid or expired".
+- **Withdrawing.** In the Share dialog (needs `dashboard:write`): "Withdraw all
+  embed tokens" refuses every token of that dashboard issued at or before that
+  moment; "Withdraw one token" takes a pasted token and refuses its `jti` for
+  that dashboard until the token could not be accepted anyway. Both are read
+  from the dashboard on every request, with no cache, so they apply to the next
+  request. Withdraw all uses the API server's clock against the token's `iat`:
+  a token minted by a clock more than a moment ahead of the API's survives it
+  until it expires, which the lifetime limit bounds.
+- **Framing.** Each dashboard lists the sites allowed to show its embed pages
+  (Share dialog; at most 20; `https://host[:port]`, or `http://localhost[:port]`
+  for development; no wildcards). The console's `proxy.ts` asks the API
+  (`POST /api/embed/frame`, which needs no sign-in and answers only the list)
+  and sends `Content-Security-Policy: frame-ancestors <sites>`, or
+  `frame-ancestors 'none'` when the list is empty, the token is not good, or
+  the API cannot be reached within 3 seconds. The console reads the API address
+  from `RUST_API_URL` **at run time** for this call (the image defaults it to
+  `http://localhost:8080`; a deployment must pass `-e RUST_API_URL=...`, as the
+  staging deploy does). If it points where nothing listens, every embed page is
+  sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
+  viewer's browser; it does not replace the token. No other console page sends
+  a framing header.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
@@ -783,7 +841,7 @@ check.
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
-| Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
+| Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |
 
 ## Login throttling and session cleanup

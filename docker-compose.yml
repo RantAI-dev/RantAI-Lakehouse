@@ -263,6 +263,10 @@ services:
       # per-request 503 rather than lakehouse-api refusing to boot.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
       EMBED_SECRET: ${EMBED_SECRET:-}
+      # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
+      # means 86400. A value that is not a positive whole number stops the
+      # API at start, on purpose (a typo must not silently keep 24 hours).
+      EMBED_TOKEN_MAX_LIFETIME_SECONDS: ${EMBED_TOKEN_MAX_LIFETIME_SECONDS:-}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}

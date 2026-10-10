@@ -13,10 +13,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
-use lakehouse_clickhouse::ChClient;
+use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_core::ApiError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
@@ -46,6 +48,24 @@ struct EmbedDataBody {
     jwt: Option<String>,
 }
 
+/// The one message every refused signed token gets (`SEC-12`): a bad
+/// signature, a missing or too-long lifetime, an expired or withdrawn token
+/// and a token without a dashboard all read the same.
+pub(crate) const TOKEN_REFUSED: &str = "embed token is invalid or expired";
+
+/// What every signed-embed surface says when `EMBED_SECRET` is unset
+/// (`SEC-12`): `POST /api/embed/data` answers it with `503`, and
+/// `GET /api/dashboard/embed-info` as the `reason` of `supported: false`.
+pub(crate) const EMBEDDING_NOT_CONFIGURED: &str = "embedding is not configured";
+
+fn token_refused() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        ApiJson(json!({ "error": TOKEN_REFUSED })),
+    )
+        .into_response()
+}
+
 /// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
 pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
@@ -63,37 +83,36 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
             .into_response();
     };
 
-    let secret = match state.embed_secret.get_embed_secret().await {
-        Ok(s) => s,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(
-                    upstream_error::report(
-                        &upstream_error::DATABASE,
-                        upstream_error::Class::Failed,
-                        &err,
-                    )
-                    .to_json(),
-                ),
-            )
-                .into_response();
+    // SEC-12: the secret is configuration only. Unset means signed embedding
+    // is unavailable, said plainly; nothing is generated or stored.
+    let Some(secret) = state.config.embed_secret.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": EMBEDDING_NOT_CONFIGURED })),
+        )
+            .into_response();
+    };
+    let claims = match lakehouse_embed::verify_embed(
+        &jwt,
+        secret,
+        state.config.embed_token_max_lifetime_seconds,
+        lakehouse_embed::unix_now(),
+    ) {
+        Ok(claims) => claims,
+        Err(reason) => {
+            // SEC-12: the reason is for the log only; the response is one
+            // fixed message so a caller cannot tell which check failed.
+            tracing::info!(%reason, "signed embed token refused");
+            return token_refused();
         }
     };
-    let Some(claims) = lakehouse_embed::verify_embed(&jwt, &secret) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            ApiJson(json!({ "error": "invalid_or_expired" })),
-        )
-            .into_response();
-    };
 
-    let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "no_resource" })),
-        )
-            .into_response();
+    let Some(board_id) = claims
+        .resource
+        .and_then(|r| r.dashboard)
+        .filter(|d| !d.is_empty())
+    else {
+        return token_refused();
     };
 
     let board = match store::get_board(&state.clickhouse, &board_id).await {
@@ -113,6 +132,16 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
+    // SEC-12: withdrawal is read from the board on every request (a `FINAL`
+    // read, no cache in this process), so "withdraw all" and "withdraw one"
+    // take effect on the next request. A token with no `iat` cannot get here
+    // (`verify_embed` refuses it); `NEG_INFINITY` would be refused if it did.
+    if board.embed_access.is_withdrawn(
+        claims.iat.unwrap_or(f64::NEG_INFINITY),
+        claims.jti.as_deref(),
+    ) {
+        return token_refused();
+    }
 
     let mut filters = board.filters.clone().unwrap_or_default();
     filters.extend(params_to_filters(claims.params));
@@ -125,6 +154,172 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Body of `POST /api/embed/frame`: the token the embed page was opened
+/// with, either a signed `jwt` (`/embed/signed/<jwt>`) or the public link's
+/// `token` (`/embed/dashboard/<token>`).
+#[derive(Debug, Default, Deserialize)]
+struct FrameBody {
+    #[serde(default)]
+    jwt: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// `POST /api/embed/frame` — the sites allowed to frame the embed page opened
+/// with this token (`SEC-12`). Public, like the page itself: the token is
+/// the credential.
+///
+/// The console's `proxy.ts` calls this before it serves `/embed/*` and turns
+/// the answer into `Content-Security-Policy: frame-ancestors ...`. It returns
+/// ONLY the origin list. A token that is invalid, expired, withdrawn, for a
+/// board with embedding off or for no board at all gets the same answer as a
+/// board with no sites listed, `{"origins": []}`, so this route is no oracle
+/// for whether a token is good. A store failure is a `500` with the fixed
+/// database message; the caller treats anything but `200` as "no site".
+pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Response {
+    let parsed = serde_json::from_slice::<FrameBody>(&body).unwrap_or_default();
+    match resolve_frame_origins(&state, parsed).await {
+        Ok(origins) => (StatusCode::OK, ApiJson(json!({ "origins": origins }))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+        )
+            .into_response(),
+    }
+}
+
+async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<String>, ChError> {
+    if let Some(jwt) = body.jwt.filter(|s| !s.is_empty()) {
+        // Same verification `data` applies, so a token that would be refused
+        // there is not given a framing list here.
+        let Some(secret) = state.config.embed_secret.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Ok(claims) = lakehouse_embed::verify_embed(
+            &jwt,
+            secret,
+            state.config.embed_token_max_lifetime_seconds,
+            lakehouse_embed::unix_now(),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
+            return Ok(Vec::new());
+        };
+        let board = store::get_board(&state.clickhouse, &board_id).await?;
+        return Ok(board
+            .filter(|b| {
+                b.embed_enabled.unwrap_or(false)
+                    && !b.embed_access.is_withdrawn(
+                        claims.iat.unwrap_or(f64::NEG_INFINITY),
+                        claims.jti.as_deref(),
+                    )
+            })
+            .map(|b| b.embed_access.origins)
+            .unwrap_or_default());
+    }
+    if let Some(token) = body.token.filter(|s| !s.is_empty()) {
+        let board = store::get_board_by_token(&state.clickhouse, &token).await?;
+        return Ok(board.map(|b| b.embed_access.origins).unwrap_or_default());
+    }
+    Ok(Vec::new())
+}
+
+/// Body of `POST /api/dashboard/embed-revoke`.
+#[derive(Debug, Default, Deserialize)]
+struct RevokeBody {
+    #[serde(default)]
+    board: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// `POST /api/dashboard/embed-revoke` — withdraw ONE signed embed token of a
+/// dashboard (`SEC-12`). Needs `dashboard:write`.
+///
+/// The caller presents the whole token, never a bare `jti`: the server
+/// verifies the signature and reads the `jti` and `exp` itself, so nobody can
+/// withdraw (or pre-withdraw) an id they do not hold a signed token for. A
+/// token without a `jti` cannot be withdrawn singly, and the answer says so.
+///
+/// # Errors
+///
+/// `400` for a missing board or token, a token that does not verify (the
+/// same fixed message as everywhere), a token for another dashboard, a token
+/// with no `jti`, an unknown dashboard or a full withdrawal list; `503` when
+/// `EMBED_SECRET` is unset; the usual classified store errors otherwise.
+pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+    let parsed: RevokeBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("Body must be JSON {board, token}.".to_owned()))?;
+    let board = parsed.board.as_deref().map(str::trim).unwrap_or_default();
+    let token = parsed.token.as_deref().map(str::trim).unwrap_or_default();
+    if board.is_empty() || board == store::DEFAULT_BOARD_ID || token.is_empty() {
+        return Err(ApiError::BadRequest("board and token are required.".to_owned()).into());
+    }
+    let Some(secret) = state.config.embed_secret.as_deref() else {
+        return Err(ApiError::Unavailable(EMBEDDING_NOT_CONFIGURED.to_owned()).into());
+    };
+    let now = lakehouse_embed::unix_now();
+    let claims = lakehouse_embed::verify_embed(
+        token,
+        secret,
+        state.config.embed_token_max_lifetime_seconds,
+        now,
+    )
+    .map_err(|reason| {
+        tracing::info!(%reason, "embed token to withdraw refused");
+        ApiError::BadRequest(TOKEN_REFUSED.to_owned())
+    })?;
+    let for_board = claims
+        .resource
+        .as_ref()
+        .and_then(|r| r.dashboard.as_deref());
+    if for_board != Some(board) {
+        return Err(
+            ApiError::BadRequest("that token is for a different dashboard.".to_owned()).into(),
+        );
+    }
+    let Some(jti) = claims.jti.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "that token has no id (jti), so it cannot be withdrawn on its own; withdraw all the dashboard's embed tokens instead.".to_owned(),
+        )
+        .into());
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "exp is finite and within a day of now (verify_embed bounds it); rounded up, clamped at 0"
+    )]
+    let exp = claims.exp.unwrap_or(0.0).max(0.0).ceil() as u64;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "tolerance is the constant 60.0"
+    )]
+    let tolerance = lakehouse_embed::CLOCK_TOLERANCE_SECONDS as u64;
+    store::withdraw_embed_token(
+        &state.clickhouse,
+        board,
+        jti,
+        exp,
+        now_seconds(now),
+        tolerance,
+    )
+    .await
+    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    Ok(ApiJson(json!({ "ok": true, "withdrawn": jti })))
+}
+
+/// `now` (Unix seconds, fractional) as whole seconds, rounded down.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a Unix time in seconds is positive and far below u64::MAX"
+)]
+pub(crate) fn now_seconds(now: f64) -> u64 {
+    now.max(0.0).floor() as u64
 }
 
 /// `paramsToFilters` in `embed/data/route.ts`: a signed embed's locked JWT

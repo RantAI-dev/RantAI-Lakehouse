@@ -574,6 +574,14 @@ struct BoardEditBody {
     public: Option<bool>,
     #[serde(default)]
     embed: Option<bool>,
+    /// `SEC-12`: `true` withdraws every signed embed token issued so far
+    /// for this board ("withdraw all"). `false` is refused, not ignored.
+    #[serde(default, rename = "embedRevokeAll")]
+    embed_revoke_all: Option<bool>,
+    /// `SEC-12`: replace the sites allowed to frame this board's embed pages.
+    /// An empty list means no site may frame it.
+    #[serde(default, rename = "embedOrigins")]
+    embed_origins: Option<Vec<String>>,
     /// Move the board to this folder (`""` = root).
     #[serde(default, rename = "folderId")]
     folder_id: Option<String>,
@@ -590,6 +598,8 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 && body.filters.is_none()
                 && body.public.is_none()
                 && body.embed.is_none()
+                && body.embed_revoke_all.is_none()
+                && body.embed_origins.is_none()
                 && body.folder_id.is_none()
         }
         Some(_) => true,
@@ -660,19 +670,56 @@ pub async fn boards_update(
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
+    // SEC-12. Both go through `dashboard:write` like the rest of this route
+    // (`POLICY_TABLE`). Their results are merged into whichever response
+    // below is returned, so a body that also sets `public` or `embed` still
+    // reports them.
+    let mut embed_access = Map::new();
+    match parsed.embed_revoke_all {
+        Some(true) => {
+            let now = crate::routes::embed::now_seconds(lakehouse_embed::unix_now());
+            let revoked_before = store::revoke_all_embed_tokens(ch, &id, now)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            embed_access.insert("embedRevokedBefore".to_owned(), json!(revoked_before));
+        }
+        Some(false) => {
+            return Err(ApiError::BadRequest(
+                "embedRevokeAll can only be true: withdrawing cannot be undone.".to_owned(),
+            )
+            .into());
+        }
+        None => {}
+    }
+    if let Some(origins) = &parsed.embed_origins {
+        let stored = store::set_board_embed_origins(ch, &id, origins)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        embed_access.insert("embedOrigins".to_owned(), json!(stored));
+    }
+    let with_embed_access = |mut body: Value| {
+        if let Some(map) = body.as_object_mut() {
+            map.extend(embed_access.clone());
+        }
+        body
+    };
     if let Some(public) = parsed.public {
         let token = store::set_board_public(ch, &id, public)
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        return Ok(ApiJson(json!({ "ok": true, "publicToken": token })));
+        return Ok(ApiJson(with_embed_access(
+            json!({ "ok": true, "publicToken": token }),
+        )));
     }
     if let Some(embed) = parsed.embed {
         let enabled = store::set_board_embed(ch, &id, embed)
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        return Ok(ApiJson(json!({ "ok": true, "embedEnabled": enabled })));
+        return Ok(ApiJson(with_embed_access(
+            json!({ "ok": true, "embedEnabled": enabled }),
+        )));
     }
-    Ok(ApiJson(json!({ "ok": true })))
+    Ok(ApiJson(with_embed_access(json!({ "ok": true }))))
 }
 
 /// `DELETE /api/dashboard/boards?id=` — delete a board and its charts.
@@ -1382,24 +1429,64 @@ async fn embed_info_body(
     let Some(board) = store::get_board(&state.clickhouse, id).await? else {
         return Ok(None);
     };
-    let secret = state.embed_secret.get_embed_secret().await?;
-    let exp = now_unix_seconds() + 3600.0;
+    let enabled = board.embed_enabled.unwrap_or(false);
+    let max_lifetime = state.config.embed_token_max_lifetime_seconds;
+    // SEC-12: what the Share dialog shows beside the sample token. `null`
+    // when nothing has been withdrawn, so the dialog does not print "1970".
+    let revoked_before = if board.embed_access.revoked_before == 0 {
+        Value::Null
+    } else {
+        json!(board.embed_access.revoked_before)
+    };
+    let access = json!({
+        "maxLifetimeSeconds": max_lifetime,
+        "revokedBefore": revoked_before,
+        "allowedOrigins": board.embed_access.origins,
+    });
+    let with_access = |mut body: Value| {
+        if let (Some(map), Some(extra)) = (body.as_object_mut(), access.as_object()) {
+            map.extend(extra.clone());
+        }
+        body
+    };
+    // SEC-12: no secret, no signed embedding. Said as `supported: false` with
+    // the reason, and no sample token (nothing can sign one).
+    let Some(secret) = state.config.embed_secret.as_deref() else {
+        return Ok(Some(with_access(json!({
+            "enabled": enabled,
+            "supported": false,
+            "reason": crate::routes::embed::EMBEDDING_NOT_CONFIGURED,
+        }))));
+    };
+    let iat = now_unix_seconds();
+    // The sample lives an hour, or the configured maximum when that is lower:
+    // a sample the API would refuse is no sample.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a lifetime limit in seconds; far below 2^53"
+    )]
+    let lifetime = 3600.0_f64.min(max_lifetime as f64);
     let claims = lakehouse_embed::EmbedClaims {
         resource: Some(lakehouse_embed::EmbedResource {
             dashboard: Some(id.to_owned()),
         }),
         params: Some(HashMap::new()),
-        exp: Some(exp),
+        exp: Some(iat + lifetime),
+        // SEC-12: a token must carry `iat` and `exp`; the sample also gets a
+        // `jti` so the Share dialog can show a token that can be withdrawn.
+        iat: Some(iat),
+        jti: Some(uuid::Uuid::new_v4().simple().to_string()),
     };
-    let sample_token = lakehouse_embed::sign_embed(&claims, &secret);
+    let sample_token = lakehouse_embed::sign_embed(&claims, secret);
     // D2: `secret` is deliberately NOT included in the response — see this
     // function's doc comment. Only `enabled` and a freshly-signed
     // `sampleToken` (the legitimate use case the secret used to serve) go
     // over the wire.
-    Ok(Some(json!({
-        "enabled": board.embed_enabled.unwrap_or(false),
+    Ok(Some(with_access(json!({
+        "enabled": enabled,
+        "supported": true,
         "sampleToken": sample_token,
-    })))
+    }))))
 }
 
 fn now_unix_seconds() -> f64 {

@@ -126,12 +126,17 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY seven routes in the whole service. (Was "six" —
-    // corrected here, in the same commit that adds the seventh, since Task
-    // A5's `/api/auth/oidc/callback` had already made the old count
-    // stale.) ────────────────────────────────────────────────────────────
+    // ── Public: the ONLY eight routes in the whole service. (Was "six" —
+    // corrected when the seventh was added, since Task A5's
+    // `/api/auth/oidc/callback` had already made the old count stale; the
+    // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
+    // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
+    // page, with the token the page was opened with. Public because the
+    // token is the credential; it answers only an origin list, and the same
+    // empty list for a token that is invalid.
+    ("POST", "/api/embed/frame",                  Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     // Redirect-only, grants nothing — it only ever
@@ -444,6 +449,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // SEC-12: withdrawing a token changes who can read the dashboard, so it
+    // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
+    ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
@@ -762,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_seven_public_entries_exist() {
+    fn exactly_eight_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -776,7 +784,8 @@ mod tests {
             .iter()
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
-        assert_eq!(public_count, 7);
+        // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
+        assert_eq!(public_count, 8);
     }
 
     #[test]

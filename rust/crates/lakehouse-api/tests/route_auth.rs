@@ -1303,3 +1303,27 @@ async fn delete_session_writes_an_audit_event() {
          token)"
     );
 }
+
+/// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
+/// policies the plan names, so the table-driven loops above walk them both
+/// ways (a `dashboard:read`-only principal is refused on the withdrawal; the
+/// frame answer is reachable with no credentials at all).
+#[test]
+fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(
+        policy_of("POST", "/api/embed/frame"),
+        Some(Policy::Public),
+        "the frame answer is read by the console's proxy with only the embed token"
+    );
+    assert_eq!(
+        policy_of("POST", "/api/dashboard/embed-revoke"),
+        Some(Policy::RequiresPermission("dashboard:write")),
+        "withdrawing a token is a write"
+    );
+}

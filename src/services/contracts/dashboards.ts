@@ -54,6 +54,50 @@ export type DashboardService = {
   deleteFolder(id: string, signal?: AbortSignal): Promise<void>
   /** `folderId` "" = root. */
   moveBoard(boardId: string, folderId: string, signal?: AbortSignal): Promise<void>
+
+  /**
+   * SEC-12. The board's signed-embedding state: whether it can sign at all,
+   * a sample token, what has been withdrawn and which sites may frame it.
+   * Needs `dashboard:read`.
+   */
+  getEmbedInfo(board: string, signal?: AbortSignal): Promise<EmbedInfo>
+  /**
+   * Replace the sites allowed to frame the board's embed pages. The server
+   * validates and normalises them; a refusal arrives as `invalid_request`
+   * carrying its message. Resolves to the list that was stored. Needs
+   * `dashboard:write`.
+   */
+  setEmbedOrigins(board: string, origins: string[], signal?: AbortSignal): Promise<string[]>
+  /**
+   * Withdraw every signed embed token of the board issued so far. Resolves to
+   * the instant (Unix seconds) stored. Needs `dashboard:write`.
+   */
+  revokeAllEmbedTokens(board: string, signal?: AbortSignal): Promise<number>
+  /**
+   * Withdraw one signed token, presented whole. Refused with the server's
+   * message for a token that does not verify, is for another dashboard or
+   * carries no `jti`. Resolves to the withdrawn `jti`. Needs `dashboard:write`.
+   */
+  revokeEmbedToken(board: string, token: string, signal?: AbortSignal): Promise<string>
+}
+
+/**
+ * `GET /api/dashboard/embed-info` (`embed_info_body`,
+ * `rust/crates/lakehouse-api/src/routes/dashboard.rs`). When `supported` is
+ * false no secret is configured: `reason` says so and there is no
+ * `sampleToken`.
+ */
+export type EmbedInfo = {
+  enabled: boolean
+  supported: boolean
+  reason?: string
+  sampleToken?: string
+  /** The longest `exp - iat` the API accepts, in seconds. */
+  maxLifetimeSeconds: number
+  /** Unix seconds; tokens issued at or before it are withdrawn. `null` when none. */
+  revokedBefore: number | null
+  /** Sites allowed to frame the embed pages. */
+  allowedOrigins: string[]
 }
 
 export type CreateBoardInput = {

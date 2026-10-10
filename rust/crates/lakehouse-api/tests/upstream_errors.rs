@@ -94,10 +94,15 @@ async fn the_embed_data_route_never_carries_the_database_text() {
 
     assert!(!body.contains(MARKER), "the database text leaked: {body}");
     assert!(!body.contains("version 0.0.0"), "{body}");
-    // Whichever step answered (the secret lookup failing, or the token being
-    // refused), the status class is unchanged and no database text is in it.
+    // Whichever step answered, no database text is in it. SEC-12: the secret
+    // is no longer looked up in the database, so with no `EMBED_SECRET` set
+    // here the route answers 503 "embedding is not configured" before any
+    // query; 500 (a board lookup failing) and 401 (a refused token) remain
+    // the other possible answers.
     assert!(
-        status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::UNAUTHORIZED,
+        status == StatusCode::INTERNAL_SERVER_ERROR
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::SERVICE_UNAVAILABLE,
         "{status}: {body}"
     );
 }
