@@ -324,3 +324,96 @@ values search with such text returns an empty list and no error.
 *Not verified:* `cargo test --workspace`, and the `parity`,
 `query_download` and connector test targets; CI runs them on the PR.
 
+---
+
+# Part A, second round (2026-10-10)
+
+**Why a second round.** After the first round the roadmap gained a Target
+column and `docs/core/specs/bi-18.md`. Against that target part A lacked:
+specific-date, before/after and "next N" date filters, month-year and
+quarter-year pickers, named equal / not-equal / greater / less number
+filters, "does not contain", and required filters. This round adds them.
+Two target rows stay out, with the reason on the feature page: filters
+through `QS-5` parameters, and embed locking beyond signed `params`
+(`BI-26`).
+
+**Base:** `feat/uiux` at `d0dd5f3` (phase 0 is merged in: read
+`upstream_error.rs` and `tests/sec11_guard.rs`; no response may carry
+upstream text, and a new message of ours built with `{err}` needs a
+reasoned guard entry or, better, no `{err}`).
+
+## R1. Decisions already made (do not re-ask, do not change)
+
+| Decision | Choice |
+| --- | --- |
+| Wire format | Additive only. Every filter stored or linked before this round keeps its meaning and its exact serialised form. New behaviour is new values of existing fields or new optional fields. |
+| Relative "next" | `anchor: "next"` with `unit` and `n`: the `n` units starting tomorrow, today excluded. "last" is unchanged (includes today). |
+| Text | New op `not_contains`. A NULL or empty value is kept by it (it does not contain the text). Case-insensitive, same escaping as `contains`. |
+| Date and number comparisons | No new server ops: "on", "before", "after", "equal", "greater than", "less than", a month and a quarter are all a `between` with one or two ends, and "not equal" is `not_in` with one value. The console names them; the server already evaluates them. "Before" and "after" exclude the named date; "greater than" and "less than" exclude the number. If `between` cannot express an exclusive end exactly (it is inclusive today), add optional `minExclusive` / `maxExclusive` booleans, default false, skipped when false. Do not approximate with ±1. |
+| Required | Optional `required: bool` on a filter, default false, skipped when false, meaningful only on a board's saved default. The server keeps it; the console enforces it: the chip has no remove control, clearing restores the default's value, a URL (`?f=`) that omits a required column gets the default's filter for that column added. Public and embed views already use the saved default and are unaffected. |
+| Labels | The chip reads what the person picked ("on 3 Oct 2026", "before …", "in March 2026", "in Q1 2026", "= 5", "≠ 5", "> 5", "next 7 days"), derived from the stored filter by a pure function, with no extra stored hint except where two picks would serialise identically; then prefer the more specific reading (a full calendar month reads as the month). |
+
+## R2. Tasks
+
+One commit per task; Rust first.
+
+### RT1 — Server: `next`, `not_contains`, exclusive ends, `required`
+
+`lakehouse-bi` `filters.rs` and `builder.rs`, and the validation in
+`routes/dashboard.rs` where filters are accepted. Follow R1. `relative`
+with `anchor: next` uses the same date functions as `last`, mirrored.
+
+*Accept:* unit tests: every pre-existing filter test passes unchanged; a
+filter from round one serialises byte-for-byte as before; `next n unit`
+boundaries for each unit; `not_contains` with `%`, `_`, `'`, `\\` and
+its NULL behaviour; exclusive ends on number and date, each side; `required`
+round-trips and is ignored by predicate building. Because mock-only tests
+missed a real-engine failure in round one: run each new predicate shape
+once against the dev `ClickHouse` (`docker exec lakehouse-clickhouse-1
+clickhouse-client -q "…"`, read-only, over `serving.mart_demo_map_points`,
+which has `visit_date Date`, `visitors UInt32`, `provinsi String`) and
+quote the commands and row counts in the handoff. Do not reference that
+table in code or tests.
+
+### RT2 — Console: the named comparisons
+
+`src/lib/dashboard-filter-state.ts` (+ tests): the pure mapping between
+what the editor offers and the stored filter, both ways, and the labels.
+`src/features/dashboards/filters/filter-editors.tsx`: date editor gains
+"On", "Before", "After", "Next N" (beside "Last N"), a month picker and a
+quarter picker (year + month, year + quarter; native controls or the
+existing select, no new dependency); number editor offers equal, not
+equal, greater than, less than, between, and the value list; text editor
+adds "does not contain". Keep the editors compact: the owner asked for
+less text in dialogs on 2026-10-10 (one line of help at most, controls
+first).
+
+*Accept:* round-trip tests for every new pick (pick → stored → label →
+editor state); typecheck, lint, tests.
+
+### RT3 — Console: required
+
+A "Required" toggle on a filter chip's editor, shown to a caller with
+`dashboard:write` on a user dashboard; it takes effect with "Save as
+default". Enforcement as in R1, in the pure state module with tests (URL
+without the column, clear, Reset, a default that later loses its required
+flag).
+
+*Accept:* unit tests for each enforcement path; the bar's test for the
+missing remove control.
+
+### RT4 — Docs
+
+`CHANGELOG.md` `[Unreleased]`: extend the dashboard-filters entry.
+
+## R3. Out of scope
+
+`QS-5` parameters; embed-locked filters; filter widgets other than the
+existing bar; time grain.
+
+## R4. Things the developer must verify, not assume
+
+- That a `?f=` link and a saved board from round one decode to the same filters and labels as before (add a fixture taken from a real round-one value).
+- The exact inclusive/exclusive behaviour of the existing `between` on dates and on `DateTime` columns before building "before"/"after" on it.
+- What "this quarter"/"next quarter" return on the dev engine at a quarter boundary date (compute with a fixed date expression, not `today()`).
+

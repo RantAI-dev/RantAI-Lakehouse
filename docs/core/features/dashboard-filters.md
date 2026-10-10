@@ -31,10 +31,20 @@ default everyone sees, including public-link and embed viewers.
 10. Filter the year like any other number column; the special Year chip is gone.
 11. See on a tile when an active filter does not apply to it because the tile's data has no such column.
 
+Added on 2026-10-10 to reach the target in `docs/core/specs/bi-18.md` (part A, second round):
+
+12. Filter a date column by one specific date, before a date, after a date, or by the next N days, weeks, months, quarters or years.
+13. Filter a date column by a month of a year or a quarter of a year, picked as such rather than typed as two dates.
+14. Filter a number column by "equal to", "not equal to", "greater than" and "less than", named as such.
+15. Filter a text column by "does not contain".
+16. As an editor, mark a saved default filter as required: a viewer can change its value but cannot remove it, and clearing it returns to the default value.
+
 ## Not included
 
 - Filter controls for public-link and embed viewers. They keep seeing the saved default; an embed token's locked `params` still cannot be overridden (`BI-26`).
 - Parameters and SQL variables (`BI-11`); time grain (`BI-9`).
+- Filters that reach a SQL-source chart through named parameters: the spec ties this to `QS-5`, which does not exist yet. A filter still applies to a SQL-source chart when the source returns a column of that name.
+- Locking a filter in an embed beyond today's signed `params`: `BI-26`.
 - Per-tile filters, and wiring one filter to differently named columns.
 - Saving a default on the built-in "Main" dashboard (its filters were never stored).
 
@@ -53,6 +63,8 @@ cannot set or save dashboard filters; that needs a tool of its own.
 | 3 | The Year chip is folded into ordinary filters | — | Owner, 2026-10-07 |
 | 4 | "Main" cannot save a default | Planner default, not objected | 2026-10-07 |
 | 5 | A filter whose column a tile lacks is skipped for that tile and the tile says so | Planner default, not objected | 2026-10-07 |
+| 6 | "Required" belongs to a saved default filter. It cannot be removed by a viewer; clearing it restores the default value. A required filter always has a value, so a dashboard never opens unfiltered by it | Planner default (the spec says only "a filter can be required") | Owner to confirm at QA |
+| 7 | "Next N" counts from tomorrow and excludes today; "last N" keeps including today, as built | Planner default | Owner to confirm at QA |
 
 ## Limits to tell a customer
 
@@ -81,6 +93,12 @@ cannot set or save dashboard filters; that needs a tool of its own.
 | 14 | Filter a column one tile lacks | That tile is unchanged and says the filter does not apply | |
 | 15 | Open a dashboard saved before this change with filters and a year | Renders as before; old `{column, values}` filters still work | |
 | 16 | Stop ClickHouse and open a value list (operator) | A plain "could not load values", no database text | |
+| 17 | Date filter: "on" one date, "before", "after", "next 7 days" | Each narrows as named; the chip reads it in words | |
+| 18 | Date filter: pick a month of a year, then a quarter of a year | The whole month or quarter, inclusive | |
+| 19 | Number filter: equal to, not equal to, greater than, less than | Each narrows as named | |
+| 20 | Text filter: does not contain | Rows with the text are gone; rows with an empty value stay | |
+| 21 | Mark a saved default filter as required, save, reopen as a viewer and try to remove it | It cannot be removed; changing its value works; Reset returns the default | |
+| 22 | Open a link saved before this round (`?f=…` with only the older filter kinds) | Same view as before | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
