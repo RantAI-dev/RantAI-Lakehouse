@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Dashboards |
 | Backlog | `BI-16` (part A), with `AI-5` for these types |
-| Status | Planner defaults throughout; the owner confirms at QA (asked to move fast, 2026-10-11) |
+| Status | Decisions signed 2026-10-11 |
 | Plan | `docs/superpowers/plans/2026-10-11-bi-16a-tables-kpi.md` |
 
 ## Problem
@@ -35,13 +35,14 @@ nothing to compare it to. A row in the drill-down list cannot be opened.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | A raw table pages 50 rows at a time with the total, like the record list | Planner default | Owner to confirm at QA |
-| 2 | A pivot shows at most 10,000 cells; beyond that it shows the first ones and says it was cut | Spec *(proposed)* | Owner to confirm at QA |
-| 3 | Totals and subtotals are computed by the database over the underlying rows, never by adding up the cells (an average of averages would be wrong) | Planner default | Owner to confirm at QA |
-| 4 | "Previous period" compares the latest period that has data with the one before it, in the report time zone of `BI-9` | Planner default (Metabase trend) | Owner to confirm at QA |
-| 5 | The editor says whether up is good or down is good; the default is up | Planner default | Owner to confirm at QA |
-| 6 | A link cell opens `http`/`https` in a new tab; an image cell loads `https` only and sends no referrer. Anything else is shown as text | Planner default | Owner to confirm at QA |
-| 7 | Currency is shown with the browser's Indonesian formatting (`Rp`), no conversion | Planner default | Owner to confirm at QA |
+| 1 | A raw table pages 50 rows at a time with the total, like the record list | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 2 | A pivot shows at most 10,000 cells; beyond that it shows the first ones and says it was cut | Spec *(proposed)* | Owner, 2026-10-11 ("as best practice") |
+| 3 | Totals and subtotals are computed by the database over the underlying rows, never by adding up the cells (an average of averages would be wrong) | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 4 | "Previous period" compares the latest period that has data with the one before it, in the report time zone of `BI-9` | Planner default (Metabase trend) | Owner, 2026-10-11 ("as best practice") |
+| 5 | The editor says whether up is good or down is good; the default is up | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 6 | A link cell opens `http`/`https` in a new tab; an image cell loads `https` only and sends no referrer. Anything else is shown as text | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 7 | Currency is shown with the browser's Indonesian formatting (`Rp`), no conversion | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 8 | CSV export of a raw table exports the whole result, not the page on screen: visible columns in their order with their labels, raw values, the dashboard's filters and the tile's sort, up to 100,000 rows with a notice when cut. Cells that a spreadsheet would run as a formula are neutralised | Owner asked for best practice, 2026-10-11 | Owner, 2026-10-11 |
 
 ## Limits to tell a customer
 

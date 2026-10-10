@@ -174,3 +174,19 @@ R1 to R5 are closed, confirmed by the product owner in a browser: the pivot read
 Not verified by anyone: `BI-16A-AC6` as a user without `dashboard:write`; `AI-5-AC1` through the assistant; a raw table, pivot or comparing KPI on an embed or public link; a pivot over a masked table in a browser; the workspace-wide suites (CI).
 
 Owed: the owner's answer on CSV export of a raw table (today: the 50 rows on screen, hidden columns included); decisions 1 to 7 on the feature page are planner defaults.
+
+## 8. Addendum: whole-result CSV export of a raw table (owner's decision, 2026-10-11)
+
+Decision 8 on the feature page. One task, T8.
+
+| Decision | Choice |
+| --- | --- |
+| What is exported | Every row of the raw table's result, not the page on screen: the tile's visible columns (hidden ones left out) in their order, header = the column's label when set, else its name. The dashboard's active filters and the tile's sort apply. |
+| Values | Raw, not display-formatted: numbers without separators or currency marks, dates as ISO text, so a spreadsheet can compute with them. |
+| Limit | 100,000 rows. Beyond that the first 100,000 are exported and the console says the export was cut and at how many rows; nothing is cut silently. |
+| Encoding | UTF-8 with a byte-order mark, CRLF line ends, RFC 4180 quoting. |
+| Formula injection | A text cell that starts with `=`, `+`, `-`, `@`, tab or carriage return is prefixed with a single quote (OWASP CSV injection guidance). Numbers stay numbers. |
+| Permissions | The statement goes through the same guard and role rewrite as the tile, so masks and row filters apply. Follow the existing download route of Query Studio (`tests/query_download.rs`) for the permission, the response headers and the audit entry; do not invent a second pattern. In `POLICY_TABLE` and `tests/route_auth.rs`. Not available on embeds and public links. |
+| Where | The table tile's existing CSV action, for a raw table; grouped tables and other tiles keep today's export. The file is named after the tile. |
+
+Verify, not assume: how Query Studio's download streams and caps, and reuse it; that an existing CSV helper (`src/lib/table-csv.ts`) already escapes formulas or not — one escaping rule, in one place; one real-engine run of the export statement with a filter and a sort, row count quoted.

@@ -51,10 +51,10 @@ monthly." (`AI-3-AC1`). The AI team reviews this part.
 | 3 | A click on a bucket becomes a date-range filter, and the record list shows that range. A click on a date part (for example "Monday") does nothing, and the tile says so | — | Owner, 2026-10-10 |
 | 4 | A chart with a grain may return up to 1000 points (others stay at 100); a cut-off result is marked on the tile | — | Owner, 2026-10-10 |
 | 5 | Grains and date parts are Metabase's list | Spec | 2026-10-10 |
-| 6 | Changing the settings needs a new permission, `settings:write`; reading them needs only a login (the console needs them to label axes) | Planner default | Owner to confirm at QA |
-| 7 | First day of the week is Monday or Sunday, no other day | Planner default | Owner to confirm at QA |
-| 8 | Date filters made in `BI-18` part A ("this month", "last 7 days", a day range on a timestamp column) follow the same time zone and week start, so a filter and a chart never disagree about where a month begins | Planner default | Owner to confirm at QA |
-| 9 | The dashboard control offers day, week, month, quarter, year, plus hour and minute only when every grained chart is on a timestamp column | Planner default | Owner to confirm at QA |
+| 6 | Changing the settings needs a new permission, `settings:write`; reading them needs only a login (the console needs them to label axes) | Planner default | Owner, 2026-10-11 |
+| 7 | First day of the week is Monday or Sunday, no other day | Planner default | Owner, 2026-10-11 |
+| 8 | Date filters made in `BI-18` part A ("this month", "last 7 days", a day range on a timestamp column) follow the same time zone and week start, so a filter and a chart never disagree about where a month begins | Planner default | Owner, 2026-10-11 |
+| 9 | The dashboard control offers day, week, month, quarter, year, plus hour and minute only when every grained chart is on a timestamp column | Planner default | Owner, 2026-10-11 |
 
 ## Limits to tell a customer
 

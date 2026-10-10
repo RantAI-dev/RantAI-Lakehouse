@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Dashboards |
 | Backlog | `BI-8`, with `AI-4` (assistant parity) |
-| Status | Planner defaults throughout; the owner confirms at QA (asked to move fast, 2026-10-11) |
+| Status | Decisions signed 2026-10-11 |
 | Plan | `docs/superpowers/plans/2026-10-11-bi-8-calculated-fields.md` |
 
 ## Problem
@@ -41,10 +41,10 @@ Part 2:
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | The product has its own small formula language: `[Column]` references, numbers, quoted text, operators, and a fixed list of functions. It is parsed and compiled by the server; nothing the user types is ever placed in SQL as it is | Spec | 2026-10-11 |
-| 2 | A field belongs to one table or SQL source and is visible to everyone who can read that source; creating, changing and deleting need `dashboard:write` | Planner default | Owner to confirm at QA |
-| 3 | A field is row-level (usable as a dimension or inside an aggregation) or aggregate (usable as a measure); the server works out which from the formula | Planner default | Owner to confirm at QA |
-| 4 | A field that a chart uses cannot be deleted; the refusal lists the charts | Planner default | Owner to confirm at QA |
-| 5 | Dividing by zero gives an empty value, not an error | Planner default | Owner to confirm at QA |
+| 2 | A field belongs to one table or SQL source and is visible to everyone who can read that source; creating, changing and deleting need `dashboard:write` | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 3 | A field is row-level (usable as a dimension or inside an aggregation) or aggregate (usable as a measure); the server works out which from the formula | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 4 | A field that a chart uses cannot be deleted; the refusal lists the charts | Planner default | Owner, 2026-10-11 ("as best practice") |
+| 5 | Dividing by zero gives an empty value, not an error | Planner default | Owner, 2026-10-11 ("as best practice") |
 | 6 | Column permissions hold: a formula over a masked column sees the masked value, and over a denied column fails for that user | Security posture | 2026-10-11 |
 | 7 | The function list is the Metabase set named in the spec; the exact names are in the plan | Spec | 2026-10-11 |
 
