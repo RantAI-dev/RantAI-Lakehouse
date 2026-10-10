@@ -582,7 +582,14 @@ jobs:
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 25, not 20 (PR #101, product owner 2026-10-10). Measured: bringing the
+    # stack up takes 11m38s to 13m47s of this job, and eight runs on `main`
+    # took 13m02s to 18m37s before SRC-7 and SRC-8 added about two minutes of
+    # steps. On PR #101 every step passed and the job was cut off at 20m02s
+    # during the final `down`. 25 is what G3 and G3a already use. SRC-9
+    # splits the connector gates into parallel jobs and measures its
+    # 20-minute target again.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v7
