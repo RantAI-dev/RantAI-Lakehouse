@@ -90,7 +90,7 @@ export function summarizeTiles(
  * sees.
  */
 export function summarizeFilters(filters: FilterLike[]): string {
-  const parts = filters.filter(isActiveFilter).map(filterLabel)
+  const parts = filters.filter(isActiveFilter).map((f) => filterLabel(f))
   return parts.length ? parts.join("; ") : "none"
 }
 

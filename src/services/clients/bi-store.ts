@@ -45,9 +45,10 @@ export type ChartInput = {
 export type TileBox = { x: number; y: number; w: number; h: number };
 export type LayoutMap = Record<string, TileBox>;
 /** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
-export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with";
+export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
 export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
-export type RelativeAnchor = "last" | "this" | "previous";
+/** `next`: the `n` units starting tomorrow, today excluded (BI-18 round two). */
+export type RelativeAnchor = "last" | "this" | "previous" | "next";
 /** What a column holds, as far as filtering cares; derived server-side from its ClickHouse type. */
 export type FilterKind = "number" | "date" | "datetime" | "text";
 /**
@@ -62,12 +63,17 @@ export type FilterDef = {
   /** `between` bounds: a number, or a date as `YYYY-MM-DD`; either may be absent. */
   min?: string;
   max?: string;
-  /** `relative`: `n` units ending today (`anchor: "last"`), or this / the previous calendar unit. */
+  /** `relative`: `n` units ending today (`last`) or starting tomorrow (`next`), or this / the previous calendar unit. */
   unit?: RelativeUnit;
   n?: number;
   anchor?: RelativeAnchor;
-  /** `contains` / `starts_with` / `ends_with`, at most 200 characters. */
+  /** `contains` / `starts_with` / `ends_with` / `not_contains`, at most 200 characters. */
   text?: string;
+  /** `between` leaves out `min` / `max` itself ("after", "before", "greater than", "less than"). Absent means inclusive. */
+  minExclusive?: boolean;
+  maxExclusive?: boolean;
+  /** The filter cannot be removed in the console. Meaningful only on a board's saved default. */
+  required?: boolean;
 };
 /** A column a filter can target, with how many tiles of the board have it. */
 export type FilterField = { column: string; kind: FilterKind | string; tiles: number };

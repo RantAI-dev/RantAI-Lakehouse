@@ -53,6 +53,9 @@ pub enum FilterOp {
     StartsWith,
     /// Text column ends with `text`, case-insensitively.
     EndsWith,
+    /// Text column does not contain `text`, case-insensitively. A NULL or
+    /// empty value is kept: it does not contain the text (BI-18 round two).
+    NotContains,
 }
 
 impl FilterOp {
@@ -94,6 +97,8 @@ pub enum RelativeAnchor {
     This,
     /// The calendar unit before the current one.
     Previous,
+    /// The `n` units starting tomorrow, today excluded (BI-18 round two).
+    Next,
 }
 
 /// A dashboard filter, applied to every tile whose data has the column.
@@ -126,6 +131,27 @@ pub struct FilterDef {
     /// Needle of `contains` / `starts_with` / `ends_with`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `between` leaves out `min` itself (a "greater than" / "after").
+    /// BI-18 round two: `between` was inclusive only, and "after 3 Oct" must
+    /// not include 3 Oct; skipped when false so older filters keep their bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub min_exclusive: bool,
+    /// `between` leaves out `max` itself (a "less than" / "before").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub max_exclusive: bool,
+    /// The console may not remove this filter. Meaningful only on a board's
+    /// saved default; the server keeps it and never reads it when building
+    /// SQL, so public and embed views (which use the default) are unaffected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl FilterDef {
@@ -143,6 +169,9 @@ impl FilterDef {
             n: None,
             anchor: None,
             text: None,
+            min_exclusive: false,
+            max_exclusive: false,
+            required: false,
         }
     }
 
@@ -156,9 +185,10 @@ impl FilterDef {
             FilterOp::In | FilterOp::NotIn => !self.values.is_empty(),
             FilterOp::Between => self.min.is_some() || self.max.is_some(),
             FilterOp::Relative => self.unit.is_some() && self.anchor.is_some(),
-            FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith => {
-                self.text.as_deref().is_some_and(|t| !t.is_empty())
-            }
+            FilterOp::Contains
+            | FilterOp::StartsWith
+            | FilterOp::EndsWith
+            | FilterOp::NotContains => self.text.as_deref().is_some_and(|t| !t.is_empty()),
         }
     }
 
@@ -181,7 +211,10 @@ impl FilterDef {
             FilterOp::In | FilterOp::NotIn => Ok(()),
             FilterOp::Between => self.validate_between(),
             FilterOp::Relative => self.validate_relative(),
-            FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith => {
+            FilterOp::Contains
+            | FilterOp::StartsWith
+            | FilterOp::EndsWith
+            | FilterOp::NotContains => {
                 let Some(text) = self.text.as_deref() else {
                     return Err("a text filter needs `text`".to_owned());
                 };
@@ -199,6 +232,11 @@ impl FilterDef {
     fn validate_between(&self) -> Result<(), String> {
         if self.min.is_none() && self.max.is_none() {
             return Err("a range filter needs `min`, `max`, or both".to_owned());
+        }
+        // An exclusive end with no end to exclude is a malformed pick.
+        if (self.min_exclusive && self.min.is_none()) || (self.max_exclusive && self.max.is_none())
+        {
+            return Err("an exclusive end needs its bound".to_owned());
         }
         let mut seen_number = false;
         let mut seen_date = false;
@@ -228,6 +266,7 @@ impl FilterDef {
         };
         match (anchor, self.n) {
             (RelativeAnchor::Last, None) => Err("`last` needs `n`".to_owned()),
+            (RelativeAnchor::Next, None) => Err("`next` needs `n`".to_owned()),
             (_, Some(n)) if !(1..=MAX_RELATIVE_N).contains(&n) => {
                 Err(format!("`n` must be between 1 and {MAX_RELATIVE_N}"))
             }
@@ -251,6 +290,17 @@ pub fn validate_filters(filters: &[FilterDef]) -> Result<(), String> {
             .map_err(|msg| format!("filter {}: {msg}", i + 1))?;
     }
     Ok(())
+}
+
+/// The filters that restrict something, in order. An `in` with no values
+/// (the pre-BI-18 bar stored a column with an empty selection that way), a
+/// `between` with neither bound and a text op with no text filter nothing, so
+/// they are not stored (BI-18 review round 1). A `required` flag on such a
+/// placeholder goes with it: a filter that restricts nothing cannot be
+/// required.
+#[must_use]
+pub fn without_inert(filters: &[FilterDef]) -> Vec<FilterDef> {
+    filters.iter().filter(|f| f.is_active()).cloned().collect()
 }
 
 /// A finite number, as text. `NaN` and infinities are refused so a bound can
@@ -377,6 +427,21 @@ mod tests {
     }
 
     #[test]
+    fn round_two_fields_round_trip_and_stay_off_the_wire_when_false() {
+        let json = r#"{"column":"d","values":[],"op":"between","min":"2026-10-03","minExclusive":true,"required":true}"#;
+        let f = parse(json);
+        assert!(f.min_exclusive && !f.max_exclusive && f.required);
+        assert_eq!(serde_json::to_string(&f).unwrap(), json);
+        // A round-one typed filter keeps its exact bytes.
+        let one =
+            r#"{"column":"d","values":[],"op":"between","min":"2026-10-03","max":"2026-10-09"}"#;
+        assert_eq!(serde_json::to_string(&parse(one)).unwrap(), one);
+        let next =
+            r#"{"column":"d","values":[],"op":"relative","unit":"day","n":7,"anchor":"next"}"#;
+        assert_eq!(serde_json::to_string(&parse(next)).unwrap(), next);
+    }
+
+    #[test]
     fn an_unknown_op_is_a_parse_error_not_a_silent_in() {
         let bad = r#"{"column":"c","values":[],"op":"regex"}"#;
         assert!(serde_json::from_str::<FilterDef>(bad).is_err());
@@ -407,6 +472,10 @@ mod tests {
             r#"{"column":"c","op":"contains","text":"bal"}"#,
             r#"{"column":"c","op":"starts_with","text":"b"}"#,
             r#"{"column":"c","op":"ends_with","text":"i"}"#,
+            r#"{"column":"c","op":"not_contains","text":"i"}"#,
+            r#"{"column":"c","op":"relative","anchor":"next","n":7,"unit":"day"}"#,
+            r#"{"column":"c","op":"between","min":"1","minExclusive":true}"#,
+            r#"{"column":"c","op":"between","max":"2024-01-01","maxExclusive":true,"required":true}"#,
         ] {
             assert_eq!(parse(json).validate(), Ok(()), "{json}");
         }
@@ -430,6 +499,11 @@ mod tests {
             r#"{"column":"c","op":"relative","anchor":"last","n":3651,"unit":"day"}"#,
             r#"{"column":"c","op":"contains"}"#,
             r#"{"column":"c","op":"contains","text":""}"#,
+            r#"{"column":"c","op":"not_contains"}"#,
+            r#"{"column":"c","op":"relative","anchor":"next","unit":"day"}"#,
+            r#"{"column":"c","op":"relative","anchor":"next","n":0,"unit":"day"}"#,
+            r#"{"column":"c","op":"between","max":"3","minExclusive":true}"#,
+            r#"{"column":"c","op":"between","min":"3","maxExclusive":true,"max":"x"}"#,
         ] {
             assert!(parse(json).validate().is_err(), "{json}");
         }
@@ -467,6 +541,23 @@ mod tests {
         assert!(f.validate().is_ok());
         assert!(!f.is_active());
         assert!(FilterDef::in_values("c", vec!["a".into()]).is_active());
+    }
+
+    #[test]
+    fn inert_filters_are_dropped_before_storing_and_active_ones_kept_in_order() {
+        let mut required_empty = FilterDef::in_values("r", vec![]);
+        required_empty.required = true;
+        let keep = parse(r#"{"column":"k","values":["a"]}"#);
+        let range = parse(r#"{"column":"p","op":"between","min":"1"}"#);
+        let list = vec![
+            FilterDef::in_values("visit_date", vec![]),
+            keep.clone(),
+            parse(r#"{"column":"visitors","values":[],"op":"not_in"}"#),
+            required_empty,
+            range.clone(),
+        ];
+        assert_eq!(without_inert(&list), vec![keep, range]);
+        assert!(without_inert(&[]).is_empty());
     }
 
     #[test]

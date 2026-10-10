@@ -27,7 +27,17 @@ once a first release is tagged.
   anyone with `dashboard:write` can press **Save as default** on a user
   dashboard (the built-in Main dashboard cannot save one). Public links and
   embeds still show the saved default and cannot be changed by the viewer.
-  Limits: relative dates follow the database server's clock and time zone, not
+  A date column can also be filtered on, before or after a day (the day itself
+  is left out of before and after), in a month or a quarter of a year, and by
+  the next N days, weeks, months, quarters or years (starting tomorrow, today
+  left out); a number column by equal, not equal, greater than or less than; a
+  text column by does not contain (a row with no value is kept). Someone with
+  `dashboard:write` can mark a filter **Required** on a user dashboard and
+  save it as the default: the console then shows no remove control for it and
+  puts it back if a link or a cleared list leaves it out. Required is a console
+  rule, not an access control: the API stores the flag and does not enforce it.
+  Limits: "next N months" counts N months from today, not calendar months;
+  relative dates follow the database server's clock and time zone, not
   the viewer's; one filter applies to every tile that has a column of that
   name and to no other. `GET /api/dashboard` returns `filterFields`,
   `defaultFilters` and per-tile `filtersSkipped`; `GET /api/dashboard/values`

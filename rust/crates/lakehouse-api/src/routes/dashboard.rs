@@ -18,7 +18,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::builder::{FilteredSql, RelationColumns};
-use lakehouse_bi::filters::{ColumnKind, validate_filters};
+use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
 use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
@@ -774,7 +774,11 @@ pub async fn boards_update(
             })?;
     }
     if let Some(filters) = &parsed.filters {
-        store::update_board_filters(ch, &id, filters)
+        // BI-18 review round 1: a save cleans the row of filters that filter
+        // nothing. Not rejected (an older console still sends them) and not
+        // rewritten on read.
+        let filters = without_inert(filters);
+        store::update_board_filters(ch, &id, &filters)
             .await
             .map_err(|err| {
                 upstream_error::ch_error_as(
@@ -2486,12 +2490,24 @@ mod typed_filters {
             r#"[{"column":"c","op":"regex","values":[]}]"#,
             r#"[{"column":"c","op":"between","min":"2024-02-30"}]"#,
             r#"[{"column":"bad col","values":["a"]}]"#,
+            // BI-18 round two: `next` needs `n`, an exclusive end needs its
+            // bound, `not_contains` needs text.
+            r#"[{"column":"d","op":"relative","anchor":"next","unit":"day"}]"#,
+            r#"[{"column":"d","op":"between","max":"3","minExclusive":true}]"#,
+            r#"[{"column":"c","op":"not_contains"}]"#,
         ] {
             let err = parse_filters_param(Some(bad)).expect_err(bad);
             assert!(matches!(err, ApiError::BadRequest(_)), "{bad}");
         }
         assert!(parse_filters_param(None).unwrap().is_none());
         assert!(parse_filters_param(Some("  ")).unwrap().is_none());
+        assert!(
+            parse_filters_param(Some(
+                r#"[{"column":"d","op":"relative","anchor":"next","n":7,"unit":"day","required":true},{"column":"p","op":"between","min":"5","minExclusive":true}]"#
+            ))
+            .unwrap()
+            .is_some()
+        );
         assert!(
             parse_filters_param(Some(r#"[{"column":"kab","values":["a"]}]"#))
                 .unwrap()

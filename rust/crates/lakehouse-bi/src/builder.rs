@@ -669,7 +669,7 @@ fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<S
             }
             relative_predicate(f, &date_expr(column, kind))
         }
-        FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith => {
+        FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith | FilterOp::NotContains => {
             if kind != ColumnKind::Text {
                 return None;
             }
@@ -685,6 +685,12 @@ fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<S
                 FilterOp::StartsWith => {
                     format!("startsWith(lowerUTF8(toString({column})), lowerUTF8({needle}))")
                 }
+                // BI-18 round two: a NULL value does not contain the text, so
+                // it is kept; without `ifNull` the comparison is NULL and the
+                // row would silently drop out.
+                FilterOp::NotContains => format!(
+                    "ifNull(positionCaseInsensitiveUTF8(toString({column}), {needle}) = 0, 1)"
+                ),
                 _ => format!("endsWith(lowerUTF8(toString({column})), lowerUTF8({needle}))"),
             })
         }
@@ -701,7 +707,9 @@ fn date_expr(column: &Ident, kind: ColumnKind) -> String {
 }
 
 /// `col >= min AND col <= max` over a number or date column, either end
-/// optional and both inclusive.
+/// optional. Ends are inclusive unless `min_exclusive` / `max_exclusive`
+/// turn that side into `>` / `<` (BI-18 round two: "after", "before",
+/// "greater than", "less than" must not include the named value).
 fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<String> {
     let (subject, render): (String, fn(&str) -> Option<String>) = match kind {
         ColumnKind::Number => (column.to_string(), |raw| {
@@ -715,7 +723,9 @@ fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<
         ColumnKind::Text => return None,
     };
     let mut parts = Vec::new();
-    for (op, bound) in [(">=", &f.min), ("<=", &f.max)] {
+    let min_op = if f.min_exclusive { ">" } else { ">=" };
+    let max_op = if f.max_exclusive { "<" } else { "<=" };
+    for (op, bound) in [(min_op, &f.min), (max_op, &f.max)] {
         if let Some(raw) = bound.as_deref() {
             parts.push(format!("{subject} {op} {}", render(raw)?));
         }
@@ -731,7 +741,8 @@ fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<
 /// closed enums and the bounded `n` reach the SQL.
 ///
 /// `last n unit` is the `n` units ending today, both ends included
-/// (`d > today() - n units`); `this` and `previous` are calendar periods
+/// (`d > today() - n units`); `next n unit` is the `n` units starting
+/// tomorrow (`d > today() AND d <= today() + n units`); `this` and `previous` are calendar periods
 /// (weeks start on Monday). `today()` is the `ClickHouse` server's clock.
 fn relative_predicate(f: &FilterDef, d: &str) -> Option<String> {
     let (unit, anchor) = (f.unit?, f.anchor?);
@@ -751,6 +762,12 @@ fn relative_predicate(f: &FilterDef, d: &str) -> Option<String> {
             let n =
                 f.n.filter(|n| (1..=crate::filters::MAX_RELATIVE_N).contains(n))?;
             format!("({d} > {subtract}(today(), {n}) AND {d} <= today())")
+        }
+        // The mirror of `last`: tomorrow through `n` units ahead, today out.
+        RelativeAnchor::Next => {
+            let n =
+                f.n.filter(|n| (1..=crate::filters::MAX_RELATIVE_N).contains(n))?;
+            format!("({d} > today() AND {d} <= {add}(today(), {n}))")
         }
         RelativeAnchor::This => format!("({d} >= {start} AND {d} < {add}({start}, 1))"),
         RelativeAnchor::Previous => format!("({d} >= {subtract}({start}, 1) AND {d} < {start})"),
@@ -1612,6 +1629,115 @@ mod tests {
                 r#"{"column":"t","op":"relative","anchor":"this","unit":"day"}"#
             ),
             "(toDate(t) >= toDate(today()) AND toDate(t) < addDays(toDate(today()), 1))"
+        );
+    }
+
+    #[test]
+    fn next_n_units_start_tomorrow_and_leave_today_out_for_every_unit() {
+        let cols = [("d", ColumnKind::Date)];
+        for (unit, add) in [
+            ("day", "addDays"),
+            ("week", "addWeeks"),
+            ("month", "addMonths"),
+            ("quarter", "addQuarters"),
+            ("year", "addYears"),
+        ] {
+            let json = format!(
+                r#"{{"column":"d","op":"relative","anchor":"next","n":7,"unit":"{unit}"}}"#
+            );
+            assert_eq!(
+                one_predicate(&cols, &json),
+                format!("(d > today() AND d <= {add}(today(), 7))")
+            );
+        }
+        assert_eq!(
+            one_predicate(
+                &[("t", ColumnKind::DateTime)],
+                r#"{"column":"t","op":"relative","anchor":"next","n":3,"unit":"day"}"#
+            ),
+            "(toDate(t) > today() AND toDate(t) <= addDays(today(), 3))"
+        );
+        // `next` without `n` is not valid and never reaches SQL.
+        let f = filter(r#"{"column":"d","op":"relative","anchor":"next","unit":"day"}"#);
+        assert!(f.validate().is_err());
+        assert!(
+            filter_predicates(&typed(&cols), &[], &[f])
+                .predicates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exclusive_ends_use_strict_comparisons_on_numbers_and_dates() {
+        let num = [("price", ColumnKind::Number)];
+        assert_eq!(
+            one_predicate(
+                &num,
+                r#"{"column":"price","op":"between","min":"5","minExclusive":true}"#
+            ),
+            "price > 5"
+        );
+        assert_eq!(
+            one_predicate(
+                &num,
+                r#"{"column":"price","op":"between","max":"5","maxExclusive":true}"#
+            ),
+            "price < 5"
+        );
+        assert_eq!(
+            one_predicate(
+                &num,
+                r#"{"column":"price","op":"between","min":"1","max":"5","maxExclusive":true}"#
+            ),
+            "(price >= 1 AND price < 5)"
+        );
+        let json = r#"{"column":"d","op":"between","min":"2026-10-03","minExclusive":true}"#;
+        assert_eq!(
+            one_predicate(&[("d", ColumnKind::Date)], json),
+            "d > toDate32('2026-10-03')"
+        );
+        assert_eq!(
+            one_predicate(&[("d", ColumnKind::DateTime)], json),
+            "toDate(d) > toDate32('2026-10-03')"
+        );
+        assert_eq!(
+            one_predicate(
+                &[("d", ColumnKind::Date)],
+                r#"{"column":"d","op":"between","max":"2026-10-03","maxExclusive":true}"#
+            ),
+            "d < toDate32('2026-10-03')"
+        );
+    }
+
+    #[test]
+    fn required_is_ignored_when_predicates_are_built() {
+        let cols = [("price", ColumnKind::Number)];
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"price","op":"between","min":"5","required":true}"#
+            ),
+            one_predicate(&cols, r#"{"column":"price","op":"between","min":"5"}"#)
+        );
+    }
+
+    #[test]
+    fn not_contains_keeps_null_values_and_escapes_the_needle_like_contains() {
+        let json = serde_json::json!({
+            "column": "name", "op": "not_contains", "text": "50%_off\\o'Neil"
+        })
+        .to_string();
+        assert_eq!(
+            one_predicate(&[("name", ColumnKind::Text)], &json),
+            "ifNull(positionCaseInsensitiveUTF8(toString(name), '50%_off\\\\o''Neil') = 0, 1)"
+        );
+        assert_eq!(
+            skipped(
+                &[("c", ColumnKind::Number)],
+                r#"{"column":"c","op":"not_contains","text":"x"}"#
+            )
+            .len(),
+            1
         );
     }
 

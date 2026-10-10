@@ -417,3 +417,115 @@ existing bar; time grain.
 - The exact inclusive/exclusive behaviour of the existing `between` on dates and on `DateTime` columns before building "before"/"after" on it.
 - What "this quarter"/"next quarter" return on the dev engine at a quarter boundary date (compute with a fixed date expression, not `today()`).
 
+
+### Part A, second round — partial notes
+
+**RT1 (developer, 2026-10-10), on disk, not committed.** Files: `rust/crates/lakehouse-bi/src/{filters.rs,builder.rs}`, `rust/crates/lakehouse-api/src/routes/dashboard.rs` (only the existing malformed-filters test gained cases; validation itself is `validate_filters`, unchanged). Added `FilterOp::NotContains`, `RelativeAnchor::Next`, `minExclusive` / `maxExclusive` / `required` (all skipped on the wire when false/absent). Exclusive ends did need the booleans: numbers cannot be expressed by `between` otherwise, and dates must not be approximated with a day offset. `cargo test -p lakehouse-bi`: 126 + 1 passed; clippy for bi+api clean. Real-ClickHouse runs and the full verification block come in the final entry.
+
+**RT2 (developer, 2026-10-10), on disk, not committed.** Files: `src/services/clients/bi-store.ts` (types), `src/lib/dashboard-filter-state.ts` + `.test.ts` (pick mappings `datePickToFilter` / `filterToDatePick` / `numberPickToFilter` / `filterToNumberPick`, labels, `filterLabel(f, kind?)`), `src/lib/page-context-summary.ts` (map callback made explicit because `filterLabel` gained a second parameter), `src/features/dashboards/filters/filter-editors.tsx`, `filter-bar.tsx` (passes the column kind to the label), new `filter-editors.test.tsx`. `bun run typecheck` clean; `bun run lint` 0 errors, 6 pre-existing warnings; `bun run test` 1025 pass, 1 skip, 0 fail.
+
+**RT3 (developer, 2026-10-10), on disk, not committed.** Files: `src/lib/dashboard-filter-state.ts` + `.test.ts` (`isRequiredColumn`, `enforceRequired`), `src/features/dashboards/filters/filter-bar.tsx` (+ `filter-bar.test.tsx`: `savedFilters` prop, no remove control for a required column, "Required" switch in the chip editor for a caller who may save), `src/features/dashboards/dashboard-page.tsx` (enforcement on every change, and an effect that writes the required column into an address that lacks it). What counts is the saved default's flag; the working state's flag is only what Save writes. Tests: 32 pass across the three touched files; typecheck clean.
+
+### BI-18·A second round — RT1–RT4 (developer, 2026-10-10)
+
+Nothing is committed (owner's instruction: browser QA first). Files per task:
+- RT1: `rust/crates/lakehouse-bi/src/{filters.rs,builder.rs}`; `rust/crates/lakehouse-api/src/routes/dashboard.rs` (test cases only).
+- RT2: `src/services/clients/bi-store.ts`, `src/lib/dashboard-filter-state.ts` + `.test.ts`, `src/lib/page-context-summary.ts`, `src/features/dashboards/filters/{filter-editors.tsx,filter-bar.tsx}`, new `filter-editors.test.tsx`.
+- RT3: `src/lib/dashboard-filter-state.ts` + `.test.ts`, `src/features/dashboards/filters/{filter-bar.tsx,filter-bar.test.tsx}`, `src/features/dashboards/dashboard-page.tsx`.
+- RT4: `CHANGELOG.md`.
+
+**Exclusive ends did need the booleans.** Number "greater than / less than" cannot be written with the inclusive `between` without a ±epsilon, and "before / after" on a date must not be a ±1 day approximation (a `DateTime` column compares on `toDate(col)`, so ±1 would also be wrong there). `minExclusive` / `maxExclusive` are skipped on the wire when false and rejected by `validate` when set without their bound. `required` is skipped when false and ignored by predicate building (test). A round-one filter serialises byte-for-byte as before (test with a real round-one string).
+
+**Real ClickHouse 26.8 (`docker exec lakehouse-clickhouse-1 clickhouse-client -q`, read-only), `serving.mart_demo_map_points` (237 rows, `visit_date` 2025-09-03..2026-10-07, `visitors` 44..2377):**
+- Existing `between` is inclusive on both ends, on `Date` and on a DateTime-by-day expression: for the max date 2026-10-07, `=`/`>=`/`>`/`<=`/`<` counted 1/1/0/237/236; through `toDate(toDateTime(visit_date))` `>=`/`>` counted 1/0.
+- Exclusive date: `visit_date > toDate32('2026-10-03')` 2 rows (after); `< toDate32(...)` 235 (before).
+- Exclusive number (min 44, max 2377): `countIf(visitors >= 2377)` 1, `> 2377` 0, `<= 44` 1, `< 44` 0; the tile shape `SELECT provinsi, round(sum(visitors)) AS s FROM T WHERE visitors > 44 GROUP BY provinsi` returned 26 rows; `visitors > 5` 237 and `(visitors >= 1 AND visitors < 5)` 0 rows.
+- `not_contains` as generated, `ifNull(positionCaseInsensitiveUTF8(toString(provinsi), 'bali') = 0, 1)`: 231 rows (6 contain "bali", 231 + 6 = 237). NULL behaviour on a 4-row set (NULL, '', 'xBALIx', 'a'): with `ifNull` 3 rows kept; without it 2 (NULL dropped), which is why `ifNull` is there. The needle with `%`, `_`, `'` and backslashes ran without error (237 rows kept, none contain it).
+- `next`: the table's dates are all in the past, so against `today()` every shape (`d > today() AND d <= addDays/Weeks/Months/Quarters/Years(today(), 2)`) returned 0 rows with no error. Boundaries were checked with a fixed date instead: with `t = 2026-09-30` and ten fixed dates, `d > t AND d <= addDays(t,7)` 2, `addWeeks(t,1)` 2, `addMonths(t,1)` 4, `addQuarters(t,1)` 6, `addYears(t,1)` 8, each equal to the hand count.
+- Quarter boundaries (fixed expressions): `toStartOfQuarter('2026-09-30')` = 2026-07-01, of `2026-10-01` = 2026-10-01; `addQuarters(toStartOfQuarter('2026-10-01'),1)` = 2027-01-01; `subtractQuarters(toStartOfQuarter('2026-09-30'),1)` = 2026-04-01 (so "this quarter" and "previous quarter" are calendar quarters on both sides of the boundary). FINDING: `next 1 quarter` from 2026-09-30 is 2026-10-01..2026-12-30 (`addQuarters('2026-09-30',1)` = 2026-12-30), not the calendar quarter, because "next N units" is rolling by decision R1; the CHANGELOG states this for months.
+- Not run against a real `DateTime` column (the table has none); the `toDate(col)` shape was exercised through `toDate(toDateTime(visit_date))`.
+
+**Commands (CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target, CARGO_BUILD_JOBS=2, `free -g` and `df -h /` checked before each; disk 18G free, memory 8-9G available):**
+- `cd rust && cargo fmt --check`: clean (I ran `cargo fmt` once; it changed only my hunks in the two bi files).
+- `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets --all-features --locked -- -D warnings` (crate `lib.rs` touched first): clean (also checked `lakehouse-alerts`).
+- `cargo test -p lakehouse-bi`: 126 + 1 passed (was 101 + 1 plus the 25 new). `cargo test -p lakehouse-api --lib`: 1542 passed, 0 failed, 1 ignored. `cargo test -p lakehouse-api --test sec11_guard --test route_auth`: 4 + 32 passed. `cargo test -p lakehouse-alerts`: 70 passed.
+- Test executables over 20M deleted from `debug/deps` afterwards (7 files); `lakehouse_api-*` left alone.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 pre-existing warnings. `bun run test`: 1033 pass, 1 skip, 0 fail.
+
+**Existing tests changed:** none weakened. In `dashboard.rs`, `a_malformed_filters_query_is_a_400...` gained cases (it already covered the same function). `filter-bar.test.tsx` gained a `savedFilters` prop in its helper and two cases.
+
+**Deviations and decisions to confirm:**
+1. `filterLabel(f, kind?)` takes the column kind: "≠ 5" is shown only for a number column, so a text filter "is not 5" keeps its round-one label (R4). Ranges keep their ISO labels (`d from 2024-01-01 to 2024-02-01`); only "on / before / after" read as `3 Oct 2026`. A round-one number range with equal ends now reads `= 5`, and a full calendar month or quarter range now reads as the month or quarter (R1's "more specific reading").
+2. A number `not_in` with one numeric value opens in the Compare tab as "not equal to" (not the Values list); the two picks serialise identically and no hint is stored.
+3. Number editor tabs are now Compare / Values (the old Range tab is Compare's "between"); date editor tabs are Relative / Date (the old Range tab is Date's "Between"). Month and quarter use a native select plus a year number input (the year starts empty, no clock read). Native `<select>`/`<input type=date>`, no new dependency.
+4. Required: what counts is the saved default's flag (a default that loses it stops enforcing at once); the working state's flag is only what "Save as default" writes. The page also runs an effect that writes a missing required column into the address (it reloads), because the first load happens before the default is known. The server ignores the flag.
+5. `required` is carried over when an editor replaces a filter; the "Required" switch is in the chip's popover for callers who can save the default on user dashboards.
+
+**Not verified:** anything in a browser; `cargo test --workspace`, other `lakehouse-api` integration targets (`parity` etc.); the "Required" switch itself (no component test), and the address-rewrite effect in the page (covered only through the pure `enforceRequired` tests); a real `DateTime` column.
+
+### BI-18·A second round — review round 1 (developer, 2026-10-10)
+
+Nothing committed. **BLOCKER 1 (inert saved filters make their column unreachable): fixed.**
+
+Cause: the new bar listed a column as "used" when any filter named it, active or not, and the pre-BI-18 bar had stored `{column, values: []}`.
+
+Console: `dropInertFilters` in `src/lib/dashboard-filter-state.ts` (keeps exactly the filters `isActiveFilter` accepts), applied to the board's `defaultFilters` and to every decoded `?f=` (in `decodeFilters`); `dashboard-page.tsx` derives the default, the working filters and the required-column enforcement from the cleaned default; `filter-bar.tsx` counts a column as used only for active filters (defence). A required placeholder with no value is dropped with the rest: it cannot be saved as required, so a stored one is treated as not required (comment at the function). Server: `lakehouse_bi::filters::without_inert`, used in `PUT /api/dashboard/boards` after validation and before the write; a bad list is still a 400, inert entries are not rejected, `GET` returns what is stored.
+
+Other consumers checked: public and embed (server builder and `embed.rs` already use `is_active`), `summarizeFilters` (already filters active), the "N tiles" count (comes from `filterFields`, not filters), cross-filter (`toggleValue` appends to an inert `in` of the column, which is correct). Nothing else described an inert filter as active.
+
+Tests: state module (the exact payload yields `[]`, equals no filters, is not dirty, decodes to `[]`; mixed ops; required placeholder), bar (no chip for the two placeholder filters and both columns offered in Add filter), `without_inert` unit test in `lakehouse-bi`. The PUT handler itself is not route-tested (it needs a ClickHouse store); only the pure function is.
+
+Commands: `cargo fmt --check` clean; `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets --all-features --locked -- -D warnings` clean; `cargo test -p lakehouse-bi` 127 + 1; `cargo test -p lakehouse-api --lib` 1542 passed, 1 ignored; `--test sec11_guard --test route_auth` 4 + 32; `bun run typecheck` clean; `bun run lint` 0 errors, 6 old warnings; `bun run test` 1037 pass, 1 skip, 0 fail. Test executables >20M removed from `debug/deps`. Not verified: browser.
+
+### BI-18·A second round — review round 2 (developer, 2026-10-10)
+
+Nothing committed; frontend only, no Rust touched.
+
+**SHOULD-FIX 1.** The editor opened from "Add filter" now shows the same "Required" row (shared `RequiredRow` in `src/features/dashboards/filters/filter-bar.tsx`), under the same rule (`canSaveDefault`: `dashboard:write` on a user dashboard). One Apply adds the filter with `required: true`; the switch resets when the popover closes.
+
+**SHOULD-FIX 2.** `RequiredRow` carries a focusable `CircleHelp` button inside the repo's `Tooltip` (the root `TooltipProvider` in `app/layout.tsx` is used, none added). Its `aria-label` and the tooltip are the owner's text: "Viewers can change this filter's value but cannot remove it. Takes effect after Save as default." No visible paragraph. Same row in both places.
+
+**Removal rule unchanged:** only the saved default's flag removes the remove control. Tests in `filter-bar.test.tsx` (stateful harness around `FilterBar`): the add editor shows the switch to a caller who can save the default and the help is reachable by label; not shown to one who cannot; add with Required on gives `price ≥ 5` with its remove control still present, and after "Save as default" the control is gone. Not verified: the tooltip popup opening on hover or focus in a browser (tests reach it by label only).
+
+Commands: `bun run typecheck` clean; `bun run lint` 0 errors, 6 old warnings; `bun run test` 1040 pass, 1 skip, 0 fail.
+
+### BI-18·A second round — RT1–RT4 and two review rounds (reviewer, 2026-10-10)
+
+- **Server: no finding.** On a rebuilt API against the dev `ClickHouse`
+  each new shape matched a direct count on the table: a date after
+  2026-06-30 with an exclusive end 56, on one date 1, `visitors > 2000`
+  exclusive 38 (the inclusive form gave 39 in round one), `< 100` exclusive
+  6, `not_contains` 201, "next 7 days" 8 once the demo table had future
+  dates, `required` accepted, a round-one filter unchanged, an exclusive
+  flag without its bound 400.
+- **BLOCKER 1 (round 1, fixed).** A board saved by the pre-BI-18 bar held
+  `{column, values: []}` for two columns. The new bar drew no chip for
+  them and left both out of "Add filter", so they could not be filtered at
+  all. Inert filters are now dropped wherever filters enter the console's
+  state, and before a board's filters are stored. Seen fixed in a browser.
+- **Round 2, from the owner's QA (done).** The Required switch is also in
+  the "Add filter" editor, and a help tooltip says what it does; the owner
+  had asked what the feature was for.
+- **Accepted deviations.** Labels take the column kind ("≠ 5" only on a
+  number column); a number range with equal ends now reads "= 5" and a full
+  calendar month or quarter reads as such; "next N months" is rolling from
+  today, not calendar months, and the calendar reading is the Month and
+  Quarter pickers.
+- **No open BLOCKER.**
+
+Verified by the reviewer on the final tree: `bun run typecheck` clean,
+`bun run lint` 0 errors, `bun run test` 1040 pass, 1 skip (on `main`);
+`cargo fmt --check` clean; `cargo clippy -p lakehouse-bi -p lakehouse-api
+--all-targets --all-features --locked -- -D warnings` clean;
+`lakehouse-bi` 127, `lakehouse-api --lib` 1542 (1 ignored), `route_auth`
+32, `sec11_guard` 4. Rust was not changed after those runs. The product
+owner ran the five QA groups and the Required flow on 2026-10-10.
+
+*Not verified:* a real `DateTime` column (the demo table has only a
+`Date`); the `PUT` that drops inert filters on a running system (unit
+test only); the light theme; `cargo test --workspace`.
+
+Part A against `docs/core/specs/bi-18.md`: met, except filters through
+`QS-5` parameters and embed locking beyond signed `params` (`BI-26`), both
+left out on the feature page with the reason.
+

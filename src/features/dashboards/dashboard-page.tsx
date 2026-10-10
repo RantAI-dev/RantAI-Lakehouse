@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
-import { FILTER_PARAM, decodeFilters, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -168,12 +168,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     return () => window.removeEventListener("keydown", h);
   }, [fullscreen]);
 
-  const defaultFilters = data?.defaultFilters ?? NO_FILTERS;
+  // Placeholders the pre-BI-18 bar stored (a column with no values) filter
+  // nothing; dropped here so they neither draw a chip nor block the column.
+  const defaultFilters = React.useMemo(
+    () => (data?.defaultFilters ? dropInertFilters(data.defaultFilters) : NO_FILTERS),
+    [data?.defaultFilters],
+  );
   // The data on screen was loaded with these; before the first answer the
   // address (or nothing) is all there is.
   const filters = React.useMemo(
-    () => decodeFilters(fParam) ?? data?.defaultFilters ?? NO_FILTERS,
-    [fParam, data?.defaultFilters],
+    () => enforceRequired(decodeFilters(fParam) ?? defaultFilters, defaultFilters),
+    [fParam, defaultFilters],
   );
   const dirty = decodeFilters(fParam) !== null && filtersToParam(filters, defaultFilters) !== null;
 
@@ -186,8 +191,19 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   }, [router, pathname]);
 
   const applyFilters = React.useCallback((next: FilterDef[]) => {
-    writeAddress(filtersToParam(next, defaultFilters));
+    // Required columns (BI-18 round two) cannot be dropped: an emptied or
+    // removed one comes back as the saved default's filter.
+    writeAddress(filtersToParam(enforceRequired(next, defaultFilters), defaultFilters));
   }, [writeAddress, defaultFilters]);
+
+  // A link that omits a required column loaded its tiles without it, before
+  // the saved default was known. Put the column in the address, which reloads.
+  React.useEffect(() => {
+    const fromAddress = decodeFilters(fParam);
+    if (!fromAddress || !data) return;
+    const enforced = enforceRequired(fromAddress, defaultFilters);
+    if (!filtersEqual(enforced, fromAddress)) writeAddress(filtersToParam(enforced, defaultFilters));
+  }, [fParam, data, defaultFilters, writeAddress]);
 
   const resetFilters = React.useCallback(() => writeAddress(null), [writeAddress]);
 
@@ -449,6 +465,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             board={board}
             fields={filterFields}
             filters={filters}
+            savedFilters={defaultFilters}
             onChange={applyFilters}
             dirty={dirty}
             canSaveDefault={!isDefault && hasPermission("dashboard:write")}
