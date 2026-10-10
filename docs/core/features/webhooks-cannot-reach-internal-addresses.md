@@ -23,7 +23,7 @@ webhook sender does not use it.
 
 1. Keep sending alerts and digests to public webhooks (Slack, Discord, Teams, their own endpoint) exactly as before.
 2. Be told at once, with a plain message, when a webhook URL points at an internal, loopback or link-local address, when saving the rule and when testing it.
-3. As an administrator, list the internal hosts webhooks may reach, for an on-premises chat server or an internal incident tool.
+3. As an administrator, list the internal networks webhooks may reach (`WEBHOOK_ALLOWED_CIDRS`), for an on-premises chat server or an internal incident tool.
 4. See a failed delivery recorded with a fixed reason, not the network library's text.
 
 ## Not included
@@ -45,13 +45,18 @@ with the same message.
 | 1 | Refused by default: loopback, private, link-local, carrier-grade NAT, multicast, reserved and the wrapped forms, the same set `SEC-15` uses | Spec | 2026-10-10 |
 | 2 | Redirects are not followed | Spec ("not followed, or every hop re-checked"); not following is the simpler guarantee | Planner default |
 | 3 | The request goes to the address that passed the check | Spec | 2026-10-10 |
-| 4 | An allowlist setting for internal webhook targets, empty by default | Spec *(proposed)*; the owner approved the planner's proposals for phase 0 on 2026-10-10 | Planner default, owner to confirm at QA |
+| 4 | An allowlist setting for internal webhook targets, empty by default. It is its own setting, `WEBHOOK_ALLOWED_CIDRS`, in the format of the connector allowlist but not shared with it and with no "allow everything" switch: what a connector may dial says nothing about where an alert may send data | Spec *(proposed)*; the owner approved the planner's proposals for phase 0 on 2026-10-10 | Planner default, owner to confirm at QA |
+| 6 | Deliveries do not go through a system proxy (`HTTPS_PROXY`): a proxy resolves the name itself, so the address check could not be enforced | Developer's finding, accepted by the planner as the safe default | Owner to confirm at QA |
+| 7 | A delivery times out after 10 seconds (5 to connect); there was no limit before | Developer's choice, accepted | Owner to confirm at QA |
 | 5 | The check runs when a rule is saved or tested and again at every send | Planner default: a name can resolve differently later | 2026-10-10 |
 
 ## Limits to tell a customer
 
 - A webhook that answers with a redirect is treated as failed; give the final URL.
 - An internal chat or incident tool works only after an administrator lists its host in the allowlist setting.
+- A deployment that can only reach the internet through a proxy cannot deliver webhooks to public services. This needs its own decision before such a customer relies on webhooks.
+- A webhook that does not answer within 10 seconds is recorded as timed out.
+- "Run now" on a rule reports a refused webhook in that rule's result, with the fixed message; only saving a rule answers with an error.
 - The check is on the address the name resolves to at send time. A name that stops resolving, or starts resolving inward, fails from then on.
 
 ## Acceptance checklist

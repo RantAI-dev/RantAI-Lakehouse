@@ -24,7 +24,7 @@
 
 use lakehouse_alerts::AlertRuleInput;
 use lakehouse_clickhouse::ChClient;
-use lakehouse_notify::EmailSender;
+use lakehouse_notify::{EmailSender, WebhookSender};
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
@@ -49,21 +49,31 @@ pub(super) async fn list_alert_rules(ch: &ChClient) -> Value {
     }
 }
 
-pub(super) async fn create_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn create_alert_rule(
+    ch: &ChClient,
+    webhooks: &WebhookSender,
+    args: &Map<String, Value>,
+) -> Value {
     let input = parse_input(args);
-    match lakehouse_alerts::save_rule(ch, &input, None).await {
+    // SEC-10: `save_rule` checks the webhook target with the same sender and
+    // message as the console route.
+    match lakehouse_alerts::save_rule(ch, webhooks, &input, None).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
         Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn update_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn update_alert_rule(
+    ch: &ChClient,
+    webhooks: &WebhookSender,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
     let input = parse_input(args);
-    match lakehouse_alerts::save_rule(ch, &input, Some(&id)).await {
+    match lakehouse_alerts::save_rule(ch, webhooks, &input, Some(&id)).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
         Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
@@ -85,7 +95,8 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = crate::webhook_guard::sender(&state.config);
     let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
     // Same real `FreshnessSource`/`SilenceSource` wiring as
     // `routes::alerts::run` (WS5 item C1) — reused here, not
@@ -188,7 +199,12 @@ mod tests {
             .mount(&server)
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let result = create_alert_rule(&ch, &Map::new()).await;
+        let result = create_alert_rule(
+            &ch,
+            &crate::webhook_guard::sender(&state().config),
+            &Map::new(),
+        )
+        .await;
         assert!(result["error"].is_string(), "{result}");
         assert!(result.get("errorId").is_none(), "{result}");
     }
@@ -196,8 +212,9 @@ mod tests {
     #[tokio::test]
     async fn update_delete_and_run_require_id() {
         let ch = &state().clickhouse;
+        let webhooks = crate::webhook_guard::sender(&state().config);
         assert_eq!(
-            update_alert_rule(ch, &Map::new()).await,
+            update_alert_rule(ch, &webhooks, &Map::new()).await,
             json!({ "error": "id is required" })
         );
         assert_eq!(

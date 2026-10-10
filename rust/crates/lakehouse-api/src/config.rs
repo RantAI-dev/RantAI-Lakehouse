@@ -55,6 +55,12 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
+    /// `WEBHOOK_ALLOWED_CIDRS` holds an entry that is not a network or an
+    /// address (`SEC-10`). Fails config resolution for the same reason
+    /// [`ConfigError::MalformedAllowedCidrs`] does: a dropped entry would
+    /// quietly keep refusing the internal webhook target the operator listed.
+    #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
+    MalformedWebhookAllowedCidrs(String),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -166,6 +172,20 @@ pub struct Config {
     /// `connector_probe_allow_internal_hosts`. Empty by default. See
     /// [`crate::internal_hosts`] for what the list can never open.
     pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Internal networks alert webhooks may call (`WEBHOOK_ALLOWED_CIDRS`,
+    /// `SEC-10`), in the same format as `connector_probe_allowed_cidrs` and
+    /// with the same limits (the list never opens loopback, link-local,
+    /// multicast or `0/8`; see [`crate::internal_hosts`]). A separate
+    /// setting, not the connector one: what a connector may dial says
+    /// nothing about where an alert author may send data, and there is
+    /// deliberately no "allow every internal address" switch for webhooks.
+    /// Empty by default.
+    pub webhook_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Test-only: lets webhook tests reach a `wiremock` listener on
+    /// loopback, which no deployment setting can open. `WEBHOOK_TEST_ALLOW_ALL`
+    /// is read only when compiled for tests (`cfg!(test)`), so in a service
+    /// build this is always `false` whatever the environment says.
+    pub webhook_test_allow_all: bool,
     /// Where connector credential files physically live
     /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
     /// `file:/run/secrets/...`, the path Dagster reads inside its own
@@ -831,6 +851,8 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allowed_cidrs",
                 &self.connector_probe_allowed_cidrs,
             )
+            .field("webhook_allowed_cidrs", &self.webhook_allowed_cidrs)
+            .field("webhook_test_allow_all", &self.webhook_test_allow_all)
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
                 "oracle_cdc_logminer_enabled",
@@ -1113,6 +1135,14 @@ impl Config {
                     .map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedAllowedCidrs)?,
+            webhook_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("WEBHOOK_ALLOWED_CIDRS").map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedWebhookAllowedCidrs)?,
+            webhook_test_allow_all: cfg!(test)
+                && env
+                    .get("WEBHOOK_TEST_ALLOW_ALL")
+                    .is_some_and(|v| v == "true"),
             connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
                 || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
                 std::path::PathBuf::from,
@@ -1265,6 +1295,17 @@ impl Config {
         crate::internal_hosts::InternalHosts {
             allow_all: self.connector_probe_allow_internal_hosts,
             allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
+
+    /// The internal addresses an alert webhook may call (`SEC-10`): only the
+    /// listed networks, never "all" (see
+    /// [`Config::webhook_allowed_cidrs`]).
+    #[must_use]
+    pub fn webhook_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.webhook_test_allow_all,
+            allowed: self.webhook_allowed_cidrs.clone(),
         }
     }
 }
@@ -1606,6 +1647,48 @@ mod tests {
 
         let err = Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOWED_CIDRS", "lan")])).unwrap_err();
         assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
+    }
+
+    /// `SEC-10`: the webhook allowlist is empty by default, parsed at start,
+    /// opens exactly the listed hosts and no other, never reaches loopback or
+    /// the metadata address, is independent of the connector list, and a
+    /// malformed entry refuses to boot rather than being ignored.
+    #[test]
+    fn webhook_allowed_cidrs_allow_exactly_the_listed_hosts_and_refuse_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert!(cfg.webhook_allowed_cidrs.is_empty());
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "WEBHOOK_ALLOWED_CIDRS",
+            "192.168.18.205, 10.1.0.0/16",
+        )]))
+        .unwrap();
+        let hosts = cfg.webhook_internal_hosts();
+        assert!(!hosts.allow_all);
+        assert!(hosts.permits(&"192.168.18.205".parse().unwrap()));
+        assert!(!hosts.permits(&"192.168.18.206".parse().unwrap()));
+        assert!(hosts.permits(&"10.1.7.7".parse().unwrap()));
+        assert!(!hosts.permits(&"10.2.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"127.0.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"169.254.169.254".parse().unwrap()));
+
+        // The connector setting does not leak into webhooks, or back.
+        let cfg = Config::from_map(&map(&[
+            ("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true"),
+            ("CONNECTOR_PROBE_ALLOWED_CIDRS", "192.168.18.0/24"),
+        ]))
+        .unwrap();
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("WEBHOOK_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
     /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset

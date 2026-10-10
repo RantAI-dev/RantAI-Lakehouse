@@ -645,6 +645,36 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Alert webhooks and internal addresses (`SEC-10`)
+
+An alert or digest sends its message to a webhook URL a user typed, so the
+sender applies the same address policy as the connector tests above:
+
+- **Internal addresses are refused.** Loopback, RFC1918, link-local (cloud
+  metadata), carrier-grade NAT, multicast, `0/8`, the reserved block and their
+  IPv6 forms, including IPv4 wrapped in IPv6. The host is resolved once; if
+  any address it resolves to is blocked the whole name is refused, and the
+  request goes to the address that was checked. A rule is checked when it is
+  saved (a 400 with "webhook address is not allowed") and again at every send,
+  because a name can resolve differently later.
+- **Redirects are not followed.** A webhook that answers with a redirect is a
+  failed delivery ("webhook redirect not followed"); give the final URL. The
+  sender also ignores a system proxy (a proxy resolves the name itself, which
+  defeats the check) and gives up after 10 seconds (it had no limit before).
+- **To allow an internal tool** (an on-premises chat or incident server), set
+  `WEBHOOK_ALLOWED_CIDRS` to its network or address (comma-separated, e.g.
+  `10.1.0.0/16`; a bare address is one host) and restart `lakehouse-api`. It
+  is separate from `CONNECTOR_PROBE_ALLOWED_CIDRS`, has no allow-everything
+  form, and never opens loopback, link-local, multicast or `0/8`. A malformed
+  entry stops the API at start.
+- **Failed deliveries carry a fixed reason**, never the HTTP library's text:
+  "webhook address is not allowed", "webhook host could not be resolved",
+  "webhook redirect not followed", "webhook HTTP <status>", "webhook request
+  timed out", "webhook connection failed", "webhook request failed". Delivery
+  records written before this change may hold the old library text; they are
+  not rewritten.
+- **Email (`SMTP`) is a separate item** and unchanged.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

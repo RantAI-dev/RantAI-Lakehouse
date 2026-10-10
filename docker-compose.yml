@@ -329,6 +329,17 @@ services:
       # effect when the flag above is not `true`. Never opens loopback,
       # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      # SEC-10: alert and digest webhooks refuse the same private/internal
+      # addresses as the connector tests above, never follow a redirect, and
+      # connect to the address that was checked. This lists the internal
+      # networks webhooks MAY reach (e.g. `10.1.0.0/16` for an on-premises
+      # chat or incident server; comma-separated, a bare address is one
+      # host). Empty by default: only public webhook targets work. It is
+      # separate from the connector setting on purpose, and there is no
+      # "allow every internal address" form for webhooks. Never opens
+      # loopback, link-local (cloud metadata), multicast or `0/8`. A
+      # malformed entry stops the API at start.
+      WEBHOOK_ALLOWED_CIDRS: ${WEBHOOK_ALLOWED_CIDRS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env

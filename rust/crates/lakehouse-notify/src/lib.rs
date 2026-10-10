@@ -4,16 +4,23 @@
 //! - **webhook**: `POST` JSON to an incoming-webhook URL (Slack/Discord/
 //!   generic). The URL is supplied by the caller/user at call time — this
 //!   crate never stores one, matching the TypeScript's "self-contained, no
-//!   secret in the server" design.
+//!   secret in the server" design. The address check, the pinned
+//!   connection and the no-redirect rule are in [`WebhookSender`]
+//!   (`SEC-10`).
 //! - **email**: via `SMTP`, using `lettre`. Only active when a host is
 //!   configured; the server never hardcodes a password in code or a
 //!   database.
+
+mod webhook;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use webhook::MappedResolver;
+pub use webhook::{ResolveFuture, TargetRefusal, TargetResolver, WebhookError, WebhookSender};
 
 use lettre::message::{Mailbox, SinglePart, header};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Serialize;
-use serde_json::json;
 
 /// Outcome of a delivery attempt, matching the TypeScript's
 /// `DeliverResult`. Deliberately not a `Result<(), String>`: the
@@ -67,41 +74,6 @@ pub struct SmtpConfig {
     /// `SMTP_FROM` (already resolved with its `??` fallback chain by the
     /// caller).
     pub from: String,
-}
-
-/// `POST` `body` to `url` as an incoming webhook, matching `sendWebhook`.
-///
-/// `body` carries `text` (Slack), `content` (Discord), and `title`/
-/// `message` (generic) — the same fan-out shape as the TypeScript, sent to
-/// every webhook regardless of which platform is actually listening.
-///
-/// # Errors
-///
-/// Never returns `Err` — every failure mode is reported via
-/// `DeliverResult { ok: false, .. }`, matching the TypeScript, which never
-/// throws from `sendWebhook`.
-pub async fn send_webhook(
-    client: &reqwest::Client,
-    url: &str,
-    title: &str,
-    text: &str,
-) -> DeliverResult {
-    // `/^https?:\/\/i.test(url)` — case-insensitive prefix check.
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return DeliverResult::err("invalid webhook URL");
-    }
-    let body = json!({
-        "text": format!("*{title}*\n{text}"),
-        "content": format!("**{title}**\n{text}"),
-        "title": title,
-        "message": text,
-    });
-    match client.post(url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => DeliverResult::ok(),
-        Ok(resp) => DeliverResult::err(format!("webhook HTTP {}", resp.status().as_u16())),
-        Err(err) => DeliverResult::err(err.to_string()),
-    }
 }
 
 /// Build the `SMTP` message that `EmailSender::send` would send, without
@@ -216,9 +188,9 @@ impl EmailSender {
 ///
 /// # Errors
 ///
-/// Never returns `Err` — see [`send_webhook`]/[`EmailSender::send`].
+/// Never returns `Err` — see [`WebhookSender::send`]/[`EmailSender::send`].
 pub async fn deliver(
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     channel: &str,
     target: &str,
@@ -226,7 +198,7 @@ pub async fn deliver(
     text: &str,
 ) -> DeliverResult {
     match channel {
-        "webhook" => send_webhook(http, target, title, text).await,
+        "webhook" => http.send(target, title, text).await,
         "email" => {
             let html = format!(
                 "<div style=\"font-family:system-ui,sans-serif\"><h3 style=\"margin:0 0 8px\">{title}</h3><pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{text}</pre><p style=\"color:#888;font-size:12px;margin-top:16px\">Rantai Lake — Enterprise Lakehouse Console</p></div>"
@@ -247,6 +219,7 @@ pub async fn deliver(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use serde_json::json;
     use wiremock::matchers::{body_json, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -254,8 +227,8 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_rejects_non_http_url() {
-        let client = reqwest::Client::new();
-        let result = send_webhook(&client, "ftp://example.com", "t", "x").await;
+        let client = MappedResolver::new().into_sender();
+        let result = client.send("ftp://example.com", "t", "x").await;
         assert_eq!(result, DeliverResult::err("invalid webhook URL"));
     }
 
@@ -273,8 +246,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = reqwest::Client::new();
-        let result = send_webhook(&client, &server.uri(), "Alert", "something happened").await;
+        let client = MappedResolver::new().into_sender();
+        let result = client
+            .send(&server.uri(), "Alert", "something happened")
+            .await;
         assert_eq!(result, DeliverResult::ok());
     }
 
@@ -286,9 +261,114 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = reqwest::Client::new();
-        let result = send_webhook(&client, &server.uri(), "t", "x").await;
+        let client = MappedResolver::new().into_sender();
+        let result = client.send(&server.uri(), "t", "x").await;
         assert_eq!(result, DeliverResult::err("webhook HTTP 500"));
+    }
+
+    /// `SEC-10`: the connection goes to the address the resolver approved,
+    /// not to wherever the name resolves. `pinned.test` is a reserved name
+    /// that resolves nowhere, so a delivery can only succeed if the request
+    /// was pinned to the mapped listener.
+    #[tokio::test]
+    async fn a_named_webhook_connects_to_the_approved_address_not_to_dns() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let sender = MappedResolver::new()
+            .with("pinned.test", addr)
+            .into_sender();
+        let url = format!("http://pinned.test:{}/hook", addr.port());
+        assert_eq!(
+            sender.send(&url, "t", "x").await,
+            DeliverResult::ok(),
+            "the request must reach the pinned address"
+        );
+    }
+
+    /// `SEC-10`: a redirect is a failed delivery and the second hop is never
+    /// requested.
+    #[tokio::test]
+    async fn a_redirect_is_a_failed_delivery_and_is_not_followed() {
+        let second = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&second)
+            .await;
+        let first = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", second.uri().as_str()),
+            )
+            .mount(&first)
+            .await;
+        let sender = MappedResolver::new().into_sender();
+        let result = sender.send(&first.uri(), "t", "x").await;
+        assert_eq!(result, DeliverResult::err("webhook redirect not followed"));
+        assert!(
+            second.received_requests().await.unwrap().is_empty(),
+            "the redirect target must never be requested"
+        );
+    }
+
+    /// `SEC-10`: a refusal from the resolver is a fixed message, the
+    /// listener is never contacted, and a URL with user info or a missing
+    /// host is refused before any lookup.
+    #[tokio::test]
+    async fn an_unresolvable_or_malformed_target_gets_a_fixed_message() {
+        let sender = MappedResolver::new().into_sender();
+        assert_eq!(
+            sender.send("http://nowhere.test/x", "t", "x").await,
+            DeliverResult::err("webhook host could not be resolved")
+        );
+        for bad in [
+            "http://user:pw@example.test/x",
+            "http://user@example.test/x",
+            "http://:80/x",
+            "not a url",
+            "file:///etc/passwd",
+        ] {
+            assert_eq!(
+                sender.send(bad, "t", "x").await,
+                DeliverResult::err("invalid webhook URL"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `SEC-10`: no result string carries the HTTP library's text. A closed
+    /// port makes `reqwest` fail with an error whose own text names the URL;
+    /// the delivery record must hold only the fixed message.
+    #[tokio::test]
+    async fn a_connection_failure_reports_fixed_text_not_the_library_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let sender = MappedResolver::new().into_sender();
+        let url = format!("http://127.0.0.1:{port}/secret-marker-token");
+        let result = sender.send(&url, "t", "x").await;
+        assert_eq!(result, DeliverResult::err("webhook connection failed"));
+        let text = result.error.unwrap();
+        assert!(!text.contains("secret-marker-token"), "{text}");
+        assert!(!text.contains("error sending request"), "{text}");
+    }
+
+    /// `SEC-10`: the pre-check used when a rule is saved agrees with the
+    /// send path and sends nothing.
+    #[tokio::test]
+    async fn check_validates_a_url_without_sending() {
+        let server = MockServer::start().await;
+        let sender = MappedResolver::new().into_sender();
+        assert_eq!(sender.check(&server.uri()).await, Ok(()));
+        assert_eq!(
+            sender.check("ftp://example.test").await,
+            Err(WebhookError::InvalidUrl)
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     fn cfg(host: Option<&str>) -> SmtpConfig {
@@ -360,7 +440,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = MappedResolver::new().into_sender();
         let email = EmailSender::new(cfg(None));
         let result = deliver(&http, &email, "webhook", &server.uri(), "t", "x").await;
         assert_eq!(result, DeliverResult::ok());
@@ -368,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_dispatches_email_channel_and_still_validates_smtp() {
-        let http = reqwest::Client::new();
+        let http = MappedResolver::new().into_sender();
         let email = EmailSender::new(cfg(None));
         let result = deliver(&http, &email, "email", "someone@example.com", "t", "x").await;
         assert_eq!(
@@ -381,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_rejects_unknown_channel() {
-        let http = reqwest::Client::new();
+        let http = MappedResolver::new().into_sender();
         let email = EmailSender::new(cfg(None));
         let result = deliver(&http, &email, "carrier-pigeon", "target", "t", "x").await;
         assert_eq!(

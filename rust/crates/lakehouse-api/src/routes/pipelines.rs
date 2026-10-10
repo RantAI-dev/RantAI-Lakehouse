@@ -1808,7 +1808,8 @@ pub async fn run_failed_event(
             "reason": "run already alerted; sensor retry ignored",
         })));
     }
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = crate::webhook_guard::sender(&state.config);
     let email = EmailSender::new(smtp_config(&state.config));
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
@@ -1977,7 +1978,8 @@ pub async fn run_finished_event(
         // No SLA at all — the alert rule cannot decide.
         None
     };
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = crate::webhook_guard::sender(&state.config);
     let email = EmailSender::new(smtp_config(&state.config));
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
@@ -6282,6 +6284,12 @@ mod tests {
             env.insert("DATABASE_URL".to_owned(), database_url);
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // SEC-10: these tests deliver to a `wiremock` webhook on loopback,
+            // which the production webhook policy refuses and no setting can
+            // open; this test-only switch (absent from production builds) lets
+            // the delivery reach it. The refusal itself is tested in
+            // `webhook_guard`.
+            env.insert("WEBHOOK_TEST_ALLOW_ALL".to_owned(), "true".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }

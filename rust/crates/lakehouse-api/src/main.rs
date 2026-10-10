@@ -42,6 +42,7 @@ mod upload_parse;
 mod upload_store;
 mod upload_workbook;
 mod upstream_error;
+mod webhook_guard;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
