@@ -395,15 +395,7 @@ pub struct TileBox {
 /// order effectively random per run and fail parity nondeterministically.
 pub type LayoutMap = IndexMap<String, TileBox>;
 
-/// A dashboard filter: a column's allowed values, applied to every tile that
-/// has that column.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FilterDef {
-    /// The column to filter on.
-    pub column: String,
-    /// Allowed values.
-    pub values: Vec<String>,
-}
+pub use crate::filters::FilterDef;
 
 // ── id generation ───────────────────────────────────────────────────────
 // Mirrors `randomUUID().slice(0, 8)` (first 8 hex chars of a v4 UUID's
@@ -2664,10 +2656,7 @@ mod tests {
         assert_eq!(parse_filters("nope"), Vec::<FilterDef>::new());
         assert_eq!(
             parse_filters(r#"[{"column":"kawasan","values":["Asia"]}]"#),
-            vec![FilterDef {
-                column: "kawasan".to_owned(),
-                values: vec!["Asia".to_owned()]
-            }]
+            vec![FilterDef::in_values("kawasan", vec!["Asia".to_owned()])]
         );
     }
 

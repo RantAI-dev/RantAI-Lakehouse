@@ -11,13 +11,17 @@
 //! builder ([`QueryBuilder`]) so a caller cannot build a query without first
 //! supplying its projection.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use lakehouse_core::ident::{Ident, SqlLiteral};
+use serde::Serialize;
 
+use crate::filters::{
+    ColumnKind, FilterDef, FilterOp, RelativeAnchor, RelativeUnit, parse_iso_date, parse_number,
+};
 use crate::specs::Aggregate;
-use crate::store::{ChartInput, FilterDef, StoredChartSpec};
+use crate::store::{ChartInput, StoredChartSpec};
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -50,14 +54,34 @@ pub enum Relation {
     /// newline before `)` keeps a trailing `-- comment` from swallowing
     /// the closing parenthesis.
     Sql(String),
+    /// `base` with `predicates` applied in an inner `SELECT *`, so the row
+    /// filter can only see the relation's own columns. Used when a filtered
+    /// column has the same name as an output alias of the chart query
+    /// (`sum(visitors) AS visitors`): in a plain `WHERE`, `ClickHouse`
+    /// resolves that name to the alias and rejects the aggregate (error 184,
+    /// `BI-18·A review BLOCKER 1`). Only [`rebuild`] creates it.
+    Filtered {
+        /// What is filtered.
+        base: Box<Relation>,
+        /// Complete SQL fragments, joined with `AND`.
+        predicates: Vec<String>,
+    },
 }
 
 impl Relation {
-    /// The `FROM` target.
-    fn render(&self) -> String {
+    /// The `FROM` target: `serving.<mart>`, or the source text as a derived
+    /// table. Public so the filter value list reads a relation exactly the
+    /// way a tile does.
+    #[must_use]
+    pub fn render(&self) -> String {
         match self {
             Self::Mart(mart) => format!("serving.{mart}"),
             Self::Sql(sql) => format!("(\n{}\n) AS src", sql.trim()),
+            Self::Filtered { base, predicates } => format!(
+                "(SELECT * FROM {} WHERE {}) AS flt",
+                base.render(),
+                predicates.join(" AND ")
+            ),
         }
     }
 
@@ -67,6 +91,7 @@ impl Relation {
         match self {
             Self::Mart(_) => "",
             Self::Sql(_) => SQL_SOURCE_SETTINGS,
+            Self::Filtered { base, .. } => base.settings(),
         }
     }
 }
@@ -339,6 +364,7 @@ pub fn point_limit(from: &Relation) -> u32 {
     match from {
         Relation::Mart(_) => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
+        Relation::Filtered { base, .. } => point_limit(base),
     }
 }
 
@@ -378,10 +404,72 @@ pub fn build_points_sql(
     )
 }
 
+/// Why a filter did not apply to one tile's relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The relation has no column of that name (or the name is not a valid
+    /// identifier).
+    NoColumn,
+    /// The column exists but its type does not fit the filter (a text match
+    /// on a number, a date range on a string, a bound that is not a number).
+    WrongType,
+}
+
+/// A filter that was left out of one tile's SQL, so the tile can say so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedFilter {
+    /// The filter's column.
+    pub column: String,
+    /// Why it did not apply.
+    pub reason: SkipReason,
+}
+
+/// A relation's columns with their kinds, by name.
+pub type RelationColumns<H = std::collections::hash_map::RandomState> =
+    HashMap<String, ColumnKind, H>;
+
+/// The WHERE predicates for one relation, and the filters left out of it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FilterOutcome {
+    /// Predicates to AND together.
+    pub predicates: Vec<String>,
+    /// Active filters that did not apply, in filter order.
+    pub skipped: Vec<SkippedFilter>,
+    /// The columns `predicates` read (with `tahun` for the year predicate),
+    /// so a builder can tell whether one is also an output alias.
+    pub columns: Vec<String>,
+}
+
+/// A chart's SQL with the filters that did not apply to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilteredSql {
+    /// The statement to run.
+    pub sql: String,
+    /// Active filters left out of `sql`.
+    pub skipped: Vec<SkippedFilter>,
+}
+
 /// SQL for a stored spec with runtime filters applied (year filter + the
-/// dashboard's dimension filters). `mart_cols` maps mart name to its column
-/// set, so we know which filters actually apply. Ports `sqlWithFilters` in
-/// `bi-store.ts`.
+/// dashboard's filters). `mart_cols` maps mart name to its columns with
+/// their kinds, so we know which filters apply and which fit. Ports
+/// `sqlWithFilters` in `bi-store.ts`; this is [`sql_with_filters_report`]
+/// without the skipped list.
+#[must_use]
+pub fn sql_with_filters<HMap, HCols>(
+    spec: &StoredChartSpec,
+    years: &[i64],
+    filters: &[FilterDef],
+    mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+) -> String
+where
+    HMap: std::hash::BuildHasher,
+    HCols: std::hash::BuildHasher + Default,
+{
+    sql_with_filters_report(spec, years, filters, mart_cols).sql
+}
+
+/// [`sql_with_filters`] plus the filters that were left out.
 ///
 /// # Fidelity notes
 ///
@@ -400,28 +488,39 @@ pub fn build_points_sql(
 ///   unchanged (not a WHERE-less rebuild — this preserves the exact stored
 ///   SQL byte-for-byte when no filter applies).
 #[must_use]
-pub fn sql_with_filters<HMap, HSet>(
+pub fn sql_with_filters_report<HMap, HCols>(
     spec: &StoredChartSpec,
     years: &[i64],
     filters: &[FilterDef],
-    mart_cols: &std::collections::HashMap<String, HashSet<String, HSet>, HMap>,
-) -> String
+    mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
+) -> FilteredSql
 where
     HMap: std::hash::BuildHasher,
-    HSet: std::hash::BuildHasher + Default,
+    HCols: std::hash::BuildHasher + Default,
 {
+    let unfiltered = |skipped| FilteredSql {
+        sql: spec.spec.sql.clone(),
+        skipped,
+    };
     if spec.spec.kind == crate::specs::ChartKind::Text {
-        return String::new();
+        return FilteredSql {
+            sql: String::new(),
+            skipped: Vec::new(),
+        };
     }
     let def: &ChartInput = &spec.def;
     if def.mart.is_empty() {
-        return spec.spec.sql.clone();
+        return unfiltered(Vec::new());
     }
-    let empty_cols: HashSet<String, HSet> = HashSet::default();
+    let empty_cols: RelationColumns<HCols> = RelationColumns::default();
     let cols = mart_cols.get(&def.mart).unwrap_or(&empty_cols);
-    let where_clauses = filter_predicates(cols, years, filters);
-    if where_clauses.is_empty() {
-        return spec.spec.sql.clone();
+    let FilterOutcome {
+        predicates,
+        skipped,
+        columns,
+    } = filter_predicates(cols, years, filters);
+    if predicates.is_empty() {
+        return unfiltered(skipped);
     }
     // `mart` was already validated as a well-formed identifier when the
     // spec was created via `specFromInput`, so re-validating here would
@@ -429,9 +528,11 @@ where
     // than panicking, matching "SQL never comes raw from untrusted input"
     // without introducing a new failure mode.
     let Ok(mart) = Ident::new(def.mart.clone()) else {
-        return spec.spec.sql.clone();
+        return unfiltered(skipped);
     };
-    rebuild(spec, &Relation::Mart(mart), where_clauses).unwrap_or_else(|| spec.spec.sql.clone())
+    let sql = rebuild(spec, &Relation::Mart(mart), predicates, &columns)
+        .unwrap_or_else(|| spec.spec.sql.clone());
+    FilteredSql { sql, skipped }
 }
 
 /// SQL for a stored chart built on a dashboard SQL source, with runtime
@@ -445,72 +546,257 @@ where
 /// identifiers (data corruption); the caller reports that tile as an error
 /// rather than running something else.
 #[must_use]
-pub fn sql_for_sql_source<HSet>(
+pub fn sql_for_sql_source<HCols>(
     spec: &StoredChartSpec,
     source_sql: &str,
-    source_cols: &HashSet<String, HSet>,
+    source_cols: &RelationColumns<HCols>,
     years: &[i64],
     filters: &[FilterDef],
 ) -> Option<String>
 where
-    HSet: std::hash::BuildHasher,
+    HCols: std::hash::BuildHasher,
+{
+    sql_for_sql_source_report(spec, source_sql, source_cols, years, filters).map(|f| f.sql)
+}
+
+/// [`sql_for_sql_source`] plus the filters that were left out.
+#[must_use]
+pub fn sql_for_sql_source_report<HCols>(
+    spec: &StoredChartSpec,
+    source_sql: &str,
+    source_cols: &RelationColumns<HCols>,
+    years: &[i64],
+    filters: &[FilterDef],
+) -> Option<FilteredSql>
+where
+    HCols: std::hash::BuildHasher,
 {
     if spec.spec.kind == crate::specs::ChartKind::Text {
-        return Some(String::new());
+        return Some(FilteredSql {
+            sql: String::new(),
+            skipped: Vec::new(),
+        });
     }
-    let where_clauses = filter_predicates(source_cols, years, filters);
-    rebuild(spec, &Relation::Sql(source_sql.to_owned()), where_clauses)
+    let FilterOutcome {
+        predicates,
+        skipped,
+        columns,
+    } = filter_predicates(source_cols, years, filters);
+    let sql = rebuild(
+        spec,
+        &Relation::Sql(source_sql.to_owned()),
+        predicates,
+        &columns,
+    )?;
+    Some(FilteredSql { sql, skipped })
 }
 
 /// The `tahun IN (...)` and dashboard-filter predicates that apply to a
-/// relation with columns `cols`.
+/// relation with columns `cols`, and the active filters that do not.
 ///
 /// A dashboard filter applies only when its column is *both* a valid
-/// identifier *and* present in `cols` — see [`sql_with_filters`]'s
-/// fidelity notes for why both checks are needed.
-fn filter_predicates<HSet>(
-    cols: &HashSet<String, HSet>,
+/// identifier *and* present in `cols` — see [`sql_with_filters_report`]'s
+/// fidelity notes for why both checks are needed. A filter whose op does not
+/// fit the column's kind is skipped, never coerced (an honest "does not
+/// apply" beats a silently different query).
+///
+/// Every value that reaches the SQL is a validated identifier, a
+/// [`SqlLiteral`], a finite number printed by Rust, a date this module
+/// parsed and re-printed, or one of the closed enums in [`crate::filters`];
+/// no raw filter text is ever formatted in.
+#[must_use]
+pub fn filter_predicates<HCols>(
+    cols: &RelationColumns<HCols>,
     years: &[i64],
     filters: &[FilterDef],
-) -> Vec<String>
+) -> FilterOutcome
 where
-    HSet: std::hash::BuildHasher,
+    HCols: std::hash::BuildHasher,
 {
-    let mut where_clauses: Vec<String> = Vec::new();
-    if !years.is_empty() && cols.contains("tahun") {
+    let mut out = FilterOutcome::default();
+    if !years.is_empty() && cols.contains_key("tahun") {
         let years_csv = years
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        where_clauses.push(format!("tahun IN ({years_csv})"));
+        out.predicates.push(format!("tahun IN ({years_csv})"));
+        out.columns.push("tahun".to_owned());
     }
     for f in filters {
-        if f.values.is_empty() {
+        if !f.is_active() {
             continue;
         }
-        let Ok(column) = Ident::new(f.column.clone()) else {
+        let skip = |reason| SkippedFilter {
+            column: f.column.clone(),
+            reason,
+        };
+        let (Ok(column), Some(kind)) = (Ident::new(f.column.clone()), cols.get(&f.column)) else {
+            out.skipped.push(skip(SkipReason::NoColumn));
             continue;
         };
-        if !cols.contains(&f.column) {
-            continue;
+        match filter_predicate(f, &column, *kind) {
+            Some(p) => {
+                out.predicates.push(p);
+                out.columns.push(f.column.clone());
+            }
+            None => out.skipped.push(skip(SkipReason::WrongType)),
         }
-        let list = f
-            .values
-            .iter()
-            .map(|v| SqlLiteral::from(v.clone()).to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        where_clauses.push(format!("{column} IN ({list})"));
     }
-    where_clauses
+    out
+}
+
+/// One filter's predicate over `column` of `kind`, or `None` when the op
+/// does not fit that kind.
+fn filter_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<String> {
+    match f.op {
+        // Kind-agnostic on purpose: it is what filters did before BI-18, and
+        // a value list over a number column compares as the server coerces it.
+        FilterOp::In | FilterOp::NotIn => {
+            let list = f
+                .values
+                .iter()
+                .map(|v| SqlLiteral::from(v.clone()).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let keyword = if f.op == FilterOp::In { "IN" } else { "NOT IN" };
+            Some(format!("{column} {keyword} ({list})"))
+        }
+        FilterOp::Between => between_predicate(f, column, kind),
+        FilterOp::Relative => {
+            if !kind.is_temporal() {
+                return None;
+            }
+            relative_predicate(f, &date_expr(column, kind))
+        }
+        FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith => {
+            if kind != ColumnKind::Text {
+                return None;
+            }
+            // Position / prefix / suffix functions rather than `ILIKE`, so
+            // `%`, `_` and `\` in the needle are plain characters and there
+            // is no wildcard escaping to get wrong. The UTF-8 variants keep
+            // the match case-insensitive beyond ASCII.
+            let needle = SqlLiteral::from(f.text.clone()?);
+            Some(match f.op {
+                FilterOp::Contains => {
+                    format!("positionCaseInsensitiveUTF8(toString({column}), {needle}) > 0")
+                }
+                FilterOp::StartsWith => {
+                    format!("startsWith(lowerUTF8(toString({column})), lowerUTF8({needle}))")
+                }
+                _ => format!("endsWith(lowerUTF8(toString({column})), lowerUTF8({needle}))"),
+            })
+        }
+    }
+}
+
+/// The column as a `Date`: a `DateTime` compares by its calendar day.
+fn date_expr(column: &Ident, kind: ColumnKind) -> String {
+    if kind == ColumnKind::DateTime {
+        format!("toDate({column})")
+    } else {
+        column.to_string()
+    }
+}
+
+/// `col >= min AND col <= max` over a number or date column, either end
+/// optional and both inclusive.
+fn between_predicate(f: &FilterDef, column: &Ident, kind: ColumnKind) -> Option<String> {
+    let (subject, render): (String, fn(&str) -> Option<String>) = match kind {
+        ColumnKind::Number => (column.to_string(), |raw| {
+            parse_number(raw).map(|v| v.to_string())
+        }),
+        // `toDate32`, not `toDate`: the validated range starts in 1900, which
+        // `Date` cannot hold.
+        ColumnKind::Date | ColumnKind::DateTime => (date_expr(column, kind), |raw| {
+            parse_iso_date(raw).map(|(y, m, d)| format!("toDate32('{y:04}-{m:02}-{d:02}')"))
+        }),
+        ColumnKind::Text => return None,
+    };
+    let mut parts = Vec::new();
+    for (op, bound) in [(">=", &f.min), ("<=", &f.max)] {
+        if let Some(raw) = bound.as_deref() {
+            parts.push(format!("{subject} {op} {}", render(raw)?));
+        }
+    }
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(format!("({})", parts.join(" AND "))),
+    }
+}
+
+/// A date range relative to `today()` over the date expression `d`. Only
+/// closed enums and the bounded `n` reach the SQL.
+///
+/// `last n unit` is the `n` units ending today, both ends included
+/// (`d > today() - n units`); `this` and `previous` are calendar periods
+/// (weeks start on Monday). `today()` is the `ClickHouse` server's clock.
+fn relative_predicate(f: &FilterDef, d: &str) -> Option<String> {
+    let (unit, anchor) = (f.unit?, f.anchor?);
+    let (subtract, add, start) = match unit {
+        RelativeUnit::Day => ("subtractDays", "addDays", "toDate(today())"),
+        RelativeUnit::Week => ("subtractWeeks", "addWeeks", "toStartOfWeek(today(), 1)"),
+        RelativeUnit::Month => ("subtractMonths", "addMonths", "toStartOfMonth(today())"),
+        RelativeUnit::Quarter => (
+            "subtractQuarters",
+            "addQuarters",
+            "toStartOfQuarter(today())",
+        ),
+        RelativeUnit::Year => ("subtractYears", "addYears", "toStartOfYear(today())"),
+    };
+    Some(match anchor {
+        RelativeAnchor::Last => {
+            let n =
+                f.n.filter(|n| (1..=crate::filters::MAX_RELATIVE_N).contains(n))?;
+            format!("({d} > {subtract}(today(), {n}) AND {d} <= today())")
+        }
+        RelativeAnchor::This => format!("({d} >= {start} AND {d} < {add}({start}, 1))"),
+        RelativeAnchor::Previous => format!("({d} >= {subtract}({start}, 1) AND {d} < {start})"),
+    })
 }
 
 /// Rebuild a stored chart's SQL over `from` with `where_clauses`, from its
 /// structured definition. `None` if the definition's identifiers no longer
 /// validate (only possible through data corruption).
-fn rebuild(spec: &StoredChartSpec, from: &Relation, where_clauses: Vec<String>) -> Option<String> {
+fn rebuild(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    where_clauses: Vec<String>,
+    where_columns: &[String],
+) -> Option<String> {
     let def: &ChartInput = &spec.def;
+    // BI-18·A review BLOCKER 1: a predicate on a column that the SELECT also
+    // names as an alias would resolve to the alias (an aggregate) in WHERE.
+    // Only then are the predicates moved into an inner relation; otherwise
+    // the SQL is exactly what it was before.
+    if !where_clauses.is_empty() {
+        let aliases: Vec<&str> = match spec.spec.kind {
+            crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v"],
+            crate::specs::ChartKind::Boxplot => def
+                .measures
+                .first()
+                .map(String::as_str)
+                .into_iter()
+                .chain(["__n"])
+                .collect(),
+            crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat => def
+                .measures
+                .first()
+                .map(String::as_str)
+                .into_iter()
+                .collect(),
+            _ => def.measures.iter().map(String::as_str).collect(),
+        };
+        if where_columns.iter().any(|c| aliases.contains(&c.as_str())) {
+            let wrapped = Relation::Filtered {
+                base: Box::new(from.clone()),
+                predicates: where_clauses,
+            };
+            return rebuild(spec, &wrapped, Vec::new(), &[]);
+        }
+    }
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
     // unrecognized value — this is the untrusted path named in the H4
     // finding (`def.aggregate` comes straight from stored `spec_json`, never
@@ -631,15 +917,15 @@ const SAFE_NEXT_TOKENS: [&str; 8] = [
 /// `WHERE`/`PREWHERE`, a `JOIN`, `FINAL`, or anything else this function
 /// does not recognize as safe to precede).
 #[must_use]
-pub fn apply_builtin_year_filter<HMap, HSet>(
+pub fn apply_builtin_year_filter<HMap, HCols>(
     sql: &str,
     mart: &str,
     years: &[i64],
-    mart_cols: &std::collections::HashMap<String, HashSet<String, HSet>, HMap>,
+    mart_cols: &HashMap<String, RelationColumns<HCols>, HMap>,
 ) -> String
 where
     HMap: std::hash::BuildHasher,
-    HSet: std::hash::BuildHasher,
+    HCols: std::hash::BuildHasher,
 {
     if years.is_empty() {
         return sql.to_owned();
@@ -647,7 +933,7 @@ where
     let Some(cols) = mart_cols.get(mart) else {
         return sql.to_owned();
     };
-    if !cols.contains("tahun") {
+    if !cols.contains_key("tahun") {
         return sql.to_owned();
     }
 
@@ -698,15 +984,19 @@ mod tests {
     use super::*;
     use crate::specs::ChartKind;
 
-    fn mart_cols(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+    /// Every column is `Text`: the legacy `in` filters these tests exercise
+    /// do not depend on a column's kind.
+    fn text_cols(names: &[&str]) -> RelationColumns {
+        names
+            .iter()
+            .map(|c| ((*c).to_owned(), ColumnKind::Text))
+            .collect()
+    }
+
+    fn mart_cols(pairs: &[(&str, &[&str])]) -> HashMap<String, RelationColumns> {
         pairs
             .iter()
-            .map(|(mart, cols)| {
-                (
-                    (*mart).to_owned(),
-                    cols.iter().map(|c| (*c).to_owned()).collect(),
-                )
-            })
+            .map(|(mart, cols)| ((*mart).to_owned(), text_cols(cols)))
             .collect()
     }
 
@@ -748,10 +1038,7 @@ mod tests {
     fn skips_filter_whose_column_is_not_in_the_mart() {
         let spec = stored_spec(ChartKind::Bar, "mart_wisman", "kawasan", &["jumlah"]);
         let cols = mart_cols(&[("mart_wisman", &["kawasan", "jumlah"])]);
-        let filters = vec![FilterDef {
-            column: "negara".to_owned(),
-            values: vec!["ID".to_owned()],
-        }];
+        let filters = vec![FilterDef::in_values("negara", vec!["ID".to_owned()])];
         let sql = sql_with_filters(&spec, &[], &filters, &cols);
         assert_eq!(sql, spec.spec.sql);
     }
@@ -760,10 +1047,7 @@ mod tests {
     fn escapes_quote_inside_filter_value() {
         let spec = stored_spec(ChartKind::Bar, "mart_wisman", "kawasan", &["jumlah"]);
         let cols = mart_cols(&[("mart_wisman", &["kawasan", "jumlah"])]);
-        let filters = vec![FilterDef {
-            column: "kawasan".to_owned(),
-            values: vec!["O'Brien".to_owned()],
-        }];
+        let filters = vec![FilterDef::in_values("kawasan", vec!["O'Brien".to_owned()])];
         let sql = sql_with_filters(&spec, &[], &filters, &cols);
         assert!(sql.contains("'O''Brien'"), "{sql}");
     }
@@ -774,11 +1058,8 @@ mod tests {
         let mut cols = mart_cols(&[("mart_wisman", &["kawasan", "jumlah"])]);
         cols.get_mut("mart_wisman")
             .unwrap()
-            .insert("bad col".to_owned());
-        let filters = vec![FilterDef {
-            column: "bad col".to_owned(),
-            values: vec!["x".to_owned()],
-        }];
+            .insert("bad col".to_owned(), ColumnKind::Text);
+        let filters = vec![FilterDef::in_values("bad col", vec!["x".to_owned()])];
         let sql = sql_with_filters(&spec, &[], &filters, &cols);
         assert_eq!(sql, spec.spec.sql);
     }
@@ -786,7 +1067,7 @@ mod tests {
     #[test]
     fn text_chart_produces_no_sql() {
         let spec = stored_spec(ChartKind::Text, "", "", &[]);
-        let cols: HashMap<String, HashSet<String>> = HashMap::new();
+        let cols: HashMap<String, RelationColumns> = HashMap::new();
         let sql = sql_with_filters(&spec, &[2024], &[], &cols);
         assert_eq!(sql, "");
     }
@@ -811,10 +1092,7 @@ mod tests {
         // never in `system.columns`, so `mart_cols` correctly omits it.
         assert!(Ident::new("_part").is_ok());
         let cols = mart_cols(&[("mart_wisman", &["kawasan", "jumlah"])]);
-        let filters = vec![FilterDef {
-            column: "_part".to_owned(),
-            values: vec!["all_0_0_0".to_owned()],
-        }];
+        let filters = vec![FilterDef::in_values("_part", vec!["all_0_0_0".to_owned()])];
         let sql = sql_with_filters(&spec, &[], &filters, &cols);
         assert_eq!(sql, spec.spec.sql);
     }
@@ -961,11 +1239,8 @@ mod tests {
         spec
     }
 
-    fn source_cols() -> HashSet<String> {
-        ["material_group", "materials", "material_type"]
-            .iter()
-            .map(|c| (*c).to_owned())
-            .collect()
+    fn source_cols() -> RelationColumns {
+        text_cols(&["material_group", "materials", "material_type"])
     }
 
     #[test]
@@ -1038,14 +1313,8 @@ mod tests {
     fn dashboard_filters_apply_only_to_columns_the_source_returns() {
         let spec = source_spec(ChartKind::Bar, "material_group", &["materials"]);
         let filters = vec![
-            FilterDef {
-                column: "material_type".to_owned(),
-                values: vec!["ROH".to_owned()],
-            },
-            FilterDef {
-                column: "not_in_source".to_owned(),
-                values: vec!["x".to_owned()],
-            },
+            FilterDef::in_values("material_type", vec!["ROH".to_owned()]),
+            FilterDef::in_values("not_in_source", vec!["x".to_owned()]),
         ];
         let sql = sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[2024], &filters).unwrap();
         assert!(sql.contains("material_type IN ('ROH')"), "{sql}");
@@ -1159,10 +1428,7 @@ mod tests {
         );
         let mut spec = point_spec(ChartKind::Pointmap, "materials");
         spec.def.sql_source = Some("s_1234abcd".to_owned());
-        let cols: HashSet<String> = ["lat", "lon", "visitors", "materials"]
-            .iter()
-            .map(|c| (*c).to_owned())
-            .collect();
+        let cols = text_cols(&["lat", "lon", "visitors", "materials"]);
         let sql = sql_for_sql_source(&spec, SOURCE_SQL, &cols, &[], &[]).unwrap();
         assert!(sql.contains(" LIMIT 2000 SETTINGS"), "{sql}");
         assert!(sql.ends_with(SQL_SOURCE_SETTINGS), "{sql}");
@@ -1180,5 +1446,425 @@ mod tests {
         // With a mart and a filter the stored SQL stands in, as for any
         // chart whose definition no longer validates.
         assert_eq!(sql_with_filters(&spec, &[2024], &[], &cols), "SELECT 1");
+    }
+
+    // ── typed filters (BI-18 part A, T2) ────────────────────────────────
+
+    fn typed(pairs: &[(&str, ColumnKind)]) -> RelationColumns {
+        pairs.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect()
+    }
+
+    fn filter(json: &str) -> FilterDef {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The one predicate `filters` produce over `cols`, asserting nothing
+    /// was skipped.
+    fn one_predicate(cols: &[(&str, ColumnKind)], json: &str) -> String {
+        let out = filter_predicates(&typed(cols), &[], &[filter(json)]);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.predicates.len(), 1, "{:?}", out.predicates);
+        out.predicates[0].clone()
+    }
+
+    fn skipped(cols: &[(&str, ColumnKind)], json: &str) -> Vec<SkippedFilter> {
+        let out = filter_predicates(&typed(cols), &[], &[filter(json)]);
+        assert!(out.predicates.is_empty(), "{:?}", out.predicates);
+        out.skipped
+    }
+
+    #[test]
+    fn not_in_negates_the_value_list() {
+        let p = one_predicate(
+            &[("region", ColumnKind::Text)],
+            r#"{"column":"region","op":"not_in","values":["Bali","O'Brien"]}"#,
+        );
+        assert_eq!(p, "region NOT IN ('Bali','O''Brien')");
+    }
+
+    #[test]
+    fn a_number_range_renders_both_ends_inclusive_as_numbers() {
+        let p = one_predicate(
+            &[("price", ColumnKind::Number)],
+            r#"{"column":"price","op":"between","min":"100","max":"2.5e3"}"#,
+        );
+        assert_eq!(p, "(price >= 100 AND price <= 2500)");
+    }
+
+    #[test]
+    fn an_open_ended_range_has_only_the_bound_that_is_present() {
+        let cols = [("price", ColumnKind::Number)];
+        assert_eq!(
+            one_predicate(&cols, r#"{"column":"price","op":"between","min":"-5"}"#),
+            "price >= -5"
+        );
+        assert_eq!(
+            one_predicate(&cols, r#"{"column":"price","op":"between","max":"7.25"}"#),
+            "price <= 7.25"
+        );
+    }
+
+    #[test]
+    fn a_date_range_renders_re_printed_dates_and_a_datetime_compares_by_day() {
+        let json = r#"{"column":"d","op":"between","min":"2024-01-05","max":"2024-12-31"}"#;
+        assert_eq!(
+            one_predicate(&[("d", ColumnKind::Date)], json),
+            "(d >= toDate32('2024-01-05') AND d <= toDate32('2024-12-31'))"
+        );
+        assert_eq!(
+            one_predicate(&[("d", ColumnKind::DateTime)], json),
+            "(toDate(d) >= toDate32('2024-01-05') AND toDate(d) <= toDate32('2024-12-31'))"
+        );
+    }
+
+    #[test]
+    fn a_bound_that_does_not_fit_the_column_kind_is_skipped_not_coerced() {
+        let wrong = vec![SkippedFilter {
+            column: "d".to_owned(),
+            reason: SkipReason::WrongType,
+        }];
+        // A number bound on a date column, a date bound on a number column,
+        // and a range over text.
+        assert_eq!(
+            skipped(
+                &[("d", ColumnKind::Date)],
+                r#"{"column":"d","op":"between","min":"5"}"#
+            ),
+            wrong
+        );
+        assert_eq!(
+            skipped(
+                &[("d", ColumnKind::Number)],
+                r#"{"column":"d","op":"between","min":"2024-01-01"}"#
+            ),
+            wrong
+        );
+        assert_eq!(
+            skipped(
+                &[("d", ColumnKind::Text)],
+                r#"{"column":"d","op":"between","min":"1"}"#
+            ),
+            wrong
+        );
+    }
+
+    #[test]
+    fn a_bound_that_is_neither_number_nor_date_never_reaches_sql() {
+        for bad in [
+            "1; DROP TABLE x",
+            "NaN",
+            "inf",
+            "2024-02-30",
+            "0x10",
+            "' OR 1=1 --",
+        ] {
+            let json = serde_json::json!({"column": "c", "op": "between", "min": bad});
+            let f: FilterDef = serde_json::from_value(json).unwrap();
+            assert!(f.validate().is_err(), "{bad}");
+            for kind in [ColumnKind::Number, ColumnKind::Date, ColumnKind::DateTime] {
+                let out = filter_predicates(&typed(&[("c", kind)]), &[], std::slice::from_ref(&f));
+                assert!(out.predicates.is_empty(), "{bad}: {:?}", out.predicates);
+            }
+        }
+    }
+
+    #[test]
+    fn relative_dates_use_only_the_enum_and_the_bounded_number() {
+        let cols = [("d", ColumnKind::Date)];
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"d","op":"relative","anchor":"last","n":30,"unit":"day"}"#
+            ),
+            "(d > subtractDays(today(), 30) AND d <= today())"
+        );
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"d","op":"relative","anchor":"last","n":3,"unit":"quarter"}"#
+            ),
+            "(d > subtractQuarters(today(), 3) AND d <= today())"
+        );
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"d","op":"relative","anchor":"this","unit":"month"}"#
+            ),
+            "(d >= toStartOfMonth(today()) AND d < addMonths(toStartOfMonth(today()), 1))"
+        );
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"d","op":"relative","anchor":"this","unit":"week"}"#
+            ),
+            "(d >= toStartOfWeek(today(), 1) AND d < addWeeks(toStartOfWeek(today(), 1), 1))"
+        );
+        assert_eq!(
+            one_predicate(
+                &cols,
+                r#"{"column":"d","op":"relative","anchor":"previous","unit":"year"}"#
+            ),
+            "(d >= subtractYears(toStartOfYear(today()), 1) AND d < toStartOfYear(today()))"
+        );
+        assert_eq!(
+            one_predicate(
+                &[("t", ColumnKind::DateTime)],
+                r#"{"column":"t","op":"relative","anchor":"this","unit":"day"}"#
+            ),
+            "(toDate(t) >= toDate(today()) AND toDate(t) < addDays(toDate(today()), 1))"
+        );
+    }
+
+    #[test]
+    fn a_relative_filter_on_a_number_or_text_column_is_skipped() {
+        let json = r#"{"column":"c","op":"relative","anchor":"this","unit":"day"}"#;
+        for kind in [ColumnKind::Number, ColumnKind::Text] {
+            assert_eq!(
+                skipped(&[("c", kind)], json),
+                vec![SkippedFilter {
+                    column: "c".to_owned(),
+                    reason: SkipReason::WrongType
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_needle_with_quote_percent_underscore_and_backslash_is_one_literal() {
+        let cols = [("name", ColumnKind::Text)];
+        let json = serde_json::json!({
+            "column": "name", "op": "contains", "text": "50%_off\\o'Neil"
+        })
+        .to_string();
+        assert_eq!(
+            one_predicate(&cols, &json),
+            "positionCaseInsensitiveUTF8(toString(name), '50%_off\\\\o''Neil') > 0"
+        );
+    }
+
+    #[test]
+    fn starts_with_and_ends_with_lowercase_both_sides() {
+        let cols = [("name", ColumnKind::Text)];
+        assert_eq!(
+            one_predicate(&cols, r#"{"column":"name","op":"starts_with","text":"Ba"}"#),
+            "startsWith(lowerUTF8(toString(name)), lowerUTF8('Ba'))"
+        );
+        assert_eq!(
+            one_predicate(&cols, r#"{"column":"name","op":"ends_with","text":"li"}"#),
+            "endsWith(lowerUTF8(toString(name)), lowerUTF8('li'))"
+        );
+    }
+
+    #[test]
+    fn a_text_op_on_a_number_or_date_column_is_skipped() {
+        for kind in [ColumnKind::Number, ColumnKind::Date, ColumnKind::DateTime] {
+            assert_eq!(
+                skipped(
+                    &[("c", kind)],
+                    r#"{"column":"c","op":"contains","text":"x"}"#
+                ),
+                vec![SkippedFilter {
+                    column: "c".to_owned(),
+                    reason: SkipReason::WrongType
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_on_a_column_the_relation_lacks_is_reported_not_applied() {
+        let out = filter_predicates(
+            &typed(&[("a", ColumnKind::Text)]),
+            &[],
+            &[
+                filter(r#"{"column":"gone","values":["x"]}"#),
+                filter(r#"{"column":"a","values":["y"]}"#),
+                filter(r#"{"column":"bad col","values":["x"]}"#),
+            ],
+        );
+        assert_eq!(out.predicates, vec!["a IN ('y')".to_owned()]);
+        assert_eq!(
+            out.skipped,
+            vec![
+                SkippedFilter {
+                    column: "gone".to_owned(),
+                    reason: SkipReason::NoColumn
+                },
+                SkippedFilter {
+                    column: "bad col".to_owned(),
+                    reason: SkipReason::NoColumn
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_inactive_placeholder_filter_is_neither_applied_nor_reported() {
+        let out = filter_predicates(
+            &typed(&[("a", ColumnKind::Text)]),
+            &[],
+            &[filter(r#"{"column":"gone","values":[]}"#)],
+        );
+        assert_eq!(out, FilterOutcome::default());
+    }
+
+    #[test]
+    fn the_report_carries_skipped_filters_for_a_mart_tile_and_a_source_tile() {
+        let spec = stored_spec(ChartKind::Bar, "mart_wisman", "kawasan", &["jumlah"]);
+        let cols: HashMap<String, RelationColumns> = HashMap::from([(
+            "mart_wisman".to_owned(),
+            typed(&[
+                ("kawasan", ColumnKind::Text),
+                ("jumlah", ColumnKind::Number),
+            ]),
+        )]);
+        let filters = [
+            filter(r#"{"column":"jumlah","op":"between","min":"10"}"#),
+            filter(r#"{"column":"negara","values":["ID"]}"#),
+        ];
+        let got = sql_with_filters_report(&spec, &[], &filters, &cols);
+        // `jumlah` is also the measure's alias, so the filter sits inside.
+        assert!(
+            got.sql.contains("WHERE jumlah >= 10) AS flt"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.skipped.len(), 1);
+        assert_eq!(got.skipped[0].column, "negara");
+
+        let source_spec = source_spec(ChartKind::Bar, "material_group", &["materials"]);
+        let got = sql_for_sql_source_report(
+            &source_spec,
+            SOURCE_SQL,
+            &typed(&[
+                ("material_group", ColumnKind::Text),
+                ("materials", ColumnKind::Number),
+            ]),
+            &[],
+            &[filter(r#"{"column":"materials","op":"between","max":"5"}"#)],
+        )
+        .unwrap();
+        assert!(got.sql.contains("materials <= 5) AS flt"), "{}", got.sql);
+        assert!(got.skipped.is_empty());
+    }
+
+    // BI-18·A review BLOCKER 1: a predicate on a column the SELECT also
+    // aliases must not see the alias.
+    #[test]
+    fn a_filter_on_an_aliased_measure_is_applied_inside_the_relation() {
+        let spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        let cols: HashMap<String, RelationColumns> = HashMap::from([(
+            "mart_x".to_owned(),
+            typed(&[("kab", ColumnKind::Text), ("visitors", ColumnKind::Number)]),
+        )]);
+        let got = sql_with_filters(
+            &spec,
+            &[],
+            &[filter(
+                r#"{"column":"visitors","op":"between","min":"2000"}"#,
+            )],
+            &cols,
+        );
+        assert_eq!(
+            got,
+            "SELECT kab, round(sum(visitors)) AS visitors FROM \
+             (SELECT * FROM serving.mart_x WHERE visitors >= 2000) AS flt \
+             GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_another_column_keeps_the_plain_where() {
+        let spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        let cols: HashMap<String, RelationColumns> = HashMap::from([(
+            "mart_x".to_owned(),
+            typed(&[("kab", ColumnKind::Text), ("visitors", ColumnKind::Number)]),
+        )]);
+        let got = sql_with_filters(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"kab","values":["a"]}"#)],
+            &cols,
+        );
+        assert_eq!(
+            got,
+            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE kab IN ('a') GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn the_collision_wrap_covers_count_points_kpi_and_a_sql_source() {
+        let f = filter(r#"{"column":"visitors","op":"between","min":"5"}"#);
+        let cols: HashMap<String, RelationColumns> = HashMap::from([(
+            "mart_x".to_owned(),
+            typed(&[
+                ("kab", ColumnKind::Text),
+                ("visitors", ColumnKind::Number),
+                ("lat", ColumnKind::Number),
+                ("lon", ColumnKind::Number),
+            ]),
+        )]);
+        let inner = "(SELECT * FROM serving.mart_x WHERE visitors >= 5) AS flt";
+
+        let mut count = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        count.def.aggregate = Some("count".to_owned());
+        let sql = sql_with_filters(&count, &[], std::slice::from_ref(&f), &cols);
+        assert!(
+            sql.contains(&format!("count() AS visitors FROM {inner} GROUP BY")),
+            "{sql}"
+        );
+
+        let mut points = stored_spec(ChartKind::Pointmap, "mart_x", "kab", &["visitors"]);
+        points.def.lat = Some("lat".to_owned());
+        points.def.lon = Some("lon".to_owned());
+        let sql = sql_with_filters(&points, &[], std::slice::from_ref(&f), &cols);
+        assert!(
+            sql.contains(&format!("FROM {inner} WHERE lat IS NOT NULL")),
+            "{sql}"
+        );
+
+        let kpi = stored_spec(ChartKind::Kpi, "mart_x", "", &["visitors"]);
+        let sql = sql_with_filters(&kpi, &[], std::slice::from_ref(&f), &cols);
+        // The KPI's only alias is `v`, so a filter on the measure stays plain.
+        assert!(
+            sql.contains("AS v FROM serving.mart_x WHERE visitors >= 5"),
+            "{sql}"
+        );
+        // A filter on a column called `v` is the KPI's collision.
+        let cols_v: HashMap<String, RelationColumns> = HashMap::from([(
+            "mart_x".to_owned(),
+            typed(&[("v", ColumnKind::Number), ("visitors", ColumnKind::Number)]),
+        )]);
+        let sql = sql_with_filters(
+            &kpi,
+            &[],
+            &[filter(r#"{"column":"v","op":"between","min":"1"}"#)],
+            &cols_v,
+        );
+        assert!(
+            sql.contains("FROM (SELECT * FROM serving.mart_x WHERE v >= 1) AS flt"),
+            "{sql}"
+        );
+
+        let source = source_spec(ChartKind::Bar, "material_group", &["materials"]);
+        let got = sql_for_sql_source(
+            &source,
+            SOURCE_SQL,
+            &typed(&[
+                ("material_group", ColumnKind::Text),
+                ("materials", ColumnKind::Number),
+            ]),
+            &[],
+            &[filter(r#"{"column":"materials","op":"between","max":"5"}"#)],
+        )
+        .unwrap();
+        assert!(got.contains("FROM (SELECT * FROM (\n"), "{got}");
+        assert!(
+            got.contains("WHERE materials <= 5) AS flt GROUP BY"),
+            "{got}"
+        );
+        // The source cap stays on the statement.
+        assert!(got.ends_with(SQL_SOURCE_SETTINGS), "{got}");
     }
 }

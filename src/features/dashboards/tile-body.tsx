@@ -14,13 +14,12 @@ function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<st
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, year, onDataClick, hideLegend,
+  spec, cell, dark, loading, onDataClick, hideLegend,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
   dark: boolean;
   loading: boolean;
-  year: string;
   /** Click a data point (bar/slice/point) → drill/cross-filter. */
   onDataClick?: (name: string, pos: { x: number; y: number }) => void;
   /**
@@ -50,7 +49,7 @@ export function TileBody({
 
   if (spec.kind === "table") {
     if (!hasRows(cell) || cell.rows.length === 0) {
-      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
     return <TableView columns={cell.columns} rows={cell.rows} />;
   }
@@ -58,7 +57,7 @@ export function TileBody({
   // Map kinds — need the map registered first (local GeoJSON).
   if (spec.kind === "geomap" || spec.kind === "pointmap" || spec.kind === "geoheat") {
     if (!hasRows(cell) || cell.rows.length === 0) {
-      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
     return <GeoChart spec={spec} rows={cell.rows} dark={dark} />;
   }
@@ -68,7 +67,7 @@ export function TileBody({
     const option = buildOption(spec, cell.rows, dark);
     return <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={onDataClick} />;
   }
-  return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
+  return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
 }
 
 function TableView({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {

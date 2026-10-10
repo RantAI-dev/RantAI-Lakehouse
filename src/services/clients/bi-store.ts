@@ -44,8 +44,35 @@ export type ChartInput = {
 /** Tile position on the grid canvas (12 columns). Key = chartId. */
 export type TileBox = { x: number; y: number; w: number; h: number };
 export type LayoutMap = Record<string, TileBox>;
-/** Dashboard filter: a column value that filters every tile that has that column. */
-export type FilterDef = { column: string; values: string[] };
+/** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
+export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with";
+export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
+export type RelativeAnchor = "last" | "this" | "previous";
+/** What a column holds, as far as filtering cares; derived server-side from its ClickHouse type. */
+export type FilterKind = "number" | "date" | "datetime" | "text";
+/**
+ * Dashboard filter, applied to every tile whose data has the column. The
+ * typed fields are optional so a filter saved before typed filters
+ * (`{ column, values }`) is still valid and means `in`.
+ */
+export type FilterDef = {
+  column: string;
+  values: string[];
+  op?: FilterOp;
+  /** `between` bounds: a number, or a date as `YYYY-MM-DD`; either may be absent. */
+  min?: string;
+  max?: string;
+  /** `relative`: `n` units ending today (`anchor: "last"`), or this / the previous calendar unit. */
+  unit?: RelativeUnit;
+  n?: number;
+  anchor?: RelativeAnchor;
+  /** `contains` / `starts_with` / `ends_with`, at most 200 characters. */
+  text?: string;
+};
+/** A column a filter can target, with how many tiles of the board have it. */
+export type FilterField = { column: string; kind: FilterKind | string; tiles: number };
+/** A filter an active tile could not honour, so the tile can say so. */
+export type FilterSkip = { column: string; reason: "no_column" | "wrong_type" | string };
 
 export type Board = {
   id: string;

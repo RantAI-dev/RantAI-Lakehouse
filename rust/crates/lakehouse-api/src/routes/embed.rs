@@ -109,7 +109,15 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     let mut filters = board.filters.clone().unwrap_or_default();
     filters.extend(params_to_filters(claims.params));
 
-    match render_board_payload(&state, &board, &board_id, &filters).await {
+    let payload = render_board_payload(
+        &state.clickhouse,
+        state.pg.as_deref(),
+        &board,
+        &board_id,
+        &filters,
+    )
+    .await;
+    match payload {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -133,7 +141,7 @@ fn params_to_filters(params: Option<std::collections::HashMap<String, Value>>) -
                 Value::Array(items) => items.iter().map(value_to_string).collect(),
                 other => vec![value_to_string(&other)],
             };
-            FilterDef { column, values }
+            FilterDef::in_values(column, values)
         })
         .collect()
 }
@@ -171,7 +179,15 @@ pub async fn public_dashboard(
 
     let filters = board.filters.clone().unwrap_or_default();
     let board_id = board.id.clone();
-    match render_board_payload(&state, &board, &board_id, &filters).await {
+    let payload = render_board_payload(
+        &state.clickhouse,
+        state.pg.as_deref(),
+        &board,
+        &board_id,
+        &filters,
+    )
+    .await;
+    match payload {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -186,15 +202,15 @@ pub async fn public_dashboard(
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
 /// neither route accepts a `year` parameter).
 async fn render_board_payload(
-    state: &AppState,
+    ch: &ChClient,
+    pg: Option<&lakehouse_store::PgPool>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
-    let ch: &ChClient = &state.clickhouse;
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), ch);
+    let obligations = PolicyEngineObligations::new(pg, ch);
     let stored = store::list_stored_charts(ch).await?;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
@@ -207,7 +223,7 @@ async fn render_board_payload(
         })
         .collect();
 
-    let need_cols = filters.iter().any(|f| !f.values.is_empty());
+    let need_cols = filters.iter().any(FilterDef::is_active);
     let cols = if need_cols {
         mart_columns(ch).await?
     } else {
@@ -219,7 +235,7 @@ async fn render_board_payload(
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     for c in &stored_for_board {
         match stored_chart_sql(c, &[], filters, &cols, &sources) {
-            Ok(sql) => {
+            Ok(lakehouse_bi::builder::FilteredSql { sql, .. }) => {
                 let (id, val) =
                     run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, &obligations).await;
                 results.insert(id, val);
@@ -283,6 +299,120 @@ mod tests {
         assert_eq!(
             filters[0].values,
             vec!["2023".to_owned(), "2024".to_owned()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_filters {
+    //! A board saved with a typed filter renders publicly with it applied
+    //! (BI-18): the public and embed paths share `render_board_payload`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::json;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn answer(server: &MockServer, has: &str, meta: &[&str], data: Vec<Value>) {
+        let meta: Vec<Value> = meta
+            .iter()
+            .map(|n| json!({ "name": n, "type": "String" }))
+            .collect();
+        let rows = data.len();
+        Mock::given(method("POST"))
+            .and(body_string_contains(has))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": meta, "data": data, "rows": rows })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_board_saved_with_a_typed_filter_renders_publicly_with_it_applied() {
+        let server = MockServer::start().await;
+        let spec = json!({
+            "id": "c1", "title": "T", "kind": "bar", "mart": "mart_a",
+            "sql": "SELECT 1", "x": "kab", "y": "visitors"
+        });
+        let def = json!({
+            "title": "T", "mart": "mart_a", "kind": "bar",
+            "dimension": "kab", "measures": ["visitors"]
+        });
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            vec![json!({
+                "id": "c1", "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })],
+        )
+        .await;
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            vec![
+                json!({ "table": "mart_a", "name": "kab", "type": "String" }),
+                json!({ "table": "mart_a", "name": "visitors", "type": "UInt32" }),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let filters: Vec<FilterDef> = serde_json::from_str(
+            r#"[{"column":"visitors","op":"between","min":"100","max":"900"},
+                {"column":"kab","op":"contains","text":"ub"}]"#,
+        )
+        .unwrap();
+        let board = Board {
+            id: "b1".to_owned(),
+            name: "B".to_owned(),
+            description: None,
+            created_by: None,
+            layout: None,
+            filters: Some(filters.clone()),
+            created_at: None,
+            updated_at: None,
+            public_token: None,
+            embed_enabled: None,
+            folder_id: None,
+        };
+
+        let body = render_board_payload(&ch, None, &board, "b1", &filters)
+            .await
+            .unwrap();
+
+        assert_eq!(body["board"]["id"], "b1");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let tile = sent
+            .iter()
+            .find(|s| s.contains("FROM serving.mart_a WHERE"))
+            .unwrap_or_else(|| panic!("tile query not sent: {sent:?}"));
+        assert!(
+            tile.contains("(visitors >= 100 AND visitors <= 900)"),
+            "{tile}"
+        );
+        assert!(
+            tile.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub') > 0"),
+            "{tile}"
         );
     }
 }

@@ -61,6 +61,21 @@ impl SqlSource {
     pub fn column_names(&self) -> HashSet<String> {
         self.columns.iter().map(|c| c.name.clone()).collect()
     }
+
+    /// The columns with their filter kinds, from the types probed when the
+    /// source was saved (never guessed from the names).
+    #[must_use]
+    pub fn column_kinds(&self) -> crate::builder::RelationColumns {
+        self.columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    crate::filters::ColumnKind::from_clickhouse_type(&c.ty),
+                )
+            })
+            .collect()
+    }
 }
 
 /// A fresh source id.

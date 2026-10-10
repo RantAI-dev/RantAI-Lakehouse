@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
@@ -11,8 +11,10 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
+import { FILTER_PARAM, decodeFilters, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
-import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
+import type { LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
+import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
 import { dashboardService } from "@/services";
@@ -23,7 +25,8 @@ import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
-import { DashboardFilters } from "./dashboard-filters";
+import { FilterBar } from "./filters/filter-bar";
+import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
@@ -36,7 +39,12 @@ type KpiMeta = { id: string; title: string; caption?: string; format: string };
 type BoardOpt = { id: string; name: string; folderId?: string | null };
 type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
 type Payload = {
-  board: string; years: number[]; layout: LayoutMap; filters: FilterDef[]; filterColumns: string[];
+  board: string; layout: LayoutMap;
+  /** The filters in force for this response (the address's, else the default). */
+  filters: FilterDef[];
+  /** The board's saved default, which `filters` is not while the address overrides it. */
+  defaultFilters?: FilterDef[];
+  filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
 };
@@ -49,6 +57,8 @@ const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> =
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
 const NO_RESULTS: Record<string, Cell> = {};
+const NO_FILTERS: FilterDef[] = [];
+const NO_FIELDS: FilterField[] = [];
 
 /**
  * The column a click on this tile's data drills into, if any: category
@@ -83,12 +93,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [data, setData] = React.useState<Payload | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
-  const [year, setYear] = React.useState("all");
   const [edit, setEdit] = React.useState(false);
   const [layout, setLayout] = React.useState<LayoutMap>({});
-  const [filters, setFilters] = React.useState<FilterDef[]>([]);
-  const filtersRef = React.useRef<FilterDef[]>([]);
-  const adoptingRef = React.useRef(true);
+  // Filters are temporary and live in the address (`?f=`); the board's saved
+  // default applies while the address carries none. Nothing is written to the
+  // board until an editor presses "Save as default".
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const { hasPermission } = useAuth();
+  const fParam = searchParams.get(FILTER_PARAM);
+  const [savingDefault, setSavingDefault] = React.useState(false);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   // Tile delete is one click away, so it asks first.
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
@@ -106,20 +120,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; sqlSource: boolean }) | null>(null);
   const [records, setRecords] = React.useState<RecordsState | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
-  // Years the Gold data actually covers (the payload's `years` is only the
-  // selection echoed back).
-  const [availableYears, setAvailableYears] = React.useState<number[]>([]);
-  React.useEffect(() => {
-    let cancelled = false;
-    void apiFetch("/api/dashboard/values?column=tahun", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((j: { values?: unknown[] }) => {
-        if (!cancelled) setAvailableYears((j.values ?? []).map(Number).filter((n) => Number.isInteger(n)));
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
-
   // Only the newest load may write state. Creating a dashboard fires a
   // reload of the board being left and then navigates to the new one; the
   // old board's response (slower: it runs the built-in tiles) used to land
@@ -130,30 +130,25 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setLoading(true); setError(null);
     try {
       const q = new URLSearchParams({ board });
-      if (year !== "all") q.set("year", year);
-      if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
+      // A parameter that is not a filter list is ignored: the saved default shows.
+      const fromAddress = decodeFilters(fParam);
+      if (fromAddress) q.set("filters", JSON.stringify(fromAddress));
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
       setLayout(json.layout ?? {});
-      if (adoptingRef.current) {
-        filtersRef.current = json.filters ?? [];
-        setFilters(json.filters ?? []);
-        adoptingRef.current = false;
-      }
     } catch (e) {
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [board, year]);
+  }, [board, fParam]);
 
-  // Switching dashboard: adopt that board's saved filters, start in view mode.
-  React.useEffect(() => {
-    adoptingRef.current = true; filtersRef.current = []; setFilters([]); setEdit(false);
-  }, [board]);
+  // Switching dashboard starts in view mode; the switcher navigates without
+  // `f`, so the new board opens on its own default.
+  React.useEffect(() => { setEdit(false); }, [board]);
   // `/dashboards` meneruskan ke board terakhir, jadi membukanya di sinilah
   // yang menentukan "terakhir" — bukan klik di daftar, karena kanvas juga
   // dicapai lewat switcher, tautan bersama dan Copilot.
@@ -173,33 +168,54 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     return () => window.removeEventListener("keydown", h);
   }, [fullscreen]);
 
+  const defaultFilters = data?.defaultFilters ?? NO_FILTERS;
+  // The data on screen was loaded with these; before the first answer the
+  // address (or nothing) is all there is.
+  const filters = React.useMemo(
+    () => decodeFilters(fParam) ?? data?.defaultFilters ?? NO_FILTERS,
+    [fParam, data?.defaultFilters],
+  );
+  const dirty = decodeFilters(fParam) !== null && filtersToParam(filters, defaultFilters) !== null;
+
+  const writeAddress = React.useCallback((param: string | null) => {
+    const q = new URLSearchParams(window.location.search);
+    if (param === null) q.delete(FILTER_PARAM); else q.set(FILTER_PARAM, param);
+    const qs = q.toString();
+    // replace, not push: every click would otherwise add a history entry.
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname]);
+
   const applyFilters = React.useCallback((next: FilterDef[]) => {
-    filtersRef.current = next;
-    setFilters(next);
-    if (!isDefault) {
-      void apiFetch("/api/dashboard/boards", {
-        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, filters: next }),
+    writeAddress(filtersToParam(next, defaultFilters));
+  }, [writeAddress, defaultFilters]);
+
+  const resetFilters = React.useCallback(() => writeAddress(null), [writeAddress]);
+
+  const saveDefault = React.useCallback(async () => {
+    setSavingDefault(true);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: board, filters: normalizeFilters(filters) }),
       });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not save the default filters");
+      }
+      // The saved list now equals the state; dropping `f` reloads onto it.
+      writeAddress(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingDefault(false);
     }
-    void load();
-  }, [board, isDefault, load]);
+  }, [board, filters, writeAddress]);
 
   // Cross-filter: toggle a value in a column → filters EVERY tile with that column.
   const crossFilter = React.useCallback((column: string, value: string) => {
-    const cur = filtersRef.current;
-    const ex = cur.find((f) => f.column === column);
-    let next: FilterDef[];
-    if (ex?.values.includes(value)) {
-      const vals = ex.values.filter((v) => v !== value);
-      next = vals.length ? cur.map((f) => (f.column === column ? { ...f, values: vals } : f)) : cur.filter((f) => f.column !== column);
-    } else if (ex) {
-      next = cur.map((f) => (f.column === column ? { ...f, values: [...f.values, value] } : f));
-    } else {
-      next = [...cur, { column, values: [value] }];
-    }
-    applyFilters(next);
+    applyFilters(toggleValue(filters, column, value));
     setDrill(null);
-  }, [applyFilters]);
+  }, [applyFilters, filters]);
 
   // Drill-down: show the raw Gold rows behind the clicked value.
   const openRecords = React.useCallback(async (mart: string, column: string, value: string) => {
@@ -310,13 +326,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       },
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `Active filters: ${summarizeFilters(filters, year)}. ` +
+        `Active filters: ${summarizeFilters(filters)}. ` +
         `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, kpis, results, filters, year, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, setPageContext]);
 
   // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {
@@ -343,7 +359,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       span: spec.span,
       title: spec.title,
       subtitle: spec.subtitle,
-      hint: drillable ? (
+      hint: (
+        <>
+          {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
+          {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
             <MousePointerClick className="size-3.5" aria-label="Clickable chart" />
@@ -354,7 +373,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               : "Click a bar or slice in the chart to filter the dashboard or see its records"}
           </TooltipContent>
         </Tooltip>
-      ) : null,
+          ) : null}
+        </>
+      ),
       badge: (
         <div className="flex items-center gap-1.5">
           {badge ? (
@@ -369,14 +390,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
       body: (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year}
+        <TileBody spec={spec} cell={cell} dark={dark} loading={loading}
           onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin", sqlSource: !!spec.sqlSource }) : undefined} />
       ),
     };
   });
 
   const dialogSpec = tileDialog ? charts.find((c) => c.id === tileDialog.id) : undefined;
-  const showFilterBar = Boolean(data?.filterColumns?.length || availableYears.length);
+  const filterFields = data?.filterFields ?? NO_FIELDS;
+  const showFilterBar = filterFields.length > 0 || filters.length > 0;
 
   return (
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
@@ -423,13 +445,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
       {showFilterBar ? (
         <div data-print-hide className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/50 px-3 py-2">
-          <DashboardFilters
-            columns={data?.filterColumns ?? []}
+          <FilterBar
+            board={board}
+            fields={filterFields}
             filters={filters}
             onChange={applyFilters}
-            years={availableYears}
-            year={year}
-            onYearChange={setYear}
+            dirty={dirty}
+            canSaveDefault={!isDefault && hasPermission("dashboard:write")}
+            saving={savingDefault}
+            onSaveDefault={() => void saveDefault()}
+            onReset={resetFilters}
           />
         </div>
       ) : null}
@@ -531,7 +556,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />
       ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
-        <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} year={year} onClose={() => setTileDialog(null)} />
+        <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
       ) : null}
 
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}

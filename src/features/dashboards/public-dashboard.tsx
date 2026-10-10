@@ -72,7 +72,7 @@ export function PublicDashboard({ token }: { token: string }) {
     id: spec.id,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} year="all" />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
   }));
 
   return (

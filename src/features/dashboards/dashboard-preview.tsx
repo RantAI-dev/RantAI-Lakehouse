@@ -100,7 +100,7 @@ export function DashboardPreview({
                     {spec.title}
                   </Link>
                   <div className="min-h-0 flex-1">
-                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} year="all" hideLegend />
+                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} hideLegend />
                   </div>
                 </div>
               ))}

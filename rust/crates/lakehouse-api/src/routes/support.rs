@@ -1,8 +1,10 @@
 //! Small helpers shared by the route modules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Display;
 
+use lakehouse_bi::builder::{FilteredSql, RelationColumns};
+use lakehouse_bi::filters::ColumnKind;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -280,10 +282,11 @@ pub(crate) async fn sources_for<'a>(
 }
 
 /// The SQL to run for a stored chart right now: a mart chart through
-/// `sql_with_filters` (unchanged), a SQL-source chart rebuilt from the
-/// source's CURRENT text (`sql_for_sql_source`). `Err` carries a fixed tile
-/// error when the source was deleted or the stored definition no longer
-/// validates — reported on that tile, never replaced by other SQL.
+/// `sql_with_filters_report`, a SQL-source chart rebuilt from the source's
+/// CURRENT text (`sql_for_sql_source_report`), plus the active filters left
+/// out of it. `Err` carries a fixed tile error when the source was deleted
+/// or the stored definition no longer validates — reported on that tile,
+/// never replaced by other SQL.
 ///
 /// # Errors
 ///
@@ -292,46 +295,48 @@ pub(crate) fn stored_chart_sql(
     chart: &store::StoredChartSpec,
     years: &[i64],
     filters: &[store::FilterDef],
-    mart_cols: &HashMap<String, HashSet<String>>,
+    mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
-) -> Result<String, &'static str> {
+) -> Result<FilteredSql, &'static str> {
     let Some(id) = chart.def.sql_source.as_deref() else {
-        return Ok(lakehouse_bi::builder::sql_with_filters(
+        return Ok(lakehouse_bi::builder::sql_with_filters_report(
             chart, years, filters, mart_cols,
         ));
     };
     let source = sources
         .get(id)
         .ok_or("this chart's SQL source no longer exists")?;
-    lakehouse_bi::builder::sql_for_sql_source(
+    lakehouse_bi::builder::sql_for_sql_source_report(
         chart,
         &source.sql,
-        &source.column_names(),
+        &source.column_kinds(),
         years,
         filters,
     )
     .ok_or("this chart's definition is invalid")
 }
 
-/// `SELECT table, name FROM system.columns WHERE database='serving'`,
-/// grouped into a mart → column-set map — used to decide which dashboard
-/// filters apply to which tile.
+/// `SELECT table, name, type FROM system.columns WHERE database='serving'`,
+/// grouped into a mart → column-kinds map — used to decide which dashboard
+/// filters apply to which tile, and whether their op fits the column. The
+/// kind comes from the type, never from the name (BI-18).
 pub(crate) async fn mart_columns(
     ch: &ChClient,
-) -> Result<HashMap<String, HashSet<String>>, ChError> {
+) -> Result<HashMap<String, RelationColumns>, ChError> {
     let rows = ch
         .rows(
-            "SELECT table, name FROM system.columns WHERE database='serving'",
+            "SELECT table, name, type FROM system.columns WHERE database='serving'",
             None,
         )
         .await?;
-    let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut m: HashMap<String, RelationColumns> = HashMap::new();
     for r in &rows {
         let table = r.get("table").and_then(Value::as_str).unwrap_or("");
         let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+        let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
         m.entry(table.to_owned())
             .or_default()
-            .insert(name.to_owned());
+            .insert(name.to_owned(), ColumnKind::from_clickhouse_type(ty));
     }
     Ok(m)
 }

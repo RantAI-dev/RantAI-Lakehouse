@@ -1030,7 +1030,7 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
                 lakehouse_bi::builder::sql_for_sql_source(
                     chart,
                     &s.sql,
-                    &s.column_names(),
+                    &s.column_kinds(),
                     &[],
                     &[],
                 )

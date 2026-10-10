@@ -869,7 +869,7 @@ export function ChartBuilder({
               )}
             </div>
           ) : preview ? (
-            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} year="all" />
+            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
           ) : (

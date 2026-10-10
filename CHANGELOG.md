@@ -10,6 +10,30 @@ once a first release is tagged.
 
 ### Added
 
+- Dashboard filters (backlog `BI-18`, part A). A dashboard can now be filtered
+  on any column of the tables and SQL sources its charts read, not only chart
+  dimensions: a date column by a from-to range or relative to today (last N
+  days, weeks, months, quarters or years, this or the previous period), a
+  number column by a range with either end open or by a list, and a text
+  column by a list of values or by contains, starts with or ends with. Value
+  lists have a search box, say when they were cut at 200 values, narrow as
+  other filters are set, and include values from SQL-source charts (masking
+  and row policies apply as on the tiles). A tile whose data lacks a filtered
+  column is left unfiltered by it and says so. The Year chip is gone: the year
+  is an ordinary number filter. Filters saved before this change keep working.
+  **Behaviour change:** changing a filter no longer saves it to the dashboard.
+  The filters are temporary and kept in the page address, so a copied link
+  opens the same view; **Reset** returns to the default for everyone, and
+  anyone with `dashboard:write` can press **Save as default** on a user
+  dashboard (the built-in Main dashboard cannot save one). Public links and
+  embeds still show the saved default and cannot be changed by the viewer.
+  Limits: relative dates follow the database server's clock and time zone, not
+  the viewer's; one filter applies to every tile that has a column of that
+  name and to no other. `GET /api/dashboard` returns `filterFields`,
+  `defaultFilters` and per-tile `filtersSkipped`; `GET /api/dashboard/values`
+  accepts `q`, `board` and `filters` and returns `truncated`; a malformed
+  `filters` query is now a `400` instead of being ignored.
+
 - Login throttling and session cleanup (backlog `SEC-2`/`SEC-5`).
   `POST /api/auth/login` now throttles failed password attempts per email
   (SHA-256 of the trimmed lower-cased address, stored in a new
