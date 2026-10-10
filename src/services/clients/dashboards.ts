@@ -8,6 +8,7 @@ import type {
   SqlSourcePreview,
   UpdateBoardInput,
 } from "../contracts/dashboards"
+import type { EmbedInfo } from "../contracts/dashboards"
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
 
@@ -191,5 +192,63 @@ export const clickhouseDashboardService: DashboardService = {
       },
       "Dashboard could not be moved"
     )
+  },
+
+  // SEC-12. The server's messages for these are fixed and ours, so they are
+  // shown as they come (`request` carries `error` into the `ServiceError`).
+  async getEmbedInfo(board, signal) {
+    const json = await request<Partial<EmbedInfo>>(
+      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "Embedding state could not be loaded"
+    )
+    return {
+      enabled: Boolean(json.enabled),
+      supported: json.supported !== false,
+      reason: json.reason,
+      sampleToken: json.sampleToken,
+      maxLifetimeSeconds: json.maxLifetimeSeconds ?? 86_400,
+      revokedBefore: json.revokedBefore ?? null,
+      allowedOrigins: json.allowedOrigins ?? [],
+    }
+  },
+  async setEmbedOrigins(board, origins, signal) {
+    const json = await request<{ embedOrigins?: string[] }>(
+      "/api/dashboard/boards",
+      {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ id: board, embedOrigins: origins }),
+        signal,
+      },
+      "Allowed sites could not be saved"
+    )
+    return json.embedOrigins ?? origins
+  },
+  async revokeAllEmbedTokens(board, signal) {
+    const json = await request<{ embedRevokedBefore?: number }>(
+      "/api/dashboard/boards",
+      {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ id: board, embedRevokeAll: true }),
+        signal,
+      },
+      "Embed tokens could not be withdrawn"
+    )
+    return json.embedRevokedBefore ?? 0
+  },
+  async revokeEmbedToken(board, token, signal) {
+    const json = await request<{ withdrawn?: string }>(
+      "/api/dashboard/embed-revoke",
+      {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ board, token }),
+        signal,
+      },
+      "The token could not be withdrawn"
+    )
+    return json.withdrawn ?? ""
   },
 }

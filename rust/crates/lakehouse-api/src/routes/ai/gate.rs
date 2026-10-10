@@ -683,6 +683,36 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:write"));
     }
 
+    /// SEC-9-AC2: the assistant's two SQL tools need the same `query:read`
+    /// Query Studio's route needs, and the refusal names it. `decide` is the
+    /// only thing between a signed-in caller and the tool body, so a refusal
+    /// here is a refusal before any engine is contacted.
+    #[test]
+    fn the_sql_tools_are_refused_without_query_read_and_name_the_permission() {
+        let without = [
+            PermissionSet::default(),
+            PermissionSet::parse("catalog:read"),
+        ];
+        for tool in ["run_sql", "run_saved_query"] {
+            for perms in &without {
+                let refused = decide_by_name(true, Some(perms), tool, &no_args())
+                    .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
+                assert_eq!(refused["reason"], json!("permission"), "{tool}");
+                assert_eq!(refused["required"], json!("query:read"), "{tool}");
+            }
+            assert_eq!(
+                decide_by_name(
+                    true,
+                    Some(&PermissionSet::parse("query:read")),
+                    tool,
+                    &no_args()
+                ),
+                None,
+                "{tool} must be allowed with query:read"
+            );
+        }
+    }
+
     /// Absent-principal case (fail closed): with no principal at all,
     /// every tool with a non-empty permission is refused, even in build
     /// mode.

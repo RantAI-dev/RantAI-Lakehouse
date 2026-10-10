@@ -46,6 +46,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── POST /api/ai/build-status ───────────────────────────────────────────
 
@@ -89,7 +90,17 @@ pub async fn build_status(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": err.to_string(), "status": "unknown", "steps": [] })),
+            ApiJson({
+                let mut body = upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Unavailable,
+                    &err,
+                )
+                .to_json();
+                body["status"] = json!("unknown");
+                body["steps"] = json!([]);
+                body
+            }),
         )
             .into_response(),
     }
@@ -1159,7 +1170,6 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
 fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
-    tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
@@ -1177,8 +1187,16 @@ fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
 
 /// The fixed 503 body for a Copilot LLM failure.
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    // SEC-11: the provider's text is logged under a reference the user can
+    // quote (`errorId`), not shown.
+    let class = match err {
+        lakehouse_llm::LlmError::Transport(_) => upstream_error::Class::Unavailable,
+        lakehouse_llm::LlmError::Api(_) => upstream_error::Class::Failed,
+    };
+    let failure = upstream_error::report(&upstream_error::MODEL, class, err);
     json!({
         "error": "AI Copilot is unavailable",
+        "errorId": failure.reference(),
         "detail": llm_error_detail(err),
         "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
     })
@@ -1357,10 +1375,19 @@ fn owner_key(principal: &Principal) -> String {
     principal.id.uuid().to_string()
 }
 
+/// A `500` for a failed chat-session read or write. The session store is
+/// `ClickHouse`; its text goes to the log under the reference (SEC-11).
 fn internal(err: &impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        ApiJson(json!({ "error": err.to_string() })),
+        ApiJson(
+            upstream_error::report(
+                &upstream_error::DATABASE,
+                upstream_error::Class::Failed,
+                err,
+            )
+            .to_json(),
+        ),
     )
         .into_response()
 }
@@ -1637,7 +1664,7 @@ pub async fn sessions_save(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
 
     let requested = parsed
         .id
@@ -1646,7 +1673,7 @@ pub async fn sessions_save(
         Some(id) => {
             let row = session_row(ch, &owner, id)
                 .await
-                .map_err(|err| ApiError::Internal(err.to_string()))?;
+                .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
             // Never overwrite someone else's session under its id.
             Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
         }
@@ -1696,7 +1723,7 @@ pub async fn sessions_save(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1736,10 +1763,10 @@ pub async fn sessions_rename(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     let row = session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
     let field = |k: &str| {
         row.get(k)
@@ -1760,7 +1787,7 @@ pub async fn sessions_rename(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1801,10 +1828,10 @@ pub async fn sessions_delete(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .is_none()
     {
         return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
@@ -1822,7 +1849,7 @@ pub async fn sessions_delete(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -2402,6 +2429,7 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("1016"), "{text}");
         assert!(!text.contains("upstream-secret-detail"), "{text}");
+        assert!(body["errorId"].is_string(), "{text}");
         assert_eq!(
             body["detail"],
             "The AI service returned an error (HTTP 530). Try again later."

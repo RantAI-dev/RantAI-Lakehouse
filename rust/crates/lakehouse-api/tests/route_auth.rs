@@ -1006,6 +1006,33 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
     );
 }
 
+/// SEC-9: the natural-language box in Query Studio has no endpoint of its
+/// own. The old `/api/agent*` ask and text-to-SQL routes ran model-written SQL
+/// straight against the engine; #78 removed them, and the assistant now runs
+/// SQL only through the tool gate (`/api/ai/chat`, `/api/ai/tool`). A route
+/// of that shape coming back would be a path around the gate, so it fails
+/// here by name.
+#[test]
+fn no_route_runs_model_written_sql_outside_the_assistant_tool_gate() {
+    for (method, path, _) in POLICY_TABLE {
+        let lower = path.to_ascii_lowercase();
+        assert!(
+            lower != "/api/agent" && !lower.starts_with("/api/agent/"),
+            "{method} {path}: a standalone agent endpoint (SEC-9)"
+        );
+        assert!(
+            !lower.contains("text-to-sql")
+                && !lower.contains("text_to_sql")
+                && !lower.contains("nl2sql"),
+            "{method} {path}: a text-to-SQL endpoint (SEC-9)"
+        );
+        assert!(
+            !(lower.starts_with("/api/ai/") && lower.contains("sql")),
+            "{method} {path}: an AI route that names SQL outside the tool gate (SEC-9)"
+        );
+    }
+}
+
 /// Every route the router actually registers must have a `POLICY_TABLE`
 /// entry — the direction the two loops above do NOT cover.
 ///
@@ -1274,5 +1301,29 @@ async fn delete_session_writes_an_audit_event() {
         "resource_id must be the UUID string of the session that was \
          revoked (the request path's {{id}}, never the caller's bearer \
          token)"
+    );
+}
+
+/// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
+/// policies the plan names, so the table-driven loops above walk them both
+/// ways (a `dashboard:read`-only principal is refused on the withdrawal; the
+/// frame answer is reachable with no credentials at all).
+#[test]
+fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(
+        policy_of("POST", "/api/embed/frame"),
+        Some(Policy::Public),
+        "the frame answer is read by the console's proxy with only the embed token"
+    );
+    assert_eq!(
+        policy_of("POST", "/api/dashboard/embed-revoke"),
+        Some(Policy::RequiresPermission("dashboard:write")),
+        "withdrawing a token is a write"
     );
 }

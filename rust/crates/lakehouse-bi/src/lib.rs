@@ -5,6 +5,7 @@
 //! This crate is a library only — no axum routes are wired here.
 
 pub mod builder;
+pub mod embed_access;
 pub mod filters;
 pub mod folders;
 pub mod sources;

@@ -48,7 +48,7 @@ use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarg
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::js_error;
+use crate::routes::support::upstream_message;
 use crate::state::AppState;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -3135,7 +3135,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// out: `Err` is reserved for transport failures and malformed GraphQL
 /// responses. This handler branches the identical way: `outcome.error`
 /// present becomes a 422 naming that error; `Err(err)` becomes a 503,
-/// classified through [`js_error`] the same way `trigger`'s own 503
+/// classified through [`upstream_message`] the same way `trigger`'s own 503
 /// branch is (`DgError`'s `Display` is already sanitized — see that
 /// type's doc comment — so this is not a fourteenth Phase-1
 /// `ApiError::Internal(err.to_string())` leak).
@@ -3175,7 +3175,7 @@ pub async fn ingest_run(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     if let Some(active) = connector_runs(&recent, &id)
         .into_iter()
         .find(ConnectorIngestRun::is_active)
@@ -3201,11 +3201,12 @@ pub async fn ingest_run(
     {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
-                return Err(ApiError::Unprocessable(error).into());
+                // SEC-11: Dagster's launch message is the orchestrator's own text.
+                return Err(ApiError::Unprocessable(upstream_message(error)).into());
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
-        Err(err) => Err(ApiError::Unavailable(js_error(err)).into()),
+        Err(err) => Err(ApiError::Unavailable(upstream_message(err)).into()),
     }
 }
 
@@ -3283,7 +3284,7 @@ pub async fn ingest_run_history(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     Ok(ApiJson(connector_runs(&runs, &id)))
 }
 

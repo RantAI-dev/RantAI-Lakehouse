@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 
 use crate::health;
 use crate::json::ApiJson;
-use crate::routes::support::{js_error, num_or_zero, str_col};
+use crate::routes::support::{num_or_zero, str_col, upstream_message};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::DgError;
@@ -76,7 +76,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
             // `{ error: String(e) }` at 503.
             Err(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response(),
         },
@@ -434,7 +434,7 @@ pub async fn cancel_workload(State(state): State<AppState>, Path(id): Path<Strin
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }

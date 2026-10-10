@@ -1042,6 +1042,24 @@ pub(crate) async fn resolve_checked(
     check_addrs(host, addrs, internal_hosts)
 }
 
+/// The first of `addrs` that [`is_blocked_ip`] refuses and `internal_hosts`
+/// does not permit, if any: the one address policy, shared by the connector
+/// dials and the alert webhook sender (`SEC-10`, `webhook_guard`) so there
+/// is a single implementation of what "internal" means. `allow_all` skips
+/// the check entirely, as it always has.
+pub(crate) fn first_refused(
+    addrs: &[std::net::SocketAddr],
+    internal_hosts: &InternalHosts,
+) -> Option<IpAddr> {
+    if internal_hosts.allow_all {
+        return None;
+    }
+    addrs
+        .iter()
+        .map(std::net::SocketAddr::ip)
+        .find(|ip| is_blocked_ip(ip) && !internal_hosts.permits(ip))
+}
+
 /// The decision half of [`resolve_checked`], on addresses already resolved:
 /// separate so the mixed-answer case (one public and one internal address)
 /// can be tested without a resolver.
@@ -1054,17 +1072,13 @@ fn check_addrs(
         tracing::warn!(%host, "SEC-15: connector host resolved to no address");
         return Err(format!("host {host:?} did not resolve to any address"));
     };
-    if !internal_hosts.allow_all {
-        for addr in &addrs {
-            if is_blocked_ip(&addr.ip()) && !internal_hosts.permits(&addr.ip()) {
-                tracing::warn!(
-                    %host,
-                    resolved = %addr.ip(),
-                    "SEC-15: refused a connector host that resolves to an internal address"
-                );
-                return Err(refused_internal_message(host));
-            }
-        }
+    if let Some(refused) = first_refused(&addrs, internal_hosts) {
+        tracing::warn!(
+            %host,
+            resolved = %refused,
+            "SEC-15: refused a connector host that resolves to an internal address"
+        );
+        return Err(refused_internal_message(host));
     }
     Ok(Approved {
         primary,

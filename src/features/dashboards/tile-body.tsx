@@ -2,12 +2,14 @@
 
 import * as React from "react";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
+import { ErrorWithReference } from "@/components/error-reference";
+import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, fmtInt } from "./chart-option";
 import { GeoChart } from "./geo-chart";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<string, unknown>[] } {
   return !!c && "rows" in c;
 }
@@ -33,7 +35,11 @@ export function TileBody({
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
   if (cell && "error" in cell) {
-    return <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">{cell.error}</p>;
+    return (
+      <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">
+        <ErrorWithReference message={cell.error} errorId={cell.errorId} />
+      </p>
+    );
   }
   if (loading && !cell) return <div className="h-full animate-pulse rounded bg-muted/40" />;
 

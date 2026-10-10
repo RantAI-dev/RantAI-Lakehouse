@@ -66,12 +66,13 @@ use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
         match err {
-            GoldExportError::ClickHouse(e) => Self::from(e),
+            GoldExportError::ClickHouse(e) => upstream_error::ch_error(&upstream_error::DATABASE, &e),
             GoldExportError::UnsupportedColumn { .. }
             | GoldExportError::Batch(_)
             // The mart is over `GOLD_EXPORT_MAX_ROWS` — a well-formed
@@ -85,7 +86,11 @@ impl From<GoldExportError> for ApiError {
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
-            GoldExportError::Iceberg(e) => Self::Internal(e.to_string()),
+            // SEC-11: the Iceberg writer's text (catalog URLs, object keys)
+            // goes to the log under a reference, not into the body.
+            GoldExportError::Iceberg(e) => {
+                upstream_error::internal_error(&upstream_error::CATALOG, &e)
+            }
         }
     }
 }
@@ -155,10 +160,10 @@ async fn unchanged_since_last_export_reason(
     let last_changed_at =
         mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(if_changed_skip_reason(last_changed_at, last_exported_at))
 }
 
@@ -557,7 +562,7 @@ pub async fn exports(
 
     let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
 
     Ok(ApiJson(
         json!({ "mart": mart_ident.as_str(), "runs": runs }),
@@ -688,10 +693,10 @@ async fn publication_body(
     let last_changed_at =
         mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
@@ -873,7 +878,7 @@ pub async fn set_publication(
         mart_ident.as_str(),
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     if !exists {
         return Err(ApiError::NotFound(format!(
             "mart {:?} does not exist in {}",

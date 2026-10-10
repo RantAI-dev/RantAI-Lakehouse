@@ -8,6 +8,7 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import type { FilterSkip } from "@/services/clients/bi-store";
 import { TileBody } from "./tile-body";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
 export type Rows = {
   columns: string[];
@@ -15,7 +16,7 @@ export type Rows = {
   /** Active filters this tile's data could not honour (BI-18). */
   filtersSkipped?: FilterSkip[];
 };
-export type Cell = Rows | { error: string };
+export type Cell = Rows | TileFailure;
 
 export function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;

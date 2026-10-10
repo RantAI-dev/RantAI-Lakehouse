@@ -245,7 +245,16 @@ async fn ingest_run_dagster_launch_failure_is_422_not_200() {
         .await
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    assert_eq!(body["error"], "job not found");
+    // SEC-11: this used to assert that Dagster's own message ("job not
+    // found") reached the body; that asserted the bug. The body now carries
+    // a fixed sentence and a reference, and the orchestrator's text is only
+    // in the log.
+    let message = body["error"].as_str().expect("an error message");
+    assert!(
+        message.starts_with("The request to a backing service failed. Reference: "),
+        "{message}"
+    );
+    assert!(!message.contains("job not found"), "{message}");
 }
 
 /// A second run while this connector's run is still going is refused with

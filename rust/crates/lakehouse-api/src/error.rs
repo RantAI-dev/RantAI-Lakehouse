@@ -259,14 +259,19 @@ mod tests {
         );
     }
 
-    /// End-to-end path every data route depends on: a `ClickHouse` failure
-    /// converts through `?` into a 422 rejection with the `ClickHouse`
-    /// message intact.
+    /// SEC-11: the end-to-end path a data route takes for a `ClickHouse`
+    /// failure. It used to convert through `?` into a 422 with the
+    /// database's own message intact (`Code: 47. Unknown identifier: nope`,
+    /// asserted here); that asserted the bug. There is no `From<ChError>` any
+    /// more, so the route reports it explicitly and the body carries only the
+    /// fixed message and a reference.
     #[tokio::test]
-    async fn ch_error_converts_through_question_mark_to_422_rejection() {
+    async fn ch_error_reaches_the_body_as_a_fixed_message_with_a_reference() {
         fn handler() -> Result<(), ApiRejection> {
-            Err(ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
+            let err = ChError::Server("Code: 47. Unknown identifier: planted-marker".to_owned());
+            Err(crate::upstream_error::ch_error(
+                &crate::upstream_error::DATABASE,
+                &err,
             ))?;
             Ok(())
         }
@@ -274,10 +279,10 @@ mod tests {
         let rejection = handler().unwrap_err();
         let resp = rejection.into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            body_json(resp).await,
-            json!({"error": "Code: 47. Unknown identifier: nope"})
-        );
+        let body = body_json(resp).await;
+        let message = body["error"].as_str().unwrap();
+        assert!(message.starts_with("The database request failed. Reference: "));
+        assert!(!message.contains("planted-marker"));
     }
 
     /// `OpenfgaError::Rejected` (Lakekeeper reached, our request refused)

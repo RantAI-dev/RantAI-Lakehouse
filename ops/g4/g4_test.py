@@ -123,7 +123,13 @@ def step_seed_wal_alert_rule() -> None:
             "op": ">",
             "threshold": 0,
             "channel": "webhook",
-            "target": "http://127.0.0.1:1/g4-webhook-sink",
+            # A sink nothing listens on. It was `http://127.0.0.1:1/...`, which
+            # SEC-10 now refuses when the rule is saved (loopback can never be
+            # allow-listed, by design). 192.0.2.0/24 is TEST-NET-1, reserved
+            # for documentation and never routed, so this is still a dead
+            # target, but one the address check admits: the delivery fails
+            # at connect, as it did before.
+            "target": "http://192.0.2.1:9/g4-webhook-sink",
             "severity": "critical",
         },
         timeout=10,
