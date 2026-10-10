@@ -61,4 +61,84 @@ Per task: `cargo fmt --check`, `cargo clippy -p <crate> --all-targets -- -D warn
 
 ## 6. Handoff (developer appends)
 
+### Partial notes (developer, uncommitted)
+
+- 2026-10-10 T1 done (not committed): `lakehouse-bi/src/tables.rs` (new: `TableFields` flattened into `ChartInput`, `ColumnSetting`, `PivotValue`, `Compare`, `plan_rows`/`rows_sql`, `plan_pivot`/`pivot_sql` with `GROUPING SETS` and `grouping()` flags, `plan_compare`/`kpi_trend_sql`), `ChartKind::Pivot`, `builder.rs` (`rebuild` dispatches the three shapes, `FilteredSql.table`, `rows_page_sql`), `store.rs` (save-time validation, `spec_from_rows_input`, `spec_from_pivot_input`, KPI comparison), `grain.rs` (`Pivot` takes a grain). `cargo test -p lakehouse-bi`: 204 lib + 1 pass; clippy `-p lakehouse-bi --all-targets -D warnings` clean.
+- 2026-10-10 T2 done (not committed): API (`records` route takes `columns`/`sortColumn`/`sortDir`; `support::annotate_table` adds `total`/`limit`/`offset` to a raw table's tile and cuts a pivot at its cap with `truncated`; embed and public use it; preview and SQL-source preview annotate; YAML export lists the new fields; `create_chart`/`update_chart` schemas and `tool_schemas.json` regenerated, `pivot` added to the kind enum). Focused API tests pass (24, including a masked/sorted raw-table page); the single `--lib` and `route_auth`/`sec11_guard` runs are still to do at the end.
+- 2026-10-10 T3 to T6 done (not committed): lib (`table-types.ts`, `cell-format.ts`, `pivot.ts`, `kpi-compare.ts`, `table-draft.ts`, each with a test file: 13 + 9 + 9 + 9), features (`raw-table.tsx`, `pivot-table.tsx`, `kpi-card.tsx`, `table-cell.tsx`, `table-settings.tsx`; `tile-body.tsx`, `chart-builder.tsx`, `drill.tsx`, `records.ts`, `dashboard-page.tsx` edited; `rows-table.tsx` takes an optional `onRowClick`), tests `table-tiles.test.tsx` (22) and three new `drill.test.tsx` tests (30 pass in the two files). `bun run typecheck` clean, `bun run lint` 0 errors and the same 6 warnings as before. T7 (CHANGELOG) written. The handoff and the final single runs follow.
+
+### BI-16 part A, T1 to T7 — handoff (developer, 2026-10-10, uncommitted)
+
+Nothing is committed, pushed or stashed. No migration, no Postgres change.
+
+**Files by task**
+
+- T1 `lakehouse-bi`: `src/tables.rs` (new), `src/builder.rs`, `src/store.rs`, `src/grain.rs`, `src/specs.rs` (`ChartKind::Pivot`), `src/lib.rs`.
+- T2 `lakehouse-api`: `src/routes/dashboard.rs` (records route, YAML export, tests), `src/routes/support.rs`, `src/routes/embed.rs`, `src/routes/dashboard_sources.rs`, `src/routes/ai/registry.rs`, `tests/fixtures/tool_schemas.json`.
+- T3 to T5 console: `src/lib/{table-types,cell-format,pivot,kpi-compare,table-draft}.ts` (+ tests), `src/features/dashboards/{raw-table,pivot-table,kpi-card,table-cell,table-settings}.tsx`, `tile-body.tsx`, `chart-builder.tsx`, `dashboard-page.tsx`, `records.ts`, `tile-dialogs.tsx`, `src/lib/{dashboard-specs,time-grain,chart-click,preview-key}.ts`, `src/services/clients/bi-store.ts`.
+- T6: `drill.tsx` (one-record view), `src/components/patterns/rows-table.tsx` (optional `onRowClick`).
+- T7: `CHANGELOG.md` `[Unreleased]`.
+
+**Commands run, with counts (all in the foreground)**
+
+- `cargo fmt --check -p lakehouse-bi -p lakehouse-api`: clean (I ran `cargo fmt -p` on both; the HEAD versions of every file I touched were already rustfmt-clean, so only my hunks moved).
+- `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` and `-p lakehouse-api --all-targets -- -D warnings`: clean (after `touch` of each `lib.rs`).
+- `cargo test -p lakehouse-bi`: 210 lib + 1 pass.
+- `cargo test -p lakehouse-api --lib`: 1574 passed, 0 failed, 1 ignored (the fixture writer). Before the plan: 1568.
+- `cargo test -p lakehouse-api --test route_auth --test sec11_guard`: 32 + 4 pass. No route was added, so `POLICY_TABLE` is unchanged.
+- `cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored` (once): regenerated `tool_schemas.json` (+170 lines: the new properties on both chart tools and `pivot` in the kind enum; nothing removed).
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings (the same six as before). Full `bun run test`: 1201 pass, 1 skip, 0 fail (1202 tests, 134 files). Before: 1145.
+
+**Real-engine statements (ClickHouse 26.8.9.10, read-only, no scratch objects created)**
+
+- Rows mode, sort and filter: `SELECT place, provinsi, visitors FROM serving.mart_demo_map_points WHERE provinsi IN ('Jawa Barat','Bali') ORDER BY visitors DESC, place, provinsi, visitors LIMIT 5 OFFSET 0` returned Bandung #4 2224, Denpasar #4 2207, Bandung #3 2137, Bogor #7 2035, Bogor #6 1955; the count statement over the same `WHERE` returned 17. Last page: `ORDER BY visitors DESC, place, visitors LIMIT 3 OFFSET 234` returned 3 rows (47, 47, 44) and `count()` was 237. The same shape over a derived table with the `SETTINGS` cap ran and returned 38 rows for `visitors > 2000`.
+- Pivot, rows `provinsi, category`, column `visit_date` bucketed by quarter (and by month), `all` totals: `SELECT provinsi, category, m, sum(visitors) AS __v0, count() AS __v1, grouping(provinsi) AS __g0, grouping(category) AS __g1, grouping(m) AS __g2 FROM (SELECT date_trunc('quarter', visit_date) AS m, provinsi, category, visitors FROM (SELECT * FROM serving.mart_demo_map_points WHERE visitors > 0) AS flt) AS bkt GROUP BY GROUPING SETS (...) ORDER BY grouping(provinsi, category, m) DESC, provinsi, category, m`. The first row (all flags 1) is `278955 / 237`, equal to `SELECT sum(visitors)` and `count()` on the table; per-quarter totals 18148 / 51437 / 47943 / 60020 / 58350 / 43057 add to 278955. With `avg` the grand total is 1177.0253164556962, equal to the table's own average. The same statement over a SQL-source derived table with the cap returned 717 rows.
+- Total rows: on 26.8 a rolled-up `Nullable` key prints as `NULL` and a rolled-up `String` or `Date` key as its default (`''`, `1970-01-01`); a real `NULL` group has `grouping() = 0` (probe: `GROUP BY GROUPING SETS ((k),())` over a `Nullable(String)` with real nulls gave `\N 21 g=1` for the total and `\N 9 g=0` for the real null group). So neither null nor empty can mark a total: the `__g<j>` flags do, and the console reads only them.
+- KPI previous period on a `Date`: `SELECT * FROM (SELECT visit_date, round(sum(visitors)) AS v FROM (SELECT date_trunc('month', visit_date) AS visit_date, visitors FROM (SELECT * FROM serving.mart_demo_map_points WHERE provinsi IN ('Bali','Jawa Barat')) AS flt) AS bkt WHERE visit_date IS NOT NULL GROUP BY visit_date ORDER BY visit_date DESC LIMIT 12) ORDER BY visit_date` returned ten monthly rows, oldest first, the last two 2026-10-01 6511 and 2026-11-01 629. On a `DateTime('UTC')` (`serving.mart_demo_events`, `date_trunc('week', toTimeZone(event_time, 'Asia/Jakarta'))`): ten weeks, 2026-07-27 655 to 2026-09-28 888, last two 2683 and 888. On a quarter bucket over a SQL-source derived table: six rows.
+- A raw table and the role rewrite: the unit test `a_raw_table_page_masks_a_listed_and_a_sorted_column` (real policy row in Postgres, wiremock `ClickHouse`) lists a masked column and sorts by it; every statement sent, page and count, carries the `replaceRegexpOne(toString(`email`)...)` mask. Not run against a real masked mart.
+- Console CSP: the console sets a `Content-Security-Policy` only on `/embed/*`, and it holds `frame-ancestors` and nothing else (`src/proxy.ts`, `src/lib/embed-frame.ts`); there is no `img-src`, so an `https` image loads. Nothing loosened.
+
+**CSV export of a raw table:** `downloadRowsCsv` writes the tile's `columns` and `rows` as they came, so for a raw table it is the first page of 50 rows with every listed column, hidden ones included. Unchanged code. Whether a whole-result export is wanted is a decision for the planner (it would be a new route or a paged client loop).
+
+**Existing tests changed**
+
+- `src/lib/preview-key.test.ts`: `base` gained `tables: ""`. The test asserts that every input changes the key; the key has a new input (the table, pivot and comparison fields), so `base` had to list it. No assertion removed.
+- `tests/fixtures/tool_schemas.json` regenerated by the existing ignored writer for a reviewed schema change (additions only).
+- `src/features/dashboards/drill.test.tsx`: three tests added; none changed. `rows-table.tsx` gained an optional prop; its other uses are unchanged.
+
+**Deviations and choices where the plan was silent**
+
+1. The new fields are one `TableFields` struct flattened into `ChartInput` (`ChartInput.tables`); the wire shape is flat camelCase, as the plan says. A chart saved before reads back with every one absent.
+2. `columns` means the listed columns of a raw table and, on a pivot, its column fields; `rows` is the pivot's row fields. A raw table or a pivot refuses `dimension`, `measures` and `breakdown`, and a kind refuses a field it does not take (as `lat`/`lon` are refused).
+3. Totals: `grand` = every row total, every column total and the corner; `all` = a total for every leading prefix of the row fields and of the column fields (rows `[p, k]`, columns `[m]` gives six grouping sets). Subtotals fold in the console only with `all`, because a folded group stays in view as its subtotal.
+4. A pivot carries one `grain`, applied to the first date or timestamp field among rows then columns; the dashboard's grain switch applies to a pivot like any other grained chart (a pivot is never cut to its "latest buckets"). `count` in a pivot is `count()` and ignores its column.
+5. Cell cap: 10,000 divided by the number of values, long-format rows, and below 2,000 over a SQL source so `ClickHouse` never cuts by itself; the statement asks for one row more and the API trims and sets `truncated: true`. Totals are ordered first so the cut falls on body cells.
+6. A raw table's later pages and header sort go through the existing records route (`columns`, `sortColumn`, `sortDir`), over the same `filter_predicates`. The records route ignores the legacy `year` query parameter, which the console never sends; the tile statement applies it.
+7. The dashboard payload gives the raw table `total`, `limit` and `offset`; if the count statement fails it is logged and `total` is left out, and the tile then shows its rows and no paging. Embeds and public links show the first page and "First N of M rows". The builder preview shows the first page without a total.
+8. KPI "previous period" is the last two periods that have data (a month with no rows is skipped, so "previous" can be two months back); the trend line is up to 12 such periods. The KPI value in that mode is the latest period's, not the whole table's.
+9. `percent` format reads the value as a ratio (0.25 is 25%); `currency` is `Intl` `id-ID` IDR with 0 decimals unless set; `date` shows the calendar day only.
+10. Column settings keys must be columns of the relation; for a grouped table the builder offers the dimension and the measure.
+
+**Not verified**
+
+- Nothing was seen in a browser. The builder dialog is not rendered by any test (as for BI-9); `previewKey` includes the table fields and the draft conversions are pinned by `table-draft.test.ts`.
+- The workspace-wide clippy and test, the other `lakehouse-api` integration test files, `docker compose`, and the gates (CI runs them).
+- A raw table, pivot or comparing KPI on an embed or a public link end to end (only the shared `annotate_table` path is covered by the dashboard payload tests).
+- A pivot over a real masked mart; a SQL-source chart through the browser; the assistant making a pivot from the quoted request (`AI-5-AC1`).
+- `docs/core/PRODUCT.md` and `BACKLOG.md` were not touched (planner's).
+
+**To check in a browser**
+
+1. New chart > Data table > Raw rows on a 237-row mart: pick, reorder and remove columns; the preview shows the first rows; save. The tile pages to the last row and its footer says 237; the header sorts across pages and returns to page 1.
+2. Edit that table: set one column to currency, hide one, swap two; save and reload; they stay. Add a link column holding `javascript:` and `https:` values: only the `https:` one is an anchor.
+3. An image column: an `https` URL shows a small image; an `http` one shows its text.
+4. A dashboard filter set before opening the table: the table, its total and its pages follow it; clear it and they follow that.
+5. New chart > Pivot table: rows province and category, column a month (Group by month), value sum of visitors, Totals and subtotals. The grand total equals the sum of the table; a folded province keeps its subtotal; the corner cell is the grand total. Change Totals to None and Grand and check the total rows and columns go.
+6. A pivot with five values over a big table: the tile says it was cut at 10,000 cells; the dashboard's "Group dates by" switch regroups a pivot that has a date field.
+7. KPI > Compare with Previous period on a date column, Month: the number is the latest month, the change shows an amount, a percent, an arrow, green; Better when Down is good turns it red. A previous value of zero shows the amount only. Compare with Goal shows the percent of the goal and the distance.
+8. In a records list (View records on a chart or a table), click a row: the one-record view lists every field; Next from row 50 lands on row 51 of page two; Previous goes back; Back returns to the page.
+9. Export YAML (Dashboard menu) lists the new fields for a raw table, a pivot and a comparing KPI.
+10. A user without `dashboard:write` cannot save any of it; a failing preview or page shows the sentence and reference, not database text.
+11. Ask the assistant: "Show this as a pivot table with totals."
+
 ## 7. Review (planner appends)

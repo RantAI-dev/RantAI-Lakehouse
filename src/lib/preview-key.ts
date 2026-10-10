@@ -11,6 +11,8 @@ export type PreviewInputs = {
   mapId: string; lat: string; lon: string; aggregate: string; span: number
   caption: string; target: string; text: string; order: string; limit: number
   targetBoard: string; grain: string
+  /** The fields of raw tables, pivots and KPI comparisons as they would be sent (BI-16 part A). */
+  tables: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {

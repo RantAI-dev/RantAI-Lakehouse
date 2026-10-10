@@ -81,4 +81,52 @@ describe("RecordsDialog", () => {
     render(<RecordsDialog request={null} onClose={() => {}} />)
     expect(screen.queryByText(/Records/)).toBeNull()
   })
+
+  // BI-16 part A: a row opens as one record, and Previous / Next walk the whole list.
+  it("opens a row as one record with every field, and Back returns to the same page", async () => {
+    stubPages(58)
+    render(<RecordsDialog request={REQUEST} onClose={() => {}} />)
+
+    await screen.findByText("1–50 of 58")
+    fireEvent.click(screen.getByText("row-3"))
+
+    await screen.findByText("Record 3 of 58")
+    expect(screen.getByText("n")).toBeTruthy()
+    expect(screen.getByText("row-3")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: /Back to the list/ }))
+    await screen.findByText("1–50 of 58")
+    expect(screen.getByText("row-50")).toBeTruthy()
+  })
+
+  it("walks Next across a page boundary and Previous back over it", async () => {
+    const urls = stubPages(58)
+    render(<RecordsDialog request={REQUEST} onClose={() => {}} />)
+
+    await screen.findByText("1–50 of 58")
+    fireEvent.click(screen.getByText("row-50"))
+    await screen.findByText("Record 50 of 58")
+
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }))
+    await screen.findByText("Record 51 of 58")
+    expect(screen.getByText("row-51")).toBeTruthy()
+    expect(urls.at(-1)).toContain("offset=50")
+
+    fireEvent.click(screen.getByRole("button", { name: /Previous/ }))
+    await screen.findByText("Record 50 of 58")
+    expect(screen.getByText("row-50")).toBeTruthy()
+    expect(urls.at(-1)).toContain("offset=0")
+  })
+
+  it("stops at the first and the last record of the whole list", async () => {
+    stubPages(2)
+    render(<RecordsDialog request={REQUEST} onClose={() => {}} />)
+
+    await screen.findByText("1–2 of 2")
+    fireEvent.click(screen.getByText("row-1"))
+    await screen.findByText("Record 1 of 2")
+    expect((screen.getByRole("button", { name: /Previous/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }))
+    await screen.findByText("Record 2 of 2")
+    expect((screen.getByRole("button", { name: /Next/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
 })

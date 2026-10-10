@@ -77,7 +77,7 @@ export type DrillValue = {
  * gauge are one number or a list, not a mark per value: those offer the
  * rows behind the whole tile instead ({@link offersTileRecords}).
  */
-const NO_VALUE_KINDS: ReadonlySet<ChartKind> = new Set(["geoheat", "table", "kpi", "gauge", "text"])
+const NO_VALUE_KINDS: ReadonlySet<ChartKind> = new Set(["geoheat", "table", "pivot", "kpi", "gauge", "text"])
 
 /**
  * Whether a click on this chart can ever name a value. A built-in line or
@@ -98,7 +98,7 @@ export function kindHasClickValue(kind: ChartKind): boolean {
 
 /** Whether the tile's menu offers "View records" for the whole tile. */
 export function offersTileRecords(kind: ChartKind): boolean {
-  return kind === "kpi" || kind === "gauge" || kind === "table" || kind === "geoheat"
+  return kind === "kpi" || kind === "gauge" || kind === "table" || kind === "pivot" || kind === "geoheat"
 }
 
 const firstY = (y: string | string[]) => (Array.isArray(y) ? y[0] ?? "" : y)

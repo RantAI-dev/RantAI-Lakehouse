@@ -345,7 +345,8 @@ impl Grain {
             | ChartKind::Rose
             | ChartKind::Funnel
             | ChartKind::Treemap
-            | ChartKind::Radar => true,
+            | ChartKind::Radar
+            | ChartKind::Pivot => true,
             _ => false,
         }
     }

@@ -33,6 +33,9 @@ import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
 import { ClickSetting } from "./click-setting";
+import { KpiCompareSection, PivotSection, TableSection, type SourceColumns } from "./table-settings";
+import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableDraft } from "@/lib/table-draft";
+import type { TableDefFields } from "@/lib/table-types";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
@@ -61,7 +64,7 @@ export type ChartDef = {
   click?: ChartClick;
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
   grain?: string;
-};
+} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
 type BoardOpt = { id: string; name: string };
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
@@ -115,6 +118,7 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
   ] },
   { group: "Other", items: [
     { value: "table", label: "Data table" },
+    { value: "pivot", label: "Pivot table" },
     { value: "text", label: "Text / note" },
   ] },
 ];
@@ -172,7 +176,7 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   pointmap: "Plot locations as points sized and coloured by a value",
   geoheat: "Show where locations are concentrated",
   kpi: "Highlight one important number", gauge: "Track a value against a target",
-  table: "Inspect detailed rows and values", text: "Add context, notes, or instructions",
+  table: "Inspect detailed rows and values", pivot: "Cross-tabulate with totals and subtotals", text: "Add context, notes, or instructions",
   sankey: "Show how a total flows from one dimension to another",
   sunburst: "Break each category into its parts, as rings",
   boxplot: "Compare the spread of a measure across categories",
@@ -187,6 +191,8 @@ const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
   geomap: "map peta region wilayah choropleth spatial geo",
   pointmap: "map peta points titik lokasi bubble spatial geo",
   geoheat: "map peta heatmap density kepadatan spatial geo",
+  pivot: "pivot cross tab crosstab matrix totals subtotals",
+  table: "table rows raw columns grid",
 };
 function kindIcon(kind: ChartKind): LucideIcon {
   if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
@@ -201,7 +207,7 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (kind === "boxplot") return ChartCandlestick;
   if (kind === "calendar") return CalendarDays;
   if (kind === "kpi" || kind === "gauge") return Gauge;
-  return kind === "table" ? Table2 : Type;
+  return kind === "table" || kind === "pivot" ? Table2 : Type;
 }
 /** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
 const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
@@ -283,6 +289,8 @@ export function ChartBuilder({
   // Whether the person (or a saved chart) set the limit, so choosing a grain
   // only replaces the untouched default (BI-9 review fix R2).
   const [limitTouched, setLimitTouched] = React.useState(false);
+  // Raw table, pivot and KPI comparison settings (BI-16 part A).
+  const [tableDraft, setTableDraft] = React.useState<TableDraft>(emptyTableDraft);
   const isText = kind === "text";
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
@@ -297,8 +305,17 @@ export function ChartBuilder({
   const effectiveMap = mapId || (isChoropleth ? DEFAULT_CHOROPLETH_MAP : DEFAULT_POINT_MAP);
   const isBoxplot = kind === "boxplot";
   const isCalendar = kind === "calendar";
-  // The grains this dimension and chart kind allow; empty hides the picker.
-  const dimensionKind = fields?.kinds?.[dimension];
+  const isPivot = kind === "pivot";
+  // A pivot and a raw table name their columns in their own fields, not as a dimension and measures.
+  const ownColumns = isPivot || (kind === "table" && tableDraft.mode === "rows");
+  const sourceColumns = React.useMemo<SourceColumns>(() => ({
+    all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
+    dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
+  }), [fields]);
+  // The grains this dimension and chart kind allow; empty hides the picker. A
+  // pivot's grain applies to its first date row or column field.
+  const pivotDateField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => fields?.kinds?.[c] === "date" || fields?.kinds?.[c] === "datetime") : undefined;
+  const dimensionKind = isPivot ? (pivotDateField ? fields?.kinds?.[pivotDateField] : undefined) : fields?.kinds?.[dimension];
   const grainOptions = React.useMemo(() => grainChoices(kind, dimensionKind), [kind, dimensionKind]);
   // A calendar on a timestamp groups by day: the server would otherwise keep one value per day silently.
   const grainRequired = isCalendar && dimensionKind === "datetime";
@@ -381,13 +398,14 @@ export function ChartBuilder({
     ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
     : [
         ...(choice || isNewSql ? [] : ["Data source"]),
-        ...(!isSingle && !isPoints && !dimension ? [dimensionLabel] : []),
+        ...(!isSingle && !isPoints && !ownColumns && !dimension ? [dimensionLabel] : []),
         ...(isPoints && !lat ? ["Latitude"] : []),
         ...(isPoints && !lon ? ["Longitude"] : []),
-        ...(measure ? [] : [mLabels[0]]),
+        ...(ownColumns || measure ? [] : [mLabels[0]]),
         ...(needsM2 && !measure2 ? [mLabels[1] ?? "2nd measure"] : []),
         ...(needsM3 && !measure3 ? [mLabels[2] ?? "3rd measure"] : []),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
+        ...draftProblems(kind, tableDraft),
       ];
   const isEdit = !!editId;
   // Why no chart can be drawn yet while the SQL is new or edited (null = it
@@ -445,6 +463,7 @@ export function ChartBuilder({
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
       setGrain(isGrain(initial.grain) ? initial.grain : "");
+      setTableDraft(draftFromDef(initial));
       const m = sourceValueFromDef(initial);
       setSource(m);
       if (m) {
@@ -466,7 +485,7 @@ export function ChartBuilder({
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20); setLimitTouched(false);
-    setTargetBoard(board); setClick(undefined); setGrain(""); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
   }
 
@@ -475,6 +494,8 @@ export function ChartBuilder({
     draft.cancel();
     setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
     setLat(""); setLon("");
+    // The columns of a raw table, a pivot or a comparison belong to the old source.
+    setTableDraft((d) => ({ ...emptyTableDraft(), mode: d.mode, totals: d.totals, goodDirection: d.goodDirection, compareKind: d.compareKind }));
     if (value === NEW_SQL_CHOICE) { setFields(null); draft.startNew(); return; }
     if (value) void loadFields(value); else setFields(null);
   }
@@ -504,6 +525,14 @@ export function ChartBuilder({
         title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure], aggregate, span, board: targetBoard,
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
+        ...draftPayload(kind, tableDraft),
+      };
+    } else if (ownColumns) {
+      // BI-16 part A: no dimension, measures or aggregate; the columns travel in the table's own fields.
+      payload = {
+        title: payloadTitle, ...sourcePayload(withSource), kind, span, board: targetBoard,
+        ...draftPayload(kind, tableDraft),
+        grain: isPivot && grain && grainOptions.includes(grain) ? grain : undefined,
       };
     } else {
       const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
@@ -516,6 +545,7 @@ export function ChartBuilder({
         order: isCalendar ? "none" : isPoints ? undefined : order, limit: isPoints ? undefined : Math.min(limit, maxLimit),
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
+        ...draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean)),
       };
     }
     // A chart without marks to click (text, KPI, gauge, table, density map)
@@ -531,6 +561,8 @@ export function ChartBuilder({
   const previewInputsKey = previewKey({
     title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon,
     aggregate, span, caption, target, text, order, limit, targetBoard, grain,
+    // BI-16 part A: every table, pivot and comparison setting reaches the SQL or the render spec.
+    tables: JSON.stringify(draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean))),
   });
   React.useEffect(() => {
     if (!open) return;
@@ -642,6 +674,19 @@ export function ChartBuilder({
       setBusy(false);
     }
   }
+
+  const grainPicker = grainOptions.length > 0 ? (
+    <div className="mt-1 grid gap-1.5">
+      <Label>Group by</Label>
+      <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
+        <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {grainRequired ? null : <SelectItem value={NO_GRAIN}>No grouping</SelectItem>}
+          {grainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
 
   const formFields = (
     <div className="grid content-start gap-4 px-5 pt-1 pb-5">
@@ -756,7 +801,7 @@ export function ChartBuilder({
           ) : null}
 
           {/* Dimensions together, then the measure next to how it is aggregated. */}
-          {!isSingle ? (
+          {!isSingle && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
@@ -774,18 +819,7 @@ export function ChartBuilder({
                     <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
-                {grainOptions.length > 0 ? (
-                  <div className="mt-1 grid gap-1.5">
-                    <Label>Group by</Label>
-                    <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
-                      <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {grainRequired ? null : <SelectItem value={NO_GRAIN}>No grouping</SelectItem>}
-                        {grainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ) : null}
+                {grainPicker}
               </div>
               {canBreakdown ? (
                 <div className="grid gap-1.5">
@@ -823,7 +857,7 @@ export function ChartBuilder({
             <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {ownColumns ? null : <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>{mLabels[0]} <Req /></Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
@@ -845,9 +879,9 @@ export function ChartBuilder({
                 </Select>
               </div>
             )}
-          </div>
+          </div>}
 
-          {needsM2 ? (
+          {needsM2 && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>{mLabels[1] ?? "2nd measure"} <Req /></Label>
@@ -868,11 +902,14 @@ export function ChartBuilder({
             </div>
           ) : null}
 
-          {isKpi ? (
-            <div className="grid gap-1.5">
-              <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
-              <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
-            </div>
+          {ownColumns ? null : isKpi ? (
+            <>
+              <div className="grid gap-1.5">
+                <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
+                <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
+              </div>
+              <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
+            </>
           ) : isGauge ? (
             <div className="grid gap-1.5">
               <Label>Target / max <span className="font-normal text-muted-foreground">(optional)</span></Label>
@@ -909,6 +946,14 @@ export function ChartBuilder({
               </div> : null}
             </div>
           )}
+
+          {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={[dimension, measure].filter(Boolean)} /> : null}
+          {isPivot ? (
+            <>
+              <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
+              {grainPicker}
+            </>
+          ) : null}
 
           {kindHasClickValue(kind) ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
         </>

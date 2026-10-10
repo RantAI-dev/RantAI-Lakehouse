@@ -23,6 +23,7 @@ use crate::filters::{
 use crate::grain::{self, Grain, TimeContext, WeekStart};
 use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
+use crate::tables;
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -122,7 +123,7 @@ impl Relation {
 
     /// Trailing `SETTINGS` for this relation (empty for a mart, whose
     /// SQL is assembled entirely from validated identifiers).
-    fn settings(&self) -> &'static str {
+    pub(crate) fn settings(&self) -> &'static str {
         match self {
             Self::Mart(_) => "",
             Self::Sql(_) => SQL_SOURCE_SETTINGS,
@@ -532,6 +533,33 @@ pub struct FilteredSql {
     /// built to return one more, so the caller trims the surplus with
     /// [`grain::trim_to_latest`] and marks the tile `truncated`.
     pub latest_limit: Option<u32>,
+    /// What a raw table, a pivot or a comparing KPI needs beyond its rows
+    /// (`BI-16` part A).
+    pub table: Option<TableRead>,
+}
+
+/// What the tile of a raw table, a pivot or a KPI with a comparison carries
+/// beyond its rows (`BI-16` part A), so the caller can finish the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableRead {
+    /// A raw table's first page: the statement that counts the rows the pages
+    /// walk through.
+    Rows {
+        /// `SELECT count() AS n ...` over the same relation and predicates.
+        count_sql: String,
+    },
+    /// A pivot: the most long-format rows it may keep; the statement asked for
+    /// one more, so a surplus row means the cell cap cut the result.
+    Pivot {
+        /// Rows to keep ([`tables::pivot_row_cap`]).
+        row_cap: u32,
+    },
+    /// A KPI that compares with its previous period: the period the buckets
+    /// are cut by, so the tile can label them.
+    Trend {
+        /// The period.
+        period: Grain,
+    },
 }
 
 /// How a chart is read right now (BI-9): the deployment's time context, and
@@ -567,7 +595,13 @@ fn grained<H: std::hash::BuildHasher>(
     read: &ReadContext<'_>,
 ) -> (Option<Grained>, Option<Grain>) {
     let def: &ChartInput = &spec.def;
-    let column = cols.get(&def.dimension).copied();
+    let pivot = spec.spec.kind == crate::specs::ChartKind::Pivot;
+    // A pivot has no `dimension`: its grain applies to its first date field.
+    let column = if pivot {
+        tables::pivot_grain_field(&def.tables, cols).map(|(_, kind)| kind)
+    } else {
+        cols.get(&def.dimension).copied()
+    };
     let r = grain::resolve(def.grain.as_deref(), spec.spec.kind, column, read.grain);
     let g = r.effective.zip(column).map(|(grain, column)| {
         let order = def.order.as_deref().unwrap_or("none");
@@ -576,7 +610,8 @@ fn grained<H: std::hash::BuildHasher>(
         Grained {
             grain,
             column,
-            latest_limit: grain::cuts_to_latest(grain, order).then_some(limit),
+            // A pivot is cut by its cell cap, not to its latest buckets.
+            latest_limit: (!pivot && grain::cuts_to_latest(grain, order)).then_some(limit),
         }
     });
     (g, r.skipped)
@@ -642,6 +677,7 @@ where
         grain: None,
         grain_column: None,
         latest_limit: None,
+        table: None,
     };
     if spec.spec.kind == crate::specs::ChartKind::Text {
         return FilteredSql {
@@ -651,6 +687,7 @@ where
             grain: None,
             grain_column: None,
             latest_limit: None,
+            table: None,
         };
     }
     let def: &ChartInput = &spec.def;
@@ -664,7 +701,15 @@ where
         skipped,
         columns,
     } = filter_predicates(cols, years, filters, read.time);
-    if predicates.is_empty() && def.grain.is_none() {
+    // BI-16 part A: a raw table is rebuilt too, because its second statement
+    // (the count) is built here and not stored; a comparing KPI because its
+    // periods depend on the deployment's time settings.
+    let kind = spec.spec.kind;
+    let rebuilds = def.grain.is_some()
+        || kind == crate::specs::ChartKind::Pivot
+        || def.tables.is_rows_mode(kind)
+        || def.tables.compares_to_previous(kind);
+    if predicates.is_empty() && !rebuilds {
         return unfiltered(skipped);
     }
     // `mart` was already validated as a well-formed identifier when the
@@ -677,22 +722,38 @@ where
     };
     let (g, grain_skipped) = grained(spec, cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
-    let sql = rebuild(
+    let rebuilt = rebuild(
         spec,
         &Relation::Mart(mart),
         predicates,
         &columns,
-        read,
-        g.as_ref(),
-    )
-    .unwrap_or_else(|| spec.spec.sql.clone());
+        &Rebuild {
+            read,
+            grained: g.as_ref(),
+            cols,
+        },
+    );
+    let (sql, table) = rebuilt.map_or_else(|| (spec.spec.sql.clone(), None), |r| (r.sql, r.table));
+    let grain = g
+        .as_ref()
+        .map(|g| g.grain)
+        .or_else(|| trend_period(table.as_ref()));
     FilteredSql {
         sql,
         skipped,
         grain_skipped,
-        grain: g.as_ref().map(|g| g.grain),
+        grain,
         grain_column: g.as_ref().map(|g| g.column),
         latest_limit,
+        table,
+    }
+}
+
+/// The period a comparing KPI's buckets are cut by, when `table` says so.
+fn trend_period(table: Option<&TableRead>) -> Option<Grain> {
+    match table {
+        Some(TableRead::Trend { period }) => Some(*period),
+        _ => None,
     }
 }
 
@@ -742,6 +803,7 @@ where
             grain: None,
             grain_column: None,
             latest_limit: None,
+            table: None,
         });
     }
     let FilterOutcome {
@@ -751,21 +813,29 @@ where
     } = filter_predicates(source_cols, years, filters, read.time);
     let (g, grain_skipped) = grained(spec, source_cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
-    let sql = rebuild(
+    let rebuilt = rebuild(
         spec,
         &Relation::Sql(source_sql.to_owned()),
         predicates,
         &columns,
-        read,
-        g.as_ref(),
+        &Rebuild {
+            read,
+            grained: g.as_ref(),
+            cols: source_cols,
+        },
     )?;
+    let grain = g
+        .as_ref()
+        .map(|g| g.grain)
+        .or_else(|| trend_period(rebuilt.table.as_ref()));
     Some(FilteredSql {
-        sql,
+        sql: rebuilt.sql,
         skipped,
         grain_skipped,
-        grain: g.as_ref().map(|g| g.grain),
+        grain,
         grain_column: g.as_ref().map(|g| g.column),
         latest_limit,
+        table: rebuilt.table,
     })
 }
 
@@ -864,6 +934,36 @@ where
             "SELECT * FROM {from_sql}{where_sql} ORDER BY ALL LIMIT {limit} OFFSET {offset}{settings}"
         ),
         count: format!("SELECT count() AS n FROM {from_sql}{where_sql}{settings}"),
+        skipped,
+    }
+}
+
+/// SQL for one page of a raw table (`BI-16` part A) through the records
+/// route: the table's columns and sort, with the dashboard's active `filters`
+/// applied exactly as a tile applies them ([`filter_predicates`]), so page two
+/// agrees with the first page the dashboard carried. The page and the total
+/// share the relation, so a SQL source's row cap rides on both.
+#[must_use]
+pub fn rows_page_sql<HCols>(
+    from: &Relation,
+    cols: &RelationColumns<HCols>,
+    filters: &[FilterDef],
+    plan: &tables::RowsPlan,
+    (limit, offset): (u32, u64),
+    time: &TimeContext,
+) -> RecordsSql
+where
+    HCols: std::hash::BuildHasher,
+{
+    let FilterOutcome {
+        predicates,
+        skipped,
+        ..
+    } = filter_predicates(cols, &[], filters, time);
+    let page = tables::rows_sql(from, plan, &predicates, limit, offset);
+    RecordsSql {
+        rows: page.rows,
+        count: page.count,
         skipped,
     }
 }
@@ -1064,10 +1164,96 @@ fn relative_predicate(f: &FilterDef, d: &str, time: &TimeContext) -> Option<Stri
     })
 }
 
+/// What [`rebuild`] reads besides the definition and the predicates.
+struct Rebuild<'a, H> {
+    read: &'a ReadContext<'a>,
+    grained: Option<&'a Grained>,
+    /// The relation's columns, for the kinds that need a column's kind.
+    cols: &'a RelationColumns<H>,
+}
+
+/// A rebuilt statement and what the tile needs besides its rows.
+struct Rebuilt {
+    sql: String,
+    table: Option<TableRead>,
+}
+
 /// Rebuild a stored chart's SQL over `from` with `where_clauses`, from its
 /// structured definition. `None` if the definition's identifiers no longer
 /// validate (only possible through data corruption).
-fn rebuild(
+///
+/// `BI-16` part A: a pivot, a raw table and a KPI that compares with its
+/// previous period have their own statements ([`crate::tables`]); every other
+/// kind goes through [`rebuild_chart`].
+fn rebuild<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    where_clauses: Vec<String>,
+    where_columns: &[String],
+    ctx: &Rebuild<'_, H>,
+) -> Option<Rebuilt> {
+    let def: &ChartInput = &spec.def;
+    let kind = spec.spec.kind;
+    let col_set = || -> std::collections::HashSet<String> { ctx.cols.keys().cloned().collect() };
+    if kind == crate::specs::ChartKind::Pivot {
+        let plan = tables::plan_pivot(&def.tables, &col_set()).ok()?;
+        let grain = match ctx.grained {
+            Some(g) => {
+                let (field, _) = tables::pivot_grain_field(&def.tables, ctx.cols)?;
+                Some((g.grain, field, g.column))
+            }
+            None => None,
+        };
+        let sql = tables::pivot_sql(
+            from,
+            &plan,
+            where_clauses,
+            grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+            ctx.read.time,
+        )?;
+        let row_cap = tables::pivot_row_cap(from, plan.values.len());
+        return Some(Rebuilt {
+            sql,
+            table: Some(TableRead::Pivot { row_cap }),
+        });
+    }
+    if def.tables.is_rows_mode(kind) {
+        let plan = tables::plan_rows(&def.tables, &col_set()).ok()?;
+        let page = tables::rows_sql(from, &plan, &where_clauses, tables::ROWS_PAGE_SIZE, 0);
+        return Some(Rebuilt {
+            sql: page.rows,
+            table: Some(TableRead::Rows {
+                count_sql: page.count,
+            }),
+        });
+    }
+    if def.tables.compares_to_previous(kind) {
+        let plan = tables::plan_compare(&def.tables, &col_set(), ctx.cols).ok()??;
+        let tables::ComparePlan::Previous { period, .. } = &plan else {
+            return None;
+        };
+        let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        let agg = Aggregate::from_str_lossy(def.aggregate.as_deref().unwrap_or("sum"));
+        let sql = tables::kpi_trend_sql(from, &measure, agg, where_clauses, &plan, ctx.read.time)?;
+        return Some(Rebuilt {
+            sql,
+            table: Some(TableRead::Trend { period: *period }),
+        });
+    }
+    rebuild_chart(
+        spec,
+        from,
+        where_clauses,
+        where_columns,
+        ctx.read,
+        ctx.grained,
+    )
+    .map(|sql| Rebuilt { sql, table: None })
+}
+
+/// [`rebuild`] for the kinds that are a plain `GROUP BY` chart, a single
+/// number or a point map.
+fn rebuild_chart(
     spec: &StoredChartSpec,
     from: &Relation,
     where_clauses: Vec<String>,
@@ -1107,7 +1293,7 @@ fn rebuild(
                 base: Box::new(from.clone()),
                 predicates: where_clauses,
             };
-            return rebuild(spec, &wrapped, Vec::new(), &[], read, None);
+            return rebuild_chart(spec, &wrapped, Vec::new(), &[], read, None);
         }
     }
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
@@ -2868,5 +3054,174 @@ mod tests {
         let got = sql_with_filters_report(&month, &[], &[], &dated(ColumnKind::Date));
         assert_eq!(got.latest_limit, Some(5));
         assert!(got.sql.contains("LIMIT 6"), "{}", got.sql);
+    }
+    // ── BI-16 part A: raw tables, pivots, KPI comparisons ──────────────
+
+    fn table_cols() -> HashMap<String, RelationColumns> {
+        let mut cols: RelationColumns = RelationColumns::default();
+        cols.insert("p".to_owned(), ColumnKind::Text);
+        cols.insert("d".to_owned(), ColumnKind::Date);
+        cols.insert("t".to_owned(), ColumnKind::DateTime);
+        cols.insert("v".to_owned(), ColumnKind::Number);
+        HashMap::from([("mart_x".to_owned(), cols)])
+    }
+
+    fn with_tables(kind: ChartKind, json: &str) -> StoredChartSpec {
+        let mut spec = stored_spec(kind, "mart_x", "", &[]);
+        spec.def.tables = serde_json::from_str(json).unwrap();
+        spec
+    }
+
+    #[test]
+    fn a_raw_table_is_rebuilt_with_its_filters_and_carries_the_count_of_the_same_rows() {
+        let spec = with_tables(
+            ChartKind::Table,
+            r#"{"tableMode":"rows","columns":["p","v"],"sortColumn":"v","sortDir":"desc"}"#,
+        );
+        let f = filter(r#"{"column":"p","values":["a"]}"#);
+        let got = sql_with_filters_report(&spec, &[], &[f], &table_cols());
+        assert_eq!(
+            got.sql,
+            "SELECT p, v FROM serving.mart_x WHERE p IN ('a') ORDER BY v DESC, p, v LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(
+            got.table,
+            Some(TableRead::Rows {
+                count_sql: "SELECT count() AS n FROM serving.mart_x WHERE p IN ('a')".to_owned()
+            })
+        );
+        // Without a filter it is still rebuilt, because the count is not stored.
+        let got = sql_with_filters_report(&spec, &[], &[], &table_cols());
+        assert!(matches!(got.table, Some(TableRead::Rows { .. })));
+    }
+
+    #[test]
+    fn a_raw_table_over_a_sql_source_keeps_the_source_cap_on_the_page_and_the_count() {
+        let spec = with_tables(ChartKind::Table, r#"{"tableMode":"rows","columns":["p"]}"#);
+        let cols = text_cols(&["p"]);
+        let got = sql_for_sql_source_report(&spec, "SELECT 'a' AS p", &cols, &[], &[]).unwrap();
+        assert!(
+            got.sql.contains(") AS src ORDER BY p LIMIT 50"),
+            "{}",
+            got.sql
+        );
+        assert!(got.sql.ends_with(SQL_SOURCE_SETTINGS), "{}", got.sql);
+        let Some(TableRead::Rows { count_sql }) = got.table else {
+            panic!("no count");
+        };
+        assert!(count_sql.ends_with(SQL_SOURCE_SETTINGS), "{count_sql}");
+    }
+
+    #[test]
+    fn a_page_through_the_records_route_has_the_same_predicates_as_the_dashboards_page() {
+        let plan = tables::plan_rows(
+            &serde_json::from_str(r#"{"columns":["p","v"]}"#).unwrap(),
+            &["p", "v"]
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect::<std::collections::HashSet<String>>(),
+        )
+        .unwrap();
+        let cols = text_cols(&["p", "v"]);
+        let from = Relation::Mart(Ident::new("mart_x").unwrap());
+        let f = filter(r#"{"column":"p","values":["a"]}"#);
+        let page = rows_page_sql(&from, &cols, &[f], &plan, (50, 100), &DEFAULT_TIME);
+        assert_eq!(
+            page.rows,
+            "SELECT p, v FROM serving.mart_x WHERE p IN ('a') ORDER BY p, v LIMIT 50 OFFSET 100"
+        );
+        assert_eq!(
+            page.count,
+            "SELECT count() AS n FROM serving.mart_x WHERE p IN ('a')"
+        );
+    }
+
+    #[test]
+    fn a_pivot_is_rebuilt_with_filters_and_reports_its_row_cap() {
+        let spec = with_tables(
+            ChartKind::Pivot,
+            r#"{"rows":["p"],"values":[{"column":"v","aggregate":"sum"}],"totals":"grand"}"#,
+        );
+        let f = filter(r#"{"column":"p","values":["a"]}"#);
+        let got = sql_with_filters_report(&spec, &[], &[f], &table_cols());
+        assert!(
+            got.sql
+                .contains("FROM serving.mart_x WHERE p IN ('a') GROUP BY GROUPING SETS ((p), ())"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.table, Some(TableRead::Pivot { row_cap: 10_000 }));
+        // No filter: still the same statement, with the cap.
+        let got = sql_with_filters_report(&spec, &[], &[], &table_cols());
+        assert!(matches!(got.table, Some(TableRead::Pivot { .. })));
+    }
+
+    #[test]
+    fn a_pivot_takes_the_dashboard_switch_on_its_first_date_field_and_says_when_it_cannot() {
+        let mut spec = with_tables(
+            ChartKind::Pivot,
+            r#"{"rows":["p"],"columns":["d"],"values":[{"column":"v","aggregate":"sum"}]}"#,
+        );
+        spec.def.grain = Some("month".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &table_cols());
+        assert!(
+            got.sql.contains("date_trunc('month', d) AS d"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.grain, Some(Grain::Month));
+        let time = TimeContext::default();
+        let week = ReadContext {
+            time: &time,
+            grain: Some(Grain::Week),
+        };
+        let got = super::sql_with_filters_report(&spec, &[], &[], &table_cols(), &week);
+        assert!(
+            got.sql.contains("date_trunc('week', d) AS d"),
+            "{}",
+            got.sql
+        );
+        let hour = ReadContext {
+            time: &time,
+            grain: Some(Grain::Hour),
+        };
+        let got = super::sql_with_filters_report(&spec, &[], &[], &table_cols(), &hour);
+        assert_eq!(got.grain_skipped, Some(Grain::Hour));
+        assert!(
+            got.sql.contains("date_trunc('month', d) AS d"),
+            "{}",
+            got.sql
+        );
+    }
+
+    #[test]
+    fn a_kpi_that_compares_is_rebuilt_at_read_time_and_a_filter_on_its_date_reads_the_raw_column() {
+        let mut spec = with_tables(
+            ChartKind::Kpi,
+            r#"{"compare":{"kind":"previous","dateColumn":"d","period":"month"}}"#,
+        );
+        spec.def.measures = vec!["v".to_owned()];
+        let f = filter(r#"{"column":"d","op":"between","min":"2026-01-01"}"#);
+        let got = sql_with_filters_report(&spec, &[], &[f], &table_cols());
+        assert!(
+            got.sql.contains(
+                "(SELECT date_trunc('month', d) AS d, v FROM (SELECT * FROM serving.mart_x WHERE d >= toDate32('2026-01-01')) AS flt) AS bkt"
+            ),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.grain, Some(Grain::Month));
+        assert_eq!(
+            got.table,
+            Some(TableRead::Trend {
+                period: Grain::Month
+            })
+        );
+        // A goal is the ordinary KPI statement.
+        let mut goal = with_tables(ChartKind::Kpi, r#"{"compare":{"kind":"goal","value":5}}"#);
+        goal.def.measures = vec!["v".to_owned()];
+        let got = sql_with_filters_report(&goal, &[], &[], &table_cols());
+        assert_eq!(got.sql, "SELECT 1");
+        assert_eq!(got.table, None);
     }
 }

@@ -290,6 +290,13 @@ async fn get_body(
         .await;
         let skipped = &filtered.skipped;
         crate::routes::support::annotate_grain(&mut val, &filtered, c);
+        crate::routes::support::annotate_table(
+            ch,
+            &mut val,
+            &filtered,
+            (roles, placeholders, obligations),
+        )
+        .await;
         // The tile still renders; this only lets it say which active filters
         // its data cannot honour (no such column, or a type that does not fit).
         if !skipped.is_empty()
@@ -547,6 +554,7 @@ pub async fn specs_preview(
     )
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
+    crate::routes::support::annotate_saved_table(&mut result, &spec);
     Ok(ApiJson(json!({
         "spec": render_stored_spec(&spec.spec, ChartSource::Ui),
         "result": result,
@@ -1164,6 +1172,18 @@ pub struct RecordsQuery {
     /// `column` falls in it, in the report time zone.
     #[serde(default)]
     grain: Option<String>,
+    /// `BI-16` part A: the columns of a raw table (comma-separated, in
+    /// order). With it the route lists those columns of the whole tile (no
+    /// `column` or `value`), sorted by `sortColumn` and `sortDir`, through the
+    /// same filters, role rewrite and page size as any records list.
+    #[serde(default)]
+    columns: Option<String>,
+    /// With `columns`: the column to sort by.
+    #[serde(default, rename = "sortColumn")]
+    sort_column: Option<String>,
+    /// With `sortColumn`: `asc` (default) or `desc`.
+    #[serde(default, rename = "sortDir")]
+    sort_dir: Option<String>,
 }
 
 /// Rows per page: the default and the maximum (BI-18·B; the owner confirms 50
@@ -1396,6 +1416,23 @@ async fn records_for_roles(
         }
     };
     let relation = records_relation(ch, &q).await?;
+    if q.columns.is_some() {
+        if drill.is_some() {
+            return Err(ApiError::BadRequest(
+                "columns cannot be combined with column and value".to_owned(),
+            ));
+        }
+        let sql = rows_statements(&q, &relation, &filters, (limit, offset), time)?;
+        return run_records(
+            ch,
+            &relation,
+            sql,
+            (limit, offset),
+            None,
+            (roles, placeholders, obligations),
+        )
+        .await;
+    }
     let drill = match drill {
         Some((column, value)) => {
             let ident = lakehouse_core::ident::Ident::new(column.to_owned())
@@ -1420,6 +1457,32 @@ async fn records_for_roles(
         time,
     );
 
+    run_records(
+        ch,
+        &relation,
+        sql,
+        (limit, offset),
+        drill.as_ref().map(|(c, v)| (c.as_str(), *v)),
+        (roles, placeholders, obligations),
+    )
+    .await
+}
+
+/// Run a records list's two statements through the caller's role rewrite and
+/// shape the response: one page of rows, the total, and the filters the
+/// relation could not honour.
+async fn run_records(
+    ch: &ChClient,
+    relation: &RecordsRelation,
+    sql: lakehouse_bi::builder::RecordsSql,
+    (limit, offset): (u32, u64),
+    drill: Option<(&str, &str)>,
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &PolicyEngineObligations<'_>,
+    ),
+) -> Result<Value, ApiError> {
     let rewrite = |statement: String| async move {
         crate::policy_engine::rewrite_sql_for_roles(
             &statement,
@@ -1462,12 +1525,46 @@ async fn records_for_roles(
         "total": total,
         "limit": limit,
         "offset": offset,
-        "column": drill.as_ref().map(|(c, _)| c.as_str()),
-        "value": drill.as_ref().map(|(_, v)| *v),
+        "column": drill.map(|(c, _)| c),
+        "value": drill.map(|(_, v)| v),
         "filtersSkipped": sql.skipped,
     });
     body[relation.label.0] = json!(relation.label.1);
     Ok(body)
+}
+
+/// The statements of a raw table's page (`BI-16` part A): its columns and sort
+/// from the query, checked against the relation like a saved definition is.
+fn rows_statements(
+    q: &RecordsQuery,
+    relation: &RecordsRelation,
+    filters: &[FilterDef],
+    page: (u32, u64),
+    time: &TimeContext,
+) -> Result<lakehouse_bi::builder::RecordsSql, ApiError> {
+    let fields = lakehouse_bi::tables::TableFields {
+        columns: Some(
+            q.columns
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
+        ),
+        sort_column: q.sort_column.clone().filter(|c| !c.is_empty()),
+        sort_dir: q.sort_dir.clone().filter(|d| !d.is_empty()),
+        ..lakehouse_bi::tables::TableFields::default()
+    };
+    let known: std::collections::HashSet<String> = relation.cols.keys().cloned().collect();
+    let plan = lakehouse_bi::tables::plan_rows(&fields, &known).map_err(ApiError::BadRequest)?;
+    Ok(lakehouse_bi::builder::rows_page_sql(
+        &relation.from,
+        &relation.cols,
+        filters,
+        &plan,
+        page,
+        time,
+    ))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -1858,9 +1955,19 @@ fn yaml_chart(c: &StoredChartSpec) -> String {
         match &val {
             Value::Null => {}
             Value::Array(items) => {
-                let rendered = items.iter().map(yaml_value).collect::<Vec<_>>().join(", ");
+                // BI-16 part A: a pivot's `values` are objects. Compact JSON
+                // is a valid YAML flow mapping, so they are written as is.
+                let rendered = items
+                    .iter()
+                    .map(|i| match i {
+                        Value::Object(_) => i.to_string(),
+                        _ => yaml_value(i),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 lines.push(format!("  {k}: [{rendered}]"));
             }
+            Value::Object(_) => lines.push(format!("  {k}: {val}")),
             other => lines.push(format!("  {k}: {}", yaml_value(other))),
         }
     }
@@ -1911,6 +2018,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
             if let Some(target) = def.target {
                 out.push(("target", js_number(target)));
             }
+            push_table_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
             }
@@ -1955,6 +2063,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
             if let Some(grain) = &def.grain {
                 out.push(("grain", json!(grain)));
             }
+            push_table_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
             }
@@ -1964,6 +2073,32 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
         }
     }
     out
+}
+
+/// The `BI-16` part A fields of a definition (raw table, pivot, comparison),
+/// present only on the charts that carry them, so the exported shape of every
+/// earlier chart does not change.
+fn push_table_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
+    const NAMES: [&str; 10] = [
+        "tableMode",
+        "columns",
+        "rows",
+        "values",
+        "totals",
+        "sortColumn",
+        "sortDir",
+        "columnSettings",
+        "compare",
+        "goodDirection",
+    ];
+    let Ok(Value::Object(fields)) = serde_json::to_value(&def.tables) else {
+        return;
+    };
+    for name in NAMES {
+        if let Some(value) = fields.get(name) {
+            out.push((name, value.clone()));
+        }
+    }
 }
 
 // ── /api/dashboard/embed-info ───────────────────────────────────────────
@@ -2365,6 +2500,78 @@ mod records_enforcement {
                 .filter(|b| !b.contains("count() AS n"))
                 .all(|b| b.contains("ORDER BY ALL")),
             "{row_queries:?}"
+        );
+        Ok(())
+    }
+
+    /// BI-16 part A, plan section 4: a raw table that lists a masked column,
+    /// or sorts by it, still gets the mask. The page and the total go through
+    /// the same rewrite as a drill-down.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_raw_table_page_masks_a_listed_and_a_sorted_column(pool: PgPool) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "raw-table-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_mart_columns(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "id", "type": "UInt64"}, {"name": "email", "type": "String"}],
+                "data": [{"id": "1", "email": "***"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let q = RecordsQuery {
+            mart: Some("mart_x".to_owned()),
+            columns: Some("id,email".to_owned()),
+            sort_column: Some("email".to_owned()),
+            sort_dir: Some("desc".to_owned()),
+            ..RecordsQuery::default()
+        };
+
+        let body = records_for_roles(
+            &ch,
+            q,
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .expect("a masked raw-table page still answers");
+
+        assert_eq!(body["rows"][0]["email"], "***");
+        let requests = server.received_requests().await.expect("requests recorded");
+        let bodies: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("serving.mart_x") && !b.contains("system."))
+            .collect();
+        assert!(!bodies.is_empty(), "the page must reach ClickHouse");
+        assert!(
+            bodies
+                .iter()
+                .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
+            "every statement must carry the mask, listed or sorted: {bodies:?}"
         );
         Ok(())
     }
@@ -3493,6 +3700,70 @@ mod records_pages {
         assert!(!rows.contains("WHERE"), "{rows}");
     }
 
+    fn rows_query(columns: &str, sort: Option<(&str, &str)>) -> RecordsQuery {
+        RecordsQuery {
+            mart: Some("mart_x".to_owned()),
+            columns: Some(columns.to_owned()),
+            sort_column: sort.map(|(c, _)| c.to_owned()),
+            sort_dir: sort.map(|(_, d)| d.to_owned()),
+            ..RecordsQuery::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_raw_table_page_lists_its_columns_sorted_with_the_filters_and_a_total() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            offset: Some("50".to_owned()),
+            filters: Some(r#"[{"column":"visitors","op":"between","min":"7"}]"#.to_owned()),
+            ..rows_query("region,visitors", Some(("visitors", "desc")))
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["total"], 120);
+        assert_eq!(body["offset"], 50);
+        let all = statements(&server).await;
+        let rows = all
+            .iter()
+            .find(|s| s.contains("LIMIT 50 OFFSET 50"))
+            .unwrap();
+        assert!(
+            rows.contains("SELECT region, visitors FROM serving.mart_x WHERE visitors >= 7 ORDER BY visitors DESC, region, visitors"),
+            "{rows}"
+        );
+        let count = all.iter().find(|s| s.contains("count() AS n")).unwrap();
+        assert!(count.contains("visitors >= 7"), "{count}");
+    }
+
+    #[tokio::test]
+    async fn a_raw_table_page_refuses_a_column_the_relation_lacks_and_a_drill_beside_it() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        for q in [
+            rows_query("region,absent", None),
+            rows_query("", None),
+            rows_query("region", Some(("absent", "asc"))),
+            rows_query("region", Some(("region", "sideways"))),
+            RecordsQuery {
+                column: Some("region".to_owned()),
+                value: Some("north".to_owned()),
+                ..rows_query("region", None)
+            },
+        ] {
+            let err = run(&server, q).await.unwrap_err();
+            assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        }
+        assert!(
+            !statements(&server)
+                .await
+                .iter()
+                .any(|s| s.contains("serving.mart_x")),
+            "nothing may reach the data when the request is refused"
+        );
+    }
+
     #[tokio::test]
     async fn a_column_without_a_value_is_a_400() {
         let server = MockServer::start().await;
@@ -4034,5 +4305,248 @@ mod time_grain {
         };
         let err = records(&server, q, &t).await.unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod table_tiles {
+    //! `BI-16` part A on the dashboard payload: a raw table's first page with
+    //! its total, a pivot cut at the cell cap, and a KPI that compares. A
+    //! wiremock `ClickHouse` answers the store reads and records every
+    //! statement it is sent.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_bi::grain::TimeContext;
+    use lakehouse_clickhouse::ChClient;
+    use serde_json::{Value, json};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{DashboardQuery, GrainRequest, get_body};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    async fn answer(
+        server: &MockServer,
+        statement_has: &str,
+        meta: &[(&str, &str)],
+        data: Vec<Value>,
+    ) {
+        let meta: Vec<Value> = meta
+            .iter()
+            .map(|(n, t)| json!({ "name": n, "type": t }))
+            .collect();
+        let rows = data.len();
+        Mock::given(method("POST"))
+            .and(body_string_contains(statement_has))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": meta, "data": data, "rows": rows })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn chart_row(id: &str, kind: &str, def: &Value) -> Value {
+        let spec = json!({
+            "id": id, "title": id, "kind": kind, "mart": "mart_a",
+            "sql": "SELECT stored", "x": "", "y": "visitors"
+        });
+        let mut def = def.clone();
+        def["title"] = json!(id);
+        def["mart"] = json!("mart_a");
+        def["kind"] = json!(kind);
+        json!({
+            "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        })
+    }
+
+    /// Board `b1` with a raw table, a five-value pivot and a KPI that compares
+    /// with its previous month, all on `mart_a`.
+    async fn mount_board(server: &MockServer, pivot_rows: usize) {
+        let values: Vec<Value> = ["sum", "avg", "min", "max", "count"]
+            .iter()
+            .map(|a| json!({ "column": "visitors", "aggregate": a }))
+            .collect();
+        let charts = vec![
+            chart_row(
+                "c_rows",
+                "table",
+                &json!({ "tableMode": "rows", "columns": ["place", "visitors"] }),
+            ),
+            chart_row(
+                "c_pivot",
+                "pivot",
+                &json!({ "rows": ["place"], "values": values }),
+            ),
+            chart_row(
+                "c_kpi",
+                "kpi",
+                &json!({
+                    "measures": ["visitors"], "aggregate": "sum",
+                    "compare": { "kind": "previous", "dateColumn": "day", "period": "month" },
+                }),
+            ),
+        ];
+        let meta = [
+            ("id", "String"),
+            ("board", "String"),
+            ("created_by", "String"),
+            ("created_at", "String"),
+            ("spec_json", "String"),
+        ];
+        answer(server, "FROM console.bi_chart FINAL", &meta, charts).await;
+        answer(
+            server,
+            "FROM console.bi_board FINAL",
+            &[("id", "String")],
+            vec![json!({
+                "id": "b1", "name": "B", "description": "", "created_by": "", "layout_json": "{}",
+                "filters_json": "[]", "public_token": "", "embed_enabled": 0, "folder_id": "",
+                "embed_revoked_before": "0", "embed_revoked_jti_json": "[]",
+                "embed_origins_json": "[]", "refresh_seconds": 0, "grain": "",
+                "created_at": "2026-01-01 00:00:00",
+            })],
+        )
+        .await;
+        answer(
+            server,
+            "SELECT table, name, type FROM system.columns",
+            &[("table", "String"), ("name", "String"), ("type", "String")],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "place", "type": "String"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+        answer(
+            server,
+            "count() AS n FROM",
+            &[("n", "UInt64")],
+            vec![json!({ "n": "237" })],
+        )
+        .await;
+        answer(
+            server,
+            "GROUPING SETS",
+            &[("place", "String"), ("__v0", "UInt64")],
+            (0..pivot_rows)
+                .map(|i| json!({ "place": format!("p{i}"), "__v0": "1" }))
+                .collect(),
+        )
+        .await;
+        answer(
+            server,
+            "ORDER BY day DESC LIMIT 12",
+            &[("day", "Date"), ("v", "UInt64")],
+            vec![
+                json!({"day": "2026-02-01", "v": "5"}),
+                json!({"day": "2026-03-01", "v": "7"}),
+            ],
+        )
+        .await;
+        answer(
+            server,
+            "LIMIT 50 OFFSET 0",
+            &[("place", "String"), ("visitors", "UInt32")],
+            vec![json!({ "place": "a", "visitors": 1 })],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn dashboard(server: &MockServer) -> Value {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let q = DashboardQuery {
+            board: Some("b1".to_owned()),
+            year: None,
+            filters: None,
+            grain: None,
+        };
+        get_body(
+            &ch,
+            &q,
+            None,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            (&TimeContext::default(), GrainRequest::Saved),
+        )
+        .await
+        .expect("the payload builds")
+    }
+
+    async fn statements(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_raw_tables_tile_carries_its_first_page_and_the_total_of_the_rows_behind_it() {
+        let server = MockServer::start().await;
+        mount_board(&server, 3).await;
+        let body = dashboard(&server).await;
+        let tile = &body["results"]["c_rows"];
+        assert_eq!(tile["total"], json!(237));
+        assert_eq!(tile["limit"], json!(50));
+        assert_eq!(tile["offset"], json!(0));
+        assert_eq!(tile["rows"].as_array().unwrap().len(), 1);
+        let sent = statements(&server).await;
+        assert!(
+            sent.iter().any(|s| s.contains(
+                "SELECT place, visitors FROM serving.mart_a ORDER BY place, visitors LIMIT 50 OFFSET 0"
+            )),
+            "{sent:#?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|s| s.contains("SELECT count() AS n FROM serving.mart_a")),
+            "{sent:#?}"
+        );
+        assert_eq!(body["charts"][0]["def"]["tableMode"], json!("rows"));
+    }
+
+    #[tokio::test]
+    async fn a_pivot_is_cut_at_its_cell_cap_and_says_so_only_when_it_was() {
+        // Five values: 10 000 cells / 5 = 2 000 long-format rows.
+        let server = MockServer::start().await;
+        mount_board(&server, 2001).await;
+        let body = dashboard(&server).await;
+        let tile = &body["results"]["c_pivot"];
+        assert_eq!(tile["rows"].as_array().unwrap().len(), 2000);
+        assert_eq!(tile["truncated"], json!(true));
+
+        let server = MockServer::start().await;
+        mount_board(&server, 2000).await;
+        let body = dashboard(&server).await;
+        let tile = &body["results"]["c_pivot"];
+        assert_eq!(tile["rows"].as_array().unwrap().len(), 2000);
+        assert!(tile.get("truncated").is_none(), "{tile}");
+    }
+
+    #[tokio::test]
+    async fn a_kpi_that_compares_returns_its_periods_and_the_grain_that_labels_them() {
+        let server = MockServer::start().await;
+        mount_board(&server, 3).await;
+        let body = dashboard(&server).await;
+        let tile = &body["results"]["c_kpi"];
+        assert_eq!(tile["grain"], json!("month"));
+        assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(tile["rows"][1]["v"], json!("7"));
     }
 }

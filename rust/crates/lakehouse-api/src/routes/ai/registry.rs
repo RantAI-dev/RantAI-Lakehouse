@@ -119,8 +119,40 @@ fn chart_kind_enum() -> Value {
         "kpi",
         "gauge",
         "table",
+        "pivot",
         "text"
     ])
+}
+
+/// The properties `BI-16` part A adds to both chart tools (raw tables, pivots,
+/// KPI comparisons, column settings), inserted into the schema built by
+/// [`create_chart_schema`] and [`update_chart_schema`] so the two cannot drift.
+/// The limits are the ones `lakehouse_bi::tables` enforces.
+fn with_table_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "tableMode": { "type": "string", "enum": ["grouped", "rows"], "description": "table only: grouped (default) summarises by `dimension`; rows lists the rows themselves, 50 a page, in the `columns` you pick (no dimension or measures)" },
+        "columns": { "type": "array", "items": { "type": "string" }, "description": "table in rows mode: the columns to list, in order (1 to 30). pivot: the column fields (0 to 2)" },
+        "rows": { "type": "array", "items": { "type": "string" }, "description": "pivot only (required): the row fields, outermost first (1 to 3)" },
+        "values": { "type": "array", "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column", "aggregate"] },
+            "description": "pivot only (required): what each cell shows (1 to 5). A pivot takes no dimension, measures or breakdown" },
+        "totals": { "type": "string", "enum": ["none", "grand", "all"], "description": "pivot only: none (default); grand adds the row, column and grand totals; all adds a subtotal for every outer group as well. Computed by the database, not by adding cells" },
+        "sortColumn": { "type": "string", "description": "table in rows mode: the column the rows are sorted by" },
+        "sortDir": { "type": "string", "enum": ["asc", "desc"] },
+        "columnSettings": { "type": "object", "description": "table and pivot: per column name, {label, format (auto, number, percent, currency, date, link, image), decimals 0 to 6, width 60 to 800, wrap, hidden}. A link or image column must hold http(s) URLs" },
+        "compare": { "type": "object", "description": "kpi only: {\"kind\":\"previous\",\"dateColumn\":<a date or timestamp column>,\"period\":day|week|month|quarter|year} compares the latest period that has data with the one before it and draws a trend line; or {\"kind\":\"goal\",\"value\":<number>} compares with a goal" },
+        "goodDirection": { "type": "string", "enum": ["up", "down"], "description": "kpi only: which way is good, up (default) or down; colours the change" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
 }
 
 fn run_sql_schema() -> Value {
@@ -200,7 +232,8 @@ fn describe_mart_schema() -> Value {
 }
 
 fn create_chart_schema() -> Value {
-    json!({ "type": "function", "function": { "name": "create_chart",
+    with_table_properties(
+        json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -218,11 +251,13 @@ fn create_chart_schema() -> Value {
             "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
-            "required": ["title", "kind"] } } })
+            "required": ["title", "kind"] } } }),
+    )
 }
 
 fn update_chart_schema() -> Value {
-    json!({ "type": "function", "function": { "name": "update_chart",
+    with_table_properties(
+        json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -240,7 +275,8 @@ fn update_chart_schema() -> Value {
             "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
-            "required": ["id", "title", "kind"] } } })
+            "required": ["id", "title", "kind"] } } }),
+    )
 }
 
 fn create_board_schema() -> Value {

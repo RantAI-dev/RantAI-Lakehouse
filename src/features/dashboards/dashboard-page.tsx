@@ -586,8 +586,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       hint: (
         <>
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
-          {hasRows(cell) && (cell.grainSkipped || cell.truncated)
-            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated} limit={spec.def?.limit} /> : null}
+          {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
+          {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
+            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={spec.def?.limit} /> : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
@@ -618,7 +619,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
       body: (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading}
+        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };

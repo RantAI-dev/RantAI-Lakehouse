@@ -1,4 +1,5 @@
 import type { ChartKind, ChartSpec, ChartSource } from "@/lib/dashboard-specs";
+import type { TableDefFields } from "@/lib/table-types";
 
 /**
  * Shared BI/dashboard types.
@@ -39,7 +40,7 @@ export type ChartInput = {
   text?: string; // markdown content (kind="text")
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
-};
+} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
 
 /** Tile position on the grid canvas (12 columns). Key = chartId. */
 export type TileBox = { x: number; y: number; w: number; h: number };

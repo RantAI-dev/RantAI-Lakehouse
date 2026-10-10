@@ -439,7 +439,7 @@ async fn render_board_payload(
     // Column types are also what decides whether a chart's grain still fits
     // its dimension (BI-9).
     let need_cols = filters.iter().any(FilterDef::is_active)
-        || stored_for_board.iter().any(|c| c.def.grain.is_some());
+        || stored_for_board.iter().any(|c| c.def.needs_columns());
     let cols = if need_cols {
         mart_columns(ch).await?
     } else {
@@ -472,6 +472,15 @@ async fn render_board_payload(
                 )
                 .await;
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                // BI-16 part A: the first page of a raw table, with its
+                // total; an embed and a public link offer no paging.
+                crate::routes::support::annotate_table(
+                    ch,
+                    &mut val,
+                    &filtered,
+                    (&roles, &placeholders, obligations),
+                )
+                .await;
                 results.insert(id, val);
             }
             Err(msg) => {

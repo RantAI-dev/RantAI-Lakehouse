@@ -13,3 +13,4 @@ pub mod grain;
 pub mod sources;
 pub mod specs;
 pub mod store;
+pub mod tables;

@@ -10,6 +10,12 @@ import { EChart } from "./echart";
 import { buildOption, fmtInt } from "./chart-option";
 import { GeoChart } from "./geo-chart";
 import { useReporting } from "./reporting-context";
+import { KpiCard } from "./kpi-card";
+import { PivotTable } from "./pivot-table";
+import { RawTable } from "./raw-table";
+import { cellClass, CellValue, columnStyle } from "./table-cell";
+import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
+import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
 import type { Rows } from "./tile-dialogs";
 
@@ -20,7 +26,7 @@ function hasRows(c: Cell | undefined): c is Rows {
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, onDataClick, hideLegend,
+  spec, cell, dark, loading, onDataClick, hideLegend, paging,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
@@ -34,8 +40,17 @@ export function TileBody({
    * names each series.
    */
   hideLegend?: boolean;
+  /**
+   * A raw table can page and sort through the records route with these
+   * filters. Absent (an embed, a public link, a preview): it shows its first
+   * page only (BI-16 part A).
+   */
+  paging?: { filters: FilterDef[] };
 }) {
   const reporting = useReporting();
+  // `def` is the stored definition (typed `unknown` on the shared spec): the
+  // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
+  const def = spec.def as TableDefFields | undefined;
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
@@ -48,6 +63,9 @@ export function TileBody({
   }
   if (loading && !cell) return <div className="h-full animate-pulse rounded bg-muted/40" />;
 
+  if (spec.kind === "kpi" && hasRows(cell) && def?.compare) {
+    return <KpiCard def={def} cell={cell} caption={spec.caption} />;
+  }
   if (spec.kind === "kpi") {
     const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
     return (
@@ -62,7 +80,17 @@ export function TileBody({
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <TableView columns={cell.columns} rows={cell.rows} />;
+    if (def?.tableMode === "rows") {
+      return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def }} cell={cell} paging={paging} />;
+    }
+    return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} />;
+  }
+
+  if (spec.kind === "pivot") {
+    if (!hasRows(cell) || cell.rows.length === 0 || !def) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <PivotTable def={def} cell={cell} />;
   }
 
   // Map kinds — need the map registered first (local GeoJSON).
@@ -90,20 +118,20 @@ export function TileBody({
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
 }
 
-function TableView({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {
-  const fmt = (v: unknown) => (typeof v === "number" ? v.toLocaleString("id-ID") : String(v ?? ""));
+function TableView({ columns, rows, settings = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting> }) {
+  const shown = columns.filter((c) => !settings[c]?.hidden);
   return (
     <div className="h-full overflow-auto">
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 bg-card">
           <tr className="border-b border-border">
-            {columns.map((c) => <th key={c} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{c}</th>)}
+            {shown.map((c) => <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{settings[c]?.label ?? c}</th>)}
           </tr>
         </thead>
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} className="border-b border-border/40 last:border-0">
-              {columns.map((c) => <td key={c} className="px-2 py-1 tabular-nums">{fmt(r[c])}</td>)}
+              {shown.map((c) => <td key={c} style={columnStyle(settings[c])} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} /></td>)}
             </tr>
           ))}
         </tbody>

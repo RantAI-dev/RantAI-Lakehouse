@@ -6,7 +6,7 @@ import { previewKey, type PreviewInputs } from "./preview-key"
 const base: PreviewInputs = {
   title: "t", source: "mart:m", kind: "line", dimension: "d", measure: "v", measure2: "", measure3: "",
   breakdown: "", mapId: "", lat: "", lon: "", aggregate: "sum", span: 1, caption: "", target: "",
-  text: "", order: "none", limit: 20, targetBoard: "default", grain: "",
+  text: "", order: "none", limit: 20, targetBoard: "default", grain: "", tables: "",
 }
 
 test("the preview is requested again when Group by changes", () => {

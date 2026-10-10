@@ -22,8 +22,8 @@ export type ChartKind =
   | "sankey" | "sunburst" | "boxplot" | "calendar"
   // single number
   | "kpi" | "gauge"
-  // non-chart
-  | "table" | "text";
+  // non-chart; a pivot is a table whose rows and columns are fields (BI-16 part A)
+  | "table" | "pivot" | "text";
 export type NumFmt = "int" | "float";
 /** Spec origin: builtin (seeded), AI-generated via chat, or manual via the UI. */
 export type ChartSource = "builtin" | "ai" | "ui";

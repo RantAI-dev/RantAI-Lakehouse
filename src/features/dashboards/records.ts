@@ -22,6 +22,13 @@ export type RecordsRequest = {
   grain?: string;
   /** The dashboard's active filters, so the list agrees with the number clicked. */
   filters: FilterDef[];
+  /**
+   * A raw table (BI-16 part A): list these columns of the whole tile, in this
+   * order, sorted by `sortColumn`. Not combined with `column` and `value`.
+   */
+  columns?: readonly string[];
+  sortColumn?: string;
+  sortDir?: "asc" | "desc";
 };
 
 export type RecordsPage = {
@@ -42,6 +49,13 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
     q.set("column", req.column);
     q.set("value", req.value);
     if (req.grain) q.set("grain", req.grain);
+  }
+  if (req.columns?.length) {
+    q.set("columns", req.columns.join(","));
+    if (req.sortColumn) {
+      q.set("sortColumn", req.sortColumn);
+      if (req.sortDir) q.set("sortDir", req.sortDir);
+    }
   }
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));

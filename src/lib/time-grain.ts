@@ -62,10 +62,10 @@ export function columnKindOfType(type: string): ColumnKind {
   return "text"
 }
 
-/** Chart kinds that take a grain; a calendar takes `day` only. Mirrors `Grain::kind_takes`. */
+/** Chart kinds that take a grain; a calendar takes `day` only. Mirrors `Grain::kind_takes`. A pivot's grain applies to its first date row or column field (BI-16 part A). */
 const GRAIN_KINDS: ReadonlySet<string> = new Set([
   "bar", "hbar", "line", "area", "stacked", "combo", "waterfall", "heatmap", "pie", "rose", "funnel",
-  "treemap", "radar", "calendar",
+  "treemap", "radar", "calendar", "pivot",
 ])
 
 export function kindTakesGrain(chartKind: string): boolean {

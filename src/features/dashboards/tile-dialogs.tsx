@@ -21,8 +21,12 @@ export type Rows = {
   grainColumn?: string;
   /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
   grainSkipped?: string;
-  /** More buckets existed than the chart's limit; the latest are shown (BI-9). */
+  /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
+  /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
+  total?: number;
+  limit?: number;
+  offset?: number;
 };
 export type Cell = Rows | TileFailure;
 

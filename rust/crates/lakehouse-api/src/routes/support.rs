@@ -367,6 +367,7 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
         grain_column: None,
         latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
             .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
+        table: None,
     };
     annotate_grain(tile, &filtered, chart);
 }
@@ -413,6 +414,103 @@ pub(crate) fn annotate_grain(
     if cut {
         *rows = objects.into_iter().map(Value::Object).collect();
         tile.insert("truncated".to_owned(), json!(true));
+    }
+}
+
+/// What the tile of a raw table or a pivot carries beyond its rows
+/// (`BI-16` part A).
+///
+/// A raw table's first page gets `total` (the rows its pages walk through),
+/// `limit` and `offset`, from the count statement, which goes through the same
+/// role rewrite as the page. A count that fails or is refused leaves `total`
+/// out: the tile then shows its rows and offers no paging, and the failure is
+/// only logged (the page itself already told the caller if the table could not
+/// be read). A pivot keeps the first [`lakehouse_bi::tables::pivot_cap`] rows
+/// and is marked `truncated` when the statement returned more.
+///
+/// A tile that carries an error (no `rows`) is left alone.
+pub(crate) async fn annotate_table(
+    ch: &ChClient,
+    tile: &mut Value,
+    filtered: &FilteredSql,
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    use lakehouse_bi::builder::TableRead;
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    match &filtered.table {
+        Some(TableRead::Rows { count_sql }) => {
+            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+                Ok(counted) => {
+                    let total = counted["rows"][0]["n"].as_u64().or_else(|| {
+                        counted["rows"][0]["n"]
+                            .as_str()
+                            .and_then(|t| t.parse().ok())
+                    });
+                    if let Some(total) = total {
+                        tile.insert("total".to_owned(), json!(total));
+                        tile.insert(
+                            "limit".to_owned(),
+                            json!(lakehouse_bi::tables::ROWS_PAGE_SIZE),
+                        );
+                        tile.insert("offset".to_owned(), json!(0));
+                    }
+                }
+                Err(SpecRunFailure::Clickhouse(err)) => {
+                    // The page was read; only its total was not. Logged under
+                    // a reference id, nothing of it in the response.
+                    let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                }
+                Err(SpecRunFailure::Refused(_)) => {}
+            }
+        }
+        Some(TableRead::Pivot { row_cap }) => {
+            if let Some(Value::Array(rows)) = tile.get_mut("rows")
+                && lakehouse_bi::tables::pivot_trim(rows, *row_cap)
+            {
+                tile.insert("truncated".to_owned(), json!(true));
+            }
+        }
+        Some(TableRead::Trend { .. }) | None => {}
+    }
+}
+
+/// [`annotate_table`] for a chart that is not on a dashboard (the builder's
+/// preview): a pivot is cut like a tile; a comparing KPI says which period its
+/// buckets are cut by. A raw table's total is not counted, the preview shows
+/// its first page.
+pub(crate) fn annotate_saved_table(tile: &mut Value, chart: &store::StoredChartSpec) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if chart.spec.kind == lakehouse_bi::specs::ChartKind::Pivot {
+        let cap = lakehouse_bi::tables::pivot_cap(
+            chart.def.sql_source.is_some(),
+            chart.def.tables.values.as_ref().map_or(1, Vec::len),
+        );
+        if let Some(Value::Array(rows)) = tile.get_mut("rows")
+            && lakehouse_bi::tables::pivot_trim(rows, cap)
+        {
+            tile.insert("truncated".to_owned(), json!(true));
+        }
+    }
+    if chart.def.tables.compares_to_previous(chart.spec.kind)
+        && let Some(period) = chart
+            .def
+            .tables
+            .compare
+            .as_ref()
+            .and_then(|c| c.period.as_deref())
+    {
+        tile.insert("grain".to_owned(), json!(period));
     }
 }
 
