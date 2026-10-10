@@ -190,3 +190,8 @@ Decision 8 on the feature page. One task, T8.
 | Where | The table tile's existing CSV action, for a raw table; grouped tables and other tiles keep today's export. The file is named after the tile. |
 
 Verify, not assume: how Query Studio's download streams and caps, and reuse it; that an existing CSV helper (`src/lib/table-csv.ts`) already escapes formulas or not — one escaping rule, in one place; one real-engine run of the export statement with a filter and a sort, row count quoted.
+
+**Owner's decisions, 2026-10-11 (after the developer stopped on the permission question).**
+
+- Who may export: anyone who can see the tile (`dashboard:read`). Every export writes an audit entry: who, which dashboard and tile, how many rows, whether it was cut. Query Studio's download is not the pattern to copy for the permission (it is owner-scoped on `query:read`) or for the statement path.
+- T9, same slice: Query Studio's download route re-runs the stored statement without the role rewrite that the run route applies. It must apply the same rewrite as the run route, for the calling principal's current roles, and refuse when the rewrite refuses. The owner asked for this fix in this PR.
