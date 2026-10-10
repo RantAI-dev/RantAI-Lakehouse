@@ -61,11 +61,16 @@ test("without a comparison the number is the first row's v", () => {
 })
 
 test("amounts and percents carry their sign, and a flat line has no height", () => {
-  assert.equal(signedPercent(12.34), "+12,3%")
+  assert.equal(signedPercent(12.34), "+12.3%")
   assert.equal(signedPercent(-3), "-3%")
-  assert.equal(signedAmount(1234), "+1.234")
+  assert.equal(signedAmount(1234), "+1,234")
   assert.equal(signedAmount(-5), "-5")
   assert.equal(sparklinePoints([], 100, 20), "")
   assert.equal(sparklinePoints([4, 4], 100, 20), "2.0,10.0 98.0,10.0")
   assert.equal(sparklinePoints([0, 10], 100, 20), "2.0,18.0 98.0,2.0")
+})
+
+test("fractional data keeps the charts' decimals on the change", () => {
+  assert.equal(signedAmount(2.5, 2), "+2.5")
+  assert.equal(signedAmount(-20459.4), "-20,459")
 })

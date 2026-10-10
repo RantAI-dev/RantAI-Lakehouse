@@ -1,3 +1,4 @@
+import { formatNumber } from "./chart-axis"
 import type { KpiCompare } from "./table-types"
 
 /**
@@ -74,16 +75,16 @@ export function readKpi(
   }
 }
 
-/** `+12,5%` / `-3%`, one decimal at most; `null` reads as nothing. */
+/** `+12.5%` / `-3%`, one decimal at most; `null` reads as nothing. */
 export function signedPercent(percent: number | null): string {
   if (percent === null) return ""
-  const body = Math.abs(percent).toLocaleString("id-ID", { maximumFractionDigits: 1 })
+  const body = Math.abs(percent).toLocaleString("en-US", { maximumFractionDigits: 1 })
   return `${percent > 0 ? "+" : percent < 0 ? "-" : ""}${body}%`
 }
 
-/** `+1.234` / `-56`. */
-export function signedAmount(delta: number): string {
-  const body = Math.abs(delta).toLocaleString("id-ID", { maximumFractionDigits: 2 })
+/** `+1,234` / `-56`; fractional data keeps `decimals` as the chart does (`decimalsFor`). */
+export function signedAmount(delta: number, decimals = 0): string {
+  const body = formatNumber(Math.abs(delta), decimals)
   return `${delta > 0 ? "+" : delta < 0 ? "-" : ""}${body}`
 }
 

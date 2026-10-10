@@ -22,11 +22,11 @@ test("an image cell loads only an https address", () => {
   assert.equal(safeImageUrl("http://example.com/a.png"), null)
 })
 
-test("numbers read with the Indonesian grouping and the column's digits", () => {
-  assert.equal(cellText(1234567.891, { format: "number", decimals: 1 }), "1.234.567,9")
-  assert.equal(cellText(1234, undefined), "1.234")
-  assert.equal(cellText("1234", { format: "number", decimals: 0 }), "1.234")
-  assert.equal(cellText(0.256, { format: "percent", decimals: 1 }), "25,6%")
+test("numbers read in the console's English convention and the column's digits", () => {
+  assert.equal(cellText(1234567.891, { format: "number", decimals: 1 }), "1,234,567.9")
+  assert.equal(cellText(1234, undefined), "1,234")
+  assert.equal(cellText("1234", { format: "number", decimals: 0 }), "1,234")
+  assert.equal(cellText(0.256, { format: "percent", decimals: 1 }), "25.6%")
   assert.match(cellText(1500, { format: "currency" }), /^Rp\s?1\.500$/)
   assert.match(cellText(1500.5, { format: "currency", decimals: 2 }), /^Rp\s?1\.500,50$/)
 })

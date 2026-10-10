@@ -16,6 +16,8 @@ export type PivotInput = {
   rowFields: readonly string[]
   colFields: readonly string[]
   valueCount: number
+  /** A display label for a key of one field, or `null` for the default (BI-9 bucket labels). */
+  labelFor?: (field: string, key: string) => string | null
 }
 
 export type PivotColumn = {
@@ -123,15 +125,16 @@ export function buildPivot(input: PivotInput): PivotModel {
     cellsByKey.set(`${idOf(rowPath)}|${idOf(colPath)}`, Array.from({ length: input.valueCount }, (_, i) => num(row[`__v${i}`])))
   }
 
+  const fieldLabel = (field: string, key: string) => input.labelFor?.(field, key) ?? labelOf(key)
   const colOrder = nC === 0 ? [[]] : ordered(trieOf(colPaths))
   const columns: PivotColumn[] = colOrder.map((path) => ({
     path,
-    labels: path.map(labelOf),
+    labels: path.map((k, i) => fieldLabel(input.colFields[i], k)),
     kind: path.length === nC ? "leaf" : "total",
   }))
   const rows: PivotRow[] = ordered(trieOf(rowPaths)).map((path) => ({
     path,
-    labels: path.map(labelOf),
+    labels: path.map((k, i) => fieldLabel(input.rowFields[i], k)),
     kind: path.length === nR ? "leaf" : path.length === 0 ? "grand" : "subtotal",
     cells: colOrder.map((colPath) => cellsByKey.get(`${idOf(path)}|${idOf(colPath)}`) ?? Array.from({ length: input.valueCount }, () => null)),
   }))

@@ -40,6 +40,7 @@ import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
+import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
@@ -636,7 +637,7 @@ export function ChartBuilder({
             return json as Preview;
           });
       void request.then((next) => {
-        if (!controller.signal.aborted) setPreview(next);
+        if (!controller.signal.aborted) setPreview({ ...next, spec: withPreviewDef(next.spec, payload) });
       }).catch((e: unknown) => {
         if (!controller.signal.aborted) { setPreview(null); setPreviewError(e instanceof Error ? e.message : String(e)); }
       }).finally(() => { if (!controller.signal.aborted) setPreviewBusy(false); });

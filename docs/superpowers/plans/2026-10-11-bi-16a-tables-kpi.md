@@ -141,4 +141,36 @@ Nothing is committed, pushed or stashed. No migration, no Postgres change.
 10. A user without `dashboard:write` cannot save any of it; a failing preview or page shows the sentence and reference, not database text.
 11. Ask the assistant: "Show this as a pivot table with totals."
 
+### BI-16 part A — fix handoff (developer, 2026-10-11, uncommitted, console only)
+
+Rust not touched. Cited as "BI-16A review fix".
+
+- **R1 (BLOCKER):** `pivot-table.tsx`. Cause: row-head cells used `bg-inherit` of a transparent `tr`, only the thead cells were opaque, nothing was stacked, and the table was squeezed. Now: table `w-max min-w-full` (scrolls sideways instead of squeezing); header cells `bg-card`, `z-20`, fixed `h-7` (second header row sticks at `top-7`); only the first row-field column sticks (`left-0 z-10`, opaque `bg-card`, or `bg-muted` on total rows, `min-w-28 max-w-56 truncate` with a `title`); the corner is `z-30`. Theme tokens only. Test pins opaque background and z-index on every sticky cell. *Not verified in a browser* (reasoned from the CSS).
+- **R2 (BLOCKER):** cause: the preview route's spec has no `def`, so `TileBody` never saw column settings, pivot fields or the comparison (the `previewKey` already carried them). `src/lib/preview-spec.ts` `withPreviewDef` attaches the payload sent; `chart-builder.tsx` applies it to every preview result (mart and SQL-source paths). Tests (component layer, `table-tiles.test.tsx`): a spec without `def` shows the hidden column; with the attached payload it is hidden and the value is `Rp`; a KPI shows "75% of goal" only with the attached payload. The dialog itself is not rendered by any test.
+- **R3 (SHOULD-FIX):** `pivot.ts` `labelFor`; `pivot-table.tsx` labels the grained field with `bucketLabel` (truncation grains). The tile does not carry which field was grained, so it is the first row/column field whose keys all have a date's shape, matching the server's choice (first date field). A part-of-date grain (day of week) on a pivot is not relabelled. Test: "Q3 2025".
+- **R4 (SHOULD-FIX):** `cell-format.ts` number and percent now `en-US`; `kpi-compare.ts` signed amount/percent `en-US`; `kpi-card.tsx` value and change share `decimalsFor` and `formatNumber` from `chart-axis.ts`. Currency keeps `Rp`/`id-ID`. Tests updated for the convention (`cell-format.test.ts`, `kpi-compare.test.ts`: expectations changed from `1.234`/`+12,3%` to `1,234`/`+12.3%`, because the convention changed).
+- **R5 (SHOULD-FIX):** collapsing needs two or more row fields. With one row field each group is a leaf, there is no subtotal row to stay in view, so there is nothing to fold; no change (a test pins it).
+
+Counts: `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings (as before); `bun test src/features/dashboards src/lib`: 684 pass, 0 fail; full `bun run test`: see the final message.
+
 ## 7. Review (planner appends)
+
+### BI-16 part A — findings from the product owner's QA (reviewer, 2026-10-11)
+
+The reviewer did not re-run the suites (owner's instruction); the developer's counts are in the handoff, CI runs the rest.
+
+QA passed: `BI-16A-AC1` (50 rows a page of 237, sort across pages), `AC2` after saving (currency, a hidden column and the order survive a reload), the pivot's grand total (278,955), the KPI comparison and the goal on the saved tile, `AC5` (record detail, "Record 6 of 56", Previous / Next).
+
+- `BLOCKER` R1 — The pivot tile is unreadable: the sticky row-header column and the sticky header row have no opaque background and no reserved width, so row labels are drawn over the first value column ("Sumatera Barat" over "4.404"), the first row label over the column header, and the "Total" label over the first total. Give the sticky cells a background, a width and the right stacking; check with long labels, a narrow half-width tile and horizontal scroll, in light and dark themes.
+- `BLOCKER` R2 — The builder preview does not show what is being edited for the new features: column settings of a raw table (currency, hidden column) and a KPI's comparison or goal appear only after saving. The preview must render through the same components and settings as the tile, and every new input must change it (`previewKey` and the preview renderer both).
+- `SHOULD-FIX` R3 — A pivot column field grouped by a time grain shows the raw bucket start ("2025-07-01"); use `BI-9`'s bucket labels ("Q3 2025"), for row fields too.
+- `SHOULD-FIX` R4 — Mixed number conventions on one tile: the KPI's value reads "11,299" and its change "-20.459 (-64,4%)"; table cells read "1.282" where charts read "1,282". New formatters must follow the convention the console already uses for chart and KPI numbers; only the currency format keeps its own (`Rp`).
+- `SHOULD-FIX` R5 — The QA pivot (one row field, totals `all`) offers no collapse control. If collapsing needs two or more row fields, that is the answer and nothing changes; if a control should be there, fix it. Say which.
+
+### BI-16 part A — closed (reviewer, 2026-10-11)
+
+R1 to R5 are closed, confirmed by the product owner in a browser: the pivot reads cleanly with labelled quarters and a sticky first column; the builder preview follows column settings and a KPI's comparison or goal; numbers follow one convention; a two-level pivot collapses (R5: one row field has nothing to collapse, unchanged). No open `BLOCKER`.
+
+Not verified by anyone: `BI-16A-AC6` as a user without `dashboard:write`; `AI-5-AC1` through the assistant; a raw table, pivot or comparing KPI on an embed or public link; a pivot over a masked table in a browser; the workspace-wide suites (CI).
+
+Owed: the owner's answer on CSV export of a raw table (today: the 50 rows on screen, hidden columns included); decisions 1 to 7 on the feature page are planner defaults.

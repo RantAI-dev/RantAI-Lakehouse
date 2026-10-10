@@ -7,6 +7,7 @@ import { TileBody } from "./tile-body"
 import type { Rows } from "./tile-dialogs"
 import type { ChartRenderSpec } from "@/lib/dashboard-specs"
 import type { TableDefFields } from "@/lib/table-types"
+import { withPreviewDef } from "@/lib/preview-spec"
 
 const originalFetch = global.fetch
 afterEach(() => {
@@ -255,5 +256,66 @@ describe("TileBody", () => {
     cleanup()
     render(<TileBody spec={spec("pivot", { rows: ["p"], values: [{ column: "v", aggregate: "sum" }] })} cell={{ columns: [], rows: [{ p: "a", __v0: 5, __g0: 0 }] }} dark={false} loading={false} />)
     expect(screen.getByText("a")).toBeTruthy()
+  })
+})
+
+describe("builder preview (BI-16A review fix R2)", () => {
+  // The preview route's spec has no `def`; the builder attaches its payload.
+  const served = { id: "p", title: "T", kind: "table", mart: "m", x: "", y: "", source: "ui" } as ChartRenderSpec
+  const cell: Rows = { columns: ["a", "b"], rows: [{ a: 1500, b: "hidden-value" }] }
+  const payload = { tableMode: "rows", columns: ["a", "b"], columnSettings: { a: { format: "currency" }, b: { hidden: true } } }
+
+  it("shows a raw table's currency and hidden column only once the definition is attached", () => {
+    render(<TileBody spec={{ ...served, kind: "table", def: { tableMode: "rows", columns: ["a", "b"] } }} cell={cell} dark={false} loading={false} />)
+    expect(screen.getByText("hidden-value")).toBeTruthy()
+    cleanup()
+    render(<TileBody spec={withPreviewDef(served, payload)} cell={cell} dark={false} loading={false} />)
+    expect(screen.queryByText("hidden-value")).toBeNull()
+    expect(screen.getByText(/^Rp/)).toBeTruthy()
+  })
+
+  it("draws a KPI's comparison from the attached payload", () => {
+    const kpi = { ...served, kind: "kpi" } as ChartRenderSpec
+    const rows: Rows = { columns: ["v"], rows: [{ v: 150 }] }
+    render(<TileBody spec={kpi} cell={rows} dark={false} loading={false} />)
+    expect(screen.queryByText(/of goal/)).toBeNull()
+    cleanup()
+    render(<TileBody spec={withPreviewDef(kpi, { compare: { kind: "goal", value: 200 } })} cell={rows} dark={false} loading={false} />)
+    expect(screen.getByText(/75% of goal/)).toBeTruthy()
+  })
+})
+
+describe("pivot labels and folding (BI-16A review fix R3, R5)", () => {
+  it("labels a grained date field with BI-9's bucket label, not the bucket start", () => {
+    const def: TableDefFields = { rows: ["p"], columns: ["q"], values: [{ column: "v", aggregate: "sum" }], totals: "none" }
+    const cell: Rows = {
+      columns: [], grain: "quarter",
+      rows: [{ p: "a", q: "2025-07-01", __v0: 1, __g0: 0, __g1: 0 }, { p: "a", q: "2025-10-01", __v0: 2, __g0: 0, __g1: 0 }],
+    }
+    render(<PivotTable def={def} cell={cell} />)
+    expect(screen.getByText("Q3 2025")).toBeTruthy()
+    expect(screen.getByText("Q4 2025")).toBeTruthy()
+    expect(screen.queryByText("2025-07-01")).toBeNull()
+  })
+
+  it("has nothing to fold with one row field: its groups are leaves (folding needs two row fields)", () => {
+    const def: TableDefFields = { rows: ["p"], values: [{ column: "v", aggregate: "sum" }], totals: "all" }
+    const cell: Rows = { columns: [], rows: [{ p: "a", __v0: 1, __g0: 0 }, { p: "", __v0: 1, __g0: 1 }] }
+    render(<PivotTable def={def} cell={cell} />)
+    expect(screen.queryByRole("button", { name: /Collapse/ })).toBeNull()
+  })
+
+  it("makes every sticky cell opaque and stacked so labels cannot draw over values", () => {
+    const def: TableDefFields = { rows: ["p"], columns: ["m"], values: [{ column: "v", aggregate: "sum" }], totals: "grand" }
+    const cell: Rows = { columns: [], rows: [{ p: "a", m: "x", __v0: 1, __g0: 0, __g1: 0 }, { p: "", m: "", __v0: 1, __g0: 1, __g1: 1 }] }
+    const { container } = render(<PivotTable def={def} cell={cell} />)
+    const sticky = Array.from(container.querySelectorAll(".sticky"))
+    expect(sticky.length).toBeGreaterThan(0)
+    for (const el of sticky) {
+      expect(/\bbg-(card|muted)\b/.test(el.className)).toBe(true)
+      expect(/\bz-(10|20|30)\b/.test(el.className)).toBe(true)
+    }
+    // The corner is above both axes.
+    expect(container.querySelector("thead th.left-0")?.className).toContain("z-30")
   })
 })

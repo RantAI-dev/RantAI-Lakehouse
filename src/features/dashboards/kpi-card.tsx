@@ -5,7 +5,7 @@ import { readKpi, signedAmount, signedPercent, sparklinePoints, type KpiReading 
 import { bucketLabel, isGrain } from "@/lib/time-grain";
 import type { TableDefFields } from "@/lib/table-types";
 import { cn } from "@/lib/utils";
-import { fmtInt } from "./chart-option";
+import { decimalsFor, formatNumber } from "@/lib/chart-axis";
 import type { Rows } from "./tile-dialogs";
 
 const TONE: Record<KpiReading["tone"], string> = {
@@ -22,12 +22,14 @@ const TONE: Record<KpiReading["tone"], string> = {
  */
 export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; readonly cell: Rows; readonly caption?: string }) {
   const r = readKpi(cell.rows, def.compare, def.goodDirection);
+  // R4: one convention for the value and its change, the charts' (`decimalsFor`).
+  const dec = decimalsFor([r.value ?? 0, r.reference ?? 0, r.delta ?? 0, ...r.series]);
   const grain = isGrain(cell.grain) ? cell.grain : null;
   const label = (bucket: unknown) => (grain && bucket !== undefined ? bucketLabel(grain, bucket) : "");
   const Arrow = r.delta === null || r.delta === 0 ? Minus : r.delta > 0 ? ArrowUp : ArrowDown;
   return (
     <div className="grid h-full place-content-center px-2 text-center">
-      <p className="text-4xl font-semibold tabular-nums text-foreground">{r.value === null ? "—" : fmtInt(r.value)}</p>
+      <p className="text-4xl font-semibold tabular-nums text-foreground">{r.value === null ? "—" : formatNumber(r.value, dec)}</p>
       {r.mode === "previous" && r.value !== null ? (
         <p className="mt-0.5 text-xs text-muted-foreground">{label(r.valueBucket)}</p>
       ) : null}
@@ -36,12 +38,12 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; 
           <Arrow className="size-4" aria-hidden />
           {r.mode === "goal" ? (
             <span>
-              {r.percent !== null ? `${r.percent.toLocaleString("id-ID", { maximumFractionDigits: 1 })}% of goal` : "of goal"}
-              <span className="font-normal text-muted-foreground"> · {signedAmount(r.delta)} {r.delta < 0 ? "to go" : "over"}</span>
+              {r.percent !== null ? `${r.percent.toLocaleString("en-US", { maximumFractionDigits: 1 })}% of goal` : "of goal"}
+              <span className="font-normal text-muted-foreground"> · {signedAmount(r.delta, dec)} {r.delta < 0 ? "to go" : "over"}</span>
             </span>
           ) : (
             <span>
-              {signedAmount(r.delta)}{r.percent !== null ? ` (${signedPercent(r.percent)})` : ""}
+              {signedAmount(r.delta, dec)}{r.percent !== null ? ` (${signedPercent(r.percent)})` : ""}
               {r.referenceBucket !== undefined ? <span className="font-normal text-muted-foreground"> vs {label(r.referenceBucket)}</span> : null}
             </span>
           )}

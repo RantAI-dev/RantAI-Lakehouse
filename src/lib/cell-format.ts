@@ -4,6 +4,8 @@ import type { ColumnSetting } from "./table-types"
  * How a table cell reads (`BI-16` part A). The server returns raw values;
  * the column's setting decides how they look. Currency is the browser's
  * Indonesian formatting (`Rp`), without conversion (feature-page decision 7).
+ * BI-16A review fix (SHOULD-FIX) R4: every other number uses the console's
+ * English convention (`1,282`, `12.5`), as charts and KPI values do.
  */
 export type CellContent =
   | { kind: "text"; text: string }
@@ -80,14 +82,14 @@ export function cellContent(value: unknown, setting?: ColumnSetting): CellConten
       return { kind: "text", text: formatDate(value) }
     case "percent":
       // A ratio, as `Intl` reads it: 0.25 is 25%.
-      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat("id-ID", { style: "percent", ...fractionOptions(decimals, 2) }).format(n) }
+      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat("en-US", { style: "percent", ...fractionOptions(decimals, 2) }).format(n) }
     case "currency":
       return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", ...fractionOptions(decimals ?? 0, 0) }).format(n) }
     case "number":
-      return { kind: "text", text: n === null ? String(value) : n.toLocaleString("id-ID", fractionOptions(decimals, 3)) }
+      return { kind: "text", text: n === null ? String(value) : n.toLocaleString("en-US", fractionOptions(decimals, 3)) }
     default:
       // `auto`: a JSON number reads as a number; a quoted one is left as text.
-      if (typeof value === "number") return { kind: "text", text: value.toLocaleString("id-ID", fractionOptions(decimals, 3)) }
+      if (typeof value === "number") return { kind: "text", text: value.toLocaleString("en-US", fractionOptions(decimals, 3)) }
       return { kind: "text", text: String(value) }
   }
 }
