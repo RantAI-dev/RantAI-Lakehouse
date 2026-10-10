@@ -39,6 +39,7 @@ use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
+use lakehouse_store::schema_change::{self, SchemaChangePolicy};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -53,7 +54,7 @@ use crate::state::AppState;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::pipelines::pool`.
-fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
+pub(super) fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "connector store unavailable: no Postgres pool is configured \
@@ -63,7 +64,7 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     })
 }
 
-fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+pub(super) fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
@@ -233,13 +234,16 @@ fn due_window(
 }
 
 /// A `cdc` connector streams through its own Debezium service and is never
-/// launched on a schedule, whatever its row says.
+/// launched on a schedule, whatever its row says. A paused connector is never
+/// due either (`SRC-8` F6): only this DUE list filters, the unfiltered list
+/// the orchestrator reads for one connector still carries it.
 fn is_due(
     connector: &connectors::IngestibleConnector,
     after: time::OffsetDateTime,
     until: time::OffsetDateTime,
 ) -> bool {
     connector.adapter != "cdc"
+        && !connector.paused
         && connector
             .schedule_cron
             .as_deref()
@@ -305,6 +309,9 @@ pub struct UpdateConnectorBody {
     residency: Option<String>,
     #[serde(default)]
     host: Option<String>,
+    /// `SRC-8` D1: one of `apply_non_breaking | apply_all | ask_first | pause`.
+    #[serde(default)]
+    schema_change_policy: Option<String>,
 }
 
 /// Validate an [`UpdateConnectorBody`] into the store's input. Pure —
@@ -326,12 +333,26 @@ fn update_input(body: UpdateConnectorBody) -> Result<connectors::UpdateConnector
             "direction must be one of {VALID_DIRECTIONS:?}, got {direction:?}"
         )));
     }
+    let schema_change_policy = non_blank("schemaChangePolicy", body.schema_change_policy)?;
+    if let Some(policy) = &schema_change_policy
+        && SchemaChangePolicy::parse(policy).is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "schemaChangePolicy must be one of apply_non_breaking, apply_all, ask_first, pause"
+                .to_owned(),
+        ));
+    }
     let input = connectors::UpdateConnectorInput {
         name: non_blank("name", body.name)?,
         direction,
         environment: non_blank("environment", body.environment)?,
         residency: non_blank("residency", body.residency)?,
         host: non_blank("host", body.host)?,
+        // `SRC-8`: changing the policy never lifts an existing pause. Only an
+        // approval does (`schema_change::approve_object`), so moving a
+        // connector from `pause` to another policy while a change waits
+        // does not start loading behind that change's back.
+        schema_change_policy,
     };
     if input.is_empty() {
         return Err(ApiError::BadRequest("nothing to update".to_owned()));
@@ -416,6 +437,7 @@ pub async fn update(
         ("environment", input.environment.is_some()),
         ("residency", input.residency.is_some()),
         ("host", input.host.is_some()),
+        ("schemaChangePolicy", input.schema_change_policy.is_some()),
     ]
     .into_iter()
     .filter_map(|(field, changed)| changed.then_some(field))
@@ -621,7 +643,7 @@ fn reject_legacy_secret_ref_fields(body: &Bytes) -> Result<(), ApiError> {
 /// `principal_kind` comes from [`Principal::kind_for_audit`], never
 /// `Principal::provider` — same CHECK this crate's other audit sites
 /// satisfy (see that method's doc comment).
-fn connector_audit_event(
+pub(super) fn connector_audit_event(
     principal: &Principal,
     action: &str,
     connector_id: &str,
@@ -944,10 +966,13 @@ async fn remove_managed_credentials(
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
 ///
 /// Opens a REAL, bounded (5s, no retries) connectivity probe for
-/// `PostgreSQL` and S3-compatible object-storage connectors — see
-/// `crate::connector_probe`'s module doc comment for exactly what that
-/// does and does not cover. Every other connector `type` gets an honest
-/// `supported: false` result, never a fabricated latency or success.
+/// `PostgreSQL`, `MySQL`/`MariaDB`, SQL Server, REST and S3-compatible
+/// object-storage connectors (an object-storage connector is tested at the
+/// endpoint in its `dial`, `SRC-6`) — see `crate::connector_probe`'s module
+/// doc comment for exactly what that does and does not cover. Every other
+/// connector gets an honest `supported: false` result, never a fabricated
+/// latency or success: Oracle, `MongoDB`, Kafka and SFTP connect only from
+/// the orchestrator (`SRC-6` F3, F4), and a stored `health` is left alone.
 ///
 /// # Errors
 ///
@@ -1653,7 +1678,9 @@ async fn publish_credentials<T>(
 /// refusing an unprobeable type (Kafka, SFTP, `MongoDB`, Oracle, …) would
 /// make its credential impossible to set at all. So an unsupported probe
 /// saves the value with `verified: false` and says so — never a fabricated
-/// success.
+/// success. Oracle used to answer "supported, misconfigured" and so was
+/// refused here; it now answers `supported: false` like the others
+/// (`SRC-6` F3).
 ///
 /// # Errors
 ///
@@ -3143,7 +3170,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// # Errors
 ///
 /// 404 if `id` is unknown or has no ingest spec set (`adapter IS NULL`);
-/// 409 if a run for this connector is still queued or running (see
+/// 409 if the connector is paused (`SRC-8`, [`CONNECTOR_PAUSED`]) or if a
+/// run for this connector is still queued or running (see
 /// [`ingest_run_history`]); 422 if `Dagster` reports a launch-time
 /// failure; 503 on a `Dagster` transport failure; 503/500 as above for the
 /// database pool.
@@ -3151,6 +3179,13 @@ pub async fn ingest_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // `SRC-8` F6: a paused connector starts nothing, and this is answered
+    // before Dagster is asked anything. Unknown ids stay a 404.
+    match schema_change::is_paused(pool(&state)?, &id).await? {
+        None => return Err(ApiError::NotFound(format!("Connector {id} not found")).into()),
+        Some(true) => return Err(ApiError::Conflict(CONNECTOR_PAUSED.to_owned()).into()),
+        Some(false) => {}
+    }
     let spec = connectors::get_ingest_spec(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
@@ -3209,9 +3244,14 @@ pub async fn ingest_run(
     }
 }
 
+/// The 409 for a run of a paused connector (`SRC-8` F6). Fixed text: what
+/// paused it is on the connector's page, not repeated here.
+pub(super) const CONNECTOR_PAUSED: &str = "This connector is paused, so no run was started. \
+     Resolve what paused it on the connector's page first.";
+
 /// The one Dagster job every connector's ingest runs as
 /// (`dagster/dispar_orchestrate/ingest_factory.py`).
-const INGEST_JOB: &str = "ingest_job";
+pub(super) const INGEST_JOB: &str = "ingest_job";
 
 /// How many of `ingest_job`'s most recent runs, across every connector,
 /// are searched for one connector's runs.
@@ -3928,6 +3968,22 @@ mod tests {
             json!({}),
         ] {
             assert!(update_input(update_body(body.clone())).is_err(), "{body}");
+        }
+    }
+
+    /// `SRC-8` D1: the policy is a patchable field; the four values pass and
+    /// anything else is refused (the column's CHECK is the second guard).
+    #[test]
+    fn update_input_takes_the_four_schema_change_policies_and_refuses_others() {
+        for policy in ["apply_non_breaking", "apply_all", "ask_first", "pause"] {
+            let input = update_input(update_body(json!({ "schemaChangePolicy": policy }))).unwrap();
+            assert_eq!(input.schema_change_policy.as_deref(), Some(policy));
+        }
+        for bad in ["Pause", "apply-all", "", "  "] {
+            assert!(
+                update_input(update_body(json!({ "schemaChangePolicy": bad }))).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -4830,6 +4886,8 @@ mod tests {
             schedule_cron: cron.map(str::to_owned),
             secret_ref: format!("file:/run/secrets/connector_managed_{id}_password"),
             secret_ref_secondary: None,
+            paused: false,
+            schema_change_policy: "apply_non_breaking".to_owned(),
         }
     }
 
@@ -4856,6 +4914,18 @@ mod tests {
             until
         ));
         assert!(!is_due(&ingestible("d", "sql", None), after, until));
+    }
+
+    /// `SRC-8` F6: a paused connector is left out of the due list even when
+    /// its cron fires in the window.
+    #[test]
+    fn is_due_leaves_out_a_paused_connector() {
+        let until = time::macros::datetime!(2026 - 09 - 30 02:00:00 UTC);
+        let after = until - time::Duration::minutes(1);
+        let mut paused = ingestible("p", "sql", Some("0 2 * * *"));
+        assert!(is_due(&paused, after, until));
+        paused.paused = true;
+        assert!(!is_due(&paused, after, until));
     }
 
     #[test]

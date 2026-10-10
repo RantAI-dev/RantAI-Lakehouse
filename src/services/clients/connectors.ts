@@ -1,4 +1,6 @@
 import type {
+  ApproveSchemaChangeRequest,
+  ApproveSchemaChangeResponse,
   Connector,
   ConnectorDetail,
   ConnectorService,
@@ -17,6 +19,7 @@ import type {
   ProbeHistoryResponse,
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
+  SchemaChangeList,
   SetConnectorCredentialRequest,
   SetConnectorCredentialResponse,
   UpdateConnectorInput,
@@ -168,6 +171,16 @@ export const postgresConnectorService: ConnectorService = {
   },
   updateConnector(id, input: UpdateConnectorInput, signal) {
     return sendJson<Connector>("PATCH", `/api/connectors/${encodeURIComponent(id)}`, input, signal);
+  },
+  listSchemaChanges(id, signal) {
+    return getJson<SchemaChangeList>(`/api/connectors/${encodeURIComponent(id)}/schema-changes`, { signal });
+  },
+  approveSchemaChanges(id, body: ApproveSchemaChangeRequest, signal) {
+    return postJson<ApproveSchemaChangeResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/schema-changes/approve`,
+      body,
+      signal
+    );
   },
   async deleteConnector(id, options, signal) {
     const query = options?.force ? "?force=true" : "";

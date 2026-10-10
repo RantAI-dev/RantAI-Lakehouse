@@ -56,6 +56,12 @@ const DETAIL = {
   tenant: "Acme Co",
   lastTestAt: null,
   lastActivityAt: null,
+  lastRunSuccessAt: null,
+  lastRunFailureAt: null,
+  failureStreak: 0,
+  schemaChangePolicy: "apply_non_breaking",
+  pausedReason: null,
+  pausedAt: null,
   capabilities: [],
   owner: "admin",
   discoveredAssets: 0,
@@ -105,6 +111,7 @@ function stubFetch(
     if (key.startsWith("GET /api/connectors/conn-a/probe-history")) {
       return json({ results: key.endsWith("?limit=1") ? probes.slice(0, 1) : probes })
     }
+    if (key === "GET /api/connectors/conn-a/schema-changes") return json({ pending: [], recent: [], inactiveColumns: [] })
     if (key === "GET /api/connectors/conn-a/ingest/runs") return json([])
     if (key === "GET /api/governance/ingest-runs?connectorId=conn-a") return json([])
     if (key === "POST /api/connectors/conn-a/test") {
@@ -187,11 +194,59 @@ describe("ConnectorDetailPage", () => {
     // Ingest carries a count once the saved spec is read; the others none.
     expect(names[0]).toBe("Overview")
     expect(names[1]).toMatch(/^Ingest\d*$/)
-    expect(names[2]).toBe("Connection tests")
+    // `SRC-8` added the Schema changes tab between Ingest and Connection tests
+    // (it carries a count only while a table waits, so none here).
+    expect(names[2]).toBe("Schema changes")
+    expect(names[3]).toBe("Connection tests")
     expect(selected("Overview")).toBe("true")
     expect(selected("Ingest")).toBe("false")
     expect(selected("Connection tests")).toBe("false")
     expect(window.history.replaceState).not.toHaveBeenCalled()
+  })
+
+  it("marks a paused connector in the header and holds Run now back with the reason", async () => {
+    url.search = "?tab=ingest"
+    stubFetch({}, {
+      ...DETAIL,
+      pausedReason: "A schema change at the source is waiting for approval.",
+      pausedAt: "2026-10-09T01:00:00.000Z",
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    const title = await screen.findByRole("heading", { level: 1, name: "db demo" })
+    expect(
+      within(title.parentElement as HTMLElement).getByText(
+        "Paused: A schema change at the source is waiting for approval."
+      )
+    ).toBeDefined()
+    // The ingest spec has no tables, so the paused reason must win over "Save at least one table".
+    expect(await screen.findByText("Paused: A schema change at the source is waiting for approval.", { selector: "p" })).toBeDefined()
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("marks a table that waits for a schema decision in the Ingest tab, from the one list the Schema tab reads", async () => {
+    url.search = "?tab=ingest"
+    const { count } = stubFetch(
+      {
+        "GET /api/connectors/conn-a/ingest-spec": () =>
+          json({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "orders" }, { name: "public.items", target: "items" }] }),
+        "GET /api/connectors/conn-a/schema-changes": () =>
+          json({
+            pending: [
+              {
+                id: "chg-1", objectName: "public.orders", kind: "column_removed", columnName: "note", beforeValue: "text",
+                afterValue: null, breaking: true, status: "pending", runId: null, detectedAt: "2026-10-09T01:00:00.000Z",
+                decidedBy: null, decidedAt: null, canApprove: true,
+              },
+            ],
+            recent: [],
+            inactiveColumns: [],
+          }),
+      }
+    )
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findAllByText("Waiting for a decision")).toHaveLength(1)
+    expect(tab("Schema changes").textContent).toBe("Schema changes1")
+    expect(count("GET /api/connectors/conn-a/schema-changes")).toBe(1)
   })
 
   it("opens the Ingest tab for ?tab=ingest and the Connection tests tab for ?tab=tests", async () => {

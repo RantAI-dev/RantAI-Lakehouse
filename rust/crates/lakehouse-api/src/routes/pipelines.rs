@@ -31,6 +31,7 @@ use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
+use crate::routes::load_alerts;
 use crate::routes::support::{extract_json_object, js_error};
 use crate::state::AppState;
 
@@ -1760,6 +1761,19 @@ pub async fn run_failed_event(
     }
     let req: RunFailedBody = parse_body(&body)?;
     let pool = pool(&state)?;
+    // `SRC-7` F1: connector runs and upload loads are not authored
+    // pipelines; they have their own mapping and alert kinds.
+    if load_alerts::is_connector_job(&req.job_name) {
+        return Ok(ApiJson(
+            load_alerts::connector_run_event(&state, pool, &req, load_alerts::Outcome::Failure)
+                .await?,
+        ));
+    }
+    if load_alerts::is_upload_job(&req.job_name) {
+        return Ok(ApiJson(
+            load_alerts::upload_run_failed(&state, pool, &req).await?,
+        ));
+    }
     // Reverse the `authored_pipelines::job_name` mapping to find the
     // pipeline id behind `jobName`. The store owns the only authoritative
     // list of runnable pipelines, so we ask it and match by `job_name`
@@ -1931,6 +1945,14 @@ pub async fn run_finished_event(
     crate::routes::ai::semantic::spawn_pass(&state);
     let req: RunFailedBody = parse_body(&body)?;
     let pool = pool(&state)?;
+    // `SRC-7` F1: a finished connector run clears its failure streak and
+    // may deliver `connector_success`. An upload's success needs no alert.
+    if load_alerts::is_connector_job(&req.job_name) {
+        return Ok(ApiJson(
+            load_alerts::connector_run_event(&state, pool, &req, load_alerts::Outcome::Success)
+                .await?,
+        ));
+    }
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
         return Ok(ApiJson(json!({
             "matched": 0,

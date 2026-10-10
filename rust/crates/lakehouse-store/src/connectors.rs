@@ -101,6 +101,26 @@ pub struct Connector {
     pub capabilities: Vec<String>,
     /// Owning team or person.
     pub owner: String,
+    /// When the latest successful run finished, ISO 8601. `None` until a
+    /// run has been reported by the orchestrator (`SRC-7` F4): never
+    /// derived from a manual test.
+    pub last_run_success_at: Option<String>,
+    /// When the latest failed run finished, ISO 8601. `None` until a failed
+    /// run has been reported (`SRC-7` F4).
+    pub last_run_failure_at: Option<String>,
+    /// Failed runs since the last success; `0` after a success (`SRC-7` F4,
+    /// decision D2).
+    pub failure_streak: i32,
+    /// What a non-breaking source schema change does: `"apply_non_breaking"`
+    /// (the default), `"apply_all"`, `"ask_first"` or `"pause"` (`SRC-8`
+    /// decision D1; a breaking change waits under every value).
+    pub schema_change_policy: String,
+    /// Why the connector is held back from loading, or `None` when it is
+    /// not paused (`SRC-8` F6). Written with [`Self::paused_at`]; the
+    /// policy `"pause"` sets it and an approval lifts it.
+    pub paused_reason: Option<String>,
+    /// When the pause began, ISO 8601; `None` when not paused.
+    pub paused_at: Option<String>,
 }
 
 /// A dependent pipeline, derived (never stored) from `pipeline_definition`
@@ -230,6 +250,15 @@ struct ConnectorRow {
     residency: String,
     /// Read only by [`get_connector`], for [`ConnectorDetail::tenant_id`].
     tenant_id: Option<Uuid>,
+    /// `SRC-7` F4: written only by [`record_run_result`].
+    last_run_success_at: Option<OffsetDateTime>,
+    last_run_failure_at: Option<OffsetDateTime>,
+    failure_streak: i32,
+    /// `SRC-8` F2/F6: written by [`update_connector`] (the policy) and by
+    /// `schema_change.rs` (the pause).
+    schema_change_policy: String,
+    paused_reason: Option<String>,
+    paused_at: Option<OffsetDateTime>,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -254,6 +283,12 @@ impl std::fmt::Debug for ConnectorRow {
             .field("owner", &self.owner)
             .field("residency", &self.residency)
             .field("tenant_id", &self.tenant_id)
+            .field("last_run_success_at", &self.last_run_success_at)
+            .field("last_run_failure_at", &self.last_run_failure_at)
+            .field("failure_streak", &self.failure_streak)
+            .field("schema_change_policy", &self.schema_change_policy)
+            .field("paused_reason", &self.paused_reason)
+            .field("paused_at", &self.paused_at)
             .finish()
     }
 }
@@ -274,6 +309,12 @@ impl From<ConnectorRow> for Connector {
             last_activity_at: None,
             capabilities: row.capabilities,
             owner: row.owner,
+            last_run_success_at: iso_opt(row.last_run_success_at),
+            last_run_failure_at: iso_opt(row.last_run_failure_at),
+            failure_streak: row.failure_streak,
+            schema_change_policy: row.schema_change_policy,
+            paused_reason: row.paused_reason,
+            paused_at: iso_opt(row.paused_at),
         }
     }
 }
@@ -282,7 +323,9 @@ impl From<ConnectorRow> for Connector {
 // (see `Connector::last_activity_at`'s doc comment), so every read maps it
 // to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
-     secret_ref, last_test_at, capabilities, owner, residency, tenant_id";
+     secret_ref, last_test_at, capabilities, owner, residency, tenant_id, \
+     last_run_success_at, last_run_failure_at, failure_streak, \
+     schema_change_policy, paused_reason, paused_at";
 
 /// Optional narrowing for [`list_connectors`] for tenant isolation: a
 /// caller must never see a connector outside its own tenant.
@@ -350,6 +393,29 @@ pub async fn connector_in_tenants(
     .bind(tenant_ids)
     .fetch_one(pool)
     .await?)
+}
+
+/// Which of `ids` are connectors of one of `tenant_ids`: [`connector_in_tenants`]
+/// for many ids in one query, for a caller that filters a list (the alert
+/// rule list, `SRC-7` review BLOCKER 1) and must not pay a round trip per
+/// row. An unknown id, another tenant's connector and one with no tenant are
+/// all absent from the answer alike.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_ids_in_tenants(
+    pool: &PgPool,
+    ids: &[String],
+    tenant_ids: &[Uuid],
+) -> Result<Vec<String>, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT id FROM connector WHERE id = ANY($1) AND tenant_id = ANY($2)")
+            .bind(ids)
+            .bind(tenant_ids)
+            .fetch_all(pool)
+            .await?,
+    )
 }
 
 /// Assign (or reassign) a connector to a tenant — the write behind `PUT
@@ -804,9 +870,9 @@ pub struct ConnectorTestResult {
     /// success.
     pub ok: bool,
     /// Whether this build knows how to dial this connector's type at all.
-    /// `false` for every type besides `PostgreSQL` and S3-compatible object
-    /// storage today — see `connector_probe`'s module doc comment for the
-    /// full list and why.
+    /// `false` for a type this build has no client for (Oracle, `MongoDB`,
+    /// Kafka, SFTP, Google Sheets, ...) — see `connector_probe`'s module doc
+    /// comment for the types it does dial and why.
     pub supported: bool,
     /// Real measured latency in milliseconds, or `None` when `supported`
     /// is `false` (no attempt was made, so no latency exists to report).
@@ -1137,6 +1203,22 @@ async fn save_ingest_spec(
     spec: &IngestSpecInput,
     swaps: Option<&[SecretRefSwap<'_>]>,
 ) -> Result<IngestSpec, StoreError> {
+    let mut tx = pool.begin().await?;
+    let saved = save_ingest_spec_in(&mut tx, id, spec, swaps).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// [`save_ingest_spec`] inside a transaction the caller owns (and commits):
+/// the same validation, the same `SEC-14` comparison under the row lock and
+/// the same `UPDATE`. `append_source_objects_in` uses it so that adding
+/// tables passes through exactly the checks a person's save does.
+async fn save_ingest_spec_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: Option<&[SecretRefSwap<'_>]>,
+) -> Result<IngestSpec, StoreError> {
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
 
@@ -1149,16 +1231,19 @@ async fn save_ingest_spec(
             ))
         })?;
 
-    let mut tx = pool.begin().await?;
-
     // The stored target, read under a row lock so the comparison below and
     // the write stay one decision (SEC-14).
-    let (stored_adapter, stored_dial): (Option<String>, serde_json::Value) =
-        sqlx::query_as("SELECT adapter, dial FROM connector WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+    let (stored_adapter, stored_dial, stored_objects): (
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT adapter, dial, source_objects FROM connector WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
 
     // SEC-14: a change of target needs the credentials in the same write.
     // `set_ingest_spec` has none to offer, so it refuses; `repoint_ingest_spec`
@@ -1174,7 +1259,7 @@ async fn save_ingest_spec(
         }
     }
     if let Some(swaps) = swaps {
-        apply_swaps(&mut tx, id, swaps).await?;
+        apply_swaps(tx, id, swaps).await?;
     }
 
     // Read the connector's OWN declared secret-ref count before writing —
@@ -1186,7 +1271,7 @@ async fn save_ingest_spec(
         "SELECT secret_ref_secondary FROM connector WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or(StoreError::NotFound)?;
 
@@ -1211,13 +1296,148 @@ async fn save_ingest_spec(
     .bind(&spec.dial)
     .bind(&spec.source_objects)
     .bind(&spec.schedule_cron)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
         return Err(StoreError::NotFound);
     };
-    tx.commit().await?;
+    // `SRC-8 review BLOCKER 3b`: the one place the selection is written (a
+    // person's save, a re-point and "apply all" all come through here), so
+    // the tables that just left it are cleared in the same transaction.
+    let removed = removed_object_names(&stored_objects, &spec.source_objects);
+    crate::schema_change::clear_removed_tables_in(tx, id, &removed).await?;
     Ok(ingest_spec_from_row(row))
+}
+
+/// Names (`source_objects[].name`) in `before` and not in `after`. Pure.
+fn removed_object_names(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    let kept = names(after);
+    names(before)
+        .into_iter()
+        .filter(|name| !kept.contains(name))
+        .collect()
+}
+
+/// One table [`append_source_objects_in`] is asked to add to a connector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObjectAddition {
+    /// `<schema>.<table>`, the source object's `name`.
+    pub name: String,
+    /// The Bronze table it lands in.
+    pub target: String,
+}
+
+/// What [`append_source_objects_in`] did with one addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdditionOutcome {
+    /// Appended, with load mode `replace`.
+    Added,
+    /// The connector already loads a source object of this name: nothing to do.
+    AlreadySelected,
+    /// Another source object of this connector already lands in the target
+    /// (decided under the row lock, so two racing callers cannot both take it).
+    TargetTaken,
+}
+
+/// Append tables to a connector's `source_objects` in a transaction the
+/// caller owns (`SRC-8` task 8, decision D2), one outcome per addition, in
+/// order.
+///
+/// The row is locked (`FOR UPDATE`), the new list is the stored one plus the
+/// additions that are neither already selected nor land in a target the
+/// connector already uses, and it is written through
+/// [`save_ingest_spec_in`]: the very `UPDATE` and checks a person's save
+/// goes through. The dial and the adapter are written back unchanged, so
+/// `SEC-14`'s re-point comparison finds the target identity the same and
+/// passes; the load mode is `replace` (the default of a source object that
+/// names none), so a table added without a person is never appended to twice.
+///
+/// Nothing is written when nothing is appended.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] for an unknown connector;
+/// [`StoreError::Validation`] when the connector has no ingest spec yet or
+/// its stored `source_objects` is not an array; otherwise as
+/// [`set_ingest_spec`].
+pub(crate) async fn append_source_objects_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    additions: &[SourceObjectAddition],
+) -> Result<Vec<AdditionOutcome>, StoreError> {
+    type Locked = (
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+        Option<String>,
+    );
+    let (adapter, ingest_mode, dial, source_objects, schedule_cron): Locked = sqlx::query_as(
+        "SELECT adapter, ingest_mode, dial, source_objects, schedule_cron FROM connector \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    let (Some(adapter), Some(ingest_mode)) = (adapter, ingest_mode) else {
+        return Err(StoreError::Validation(
+            "the connector has no ingest spec yet".to_owned(),
+        ));
+    };
+    let serde_json::Value::Array(mut objects) = source_objects else {
+        return Err(StoreError::Validation(
+            "the connector's source objects are not a list".to_owned(),
+        ));
+    };
+    let text = |object: &serde_json::Value, key: &str| -> Option<String> {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut names: std::collections::HashSet<String> =
+        objects.iter().filter_map(|o| text(o, "name")).collect();
+    let mut targets: std::collections::HashSet<String> =
+        objects.iter().filter_map(|o| text(o, "target")).collect();
+
+    let mut outcomes = Vec::with_capacity(additions.len());
+    for addition in additions {
+        if names.contains(&addition.name) {
+            outcomes.push(AdditionOutcome::AlreadySelected);
+        } else if targets.contains(&addition.target) {
+            outcomes.push(AdditionOutcome::TargetTaken);
+        } else {
+            names.insert(addition.name.clone());
+            targets.insert(addition.target.clone());
+            objects.push(serde_json::json!({
+                "name": addition.name,
+                "target": addition.target,
+                "loadMode": "replace",
+            }));
+            outcomes.push(AdditionOutcome::Added);
+        }
+    }
+    if outcomes.contains(&AdditionOutcome::Added) {
+        let input = IngestSpecInput {
+            adapter,
+            ingest_mode,
+            dial,
+            source_objects: serde_json::Value::Array(objects),
+            schedule_cron,
+        };
+        save_ingest_spec_in(tx, id, &input, None).await?;
+    }
+    Ok(outcomes)
 }
 
 /// Persist the outcome of a real connectivity probe and, when the probe
@@ -1300,6 +1520,65 @@ pub async fn record_test_result(
         latency_ms,
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
+    })
+}
+
+/// Failed runs in a row at which a connector turns `"unhealthy"` and the
+/// "repeated failures" alert fires (`SRC-7`, decision D2/D6). One constant for
+/// the store's health rule and the API's alert trigger, so they cannot drift.
+pub const REPEATED_FAILURE_STREAK: i32 = 3;
+
+/// What [`record_run_result`] leaves on the connector row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHealth {
+    /// `"healthy"` after a success, `"degraded"` for 1 or 2 failures in a
+    /// row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`].
+    pub health: String,
+    /// Failed runs since the last success, after this result.
+    pub failure_streak: i32,
+}
+
+/// Record the outcome of one real run (not a manual test) on the connector:
+/// the run time, the failure streak and `health`, together in one
+/// `UPDATE ... RETURNING` (`SRC-7` F4, decision D6). Success: `healthy`,
+/// streak 0. Failure: streak + 1, `degraded` below
+/// [`REPEATED_FAILURE_STREAK`], `unhealthy` from it. `at` is the caller's
+/// run-end time; nothing is stamped that was not reported.
+///
+/// The caller must dedupe the run first (`pipelines::record_pipeline_run_event`):
+/// this function counts every call.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn record_run_result(
+    pool: &PgPool,
+    id: &str,
+    succeeded: bool,
+    at: OffsetDateTime,
+) -> Result<RunHealth, StoreError> {
+    let sql = "UPDATE connector SET \
+                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
+                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
+                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
+                 health = CASE WHEN $2 THEN 'healthy' \
+                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
+                               ELSE 'degraded' END \
+               WHERE id = $1 RETURNING health, failure_streak";
+    let row: Option<(String, i32)> = sqlx::query_as(sql)
+        .bind(id)
+        .bind(succeeded)
+        .bind(at)
+        .bind(REPEATED_FAILURE_STREAK)
+        .fetch_optional(pool)
+        .await?;
+    let Some((health, failure_streak)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    Ok(RunHealth {
+        health,
+        failure_streak,
     })
 }
 
@@ -1530,13 +1809,23 @@ pub struct IngestibleConnector {
     /// combination that needs two (`secret_map.secret_field_names`,
     /// Dagster-side; `ingest_spec::secret_field_names`, Rust-side).
     pub secret_ref_secondary: Option<String>,
+    /// Whether the connector is paused (`connector.paused_at IS NOT NULL`,
+    /// `SRC-8` F6). The schedule's due list leaves a paused connector out;
+    /// the unfiltered list still carries it, so the orchestrator's own
+    /// single fetch of a connector keeps working.
+    pub paused: bool,
+    /// The connector's `schema_change_policy` (`SRC-8`): the orchestrator
+    /// asks for the tables that appeared in a schema it loads only when this
+    /// is `apply_all` (decision D2). Sent as stored; the API re-checks it on
+    /// the route that adds tables.
+    pub schema_change_policy: String,
 }
 
 /// The raw tuple shape [`list_ingestible_connectors`] decodes from its
-/// `SELECT`, naming the same eight columns in the same order: `id,
+/// `SELECT`, naming the same ten columns in the same order: `id,
 /// adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref,
-/// secret_ref_secondary`. A module-level alias rather than an inline type,
-/// same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
+/// secret_ref_secondary, paused, schema_change_policy`. A module-level alias rather than an
+/// inline type, same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
 type IngestibleConnectorRow = (
     String,
     Option<String>,
@@ -1546,6 +1835,8 @@ type IngestibleConnectorRow = (
     Option<String>,
     String,
     Option<String>,
+    bool,
+    String,
 );
 
 /// List every connector that has ever had an ingest spec set
@@ -1561,7 +1852,8 @@ pub async fn list_ingestible_connectors(
 ) -> Result<Vec<IngestibleConnector>, StoreError> {
     let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
         "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
-         secret_ref_secondary FROM connector WHERE adapter IS NOT NULL",
+         secret_ref_secondary, paused_at IS NOT NULL, schema_change_policy FROM connector \
+         WHERE adapter IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -1577,6 +1869,8 @@ pub async fn list_ingestible_connectors(
                 schedule_cron,
                 secret_ref,
                 secret_ref_secondary,
+                paused,
+                schema_change_policy,
             )| {
                 // `adapter IS NOT NULL` is the query's own WHERE clause, so
                 // this `?` never actually short-circuits in practice — it
@@ -1595,6 +1889,8 @@ pub async fn list_ingestible_connectors(
                     schedule_cron,
                     secret_ref,
                     secret_ref_secondary,
+                    paused,
+                    schema_change_policy,
                 })
             },
         )
@@ -1716,6 +2012,11 @@ pub struct UpdateConnectorInput {
     /// New connection target label — kept in step with `dial` by the
     /// console, since the legacy probe and CDC deprovisioning still read it.
     pub host: Option<String>,
+    /// New `SRC-8` schema-change policy (one of
+    /// [`crate::schema_change::SchemaChangePolicy`]'s wire values; the
+    /// column's CHECK refuses anything else). Changing it never lifts an
+    /// existing pause -- only an approval does.
+    pub schema_change_policy: Option<String>,
 }
 
 impl UpdateConnectorInput {
@@ -1727,6 +2028,7 @@ impl UpdateConnectorInput {
             && self.environment.is_none()
             && self.residency.is_none()
             && self.host.is_none()
+            && self.schema_change_policy.is_none()
     }
 }
 
@@ -1749,7 +2051,8 @@ pub async fn update_connector(
            direction = COALESCE($3, direction), \
            environment = COALESCE($4, environment), \
            residency = COALESCE($5, residency), \
-           host = COALESCE($6, host) \
+           host = COALESCE($6, host), \
+           schema_change_policy = COALESCE($7, schema_change_policy) \
          WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
     );
     let row: Option<ConnectorRow> = sqlx::query_as(&sql)
@@ -1759,6 +2062,7 @@ pub async fn update_connector(
         .bind(input.environment.as_deref())
         .bind(input.residency.as_deref())
         .bind(input.host.as_deref())
+        .bind(input.schema_change_policy.as_deref())
         .fetch_optional(pool)
         .await?;
     row.map(Connector::from).ok_or(StoreError::NotFound)
@@ -1835,6 +2139,17 @@ mod tests {
     }
     use uuid::Uuid;
 
+    /// `SRC-8 review BLOCKER 3b`: only names that left the selection are
+    /// cleared; a malformed entry never counts as a name.
+    #[test]
+    fn only_the_names_that_left_the_selection_are_removed() {
+        let before = serde_json::json!([{"name": "a.t"}, {"name": "b.t"}, {"nope": 1}]);
+        let after = serde_json::json!([{"name": "b.t"}, {"name": "c.t"}]);
+        assert_eq!(super::removed_object_names(&before, &after), ["a.t"]);
+        assert!(super::removed_object_names(&before, &before).is_empty());
+        assert!(super::removed_object_names(&serde_json::Value::Null, &after).is_empty());
+    }
+
     #[test]
     fn connector_serializes_without_host_or_secret_ref() {
         let connector = Connector {
@@ -1851,6 +2166,12 @@ mod tests {
             last_activity_at: None,
             capabilities: vec!["CDC".to_owned()],
             owner: "o".to_owned(),
+            last_run_success_at: None,
+            last_run_failure_at: Some("2026-01-02T00:00:00.000Z".to_owned()),
+            failure_streak: 1,
+            schema_change_policy: "apply_non_breaking".to_owned(),
+            paused_reason: None,
+            paused_at: None,
         };
         let value = serde_json::to_value(&connector).unwrap();
         for key in [
@@ -1865,6 +2186,9 @@ mod tests {
             "lastActivityAt",
             "capabilities",
             "owner",
+            "lastRunSuccessAt",
+            "lastRunFailureAt",
+            "failureStreak",
         ] {
             assert!(value.get(key).is_some(), "Connector is missing `{key}`");
         }
@@ -1891,6 +2215,12 @@ mod tests {
                 last_activity_at: None,
                 capabilities: vec![],
                 owner: "o".to_owned(),
+                last_run_success_at: None,
+                last_run_failure_at: None,
+                failure_streak: 0,
+                schema_change_policy: "apply_non_breaking".to_owned(),
+                paused_reason: None,
+                paused_at: None,
             },
             discovered_assets: 0,
             discovered_schemas: vec![],
@@ -1940,6 +2270,12 @@ mod tests {
             owner: "o".to_owned(),
             residency: "in-region".to_owned(),
             tenant_id: None,
+            last_run_success_at: None,
+            last_run_failure_at: None,
+            failure_streak: 0,
+            schema_change_policy: "apply_non_breaking".to_owned(),
+            paused_reason: None,
+            paused_at: None,
         };
         let debug = format!("{row:?}");
         assert!(!debug.contains("super-secret-internal-host"));

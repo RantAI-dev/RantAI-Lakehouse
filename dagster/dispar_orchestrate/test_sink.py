@@ -443,3 +443,50 @@ def test_a_cursor_is_only_attached_to_a_resource_that_takes_one_itself(monkeypat
     table = _orders_table()
     load_via_sink(table, "orders", _sink_config(), plan)
     assert [type(step).__name__ for step in table._pipe.steps][1:] == ["IncrementalResourceWrapper", "MapItem"]
+
+
+# --- SRC-8: the columns a load reports ---------------------------------------
+
+
+class _FakeSchema:
+    def __init__(self, tables: dict) -> None:
+        self.tables = tables
+
+
+def test_load_via_sink_reports_the_loaded_columns_without_bookkeeping_or_the_ingested_at_stamp(monkeypatch) -> None:
+    pipelines = _one_fake_pipeline(monkeypatch)
+    schema = _FakeSchema(
+        {
+            "orders": {
+                "columns": {
+                    "id": {"data_type": "bigint", "nullable": False},
+                    "note": {"data_type": "text"},
+                    "_ingested_at": {"data_type": "timestamp"},
+                    "_dlt_id": {"data_type": "text"},
+                    "_dlt_load_id": {"data_type": "text"},
+                    "half_known": {"nullable": True},  # no data_type yet: not a column of the table
+                }
+            }
+        }
+    )
+    original = sink_module.dlt.pipeline
+
+    def with_schema(**kwargs):
+        pipeline = original(**kwargs)
+        pipeline.default_schema = schema
+        pipeline.schemas = {"default": schema}
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", with_schema)
+    result = load_via_sink([{"id": 1}], "orders", _sink_config())
+    assert [(c.name, c.data_type, c.nullable) for c in result.columns] == [
+        ("id", "bigint", False),
+        ("note", "text", True),
+    ]
+    assert pipelines  # the fake pipeline ran
+
+
+def test_load_via_sink_reports_no_columns_when_the_schema_cannot_be_read(monkeypatch) -> None:
+    _one_fake_pipeline(monkeypatch)  # a pipeline with no schema attributes
+    result = load_via_sink([{"id": 1}], "orders", _sink_config())
+    assert result.columns == ()

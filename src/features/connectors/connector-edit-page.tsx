@@ -169,7 +169,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   const anyChange = basicChanged || dialChanged || tenantChanged || credentialTyped
 
   const tenantNameOf = (id: string | null) => user?.tenants.find((t) => t.id === id)?.name ?? (id ? "Other tenant" : "Unassigned")
-  const typeShown: ConnectorType = type ?? { name: detail.type, adapter, supported: true, docsUrl: null }
+  const typeShown: ConnectorType = type ?? { name: detail.type, adapter, supported: true, docsUrl: null, unsupportedReason: null }
 
   const canProceed =
     (step === 0 && Boolean(name.trim())) ||

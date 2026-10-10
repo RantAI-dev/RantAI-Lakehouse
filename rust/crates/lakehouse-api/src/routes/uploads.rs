@@ -189,7 +189,7 @@ const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Dagster job that loads an uploaded file
 /// (`dagster/dispar_orchestrate/file_ingest.py`).
-const FILE_INGEST_JOB: &str = "file_ingest_job";
+pub(super) const FILE_INGEST_JOB: &str = "file_ingest_job";
 
 /// The longest raw table name accepted, in characters. The console's rule has
 /// no bound; this one keeps a name that is a path segment of the table's
@@ -1021,6 +1021,14 @@ impl<'a> Settler<'a> {
             }
         }
     }
+}
+
+/// Settle one upload that is `ingesting`, through the same recording path a
+/// reader's list or page uses ([`Settler`]), for the run-failed event
+/// (`SRC-7` F6): an upload nobody opens would otherwise stay `ingesting`
+/// after its run failed. Returns the row as it is afterwards.
+pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: Upload) -> Upload {
+    Settler::new(state, pool).settle(row).await
 }
 
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most

@@ -51,7 +51,7 @@ import {
   type ValueShares,
 } from "@/lib/column-profile"
 import { typeFamily, type TypeFamily } from "@/lib/column-type"
-import { formatCompactNumber, formatNumber } from "@/lib/format"
+import { formatCompactNumber, formatDate, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetProfile, ColumnProfile } from "@/services/contracts/assets"
 import { ALL, CountToggle } from "./count-toggle"
@@ -535,7 +535,8 @@ export function ColumnDetail({
 }
 
 /**
- * What a column is marked as: masked, its classification, partition, sort key.
+ * What a column is marked as: inactive at the source (`SRC-8`), masked, its
+ * classification, partition, sort key.
  * A row renders these twice and CSS shows one: beside the name from `@lg` up,
  * and below it on the type's line otherwise. Below `@lg` the name's track is
  * a third of a phone's card, so marks beside it (they never shrink) left a
@@ -544,9 +545,14 @@ export function ColumnDetail({
  */
 function Marks({ row, sortKey, className }: { row: SchemaRow; sortKey: boolean; className: string }) {
   const c = row.column
-  if (!c.masked && !c.classification && !row.partition && !sortKey) return null
+  if (!c.masked && !c.classification && !row.partition && !sortKey && !c.inactiveSince) return null
   return (
     <span className={cn("shrink-0 items-center gap-1.5", className)}>
+      {c.inactiveSince ? (
+        <Pill tone="neutral" title="The source no longer has this column. Its old values are kept.">
+          inactive since {formatDate(c.inactiveSince, { month: "short" })}
+        </Pill>
+      ) : null}
       {c.masked ? <Pill tone="warning">masked</Pill> : null}
       {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
       {row.partition ? (

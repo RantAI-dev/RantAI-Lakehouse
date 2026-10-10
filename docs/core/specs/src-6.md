@@ -21,10 +21,12 @@ Every connector type shown as supported can be created, tested and edited.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Object-storage connectors from the wizard | Wizard and test disagree on the host format; keys cannot be changed | Create, test and change keys work for S3-compatible storage |
-| Oracle | Credential change refused with 422; every test reads as failed | Credential change works; the test reports the real result |
+| Object-storage connectors from the wizard | Wizard and test disagree on the host format; keys cannot be changed | Create, test and change keys work for S3-compatible storage with an endpoint set (feature page decision 3) |
+| Oracle | Credential change refused with 422; every test reads as failed | Credential change works; the test says it cannot be run from the console instead of reading as failed (feature page decision 1: the API has no Oracle client; a live test is follow-up work) |
 | Google Sheets | Listed as supported, works nowhere | Shown as unsupported with a reason until it works (principle 2) |
 | Sources page header | Promises SaaS and federation | Describes only what exists |
+| MongoDB, Kafka and SFTP tests *(added 2026-10-08, plan finding F4)* | Answer "not supported" with a message that lists the wrong products | Answer "cannot be tested from the console", like Oracle (feature page decisions 1 and 2) |
+| Object-storage form *(added 2026-10-08, plan finding F8)* | Offers an SFTP protocol that never loads data | S3-compatible only; SFTP is its own connector type |
 
 ## Benchmark
 

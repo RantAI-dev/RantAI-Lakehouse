@@ -57,12 +57,13 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from dlt.sources.sql_database import sql_database
 
-from dispar_orchestrate import ssrf_guard
+from dispar_orchestrate import schema_observer, ssrf_guard
 from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, load_via_sink
 
 
@@ -222,7 +223,12 @@ class BronzeIngestConfig:
         )
 
 
-def run_bronze_ingest(config: BronzeIngestConfig | None = None, plan: LoadPlan = LoadPlan()) -> dict[str, Any]:
+def run_bronze_ingest(
+    config: BronzeIngestConfig | None = None,
+    plan: LoadPlan = LoadPlan(),
+    *,
+    gate: Callable[[schema_observer.ReflectedTable], schema_observer.Decision] | None = None,
+) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
     unchanged from before that pin was added), then write it through the
@@ -272,17 +278,36 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None, plan: LoadPlan =
         "port": int(cfg.source_db_port),
         "database": cfg.source_db_name,
     }
-    source = sql_database(
-        credentials=source_credentials,
-        schema=cfg.source_schema,
-        table_names=[cfg.source_table],
-        # libpq's pinning mechanism (`ssrf_guard.py`'s module docstring):
-        # `hostaddr` carries the checked IP and makes libpq skip its own
-        # DNS lookup -- verified against dlt 1.30.0, `engine_kwargs`
-        # reaches `sqlalchemy.create_engine()` directly
-        # (`dlt/sources/sql_database/__init__.py:109,272`).
-        engine_kwargs={"connect_args": {"hostaddr": resolved.ip}},
-    )
+    def build(table_adapter_callback: Callable[[Any], None] | None) -> Any:
+        extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+        return sql_database(
+            credentials=source_credentials,
+            schema=cfg.source_schema,
+            table_names=[cfg.source_table],
+            # libpq's pinning mechanism (`ssrf_guard.py`'s module docstring):
+            # `hostaddr` carries the checked IP and makes libpq skip its own
+            # DNS lookup -- verified against dlt 1.30.0, `engine_kwargs`
+            # reaches `sqlalchemy.create_engine()` directly
+            # (`dlt/sources/sql_database/__init__.py:109,272`) and so also
+            # the reflection that runs while the source is built.
+            engine_kwargs={"connect_args": {"hostaddr": resolved.ip}},
+            **extra,
+        )
+
+    collector = schema_observer.ReflectionCollector() if gate is not None else None
+    source = build(collector.callback if collector is not None else None)
+    if gate is not None and collector is not None:
+        decision = gate(collector.only())
+        if decision.action == "wait":
+            return {
+                "bronze_table_name": cfg.bronze_table_name,
+                "source_schema": cfg.source_schema,
+                "source_table": cfg.source_table,
+                "rows": None,
+                "waiting": True,
+            }
+        if decision.columns is not None:
+            source = build(schema_observer.keep_only(decision.columns))
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)
 

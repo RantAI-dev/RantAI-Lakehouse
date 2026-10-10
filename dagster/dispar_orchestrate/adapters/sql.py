@@ -30,7 +30,11 @@ mechanism its own connection API actually offers:
   `pinned_resolution` wrap gets FULL pinning with no compensating code
   in this module. Verified by absence in
   `test_build_source_needs_no_extra_pinning_for_pymysql`:
-  no `engine_kwargs` at all for this driver.
+  no `engine_kwargs` at all for this driver. One exception (SRC-8):
+  `sql_database` REFLECTS the tables while it is called, which is a dial
+  that happens inside `build_source`, before any caller can wrap the load;
+  `build_source` therefore wraps that one call in
+  `ssrf_guard.pinned_resolution` itself.
 - **`mssql` (Microsoft ODBC Driver 18, `pyodbc`):** connects via a raw
   ODBC connection string built by `_mssql_connection_string` below,
   carrying `Server=tcp:<checked-ip>,<port>` directly -- it never calls a
@@ -100,6 +104,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import sqlalchemy
 from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import ssrf_guard
@@ -187,9 +192,18 @@ def build_source(
     source_objects: list[dict],
     *,
     resolve_checked: Callable[[str, int], ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+    table_adapter_callback: Callable[[Any], None] | None = None,
 ) -> AdapterBuildResult:
     """Build a dlt `sql_database` source for `spec['driver']`
     (`mysql`/`mariadb`/`mssql`), SSRF-checked and pinned per-driver.
+
+    `table_adapter_callback` (SRC-8, `schema_observer.py`) is handed to
+    `sql_database`, which calls it with each REFLECTED table while the source
+    is being built -- so the reflection `dlt` does anyway is also how the
+    caller reads the columns (to observe them, or to hold some back), with no
+    connection of this module's own. That reflection is a dial: for
+    `mssql` it goes through the pinned ODBC string, for `mysql`/`mariadb`
+    it runs inside `ssrf_guard.pinned_resolution` (below).
 
     `resolve_checked` runs BEFORE any credential is built -- a blocked
     host never gets as far as `sql_database` being called at all (see
@@ -218,7 +232,7 @@ def build_source(
 
     if driver == "mssql":
         credentials: Any = _mssql_connection_string(spec, secrets, resolved)
-        source = sql_database(credentials=credentials, table_names=table_names)
+        source = sql_database(credentials=credentials, table_names=table_names, **_callback(table_adapter_callback))
         return AdapterBuildResult(source=source, resolved=resolved)
 
     drivername = _DRIVERNAMES.get(driver)
@@ -237,5 +251,102 @@ def build_source(
     # ssrf_guard.pinned_resolution wrap gets FULL pinning here with no
     # compensating engine_kwargs (see the module docstring's per-driver
     # pinning list).
-    source = sql_database(credentials=credentials, table_names=table_names)
+    # SRC-8 (SSRF, plan "Task 6"): `sql_database` REFLECTS the tables as it is
+    # called, i.e. it dials here, not only when the rows are read later.
+    # Before SRC-8 that dial ran by NAME, outside any pin, between
+    # `resolve_checked` and the caller's `pinned_resolution` around the load;
+    # the reflection is now also the source of the observation, so it runs
+    # inside the same pin the load gets.
+    with ssrf_guard.pinned_resolution(spec["host"], resolved):
+        source = sql_database(credentials=credentials, table_names=table_names, **_callback(table_adapter_callback))
     return AdapterBuildResult(source=source, resolved=resolved)
+
+
+def _callback(table_adapter_callback: Callable[[Any], None] | None) -> dict[str, Any]:
+    """The keyword for `sql_database`, only when there is a callback (so a
+    call without one is byte-for-byte what it was before SRC-8)."""
+    return {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+
+
+# Drivers whose tables `list_tables` can list (SRC-8 decision D2). `mariadb`
+# is the MySQL driver under another name here; the API's dial only knows
+# `mysql` (`SqlDriver`), so both spellings reach the same arm.
+LISTABLE_DRIVERS = ("postgres", "postgresql", "mysql", "mariadb", "mssql")
+
+# Seconds. Reflection through `sql_database` sets none; a listing that hangs on
+# a host that accepted the connection and then said nothing would hold the
+# whole run, so the two drivers that take one are given one.
+_LIST_CONNECT_TIMEOUT = 10
+
+
+def _inspect_table_names(engine: Any, schema: str) -> list[str]:
+    return list(sqlalchemy.inspect(engine).get_table_names(schema=schema))
+
+
+def list_tables(
+    spec: dict,
+    secrets: dict[str, str],
+    schemas: list[str],
+    *,
+    resolve_checked: Callable[[str, int], ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+    create_engine: Callable[..., Any] = sqlalchemy.create_engine,
+    table_names: Callable[[Any, str], list[str]] = _inspect_table_names,
+) -> dict[str, list[str]]:
+    """The base tables of each of `schemas` (SRC-8 decision D2: find the tables
+    that appeared in a schema a connector already loads from), through the
+    SAME pin each driver gets everywhere else. This is a connection of its
+    own, so it is guarded exactly like the loads:
+
+    - **postgres:** `hostaddr` carries the checked IP in `connect_args`
+      (libpq does not resolve through `socket.getaddrinfo`; the same pin as
+      `dlt_pipeline.run_bronze_ingest`, whose credentials this mirrors).
+      Deliberately NOT added to `build_source`, which refuses this driver.
+    - **mysql / mariadb:** the whole listing runs inside
+      `ssrf_guard.pinned_resolution` (pymysql resolves through
+      `socket.getaddrinfo`).
+    - **mssql:** the pinned ODBC connection string `build_source` uses
+      (`_mssql_connection_string`), which names the checked IP directly.
+
+    `resolve_checked` runs first, before any credential is built, and a blocked
+    host raises `ssrf_guard.SsrfBlocked`. The engine is disposed on the way
+    out. Views are not listed (`get_table_names` returns base tables).
+
+    # Errors
+
+    `ValueError` for a driver outside `LISTABLE_DRIVERS`,
+    `ssrf_guard.SsrfBlocked` for a blocked host, and whatever the driver
+    raises for a refused connection or an unknown schema.
+    """
+    driver = spec["driver"]
+    if driver not in LISTABLE_DRIVERS:
+        raise ValueError(f"cannot list the tables of driver {driver!r}")
+    resolved = resolve_checked(spec["host"], spec["port"])
+
+    if driver == "mssql":
+        engine = create_engine(_mssql_connection_string(spec, secrets, resolved))
+        return _list_with(engine, schemas, table_names)
+
+    is_postgres = driver in ("postgres", "postgresql")
+    url = sqlalchemy.engine.URL.create(
+        "postgresql" if is_postgres else "mysql+pymysql",
+        username=spec["user"],
+        password=secrets["password"],
+        host=spec["host"],
+        port=spec["port"],
+        database=spec["database"],
+    )
+    if is_postgres:
+        engine = create_engine(
+            url, connect_args={"hostaddr": resolved.ip, "connect_timeout": _LIST_CONNECT_TIMEOUT}
+        )
+        return _list_with(engine, schemas, table_names)
+    with ssrf_guard.pinned_resolution(spec["host"], resolved):
+        engine = create_engine(url, connect_args={"connect_timeout": _LIST_CONNECT_TIMEOUT})
+        return _list_with(engine, schemas, table_names)
+
+
+def _list_with(engine: Any, schemas: list[str], table_names: Callable[[Any, str], list[str]]) -> dict[str, list[str]]:
+    try:
+        return {schema: sorted(table_names(engine, schema)) for schema in schemas}
+    finally:
+        engine.dispose()

@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
-import type { AlertRule } from "@/services/contracts/alerts"
+import { LOAD_ALERT_KINDS, type AlertRule } from "@/services/contracts/alerts"
 
 /**
  * `getRuleColumns` used to declare its own looser `Rule` type (every field
@@ -33,6 +33,45 @@ import type { AlertRule } from "@/services/contracts/alerts"
  */
 export type Rule = AlertRule
 
+/** Plain labels for the rule kinds the console knows; any other kind shows as sent. */
+export const RULE_KIND_LABEL: Record<string, string> = {
+  alert: "Threshold alert",
+  digest: "Dashboard digest",
+  freshness: "Dataset freshness",
+  connector_failure: "Connector run failed",
+  connector_repeated_failure: "Connector failed 3 runs in a row",
+  connector_disabled: "Connector disabled",
+  connector_schema_change: "Connector schema changed",
+  connector_success: "Connector run succeeded",
+  upload_failure: "Upload failed",
+}
+
+export function ruleKindLabel(type: string): string {
+  return RULE_KIND_LABEL[type] ?? type
+}
+
+/** Whether `type` is one of the `SRC-7` kinds for connector and upload loads. */
+export function isLoadAlertKind(type: string): boolean {
+  return (LOAD_ALERT_KINDS as readonly string[]).includes(type)
+}
+
+/**
+ * What a rule of the `SRC-7` kinds is scoped to, for the rules table: "Uploads"
+ * for an upload rule, "All connectors" for `*`, the connector's name when the
+ * list of connectors has it, otherwise its id as stored (a connector the viewer
+ * cannot list is not given a made-up name). `null` for every other kind.
+ */
+export function ruleScope(
+  rule: Pick<AlertRule, "type" | "connector">,
+  connectors: readonly { id: string; name: string }[]
+): string | null {
+  if (!isLoadAlertKind(rule.type)) return null
+  if (rule.type === "upload_failure") return "Uploads"
+  if (!rule.connector) return null
+  if (rule.connector === "*") return "All connectors"
+  return connectors.find((c) => c.id === rule.connector)?.name ?? rule.connector
+}
+
 type RuleColumnsOptions = {
   readonly onEdit: (rule: Rule) => void
   readonly onToggle: (rule: Rule) => void
@@ -40,10 +79,11 @@ type RuleColumnsOptions = {
   readonly onDelete: (id: string) => void
   readonly busy: boolean
   readonly boards: { id: string; name: string }[]
+  readonly connectors: { id: string; name: string }[]
 }
 
 export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
-  const { onEdit, onToggle, onRun, onDelete, busy, boards } = options
+  const { onEdit, onToggle, onRun, onDelete, busy, boards, connectors } = options
 
   return [
     {
@@ -73,10 +113,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       meta: {
         label: "Type",
         variant: "select",
-        options: [
-          { label: "Threshold alert", value: "alert" },
-          { label: "Dashboard digest", value: "digest" },
-        ],
+        options: Object.entries(RULE_KIND_LABEL).map(([value, label]) => ({ label, value })),
       },
       cell: ({ row }) => {
         const isAlert = row.original.type === "alert"
@@ -89,7 +126,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
                 : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
             )}
           >
-            {isAlert ? "Threshold alert" : "Dashboard digest"}
+            {ruleKindLabel(row.original.type)}
           </span>
         )
       },
@@ -99,6 +136,10 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        // A load rule has no mart, measure or board: its scope is the next column.
+        if (isLoadAlertKind(r.type)) {
+          return <span className="text-sm text-muted-foreground">—</span>
+        }
         if (r.type === "alert") {
           return (
             <span className="font-mono text-xs text-muted-foreground">
@@ -109,6 +150,15 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
         const boardName = boards.find((b) => b.id === r.board)?.name ?? r.board
         return <span className="text-sm text-muted-foreground">{boardName}</span>
       },
+    },
+    {
+      id: "scope",
+      header: "Scope",
+      cell: ({ row }) => (
+        <span className="text-sm text-muted-foreground">
+          {ruleScope(row.original, connectors) ?? "—"}
+        </span>
+      ),
     },
     {
       id: "delivery",

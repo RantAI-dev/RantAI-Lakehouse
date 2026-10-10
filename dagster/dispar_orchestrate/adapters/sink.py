@@ -222,16 +222,32 @@ class SinkConfig:
 
 
 @dataclass(frozen=True)
+class LoadedColumn:
+    """One column of the Bronze table as `dlt`'s schema holds it after a load
+    (SRC-8): `data_type` is `dlt`'s own name (`bigint`, `text`, `timestamp`,
+    ...)."""
+
+    name: str
+    data_type: str
+    nullable: bool
+
+
+@dataclass(frozen=True)
 class SinkResult:
     """`rows` is the real, measured row count from dlt's own normalize
     trace (see module docstring) -- `None`, never `0`, when unmeasured.
     `load_info_str` (`str(load_info)`) is for a warning-level log line
     only; it can contain a file path and must never reach a caller's
-    response."""
+    response.
+
+    `columns` (SRC-8, `schema_observer.py`) are the table's columns after the
+    load, WITHOUT `dlt`'s bookkeeping and `_ingested_at` (see
+    `_loaded_columns`); `()` when they could not be read, never a guess."""
 
     rows: int | None
     has_failed_jobs: bool
     load_info_str: str
+    columns: tuple[LoadedColumn, ...] = ()
 
 
 def _install_catalog_env(config: SinkConfig) -> None:
@@ -291,6 +307,44 @@ def _extract_rows(trace, bronze_table_name: str) -> int | None:
     if trace is None:
         return None
     return trace.last_normalize_info.row_counts.get(bronze_table_name)
+
+
+def _loaded_columns(pipeline: Any, bronze_table_name: str) -> tuple[LoadedColumn, ...]:
+    """The columns `dlt`'s schema holds for `bronze_table_name` after a load,
+    for the after-load schema observation (SRC-8, decision D4).
+
+    Left OUT, on purpose: `dlt`'s own bookkeeping (`_dlt_id`, `_dlt_load_id`,
+    every `_dlt_*` name) and `_ingested_at`, the system column this module
+    stamps itself (ADR 0004). None of them is a column of the SOURCE, so
+    reporting them would make every first observation of a table carry them
+    and a source that really has a column of that name could not be told
+    apart. A `<column>__v_<type>` variant column, which `dlt` adds when a
+    value does not fit the column's type, IS a real column of the Bronze
+    table and is reported as it is.
+
+    The table lives in whichever of the pipeline's schemas the source was
+    named after, so every schema is searched, the default one first. Reading
+    the schema must never fail a load that already succeeded: any problem
+    gives `()` and a warning that names only the exception type.
+    """
+    try:
+        schemas = [pipeline.default_schema, *pipeline.schemas.values()]
+        for schema in schemas:
+            table = schema.tables.get(bronze_table_name)
+            if table is None:
+                continue
+            return tuple(
+                LoadedColumn(
+                    name=name,
+                    data_type=column["data_type"],
+                    nullable=column.get("nullable", True),
+                )
+                for name, column in table.get("columns", {}).items()
+                if "data_type" in column and not name.startswith("_dlt_") and name != "_ingested_at"
+            )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        logger.warning("could not read the loaded columns of %r (%s)", bronze_table_name, type(exc).__name__)
+    return ()
 
 
 def _incremental_cursors(pipeline: Any) -> dict[str, dict[str, set[str]]]:
@@ -483,4 +537,5 @@ def load_via_sink(
         rows=rows,
         has_failed_jobs=load_info.has_failed_jobs,
         load_info_str=str(load_info),
+        columns=() if load_info.has_failed_jobs else _loaded_columns(pipeline, bronze_table_name),
     )

@@ -99,6 +99,20 @@ explicitly for `adapter == "sql"` with `dial["driver"] in ("postgres",
 "postgresql")`, rather than guessing which of the two paths a `sql`
 adapter connector needs.
 
+# Schema changes at the source (`SRC-8`)
+
+A batch SQL table (postgres, mysql/mariadb, mssql, oracle) is OBSERVED
+BEFORE it loads: `_run_one_object` reads the columns and primary key from
+the reflection `dlt` does while it builds the source (no connection of its
+own, so reflection stays inside each driver's SSRF guard; see
+`schema_observer.py`), posts them to `lakehouse-api` and obeys the answer.
+`wait` records an `ingest_run` row with status `waiting` and returns without
+loading and without raising, so the mapped step and the run succeed (feature
+decision D7: a table waiting for a person is not a failure). `load` with a
+column list loads only those columns. An API that cannot be asked fails the
+step and loads nothing (fail closed). The run id the API stores with a change
+is the Dagster run id of the mapped step.
+
 # Secrets
 
 Resolved via `secret_resolver.resolve_secret_ref`, using
@@ -109,6 +123,7 @@ values become -- NEVER an env var name derived from the connector id (see
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -136,7 +151,7 @@ from dagster import (
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from dispar_orchestrate import connector_catalog, dlt_pipeline, secret_resolver, ssrf_guard
+from dispar_orchestrate import connector_catalog, dlt_pipeline, schema_observer, secret_resolver, ssrf_guard
 from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
 from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import files as files_adapter
@@ -156,6 +171,8 @@ from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 _POSTGRES_DRIVERS = ("postgres", "postgresql")
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownAdapter(Exception):
@@ -275,6 +292,66 @@ def _classify_exception(exc: Exception) -> str:
     return f"{type(exc).__module__}.{type(exc).__name__}"
 
 
+# SQLSTATE a driver reports for a refused login (class 28, "invalid
+# authorization specification"); SQL Server's error 18456 carries it.
+_SQLSTATE_LOGIN_REFUSED = "28000"
+# `pymysql.constants.ER.ACCESS_DENIED_ERROR` / Oracle `ORA-01017`.
+_MYSQL_ACCESS_DENIED = 1045
+_ORACLE_LOGON_DENIED = "ORA-01017"
+# Bounded walk: SQLAlchemy's `.orig`, `raise ... from` and implicit contexts
+# are chains of a few links; the bound only guards against a cycle.
+_MAX_CAUSE_DEPTH = 8
+
+
+def _is_authentication_refusal(exc: BaseException) -> bool:
+    """Whether `exc`, or anything it wraps, is a database driver telling us
+    the source REFUSED THE CREDENTIAL (a wrong user or password).
+
+    That answer does not change between attempts, so retrying it only burns
+    `DEFAULT_RETRY_POLICY`'s two backed-off retries (a measured 2m23s run in
+    the G6 gate, PR #101 CI) before the same refusal and delays the failure
+    alert. Decided by the driver's exception TYPE and error CODE, never by
+    matching message text (which is localised, version-dependent and can
+    carry a host or user name):
+
+    - `pymysql` (mysql/mariadb): `OperationalError` with `args[0] == 1045`
+      (`ER_ACCESS_DENIED_ERROR`).
+    - `pyodbc` (mssql): any `pyodbc.Error` whose `args[0]` (the SQLSTATE) is
+      `28000`, what SQL Server's "Login failed" (18456) maps to.
+    - `oracledb` (oracle): a `DatabaseError` whose first argument is the
+      driver's error object with `full_code == "ORA-01017"`.
+
+    The drivers are recognised by their module so this file imports none of
+    them (`pyodbc` needs a system ODBC library to import at all).
+
+    NOT covered, deliberately: `psycopg2` (postgres). Checked against the
+    pinned `psycopg2` 2.9.10 with a refused login: `pgcode` and
+    `diag.sqlstate` are `None` for an error raised while connecting (libpq
+    gives no SQLSTATE there), so the only signal is the message text, which
+    this function will not read. A Postgres credential failure therefore
+    still retries until a verifiable signal exists.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    for _ in range(_MAX_CAUSE_DEPTH):
+        if not pending:
+            break
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        root = type(current).__module__.split(".")[0]
+        first = current.args[0] if current.args else None
+        if root == "pymysql" and first == _MYSQL_ACCESS_DENIED:
+            return True
+        if root == "pyodbc" and first == _SQLSTATE_LOGIN_REFUSED:
+            return True
+        if root == "oracledb" and getattr(first, "full_code", None) == _ORACLE_LOGON_DENIED:
+            return True
+        pending.extend([getattr(current, "orig", None), current.__cause__, current.__context__])
+    return False
+
+
 def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> dict[str, str]:
     """Resolve `connector["secretRef"]`/`connector["secretRefSecondary"]`
     through the allowlisted resolver ONLY -- never an env var name derived
@@ -341,7 +418,172 @@ def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
     return plan
 
 
-def _run_one_object(connector: dict, obj: dict) -> int | None:
+def _observe_after_load(
+    connector_id: str, object_name: str, columns: tuple[sink_adapter.LoadedColumn, ...], run_id: str | None
+) -> None:
+    """Tell the API what a non-SQL source's table looks like now that it has
+    loaded (SRC-8, decision D4: files, REST, `MongoDB`, SFTP and the Kafka
+    micro-batch cannot be read before they load).
+
+    What is sent is exactly what the load produced and nothing else: no
+    primary key (`[]`: these sources have none to observe), and no column the
+    load did not carry -- a column absent from a batch cannot be told from one
+    that is empty in it, so this side never reports a removal; the API
+    carries the previous columns over for this phase (`routes/schema_changes.rs`,
+    `shape_for_phase`).
+
+    THE ONE PLACE THE FAIL-CLOSED RULE DOES NOT APPLY (AGENTS.md principle 3):
+    the rows are already in Bronze and recorded as succeeded, and the API
+    never asks these sources to hold anything back, so whatever it answers
+    (or fails to answer) changes nothing here. A failed post must not turn a
+    successful load into a failed run; it is logged as a warning that names
+    the exception type (and, for the observer's own errors, their fixed
+    message), never a token or a response body.
+    """
+    if not columns:
+        return
+    try:
+        schema_observer.post_observation(
+            schema_observer.ObserverConfig.from_env(),
+            connector_id,
+            object_name,
+            # SRC-8 task 11: these are the pipeline's own (already loaded) names.
+            [schema_observer.ReflectedColumn(c.name, c.data_type, c.nullable, loaded_name=c.name) for c in columns],
+            [],
+            "after_load",
+            run_id,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        detail = str(exc) if isinstance(exc, (schema_observer.ObservationRefused, schema_observer.ObservationUnreachable)) else type(exc).__name__
+        logger.warning(
+            "%r loaded, but its schema could not be reported to the API (the data is in Bronze): %s",
+            object_name,
+            detail,
+        )
+
+
+def _schemas_loaded(source_objects: list[dict]) -> list[str]:
+    """The schemas a connector already loads at least one table from, in the
+    order they first appear: the part of each `<schema>.<table>` name before
+    its first dot (the split `BronzeIngestConfig.from_dial` makes). A name
+    with no dot has no schema to list."""
+    schemas: list[str] = []
+    for obj in source_objects:
+        schema, dot, _ = obj["name"].partition(".")
+        if dot and schema and schema not in schemas:
+            schemas.append(schema)
+    return schemas
+
+
+def _discover_new_tables(connector: dict, run_id: str | None) -> bool:
+    """Tell the API about tables that appeared in a schema this connector
+    already loads from, once per run and only under the policy that asks for
+    it (`SRC-8` decision D2: `apply_all`; PostgreSQL, MySQL/MariaDB and SQL
+    Server only). Returns whether the API added any, so the caller re-reads
+    the connector and loads them in THIS run.
+
+    The listing is a connection of its own, guarded like the loads
+    (`adapters/sql.py::list_tables`). It never stops the run: nothing is
+    loaded unchecked because of it, and the tables already selected must keep
+    loading even when a listing fails (a timeout, a revoked privilege on
+    `information_schema`), so a failure is a warning that names the exception
+    type (or an observer error's fixed message), never a secret, and the new
+    tables are asked for again on the next run.
+    """
+    dial = connector.get("dial") or {}
+    driver = dial.get("driver")
+    if (
+        connector.get("adapter") != "sql"
+        or connector.get("schemaChangePolicy") != "apply_all"
+        or driver not in sql_adapter.LISTABLE_DRIVERS
+    ):
+        return False
+    objects = connector.get("sourceObjects") or []
+    schemas = _schemas_loaded(objects)
+    if not schemas:
+        return False
+    try:
+        secrets = _resolve_object_secrets(connector, "sql", dial)
+        listed = sql_adapter.list_tables(dial, secrets, schemas)
+        selected = {obj["name"] for obj in objects}
+        new = [
+            f"{schema}.{table}"
+            for schema in schemas
+            for table in listed.get(schema, [])
+            if f"{schema}.{table}" not in selected
+        ]
+        if not new:
+            return False
+        cfg = schema_observer.ObserverConfig.from_env()
+        size = schema_observer.MAX_TABLES_PER_REQUEST
+        added = False
+        for start in range(0, len(new), size):
+            answer = schema_observer.post_new_tables(cfg, connector["id"], new[start : start + size], run_id)
+            added = added or bool(answer.added)
+        return added
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        detail = (
+            str(exc)
+            if isinstance(exc, (schema_observer.ObservationRefused, schema_observer.ObservationUnreachable))
+            else _classify_exception(exc)
+        )
+        logger.warning(
+            "new tables of connector %r could not be looked for (the tables it already has still load): %s",
+            connector.get("id"),
+            detail,
+        )
+        return False
+
+
+# What an `ingest_run` row says when a table waits for a schema-change
+# decision (SRC-8, D7). Fixed text: nothing from the source or the API.
+_WAITING_MESSAGE = "waiting for a decision on a schema change at the source"
+
+
+def _make_gate(connector: dict, obj: dict, run_id: str | None):
+    """The `before_load` observation for one source object (SRC-8, D4): what
+    `dlt` reflected goes to the API and its decision comes back."""
+
+    def gate(reflected: schema_observer.ReflectedTable) -> schema_observer.Decision:
+        return schema_observer.post_observation(
+            schema_observer.ObserverConfig.from_env(),
+            connector["id"],
+            obj["name"],
+            reflected.columns,
+            reflected.primary_key,
+            "before_load",
+            run_id,
+        )
+
+    return gate
+
+
+def _build_observed(build, gate):
+    """Build a SQL source, observe its reflected table, and obey the answer.
+
+    `build(table_adapter_callback)` builds the source with that callback.
+    Returns the source build result to load -- built a second time, keeping
+    only the listed columns, when the API said so (the second reflection
+    runs under the same guard as the first) -- or `None` when the API said
+    `wait`.
+
+    # Errors
+
+    Raises `schema_observer.ReflectionMissing` if the build reflected no
+    table (nothing to observe: refused rather than loaded unchecked), and
+    whatever `gate` raises.
+    """
+    collector = schema_observer.ReflectionCollector()
+    result = build(collector.callback)
+    decision = gate(collector.only())
+    if decision.action == "wait":
+        return None
+    if decision.columns is not None:
+        result = build(schema_observer.keep_only(decision.columns))
+    return result
+
+
+def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> int | None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
     case -- a rejection (bad secret ref, SSRF-blocked host, an
@@ -352,10 +594,15 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
 
     Re-raises whatever it catches (`SecretRefRejected`,
     `ssrf_guard.SsrfBlocked`, `UnsupportedColumnType`,
-    `UnsupportedLoadMode`, or any other
-    exception a driver/HTTP call/sink raises) after recording it -- this
+    `UnsupportedLoadMode`, `schema_observer.ObservationRefused`, or any other
+    exception a driver/HTTP call/sink raises, `ObservationUnreachable`
+    included) after recording it -- this
     function's own run (the Dagster op) must still fail visibly, not just
-    the governance-surface row.
+    the governance-surface row. The one thing that does NOT raise is a table
+    the API told to `wait` (SRC-8, D7): it is recorded as `waiting` and the
+    function returns `None`.
+
+    `run_id` is the Dagster run id sent with the schema observation.
     """
     connector_id, adapter_name, dial = connector["id"], connector["adapter"], connector["dial"]
     job_name = "ingest_job"
@@ -382,6 +629,7 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
     try:
         reject_unsupported_column_types(obj.get("columns", []))
         plan = _load_plan(adapter_name, obj)
+        gate = _make_gate(connector, obj, run_id)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned
@@ -389,8 +637,13 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
             # ssrf_guard.pinned_resolution (psycopg2/libpq does not
             # resolve through socket.getaddrinfo).
             outcome = dlt_pipeline.run_bronze_ingest(
-                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]), plan
+                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]),
+                plan,
+                gate=gate,
             )
+            if outcome.get("waiting"):
+                _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
+                return None
             _record(rows=outcome["rows"], status="succeeded")
             _register_in_catalog(connector_id, obj)
             return outcome["rows"]
@@ -409,7 +662,13 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
             # wrap deliberately instead of it silently never firing (the
             # generic path's `_host_of` would find `dial["host"]` and
             # apply it "by accident" otherwise).
-            result = oracle_adapter.build_source(dial, secrets, [obj])
+            result = _build_observed(
+                lambda callback: oracle_adapter.build_source(dial, secrets, [obj], table_adapter_callback=callback),
+                gate,
+            )
+            if result is None:
+                _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
+                return None
             outcome = sink_adapter.load_via_sink(
                 result.source,
                 obj["target"],
@@ -455,6 +714,18 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
             # `mongodb` arm above states.
             result = adapter.build_source(dial, secrets, [obj])
             source, resolved = result.sources[obj["target"]], None
+        elif adapter_name == "sql":
+            # mysql/mariadb/mssql (SRC-8): the reflection that feeds the
+            # observation happens inside `build_source`, under that driver's
+            # own pin (`adapters/sql.py`), before any row is read.
+            result = _build_observed(
+                lambda callback: adapter.build_source(dial, secrets, [obj], table_adapter_callback=callback),
+                gate,
+            )
+            if result is None:
+                _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
+                return None
+            source, resolved = result.source, result.resolved
         else:
             result = adapter.build_source(dial, secrets, [obj])
             source, resolved = result.source, result.resolved
@@ -471,8 +742,17 @@ def _run_one_object(connector: dict, obj: dict) -> int | None:
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
         _register_in_catalog(connector_id, obj)
+        if adapter_name != "sql":
+            # files / rest / mongodb / sftp: observed AFTER the load (SRC-8,
+            # D4). sql was observed before it; sheets returned above.
+            _observe_after_load(connector_id, obj["name"], outcome.columns, run_id)
         return outcome.rows
-    except (ssrf_guard.SsrfBlocked, UnsupportedColumnType, UnsupportedLoadMode) as exc:
+    except (
+        ssrf_guard.SsrfBlocked,
+        UnsupportedColumnType,
+        UnsupportedLoadMode,
+        schema_observer.ObservationRefused,
+    ) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise
     except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)
@@ -527,6 +807,7 @@ def run_kafka_stream_batch(
     secrets: dict,
     source_objects: list[dict],
     consumer: "KafkaConsumer | None" = None,
+    run_id: str | None = None,
 ) -> None:
     """One scheduled micro-batch for a `kafka`-adapter, `ingest_mode='stream'`
     connector. At-least-once, stated explicitly:
@@ -542,6 +823,8 @@ def run_kafka_stream_batch(
     call re-delivers the same batch on the next scheduled run -- a
     deliberate, documented at-least-once gap (`adapters/sink.py`'s Iceberg
     append path is not deduplicated), never a silent skip.
+
+    `run_id` is the Dagster run id sent with the after-load schema observation.
 
     A micro-batch that loaded also registers (or refreshes) its Bronze
     table in the console catalog (`_register_in_catalog`), like every batch
@@ -634,6 +917,11 @@ def run_kafka_stream_batch(
                 connector_id,
                 {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
             )
+            # SRC-8 (D4): a micro-batch is observed AFTER it loads, like every
+            # source whose columns cannot be read first. The offsets are
+            # already committed; a failed post changes nothing (see
+            # `_observe_after_load`).
+            _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
             raise
@@ -645,7 +933,7 @@ def run_kafka_stream_batch(
             consumer.close()
 
 
-def _run_stream_connector(connector: dict) -> None:
+def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
     """Dispatch a `kafka`-adapter, `ingest_mode="stream"` connector
     (`connector_ingest_mode_check`, widened to admit `"stream"` by
     `0043_ingest_tier2_adapters.sql`) to `run_kafka_stream_batch` -- the
@@ -672,6 +960,7 @@ def _run_stream_connector(connector: dict) -> None:
         spec=dial,
         secrets=secrets,
         source_objects=connector.get("sourceObjects", []),
+        run_id=run_id,
     )
 
 
@@ -718,6 +1007,12 @@ def run_ingest(context) -> Any:
     body via the existing `_resolve_object_secrets`/`secret_resolver`
     path; the fan-out's payload never crosses that line.
 
+    Before the fan-out, a connector on the `apply_all` schema-change policy
+    asks the API to add the tables that appeared in a schema it already
+    loads (`_discover_new_tables`, `SRC-8` decision D2). Tables the API adds
+    are loaded in this same run: the connector is read again after the add, so
+    the fan-out sees them. A failure of that step never stops the run.
+
     Two source objects whose sanitized targets collide raise
     `Failure(allow_retries=False)` -- they would otherwise collapse
     into one mapped step doing two objects' work, which Dagster's
@@ -739,8 +1034,13 @@ def run_ingest(context) -> Any:
         # cannot run: a kafka connector's rows arrive from one bounded
         # consumer.poll() loop over the whole topic, not from a
         # build_source() call per sourceObjects entry.
-        _run_stream_connector(connector)
+        _run_stream_connector(connector, run_id=context.run_id)
         return
+    if _discover_new_tables(connector, context.run_id):
+        # Added in this run, loaded in this run: the API wrote them to the
+        # connector's tables, so one more read of the connector (the same call
+        # that started this run) fans out over the new list.
+        connector = _fetch_one_connector(cfg, connector_id)
     seen: dict[str, str] = {}
     for obj in connector.get("sourceObjects", []):
         target = obj["target"]
@@ -795,8 +1095,14 @@ PART D: a config-shaped failure retries with the same input and
     says it says."""
     connector, obj = payload["connector"], payload["obj"]
     try:
-        rows = _run_one_object(connector, obj)
+        rows = _run_one_object(connector, obj, run_id=context.run_id)
+    except schema_observer.ObservationUnreachable as exc:
+        # SRC-8, fail closed: the API could not be asked, so the table was
+        # NOT loaded unchecked. Transient (a connection error or a 5xx), so
+        # `allow_retries` stays True and `DEFAULT_RETRY_POLICY` retries it.
+        raise Failure(description=f"ingest of {obj.get('target')!r}: {exc}") from exc
     except (
+        schema_observer.ObservationRefused,
         UnknownAdapter,
         SecretRefRejected,
         ssrf_guard.SsrfBlocked,
@@ -829,6 +1135,17 @@ PART D: a config-shaped failure retries with the same input and
     ) as exc:
         raise Failure(
             description=f"ingest of {obj.get('target')!r}: {exc}",
+            allow_retries=False,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless it is a refused credential
+        if not _is_authentication_refusal(exc):
+            raise
+        # PR #101 CI (G6 `g6-mysql-wrong-password`): the source said the
+        # credential is wrong. Retrying cannot change that answer, and the
+        # two retries turned a 10-second failure into a 2m23s one. Fixed
+        # text: nothing from the driver (it names user and client address).
+        raise Failure(
+            description=f"ingest of {obj.get('target')!r}: the source refused the connector's credential",
             allow_retries=False,
         ) from exc
     if isinstance(rows, int):
