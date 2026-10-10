@@ -48,10 +48,19 @@ Part 2:
 | 6 | Column permissions hold: a formula over a masked column sees the masked value, and over a denied column fails for that user | Security posture | 2026-10-11 |
 | 7 | The function list is the Metabase set named in the spec; the exact names are in the plan | Spec | 2026-10-11 |
 
+## Part 2: how the new functions behave
+
+- A table calculation (`RunningTotal`, `RunningCount`, `Offset`, `PercentOfTotal`, `Rank`, `MovingAverage`) and a period comparison (`PreviousPeriod`, `SamePeriodLastYear`) take an aggregate, for example `RunningTotal(Sum([visitors]))`, and are computed over the chart's whole result in its dimension order. They are a measure of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart only; a KPI, gauge, pivot, raw table, map or box plot refuses them with a plain message.
+- With a breakdown they run per series (partitioned by the breakdown); `PercentOfTotal` is of the whole chart, 0 to 100.
+- `PreviousPeriod` and `SamePeriodLastYear` need the dimension grouped by day, week, month, quarter or year (minute and hour for the first). They match by calendar date, not by row position, so a month without data leaves an empty value and the next month still compares with the right one. A week looks a year back as 52 weeks.
+- The latest buckets a chart keeps are cut after the calculation, so a running total at the last bucket is the true running total. The result may have at most 10,000 groups; past that the database refuses and the tile says it failed, rather than showing a wrong total.
+- `Fixed([a], [b], ..., aggregate)` computes the aggregate at those columns over the chart's filtered rows and joins it back. It can only name columns the chart groups by (its dimension or breakdown), never a date column the chart groups by date, and a KPI can take only `Fixed(aggregate)`, a grand total. Dashboard filters apply to it; the role's masks and row filters apply to every read inside it.
+
 ## Limits to tell a customer
 
 - A field works on the source it was written for only.
 - Table calculations follow the chart's own order (its dimension).
+- A table calculation, period comparison or `Fixed` is a chart measure; it cannot be a dimension, a breakdown, a column, a pivot value or a KPI value (`Fixed` grand total excepted).
 - "Same period last year" needs a chart grouped by month, quarter or year, or by day or week with a full year of data behind it.
 
 ## Acceptance checklist

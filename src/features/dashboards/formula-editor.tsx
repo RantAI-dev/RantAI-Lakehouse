@@ -12,7 +12,7 @@ import { calcFieldService } from "@/services";
 import type {
   CalcField, CalcFieldSource, FormulaCheck, FormulaFunction,
 } from "@/services/contracts/calc-fields";
-import { applySuggestion, callAtCaret, splitAtProblem, suggest } from "@/lib/formula-assist";
+import { applySuggestion, callAtCaret, levelLabel, splitAtProblem, suggest } from "@/lib/formula-assist";
 import { cn } from "@/lib/utils";
 
 /** How long the box waits after the last keystroke before asking the server to check. */
@@ -192,7 +192,7 @@ export function FormulaEditorDialog({
             </div>
           ) : check && check !== "pending" && check.ok ? (
             <p className="text-xs text-muted-foreground">
-              {check.level === "aggregate" ? "Aggregate" : "One value per row"}, {check.type}.
+              {levelLabel(check.level, check.type)}
             </p>
           ) : null}
           {problem ? <p role="alert" className="text-sm text-destructive">{problem}</p> : null}

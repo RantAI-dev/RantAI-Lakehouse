@@ -365,18 +365,16 @@ pub async fn update(
         &time,
     )
     .map_err(|problem| unprocessable(&problem))?;
-    if level != Level::Row && !current.is_aggregate()
-        || level == Level::Row && current.is_aggregate()
-    {
+    if level.as_str() != current.level {
         let users = dependents(ch, &current, &source, &siblings, &time).await?;
         if !users.is_empty() {
+            let into = match level {
+                Level::Aggregate => "an aggregate",
+                Level::Table => "a table calculation",
+                Level::Row | Level::Constant => "a row-level",
+            };
             return Err(ApiError::Conflict(format!(
-                "this change turns the field into {} one, but it is used by {}.",
-                if level == Level::Row {
-                    "a row-level"
-                } else {
-                    "an aggregate"
-                },
+                "this change turns the field into {into} one, but it is used by {}.",
                 users.join(", ")
             ))
             .into());
@@ -566,6 +564,22 @@ mod tests {
         let measure = Ident::new(def.measures[0].as_str()).unwrap();
         if def.kind == lakehouse_bi::specs::ChartKind::Kpi {
             return build_kpi_sql(&p.from, &measure, Aggregate::Sum, &[]);
+        }
+        if let Some(grain) = def
+            .grain
+            .as_deref()
+            .and_then(lakehouse_bi::grain::Grain::parse)
+        {
+            let chart =
+                lakehouse_bi::builder::GrainedChart::from_def(&def, def.kind, grain).unwrap();
+            return lakehouse_bi::builder::grained_sql(
+                &p.from,
+                Vec::new(),
+                &chart,
+                ColumnKind::Date,
+                &time,
+            )
+            .unwrap();
         }
         QueryBuilder::over(p.from)
             .dimension(Ident::new(def.dimension.as_str()).unwrap())
@@ -775,5 +789,113 @@ mod tests {
             // that matters and still parses.
             assert!(rewrite(&out, &policy).is_ok(), "{}: {out}", f.name);
         }
+    }
+
+    /// `BI-8` part 2: the new statement shapes (a window over a grouped
+    /// subquery, a self-join for the previous period, a `Fixed` join) are
+    /// read by the role rewrite like any other: every occurrence of the table,
+    /// in every subquery and on both sides of every join, is replaced by its
+    /// masked and row-filtered projection.
+    #[test]
+    fn table_calculations_period_comparisons_and_fixed_read_only_masked_and_filtered_rows() {
+        let policy = OneTable {
+            table: "serving.mart_demo_map_points",
+            mask: vec!["place"],
+            row_filter: Some("provinsi = 'Bali'"),
+            real_columns: Some(DEMO_REAL_COLUMNS.to_vec()),
+        };
+        let cases = [
+            (
+                "running total of a count over a masked column",
+                vec![demo_field(
+                    "run_places",
+                    "RunningTotal(CountDistinct(place))",
+                )],
+                serde_json::json!({ "kind": "line", "dimension": "category", "measures": ["run_places"] }),
+            ),
+            (
+                "rank and percent of total over the filtered rows",
+                vec![
+                    demo_field("rk", "Rank(Sum(visitors))"),
+                    demo_field("pc", "PercentOfTotal(Sum(visitors))"),
+                ],
+                serde_json::json!({ "kind": "bar", "dimension": "category", "measures": ["rk", "pc"] }),
+            ),
+            (
+                "previous month of a count over a masked column, per series",
+                vec![demo_field(
+                    "prev_places",
+                    "PreviousPeriod(CountDistinct(place))",
+                )],
+                serde_json::json!({ "kind": "line", "dimension": "visit_date", "grain": "month", "breakdown": "category", "measures": ["prev_places"] }),
+            ),
+            (
+                "same month last year of the filtered visitors",
+                vec![demo_field("ly_v", "SamePeriodLastYear(Sum(visitors))")],
+                serde_json::json!({ "kind": "line", "dimension": "visit_date", "grain": "month", "measures": ["ly_v"] }),
+            ),
+            (
+                "Fixed share within a category",
+                vec![demo_field(
+                    "share",
+                    "Sum(visitors) / Fixed([category], Sum(visitors))",
+                )],
+                serde_json::json!({ "kind": "bar", "dimension": "category", "measures": ["share"] }),
+            ),
+            (
+                "Fixed over a masked column",
+                vec![demo_field(
+                    "masked_share",
+                    "CountDistinct(place) / Fixed([category], CountDistinct(place))",
+                )],
+                serde_json::json!({ "kind": "bar", "dimension": "category", "measures": ["masked_share"] }),
+            ),
+            (
+                "Fixed grand total as a KPI",
+                vec![demo_field("of_all", "Sum(visitors) / Fixed(Sum(visitors))")],
+                serde_json::json!({ "kind": "kpi", "measures": ["of_all"] }),
+            ),
+        ];
+        for (label, fields, chart) in cases {
+            let sql = chart_sql(&fields, &chart);
+            assert!(!sql.is_empty(), "{label}");
+            let out = rewrite(&sql, &policy).unwrap_or_else(|failure| panic!("{label}: {failure}"));
+            record(label, &out);
+            let reads = sql.matches("serving.mart_demo_map_points").count();
+            assert!(reads >= 1, "{label}: {sql}");
+            assert_eq!(
+                out.matches("FROM serving.mart_demo_map_points").count(),
+                reads,
+                "{label}: {out}"
+            );
+            // Each of the reads is the masked, filtered projection.
+            let masked = "replaceRegexpOne(toString(`place`), '(?s)^.*$', '***') AS `place`";
+            assert_eq!(out.matches(masked).count(), reads, "{label}: {out}");
+            assert_eq!(
+                out.matches("WHERE provinsi = 'Bali'").count(),
+                reads,
+                "{label}: {out}"
+            );
+            let tables =
+                crate::sql_rewrite::referenced_tables(&out, &ClickHouseDialect {}).unwrap();
+            assert_eq!(
+                tables,
+                vec!["serving.mart_demo_map_points".to_owned()],
+                "{label}"
+            );
+        }
+        // The same shapes fail closed when the rewrite cannot prove them.
+        let field = demo_field("share", "Sum(visitors) / Fixed([category], Sum(visitors))");
+        let sql = chart_sql(
+            std::slice::from_ref(&field),
+            &serde_json::json!({ "kind": "bar", "dimension": "category", "measures": ["share"] }),
+        );
+        let unproven = OneTable {
+            table: "serving.mart_demo_map_points",
+            mask: vec![],
+            row_filter: None,
+            real_columns: None,
+        };
+        assert!(rewrite(&sql, &unproven).is_err());
     }
 }

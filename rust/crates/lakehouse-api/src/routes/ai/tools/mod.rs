@@ -142,12 +142,12 @@ pub(in crate::routes) async fn run_tool(
         "list_charts" => dashboards::list_charts(ch).await,
         "list_sql_sources" => dashboards::list_sql_sources(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
-        "list_formula_functions" => calc_fields::list_formula_functions(),
-        "list_calculated_fields" => calc_fields::list_calculated_fields(state, args).await,
-        "validate_formula" => calc_fields::validate_formula(state, args).await,
-        "create_calculated_field" => calc_fields::create_calculated_field(state, args).await,
-        "update_calculated_field" => calc_fields::update_calculated_field(state, args).await,
-        "delete_calculated_field" => calc_fields::delete_calculated_field(state, args).await,
+        "list_formula_functions"
+        | "list_calculated_fields"
+        | "validate_formula"
+        | "create_calculated_field"
+        | "update_calculated_field"
+        | "delete_calculated_field" => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(ch).await,
         "create_alert_rule" => {
             alerts::create_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await

@@ -150,9 +150,10 @@ function kindsOf(columns: readonly { name: string; type: string }[]): Record<str
   return Object.fromEntries(columns.map((c) => [c.name, columnKindOfType(c.type)]));
 }
 /**
- * The source's columns plus its calculated fields (BI-8). A per-row number
- * and an aggregate are offered as measures, any other per-row field as a
- * dimension; the server refuses an aggregate anywhere but a measure.
+ * The source's columns plus its calculated fields (BI-8). A per-row number,
+ * an aggregate and a table calculation are offered as measures, any other
+ * per-row field as a dimension; the server refuses the last two anywhere but
+ * a measure, and says why (the preview shows its sentence).
  */
 function withCalculated(base: Fields, columns: string[], calculated: CalcField[]): Fields {
   const kinds = { ...base.kinds };
@@ -160,7 +161,7 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
   const measures = [...base.measures];
   for (const f of calculated) {
     kinds[f.name] = f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "datetime" ? "datetime" : "text";
-    (f.level === "aggregate" || f.type === "number" ? measures : dimensions).push(f.name);
+    (f.level === "aggregate" || f.level === "table" || f.type === "number" ? measures : dimensions).push(f.name);
   }
   return { dimensions, measures, kinds, columns, calculated };
 }

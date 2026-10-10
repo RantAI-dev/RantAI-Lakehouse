@@ -40,8 +40,8 @@ use lakehouse_core::ident::{Ident, SqlLiteral};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::builder::{AggregateField, Relation, RelationColumns};
-use crate::formula::compile::{FType, Level, Scope, compile};
+use crate::builder::{AggregateField, Relation, RelationColumns, TableCalc};
+use crate::formula::compile::{ChartCtx, FType, FixedJoin, Level, Scope, compile};
 use crate::grain::TimeContext;
 use crate::specs::ChartKind;
 use crate::store::{ChartInput, StoredChartSpec, ensure_bi_table, random_hex};
@@ -416,6 +416,51 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
     }
 }
 
+/// Whether the chart's order makes a table calculation meaningful: a chart
+/// that lists its groups along a dimension (`BI-8` part 2). A single number,
+/// a pivot, a raw table, a map and a box plot have none.
+fn takes_table_calc(def: &ChartInput) -> bool {
+    let kind = def.kind;
+    matches!(
+        kind,
+        ChartKind::Bar
+            | ChartKind::Hbar
+            | ChartKind::Line
+            | ChartKind::Area
+            | ChartKind::Stacked
+            | ChartKind::Combo
+            | ChartKind::Waterfall
+    ) || (kind == ChartKind::Table && !def.tables.is_rows_mode(kind))
+}
+
+/// How a chart may use the fields it names, for [`prepare_refs`].
+struct Use {
+    aggregate_measure_ok: bool,
+    table_calc_ok: bool,
+    chart: Option<ChartCtx>,
+}
+
+/// What a formula needs to know about `def`'s chart.
+fn chart_ctx(def: &ChartInput, time: &TimeContext) -> ChartCtx {
+    let grain = def
+        .grain
+        .as_deref()
+        .and_then(crate::grain::Grain::parse)
+        .filter(|g| g.is_truncation());
+    let dimension = (!def.dimension.is_empty()).then(|| def.dimension.clone());
+    let order_key = match (&dimension, grain) {
+        (Some(d), Some(g)) => g.order_key(d, time.week_start()),
+        (Some(d), None) => d.clone(),
+        (None, _) => "1".to_owned(),
+    };
+    ChartCtx {
+        dimension,
+        breakdown: def.breakdown.clone().filter(|b| !b.is_empty()),
+        order_key,
+        grain,
+    }
+}
+
 /// A chart's relation and columns once its calculated fields are applied.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -448,7 +493,11 @@ pub fn prepare<H: std::hash::BuildHasher>(
     prepare_refs(
         fields,
         &referenced(def),
-        takes_aggregate_measure(def),
+        &Use {
+            aggregate_measure_ok: takes_aggregate_measure(def),
+            table_calc_ok: takes_table_calc(def),
+            chart: Some(chart_ctx(def, time)),
+        },
         from,
         cols,
         time,
@@ -470,13 +519,18 @@ pub fn prepare_named<H: std::hash::BuildHasher>(
     time: &TimeContext,
 ) -> Result<Option<Prepared>, String> {
     let refs: Vec<(&str, Slot)> = names.iter().map(|n| (*n, Slot::Other)).collect();
-    prepare_refs(fields, &refs, false, from, cols, time)
+    let none = Use {
+        aggregate_measure_ok: false,
+        table_calc_ok: false,
+        chart: None,
+    };
+    prepare_refs(fields, &refs, &none, from, cols, time)
 }
 
 fn prepare_refs<H: std::hash::BuildHasher>(
     fields: &[FieldDef],
     refs: &[(&str, Slot)],
-    aggregate_measure_ok: bool,
+    usage: &Use,
     from: Relation,
     cols: &RelationColumns<H>,
     time: &TimeContext,
@@ -496,11 +550,16 @@ fn prepare_refs<H: std::hash::BuildHasher>(
         return Ok(None);
     }
     let mut scope = Scope::new(&raw, time);
+    if let Some(chart) = &usage.chart {
+        scope = scope.with_chart(chart.clone());
+    }
     for f in &live {
         scope = scope.with_field(&f.name, &f.formula);
     }
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut aggregates: Vec<AggregateField> = Vec::new();
+    let mut table_calcs: Vec<TableCalc> = Vec::new();
+    let mut fixed: Vec<FixedJoin> = Vec::new();
     let mut aug = raw.clone();
     for name in &used {
         let Some(field) = live.iter().find(|f| f.name == *name) else {
@@ -515,33 +574,62 @@ fn prepare_refs<H: std::hash::BuildHasher>(
         // The level is read from the formula as it is now, never from the
         // stored word, so an edit that changed it cannot leave a chart
         // building a row-level column out of an aggregate.
-        if compiled.level == Level::Aggregate {
-            let as_measure = aggregate_measure_ok
-                && refs
-                    .iter()
-                    .filter(|(n, _)| n == name)
-                    .all(|(_, s)| *s == Slot::Measure);
-            if !as_measure {
-                return Err(format!(
-                    "'{name}' is an aggregate field; it can only be a value (measure) of a chart that groups, not a dimension, breakdown or column."
-                ));
+        let only_measure = refs
+            .iter()
+            .filter(|(n, _)| n == name)
+            .all(|(_, s)| *s == Slot::Measure);
+        match compiled.level {
+            Level::Table => {
+                if !(usage.table_calc_ok && only_measure) {
+                    return Err(format!(
+                        "'{name}' is a table calculation; it can only be a value (measure) of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart, not a dimension, breakdown, column, pivot value, map, KPI or gauge."
+                    ));
+                }
+                table_calcs.push(TableCalc {
+                    name: field.name.clone(),
+                    sql: compiled.sql,
+                    aggs: compiled.staged.aggs.clone(),
+                    shifts: compiled.staged.shifts.clone(),
+                    reads: compiled.reads.into_iter().collect(),
+                });
             }
-            aggregates.push(AggregateField {
-                name: field.name.clone(),
-                sql: compiled.sql,
-                reads: compiled.reads.into_iter().collect(),
-            });
-        } else {
-            columns.push((field.name.clone(), compiled.sql));
+            Level::Aggregate => {
+                if !(usage.aggregate_measure_ok && only_measure) {
+                    return Err(format!(
+                        "'{name}' is an aggregate field; it can only be a value (measure) of a chart that groups, not a dimension, breakdown or column."
+                    ));
+                }
+                aggregates.push(AggregateField {
+                    name: field.name.clone(),
+                    sql: compiled.sql,
+                    reads: compiled.reads.into_iter().collect(),
+                });
+            }
+            _ => columns.push((field.name.clone(), compiled.sql)),
+        }
+        for j in compiled.staged.fixed {
+            if !fixed.iter().any(|x| x.alias == j.alias) {
+                fixed.push(j);
+            }
         }
         aug.insert(field.name.clone(), compiled.ty.column_kind());
     }
+    let calculated = Relation::Calculated {
+        base: Box::new(from),
+        columns,
+        aggregates,
+        table_calcs,
+    };
+    let from = if fixed.is_empty() {
+        calculated
+    } else {
+        Relation::Fixed {
+            base: Box::new(calculated),
+            joins: fixed,
+        }
+    };
     Ok(Some(Prepared {
-        from: Relation::Calculated {
-            base: Box::new(from),
-            columns,
-            aggregates,
-        },
+        from,
         cols: aug,
         used: used.into_iter().map(str::to_owned).collect(),
     }))
@@ -1063,5 +1151,312 @@ mod tests {
         assert_eq!(named[0], "the chart \"Chart 0\" on Main");
         assert_eq!(named[MAX_NAMED], "and 3 more");
         assert!(named.iter().all(|n| !n.contains("u_00")), "{named:?}");
+    }
+
+    // ── BI-8 part 2 ──────────────────────────────────────────────────────
+
+    fn demo_cols() -> RelationColumns {
+        [
+            ("category", ColumnKind::Text),
+            ("provinsi", ColumnKind::Text),
+            ("visitors", ColumnKind::Number),
+            ("visit_date", ColumnKind::Date),
+        ]
+        .into_iter()
+        .map(|(n, k)| (n.to_owned(), k))
+        .collect()
+    }
+
+    fn demo_catalog() -> FieldCatalog {
+        let f = |n: &str, formula: &str, level: Level| {
+            let mut x = field(n, formula, level);
+            x.source_id = "mart_demo".to_owned();
+            x
+        };
+        FieldCatalog::from_fields(vec![
+            f("running", "RunningTotal(Sum(visitors))", Level::Table),
+            f("pct", "PercentOfTotal(Sum(visitors))", Level::Table),
+            f("prev", "PreviousPeriod(Sum(visitors))", Level::Table),
+            f("ly", "SamePeriodLastYear(Sum(visitors))", Level::Table),
+            f("rnk", "Rank(Sum(visitors))", Level::Table),
+            f("ma", "MovingAverage(Sum(visitors), 3)", Level::Table),
+            f(
+                "share",
+                "Sum(visitors) / Fixed([category], Sum(visitors))",
+                Level::Aggregate,
+            ),
+            f(
+                "grand",
+                "Sum(visitors) / Fixed(Sum(visitors))",
+                Level::Aggregate,
+            ),
+            f("shout", "Upper(category)", Level::Row),
+        ])
+    }
+
+    fn staged_sql(chart: &serde_json::Value, filters: &[FilterDef]) -> crate::builder::FilteredSql {
+        let mut def = serde_json::json!({ "title": "t", "mart": "mart_demo", "kind": "line" });
+        def.as_object_mut()
+            .unwrap()
+            .extend(chart.as_object().unwrap().clone());
+        let def: ChartInput = serde_json::from_value(def).unwrap();
+        let mut spec = StoredChartSpec::for_test(
+            def.kind,
+            "mart_demo",
+            &def.dimension,
+            &[],
+            "SELECT 1".to_owned(),
+        );
+        spec.def = def;
+        let time = TimeContext::default();
+        let cat = demo_catalog();
+        let read = ReadContext {
+            time: &time,
+            grain: None,
+            fields: &cat,
+        };
+        let marts = HashMap::from([("mart_demo".to_owned(), demo_cols())]);
+        sql_with_filters_report(&spec, &[], filters, &marts, &read)
+    }
+
+    /// With `CALC_STAGED_OUT=<file>` the statements of the tests below are
+    /// appended there for a by-hand run on the real engine.
+    fn dump(label: &str, sql: &str) {
+        use std::io::Write as _;
+        if let Ok(path) = std::env::var("CALC_STAGED_OUT") {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(file, "-- {label}\n{sql}").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_running_total_chart_windows_the_whole_grouped_result_and_keeps_the_latest_buckets_by_rank()
+    {
+        let got = staged_sql(
+            &serde_json::json!({
+                "dimension": "visit_date", "grain": "month", "measures": ["visitors", "running"], "limit": 12,
+            }),
+            &[],
+        );
+        dump("running total by month", &got.sql);
+        assert!(got.sql.contains("sum(__a_"), "{}", got.sql);
+        assert!(
+            got.sql.contains(
+                "ORDER BY visit_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running"
+            ),
+            "{}",
+            got.sql
+        );
+        assert!(
+            got.sql
+                .contains("dense_rank() OVER (ORDER BY visit_date DESC) AS __rk"),
+            "{}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains(
+                "WHERE __rk <= 13 ORDER BY visit_date SETTINGS max_rows_to_group_by = 10000"
+            ),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.latest_limit, Some(12));
+    }
+
+    #[test]
+    fn period_comparisons_join_the_grouped_result_to_itself_on_the_calendar_shift() {
+        let prev = staged_sql(
+            &serde_json::json!({
+                "dimension": "visit_date", "grain": "month", "measures": ["visitors", "prev"],
+            }),
+            &[],
+        );
+        dump("previous month", &prev.sql);
+        assert!(
+            prev.sql
+                .contains("LEFT JOIN (SELECT visit_date, round(sum(visitors)) AS __m0"),
+            "{}",
+            prev.sql
+        );
+        assert!(
+            prev.sql
+                .contains("ON cur.visit_date = addMonths(p0.visit_date, 1)"),
+            "{}",
+            prev.sql
+        );
+        let ly = staged_sql(
+            &serde_json::json!({
+                "dimension": "visit_date", "grain": "month", "measures": ["visitors", "ly"],
+            }),
+            &[],
+        );
+        dump("same month last year", &ly.sql);
+        assert!(
+            ly.sql
+                .contains("ON cur.visit_date = addYears(p0.visit_date, 1)"),
+            "{}",
+            ly.sql
+        );
+        let wk = staged_sql(
+            &serde_json::json!({
+                "dimension": "visit_date", "grain": "week", "measures": ["ly"],
+            }),
+            &[],
+        );
+        assert!(wk.sql.contains("addWeeks(p0.visit_date, 52)"), "{}", wk.sql);
+        let series = staged_sql(
+            &serde_json::json!({
+                "dimension": "visit_date", "grain": "month", "breakdown": "category", "measures": ["prev"],
+            }),
+            &[],
+        );
+        dump("previous month per series", &series.sql);
+        assert!(
+            series.sql.contains("AND cur.category = p0.category"),
+            "{}",
+            series.sql
+        );
+    }
+
+    #[test]
+    fn a_table_calculation_is_refused_where_the_chart_has_no_dimension_order() {
+        let cols = demo_cols();
+        let t = TimeContext::default();
+        let cat = demo_catalog();
+        let fields = cat.of(SourceKind::Mart, "mart_demo");
+        let from = || Relation::Mart(Ident::new("mart_demo").unwrap());
+        let def = |chart: serde_json::Value| -> ChartInput {
+            let mut d = serde_json::json!({ "title": "t", "mart": "mart_demo" });
+            d.as_object_mut()
+                .unwrap()
+                .extend(chart.as_object().unwrap().clone());
+            serde_json::from_value(d).unwrap()
+        };
+        for chart in [
+            serde_json::json!({ "kind": "kpi", "measures": ["running"] }),
+            serde_json::json!({ "kind": "gauge", "measures": ["running"] }),
+            serde_json::json!({ "kind": "pie", "dimension": "category", "measures": ["running"] }),
+            serde_json::json!({ "kind": "bar", "dimension": "running", "measures": ["visitors"] }),
+            serde_json::json!({ "kind": "bar", "dimension": "category", "breakdown": "running", "measures": ["visitors"] }),
+            serde_json::json!({ "kind": "table", "tableMode": "rows", "columns": ["running"] }),
+            serde_json::json!({ "kind": "pivot", "rows": ["category"], "values": [{ "column": "running", "aggregate": "sum" }] }),
+        ] {
+            let e = prepare(fields, &def(chart.clone()), from(), &cols, &t).unwrap_err();
+            assert!(
+                e.contains("table calculation") || e.contains("needs a chart with a dimension"),
+                "{chart}: {e}"
+            );
+        }
+        // Without a grain a period comparison says what to do.
+        let e = prepare(fields, &def(serde_json::json!({ "kind": "line", "dimension": "category", "measures": ["prev"] })), from(), &cols, &t).unwrap_err();
+        assert!(e.contains("Group by"), "{e}");
+        // Fixed only at columns the chart groups by.
+        let e = prepare(fields, &def(serde_json::json!({ "kind": "bar", "dimension": "provinsi", "measures": ["share"] })), from(), &cols, &t).unwrap_err();
+        assert!(e.contains("groups by provinsi"), "{e}");
+        // A KPI may take a Fixed grand total, nothing else.
+        assert!(
+            prepare(
+                fields,
+                &def(serde_json::json!({ "kind": "kpi", "measures": ["grand"] })),
+                from(),
+                &cols,
+                &t
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            prepare(
+                fields,
+                &def(serde_json::json!({ "kind": "kpi", "measures": ["share"] })),
+                from(),
+                &cols,
+                &t
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fixed_is_joined_over_the_filtered_rows_and_the_filters_move_inside_the_join() {
+        let filters: Vec<FilterDef> =
+            serde_json::from_str(r#"[{"id":"1","column":"provinsi","op":"in","values":["Bali"]}]"#)
+                .unwrap();
+        let got = staged_sql(
+            &serde_json::json!({
+                "kind": "bar", "dimension": "category", "measures": ["share"],
+            }),
+            &filters,
+        );
+        dump("share within category, Bali only", &got.sql);
+        assert!(got.sql.contains("USING (category)"), "{}", got.sql);
+        assert!(
+            got.sql
+                .contains("(SELECT * FROM serving.mart_demo WHERE provinsi IN ('Bali')) AS flt"),
+            "{}",
+            got.sql
+        );
+        assert!(
+            !got.sql.contains("AS fx WHERE"),
+            "no filter outside the join: {}",
+            got.sql
+        );
+        assert!(
+            got.sql.ends_with("SETTINGS join_use_nulls = 1"),
+            "{}",
+            got.sql
+        );
+        let grand = staged_sql(
+            &serde_json::json!({ "kind": "kpi", "measures": ["grand"] }),
+            &[],
+        );
+        dump("grand share kpi", &grand.sql);
+        assert!(grand.sql.contains("CROSS JOIN"), "{}", grand.sql);
+        let grained = staged_sql(
+            &serde_json::json!({
+                "kind": "line", "dimension": "visit_date", "grain": "month", "breakdown": "category", "measures": ["share"],
+            }),
+            &[],
+        );
+        dump("share by month, series by category", &grained.sql);
+    }
+
+    #[test]
+    fn rank_percent_and_moving_average_with_a_breakdown_and_a_value_order() {
+        let a = staged_sql(
+            &serde_json::json!({
+                "kind": "bar", "dimension": "category", "measures": ["visitors", "rnk", "pct"], "order": "desc", "limit": 3,
+            }),
+            &[],
+        );
+        dump("top 3 categories with rank and percent", &a.sql);
+        assert!(
+            a.sql
+                .contains("dense_rank() OVER (ORDER BY visitors DESC) AS __rk"),
+            "{}",
+            a.sql
+        );
+        assert!(
+            a.sql.contains("WHERE __rk <= 3 ORDER BY visitors DESC"),
+            "{}",
+            a.sql
+        );
+        let b = staged_sql(
+            &serde_json::json!({
+                "kind": "line", "dimension": "visit_date", "grain": "month", "breakdown": "category", "measures": ["ma"],
+            }),
+            &[],
+        );
+        dump("moving average per series", &b.sql);
+        assert!(
+            b.sql
+                .contains("PARTITION BY category ORDER BY visit_date ROWS BETWEEN 2 PRECEDING"),
+            "{}",
+            b.sql
+        );
     }
 }

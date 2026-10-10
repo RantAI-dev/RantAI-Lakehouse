@@ -21,10 +21,13 @@ use crate::fields::{self, FieldCatalog};
 use crate::filters::{
     ColumnKind, FilterDef, FilterOp, RelativeAnchor, RelativeUnit, parse_iso_date, parse_number,
 };
+use crate::formula::compile::{FixedJoin, HiddenAgg, Shift};
 use crate::grain::{self, Grain, TimeContext, WeekStart};
 use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
 use crate::tables;
+
+mod staged;
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -105,7 +108,37 @@ pub enum Relation {
         columns: Vec<(String, String)>,
         /// Aggregate fields, usable as measures.
         aggregates: Vec<AggregateField>,
+        /// Table calculations and period comparisons (`BI-8` part 2),
+        /// computed over the chart's grouped result.
+        table_calcs: Vec<TableCalc>,
     },
+    /// `base` with `Fixed` aggregates joined back (`BI-8` part 2): each row of
+    /// `base` gains the aggregate computed at its fixed columns. The chart's
+    /// filters are applied *inside* `base` (see [`Relation::with_filters_inside`]),
+    /// so the aggregate is over the same filtered rows the chart reads.
+    Fixed {
+        /// The filtered source rows.
+        base: Box<Relation>,
+        /// The joins to add.
+        joins: Vec<FixedJoin>,
+    },
+}
+
+/// A table calculation or period comparison as a measure: the expression
+/// over the grouped result, and what the grouped result must carry for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCalc {
+    /// The field's name, the result column.
+    pub name: String,
+    /// The outer expression (window functions over hidden columns).
+    pub sql: String,
+    /// Hidden aggregates it reads.
+    pub aggs: Vec<HiddenAgg>,
+    /// Shifted copies it reads.
+    pub shifts: Vec<Shift>,
+    /// The source columns its aggregates read, which a bucketing inner query
+    /// must carry.
+    pub reads: Vec<String>,
 }
 
 /// An aggregate calculated field as a measure: the whole expression is the
@@ -150,6 +183,27 @@ impl Relation {
                     base.render()
                 )
             }
+            Self::Fixed { base, joins } => {
+                // `SELECT *` over a join keeps the base's columns once (the
+                // `USING` keys are not repeated) and adds each join's alias.
+                let base_sql = base.render();
+                let mut from = base_sql.clone();
+                for (i, j) in joins.iter().enumerate() {
+                    let cols = j.columns.join(", ");
+                    if j.columns.is_empty() {
+                        from = format!(
+                            "{from} CROSS JOIN (SELECT {} AS {} FROM {base_sql}) AS f{i}",
+                            j.agg_sql, j.alias
+                        );
+                    } else {
+                        from = format!(
+                            "{from} LEFT JOIN (SELECT {cols}, {} AS {} FROM {base_sql} GROUP BY {cols}) AS f{i} USING ({cols})",
+                            j.agg_sql, j.alias
+                        );
+                    }
+                }
+                format!("(SELECT * FROM {from}) AS fx")
+            }
             Self::Calculated { base, columns, .. } if columns.is_empty() => base.render(),
             Self::Calculated { base, columns, .. } => {
                 let added = columns.iter().fold(String::new(), |mut acc, (name, expr)| {
@@ -176,20 +230,69 @@ impl Relation {
                 .iter()
                 .find(|a| a.name == name)
                 .or_else(|| base.aggregate_field(name)),
-            Self::Filtered { base, .. } | Self::Bucketed { base, .. } => base.aggregate_field(name),
+            Self::Filtered { base, .. }
+            | Self::Bucketed { base, .. }
+            | Self::Fixed { base, .. } => base.aggregate_field(name),
         }
     }
 
     /// Trailing `SETTINGS` for this relation (empty for a mart, whose
-    /// SQL is assembled entirely from validated identifiers).
-    pub(crate) fn settings(&self) -> &'static str {
+    /// SQL is assembled entirely from validated identifiers). A `Fixed` join
+    /// adds `join_use_nulls = 1`, so a row whose key is empty gets an empty
+    /// `Fixed` value rather than the type's default.
+    pub(crate) fn settings(&self) -> String {
         match self {
-            Self::Mart(_) => "",
-            Self::Sql(_) => SQL_SOURCE_SETTINGS,
+            Self::Mart(_) => String::new(),
+            Self::Sql(_) => SQL_SOURCE_SETTINGS.to_owned(),
             Self::Filtered { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Calculated { base, .. } => base.settings(),
+            Self::Fixed { base, .. } => add_settings(&base.settings(), &["join_use_nulls = 1"]),
         }
+    }
+
+    /// The table calculation called `name` that this relation carries,
+    /// looking through the wrappers a builder puts around it.
+    #[must_use]
+    pub fn table_calc(&self, name: &str) -> Option<&TableCalc> {
+        match self {
+            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Calculated {
+                base, table_calcs, ..
+            } => table_calcs
+                .iter()
+                .find(|t| t.name == name)
+                .or_else(|| base.table_calc(name)),
+            Self::Filtered { base, .. }
+            | Self::Bucketed { base, .. }
+            | Self::Fixed { base, .. } => base.table_calc(name),
+        }
+    }
+
+    /// `base` for the chart's filters: moves `predicates` inside a `Fixed`
+    /// join, so the aggregate is computed over the filtered rows, and returns
+    /// what is left for the outer query (nothing, for a `Fixed` relation).
+    #[must_use]
+    pub fn with_filters_inside(self, predicates: Vec<String>) -> (Self, Vec<String>) {
+        match self {
+            Self::Fixed { base, joins } if !predicates.is_empty() => (
+                Self::Fixed {
+                    base: Box::new(Self::Filtered { base, predicates }),
+                    joins,
+                },
+                Vec::new(),
+            ),
+            other => (other, predicates),
+        }
+    }
+}
+
+/// `settings` (empty or ` SETTINGS a, b`) with more settings appended.
+pub(crate) fn add_settings(settings: &str, more: &[&str]) -> String {
+    if settings.is_empty() {
+        format!(" SETTINGS {}", more.join(", "))
+    } else {
+        format!("{settings}, {}", more.join(", "))
     }
 }
 
@@ -325,6 +428,11 @@ impl QueryBuilder<Ready> {
     /// Render the final SQL. Ports `buildSql` in `bi-store.ts`.
     #[must_use]
     pub fn build(&self) -> String {
+        // BI-8 part 2: a chart with a table calculation or a period comparison
+        // has its own, staged statement.
+        if let Some(sql) = self.staged_sql() {
+            return sql;
+        }
         let from = self.from.render();
         let settings = self.from.settings();
         let where_sql = if self.where_clauses.is_empty() {
@@ -419,13 +527,18 @@ impl QueryBuilder<Ready> {
     }
 
     fn agg_of(&self, measure: &Ident) -> String {
+        format!("{} AS {measure}", self.agg_expr(measure))
+    }
+
+    /// The measure's aggregate expression, without its alias.
+    fn agg_expr(&self, measure: &Ident) -> String {
         // BI-8: an aggregate calculated field is the whole measure.
         if let Some(field) = self.from.aggregate_field(measure.as_str()) {
-            format!("{} AS {measure}", field.sql)
+            field.sql.clone()
         } else if self.agg == Aggregate::Count {
-            format!("count() AS {measure}")
+            "count()".to_owned()
         } else {
-            format!("round({}({measure})) AS {measure}", self.agg)
+            format!("round({}({measure}))", self.agg)
         }
     }
 }
@@ -507,7 +620,8 @@ pub fn point_limit(from: &Relation) -> u32 {
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
         Relation::Filtered { base, .. }
         | Relation::Bucketed { base, .. }
-        | Relation::Calculated { base, .. } => point_limit(base),
+        | Relation::Calculated { base, .. }
+        | Relation::Fixed { base, .. } => point_limit(base),
     }
 }
 
@@ -833,6 +947,16 @@ fn report_over<H: std::hash::BuildHasher>(
         skipped,
         columns,
     } = outcome;
+    // BI-8 part 2: a `Fixed` aggregate is computed over the filtered rows, so
+    // the filters go inside the join. Nothing is left for the outer query,
+    // which also means no filter column can be mistaken for an alias there.
+    let (from, predicates) = from.clone().with_filters_inside(predicates);
+    let columns = if predicates.is_empty() {
+        Vec::new()
+    } else {
+        columns
+    };
+    let from = &from;
     let (g, grain_skipped) = grained(spec, cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
     let rebuilt = rebuild(
@@ -1561,6 +1685,17 @@ pub fn grained_sql(
                 return None;
             }
             Some(field) => field.reads.iter().cloned().for_each(&mut carry),
+            // BI-8 part 2: a table calculation is computed from the columns its
+            // hidden aggregates read, as an aggregate field is.
+            None if from.table_calc(m.as_str()).is_some() => {
+                let calc = from.table_calc(m.as_str());
+                if calc.is_some_and(|c| c.reads.iter().any(|r| r == chart.dimension.as_str())) {
+                    return None;
+                }
+                calc.into_iter()
+                    .flat_map(|c| c.reads.iter().cloned())
+                    .for_each(&mut carry);
+            }
             None => carry(m.to_string()),
         }
     }

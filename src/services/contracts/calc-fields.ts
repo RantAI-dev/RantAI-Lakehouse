@@ -12,7 +12,12 @@
 /** Which source a field belongs to: exactly one of the two. */
 export type CalcFieldSource = { mart: string; source?: undefined } | { source: string; mart?: undefined }
 
-/** `row`: one value per row (a dimension, or aggregated by the chart). `aggregate`: a measure on its own. */
+/**
+ * `row`: one value per row (a dimension, or aggregated by the chart).
+ * `aggregate`: a measure on its own. `table`: a table calculation or period
+ * comparison, computed over the chart's grouped result (a measure of a bar,
+ * line, area, stacked, combo, waterfall or grouped table chart only).
+ */
 export type CalcFieldLevel = "row" | "aggregate" | string
 
 export type CalcField = {
@@ -45,6 +50,8 @@ export type FormulaFunction = {
   minArgs: number
   maxArgs: number | null
   aggregate: boolean
+  /** A table calculation or period comparison: usable only as a chart measure. */
+  table: boolean
 }
 
 export type CalcFieldService = {

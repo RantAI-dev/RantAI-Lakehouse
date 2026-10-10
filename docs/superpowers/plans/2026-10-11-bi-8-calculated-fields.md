@@ -160,6 +160,80 @@ Per task: `cargo fmt --check`, `cargo clippy -p <crate> --all-targets -- -D warn
 - Checks: `cargo fmt --check -p lakehouse-bi -p lakehouse-api` clean; `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets -D warnings` clean (after touching lib.rs); `cargo test -p lakehouse-bi --lib fields::` 18 pass; `cargo test -p lakehouse-api --lib` 1578 pass; `bun test src/features/copilot/capabilities.test.ts` 4 pass; `bun run typecheck` clean. Not run: full `bun run test`, lint (the only console change is a list and a test).
 - Not verified: the assistant in a browser; the reworded 409 against a live database. The user must reload the console (the allowlist is built in the browser bundle) after the console is rebuilt.
 
+### Partial notes, part 2 (developer, uncommitted)
+
+- 2026-10-11 T7 and T8 core done (not committed), built together because they share one statement shape: `lakehouse-bi/src/formula/compile/staged.rs` (new: table calculations, `PreviousPeriod`, `SamePeriodLastYear`, `Fixed`), `compile.rs` (`Level::Table`, `ChartCtx`, `Staged`), `catalog.rs` (62 entries: 53 + `Fixed` + 6 table calculations + 2 period comparisons), `fields.rs` (`prepare` applies them, slot rules), `builder.rs` (`Relation::Fixed`, `TableCalc`, `with_filters_inside`, `settings()` now a `String`), `builder/staged.rs` (new: the staged statement). Real engine on `serving.mart_demo_map_points` by month: running total at 2026-11 is 278955 and matches a window `sum() OVER (ORDER BY m)` computed directly month by month; percent of total over the four categories sums to 100; previous month of 2026-10 is 18357 (= 2026-09), same month last year of 2026-09 / 2026-10 is 18148 / 17947 (= 2025-09 / 2025-10), 2025-09 has none; Fixed share of Office in 2025-09 is 3356 / 63696 = 0.052688. Engine finding: `round(sum(v)) AS v` beside a hidden `sum(v)` in one SELECT is error 184, so plain measures are computed as `__m<i>` and renamed in the next step.
+- 2026-10-11 R3 done: the assistant's `create_calculated_field` / `update_calculated_field` pass the principal to the route handler, which records its display name.
+
+### Handoff, part 2 (developer, uncommitted, nothing committed or pushed)
+
+**Files by task**
+
+- T7/T8 `lakehouse-bi`: `formula/compile/staged.rs` (new), `formula/compile.rs` (`Level::Table`, `ChartCtx`, `Staged`, `HiddenAgg`, `Shift`, `FixedJoin`), `formula/catalog.rs` (62 entries, `table` flag, categories `table calculations` and `period comparison`), `fields.rs` (`prepare` applies them, `takes_table_calc`, chart context), `builder.rs` (`Relation::Fixed`, `TableCalc`, `with_filters_inside`, `add_settings`, `settings()` returns `String`, `agg_expr`), `builder/staged.rs` (new: the staged statement), `tables.rs` (one arm). API: `routes/calc_fields.rs` (a level change of any kind is refused while used; security tests), `routes/ai/*` (prompt line, tool language text, one dispatch arm).
+- T9: `src/services/contracts/calc-fields.ts` (`table` level and flag), `src/lib/formula-assist.ts` (+ test, `levelLabel`), `formula-editor.tsx` (status line), `chart-builder.tsx` (table fields offered as measures); the builder preview already shows the server's refusal sentence. `docs/core/features/calculated-fields.md`, `CHANGELOG.md`.
+- R3: `routes/ai/tools/calc_fields.rs` passes the principal to the route handler. Also fixed a lint error left by the part 1 R1 fix (`require()` in `capabilities.test.ts`, now an import).
+
+**Decisions (planner defaults, unless the code said otherwise)**
+
+1. With a breakdown a table calculation is partitioned by it (`RunningTotal`, `Offset`, `MovingAverage`, `Rank`); `PercentOfTotal` is of the whole chart and is 0 to 100.
+2. A table calculation, period comparison is allowed only as a measure of bar, hbar, line, area, stacked, combo, waterfall or grouped table; KPI, gauge, pivot, raw table, maps, box plot and the other kinds refuse it plainly, as does any dimension, breakdown or column slot.
+3. `SamePeriodLastYear` and `PreviousPeriod` match by calendar shift of the bucket through a self-join (`addMonths`, `addYears`; a week looks 52 weeks back), so a gap leaves an empty value. `PreviousPeriod` works for minute to year; `SamePeriodLastYear` from day up.
+4. `Fixed` is joined back (`LEFT JOIN ... USING`, or `CROSS JOIN` for a grand total) over the chart's filtered rows (the dashboard filters are moved inside the join), is aggregate-level (`max` of the joined value), may name only columns the chart groups by (dimension, breakdown) and not a date the chart groups by date; a KPI takes `Fixed(aggregate)` only. `join_use_nulls = 1` so an empty key gives an empty value.
+5. Windows run over the whole grouped result and the chart's limit or latest-N is applied afterwards by rank, so the last bucket's running total is the true one. At most 10,000 groups (`max_rows_to_group_by` with `group_by_overflow_mode = 'throw'`): beyond that the tile fails instead of showing a wrong total. With a breakdown the kept dimension values follow dimension order, not value order.
+6. `RunningCount()` counts rows; `RunningCount(column)` counts rows where the column is not empty. `Offset(x, n)`: n above 0 looks back, below 0 forward, 1 to 50 either way.
+
+**Commands and counts**
+
+- `cargo fmt --check -p lakehouse-bi -p lakehouse-api -p lakehouse-alerts`: clean. `cargo clippy -p lakehouse-bi -p lakehouse-api -p lakehouse-alerts --all-targets -- -D warnings`: clean (after touching each `lib.rs`).
+- `cargo test -p lakehouse-bi`: 278 lib + 1 pass (part 1: 265 + 1). `cargo test -p lakehouse-api --lib`: 1579 pass (1578). `--test route_auth --test sec11_guard --test security_regressions`: 32 + 4 + 10 pass. No route was added, so `POLICY_TABLE` is unchanged; `tool_schemas.json` is unchanged (descriptions did not change).
+- `bun run typecheck` clean; `bun run lint` 0 errors, the same 6 warnings; full `bun run test` 1216 pass, 1 skip, 0 fail (1217 tests, 136 files); part 1: 1213.
+
+**Real engine, `serving.mart_demo_map_points` by month (ClickHouse 26.8.9.10)**
+
+- `BI-8-AC2`: `RunningTotal(Sum([visitors]))` by month: 2025-11 62104, 2026-08 217541, 2026-09 235898, 2026-10 267656, 2026-11 278955; the direct query `sum(v) OVER (ORDER BY m)` over `toStartOfMonth(visit_date)` gives the same figures; the chart limited to 12 buckets still shows true cumulative values (cut after the window).
+- `PercentOfTotal` by category: 32.07 + 27.28 + 22.83 + 17.82 = 100 (the direct sum of per-category shares is 100).
+- `PreviousPeriod`: 2026-10 shows 18357, which is the direct 2026-09 value; the first month (2025-09) is empty. `SamePeriodLastYear`: 2026-09 shows 18148 and 2026-10 shows 17947, the direct 2025-09 and 2025-10; every month before 2026-09 is empty. Per series (breakdown): 2025-10 Office shows 3356, the direct 2025-09 Office value.
+- `Fixed`: `Sum([visitors]) / Fixed([category], Sum([visitors]))` by month with series by category: 2025-09 Office 0.052688 = 3356 / 63696 (the Office total). Grand-total KPI and share-within-category by category give 1, as they must.
+- Engine finding: a plain measure `round(sum(v)) AS v` beside a hidden `sum(v)` in the same SELECT is error 184 (aggregate inside aggregate); plain measures are computed as `__m<i>` and renamed one step later.
+
+**Section 5 for the new shapes (real `enforce` + engine)**
+
+- Role rewrite (mask on `place`, row filter `provinsi = 'Bali'`), statements run by hand: a running total of `CountDistinct(place)` by category gives Office 1, Retail 2, Service point 3, Warehouse 4 (each category has one masked value; the row filter leaves 6 rows); rank and percent over the filtered rows (Warehouse 1); previous month, same month last year, `Fixed` share, `Fixed` over a masked column and a `Fixed` grand-total KPI all run on the filtered rows only; the previous-month statement over the filtered rows shows only Bali's months. Structural assertions in `table_calculations_period_comparisons_and_fixed_read_only_masked_and_filtered_rows`: every statement reads the table 1 to 2 times, and each read in each subquery and on both sides of each join becomes the masked, filtered projection (as many masked projections and row filters as reads); `referenced_tables` finds only the one table. The same statements with `real_columns: None` are refused. Every new catalog example parses for the rewrite (window frames, `lagInFrame`, `quantileExact`, joins).
+- Masked numbers: unchanged from part 1 (the engine refuses `Sum` and arithmetic over a masked number).
+- Injection: `the_new_functions_never_put_typed_text_into_sql` (4,000 generated hostile strings in every argument position of the new functions, both chart contexts, more than 1,000 compiled and audited with the same audit as part 1, plus the hidden aggregates and `Fixed` aggregates audited and the `Fixed` columns re-checked as identifiers). Aliases are hashes of generated SQL; window text and frames are written in the compiler.
+- No shape the rewrite cannot see into was found.
+
+**Existing tests changed**
+
+- `catalog.rs`: the count (53 to 62). `compile.rs`: the catalog test now expects the level per entry (row, aggregate or table). `formula-assist.test.ts`: the sample function gained `table: false`. No assertion weakened.
+
+**Deviations and notes**
+
+- `Relation::settings()` now returns a `String` (a `Fixed` join adds `join_use_nulls = 1`).
+- A table calculation formula is checked at save without a chart (shape only); the chart-dependent refusals (no dimension, no grain, `Fixed` columns, chart kind) come when a chart uses it, as plain messages with the formula position where there is one.
+- An aggregate or table field whose formula reads the grouped date column on a grained chart builds no statement (stored SQL for a mart, error for a source), as in part 1.
+- The alert digest of a mart KPI still uses the stored statement (part 1 note).
+
+**Not verified**
+
+- Nothing seen in a browser (the formula box, the builder preview refusal, a line chart with a running total, a chart with `Fixed`).
+- Embeds and public links with these fields; the records route with a table field (refused by design).
+- `Fixed` through the HTTP dashboard route with real filters (tested at the builder and with `enforce`).
+- Performance on a large mart: the previous-period and `Fixed` statements scan the source two to three times.
+- Workspace-wide clippy and test, other integration test files, gates (CI).
+
+**To check in a browser**
+
+1. Line chart on `mart_demo_map_points`, dimension `visit_date`, Group by month, measure `visitors`; create the field `running` = `RunningTotal(Sum([visitors]))`, pick it as a second measure: it climbs to 278,955 at the last month. The box says "Table calculation".
+2. `pct` = `PercentOfTotal(Sum([visitors]))` on a bar by category: the bars add to 100.
+3. `prev` = `PreviousPeriod(Sum([visitors]))` and `ly` = `SamePeriodLastYear(Sum([visitors]))` on the monthly line: `prev` of Oct 2026 equals Sep 2026's value; `ly` is empty before Sep 2026.
+4. Add a breakdown by category: the running total restarts per series; the percent is still of the whole chart.
+5. Pick `running` as a KPI value, as a dimension, or on a pie or pivot: the preview shows a plain sentence saying where it can be used.
+6. `PreviousPeriod` on a chart with no Group by: the sentence tells you to choose Group by.
+7. `share` = `Sum([visitors]) / Fixed([category], Sum([visitors]))` on a bar by category: every bar is 1; with a date dimension grouped by month and a breakdown by category, each value is the category's share of that month inside the category's total; apply a dashboard filter and the shares follow it.
+8. A role with a masked column: the formulas show values derived from the masked text, never the clear value.
+9. Ask the assistant to add "running total of visitors" on the mart; the field it creates shows your name in `createdBy` (R3).
+
 ## 8. Review (planner appends)
 
 ### BI-8 part 1 — findings from the product owner's QA (reviewer, 2026-10-11)
@@ -178,3 +252,11 @@ R1 and R2 are closed, confirmed by the product owner in a browser: the assistant
 
 - `SHOULD-FIX` R3, for part 2 — a field created through the assistant is stored with an empty `createdBy`; record the principal as the HTTP route does.
 - Not verified by anyone: `BI-8-AC4` and `AC5` in a browser (a user without `dashboard:write`; a masked role), an embed or public link with a field-using chart, the workspace-wide suites (CI).
+
+### BI-8 part 2 — product owner's QA (reviewer, 2026-10-11)
+
+The reviewer did not re-run the suites (owner's instruction). QA passed in a browser: `BI-8-AC2` (the running total ends at 278,955), percent of total (four bars summing to 100), previous period (Oct 2026 shows 18,357), a table calculation refused on a KPI with a plain sentence, and a `Fixed` ratio by category with the right bar heights.
+
+- `SHOULD-FIX` R4 — On the `Fixed` ratio chart every tick of the value axis reads "0": values between 0 and 1 are printed as whole numbers. The axis, tooltip and value labels of a chart whose measure is not a whole number must show enough decimals to tell the ticks apart (a calculated field's inferred type and the data both say so); whole-number measures keep today's formatting.
+- Not verified by anyone: a masked role in a browser, embeds and public links with these fields, speed on a large table (previous-period and `Fixed` statements read the source two to three times), the workspace-wide suites (CI).
+- Planner defaults standing until the owner says otherwise: the 10,000-group cap for table calculations; with a breakdown, kept buckets follow the dimension's order; a KPI in the alert digest follows a changed formula only after the chart is saved again.

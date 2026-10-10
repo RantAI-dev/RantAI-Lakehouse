@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test"
+import { readFileSync } from "node:fs"
 
 import { toolsFromCaps } from "./capabilities"
 
@@ -18,10 +19,7 @@ describe("the dashboard capability against the server's tool list", () => {
   // allowlist, so a dashboard tool the server has but this list lacks is never
   // offered to the model (the assistant said it had no calculated-field tools).
   const fixture = JSON.parse(
-    require("node:fs").readFileSync(
-      `${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`,
-      "utf8"
-    )
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
   ) as { function: { name: string } }[]
   const serverTools = fixture.map((t) => t.function.name)
 

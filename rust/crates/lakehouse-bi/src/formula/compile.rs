@@ -132,6 +132,9 @@ pub enum Level {
     Row,
     /// One value per group of rows.
     Aggregate,
+    /// A value computed over the whole grouped result of a chart (a running
+    /// total, a rank, the previous period): `BI-8` part 2.
+    Table,
 }
 
 impl Level {
@@ -140,6 +143,7 @@ impl Level {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Aggregate => "aggregate",
+            Self::Table => "table",
             Self::Constant | Self::Row => "row",
         }
     }
@@ -150,6 +154,7 @@ impl Level {
         match raw {
             "row" => Some(Self::Row),
             "aggregate" => Some(Self::Aggregate),
+            "table" => Some(Self::Table),
             _ => None,
         }
     }
@@ -161,6 +166,24 @@ pub struct Scope<'a> {
     columns: &'a RelationColumns,
     fields: BTreeMap<String, String>,
     time: &'a TimeContext,
+    chart: Option<ChartCtx>,
+}
+
+/// What a formula needs to know about the chart it is built into, for the
+/// functions that depend on it (table calculations, period comparisons and
+/// `Fixed`, `BI-8` part 2). Without one (saving a field, a test) those
+/// functions are checked for shape only.
+#[derive(Debug, Clone)]
+pub struct ChartCtx {
+    /// The chart's dimension column (or field), if it has one.
+    pub dimension: Option<String>,
+    /// The chart's breakdown column, which a table calculation partitions by.
+    pub breakdown: Option<String>,
+    /// The expression the dimension is ordered by (`d`, or `d % 7` for a
+    /// Sunday-first day of week).
+    pub order_key: String,
+    /// The chart's grain, if it has one.
+    pub grain: Option<Grain>,
 }
 
 impl<'a> Scope<'a> {
@@ -171,7 +194,15 @@ impl<'a> Scope<'a> {
             columns,
             fields: BTreeMap::new(),
             time,
+            chart: None,
         }
+    }
+
+    /// Build the formula into this chart.
+    #[must_use]
+    pub fn with_chart(mut self, chart: ChartCtx) -> Self {
+        self.chart = Some(chart);
+        self
     }
 
     /// Make the field `name` (its formula text) nameable.
@@ -201,6 +232,61 @@ pub struct Compiled {
     pub reads: BTreeSet<String>,
     /// The fields it uses, directly or through others, sorted.
     pub fields: BTreeSet<String>,
+    /// What the chart must compute around the expression: hidden aggregates,
+    /// shifted copies and `Fixed` joins (`BI-8` part 2). Empty for part 1.
+    pub staged: Staged,
+}
+
+/// A hidden aggregate: `sql` computed per group of the chart, under `alias`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenAgg {
+    /// The column name inside the statement.
+    pub alias: String,
+    /// The aggregate expression.
+    pub sql: String,
+}
+
+/// How far back a shifted copy of a hidden aggregate reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    /// The bucket one grain before.
+    Previous,
+    /// The same bucket a year before.
+    LastYear,
+}
+
+/// The value of hidden aggregate `source` one period back, as column `alias`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shift {
+    /// The column name inside the statement.
+    pub alias: String,
+    /// The hidden aggregate it copies.
+    pub source: String,
+    /// How far back.
+    pub kind: ShiftKind,
+}
+
+/// `Fixed`: `agg_sql` computed per combination of `columns` over the chart's
+/// filtered rows and joined back under `alias`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedJoin {
+    /// The column the join adds.
+    pub alias: String,
+    /// The source columns it is computed at.
+    pub columns: Vec<String>,
+    /// The aggregate expression.
+    pub agg_sql: String,
+}
+
+/// The staged parts of a compiled formula.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Staged {
+    /// Hidden aggregates the expression reads.
+    pub aggs: Vec<HiddenAgg>,
+    /// Shifted copies it reads.
+    pub shifts: Vec<Shift>,
+    /// `Fixed` joins it reads.
+    pub fixed: Vec<FixedJoin>,
 }
 
 /// Check `formula` against `scope` and generate its SQL. `own` is the name of
@@ -221,6 +307,7 @@ pub fn compile(
         produced: 0,
         reads: BTreeSet::new(),
         fields: BTreeSet::new(),
+        staged: Staged::default(),
     };
     let typed = cx.node(&tree)?;
     Ok(Compiled {
@@ -233,6 +320,7 @@ pub fn compile(
         },
         reads: cx.reads,
         fields: cx.fields,
+        staged: cx.staged,
     })
 }
 
@@ -253,6 +341,8 @@ pub fn print_number(v: f64) -> String {
     }
 }
 
+mod staged;
+
 struct Typed {
     sql: String,
     ty: FType,
@@ -265,6 +355,7 @@ struct Cx<'a> {
     produced: usize,
     reads: BTreeSet<String>,
     fields: BTreeSet<String>,
+    staged: Staged,
 }
 
 fn err(node: &Node, message: impl Into<String>) -> FormulaError {
@@ -317,11 +408,13 @@ fn want_same(a: &[Typed], nodes: &[Node]) -> Result<FType, FormulaError> {
 fn join_levels(args: &[(&Typed, &Node)]) -> Result<Level, FormulaError> {
     let row = args.iter().find(|(t, _)| t.level == Level::Row);
     let has_agg = args.iter().any(|(t, _)| t.level == Level::Aggregate);
-    match (row, has_agg) {
+    let has_table = args.iter().any(|(t, _)| t.level == Level::Table);
+    match (row, has_agg || has_table) {
         (Some((_, n)), true) => Err(err(
             n,
             "this is used on its own next to an aggregate; wrap it in an aggregate such as Sum().",
         )),
+        (_, true) if has_table => Ok(Level::Table),
         (_, true) => Ok(Level::Aggregate),
         (Some(_), false) => Ok(Level::Row),
         (None, false) => Ok(Level::Constant),
@@ -571,13 +664,24 @@ impl Cx<'_> {
             )
         })?;
         check_arity(info, nodes, node, name_len)?;
+        // BI-8 part 2: these read the chart they are built into and take
+        // their arguments in their own way.
+        if info.category == "table calculations" || info.category == "period comparison" {
+            return self.staged_call(info.name, node, nodes);
+        }
+        if info.name == "Fixed" {
+            return self.fixed(node, nodes);
+        }
         let mut args = Vec::with_capacity(nodes.len());
         for n in nodes {
             args.push(self.node(n)?);
         }
         let pairs: Vec<(&Typed, &Node)> = args.iter().zip(nodes).collect();
         let (sql, ty, level) = if info.aggregate {
-            if let Some((_, n)) = pairs.iter().find(|(t, _)| t.level == Level::Aggregate) {
+            if let Some((_, n)) = pairs
+                .iter()
+                .find(|(t, _)| matches!(t.level, Level::Aggregate | Level::Table))
+            {
                 return Err(err(n, "an aggregate cannot be inside another aggregate."));
             }
             let (sql, ty) = Self::aggregate(info.name, &args, nodes)?;
@@ -1040,13 +1144,14 @@ mod tests {
     fn every_catalog_example_compiles_with_the_level_the_catalog_says() {
         for f in catalog::CATALOG {
             let c = ok(f.example);
-            assert_eq!(
-                c.level == Level::Aggregate,
-                f.aggregate,
-                "{}: {}",
-                f.name,
-                f.example
-            );
+            let expected = if f.table {
+                Level::Table
+            } else if f.aggregate {
+                Level::Aggregate
+            } else {
+                Level::Row
+            };
+            assert_eq!(c.level, expected, "{}: {}", f.name, f.example);
         }
     }
 
@@ -1509,6 +1614,261 @@ mod tests {
         let deep = format!("{}1{}", "(".repeat(33), ")".repeat(33));
         assert!(err_at(&deep).message.contains("32"));
         assert!(run(&format!("{}1{}", "(".repeat(31), ")".repeat(31))).is_ok());
+    }
+
+    // ── BI-8 part 2: table calculations, period comparisons, Fixed ───────
+
+    fn in_chart(formula: &str, ctx: ChartCtx) -> Result<Compiled, FormulaError> {
+        let cols = sample_columns();
+        let time = TimeContext::default();
+        compile(
+            formula,
+            &Scope::new(&cols, &time).with_chart(ctx),
+            Some("f"),
+        )
+    }
+
+    fn by_label() -> ChartCtx {
+        ChartCtx {
+            dimension: Some("label".to_owned()),
+            breakdown: None,
+            order_key: "label".to_owned(),
+            grain: None,
+        }
+    }
+
+    fn by_month() -> ChartCtx {
+        ChartCtx {
+            dimension: Some("day".to_owned()),
+            breakdown: Some("label".to_owned()),
+            order_key: "day".to_owned(),
+            grain: Some(Grain::Month),
+        }
+    }
+
+    #[test]
+    fn a_table_calculation_is_a_window_over_hidden_aggregates_in_the_charts_order() {
+        let c = in_chart("RunningTotal(Sum(amount))", by_label()).unwrap();
+        assert_eq!(c.level, Level::Table);
+        let a = &c.staged.aggs[0].alias;
+        assert!(a.starts_with("__a_"), "{a}");
+        assert_eq!(c.staged.aggs[0].sql, "sum(amount)");
+        assert_eq!(
+            c.sql,
+            format!(
+                "sum({a}) OVER (ORDER BY label ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+            )
+        );
+        // With a breakdown the window is partitioned by it; PercentOfTotal is not.
+        let c = in_chart("RunningTotal(Sum(amount))", by_month()).unwrap();
+        assert!(
+            c.sql.contains("OVER (PARTITION BY label ORDER BY day ROWS"),
+            "{}",
+            c.sql
+        );
+        let c = in_chart("PercentOfTotal(Sum(amount))", by_month()).unwrap();
+        assert!(
+            c.sql.contains("sum(") && c.sql.contains(") OVER ()"),
+            "{}",
+            c.sql
+        );
+        assert!(!c.sql.contains("PARTITION"), "{}", c.sql);
+        let c = in_chart("Rank(Sum(amount))", by_month()).unwrap();
+        assert!(
+            c.sql
+                .starts_with("rank() OVER (PARTITION BY label ORDER BY __a_"),
+            "{}",
+            c.sql
+        );
+        let c = in_chart("MovingAverage(Sum(amount), 3)", by_label()).unwrap();
+        assert!(
+            c.sql.contains("ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"),
+            "{}",
+            c.sql
+        );
+        let c = in_chart("Offset(Sum(amount), -2)", by_label()).unwrap();
+        assert!(c.sql.starts_with("leadInFrame(toNullable("), "{}", c.sql);
+        let c = in_chart("RunningCount()", by_label()).unwrap();
+        assert_eq!(c.staged.aggs[0].sql, "count()");
+        let c = in_chart("RunningCount(label)", by_label()).unwrap();
+        assert_eq!(c.staged.aggs[0].sql, "count(label)");
+    }
+
+    #[test]
+    fn the_same_aggregate_used_twice_is_one_hidden_column() {
+        let c = in_chart(
+            "RunningTotal(Sum(amount)) / PercentOfTotal(Sum(amount))",
+            by_label(),
+        )
+        .unwrap();
+        assert_eq!(c.staged.aggs.len(), 1);
+        assert_eq!(c.level, Level::Table);
+        // An aggregate beside a table calculation is allowed (both are
+        // computed from the grouped result); a bare column is not.
+        assert_eq!(
+            in_chart("Sum(amount) - RunningTotal(Sum(amount))", by_label())
+                .unwrap()
+                .level,
+            Level::Table
+        );
+        assert!(in_chart("amount - RunningTotal(Sum(amount))", by_label()).is_err());
+    }
+
+    #[test]
+    fn each_misuse_of_a_table_calculation_is_refused_where_it_is() {
+        let at = |f: &str, ctx: ChartCtx| in_chart(f, ctx).expect_err(f);
+        let e = at("RunningTotal(amount)", by_label());
+        assert_eq!((e.position, e.length), (13, 6), "{e:?}");
+        assert!(e.message.contains("takes an aggregate"));
+        let e = at("RunningTotal(RunningTotal(Sum(amount)))", by_label());
+        assert_eq!(e.position, 13, "{e:?}");
+        assert!(e.message.contains("inside another"));
+        let e = at("MovingAverage(Sum(amount), 0)", by_label());
+        assert_eq!(e.position, 27, "{e:?}");
+        let e = at("Offset(Sum(amount), 0)", by_label());
+        assert_eq!(e.position, 20, "{e:?}");
+        let e = at("Sum(RunningTotal(Sum(amount)))", by_label());
+        assert!(e.message.contains("inside another aggregate"), "{e:?}");
+        let e = at("RunningTotal(Sum(label))", by_label());
+        assert!(e.message.contains("expected a number"), "{e:?}");
+        let no_dimension = ChartCtx {
+            dimension: None,
+            ..by_label()
+        };
+        let e = at("Rank(Sum(amount))", no_dimension);
+        assert_eq!(e.position, 0, "{e:?}");
+        assert!(e.message.contains("needs a chart with a dimension"));
+    }
+
+    #[test]
+    fn a_period_comparison_needs_a_date_grain_and_names_what_it_reads() {
+        let c = in_chart("PreviousPeriod(Sum(amount))", by_month()).unwrap();
+        assert_eq!(c.level, Level::Table);
+        assert_eq!(c.staged.shifts.len(), 1);
+        assert_eq!(c.sql, c.staged.shifts[0].alias);
+        assert_eq!(c.staged.shifts[0].kind, ShiftKind::Previous);
+        let y = in_chart("SamePeriodLastYear(Sum(amount))", by_month()).unwrap();
+        assert_eq!(y.staged.shifts[0].kind, ShiftKind::LastYear);
+        assert_ne!(y.staged.shifts[0].alias, c.staged.shifts[0].alias);
+        let e = in_chart("PreviousPeriod(Sum(amount))", by_label()).unwrap_err();
+        assert!(e.message.contains("Group by"), "{e:?}");
+        let part = ChartCtx {
+            grain: Some(Grain::MonthOfYear),
+            ..by_month()
+        };
+        assert!(
+            in_chart("PreviousPeriod(Sum(amount))", part)
+                .unwrap_err()
+                .message
+                .contains("not a part")
+        );
+        let hourly = ChartCtx {
+            grain: Some(Grain::Hour),
+            ..by_month()
+        };
+        assert!(in_chart("PreviousPeriod(Sum(amount))", hourly.clone()).is_ok());
+        assert!(in_chart("SamePeriodLastYear(Sum(amount))", hourly).is_err());
+    }
+
+    #[test]
+    fn fixed_joins_back_an_aggregate_at_columns_the_chart_groups_by() {
+        let c = in_chart("Sum(amount) / Fixed([label], Sum(amount))", by_label()).unwrap();
+        assert_eq!(c.level, Level::Aggregate);
+        let f = &c.staged.fixed[0];
+        assert_eq!(
+            (f.columns.clone(), f.agg_sql.as_str()),
+            (vec!["label".to_owned()], "sum(amount)")
+        );
+        assert_eq!(
+            c.sql,
+            format!("(sum(amount) / nullIf(max({}), 0))", f.alias)
+        );
+        assert!(c.reads.contains(&f.alias));
+        assert!(c.reads.contains("amount"));
+        // A grand total needs no columns.
+        let total = in_chart("Sum(amount) / Fixed(Sum(amount))", by_label()).unwrap();
+        assert!(total.staged.fixed[0].columns.is_empty());
+    }
+
+    #[test]
+    fn each_misuse_of_fixed_is_refused_at_the_argument() {
+        let at = |f: &str, ctx: ChartCtx| in_chart(f, ctx).expect_err(f);
+        let e = at("Fixed([qty], Sum(amount))", by_label());
+        assert_eq!(e.position, 6, "{e:?}");
+        assert!(e.message.contains("groups by label"), "{e:?}");
+        let e = at("Fixed([nope], Sum(amount))", by_label());
+        assert!(e.message.contains("not a column"), "{e:?}");
+        let e = at("Fixed([label], amount)", by_label());
+        assert_eq!(e.position, 15, "{e:?}");
+        let e = at("Fixed([label], [label], Sum(amount))", by_label());
+        assert!(e.message.contains("twice"), "{e:?}");
+        let e = at("Fixed(label + 'x', Sum(amount))", by_label());
+        assert!(e.message.contains("write a column"), "{e:?}");
+        let grouped_date = ChartCtx {
+            dimension: Some("day".to_owned()),
+            breakdown: None,
+            order_key: "day".to_owned(),
+            grain: Some(Grain::Month),
+        };
+        let e = at("Fixed([day], Sum(amount))", grouped_date);
+        assert!(e.message.contains("groups by date"), "{e:?}");
+        let e = at("Fixed([label], RunningTotal(Sum(amount)))", by_label());
+        assert!(e.message.contains("inside Fixed"), "{e:?}");
+        // A field is not a column.
+        let cols = sample_columns();
+        let time = TimeContext::default();
+        let scope = Scope::new(&cols, &time)
+            .with_field("profit", "amount - qty")
+            .with_chart(by_label());
+        assert!(
+            compile("Fixed([profit], Sum(amount))", &scope, Some("f"))
+                .unwrap_err()
+                .message
+                .contains("not a column")
+        );
+    }
+
+    #[test]
+    fn the_new_functions_never_put_typed_text_into_sql() {
+        // Hostile text in every argument position of the new functions: each
+        // is refused with a position, or compiled to SQL that passes the same
+        // audit as every other formula.
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut compiled = 0_u32;
+        for _ in 0..4000 {
+            let text = nasty(&mut rng, 30);
+            let quoted = text.replace('\'', "''");
+            for src in [
+                format!("RunningTotal(Sum([{text}]))"),
+                format!("Offset(Sum(amount), {text})"),
+                format!("MovingAverage(Sum(amount), '{quoted}')"),
+                format!("Fixed([{text}], Sum(amount))"),
+                format!("Fixed([label], Concat(Max(label), '{quoted}'))"),
+                format!("PreviousPeriod(Max(Concat(label, '{quoted}')))"),
+                format!("Rank(CountDistinct(Concat('{quoted}', label)))"),
+                format!("Sum(amount) / Fixed({text})"),
+            ] {
+                for ctx in [by_label(), by_month()] {
+                    if let Ok(c) = in_chart(&src, ctx) {
+                        audit_sql(&c.sql);
+                        for h in &c.staged.aggs {
+                            audit_sql(&h.sql);
+                            assert!(
+                                h.alias
+                                    .chars()
+                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                            );
+                        }
+                        for f in &c.staged.fixed {
+                            audit_sql(&f.agg_sql);
+                            assert!(f.columns.iter().all(|col| Ident::new(col.as_str()).is_ok()));
+                        }
+                        compiled += 1;
+                    }
+                }
+            }
+        }
+        assert!(compiled > 1000, "{compiled}");
     }
 
     /// Not a check: writes one `SELECT` per catalog function (its example,

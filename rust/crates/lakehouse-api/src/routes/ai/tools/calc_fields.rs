@@ -8,8 +8,10 @@
 //! refusal while a chart uses a field. The assistant writes a *formula* in
 //! the product's own language, never SQL; the server compiles it.
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
+use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::api_result_to_value;
@@ -31,7 +33,7 @@ fn body(args: &Map<String, Value>) -> Bytes {
 
 pub(super) fn list_formula_functions() -> Value {
     json!({
-        "language": "[Column Name] or a bare name for a column or another calculated field of the same source; numbers; 'text' or \"text\"; + - * /; = != < <= > >=; and, or, not; parentheses; the functions below (names are not case sensitive). A formula is either one value per row, for example [revenue] - [cost], or an aggregate, for example Sum([revenue]) / CountDistinct([customer]); the two cannot be mixed in one formula except through an aggregate.",
+        "language": "[Column Name] or a bare name for a column or another calculated field of the same source; numbers; 'text' or \"text\"; + - * /; = != < <= > >=; and, or, not; parentheses; the functions below (names are not case sensitive). A formula is either one value per row, for example [revenue] - [cost], or an aggregate, for example Sum([revenue]) / CountDistinct([customer]); the two cannot be mixed in one formula except through an aggregate. Table calculations (RunningTotal, Rank, PercentOfTotal, Offset, MovingAverage) and period comparisons (PreviousPeriod, SamePeriodLastYear) take an aggregate and are computed over the chart's result in its dimension order; they can only be a measure. Fixed([column], aggregate) computes an aggregate at columns the chart groups by.",
         "functions": lakehouse_bi::formula::catalog::CATALOG,
     })
 }
@@ -57,19 +59,29 @@ fn with_id(mut result: Value) -> Value {
     result
 }
 
-pub(super) async fn create_calculated_field(state: &AppState, args: &Map<String, Value>) -> Value {
-    // `created_by` stays empty, as for the board tool: the assistant is not a
-    // person.
+/// BI-8 review fix (SHOULD-FIX) R3: the field is recorded under the person
+/// who asked the assistant, as the HTTP route records it (display only; it
+/// grants nothing). With no principal (a call outside a session) it stays
+/// empty.
+pub(super) async fn create_calculated_field(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let who = principal.cloned().map(Extension);
     with_id(
-        api_result_to_value(calc_fields::create(State(state.clone()), None, body(args)).await)
-            .await,
+        api_result_to_value(calc_fields::create(State(state.clone()), who, body(args)).await).await,
     )
 }
 
-pub(super) async fn update_calculated_field(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn update_calculated_field(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let who = principal.cloned().map(Extension);
     with_id(
-        api_result_to_value(calc_fields::update(State(state.clone()), None, body(args)).await)
-            .await,
+        api_result_to_value(calc_fields::update(State(state.clone()), who, body(args)).await).await,
     )
 }
 
@@ -79,4 +91,23 @@ pub(super) async fn delete_calculated_field(state: &AppState, args: &Map<String,
         Err(_unparsed) => return json!({ "error": "id is required" }),
     };
     api_result_to_value(calc_fields::delete(State(state.clone()), Query(q)).await).await
+}
+
+/// Dispatch one of the six tools by name (one arm in `run_tool`, which is at
+/// clippy's line limit).
+pub(super) async fn run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
+    match name {
+        "list_formula_functions" => list_formula_functions(),
+        "list_calculated_fields" => list_calculated_fields(state, args).await,
+        "validate_formula" => validate_formula(state, args).await,
+        "create_calculated_field" => create_calculated_field(state, principal, args).await,
+        "update_calculated_field" => update_calculated_field(state, principal, args).await,
+        "delete_calculated_field" => delete_calculated_field(state, args).await,
+        other => json!({ "error": format!("unknown tool: {other}") }),
+    }
 }

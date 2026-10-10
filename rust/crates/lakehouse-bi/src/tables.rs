@@ -558,7 +558,8 @@ pub fn pivot_row_cap(from: &Relation, values: usize) -> u32 {
             Relation::Sql(_) => true,
             Relation::Filtered { base, .. }
             | Relation::Bucketed { base, .. }
-            | Relation::Calculated { base, .. } => is_sql(base),
+            | Relation::Calculated { base, .. }
+            | Relation::Fixed { base, .. } => is_sql(base),
         }
     }
     pivot_cap(is_sql(from), values)

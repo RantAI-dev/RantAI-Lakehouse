@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { applySuggestion, callAtCaret, charIndex, splitAtProblem, suggest } from "./formula-assist"
+import { applySuggestion, callAtCaret, charIndex, levelLabel, splitAtProblem, suggest } from "./formula-assist"
 import type { FormulaFunction } from "@/services/contracts/calc-fields"
 
 const fn = (name: string, signature: string): FormulaFunction => ({
-  name, category: "x", signature, help: "h.", example: "", minArgs: 0, maxArgs: null, aggregate: false,
+  name, category: "x", signature, help: "h.", example: "", minArgs: 0, maxArgs: null, aggregate: false, table: false,
 })
 const FUNCTIONS = [fn("Sum", "Sum(x)"), fn("SumIf", "SumIf(x, test)"), fn("Round", "Round(x, digits)")]
 const NAMES = { columns: ["revenue", "cost", "Net Sales"], fields: [{ name: "profit", formula: "[revenue] - [cost]" }] }
@@ -58,4 +58,10 @@ test("the text splits around the server's span by characters, not UTF-16 units",
   assert.deepEqual(splitAtProblem("\u{1F600} + x", { position: 4, length: 1 }), { before: "\u{1F600} + ", hit: "x", after: "" })
   assert.deepEqual(splitAtProblem("ab", { position: 9, length: 3 }), { before: "ab", hit: "", after: "" })
   assert.equal(charIndex("\u{1F600}ab", 2), 1)
+})
+
+test("the box names the three kinds of formula", () => {
+  assert.equal(levelLabel("row", "number"), "One value per row, number.")
+  assert.equal(levelLabel("aggregate", "number"), "Aggregate, number.")
+  assert.match(levelLabel("table", "number"), /^Table calculation/)
 })

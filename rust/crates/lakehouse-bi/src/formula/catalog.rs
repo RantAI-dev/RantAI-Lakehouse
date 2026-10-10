@@ -31,6 +31,9 @@ pub struct FnInfo {
     pub max_args: Option<usize>,
     /// Whether the function aggregates rows.
     pub aggregate: bool,
+    /// Whether it is a table calculation or a period comparison: computed over
+    /// the chart's whole grouped result, usable only as a chart measure.
+    pub table: bool,
 }
 
 const fn f(
@@ -50,6 +53,7 @@ const fn f(
         min_args: args.0,
         max_args: args.1,
         aggregate: false,
+        table: false,
     }
 }
 
@@ -69,7 +73,40 @@ const fn agg(
         min_args: args.0,
         max_args: args.1,
         aggregate: true,
+        table: false,
     }
+}
+
+const fn tbl(
+    name: &'static str,
+    signature: &'static str,
+    help: &'static str,
+    example: &'static str,
+    args: (usize, Option<usize>),
+) -> FnInfo {
+    FnInfo {
+        name,
+        category: "table calculations",
+        signature,
+        help,
+        example,
+        min_args: args.0,
+        max_args: args.1,
+        aggregate: false,
+        table: true,
+    }
+}
+
+const fn per(
+    name: &'static str,
+    signature: &'static str,
+    help: &'static str,
+    example: &'static str,
+    args: (usize, Option<usize>),
+) -> FnInfo {
+    let mut f = tbl(name, signature, help, example, args);
+    f.category = "period comparison";
+    f
 }
 
 /// Every function, grouped by category in the order the console lists them.
@@ -129,6 +166,15 @@ pub static CATALOG: &[FnInfo] = &[
     agg("SumIf", "SumIf(x, test)", "The total of x over the rows where the test is true.", "SumIf([amount], [qty] > 1)", (2, Some(2))),
     agg("CountIf", "CountIf(test)", "The number of rows where the test is true.", "CountIf([amount] > 100)", (1, Some(1))),
     agg("AvgIf", "AvgIf(x, test)", "The average of x over the rows where the test is true.", "AvgIf([amount], [qty] > 1)", (2, Some(2))),
+    agg("Fixed", "Fixed([a], [b], ..., aggregate)", "An aggregate computed at the columns you name, whatever the chart groups by, and joined back; the columns must be ones the chart groups by.", "Sum([amount]) / Fixed([label], Sum([amount]))", (1, None)),
+    tbl("RunningTotal", "RunningTotal(aggregate)", "The total so far, in the chart's order (per series when there is a breakdown).", "RunningTotal(Sum([amount]))", (1, Some(1))),
+    tbl("RunningCount", "RunningCount(column)", "The number of rows so far, in the chart's order; a column counts only rows where it is not empty.", "RunningCount()", (0, Some(1))),
+    tbl("Offset", "Offset(aggregate, n)", "The value n rows before (n negative: after) in the chart's order, empty where there is none.", "Offset(Sum([amount]), 1)", (2, Some(2))),
+    tbl("PercentOfTotal", "PercentOfTotal(aggregate)", "The value as a percent, 0 to 100, of the total of the whole chart.", "PercentOfTotal(Sum([amount]))", (1, Some(1))),
+    tbl("Rank", "Rank(aggregate)", "1 for the largest value, per series; equal values share a rank.", "Rank(Sum([amount]))", (1, Some(1))),
+    tbl("MovingAverage", "MovingAverage(aggregate, n)", "The average of this row and the n-1 before it, in the chart's order (fewer at the start).", "MovingAverage(Sum([amount]), 3)", (2, Some(2))),
+    per("PreviousPeriod", "PreviousPeriod(aggregate)", "The value one period earlier (a chart grouped by day, week, month, quarter or year); empty if that period has no data.", "PreviousPeriod(Sum([amount]))", (1, Some(1))),
+    per("SamePeriodLastYear", "SamePeriodLastYear(aggregate)", "The value a year earlier, matched by calendar date (a week by 52 weeks back); empty if that period has no data.", "SamePeriodLastYear(Sum([amount]))", (1, Some(1))),
 ];
 
 /// The function called `name`, ignoring case.
@@ -153,7 +199,7 @@ mod tests {
         assert_eq!(names.len(), n, "a function is listed twice");
         assert_eq!(lookup("sUm").map(|f| f.name), Some("Sum"));
         assert!(lookup("Sleep").is_none());
-        assert_eq!(n, 53);
+        assert_eq!(n, 62);
     }
 
     #[test]

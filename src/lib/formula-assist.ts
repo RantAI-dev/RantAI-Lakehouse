@@ -168,3 +168,9 @@ export function splitAtProblem(
 export function charIndex(text: string, utf16Index: number): number {
   return Array.from(text.slice(0, utf16Index)).length
 }
+
+/** What a checked formula is, in the words the box shows under it. */
+export function levelLabel(level: string, type: string): string {
+  const what = level === "aggregate" ? "Aggregate" : level === "table" ? "Table calculation (over the chart's result)" : "One value per row"
+  return `${what}, ${type}.`
+}
