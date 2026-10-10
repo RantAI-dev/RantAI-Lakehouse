@@ -12,6 +12,7 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { clickhouseDashboardService } from "./clients/dashboards"
+import { calcFieldService as calcFieldClientService } from "./clients/calc-fields"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
@@ -65,6 +66,8 @@ export const connectorService = postgresConnectorService
 // itself still calls `/api/dashboard/*` directly for charts/layout/filters.
 // No mock ever existed for this service.
 export const dashboardService = clickhouseDashboardService
+/** Calculated fields of a mart or SQL source (BI-8). */
+export const calcFieldService = calcFieldClientService
 // Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
 // ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this
 // service; the feature previously fetched `/api/alerts` directly with no

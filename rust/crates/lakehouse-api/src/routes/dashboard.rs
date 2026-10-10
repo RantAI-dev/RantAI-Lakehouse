@@ -231,9 +231,23 @@ async fn get_body(
         GrainRequest::Own => None,
         GrainRequest::Saved => saved_grain,
     };
+    // BI-8: the calculated fields of every source, read once for the board.
+    // A failed read leaves the catalog empty, so a chart that names a field
+    // shows its stored statement's error instead of the whole dashboard
+    // failing; the failure is reported like the chart store's.
+    let field_catalog = match lakehouse_bi::fields::list_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(err) => {
+            store_error.get_or_insert_with(|| {
+                upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string()
+            });
+            lakehouse_bi::fields::FieldCatalog::default()
+        }
+    };
     let read = ReadContext {
         time,
         grain: applied_grain,
+        fields: &field_catalog,
     };
 
     // The built-in tiles are served only when this tenant's
@@ -1073,12 +1087,23 @@ async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> 
             dimensions.push(c.name.clone());
         }
     }
+    // BI-8: the source's calculated fields, listed apart from its columns so
+    // nothing that reads `dimensions` or `measures` meets a name it cannot
+    // find in the source; the builder's pickers merge them with a mark.
+    let calculated = lakehouse_bi::fields::list_fields_for(
+        ch,
+        lakehouse_bi::fields::SourceKind::SqlSource,
+        &source.id,
+    )
+    .await
+    .map_err(|err| classify_dashboard_ch_error(&err))?;
     Ok(json!({
         "source": source.id,
         "title": source.title,
         "dimensions": dimensions,
         "measures": measures,
         "columns": source.columns,
+        "calculated": calculated,
     }))
 }
 
@@ -1133,11 +1158,16 @@ async fn fields_body(
         }
         columns_out.push(json!({ "name": name, "type": ty }));
     }
+    // BI-8: the mart's calculated fields; see `source_fields_body`.
+    let calculated =
+        lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::Mart, &safe)
+            .await?;
     Ok(json!({
         "mart": safe,
         "dimensions": dimensions,
         "measures": measures,
         "columns": columns_out,
+        "calculated": calculated,
     }))
 }
 
@@ -1327,6 +1357,52 @@ async fn records_relation(ch: &ChClient, q: &RecordsQuery) -> Result<RecordsRela
     })
 }
 
+/// BI-8: a records list can name a calculated field of the tile's source as
+/// the clicked column, a listed column or the sort column. Only the fields it
+/// names are applied (each as a column of the relation), so a plain "view
+/// records" shows the source's own columns and nothing is computed that was
+/// not asked for. An aggregate field is refused, and a formula that no longer
+/// checks out is a 422 with our sentence, never other rows.
+async fn with_calculated_columns(
+    ch: &ChClient,
+    relation: RecordsRelation,
+    q: &RecordsQuery,
+    time: &TimeContext,
+) -> Result<RecordsRelation, ApiError> {
+    use lakehouse_bi::fields::{self, SourceKind};
+    let mut names: Vec<&str> = q
+        .columns
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .collect();
+    names.extend(q.column.as_deref());
+    names.extend(q.sort_column.as_deref());
+    names.retain(|n| !n.is_empty() && !relation.cols.contains_key(*n));
+    if names.is_empty() {
+        return Ok(relation);
+    }
+    let kind = if relation.label.0 == "mart" {
+        SourceKind::Mart
+    } else {
+        SourceKind::SqlSource
+    };
+    let found = fields::list_fields_for(ch, kind, &relation.label.1)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let prepared =
+        fields::prepare_named(&found, &names, relation.from.clone(), &relation.cols, time)
+            .map_err(ApiError::Unprocessable)?;
+    Ok(match prepared {
+        Some(p) => RecordsRelation {
+            from: p.from,
+            cols: p.cols,
+            label: relation.label,
+        },
+        None => relation,
+    })
+}
+
 /// A page size or offset: absent means `default`; text that is not a
 /// non-negative whole number is a 400 of ours.
 fn records_number(raw: Option<&str>, name: &str, default: u64) -> Result<u64, ApiError> {
@@ -1416,6 +1492,7 @@ async fn records_for_roles(
         }
     };
     let relation = records_relation(ch, &q).await?;
+    let relation = with_calculated_columns(ch, relation, &q, time).await?;
     if q.columns.is_some() {
         if drill.is_some() {
             return Err(ApiError::BadRequest(
@@ -3575,6 +3652,10 @@ mod records_pages {
             ],
         )
         .await;
+        // BI-8: a column the relation lacks is looked up among the source's
+        // calculated fields before it is refused; `console` covers that read
+        // of `console.bi_field` and the table bootstrap before it, with none.
+        answer(server, "console", vec![]).await;
     }
 
     async fn statements(server: &MockServer) -> Vec<String> {

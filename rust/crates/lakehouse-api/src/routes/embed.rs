@@ -425,6 +425,12 @@ async fn render_board_payload(
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     let stored = store::list_stored_charts(ch).await?;
+    // BI-8: an embed or a public link shows a chart that uses a calculated
+    // field exactly as the dashboard does (same builder, same role rewrite
+    // with the embed viewer's role).
+    let field_catalog = lakehouse_bi::fields::FieldCatalog::from_fields(
+        lakehouse_bi::fields::list_fields(ch).await?,
+    );
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
         .filter(|c| {
@@ -439,7 +445,9 @@ async fn render_board_payload(
     // Column types are also what decides whether a chart's grain still fits
     // its dimension (BI-9).
     let need_cols = filters.iter().any(FilterDef::is_active)
-        || stored_for_board.iter().any(|c| c.def.needs_columns());
+        || stored_for_board
+            .iter()
+            .any(|c| c.def.needs_columns() || field_catalog.chart_uses(&c.def));
     let cols = if need_cols {
         mart_columns(ch).await?
     } else {
@@ -458,6 +466,7 @@ async fn render_board_payload(
             .as_deref()
             .and_then(lakehouse_bi::grain::Grain::parse)
             .filter(|g| g.is_truncation()),
+        fields: &field_catalog,
     };
     for c in &stored_for_board {
         match stored_chart_sql(c, &[], filters, &cols, &sources, &read) {

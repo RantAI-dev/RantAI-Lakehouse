@@ -1023,6 +1023,16 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
     } else {
         Vec::new()
     };
+    // BI-8: a tile on a SQL source that names a calculated field is built
+    // over it, so the fields are read when a source tile exists. A mart tile
+    // uses the SQL stored with it, as before.
+    let fields = if sources.is_empty() {
+        lakehouse_bi::fields::FieldCatalog::default()
+    } else {
+        lakehouse_bi::fields::FieldCatalog::from_fields(
+            lakehouse_bi::fields::list_fields(ch).await?,
+        )
+    };
     let time = lakehouse_bi::grain::TimeContext::default();
     let mut lines = vec![format!(
         "Dashboard: {} — {} tile",
@@ -1049,7 +1059,10 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
                     &s.column_kinds(),
                     &[],
                     &[],
-                    &lakehouse_bi::builder::ReadContext::new(&time),
+                    &lakehouse_bi::builder::ReadContext {
+                        fields: &fields,
+                        ..lakehouse_bi::builder::ReadContext::new(&time)
+                    },
                 )
             }),
         };

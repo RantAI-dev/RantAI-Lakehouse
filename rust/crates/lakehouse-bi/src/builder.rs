@@ -17,6 +17,7 @@ use std::marker::PhantomData;
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use serde::Serialize;
 
+use crate::fields::{self, FieldCatalog};
 use crate::filters::{
     ColumnKind, FilterDef, FilterOp, RelativeAnchor, RelativeUnit, parse_iso_date, parse_number,
 };
@@ -86,6 +87,37 @@ pub enum Relation {
         /// The other columns the chart reads (breakdown, measures).
         carried: Vec<String>,
     },
+    /// `base` plus the row-level calculated fields a chart uses (`BI-8`):
+    /// `SELECT *, <expression> AS <name>, ... FROM base`. Every column of
+    /// `base` is still there, so a filter on a raw column, a grain on a date
+    /// column and the role rewrite (which substitutes the *table* inside
+    /// `base`) all see what they saw before. The expressions are compiled by
+    /// [`crate::formula`] and name only columns of the source; an alias is a
+    /// validated field name that is not a column of the source.
+    /// `aggregates` are the aggregate fields: they add no column, they stand
+    /// in for `sum(measure)` where the chart is built
+    /// ([`Relation::aggregate_field`]). Only [`crate::fields::prepare`]
+    /// creates it.
+    Calculated {
+        /// The source relation.
+        base: Box<Relation>,
+        /// Row-level fields as `(name, expression)`.
+        columns: Vec<(String, String)>,
+        /// Aggregate fields, usable as measures.
+        aggregates: Vec<AggregateField>,
+    },
+}
+
+/// An aggregate calculated field as a measure: the whole expression is the
+/// measure, so the chart's own aggregate does not apply to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateField {
+    /// The field's name, the result column.
+    pub name: String,
+    /// The compiled aggregate expression.
+    pub sql: String,
+    /// The source columns it reads, which a bucketing inner query must carry.
+    pub reads: Vec<String>,
 }
 
 impl Relation {
@@ -118,6 +150,33 @@ impl Relation {
                     base.render()
                 )
             }
+            Self::Calculated { base, columns, .. } if columns.is_empty() => base.render(),
+            Self::Calculated { base, columns, .. } => {
+                let added = columns.iter().fold(String::new(), |mut acc, (name, expr)| {
+                    acc.push_str(", ");
+                    acc.push_str(expr);
+                    acc.push_str(" AS ");
+                    acc.push_str(name);
+                    acc
+                });
+                format!("(SELECT *{added} FROM {}) AS calc", base.render())
+            }
+        }
+    }
+
+    /// The aggregate calculated field called `name` that this relation
+    /// carries, looking through the wrappers a builder puts around it.
+    #[must_use]
+    pub fn aggregate_field(&self, name: &str) -> Option<&AggregateField> {
+        match self {
+            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Calculated {
+                base, aggregates, ..
+            } => aggregates
+                .iter()
+                .find(|a| a.name == name)
+                .or_else(|| base.aggregate_field(name)),
+            Self::Filtered { base, .. } | Self::Bucketed { base, .. } => base.aggregate_field(name),
         }
     }
 
@@ -127,7 +186,9 @@ impl Relation {
         match self {
             Self::Mart(_) => "",
             Self::Sql(_) => SQL_SOURCE_SETTINGS,
-            Self::Filtered { base, .. } | Self::Bucketed { base, .. } => base.settings(),
+            Self::Filtered { base, .. }
+            | Self::Bucketed { base, .. }
+            | Self::Calculated { base, .. } => base.settings(),
         }
     }
 }
@@ -313,6 +374,8 @@ impl QueryBuilder<Ready> {
             // ordered by bucket) the latest.
             let keep_by = if latest {
                 format!("{key} DESC")
+            } else if let Some(field) = self.from.aggregate_field(measure.as_str()) {
+                format!("{} DESC", field.sql)
             } else if self.agg == Aggregate::Count {
                 "count() DESC".to_owned()
             } else {
@@ -356,7 +419,10 @@ impl QueryBuilder<Ready> {
     }
 
     fn agg_of(&self, measure: &Ident) -> String {
-        if self.agg == Aggregate::Count {
+        // BI-8: an aggregate calculated field is the whole measure.
+        if let Some(field) = self.from.aggregate_field(measure.as_str()) {
+            format!("{} AS {measure}", field.sql)
+        } else if self.agg == Aggregate::Count {
             format!("count() AS {measure}")
         } else {
             format!("round({}({measure})) AS {measure}", self.agg)
@@ -373,7 +439,10 @@ pub fn build_kpi_sql(
     agg: Aggregate,
     where_clauses: &[String],
 ) -> String {
-    let val = if agg == Aggregate::Count {
+    let val = if let Some(field) = from.aggregate_field(measure.as_str()) {
+        // BI-8: an aggregate calculated field is the number itself.
+        field.sql.clone()
+    } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
         format!("round({agg}({measure}))")
@@ -436,7 +505,9 @@ pub fn point_limit(from: &Relation) -> u32 {
     match from {
         Relation::Mart(_) => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
-        Relation::Filtered { base, .. } | Relation::Bucketed { base, .. } => point_limit(base),
+        Relation::Filtered { base, .. }
+        | Relation::Bucketed { base, .. }
+        | Relation::Calculated { base, .. } => point_limit(base),
     }
 }
 
@@ -571,13 +642,21 @@ pub struct ReadContext<'a> {
     pub time: &'a TimeContext,
     /// The dashboard's grain switch, if any.
     pub grain: Option<Grain>,
+    /// The calculated fields of every source (`BI-8`); a chart that names
+    /// one of its source's fields is built over it.
+    pub fields: &'a FieldCatalog,
 }
 
 impl<'a> ReadContext<'a> {
-    /// No dashboard switch: every chart keeps its own grain.
+    /// No dashboard switch and no calculated fields: every chart keeps its
+    /// own grain.
     #[must_use]
     pub fn new(time: &'a TimeContext) -> Self {
-        Self { time, grain: None }
+        Self {
+            time,
+            grain: None,
+            fields: FieldCatalog::none(),
+        }
     }
 }
 
@@ -696,21 +775,19 @@ where
     }
     let empty_cols: RelationColumns<HCols> = RelationColumns::default();
     let cols = mart_cols.get(&def.mart).unwrap_or(&empty_cols);
-    let FilterOutcome {
-        predicates,
-        skipped,
-        columns,
-    } = filter_predicates(cols, years, filters, read.time);
+    let outcome = filter_predicates(cols, years, filters, read.time);
     // BI-16 part A: a raw table is rebuilt too, because its second statement
     // (the count) is built here and not stored; a comparing KPI because its
-    // periods depend on the deployment's time settings.
+    // periods depend on the deployment's time settings. BI-8: so is a chart
+    // that names a calculated field, whose formula may have changed.
     let kind = spec.spec.kind;
     let rebuilds = def.grain.is_some()
         || kind == crate::specs::ChartKind::Pivot
         || def.tables.is_rows_mode(kind)
-        || def.tables.compares_to_previous(kind);
-    if predicates.is_empty() && !rebuilds {
-        return unfiltered(skipped);
+        || def.tables.compares_to_previous(kind)
+        || read.fields.chart_uses(def);
+    if outcome.predicates.is_empty() && !rebuilds {
+        return unfiltered(outcome.skipped);
     }
     // `mart` was already validated as a well-formed identifier when the
     // spec was created via `specFromInput`, so re-validating here would
@@ -718,13 +795,49 @@ where
     // than panicking, matching "SQL never comes raw from untrusted input"
     // without introducing a new failure mode.
     let Ok(mart) = Ident::new(def.mart.clone()) else {
-        return unfiltered(skipped);
+        return unfiltered(outcome.skipped);
     };
+    let from = Relation::Mart(mart);
+    match fields::prepare(
+        read.fields.for_chart(def),
+        def,
+        from.clone(),
+        cols,
+        read.time,
+    ) {
+        Ok(None) => report_over(spec, &from, cols, outcome, read, Some(&spec.spec.sql)),
+        Ok(Some(p)) => report_over(spec, &p.from, &p.cols, outcome, read, Some(&spec.spec.sql)),
+        // A field that no longer checks out: the chart keeps the SQL it was
+        // saved with and the dashboard's error is the field's, never other
+        // SQL built from a half-understood definition.
+        Err(_) => Some(unfiltered(outcome.skipped)),
+    }
+    .unwrap_or_else(|| unfiltered(Vec::new()))
+}
+
+/// The grain, rebuilt statement and table read of one chart over `from`
+/// (already carrying its calculated fields), with `cols` the columns that
+/// relation offers. `stored` is the SQL to fall back to when the definition
+/// no longer validates (a mart chart); a SQL-source chart passes `None` and
+/// gets `None` back instead.
+fn report_over<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    cols: &RelationColumns<H>,
+    outcome: FilterOutcome,
+    read: &ReadContext<'_>,
+    stored: Option<&str>,
+) -> Option<FilteredSql> {
+    let FilterOutcome {
+        predicates,
+        skipped,
+        columns,
+    } = outcome;
     let (g, grain_skipped) = grained(spec, cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
     let rebuilt = rebuild(
         spec,
-        &Relation::Mart(mart),
+        from,
         predicates,
         &columns,
         &Rebuild {
@@ -733,12 +846,16 @@ where
             cols,
         },
     );
-    let (sql, table) = rebuilt.map_or_else(|| (spec.spec.sql.clone(), None), |r| (r.sql, r.table));
+    let (sql, table) = match (rebuilt, stored) {
+        (Some(r), _) => (r.sql, r.table),
+        (None, Some(stored)) => (stored.to_owned(), None),
+        (None, None) => return None,
+    };
     let grain = g
         .as_ref()
         .map(|g| g.grain)
         .or_else(|| trend_period(table.as_ref()));
-    FilteredSql {
+    Some(FilteredSql {
         sql,
         skipped,
         grain_skipped,
@@ -746,7 +863,7 @@ where
         grain_column: g.as_ref().map(|g| g.column),
         latest_limit,
         table,
-    }
+    })
 }
 
 /// The period a comparing KPI's buckets are cut by, when `table` says so.
@@ -806,37 +923,21 @@ where
             table: None,
         });
     }
-    let FilterOutcome {
-        predicates,
-        skipped,
-        columns,
-    } = filter_predicates(source_cols, years, filters, read.time);
-    let (g, grain_skipped) = grained(spec, source_cols, read);
-    let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
-    let rebuilt = rebuild(
-        spec,
-        &Relation::Sql(source_sql.to_owned()),
-        predicates,
-        &columns,
-        &Rebuild {
-            read,
-            grained: g.as_ref(),
-            cols: source_cols,
-        },
-    )?;
-    let grain = g
-        .as_ref()
-        .map(|g| g.grain)
-        .or_else(|| trend_period(rebuilt.table.as_ref()));
-    Some(FilteredSql {
-        sql: rebuilt.sql,
-        skipped,
-        grain_skipped,
-        grain,
-        grain_column: g.as_ref().map(|g| g.column),
-        latest_limit,
-        table: rebuilt.table,
-    })
+    let outcome = filter_predicates(source_cols, years, filters, read.time);
+    let from = Relation::Sql(source_sql.to_owned());
+    // A field that no longer checks out is the chart's error (`None`, which
+    // the caller shows on the tile); it never runs as something else.
+    match fields::prepare(
+        read.fields.for_chart(&spec.def),
+        &spec.def,
+        from.clone(),
+        source_cols,
+        read.time,
+    ) {
+        Ok(None) => report_over(spec, &from, source_cols, outcome, read, None),
+        Ok(Some(p)) => report_over(spec, &p.from, &p.cols, outcome, read, None),
+        Err(_) => None,
+    }
 }
 
 /// The statements behind a records list (drill-down, BI-18·B): one page of
@@ -1441,14 +1542,26 @@ pub fn grained_sql(
         }
     };
     let mut carried: Vec<String> = Vec::new();
-    for name in chart
-        .breakdown
-        .iter()
-        .chain(chart.measures.iter())
-        .map(ToString::to_string)
-    {
+    let mut carry = |name: String| {
         if name != chart.dimension.as_str() && !carried.contains(&name) {
             carried.push(name);
+        }
+    };
+    if let Some(b) = &chart.breakdown {
+        carry(b.to_string());
+    }
+    for m in &chart.measures {
+        match from.aggregate_field(m.as_str()) {
+            // BI-8: an aggregate field is computed from the columns it reads,
+            // not carried by name. If it reads the grouped column itself it
+            // would read the bucket that now carries that name, so no
+            // statement is built (the caller reports the chart, never runs
+            // a different one).
+            Some(field) if field.reads.iter().any(|c| c == chart.dimension.as_str()) => {
+                return None;
+            }
+            Some(field) => field.reads.iter().cloned().for_each(&mut carry),
+            None => carry(m.to_string()),
         }
     }
     let bucketed = Relation::Bucketed {
@@ -2752,7 +2865,11 @@ mod tests {
     }
 
     fn read_with(time: &TimeContext, grain: Option<Grain>) -> ReadContext<'_> {
-        ReadContext { time, grain }
+        ReadContext {
+            time,
+            grain,
+            fields: FieldCatalog::none(),
+        }
     }
 
     #[test]
@@ -3174,6 +3291,7 @@ mod tests {
         let week = ReadContext {
             time: &time,
             grain: Some(Grain::Week),
+            fields: FieldCatalog::none(),
         };
         let got = super::sql_with_filters_report(&spec, &[], &[], &table_cols(), &week);
         assert!(
@@ -3184,6 +3302,7 @@ mod tests {
         let hour = ReadContext {
             time: &time,
             grain: Some(Grain::Hour),
+            fields: FieldCatalog::none(),
         };
         let got = super::sql_with_filters_report(&spec, &[], &[], &table_cols(), &hour);
         assert_eq!(got.grain_skipped, Some(Grain::Hour));

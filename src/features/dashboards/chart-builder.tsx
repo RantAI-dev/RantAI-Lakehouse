@@ -48,12 +48,19 @@ import {
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { FormulaEditorDialog } from "./formula-editor";
+import type { CalcField } from "@/services/contracts/calc-fields";
 import { TileBody } from "./tile-body";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
 /** `kinds`: each column's kind, from its type, so the grain picker knows which dimensions are dates (BI-9). */
-type Fields = { dimensions: string[]; measures: string[]; kinds?: Record<string, ColumnKind> };
+type Fields = {
+  dimensions: string[]; measures: string[]; kinds?: Record<string, ColumnKind>;
+  /** The source's own columns, apart from the calculated fields merged into `dimensions` and `measures` (BI-8). */
+  columns?: string[];
+  calculated?: CalcField[];
+};
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
@@ -141,6 +148,21 @@ const GRAIN_ITEMS: Record<string, string> = { [NO_GRAIN]: "No grouping", ...GRAI
 /** Column name → kind, from the `{ name, type }` list a fields response or a SQL run returns. */
 function kindsOf(columns: readonly { name: string; type: string }[]): Record<string, ColumnKind> {
   return Object.fromEntries(columns.map((c) => [c.name, columnKindOfType(c.type)]));
+}
+/**
+ * The source's columns plus its calculated fields (BI-8). A per-row number
+ * and an aggregate are offered as measures, any other per-row field as a
+ * dimension; the server refuses an aggregate anywhere but a measure.
+ */
+function withCalculated(base: Fields, columns: string[], calculated: CalcField[]): Fields {
+  const kinds = { ...base.kinds };
+  const dimensions = [...base.dimensions];
+  const measures = [...base.measures];
+  for (const f of calculated) {
+    kinds[f.name] = f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "datetime" ? "datetime" : "text";
+    (f.level === "aggregate" || f.type === "number" ? measures : dimensions).push(f.name);
+  }
+  return { dimensions, measures, kinds, columns, calculated };
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
@@ -247,6 +269,14 @@ export function ChartBuilder({
   const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
+  // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
+  const [formulaOpen, setFormulaOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<CalcField | undefined>(undefined);
+  const calcNames = React.useMemo(() => new Set((fields?.calculated ?? []).map((f) => f.name)), [fields]);
+  /** A calculated field is marked "fx" wherever a column is picked. */
+  const fieldLabel = (name: string) => calcNames.has(name)
+    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
+    : name;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -432,7 +462,11 @@ export function ChartBuilder({
     const picked = decodeSourceChoice(value);
     if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
     const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
-    const f: Fields = { dimensions: j.dimensions ?? [], measures: j.measures ?? [], kinds: kindsOf(j.columns ?? []) };
+    const f = withCalculated(
+      { dimensions: j.dimensions ?? [], measures: j.measures ?? [], kinds: kindsOf(j.columns ?? []) },
+      (j.columns ?? []).map((c: { name: string }) => c.name),
+      j.calculated ?? [],
+    );
     setFields(f);
     return f;
   }
@@ -563,6 +597,8 @@ export function ChartBuilder({
     aggregate, span, caption, target, text, order, limit, targetBoard, grain,
     // BI-16 part A: every table, pivot and comparison setting reaches the SQL or the render spec.
     tables: JSON.stringify(draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean))),
+    // BI-8: a changed formula changes the rows a chart over the field returns.
+    calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
   });
   React.useEffect(() => {
     if (!open) return;
@@ -784,6 +820,21 @@ export function ChartBuilder({
               )
             ) : null}
             {sqlActive ? <SqlSourcePanel draft={draft} onCancelEdit={cancelSqlEdit} /> : null}
+            {fields?.columns && !isNewSql && !isText && choice ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(fields.calculated ?? []).map((f) => (
+                  <Button
+                    key={f.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 font-mono text-xs"
+                    title={f.formula} onClick={() => { setEditing(f); setFormulaOpen(true); }}
+                  >
+                    <span className="text-muted-foreground">fx</span>{f.name}
+                  </Button>
+                ))}
+                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditing(undefined); setFormulaOpen(true); }}>
+                  <Plus className="size-3" aria-hidden /> New calculated field
+                </Button>
+              </div>
+            ) : null}
           </div>
 
           {isMap ? (
@@ -810,13 +861,13 @@ export function ChartBuilder({
                     <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
-                      {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                      {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 ) : (
                   <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                    <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
+                    <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
                 {grainPicker}
@@ -828,7 +879,7 @@ export function ChartBuilder({
                     <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
-                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>
@@ -862,7 +913,7 @@ export function ChartBuilder({
               <Label>{mLabels[0]} <Req /></Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
                 <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             {isBoxplot ? (
@@ -887,7 +938,7 @@ export function ChartBuilder({
                 <Label>{mLabels[1] ?? "2nd measure"} <Req /></Label>
                 <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               {needsM3 ? (
@@ -895,7 +946,7 @@ export function ChartBuilder({
                   <Label>{mLabels[2] ?? "3rd measure"} <Req /></Label>
                   <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
               ) : null}
@@ -1115,6 +1166,26 @@ export function ChartBuilder({
             </DialogFooter>
           </div>
         </div>
+        {fields?.columns && choice ? (
+          <FormulaEditorDialog
+            open={formulaOpen}
+            onOpenChange={setFormulaOpen}
+            source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+            columns={fields.columns}
+            fields={fields.calculated ?? []}
+            existing={editing}
+            onSaved={() => { void loadFields(source); }}
+            onDeleted={(gone) => {
+              void loadFields(source).then((f) => {
+                setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
+                setMeasure((v) => keepIfOffered(v, f.measures));
+                setMeasure2((v) => keepIfOffered(v, f.measures));
+                setMeasure3((v) => keepIfOffered(v, f.measures));
+                setBreakdown((v) => keepIfOffered(v, f.dimensions));
+              });
+            }}
+          />
+        ) : null}
       </DialogContent>
     </Dialog>
   );

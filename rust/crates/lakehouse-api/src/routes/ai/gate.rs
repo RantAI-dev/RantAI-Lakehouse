@@ -131,6 +131,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             "Menghapus chart {} dari dashboard secara permanen.",
             s("id")
         ),
+        "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -249,6 +250,21 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("kind")
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "create_calculated_field" => format!(
+            "Membuat kolom hitung \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_calculated_field" => format!(
+            "Mengubah rumus kolom hitung {} menjadi {}.",
+            s("id"),
+            s("formula")
+        ),
         _ => format!(
             "{} is ready: the user confirms it with the Confirm button under this message. This is not an approval and does not go to Approvals.",
             spec.name

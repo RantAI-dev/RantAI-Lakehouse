@@ -319,6 +319,63 @@ fn delete_chart_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── BI-8 calculated fields (with AI-4) ───────────────────────────────────
+
+/// The properties that name the source of a calculated field, the same on
+/// every tool that takes one.
+fn calc_source_properties() -> Value {
+    json!({
+        "mart": { "type": "string", "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both" },
+        "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart" }
+    })
+}
+
+fn list_formula_functions_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_formula_functions",
+        "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_calculated_fields_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_calculated_fields",
+        "description": "The calculated fields of one mart or SQL source (name, formula, whether it is one value per row or an aggregate, and its type). A chart uses one by naming it in dimension, breakdown or measures like a column.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn validate_formula_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["formula"] = json!({ "type": "string", "description": "the formula to check, in the formula language (see list_formula_functions)" });
+    properties["name"] = json!({ "type": "string", "description": "the field's name, if it already has one (so a field that uses itself is caught)" });
+    json!({ "type": "function", "function": { "name": "validate_formula",
+        "description": "Check a formula against a mart or SQL source without saving anything: returns ok with its level and type, or the message and the character position of the first mistake. Use it to fix a formula before create_calculated_field.",
+        "parameters": { "type": "object", "properties": properties, "required": ["formula"] } } })
+}
+
+fn create_calculated_field_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] = json!({ "type": "string", "description": "a name of letters, digits and _ (for example profit), not a column of the source; charts pick the field by it" });
+    properties["formula"] = json!({ "type": "string", "description": "for example [revenue] - [cost], or Sum([revenue]) / CountDistinct([customer]); never SQL" });
+    json!({ "type": "function", "function": { "name": "create_calculated_field",
+        "description": "Save a calculated field on a mart or SQL source from a formula in the formula language (see list_formula_functions); the server checks and compiles it. Then use its name in create_chart like a column: a per-row field can be a dimension, breakdown or measure; an aggregate field only a measure.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "formula"] } } })
+}
+
+fn update_calculated_field_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "update_calculated_field",
+        "description": "Change the formula of a calculated field (by id from list_calculated_fields). The name stays; every chart using the field follows the new formula.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "formula": { "type": "string", "description": "the new formula" } },
+            "required": ["id", "formula"] } } })
+}
+
+fn delete_calculated_field_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_calculated_field",
+        "description": "Delete one calculated field (by id). Refused while a chart or another field uses it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
 // ── T1.1 Alerts ──────────────────────────────────────────────────────────
 
 /// The five comparison operators an alert rule may use, mirroring
@@ -933,6 +990,46 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // BI-8 / AI-4: calculated fields. The permissions mirror
+    // `/api/dashboard/calc-fields` in `POLICY_TABLE`: reading, checking and
+    // the function list need `dashboard:read`; saving and changing need
+    // `dashboard:write`; deleting is high-risk like `delete_chart`.
+    ToolSpec {
+        name: "list_formula_functions",
+        schema: list_formula_functions_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "list_calculated_fields",
+        schema: list_calculated_fields_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "validate_formula",
+        schema: validate_formula_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_calculated_field",
+        schema: create_calculated_field_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_calculated_field",
+        schema: update_calculated_field_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_calculated_field",
+        schema: delete_calculated_field_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
     // ── T1.1 Alerts (Tier 1 of the copilot-operations-handover plan) ────
     // Permission strings verified against `policy.rs::POLICY_TABLE`
     // (plan section 3.7 C1): `GET /api/alerts` is `RequiresAuth` (no
@@ -1304,15 +1401,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_sixty_four_entries() {
+    fn tool_schemas_has_seventy_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
-        // sources) + `ask_user`.
-        assert_eq!(tool_schemas().len(), 64);
+        // sources) + `ask_user` + 6 calculated-field tools (`BI-8`).
+        assert_eq!(tool_schemas().len(), 70);
     }
 
     #[test]

@@ -675,6 +675,141 @@
   {
     "type": "function",
     "function": {
+      "name": "list_formula_functions",
+      "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_calculated_fields",
+      "description": "The calculated fields of one mart or SQL source (name, formula, whether it is one value per row or an aggregate, and its type). A chart uses one by naming it in dimension, breakdown or measures like a column.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "validate_formula",
+      "description": "Check a formula against a mart or SQL source without saving anything: returns ok with its level and type, or the message and the character position of the first mistake. Use it to fix a formula before create_calculated_field.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "formula": {
+            "type": "string",
+            "description": "the formula to check, in the formula language (see list_formula_functions)"
+          },
+          "name": {
+            "type": "string",
+            "description": "the field's name, if it already has one (so a field that uses itself is caught)"
+          }
+        },
+        "required": [
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_calculated_field",
+      "description": "Save a calculated field on a mart or SQL source from a formula in the formula language (see list_formula_functions); the server checks and compiles it. Then use its name in create_chart like a column: a per-row field can be a dimension, breakdown or measure; an aggregate field only a measure.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "name": {
+            "type": "string",
+            "description": "a name of letters, digits and _ (for example profit), not a column of the source; charts pick the field by it"
+          },
+          "formula": {
+            "type": "string",
+            "description": "for example [revenue] - [cost], or Sum([revenue]) / CountDistinct([customer]); never SQL"
+          }
+        },
+        "required": [
+          "name",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_calculated_field",
+      "description": "Change the formula of a calculated field (by id from list_calculated_fields). The name stays; every chart using the field follows the new formula.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "formula": {
+            "type": "string",
+            "description": "the new formula"
+          }
+        },
+        "required": [
+          "id",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_calculated_field",
+      "description": "Delete one calculated field (by id). Refused while a chart or another field uses it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_alert_rules",
       "description": "List every alert rule (threshold alerts) and digest (scheduled summaries), with whether each is enabled.",
       "parameters": {

@@ -29,6 +29,7 @@ use thiserror::Error;
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
 use crate::click::ClickAction;
 use crate::embed_access::{self, EmbedAccess};
+use crate::fields::{self, FieldDef, SourceKind};
 use crate::filters::ColumnKind;
 use crate::grain::{Grain, TimeContext};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
@@ -655,6 +656,20 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
            id String, title String, sql String, columns_json String DEFAULT '[]',\n\
            folder_id String DEFAULT '', created_by String DEFAULT '',\n\
            created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-8: calculated fields (`crate::fields`). Same versioned-insert shape
+    // as `bi_source`; `data_type` and `level` are what the server inferred
+    // when the formula was saved. Created here and not by a Postgres
+    // migration because dashboards live in ClickHouse.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_field (\n\
+           id String, source_kind String, source_id String, name String,\n\
+           formula String, level String DEFAULT 'row', data_type String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
          ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
         None,
     )
@@ -1594,7 +1609,12 @@ fn empty_chart_input() -> ChartInput {
 /// mart itself exists in `serving.*` — split out of `spec_from_input` to
 /// keep it under clippy's line-count limit. Ports the `system.tables` /
 /// `system.columns` existence checks in `specFromInput`.
-async fn validated_mart_columns(
+///
+/// # Errors
+///
+/// [`BiError::Validation`] when the mart does not exist in `serving`,
+/// [`BiError::Clickhouse`] when the lookup fails.
+pub async fn validated_mart_columns(
     ch: &ChClient,
     mart: &str,
 ) -> Result<std::collections::HashMap<String, ColumnKind>, BiError> {
@@ -2465,6 +2485,8 @@ struct Resolved {
     from: Relation,
     cols: std::collections::HashSet<String>,
     kinds: std::collections::HashMap<String, ColumnKind>,
+    /// The source's calculated fields (`BI-8`); empty for unsaved SQL.
+    fields: Vec<FieldDef>,
 }
 
 /// The `sqlSource` id a spec built over [`InlineSql`] carries. It marks the
@@ -2498,6 +2520,7 @@ fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
         from: Relation::Sql(source.sql),
         cols,
         kinds,
+        fields: Vec::new(),
     }
 }
 
@@ -2525,6 +2548,7 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
             .iter()
             .map(|c| (c.name.clone(), ColumnKind::from_clickhouse_type(&c.ty)))
             .collect(),
+        fields: Vec::new(),
     })
 }
 
@@ -2545,7 +2569,9 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         let source = crate::sources::get_source(ch, id)
             .await?
             .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
-        return Ok(resolved_from_stored(source));
+        let mut resolved = resolved_from_stored(source);
+        resolved.fields = crate::fields::list_fields_for(ch, SourceKind::SqlSource, id).await?;
+        return Ok(resolved);
     }
     let mart = input
         .mart
@@ -2556,12 +2582,14 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
     let kinds = validated_mart_columns(ch, &mart).await?;
     let cols = kinds.keys().cloned().collect();
+    let fields = crate::fields::list_fields_for(ch, SourceKind::Mart, &mart).await?;
     Ok(Resolved {
         mart,
         sql_source: None,
         from: Relation::Mart(mart_ident),
         cols,
         kinds,
+        fields,
     })
 }
 
@@ -2807,8 +2835,18 @@ fn spec_from_resolved(
         from,
         cols,
         kinds,
+        fields,
     } = resolved;
     let has_year = cols.contains("tahun");
+    // BI-8: a chart that names a calculated field of its source is saved
+    // over the relation that carries it, so the stored SQL is a working
+    // fallback; at read time it is rebuilt from the field's current formula.
+    let (from, cols, kinds) = match fields::prepare(&fields, input, from.clone(), &kinds, time)
+        .map_err(BiError::Validation)?
+    {
+        Some(p) => (p.from, p.cols.keys().cloned().collect(), p.cols),
+        None => (from, cols, kinds),
+    };
     let agg = input
         .aggregate
         .clone()
@@ -3215,10 +3253,11 @@ mod tests {
         // the three SEC-12 `bi_board` columns (`embed_revoked_before`,
         // `embed_revoked_jti_json`, `embed_origins_json`). 17 = those 16 plus
         // the BI-18·B `bi_board.refresh_seconds` column. 18 = those 17 plus
-        // the BI-9 `bi_board.grain` column.
+        // the BI-9 `bi_board.grain` column. 19 = those 18 plus the BI-8
+        // `console.bi_field` table.
         assert_eq!(
-            first_call_requests, 18,
-            "first call should issue all 18 DDL statements"
+            first_call_requests, 19,
+            "first call should issue all 19 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -3726,6 +3765,121 @@ mod tests {
         assert_eq!(inline.spec.y, stored.spec.y);
         assert_eq!(inline.spec.mart, stored.spec.mart);
         assert_eq!(inline.spec.sql_source.as_deref(), Some(UNSAVED_SOURCE_ID));
+    }
+
+    fn stored_source_with_fields(fields: Vec<FieldDef>) -> Resolved {
+        let source = crate::sources::SqlSource {
+            id: "s_1234abcd".to_owned(),
+            title: "t".to_owned(),
+            sql: INLINE_SQL.to_owned(),
+            columns: inline_cols(),
+            folder_id: String::new(),
+            created_by: String::new(),
+            updated_at: None,
+        };
+        let mut resolved = resolved_from_stored(source);
+        resolved.fields = fields;
+        resolved
+    }
+
+    fn calc_field(name: &str, formula: &str, level: &str) -> FieldDef {
+        FieldDef {
+            id: format!("f_{name}"),
+            source_kind: SourceKind::SqlSource,
+            source_id: "s_1234abcd".to_owned(),
+            name: name.to_owned(),
+            formula: formula.to_owned(),
+            level: level.to_owned(),
+            ty: "number".to_owned(),
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    /// `BI-8`: a chart that names a calculated field is saved, its stored SQL
+    /// is the working fallback, and its stored definition names the field
+    /// only (the formula is read again at every dashboard read).
+    #[test]
+    fn a_chart_naming_a_calculated_field_is_saved_over_the_relation_that_carries_it() {
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["double"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let spec = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            stored_source_with_fields(vec![calc_field("double", "visitors * 2", "row")]),
+        )
+        .unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("(SELECT *, (visitors * 2) AS double FROM (\n"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(sum(double)) AS double"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.measures, vec!["double".to_owned()]);
+        assert!(
+            !serde_json::to_string(&spec.def)
+                .unwrap()
+                .contains("visitors * 2")
+        );
+    }
+
+    #[test]
+    fn an_aggregate_field_is_refused_as_a_dimension_and_an_unknown_name_is_still_refused() {
+        let fields =
+            || stored_source_with_fields(vec![calc_field("avg_v", "Avg(visitors)", "aggregate")]);
+        let mut input = inline_chart(&serde_json::json!({ "dimension": "avg_v" }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let err = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            fields(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("aggregate field")),
+            "{err:?}"
+        );
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["avg_v"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let ok = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            fields(),
+        )
+        .unwrap();
+        assert!(
+            ok.spec.sql.contains("avg(visitors) AS avg_v"),
+            "{}",
+            ok.spec.sql
+        );
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["nope"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        assert!(
+            spec_from_resolved(
+                &input,
+                ChartSource::Ui,
+                "ui",
+                derive_common_fields(&input, None).unwrap(),
+                geo_fields(ChartKind::Hbar, &input).unwrap(),
+                fields(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

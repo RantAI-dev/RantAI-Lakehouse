@@ -13,6 +13,8 @@ export type PreviewInputs = {
   targetBoard: string; grain: string
   /** The fields of raw tables, pivots and KPI comparisons as they would be sent (BI-16 part A). */
   tables: string
+  /** The source's calculated fields as (name, formula), so editing a formula refreshes the preview (BI-8). */
+  calc: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {

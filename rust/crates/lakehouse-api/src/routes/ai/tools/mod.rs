@@ -8,6 +8,7 @@
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
@@ -21,6 +22,7 @@
 
 mod alerts;
 mod ask;
+mod calc_fields;
 mod connectors;
 mod dashboards;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -140,6 +142,12 @@ pub(in crate::routes) async fn run_tool(
         "list_charts" => dashboards::list_charts(ch).await,
         "list_sql_sources" => dashboards::list_sql_sources(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "list_formula_functions" => calc_fields::list_formula_functions(),
+        "list_calculated_fields" => calc_fields::list_calculated_fields(state, args).await,
+        "validate_formula" => calc_fields::validate_formula(state, args).await,
+        "create_calculated_field" => calc_fields::create_calculated_field(state, args).await,
+        "update_calculated_field" => calc_fields::update_calculated_field(state, args).await,
+        "delete_calculated_field" => calc_fields::delete_calculated_field(state, args).await,
         "list_alert_rules" => alerts::list_alert_rules(ch).await,
         "create_alert_rule" => {
             alerts::create_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await

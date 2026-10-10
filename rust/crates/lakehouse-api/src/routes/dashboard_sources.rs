@@ -317,6 +317,17 @@ pub async fn delete(
     sources::delete_source(ch, &id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // BI-8: the source's calculated fields go with it (no chart uses the
+    // source any more, so none can use them).
+    let orphans =
+        lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::SqlSource, &id)
+            .await
+            .map_err(|err| classify_ch_error(&err))?;
+    for field in orphans {
+        lakehouse_bi::fields::delete_field(ch, &field.id)
+            .await
+            .map_err(|err| classify_ch_error(&err))?;
+    }
     Ok(ApiJson(json!({ "ok": true })))
 }
 

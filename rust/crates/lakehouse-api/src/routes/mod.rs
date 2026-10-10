@@ -10,6 +10,7 @@ pub(crate) mod ai;
 mod alerts;
 pub mod auth;
 mod authored_pipelines;
+mod calc_fields;
 mod catalog;
 mod catalog_governance;
 mod catalog_profile;
@@ -803,6 +804,21 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dashboard/sources/preview",
             axum::routing::post(dashboard_sources::preview),
+        )
+        .route(
+            "/api/dashboard/calc-fields",
+            get(calc_fields::list)
+                .post(calc_fields::create)
+                .put(calc_fields::update)
+                .delete(calc_fields::delete),
+        )
+        .route(
+            "/api/dashboard/calc-fields/validate",
+            axum::routing::post(calc_fields::validate),
+        )
+        .route(
+            "/api/dashboard/calc-fields/functions",
+            get(calc_fields::functions),
         )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route("/api/dashboard/records", get(dashboard::records))

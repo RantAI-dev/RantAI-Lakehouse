@@ -227,7 +227,21 @@ impl TimeContext {
     }
 
     fn in_zone(&self, column: &Ident) -> String {
-        format!("toTimeZone({column}, {})", self.zone_literal())
+        self.in_zone_expr(&column.to_string())
+    }
+
+    /// `expr` (a timestamp expression) converted to the report zone. `expr`
+    /// must already be SQL the caller built from validated parts.
+    #[must_use]
+    pub fn in_zone_expr(&self, expr: &str) -> String {
+        format!("toTimeZone({expr}, {})", self.zone_literal())
+    }
+
+    /// The current instant in the report zone, as a `DateTime` (`BI-8`
+    /// `Now()`).
+    #[must_use]
+    pub fn now_expr(&self) -> String {
+        format!("now({})", self.zone_literal())
     }
 }
 
@@ -406,9 +420,22 @@ impl Grain {
         kind: ColumnKind,
         ctx: &TimeContext,
     ) -> Option<String> {
+        self.bucket_expr_over(&column.to_string(), kind, ctx)
+    }
+
+    /// [`Self::bucket_expr`] over any date or timestamp expression `value`
+    /// (`BI-8`: `DateTrunc` in a formula uses the same buckets a chart's
+    /// grain does). `value` is SQL the caller built from validated parts.
+    #[must_use]
+    pub fn bucket_expr_over(
+        self,
+        value: &str,
+        kind: ColumnKind,
+        ctx: &TimeContext,
+    ) -> Option<String> {
         let x = match kind {
-            ColumnKind::DateTime => ctx.in_zone(column),
-            ColumnKind::Date if !self.needs_time() => column.to_string(),
+            ColumnKind::DateTime => ctx.in_zone_expr(value),
+            ColumnKind::Date if !self.needs_time() => value.to_owned(),
             _ => return None,
         };
         Some(match self {

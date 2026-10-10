@@ -452,6 +452,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PUT",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("DELETE", "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("POST",   "/api/dashboard/sources/preview", Policy::RequiresPermission("dashboard:sql")),
+    // BI-8: calculated fields. Validate and the function catalog only read
+    // (a source's column list, a fixed table); saving needs the same
+    // permission as saving a chart.
+    ("GET",    "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/calc-fields/validate", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/calc-fields/functions", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
