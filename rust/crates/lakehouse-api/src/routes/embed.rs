@@ -23,6 +23,7 @@ use crate::routes::support::{
     mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
 };
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// WS7 item D1: neither `POST /api/embed/data` nor
 /// `GET /api/public/dashboard/{token}` carries a real principal —
@@ -67,7 +68,14 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(json!({ "error": err.to_string() })),
+                ApiJson(
+                    upstream_error::report(
+                        &upstream_error::DATABASE,
+                        upstream_error::Class::Failed,
+                        &err,
+                    )
+                    .to_json(),
+                ),
             )
                 .into_response();
         }
@@ -93,7 +101,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(json!({ "error": err.to_string() })),
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
             )
                 .into_response();
         }
@@ -113,7 +121,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
@@ -156,7 +164,7 @@ pub async fn public_dashboard(
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(json!({ "error": err.to_string() })),
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
             )
                 .into_response();
         }
@@ -175,7 +183,7 @@ pub async fn public_dashboard(
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }

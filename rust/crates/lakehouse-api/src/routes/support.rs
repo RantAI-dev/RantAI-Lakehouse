@@ -8,6 +8,8 @@ use lakehouse_bi::store;
 use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Map, Value, json};
 
+use crate::upstream_error;
+
 /// Render any JSON value the way `String(x)` renders it in `TypeScript`,
 /// with `null`/missing treated as `""` (matching `String(row[name] ?? "")`
 /// in `src/app/api/catalog/[id]/route.ts`).
@@ -96,12 +98,24 @@ pub(crate) fn prettify(s: &str) -> String {
     out
 }
 
-/// Render an error the way `String(e)` renders a thrown `Error` in
-/// `TypeScript`: `"Error: <message>"`. Every ported route's outer
-/// `catch (e)` block builds its 503 body with `String(e)`.
+/// The text a route puts in an `error`/`unavailable` field when an upstream
+/// call failed: a fixed sentence and a reference id, never `err`'s own text.
+///
+/// SEC-11: this used to be `js_error`, which rendered `"Error: <message>"`
+/// the way the `TypeScript` ports did and so copied `ClickHouse`'s, Dagster's
+/// and the catalog's text into response bodies. The raw error is logged under
+/// the id instead (`upstream_error::report`). Use a typed
+/// `upstream_error::report_*` call where the caller needs the id or the
+/// unavailable/failed distinction as data; this is for the sites that only
+/// ever wanted a string.
 #[must_use]
-pub(crate) fn js_error(err: impl Display) -> String {
-    format!("Error: {err}")
+pub(crate) fn upstream_message(err: impl Display) -> String {
+    crate::upstream_error::report(
+        &crate::upstream_error::SERVICE,
+        crate::upstream_error::Class::Failed,
+        &err,
+    )
+    .to_string()
 }
 
 /// The outermost `{...}` in a model's reply, so a model that wraps its JSON
@@ -219,7 +233,11 @@ pub(crate) async fn run_spec_sql(
     let result = match try_run_spec_sql(ch, sql, roles, placeholders, obligations).await {
         Ok(result) => result,
         Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
-        Err(SpecRunFailure::Clickhouse(err)) => json!({ "error": err.to_string() }),
+        // SEC-11: a tile on a public or embed link is read by someone with
+        // no sign-in; the database's text goes to the log under the id.
+        Err(SpecRunFailure::Clickhouse(err)) => {
+            upstream_error::report_ch(&upstream_error::TILE, &err).to_json()
+        }
     };
     (id.to_owned(), result)
 }
@@ -461,8 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn js_error_formats_like_string_of_error() {
-        assert_eq!(js_error("bad sql"), "Error: bad sql");
+    fn upstream_message_never_repeats_the_error_text() {
+        let text = upstream_message("planted-marker-bad-sql");
+        assert!(!text.contains("planted-marker-bad-sql"), "{text}");
+        assert!(text.contains("Reference: "), "{text}");
     }
 }
 
@@ -587,6 +607,73 @@ mod run_spec_sql_enforcement {
                     .contains("replaceRegexpOne(toString(`email`)")),
             "expected ClickHouse to receive the masked/rewritten query, never the raw one"
         );
+        Ok(())
+    }
+
+    /// SEC-11: a tile whose `ClickHouse` query fails shows a fixed message
+    /// and a reference id, never the database's own text (which names
+    /// tables and carries the server version, and reaches public and embed
+    /// links that have no sign-in).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failing_tile_query_reports_a_fixed_message_and_a_reference(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 999. DB::Exception: planted-marker-table-x (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let (id, val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT 1 AS n",
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        assert_eq!(id, "chart1");
+        assert_eq!(val["error"], "This chart could not be loaded.");
+        assert!(
+            val["errorId"].as_str().is_some_and(|r| r.len() == 10),
+            "{val:?}"
+        );
+        assert!(
+            !val.to_string().contains("planted-marker"),
+            "the database's text reached the tile: {val:?}"
+        );
+        Ok(())
+    }
+
+    /// SEC-11: an unreachable `ClickHouse` is "unavailable", not "failed"
+    /// (the wording and the status differ).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unreachable_database_reports_the_unavailable_message(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let (_id, val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT 1 AS n",
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+        assert_eq!(val["error"], "The database is unavailable.");
+        assert!(val["errorId"].is_string(), "{val:?}");
         Ok(())
     }
 

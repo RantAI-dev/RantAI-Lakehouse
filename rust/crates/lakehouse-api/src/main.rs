@@ -41,6 +41,7 @@ mod upload_parquet;
 mod upload_parse;
 mod upload_store;
 mod upload_workbook;
+mod upstream_error;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;

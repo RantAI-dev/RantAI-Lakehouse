@@ -235,7 +235,11 @@ pub(super) async fn dry_run_sql(ch: &ChClient, args: &Map<String, Value>) -> Val
     let body = match ch.raw_bytes(&format!("EXPLAIN AST {sql}"), None).await {
         Ok(b) => b,
         Err(err) => {
-            return json!({ "error": format!("the query could not be parsed: {}", clean_sql_error(&err.to_string())) });
+            // SEC-11: ClickHouse's parse message echoes the statement and the
+            // server version; the assistant gets a fixed message and a
+            // reference, the log gets the text.
+            return crate::upstream_error::report_ch(&crate::upstream_error::DATABASE, &err)
+                .to_json();
         }
     };
     let text = String::from_utf8_lossy(&body);
@@ -563,7 +567,9 @@ pub(super) async fn get_quality(ch: &ChClient) -> Value {
             "reason": "no data quality checks have been run yet: there are no quality results to report",
             "hint": "list_quality_rules shows the quality rules that are defined",
         }),
-        Err(_) => json!({ "error": "the quality results could not be read from ClickHouse" }),
+        Err(err) => {
+            crate::upstream_error::report_ch(&crate::upstream_error::DATABASE, &err).to_json()
+        }
     }
 }
 
@@ -661,6 +667,27 @@ mod dry_run {
             dry_run_sql(&ch, &args).await,
             json!({"error": "only SELECT is allowed (EXPLAIN AST reported unknown)"})
         );
+    }
+
+    /// SEC-11: the parse step's `ClickHouse` error is not relayed to the
+    /// model; it gets a fixed message and a reference id.
+    #[tokio::test]
+    async fn run_sql_dry_run_hides_a_clickhouse_parse_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "Code: 62. DB::Exception: Syntax error near planted-marker-token (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELEC 1"));
+        let result = dry_run_sql(&ch, &args).await;
+        let text = result.to_string();
+        assert!(!text.contains("planted-marker"), "{text}");
+        assert!(!text.contains("version 0.0.0"), "{text}");
+        assert!(result["errorId"].is_string(), "{text}");
     }
 
     #[tokio::test]

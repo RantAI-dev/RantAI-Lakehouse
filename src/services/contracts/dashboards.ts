@@ -123,3 +123,13 @@ export type DashboardFolder = {
   createdBy: string
   updatedAt?: string
 }
+
+/**
+ * A tile (or an assistant tool) that failed. `error` is a fixed sentence the
+ * server wrote; the database's own text never reaches it (SEC-11). `errorId`
+ * is the reference under which the server logged the raw error, present when
+ * the failure came from an upstream and absent for a message the product
+ * wrote itself (a refused statement, a deleted source). Mirrors
+ * `rust/crates/lakehouse-api/src/upstream_error.rs` (`UpstreamFailure::to_json`).
+ */
+export type TileFailure = { error: string; errorId?: string }

@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 
 use super::arg_str;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// Deserializes `args` directly into [`AlertRuleInput`] — its fields
 /// (`name`, `type`, `mart`, `measure`, `agg`, `op`, `threshold`, `board`,
@@ -44,7 +45,7 @@ fn parse_input(args: &Map<String, Value>) -> AlertRuleInput {
 pub(super) async fn list_alert_rules(ch: &ChClient) -> Value {
     match lakehouse_alerts::list_rules(ch).await {
         Ok(rules) => json!({ "rules": rules }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -52,7 +53,7 @@ pub(super) async fn create_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
     let input = parse_input(args);
     match lakehouse_alerts::save_rule(ch, &input, None).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -64,7 +65,7 @@ pub(super) async fn update_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
     let input = parse_input(args);
     match lakehouse_alerts::save_rule(ch, &input, Some(&id)).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -75,7 +76,7 @@ pub(super) async fn delete_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
     }
     match lakehouse_alerts::delete_rule(ch, &id).await {
         Ok(()) => json!({ "ok": true }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -122,7 +123,7 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     .await
     {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -137,6 +138,59 @@ mod tests {
 
     fn state() -> AppState {
         AppState::new(Config::from_map(&HashMap::new()).unwrap())
+    }
+
+    /// SEC-11: a `ClickHouse` that fails every request with a planted marker.
+    async fn failing_clickhouse() -> (wiremock::MockServer, ChClient) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 60. DB::Exception: Table planted-marker-table-x doesn't exist (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        (server, ch)
+    }
+
+    fn assert_fixed_failure(result: &Value) {
+        let text = result.to_string();
+        assert!(
+            !text.contains("planted-marker"),
+            "database text leaked: {text}"
+        );
+        assert!(!text.contains("version 0.0.0"), "{text}");
+        assert!(result["errorId"].is_string(), "no reference id: {text}");
+        assert_eq!(result["error"], "The database request failed.");
+    }
+
+    #[tokio::test]
+    async fn a_failing_alert_tool_reports_a_fixed_message_and_a_reference() {
+        let (_server, ch) = failing_clickhouse().await;
+        assert_fixed_failure(&list_alert_rules(&ch).await);
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("r1"));
+        assert_fixed_failure(&delete_alert_rule(&ch, &args).await);
+    }
+
+    /// Validation text in `AlertError` is ours and stays as written.
+    #[tokio::test]
+    async fn an_alert_validation_failure_keeps_its_own_message() {
+        // `save_rule` ensures its table first, then validates; a healthy
+        // `ClickHouse` gets us to the validation message.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let result = create_alert_rule(&ch, &Map::new()).await;
+        assert!(result["error"].is_string(), "{result}");
+        assert!(result.get("errorId").is_none(), "{result}");
     }
 
     #[tokio::test]

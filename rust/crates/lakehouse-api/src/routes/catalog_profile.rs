@@ -43,6 +43,7 @@ use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::query::rewrite_sql_for_principal;
 use crate::routes::support::str_col;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// The most rows one profile reads. Enough for stable null fractions and
 /// cardinality estimates; small enough that opening an asset page never
@@ -269,7 +270,9 @@ pub(crate) async fn resolve_source(
 ) -> Result<Option<ReadSource>, ApiError> {
     if id.starts_with("silver.") || id.starts_with("serving.") {
         let (db, table) = split_db_table(id);
-        return Ok(catalog_source::clickhouse_source(&state.clickhouse, &db, &table).await?);
+        return catalog_source::clickhouse_source(&state.clickhouse, &db, &table)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e));
     }
     let slug = SqlLiteral::from(id);
     let sql = format!(
@@ -277,11 +280,17 @@ pub(crate) async fn resolve_source(
          UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_sync` WHERE slug = {slug}
          LIMIT 1"
     );
-    let rows = state.clickhouse.rows(&sql, None).await?;
+    let rows = state
+        .clickhouse
+        .rows(&sql, None)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let Some(row) = rows.first() else {
         return Err(ApiError::NotFound("Asset not found".to_owned()));
     };
-    Ok(catalog_source::bronze_source(state, str_col(row, "table_name")).await?)
+    catalog_source::bronze_source(state, str_col(row, "table_name"))
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))
 }
 
 /// `GET /api/catalog/{id}/profile` — see the module doc.
@@ -327,7 +336,11 @@ pub async fn profile(
         &principal,
     )
     .await?;
-    let result = state.clickhouse.query(&sql, None).await?;
+    let result = state
+        .clickhouse
+        .query(&sql, None)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let Some(row) = result.data.first() else {
         return Err(ApiError::Internal("profile returned no row".to_owned()).into());
     };

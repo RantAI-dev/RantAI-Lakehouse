@@ -32,6 +32,7 @@ use crate::routes::support::{
     strip_non_ident,
 };
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── GET /api/dashboard ──────────────────────────────────────────────────
 
@@ -81,7 +82,7 @@ pub async fn get(
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
@@ -119,7 +120,8 @@ async fn get_body(
         match tokio::try_join!(store::list_stored_charts(ch), store::list_boards(ch)) {
             Ok(v) => v,
             Err(err) => {
-                store_error = Some(format!("Error: {err}"));
+                store_error =
+                    Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
                 (Vec::new(), Vec::new())
             }
         };
@@ -129,7 +131,9 @@ async fn get_body(
         store::get_board(ch, store::DEFAULT_BOARD_ID)
             .await
             .unwrap_or_else(|err| {
-                store_error.get_or_insert_with(|| format!("Error: {err}"));
+                store_error.get_or_insert_with(|| {
+                    upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string()
+                });
                 None
             })
     } else {
@@ -268,7 +272,7 @@ pub async fn specs_list(State(state): State<AppState>) -> Response {
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
@@ -299,10 +303,16 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
     let input = parse_chart_input(&body)?;
     let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     store::insert_chart(&state.clickhouse, &spec)
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::BadRequest,
+            )
+        })?;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -324,7 +334,7 @@ pub async fn specs_preview(
     let input = parse_chart_input(&body)?;
     let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -382,10 +392,16 @@ pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResu
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", Some(id))
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     store::insert_chart(&state.clickhouse, &spec)
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::BadRequest,
+            )
+        })?;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -414,7 +430,13 @@ pub async fn specs_delete(
     };
     store::delete_chart(&state.clickhouse, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -435,7 +457,7 @@ pub async fn boards_list(State(state): State<AppState>) -> Response {
             Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiJson(json!({ "error": err.to_string() })),
+                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
                 )
                     .into_response();
             }
@@ -525,7 +547,7 @@ pub async fn boards_create(
         )
         .await
     }
-    .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     if !folder_id.is_empty() {
         store::move_board(&state.clickhouse, &board.id, &folder_id)
             .await
@@ -602,22 +624,34 @@ pub async fn boards_update(
     if let Some(name) = &parsed.name {
         store::rename_board(ch, &id, name)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     if let Some(description) = &parsed.description {
         store::describe_board(ch, &id, description)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    &err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })?;
     }
     if let Some(filters) = &parsed.filters {
         store::update_board_filters(ch, &id, filters)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    &err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })?;
     }
     if let Some(folder_id) = &parsed.folder_id {
         let folder_id = folder_id.trim();
@@ -629,13 +663,13 @@ pub async fn boards_update(
     if let Some(public) = parsed.public {
         let token = store::set_board_public(ch, &id, public)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
         return Ok(ApiJson(json!({ "ok": true, "publicToken": token })));
     }
     if let Some(embed) = parsed.embed {
         let enabled = store::set_board_embed(ch, &id, embed)
             .await
-            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
         return Ok(ApiJson(json!({ "ok": true, "embedEnabled": enabled })));
     }
     Ok(ApiJson(json!({ "ok": true })))
@@ -656,7 +690,13 @@ pub async fn boards_delete(
     }
     store::delete_board(&state.clickhouse, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -686,7 +726,7 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
@@ -849,21 +889,21 @@ pub async fn records(
     .map_err(Into::into)
 }
 
+/// Fixed words for the dashboard's data routes (drill-down, filter values,
+/// SQL-source fields).
+const DASHBOARD_QUERY: upstream_error::Context = upstream_error::Context::new(
+    "dashboard query",
+    "The dashboard query failed.",
+    "ClickHouse is unavailable.",
+);
+
 /// Classifies a `ClickHouse` failure on the dashboard's data routes
 /// (drill-down, filter values, SQL-source fields) without forwarding its
 /// text (AGENTS.md principle 4): a server-side error is a fixed 422,
-/// anything else a fixed 503; the real detail is only logged.
+/// anything else a fixed 503, both with a reference id; the real detail is
+/// only logged.
 fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
-    match err {
-        lakehouse_clickhouse::ChError::Server(_) => {
-            tracing::warn!(%err, "dashboard query failed");
-            ApiError::Unprocessable("dashboard query failed".to_owned())
-        }
-        lakehouse_clickhouse::ChError::Transport(_) | lakehouse_clickhouse::ChError::Cancelled => {
-            tracing::warn!(%err, "clickhouse unreachable for a dashboard query");
-            ApiError::Unavailable("clickhouse unavailable".to_owned())
-        }
-    }
+    upstream_error::ch_error(&DASHBOARD_QUERY, err)
 }
 
 /// [`records`]' body, taking the principal's roles and placeholders
@@ -1066,7 +1106,13 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
         store::list_boards(&state.clickhouse),
         store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID)
     )
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?;
 
     let mut out = String::new();
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
@@ -1323,7 +1369,7 @@ pub async fn embed_info(
             .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
+            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
@@ -1636,7 +1682,8 @@ mod records_enforcement {
             "ClickHouse's own text leaked: {text}"
         );
         assert!(
-            matches!(err, ApiError::Unprocessable(ref m) if m == "dashboard query failed"),
+            // SEC-11: the fixed message now carries a reference id after it.
+            matches!(err, ApiError::Unprocessable(ref m) if m.starts_with("The dashboard query failed. Reference: ")),
             "expected the fixed 422, got {err:?}"
         );
         Ok(())

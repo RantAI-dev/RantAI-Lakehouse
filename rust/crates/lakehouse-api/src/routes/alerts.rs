@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// `GET /api/alerts` — list every alert & digest rule.
 ///
@@ -43,7 +44,13 @@ use crate::state::AppState;
 pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_alerts::list_rules(&state.clickhouse)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     Ok(ApiJson(json!({ "rules": rules })))
 }
 
@@ -77,7 +84,10 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<Api
     let input = parse_body(&body)?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, None)
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::alert(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::BadRequest)
+        })?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -94,7 +104,10 @@ pub async fn update(State(state): State<AppState>, body: Bytes) -> ApiResult<Api
     };
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id))
         .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::alert(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::BadRequest)
+        })?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -120,7 +133,13 @@ pub async fn delete(
     };
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -524,7 +543,13 @@ pub async fn run(
         &gate,
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?;
 
     // Persist every fired, non-Digest result as an `alert_instance` row,
     // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
@@ -781,7 +806,7 @@ async fn evaluate_late_pass(
             Some(now),
         )
         .await
-        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        .map_err(|err| late_error(&err))?;
         if decision != Some(true) {
             continue;
         }
@@ -817,7 +842,7 @@ async fn evaluate_late_pass(
             Some(now),
         )
         .await
-        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        .map_err(|err| late_error(&err))?;
         delivered_pipelines += 1;
     }
     Ok(delivered_pipelines)
@@ -829,6 +854,21 @@ async fn evaluate_late_pass(
 // pass (a broken clock means we cannot make a "late" claim, and the
 // alternative — `Some(0.0)` "late since 1970" — is exactly the bug this
 // helper exists to prevent).
+
+/// A [`lakehouse_alerts::PipelineLateError`] as a `500`: the `ClickHouse`
+/// listing failure is reported (SEC-11); the `LateSource` message is already
+/// classified by the source before the alerts crate sees it (its doc comment),
+/// so it is ours.
+fn late_error(err: &lakehouse_alerts::PipelineLateError) -> ApiError {
+    match err {
+        lakehouse_alerts::PipelineLateError::ListRules(ch) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            ch,
+            upstream_error::FailedAs::Internal,
+        ),
+        lakehouse_alerts::PipelineLateError::Source(message) => ApiError::Internal(message.clone()),
+    }
+}
 
 #[cfg(test)]
 mod tests {

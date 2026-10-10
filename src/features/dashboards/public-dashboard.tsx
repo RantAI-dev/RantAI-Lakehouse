@@ -7,8 +7,9 @@ import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   board: { id: string; name: string };
   layout: LayoutMap;

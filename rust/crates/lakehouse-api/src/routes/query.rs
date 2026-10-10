@@ -26,6 +26,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// The `{sql}` request body both routes accept.
 #[derive(Debug, Deserialize)]
@@ -167,7 +168,17 @@ async fn execute_query_against_engine(
         let (columns, rows) = trino_result_to_rows(&result);
         Ok((columns, rows, elapsed_ms(started), 0))
     } else {
-        let result = state.clickhouse.query(sql, None).await?;
+        // SEC-11, query-author exception (product owner, 2026-10-10): the
+        // signed-in author of this statement, holding `query:read`, gets the
+        // engine's diagnosis of it (version and addresses trimmed); the full
+        // text is logged under the reference. An unreachable engine or a
+        // non-query failure stays the fixed message. See
+        // `upstream_error::ch_error_for_author`.
+        let result = state
+            .clickhouse
+            .query(sql, None)
+            .await
+            .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
 
         let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
         let rows: Vec<Value> = result
@@ -420,16 +431,24 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
 
 /// Map a [`TrinoError`] to the [`ApiError`] `run` returns.
 ///
-/// [`TrinoError::Query`]'s message is forwarded verbatim — the ONE place
-/// this crate lets `Trino`'s own text reach a response, because the caller
-/// reading it is the same principal whose own `SQL` produced it (the exact
-/// posture `lakehouse_trino`'s crate doc comment documents as safe).
-/// Every other variant is classified into a fixed message before it
-/// reaches the caller, per this repository's "upstream error text never
-/// reaches a response" rule.
+/// SEC-11: [`TrinoError::Query`] is the one variant whose engine text
+/// reaches the caller, trimmed and with a reference id (the query-author
+/// exception, product owner decision 2026-10-10: the person who wrote the
+/// statement is entitled to the engine's diagnosis of it). Timeouts,
+/// transport and HTTP failures stay fixed messages.
 fn map_trino_error(err: TrinoError) -> ApiError {
     match err {
-        TrinoError::Query(msg) => ApiError::Unprocessable(msg),
+        // SEC-11, query-author exception (product owner, 2026-10-10): `Query`
+        // is Trino answering that the statement is wrong, and this route's
+        // caller wrote the statement; trimmed, with the reference.
+        TrinoError::Query(msg) => upstream_error::query_error_for_author(
+            &upstream_error::Context::new(
+                "trino query",
+                "The Trino query failed.",
+                "Trino is unavailable.",
+            ),
+            &msg,
+        ),
         TrinoError::Timeout => ApiError::Unavailable("trino query timed out".to_owned()),
         TrinoError::Transport(_) | TrinoError::HttpStatus(_) => {
             ApiError::Unavailable("trino unavailable".to_owned())
@@ -697,23 +716,19 @@ fn escape_literal(value: &str) -> String {
 }
 
 /// Runs `EXPLAIN ESTIMATE <sql>` (with any trailing `;` stripped) and
-/// tallies `estimatedBytes`/`sources` from the result rows, or returns
-/// what `ClickHouse` said about why it could not plan the statement.
+/// tallies `estimatedBytes`/`sources` from the result rows, or returns a
+/// fixed message and a reference id when `ClickHouse` could not plan the
+/// statement.
 async fn estimate_body(ch: &ChClient, sql: &str) -> Result<(i64, Vec<String>), String> {
     let trimmed = strip_trailing_semicolon(sql);
     let query = format!("EXPLAIN ESTIMATE {trimmed}");
-    let result = ch.query(&query, None).await.map_err(|err| {
-        // Just the first line: ClickHouse follows its message with a stack
-        // of internal context nobody reading the console needs.
-        let message = err.to_string();
-        message
-            .lines()
-            .next()
-            .unwrap_or("could not plan this query")
-            .chars()
-            .take(240)
-            .collect::<String>()
-    })?;
+    // SEC-11, query-author exception (product owner, 2026-10-10): the editor
+    // shows the author the planner's diagnosis of their own statement,
+    // trimmed; an outage stays the fixed message.
+    let result = ch
+        .query(&query, None)
+        .await
+        .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))?;
     let mut estimated_bytes: i64 = 0;
     let mut sources = Vec::new();
     for row in &result.data {
@@ -1553,10 +1568,17 @@ mod tests {
         }
 
         #[test]
-        fn maps_query_error_to_422_forwarding_the_message_verbatim() {
-            let err = map_trino_error(TrinoError::Query("line 1:1: mismatched input".to_owned()));
+        fn maps_query_error_to_422_with_the_engines_diagnosis_and_a_reference() {
+            // SEC-11 query-author exception: the author sees the engine's
+            // message for their own statement, trimmed, with a reference.
+            let err = map_trino_error(TrinoError::Query(
+                "line 1:1: mismatched input 'x' at trino-1.internal:8080".to_owned(),
+            ));
             assert_eq!(err.status(), 422);
-            assert!(err.to_string().contains("mismatched input"));
+            let text = err.to_string();
+            assert!(text.contains("line 1:1: mismatched input"), "{text}");
+            assert!(text.contains(" Reference: "), "{text}");
+            assert!(!text.contains("trino-1.internal"), "{text}");
         }
 
         #[test]

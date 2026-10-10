@@ -39,6 +39,7 @@ import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } f
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { TileBody } from "./tile-body";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
 type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
@@ -51,7 +52,7 @@ export type ChartDef = {
 type BoardOpt = { id: string; name: string };
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
-  result: { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+  result: { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 };
 
 /**

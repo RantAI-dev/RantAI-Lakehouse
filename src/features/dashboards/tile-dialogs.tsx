@@ -7,9 +7,10 @@ import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import { TileBody } from "./tile-body";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
 export type Rows = { columns: string[]; rows: Record<string, unknown>[] };
-export type Cell = Rows | { error: string };
+export type Cell = Rows | TileFailure;
 
 export function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
