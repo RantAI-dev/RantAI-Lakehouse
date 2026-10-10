@@ -36,6 +36,8 @@ base64 = { workspace = true }
 # entry's comment on why this needed adding: it was not already a direct
 # dependency of this crate, only a transitive one via `reqwest`.
 url = { workspace = true }
+# `internal_hosts`: the connector SSRF allowlist's networks.
+ipnet = { workspace = true }
 # `routes::alerts::ApiFreshnessSource`/`ApiSilenceSource` (WS5 item C1)
 # implement `lakehouse_alerts::FreshnessSource`/`SilenceSource`, both
 # `#[async_trait::async_trait]` at their definition site -- any impl
@@ -94,6 +96,13 @@ sqlparser = { workspace = true, features = ["visitor"] }
 # dependency of something else in the tree, but this is the first direct
 # use of it in this crate (WS4 item G2).
 chrono = "0.4"
+# Reads `.xls` and `.xlsx` for the file upload (`upload_workbook`, ADR 0014,
+# amendment of 2026-10-07). MIT; it adds `atoi_simd`, `codepage`,
+# `debug_unsafe`, `fast-float2`, `typed-path`, `zip` and `zopfli` to the
+# lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
+# features: dates are rendered from its date components, so its `chrono`
+# feature is not needed.
+calamine = "0.36"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
@@ -109,6 +118,12 @@ object_store = { version = "0.14", features = ["aws"] }
 # happen in one place at a time.
 arrow-array = "58"
 arrow-schema = "58"
+# Reads `.parquet` for the file upload (`upload_parquet`, ADR 0014, amendment
+# of 2026-10-08). The same crate and the same default features
+# `lakehouse-iceberg` already uses (so the lockfile gains no crate and no
+# licence); declared here because the upload's reader is the API's own, not
+# routed through the Iceberg crate.
+parquet = "58"
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
@@ -120,6 +135,13 @@ tiberius = { version = "0.13", default-features = false, features = ["tds73", "r
 # `tokio_util::io::ReaderStream` turns `routes::ai::stream_chat`'s
 # `tokio::io::duplex` reader into the `POST /api/ai/chat` NDJSON body.
 tokio-util = { workspace = true, features = ["compat", "io"] }
+# SEC-15: `connector_probe`'s S3 test hands `object_store` a pinned HTTP
+# client (an `HttpConnector`), and `object_store` 0.14 is built on
+# `reqwest` 0.13 while the rest of this crate is on 0.12, so the client must
+# be a 0.13 one to be accepted. Same version `object_store` already pulls
+# (one copy in `Cargo.lock`); no TLS provider of its own beyond the `rustls`
+# feature `object_store`'s `aws` feature already turns on for it.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

@@ -40,6 +40,9 @@ use serde_json::{Map, Value, json};
 
 use crate::state::AppState;
 
+// One more record: what each table was last built from (see the module).
+mod builds;
+
 /// Most nodes one response carries, so a focus on a hub table cannot
 /// return the whole warehouse.
 const MAX_NODES: usize = 150;
@@ -124,6 +127,7 @@ async fn add_shared(state: &AppState, g: &mut Graph) {
     add_tables_and_views(ch, g).await;
     add_catalog(ch, g).await;
     add_exports(ch, g).await;
+    builds::add(ch, g).await;
 }
 
 /// `silver`/`serving` tables, and each view's edges from the tables its
@@ -417,9 +421,10 @@ pub(crate) async fn build(
         )),
     }
     add_tenant_owned(state, tenant, &mut g).await;
+    builds::drop_repeats(&mut g);
     g.coverage.push(
-        "only edges the platform recorded are drawn; a table loaded by a job outside the \
-         platform has no incoming edge"
+        "only recorded edges are drawn; what a table is built from is read from the statement \
+         that last wrote it, so a table filled some other way has no incoming edge"
             .to_owned(),
     );
 

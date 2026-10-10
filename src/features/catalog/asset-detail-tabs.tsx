@@ -1,462 +1,169 @@
 "use client"
 
-import Link from "next/link"
-import { EmptyState, ErrorState } from "@/components/patterns/page-states"
-import { SectionCard } from "@/components/patterns/section-card"
-import { CheckBadge, Pill } from "@/components/patterns/status-badge"
-import { Button } from "@/components/ui/button"
+import * as React from "react"
+import { usePathname, useSearchParams } from "next/navigation"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useService } from "@/hooks/use-service"
-import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
+  Activity,
+  BadgeCheck,
+  Columns3,
+  GitFork,
+  LayoutGrid,
+  Rows3,
+  ShieldCheck,
+  type LucideIcon,
+} from "lucide-react"
 import {
-  isIcebergCandidate,
-  lakehouseTableHref,
-  snapshotRelativeTime,
-  snapshotsNewestFirst,
-} from "@/lib/lakehouse-view"
-import { fmtMeasured } from "@/lib/measured"
-import { lakehouseService } from "@/services"
-import { cn } from "@/lib/utils"
+  keepStripInView,
+  LineTabsList,
+  type LineTab,
+  type LineTabCount,
+} from "@/components/patterns/line-tabs"
+import { Tabs, TabsContent } from "@/components/ui/tabs"
 import type { AssetDetail } from "@/services/contracts/assets"
+import { AssetAccess } from "./asset-access"
+import { AssetActivity } from "./asset-activity"
+import {
+  AssetLineage,
+  lineageCount,
+  useAssetLineage,
+  type AssetLineageState,
+} from "./asset-lineage"
+import { AssetOverview, type AssetTab } from "./asset-overview"
+import { AssetQuality } from "./asset-quality"
+import { AssetSample } from "./asset-sample"
+import { AssetSchema } from "./asset-schema"
+import { useIcebergTable } from "./asset-storage"
 
-function QuietEmpty({ title }: { title: string }) {
-  return <EmptyState title={title} className="py-4" />
+/** The seven tabs, in order. `?tab=` names any but the first. */
+const TABS: { value: AssetTab; label: string; icon: LucideIcon }[] = [
+  { value: "overview", label: "Overview", icon: LayoutGrid },
+  { value: "schema", label: "Schema", icon: Columns3 },
+  { value: "sample", label: "Sample", icon: Rows3 },
+  { value: "quality", label: "Quality", icon: BadgeCheck },
+  { value: "access", label: "Access", icon: ShieldCheck },
+  { value: "lineage", label: "Lineage", icon: GitFork },
+  { value: "activity", label: "Activity", icon: Activity },
+]
+
+function parseTab(raw: string | null): AssetTab {
+  return TABS.find((t) => t.value === raw)?.value ?? "overview"
 }
 
 /**
- * Iceberg snapshots for a Bronze asset whose registry `tableName` may or
- * may not name a real Bronze Iceberg table (see the module comment
- * above `iceberg_candidates` in `catalog.rs`). A `not_found` result means
- * this asset's `tableName` does not exist in the `bronze` namespace — a
- * quiet empty state, not an error. A separate child component, because
- * `useService` cannot be called conditionally in the parent.
+ * The count a tab carries, or `null` for one with nothing to count: the
+ * overview summarizes, a sample is always a handful of rows, and activity
+ * mixes snapshots, changes and usage into no single number.
  */
-function IcebergSnapshots({ tableName }: { tableName: string }) {
-  const state = useService(
-    (s) => lakehouseService.getTableDetail("bronze", tableName, s),
-    [tableName]
-  )
-
-  if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
-  if (state.status === "error") {
-    if (state.error.code === "not_found") {
-      return <QuietEmpty title="No Iceberg table for this asset" />
+function tabCount(
+  a: AssetDetail,
+  lineage: AssetLineageState,
+  tab: AssetTab
+): LineTabCount | null {
+  switch (tab) {
+    case "schema":
+      return { count: a.schema.length }
+    case "quality": {
+      const failed = a.qualityChecks.some((q) => q.status === "failed")
+      const warning = a.qualityChecks.some((q) => q.status === "warning")
+      return {
+        count: a.qualityChecks.length,
+        tone: failed ? "danger" : warning ? "warning" : undefined,
+      }
     }
-    return <ErrorState error={state.error} onRetry={state.reload} />
+    case "access":
+      return { count: a.policySummary.length }
+    case "lineage":
+      // No number until the graph is in: a count that jumps reads as a change.
+      return lineage.status === "loading" ? null : { count: lineageCount(a, lineage) }
+    default:
+      return null
   }
-
-  const snapshots = snapshotsNewestFirst(state.data.snapshots)
-  if (snapshots.length === 0) return <QuietEmpty title="No snapshots for this asset" />
-
-  return (
-    <div className="flex flex-col gap-2">
-    <ul className="divide-y divide-border text-sm">
-      {snapshots.map((s) => (
-        <li key={s.id} className="flex justify-between gap-2 py-1.5">
-          <span>{s.operation}</span>
-          <span className="text-muted-foreground">
-            {snapshotRelativeTime(s.timestampMs)} ·{" "}
-            {fmtMeasured(s.summary.totalRecords, formatCompactNumber)} records
-          </span>
-        </li>
-      ))}
-    </ul>
-      {/* Schema field ids, partition spec, the full snapshot log and the
-          maintenance policy live on the Iceberg table page, which has no
-          nav entry of its own since the Tables page folded into Table
-          Maintenance. */}
-      <Link
-        href={lakehouseTableHref("bronze", tableName)}
-        className="self-start text-sm text-primary hover:underline"
-      >
-        Iceberg details
-      </Link>
-    </div>
-  )
 }
 
 /**
- * A tab label carrying how much is behind it.
- *
- * Nine tabs with nothing to distinguish them means opening each one to find
- * out which are empty; the count says so before the click, and a zero is
- * dimmed so the eye skips it.
+ * Tab strip for the asset detail page. The open tab lives in `?tab=`, so a
+ * refresh or a shared link lands on it.
  */
-function TabLabel({ label, count }: { label: string; count: number }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      {label}
-      <span
-        className={cn(
-          "text-[11px] tabular-nums",
-          count === 0 ? "text-muted-foreground/50" : "text-muted-foreground"
-        )}
-      >
-        {count}
-      </span>
-    </span>
-  )
-}
-
-function dependentHref(id: string, kind: string) {
-  if (kind.toLowerCase().includes("pipeline")) return `/pipelines/${id}`
-  if (kind.toLowerCase().includes("agent")) return `/agents/employees/${id}`
-  if (kind.toLowerCase().includes("dashboard") || kind.toLowerCase().includes("query")) {
-    return `/query-studio?saved=${id}`
+export function AssetDetailTabs({
+  asset: a,
+  onAssetChanged,
+}: {
+  asset: AssetDetail
+  /** Reloads the asset after something on a tab changed it. */
+  onAssetChanged: () => void
+}) {
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const urlTab = parseTab(searchParams.get("tab"))
+  const [tab, setTab] = React.useState<AssetTab>(urlTab)
+  // A link to another `?tab=` of this same page changes only the URL: the
+  // page stays mounted, so the URL's tab is taken over here, during render.
+  const [seenUrlTab, setSeenUrlTab] = React.useState(urlTab)
+  if (urlTab !== seenUrlTab) {
+    setSeenUrlTab(urlTab)
+    setTab(urlTab)
   }
-  return `/data/assets/${id}`
-}
+  const rootRef = React.useRef<HTMLDivElement>(null)
+  const iceberg = useIcebergTable(a)
+  const lineage = useAssetLineage(a)
 
-/** Tab strip for the asset detail page: schema, sample, quality, and metadata. */
-export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
-  const sampleColumns = Object.keys(a.sample[0] ?? {})
+  const selectTab = React.useCallback(
+    (next: AssetTab) => {
+      setTab(next)
+      const params = new URLSearchParams(searchParams.toString())
+      if (next === "overview") params.delete("tab")
+      else params.set("tab", next)
+      const query = params.toString()
+      // The History API rather than the router: Next keeps
+      // `useSearchParams` in step with it, and a tab switch needs no
+      // server round trip.
+      window.history.replaceState(null, "", query ? `${pathname}?${query}` : pathname)
+      keepStripInView(rootRef.current)
+    },
+    [pathname, searchParams]
+  )
+
+  const stripTabs: LineTab[] = TABS.map((t) => ({ ...t, count: tabCount(a, lineage, t.value) }))
 
   return (
-    <Tabs defaultValue="schema" className="gap-1.5">
-      <TabsList>
-        <TabsTrigger value="schema">
-          <TabLabel label="Schema" count={a.schema.length} />
-        </TabsTrigger>
-        <TabsTrigger value="sample">
-          <TabLabel label="Sample" count={a.sample.length} />
-        </TabsTrigger>
-        <TabsTrigger value="quality">
-          <TabLabel label="Quality" count={a.qualityChecks.length} />
-        </TabsTrigger>
-        <TabsTrigger value="policies">
-          <TabLabel label="Policies" count={a.policySummary.length} />
-        </TabsTrigger>
-        <TabsTrigger value="lineage">
-          {/* Both directions in one number: the tab shows upstream and
-              downstream together. */}
-          <TabLabel
-            label="Lineage"
-            count={a.upstream.length + a.downstream.length}
+    <div ref={rootRef}>
+      <Tabs value={tab} onValueChange={(v) => selectTab(v as AssetTab)} className="gap-3">
+        <LineTabsList tabs={stripTabs} active={tab} />
+
+        <TabsContent value="overview">
+          <AssetOverview
+            asset={a}
+            iceberg={iceberg}
+            lineage={lineage}
+            onNavigate={selectTab}
+            onAssetChanged={onAssetChanged}
           />
-        </TabsTrigger>
-        <TabsTrigger value="dependents">
-          <TabLabel label="Dependents" count={a.dependents.length} />
-        </TabsTrigger>
-        <TabsTrigger value="history">
-          <TabLabel label="History" count={a.changeHistory.length} />
-        </TabsTrigger>
-        <TabsTrigger value="snapshots">
-          <TabLabel label="Snapshots" count={a.snapshots.length} />
-        </TabsTrigger>
-        {/* Usage has no list to count — it is one summary line plus recent
-            queries, which are shown inside. */}
-        <TabsTrigger value="usage">Usage</TabsTrigger>
-      </TabsList>
+        </TabsContent>
 
-      <TabsContent value="schema" className="mt-2 flex flex-col gap-2">
-        <SectionCard size="sm" title="Columns">
-          {a.schema.length === 0 ? (
-            <QuietEmpty title="No columns registered" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.schema.map((c) => (
-                <li key={c.name} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 py-1.5">
-                  <span className="font-mono font-medium">{c.name}</span>
-                  <span className="text-muted-foreground">{c.dataType}</span>
-                  {c.masked ? (
-                    <span className="text-xs text-amber-600 dark:text-amber-400">
-                      masked
-                    </span>
-                  ) : null}
-                  {c.description ? (
-                    <span className="text-muted-foreground">— {c.description}</span>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-        <SectionCard
-          size="sm"
-          title="Schema versions"
-          description="Registered schema changes, most recent first."
-        >
-          {a.schemaVersions.length === 0 ? (
-            <QuietEmpty title="No schema versions recorded" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.schemaVersions.map((v) => (
-                <li key={v.version} className="flex flex-wrap items-baseline gap-2 py-1.5">
-                  <span className="font-mono text-xs text-muted-foreground">
-                    v{v.version}
-                  </span>
-                  <span>{v.change}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {formatRelativeTime(v.at)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
+        <TabsContent value="schema">
+          <AssetSchema asset={a} iceberg={iceberg} />
+        </TabsContent>
 
-      <TabsContent value="sample" className="mt-2">
-        <SectionCard
-          size="sm"
-          title="Sample rows"
-          description="Masked values applied where policy requires."
-        >
-          {a.sample.length === 0 ? (
-            <QuietEmpty title="No sample rows available" />
-          ) : (
-            <div className="overflow-hidden rounded-lg border border-border">
-              <Table>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    {sampleColumns.map((col) => (
-                      <TableHead key={col} className="font-mono text-xs font-medium">
-                        {col}
-                      </TableHead>
-                    ))}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {a.sample.map((row, i) => (
-                    <TableRow key={i}>
-                      {sampleColumns.map((col) => (
-                        <TableCell key={col} className="py-1.5 font-mono text-xs">
-                          {row[col] ?? "—"}
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </SectionCard>
-      </TabsContent>
+        <TabsContent value="sample">
+          <AssetSample asset={a} iceberg={iceberg} />
+        </TabsContent>
 
-      <TabsContent value="quality" className="mt-2">
-        <SectionCard
-          size="sm"
-          title="Quality checks"
-          description="Rules evaluated against this asset."
-          action={
-            <Button size="sm" variant="outline" render={<Link href="/governance/data-quality" />}>
-              Open data quality
-            </Button>
-          }
-        >
-          {a.qualityChecks.length === 0 ? (
-            <QuietEmpty title="No quality checks configured" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.qualityChecks.map((q) => (
-                <li key={q.id} className="flex flex-wrap items-center gap-2 py-1.5">
-                  <span>
-                    {q.name} · <span className="text-muted-foreground">{q.dimension}</span>
-                  </span>
-                  <span className="ml-auto flex items-center gap-2">
-                    <CheckBadge status={q.status} />
-                    <span className="text-xs text-muted-foreground">
-                      {formatRelativeTime(q.lastRun)}
-                    </span>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
+        <TabsContent value="quality">
+          <AssetQuality asset={a} onChanged={onAssetChanged} />
+        </TabsContent>
 
-      <TabsContent value="policies" className="mt-2">
-        <SectionCard
-          size="sm"
-          title="Policies"
-          description="Access, masking, and residency rules applied to this asset."
-          action={
-            <Button size="sm" variant="outline" render={<Link href="/governance/policies" />}>
-              Open policies
-            </Button>
-          }
-        >
-          {a.policySummary.length === 0 ? (
-            <QuietEmpty title="No policies applied" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.policySummary.map((p) => (
-                <li key={p.id} className="py-1.5">
-                  <Link
-                    href={`/governance/policies?id=${p.id}`}
-                    className="font-medium text-primary hover:underline"
-                  >
-                    {p.name}
-                  </Link>
-                  <p className="text-xs text-muted-foreground">{p.effect}</p>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
+        <TabsContent value="access">
+          <AssetAccess asset={a} onChanged={onAssetChanged} />
+        </TabsContent>
 
-      <TabsContent value="lineage" className="mt-2">
-        <div className="mb-2 flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            render={<Link href={`/lineage?focus=${a.id}`} />}
-          >
-            Open lineage graph
-          </Button>
-          <Button size="sm" variant="ghost" render={<Link href="/query-studio" />}>
-            Query this asset
-          </Button>
-        </div>
-        <div className="grid gap-2 lg:grid-cols-2">
-          <SectionCard size="sm" title="Upstream">
-            {a.upstream.length === 0 ? (
-              <QuietEmpty title="No upstream assets" />
-            ) : (
-              <ul className="space-y-1 text-sm">
-                {a.upstream.map((u) => (
-                  <li key={u.id}>
-                    <Link
-                      href={`/data/assets/${u.id}`}
-                      className="text-primary hover:underline"
-                    >
-                      {u.name}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </SectionCard>
-          <SectionCard size="sm" title="Downstream">
-            {a.downstream.length === 0 ? (
-              <QuietEmpty title="No downstream assets" />
-            ) : (
-              <ul className="space-y-1 text-sm">
-                {a.downstream.map((u) => (
-                  <li key={u.id}>
-                    <Link
-                      href={`/data/assets/${u.id}`}
-                      className="text-primary hover:underline"
-                    >
-                      {u.name}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </SectionCard>
-        </div>
-      </TabsContent>
+        <TabsContent value="lineage">
+          <AssetLineage asset={a} state={lineage} />
+        </TabsContent>
 
-      <TabsContent value="dependents" className="mt-2">
-        <SectionCard
-          size="sm"
-          title="Dependents"
-          description="Pipelines, dashboards, and agents consuming this asset."
-        >
-          {a.dependents.length === 0 ? (
-            <QuietEmpty title="No dependents registered" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.dependents.map((d) => (
-                <li key={d.id} className="flex items-center gap-2 py-1.5">
-                  <Link
-                    href={dependentHref(d.id, d.kind)}
-                    className="font-mono text-primary hover:underline"
-                  >
-                    {d.name}
-                  </Link>
-                  <Pill tone="neutral" className="ml-auto">
-                    {d.kind}
-                  </Pill>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
-
-      <TabsContent value="history" className="mt-2">
-        <SectionCard size="sm" title="Change history">
-          {a.changeHistory.length === 0 ? (
-            <QuietEmpty title="No changes recorded" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.changeHistory.map((c) => (
-                <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
-                  <span className="font-medium">{c.actor}</span>
-                  <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {formatRelativeTime(c.at)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
-
-      <TabsContent value="snapshots" className="mt-2">
-        <SectionCard size="sm" title="Snapshots / time travel">
-          {isIcebergCandidate(a) && typeof a.tableName === "string" ? (
-            <IcebergSnapshots tableName={a.tableName} />
-          ) : a.snapshots.length === 0 ? (
-            <QuietEmpty title="No snapshots for this asset" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {a.snapshots.map((s) => (
-                <li key={s.id} className="flex justify-between gap-2 py-1.5">
-                  <span>{s.operation}</span>
-                  <span className="text-muted-foreground">
-                    {formatRelativeTime(s.committedAt)} ·{" "}
-                    {formatCompactNumber(s.records)} records
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
-
-      <TabsContent value="usage" className="mt-2">
-        <SectionCard size="sm" title="Usage (7d)">
-          {a.usage === null ? (
-            <QuietEmpty title="Usage not measured" />
-          ) : (
-            <p className="text-sm">
-              {a.usage.queries7d} queries · {a.usage.users7d} users · avg{" "}
-              {a.usage.avgLatencyMs} ms
-            </p>
-          )}
-          {a.recentQueries.length === 0 ? (
-            <QuietEmpty title="No recent queries" />
-          ) : (
-            <ul className="mt-2 space-y-1.5 text-sm">
-              {a.recentQueries.map((q) => (
-                <li key={q.id} className="flex flex-wrap items-center gap-2">
-                  <span className="font-mono text-xs text-muted-foreground">{q.sql}</span>
-                  <Link
-                    href={`/audit?event=aud-query-${q.id}`}
-                    className="ml-auto text-xs text-primary hover:underline"
-                  >
-                    Audit
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </TabsContent>
-    </Tabs>
+        <TabsContent value="activity">
+          <AssetActivity asset={a} iceberg={iceberg} onChanged={onAssetChanged} />
+        </TabsContent>
+      </Tabs>
+    </div>
   )
 }

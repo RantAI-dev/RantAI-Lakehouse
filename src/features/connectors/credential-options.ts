@@ -3,9 +3,10 @@
  * end in (ADR 0002 Addendum 3 — see
  * `rust/crates/lakehouse-store/src/connectors.rs`'s `CredentialKind` and
  * `src/services/contracts/connectors.ts`'s mirror of it). One definition,
- * shared by `connector-create-page.tsx` (choosing a NEW connector's
- * credential shape) and `connector-credential-rotation.tsx` (rotating an
- * EXISTING one's) rather than two option lists that could drift.
+ * read through `credential-value-input.tsx`'s `credentialKindLabel` by both
+ * `connector-create-page.tsx` (a NEW connector's credential) and
+ * `connector-edit-page.tsx` (replacing an EXISTING one's), rather
+ * than two label lists that could drift.
  */
 
 import type { CredentialKind } from "@/services/contracts/connectors"

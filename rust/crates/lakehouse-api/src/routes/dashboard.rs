@@ -77,7 +77,7 @@ pub async fn get(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = PolicyEngineObligations::from_state(&state);
     match get_body(
         &state.clickhouse,
         &q,
@@ -408,7 +408,7 @@ pub async fn specs_preview(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations = PolicyEngineObligations::from_state(&state);
     let (_, result) = run_spec_sql(
         &state.clickhouse,
         &spec.spec.id,

@@ -95,8 +95,24 @@ export type LakehouseTableStats = {
   metadataLogCount: number
 }
 
+/** One schema the table has had (`rest::SchemaVersionDetail`). */
+export type LakehouseSchemaVersion = {
+  /** Rises as the schema changes. */
+  schemaId: number
+  /**
+   * Commit time of the first snapshot written with this schema, epoch ms.
+   * `null` when no snapshot the table still keeps was written with it.
+   */
+  sinceMs: number | null
+  current: boolean
+  /** A field keeps its `id` across versions: a rename is the same id. */
+  fields: LakehouseSchemaField[]
+}
+
 export type LakehouseTableDetail = {
   schema: LakehouseSchemaField[]
+  /** The table's schema history, oldest first. Absent from an older API build. */
+  schemaVersions?: LakehouseSchemaVersion[]
   partitionSpec: LakehousePartitionField[]
   properties: Record<string, string>
   /** Oldest first, exactly as the API returns them. */

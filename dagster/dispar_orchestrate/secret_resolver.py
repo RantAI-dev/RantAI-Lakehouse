@@ -19,14 +19,13 @@ allowlist check runs before any read.
 
 `file:` refs are resolved the SAME way `FileSecretResolver` does
 API-side: canonicalize the base directory and the requested path, require
-the latter under the former. Honest gap, stated once: as of this
-workstream, `docker-compose.yml`'s `dagster-code-location` service mounts
-no `/run/secrets` volume (verified: `grep -n "run/secrets"
-docker-compose.yml` returns nothing) -- a `file:`-scheme secretRef is
-therefore syntactically allowlisted but will always fail to resolve (the
-file genuinely does not exist in this container) until an operator adds
-that mount, exactly the "unsupported, honestly" posture AGENTS.md prefers
-over pretending it works (AGENTS.md principle 2).
+the latter under the former. `docker-compose.yml` mounts the
+`lakehouse_connector_secrets` volume at `/run/secrets`, read-only, in
+`dagster-code-location` (ADR 0002 Addendum 4): `lakehouse-api` writes a
+user-supplied credential there as `connector_managed_<id>_<suffix>`, and
+this module reads it through the same `file:` branch as an
+operator-dropped `connector_<id>_<suffix>` file -- no managed-specific
+code path exists here, by design.
 
 Never log a resolved value -- only the ref NAME appears in any exception
 message here, matching `secret.rs`'s `SecretValue` guarantee that a

@@ -283,6 +283,37 @@ pub async fn list(pool: &PgPool, filter: AuditFilter) -> Result<Vec<AuditEvent>,
     Ok(rows.into_iter().map(AuditEvent::from).collect())
 }
 
+/// List the audit events about any of several resources of one kind,
+/// newest first — one catalog asset is known by more than one id (its
+/// catalog id, and the table keys rules are written against).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_for_resources(
+    pool: &PgPool,
+    resource_kind: &str,
+    resource_ids: &[String],
+    limit: i64,
+) -> Result<Vec<AuditEvent>, StoreError> {
+    if resource_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {AUDIT_COLUMNS} FROM audit_event \
+         WHERE resource_kind = $1 AND resource_id = ANY($2) \
+         ORDER BY at DESC \
+         LIMIT $3"
+    );
+    let rows: Vec<AuditRow> = sqlx::query_as(&sql)
+        .bind(resource_kind)
+        .bind(resource_ids)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(AuditEvent::from).collect())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

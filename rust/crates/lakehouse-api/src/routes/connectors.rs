@@ -24,10 +24,14 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
+use lakehouse_core::secret::SecretValue;
+use lakehouse_dagster::{DgConfiguredRun, iso_from_unix_seconds, map_run_status};
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
@@ -35,6 +39,7 @@ use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
+use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -111,24 +116,134 @@ pub async fn list(
     ))
 }
 
+/// The access rule of every `/api/connectors/{id}/*` route: the caller must
+/// belong to the connector's tenant. `POLICY_TABLE` only says what a
+/// caller may do to connectors in general; without this, `connector:manage`
+/// in one tenant reached every tenant's connectors by id — read their
+/// settings, change or replace their credentials, run them, delete them.
+///
+/// Refused with the same 404 an unknown id gets, so the answer is no
+/// oracle for which connector ids exist in other tenants. A connector with
+/// no tenant is refused too: `PUT .../tenant` (identity administration) is
+/// how one is assigned.
+///
+/// Applied to the routes by [`require_connector_in_tenants`]; a caller
+/// that invokes a connector handler without the router — the copilot's
+/// tools (`routes::ai::tools::connectors`) — calls this first itself.
+///
+/// # Errors
+///
+/// 404 as above; 401 with no principal; 503 if no pool is configured; 500
+/// on a database failure.
+pub async fn ensure_connector_in_tenants(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    if connectors::connector_in_tenants(pool(state)?, id, &principal.tenant_ids).await? {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound(format!("Connector {id} not found")))
+    }
+}
+
+/// [`ensure_connector_in_tenants`] as the route layer of every
+/// `/api/connectors/{id}/*` route (`routes::connectors_router`), so no
+/// connector route can be added without it.
+///
+/// # Errors
+///
+/// As [`ensure_connector_in_tenants`].
+pub async fn require_connector_in_tenants(
+    State(state): State<AppState>,
+    Path(params): Path<std::collections::HashMap<String, String>>,
+    request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    let Some(id) = params.get("id") else {
+        return Err(ApiError::NotFound("Connector not found".to_owned()).into());
+    };
+    ensure_connector_in_tenants(&state, request.extensions().get::<Principal>(), id).await?;
+    Ok(next.run(request).await)
+}
+
+/// `GET /api/connectors/ingestible`'s optional window: both bounds or
+/// neither, RFC 3339.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestibleQuery {
+    due_after: Option<String>,
+    due_until: Option<String>,
+}
+
 /// `GET /api/connectors/ingestible` — every connector that has an ingest
 /// spec set (`adapter IS NOT NULL`), as an
 /// [`connectors::IngestibleConnector`]. Gated on `ingest:read`
 /// (`POLICY_TABLE`), a strictly narrower grant than the base
 /// `/api/connectors` route's `connector:manage` — this is the route
 /// `dagster/dispar_orchestrate/ingest_factory.py`'s `ingest:read`-scoped
-/// service identity calls, both at code-load time (to build schedules)
-/// and at run time (`run_ingest`'s own re-fetch of its own connector).
+/// service identity calls, from its schedule sensor and at run time
+/// (`run_ingest`'s own re-fetch of its own connector).
+///
+/// With `?dueAfter=&dueUntil=`, only the batch connectors whose
+/// `scheduleCron` fires in `(dueAfter, dueUntil]` — what the schedule
+/// sensor launches. Evaluated here with the same `croner` evaluation the
+/// console's `nextRunAt` comes from ([`crate::next_run`]), so the two
+/// never disagree.
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
+/// 400 if only one bound is given or either is not RFC 3339; 503 if no
+/// pool is configured; 500 on a database failure.
 pub async fn list_ingestible(
     State(state): State<AppState>,
+    Query(query): Query<IngestibleQuery>,
 ) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
-    Ok(ApiJson(
-        connectors::list_ingestible_connectors(pool(&state)?).await?,
-    ))
+    let window = due_window(&query)?;
+    let all = connectors::list_ingestible_connectors(pool(&state)?).await?;
+    Ok(ApiJson(match window {
+        Some((after, until)) => all
+            .into_iter()
+            .filter(|c| is_due(c, after, until))
+            .collect(),
+        None => all,
+    }))
+}
+
+fn due_window(
+    query: &IngestibleQuery,
+) -> Result<Option<(time::OffsetDateTime, time::OffsetDateTime)>, ApiError> {
+    let parse = |name: &str, value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(
+            |err| ApiError::BadRequest(format!("{name} {value:?} is not an RFC 3339 time: {err}")),
+        )
+    };
+    match (&query.due_after, &query.due_until) {
+        (None, None) => Ok(None),
+        (Some(after), Some(until)) => {
+            Ok(Some((parse("dueAfter", after)?, parse("dueUntil", until)?)))
+        }
+        _ => Err(ApiError::BadRequest(
+            "dueAfter and dueUntil go together: give both or neither".to_owned(),
+        )),
+    }
+}
+
+/// A `cdc` connector streams through its own Debezium service and is never
+/// launched on a schedule, whatever its row says.
+fn is_due(
+    connector: &connectors::IngestibleConnector,
+    after: time::OffsetDateTime,
+    until: time::OffsetDateTime,
+) -> bool {
+    connector.adapter != "cdc"
+        && connector
+            .schedule_cron
+            .as_deref()
+            .is_some_and(|cron| crate::next_run::fires_between(cron, after, until))
 }
 
 /// `GET /api/connectors/types` — every row of `connector_type`
@@ -174,6 +289,172 @@ pub async fn detail(
     Ok(ApiJson(detail))
 }
 
+/// The `PATCH /api/connectors/{id}` body. Mirrors `UpdateConnectorInput`
+/// in `contracts/connectors.ts`. Every field is optional; an absent one is
+/// left unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateConnectorBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
+    residency: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// Validate an [`UpdateConnectorBody`] into the store's input. Pure —
+/// unit-tested below.
+///
+/// # Errors
+///
+/// 400 for a blank field, an unknown `direction`, or an update that
+/// changes nothing.
+fn update_input(body: UpdateConnectorBody) -> Result<connectors::UpdateConnectorInput, ApiError> {
+    let non_blank = |field: &str, value: Option<String>| -> Result<Option<String>, ApiError> {
+        value.map(|v| required(field, &v)).transpose()
+    };
+    let direction = non_blank("direction", body.direction)?;
+    if let Some(direction) = &direction
+        && !VALID_DIRECTIONS.contains(&direction.as_str())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "direction must be one of {VALID_DIRECTIONS:?}, got {direction:?}"
+        )));
+    }
+    let input = connectors::UpdateConnectorInput {
+        name: non_blank("name", body.name)?,
+        direction,
+        environment: non_blank("environment", body.environment)?,
+        residency: non_blank("residency", body.residency)?,
+        host: non_blank("host", body.host)?,
+    };
+    if input.is_empty() {
+        return Err(ApiError::BadRequest("nothing to update".to_owned()));
+    }
+    Ok(input)
+}
+
+/// Fields `PATCH` deliberately does not take, each with the route that
+/// does — refused with that pointer instead of `deny_unknown_fields`'
+/// generic "unknown field".
+fn reject_non_patchable_fields(body: &Bytes) -> Result<(), ApiError> {
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(()); // Malformed JSON is `parse_body`'s job to report.
+    };
+    let refusal = if map.contains_key("type") {
+        Some(
+            "a connector's type cannot be changed: it fixes the adapter, the connection shape \
+             and the credential names — create a new connector instead",
+        )
+    } else if map.contains_key("tenant") || map.contains_key("tenantId") {
+        Some("a connector's tenant is changed through PUT /api/connectors/{id}/tenant")
+    } else if map.contains_key("credential") || map.contains_key("secretRef") {
+        Some("a connector's credential is changed through PUT /api/connectors/{id}/credential")
+    } else if map.contains_key("dial") {
+        Some(
+            "a connector's connection settings are changed through PUT /api/connectors/{id}/ingest-spec",
+        )
+    } else {
+        None
+    };
+    refusal.map_or(Ok(()), |message| {
+        Err(ApiError::BadRequest(message.to_owned()))
+    })
+}
+
+/// The refusal for a `host` change on a connector that connects using its
+/// `host` column (`SEC-14`, decision D4).
+const HOST_CHANGE_NEEDS_CREDENTIALS: &str = "This connector connects using its host, so changing \
+     the host would send its stored credential to a different server. Nothing was changed. Where \
+     a connector points is changed through PUT /api/connectors/{id}/ingest-spec, together with \
+     its credentials.";
+
+/// `SEC-14` (decision D4): the refusal for `PATCH` changing `host` on a
+/// connector that dials from that column — a row with no adapter (the
+/// original `kind` dispatch reads `<user>@<host>:<port>/<database>` from it)
+/// and a `files` row (the S3 probe reads `<endpoint>|<bucket>`). For every
+/// other adapter the column is a label: the dial comes from `dial`, which
+/// has its own guarded route. A `host` equal to the stored one (ignoring
+/// case and padding) changes nothing and is accepted.
+fn host_change_refusal(stored: &ConnectorDialInfo, new_host: &str) -> Option<ApiError> {
+    let dials_from_host = matches!(stored.adapter.as_deref(), None | Some("files"));
+    (dials_from_host && !stored.host.trim().eq_ignore_ascii_case(new_host.trim()))
+        .then(|| ApiError::Conflict(HOST_CHANGE_NEEDS_CREDENTIALS.to_owned()))
+}
+
+/// `PATCH /api/connectors/{id}` — edit a connector's name, direction,
+/// environment, residency and connection-target label. The console's edit
+/// page calls this alongside the ingest-spec, tenant and credential routes,
+/// each of which owns its own part of a connector.
+///
+/// # Errors
+///
+/// 401 without a principal (see [`create`] on why it is `Option`); 400 per
+/// [`update_input`] / [`reject_non_patchable_fields`]; 404 if `id` is
+/// unknown; 409 if the new name is taken, or if `host` changes on a
+/// connector that dials from it ([`host_change_refusal`], `SEC-14`);
+/// 503/500 as every other route.
+pub async fn update(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<connectors::Connector>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    reject_non_patchable_fields(&body)?;
+    let input = update_input(parse_body(&body)?)?;
+    let fields: Vec<&str> = [
+        ("name", input.name.is_some()),
+        ("direction", input.direction.is_some()),
+        ("environment", input.environment.is_some()),
+        ("residency", input.residency.is_some()),
+        ("host", input.host.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect();
+    // SEC-14: before anything is written — a connector that dials from
+    // `host` would send its stored credential to the new one.
+    if let Some(new_host) = input.host.as_deref()
+        && let Some(stored) = connectors::get_connector_dial_info(pool(&state)?, &id).await?
+        && let Some(refusal) = host_change_refusal(&stored, new_host)
+    {
+        return Err(refusal.into());
+    }
+    let updated = match connectors::update_connector(pool(&state)?, &id, &input).await {
+        Ok(updated) => updated,
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+        }
+        Err(lakehouse_store::StoreError::Conflict) => {
+            return Err(
+                ApiError::Conflict("a connector with that name already exists".to_owned()).into(),
+            );
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    // Which fields changed, never their values: `host` is handled with the
+    // same care as a credential-adjacent field everywhere in this module.
+    let event = connector_audit_event(
+        &principal,
+        "connector.update",
+        &id,
+        json!({ "fields": fields }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.update audit event");
+    }
+    Ok(ApiJson(updated))
+}
+
 /// The `POST /api/connectors` body's `credential` field. Mirrors
 /// `CreateConnectorInput["credential"]` in `contracts/connectors.ts`.
 ///
@@ -194,6 +475,43 @@ pub struct CredentialSpecBody {
     /// `/test` can never succeed, since `probe_s3` requires both.
     #[serde(default)]
     secondary: Option<connectors::CredentialKind>,
+    /// The credential VALUES, write-only — accepted only with `source:
+    /// "managed"` (ADR 0002 Addendum 4). Written to the managed store by
+    /// [`create`], never persisted in Postgres, never echoed back.
+    #[serde(default)]
+    values: Option<CredentialValuesBody>,
+}
+
+/// A credential value as it arrives in a request body. Deserializes like a
+/// plain string, but its `Debug` never prints the content — so a
+/// `#[derive(Debug)]` on any body that holds one (every body here has one)
+/// cannot leak it into a log line. Converted to a [`SecretValue`] at the
+/// first use.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub struct SecretInput(String);
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl SecretInput {
+    fn into_secret(self) -> SecretValue {
+        SecretValue::new(self.0)
+    }
+}
+
+/// `credential.values` on `POST /api/connectors`: one value per slot the
+/// connector declares. `deny_unknown_fields` so a misspelled slot is an
+/// error, not a silently unset credential.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialValuesBody {
+    primary: SecretInput,
+    #[serde(default)]
+    secondary: Option<SecretInput>,
 }
 
 /// The `POST /api/connectors` body. Mirrors `CreateConnectorInput`.
@@ -207,7 +525,17 @@ pub struct CreateConnectorBody {
     host: String,
     credential: CredentialSpecBody,
     environment: String,
+    /// The tenant's display name. Ignored when a tenant id resolves (the
+    /// stored name then comes from the tenant row itself); required only
+    /// for a caller that belongs to no tenant at all.
+    #[serde(default)]
     tenant: String,
+    /// The tenant this connector belongs to — must be one the caller is a
+    /// member of. Absent: the caller's active tenant (`X-Tenant`, else
+    /// their first), the same one `GET /api/connectors` lists — so a
+    /// connector is visible to the person who just created it.
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
     #[serde(default)]
     residency: String,
     #[serde(default)]
@@ -217,9 +545,11 @@ pub struct CreateConnectorBody {
 }
 
 /// The `POST /api/connectors` response: the created
-/// [`connectors::Connector`] plus the credential reference NAMES the
-/// operator must provision. Mirrors `CreateConnectorResponse` in
-/// `contracts/connectors.ts`.
+/// [`connectors::Connector`] plus its credential reference NAMES. For an
+/// `env`/`file` source those are what an operator must provision; for a
+/// `managed` source with values the API already stored them
+/// (`credential_stored`), and the names are informational only. Mirrors
+/// `CreateConnectorResponse` in `contracts/connectors.ts`.
 ///
 /// # Returned ONCE (ADR 0002 Addendum 3)
 ///
@@ -240,6 +570,10 @@ pub struct CreateConnectorResponse {
     #[serde(flatten)]
     connector: connectors::Connector,
     credential: connectors::ConnectorCredentialNames,
+    /// Whether [`create`] stored the credential value(s) itself (`managed`
+    /// source with `values`) — i.e. whether there is anything left for an
+    /// operator to provision. Never the value.
+    credential_stored: bool,
 }
 
 const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
@@ -340,6 +674,7 @@ fn connector_audit_event(
 pub async fn create(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<CreateConnectorResponse>)> {
     let Some(Extension(principal)) = principal else {
@@ -354,32 +689,89 @@ pub async fn create(
         ))
         .into());
     }
+    let source = body.credential.source;
+    if body.credential.secondary == Some(body.credential.primary) {
+        return Err(ApiError::BadRequest(
+            "credential.primary and credential.secondary must be different kinds: both would \
+             name the same credential"
+                .to_owned(),
+        )
+        .into());
+    }
+    let values = credential_values(
+        source,
+        body.credential.secondary.is_some(),
+        body.credential.values,
+    )?;
+    let (tenant_id, tenant_name) =
+        resolve_create_tenant(&state, &principal, &headers, body.tenant_id, &body.tenant).await?;
     let input = CreateConnectorInput {
         name: required("name", &body.name)?,
         kind: required("type", &body.kind)?,
         direction,
         host: required("host", &body.host)?,
         credential: connectors::CredentialSpec {
-            source: body.credential.source,
+            source,
             primary: body.credential.primary,
             secondary: body.credential.secondary,
         },
         environment: required("environment", &body.environment)?,
-        tenant: required("tenant", &body.tenant)?,
+        tenant: tenant_name,
         residency: body.residency,
         capabilities: body.capabilities,
         owner: body.owner,
     };
     let (created, credential) = connectors::create_connector(pool(&state)?, &input).await?;
+
+    // ADR 0002 Addendum 4: the row exists, so its id — and therefore the
+    // managed file names — are known. Store the value(s) now. A connector
+    // whose credential could not be stored is removed again rather than
+    // left behind looking configured.
+    let credential_stored = values.is_some();
+    let finished = async {
+        if let Some(values) = values {
+            store_credential_values(&state, &credential, values).await?;
+        }
+        if let Some(tenant_id) = tenant_id {
+            connectors::assign_tenant(pool(&state)?, &created.id, tenant_id).await?;
+        }
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(err) = finished {
+        remove_managed_credentials(
+            &state,
+            &created.id,
+            Some(&credential.primary),
+            credential.secondary.as_deref(),
+        )
+        .await;
+        if let Err(rollback) = connectors::delete_connector(pool(&state)?, &created.id).await {
+            tracing::error!(
+                %rollback,
+                connector_id = %created.id,
+                "connector could not be finished (credential or tenant) and its row could \
+                 not be removed either; delete it manually"
+            );
+        }
+        return Err(err.into());
+    }
+
     // WS5 item D3: best-effort, never turns a successful create into an
-    // error — name/type/direction only, never a credential reference name
-    // (not this row's business to repeat, even though a name alone is not
-    // a secret value).
+    // error — name/type/direction and where the credential lives, never a
+    // credential reference name (not this row's business to repeat, even
+    // though a name alone is not a secret value) and never a value.
     let event = connector_audit_event(
         &principal,
         "connector.create",
         &created.id,
-        json!({ "name": created.name, "type": created.kind, "direction": created.direction }),
+        json!({
+            "name": created.name,
+            "type": created.kind,
+            "direction": created.direction,
+            "credentialSource": source,
+            "credentialStored": credential_stored,
+        }),
         "executed",
     );
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
@@ -390,8 +782,163 @@ pub async fn create(
         ApiJson(CreateConnectorResponse {
             connector: created,
             credential,
+            credential_stored,
         }),
     ))
+}
+
+/// Which tenant a new connector belongs to, and the name stored with it.
+///
+/// Resolved BEFORE the row exists, so a tenant the caller may not use never
+/// leaves a connector behind. Before this, every connector created through
+/// the console had `tenant_id = NULL` and was invisible to `list`, including
+/// to the person who created it.
+///
+/// An explicit `requested` tenant must be one of the caller's (else 404 —
+/// the same no-discovery rule as `tenant_scope::resolve`); absent, the
+/// caller's active tenant is used. The stored name comes from the tenant
+/// row, not from what the client typed; `typed_name` is used only for a
+/// caller that belongs to no tenant at all.
+async fn resolve_create_tenant(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    requested: Option<Uuid>,
+    typed_name: &str,
+) -> Result<(Option<Uuid>, String), ApiError> {
+    let tenant_id = match requested {
+        Some(requested) if principal.in_tenant(requested) => Some(requested),
+        Some(_) => return Err(ApiError::NotFound("tenant not found".to_owned())),
+        None => crate::tenant_scope::resolve(principal, headers)?,
+    };
+    let name = match tenant_id {
+        Some(tenant_id) => {
+            lakehouse_store::identity::get_tenant(pool(state)?, &tenant_id.to_string())
+                .await?
+                .name
+        }
+        None => required("tenant", typed_name)?,
+    };
+    Ok((tenant_id, name))
+}
+
+/// The validated credential values [`create`] will store: the primary, and
+/// the secondary when the connector declares a secondary slot.
+struct CredentialValues {
+    primary: SecretValue,
+    secondary: Option<SecretValue>,
+}
+
+/// Validate `credential.values` against the rest of the credential spec,
+/// BEFORE any row is created, so a bad value never leaves a connector
+/// behind. Pure — unit-tested below.
+///
+/// # Errors
+///
+/// 400 if values are sent with an operator-provisioned source (`env`/
+/// `file`: the API does not write those, so accepting a value would be a
+/// silent drop), if a secondary value is sent for a connector with no
+/// secondary slot or missing for one that has it (a pair stored half would
+/// be reported as stored and never authenticate), or if a value fails
+/// [`crate::connector_secret_store::validate_secret_value`].
+fn credential_values(
+    source: connectors::CredentialSource,
+    has_secondary_slot: bool,
+    values: Option<CredentialValuesBody>,
+) -> Result<Option<CredentialValues>, ApiError> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    if source != connectors::CredentialSource::Managed {
+        return Err(ApiError::BadRequest(
+            "credential.values is only accepted with credential.source \"managed\": an env/file \
+             credential is provisioned by an operator, never through this API"
+                .to_owned(),
+        ));
+    }
+    if values.secondary.is_some() && !has_secondary_slot {
+        return Err(ApiError::BadRequest(
+            "credential.values.secondary was sent, but credential.secondary (its kind) was not"
+                .to_owned(),
+        ));
+    }
+    if values.secondary.is_none() && has_secondary_slot {
+        return Err(ApiError::BadRequest(
+            "credential.values.secondary is required: this credential has two parts, and both \
+             are needed to authenticate"
+                .to_owned(),
+        ));
+    }
+    let primary = values.primary.into_secret();
+    crate::connector_secret_store::validate_secret_value(primary.expose_secret())
+        .map_err(|err| ApiError::BadRequest(format!("credential.values.primary: {err}")))?;
+    let secondary = match values.secondary {
+        Some(value) => {
+            let value = value.into_secret();
+            crate::connector_secret_store::validate_secret_value(value.expose_secret()).map_err(
+                |err| ApiError::BadRequest(format!("credential.values.secondary: {err}")),
+            )?;
+            Some(value)
+        }
+        None => None,
+    };
+    Ok(Some(CredentialValues { primary, secondary }))
+}
+
+/// Map a store failure to the response a caller can act on. Every message
+/// is already value-free (see `SecretStoreError`).
+fn secret_store_error(err: &crate::connector_secret_store::SecretStoreError) -> ApiError {
+    use crate::connector_secret_store::SecretStoreError;
+    match err {
+        SecretStoreError::InvalidValue(_) => ApiError::BadRequest(err.to_string()),
+        SecretStoreError::NotManaged => ApiError::Internal(err.to_string()),
+        SecretStoreError::Io(_) => ApiError::Unavailable(err.to_string()),
+    }
+}
+
+/// Write [`CredentialValues`] under the managed names [`create`] derived.
+async fn store_credential_values(
+    state: &AppState,
+    names: &connectors::ConnectorCredentialNames,
+    values: CredentialValues,
+) -> Result<(), ApiError> {
+    let store = &state.connector_secret_store;
+    store
+        .write(&names.primary, &values.primary)
+        .await
+        .map_err(|err| secret_store_error(&err))?;
+    if let (Some(name), Some(value)) = (names.secondary.as_deref(), values.secondary.as_ref()) {
+        store
+            .write(name, value)
+            .await
+            .map_err(|err| secret_store_error(&err))?;
+    }
+    Ok(())
+}
+
+/// Delete whichever of `refs` are managed (ADR 0002 Addendum 4) — an
+/// operator's `env:`/`file:` credential is never touched. Best-effort: a
+/// failure is logged, never surfaced, because every caller runs this after
+/// (or instead of) a change that has already succeeded or failed on its
+/// own terms.
+async fn remove_managed_credentials(
+    state: &AppState,
+    connector_id: &str,
+    primary: Option<&str>,
+    secondary: Option<&str>,
+) {
+    for secret_ref in [primary, secondary].into_iter().flatten() {
+        if !connectors::is_managed_secret_ref(secret_ref) {
+            continue;
+        }
+        if let Err(err) = state.connector_secret_store.remove(secret_ref).await {
+            tracing::warn!(
+                %err,
+                connector_id = %connector_id,
+                "failed to remove a managed connector credential file"
+            );
+        }
+    }
 }
 
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
@@ -425,7 +972,7 @@ pub async fn test_connection(
     let outcome = crate::connector_probe::probe(
         &dial_info,
         state.connector_secret_resolver.as_ref(),
-        state.config.connector_probe_allow_internal_hosts,
+        &state.config.connector_internal_hosts(),
     )
     .await;
     match connectors::record_test_result(
@@ -645,6 +1192,18 @@ pub async fn rotate_secret(
         connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
         connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
     };
+    let other = match body.slot {
+        connectors::SecretSlot::Primary => dial_info.secret_ref_secondary.as_deref(),
+        connectors::SecretSlot::Secondary => Some(dial_info.secret_ref.as_str()),
+    };
+    if other == Some(new_secret_ref.as_str()) {
+        return Err(ApiError::BadRequest(
+            "that kind is already the connector's other credential: both slots would name the \
+             same one"
+                .to_owned(),
+        )
+        .into());
+    }
 
     let mut candidate = dial_info.clone();
     match body.slot {
@@ -657,7 +1216,7 @@ pub async fn rotate_secret(
     let outcome = crate::connector_probe::probe(
         &candidate,
         state.connector_secret_resolver.as_ref(),
-        state.config.connector_probe_allow_internal_hosts,
+        &state.config.connector_internal_hosts(),
     )
     .await;
 
@@ -706,6 +1265,12 @@ pub async fn rotate_secret(
         }
         Err(err) => return Err(ApiError::from(err).into()),
     }
+    // Rotating away from a credential lakehouse stored (e.g. to an
+    // operator's `env:` one) leaves its file unused; a password must not
+    // outlive the only reference to it.
+    if expected_old.as_deref() != Some(new_secret_ref.as_str()) {
+        remove_managed_credentials(&state, &id, expected_old.as_deref(), None).await;
+    }
 
     // Matches this file's established audit convention (`create`,
     // `test_connection`, `delete`): only a SUCCESSFUL mutation is
@@ -734,6 +1299,441 @@ pub async fn rotate_secret(
     Ok(ApiJson(RotateSecretResponse {
         rotated: true,
         slot: body.slot,
+    }))
+}
+
+/// One slot's new credential in a `PUT /api/connectors/{id}/credential`
+/// body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialSlotBody {
+    /// The suffix the managed name ends in.
+    kind: connectors::CredentialKind,
+    /// The credential itself. Write-only; see [`SecretInput`].
+    value: SecretInput,
+}
+
+/// The `PUT /api/connectors/{id}/credential` body. Mirrors
+/// `SetConnectorCredentialRequest` in `contracts/connectors.ts`.
+///
+/// Unlike [`RotateSecretBody`], this carries credential VALUES — the write
+/// path ADR 0002 Addendum 4 adds for a user who has no access to the
+/// host's environment. The refs are still never caller-chosen: each is
+/// derived from the connector's own id with
+/// [`connectors::CredentialSource::Managed`].
+///
+/// Both slots in ONE request, not one request per slot: an S3 connector's
+/// access key and secret key only work as a pair, so they must be probed
+/// together — changing them one at a time would probe the new access key
+/// against the old secret key and always fail.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetCredentialBody {
+    #[serde(default)]
+    primary: Option<CredentialSlotBody>,
+    #[serde(default)]
+    secondary: Option<CredentialSlotBody>,
+    /// The connection settings this credential is for, when the same edit
+    /// changes them — e.g. REST bearer to basic auth, where the new
+    /// username/password only work with the new settings. The probe tests
+    /// the credential with these instead of the saved ones. Only the probe
+    /// uses them: saving them is still `PUT .../ingest-spec`'s job.
+    #[serde(default)]
+    dial: Option<Value>,
+}
+
+/// The `PUT /api/connectors/{id}/credential` response body. Never carries
+/// a value or a ref.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialResponse {
+    /// Always `true` — a refused request is an error response instead.
+    saved: bool,
+    /// Which slot(s) were set.
+    slots: Vec<connectors::SecretSlot>,
+    /// Whether a real probe dialed the source with the new credential(s)
+    /// before they were saved. `false` only for a connector type this
+    /// build cannot probe (see [`set_credential`]'s doc comment).
+    verified: bool,
+    /// The probe's own classified message — safe to show (see
+    /// `connector_probe`'s module doc comment).
+    message: String,
+}
+
+/// One slot a [`set_credential`] request changes, validated.
+struct SlotChange {
+    slot: connectors::SecretSlot,
+    new_ref: String,
+    value: SecretValue,
+    old_ref: Option<String>,
+}
+
+/// The refusal for a change of where a connector points that does not
+/// carry the connector's credentials (`SEC-14`, decisions D2 and D3). One
+/// fixed text for every route that can re-point, so the console and the
+/// assistant show the same thing; it names no host, address or credential.
+const REPOINT_NEEDS_CREDENTIALS: &str = "This change points the connector at a different server, \
+     so every credential it signs in with must be sent again in the same request. Nothing was \
+     saved and no connection was made.";
+
+/// How many credential slots (0, 1 or 2) a connector of `adapter` with this
+/// `dial` reads: the length of its `secret_field_names` entry, which is what
+/// the ingest job resolves. `Kafka` without authentication reads none.
+fn credential_slots_read(adapter: &str, dial: &Dial) -> usize {
+    lakehouse_store::ingest_spec::secret_field_names(adapter, dial.secret_map_auth_type())
+        .map_or(0, <[&str]>::len)
+}
+
+/// Whether the credentials a request carries cover every slot a connector
+/// reads (`required` from [`credential_slots_read`]): the primary for one or
+/// two slots, the secondary for two.
+fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
+    (required == 0 || primary) && (required < 2 || secondary)
+}
+
+/// Whether a connector can have a second credential: an S3-shaped `files`
+/// connector (access key + secret key) or a `rest` one (basic auth's
+/// username + password, an `OAuth2` client id + secret). Every other adapter
+/// reads exactly one (`secret_field_names`). A pre-WS3 row with no adapter
+/// keeps whatever slots it already has.
+fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
+    match dial_info.adapter.as_deref() {
+        Some("files" | "rest") => true,
+        Some(_) => false,
+        None => dial_info.secret_ref_secondary.is_some(),
+    }
+}
+
+/// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent,
+/// each with its managed ref derived from THIS connector's id.
+///
+/// # Errors
+///
+/// 400 for a secondary credential on a connector that reads only one, for
+/// a slot that would end up naming the same credential as the other slot
+/// (one would overwrite the other's file), or for an unusable value.
+fn slot_changes(
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+    body: SetCredentialBody,
+) -> Result<Vec<SlotChange>, ApiError> {
+    if body.secondary.is_some() && !has_secondary_slot(dial_info) {
+        return Err(ApiError::BadRequest(
+            "this connector authenticates with one credential; there is no secondary one to set"
+                .to_owned(),
+        ));
+    }
+    let mut changes = Vec::new();
+    for (slot, input) in [
+        (connectors::SecretSlot::Primary, body.primary),
+        (connectors::SecretSlot::Secondary, body.secondary),
+    ] {
+        let Some(input) = input else { continue };
+        let value = input.value.into_secret();
+        crate::connector_secret_store::validate_secret_value(value.expose_secret())
+            .map_err(|err| ApiError::BadRequest(format!("{}: {err}", slot.as_str())))?;
+        let old_ref = match slot {
+            connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
+            connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
+        };
+        changes.push(SlotChange {
+            slot,
+            new_ref: connectors::derive_secret_ref(
+                id,
+                connectors::CredentialSource::Managed,
+                input.kind,
+            ),
+            value,
+            old_ref,
+        });
+    }
+    // What each slot names once this change applies: both slots naming the
+    // same file would make one credential overwrite the other.
+    let after = |slot: connectors::SecretSlot, current: Option<&str>| {
+        changes
+            .iter()
+            .find(|c| c.slot == slot)
+            .map(|c| c.new_ref.clone())
+            .or_else(|| current.map(str::to_owned))
+    };
+    let primary = after(connectors::SecretSlot::Primary, Some(&dial_info.secret_ref));
+    let secondary = after(
+        connectors::SecretSlot::Secondary,
+        dial_info.secret_ref_secondary.as_deref(),
+    );
+    if primary.is_some() && primary == secondary {
+        return Err(ApiError::BadRequest(
+            "primary and secondary must be different kinds of credential: both would name the \
+             same one"
+                .to_owned(),
+        ));
+    }
+    Ok(changes)
+}
+
+/// The connector as the probe should see it: each changed slot naming its
+/// new managed ref, and — when the same edit changes the connection
+/// settings — those settings instead of the saved ones.
+///
+/// # Errors
+///
+/// 400 for settings sent to a connector that has none to replace, or that
+/// do not parse as its adapter's shape; 409 ([`REPOINT_NEEDS_CREDENTIALS`])
+/// for settings that change the connector's target identity when `changes`
+/// does not carry every credential slot they read (`SEC-14`).
+fn candidate_dial_info(
+    dial_info: &ConnectorDialInfo,
+    changes: &[SlotChange],
+    pending_dial: Option<Value>,
+) -> Result<ConnectorDialInfo, ApiError> {
+    let mut candidate = dial_info.clone();
+    for change in changes {
+        match change.slot {
+            connectors::SecretSlot::Primary => candidate.secret_ref.clone_from(&change.new_ref),
+            connectors::SecretSlot::Secondary => {
+                candidate.secret_ref_secondary = Some(change.new_ref.clone());
+            }
+        }
+    }
+    if let Some(dial) = pending_dial {
+        let adapter = dial_info.adapter.as_deref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "dial was sent, but this connector has no connection settings to replace"
+                    .to_owned(),
+            )
+        })?;
+        let parsed = Dial::parse(adapter, &dial)
+            .map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        // SEC-14: settings that move the connector to another target are
+        // tested with the credentials of THIS request only. A slot left out
+        // would be resolved from the stored ref and sent to the new target,
+        // so every slot the new settings read must be in the request.
+        // Refused before the probe, hence before any lookup or connection.
+        if lakehouse_store::ingest_spec::is_repoint(
+            dial_info.adapter.as_deref(),
+            &dial_info.dial,
+            &parsed,
+        ) {
+            let has = |slot: connectors::SecretSlot| changes.iter().any(|c| c.slot == slot);
+            if !slots_cover(
+                credential_slots_read(adapter, &parsed),
+                has(connectors::SecretSlot::Primary),
+                has(connectors::SecretSlot::Secondary),
+            ) {
+                return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()));
+            }
+        }
+        candidate.dial = dial;
+    }
+    Ok(candidate)
+}
+
+/// Map a failed [`connectors::swap_secret_refs`] to the caller's response.
+fn swap_error(id: &str, err: lakehouse_store::StoreError) -> ApiError {
+    match err {
+        lakehouse_store::StoreError::NotFound => {
+            ApiError::NotFound(format!("Connector {id} not found"))
+        }
+        lakehouse_store::StoreError::Conflict => ApiError::Conflict(
+            "the connector's credential changed since it was read; reload and retry".to_owned(),
+        ),
+        err => ApiError::from(err),
+    }
+}
+
+/// Put `changes` in place all or nothing (ADR 0002 Addendum 4): the new
+/// values are written aside, put in place with the files they replace
+/// kept, and the refs of every slot whose kind changed are swapped in ONE
+/// transaction. If that fails, the files go back exactly as they were, so
+/// a pair can never be left half-changed.
+///
+/// # Errors
+///
+/// A store failure (400/503), or the swap's 404/409; nothing changed.
+async fn replace_credentials(
+    state: &AppState,
+    id: &str,
+    changes: &[SlotChange],
+) -> Result<(), ApiError> {
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    publish_credentials(state, id, changes, async {
+        if swaps.is_empty() {
+            return Ok(());
+        }
+        connectors::swap_secret_refs(pool(state)?, id, &swaps)
+            .await
+            .map_err(|err| swap_error(id, err))
+    })
+    .await
+}
+
+/// The part of [`replace_credentials`] every credential change shares
+/// (`SEC-14` extracts it so the ingest-spec re-point reuses it): write the
+/// new values aside, put them in place keeping the files they replace, then
+/// run `write` — the database write that makes the change real. If `write`
+/// fails the files go back exactly as they were; if it succeeds the backups
+/// are dropped and any managed file a slot no longer names is removed.
+///
+/// `write` is awaited only after the values are in place and while the
+/// store's change lock is held, so it must not itself take that lock.
+///
+/// # Errors
+///
+/// A store failure (400/503) staging or publishing the values, or whatever
+/// `write` returns; in every case nothing changed.
+async fn publish_credentials<T>(
+    state: &AppState,
+    id: &str,
+    changes: &[SlotChange],
+    write: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    let store = &state.connector_secret_store;
+    let _serialized = store.lock().await;
+    let staged = store
+        .stage(
+            &changes
+                .iter()
+                .map(|c| (c.new_ref.clone(), c.value.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|err| secret_store_error(&err))?;
+    let published = staged
+        .publish()
+        .await
+        .map_err(|err| secret_store_error(&err))?;
+    let written = match write.await {
+        Ok(written) => written,
+        Err(err) => {
+            published.rollback().await;
+            return Err(err);
+        }
+    };
+    published.commit().await;
+    // A slot whose kind changed no longer names its old managed file —
+    // unless that file is now the OTHER slot's (the two swapped kinds).
+    for change in changes {
+        let Some(old_ref) = change.old_ref.as_deref() else {
+            continue;
+        };
+        if changes.iter().all(|c| c.new_ref != old_ref) {
+            remove_managed_credentials(state, id, Some(old_ref), None).await;
+        }
+    }
+    Ok(written)
+}
+
+/// `PUT /api/connectors/{id}/credential` — the user supplies credential
+/// values, and the API stores them as this connector's managed credentials
+/// (ADR 0002 Addendum 4). Also how an operator-provisioned connector
+/// (`env:`/`file:`) is switched to a managed one.
+///
+/// # Probe first, like `rotate_secret`
+///
+/// The candidate values are tested BEFORE anything is written: the probe
+/// runs against an in-memory copy of the connector whose changed slots name
+/// the managed refs, resolved by a [`CandidateSecretResolver`] that answers
+/// those refs from memory and delegates every other ref to the usual
+/// allowlisted resolver. A credential the source rejects is refused (422)
+/// and never stored — the connector keeps dialing with whatever it had.
+///
+/// # One deliberate difference from `rotate_secret`
+///
+/// `rotate_secret` refuses a connector type this build cannot probe,
+/// because the credential it would swap to already exists somewhere and
+/// can be verified later. Here the user holds the ONLY copy of the value;
+/// refusing an unprobeable type (Kafka, SFTP, `MongoDB`, Oracle, …) would
+/// make its credential impossible to set at all. So an unsupported probe
+/// saves the value with `verified: false` and says so — never a fabricated
+/// success.
+///
+/// # Errors
+///
+/// 400 on a malformed body, no slot at all, or an unusable value; 404 if
+/// `id` is unknown; 422 if the probe dialed and the source rejected the
+/// credential; 409 if a slot's ref changed between this handler's read and
+/// its write, or ([`REPOINT_NEEDS_CREDENTIALS`], `SEC-14`) if `dial` moves
+/// the connector to another target without every credential slot it reads
+/// in the same request; 503 if the credential store is not mounted; 500 as
+/// every other route.
+///
+/// [`CandidateSecretResolver`]: crate::connector_secret_store::CandidateSecretResolver
+pub async fn set_credential(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<SetCredentialResponse>> {
+    let mut body: SetCredentialBody = parse_body(&body)?;
+    if body.primary.is_none() && body.secondary.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one of primary/secondary is required".to_owned(),
+        )
+        .into());
+    }
+
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+
+    let pending_dial = body.dial.take();
+    let changes = slot_changes(&id, &dial_info, body)?;
+    let candidate = candidate_dial_info(&dial_info, &changes, pending_dial)?;
+    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .map(|c| (c.new_ref.clone(), c.value.clone()))
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    );
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        &resolver,
+        &state.config.connector_internal_hosts(),
+    )
+    .await;
+    if outcome.supported && !outcome.ok {
+        return Err(ApiError::Unprocessable(format!(
+            "the credential was NOT saved: {}",
+            outcome.message
+        ))
+        .into());
+    }
+
+    replace_credentials(&state, &id, &changes).await?;
+
+    let slots: Vec<connectors::SecretSlot> = changes.iter().map(|c| c.slot).collect();
+    // Same audit convention as `rotate_secret`: successful mutations only,
+    // best-effort, the slots and whether they were verified — never a ref
+    // name, never a value.
+    let event = connector_audit_event(
+        &principal,
+        "connector.credential_set",
+        &id,
+        json!({
+            "slots": slots.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "verified": outcome.supported,
+        }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.credential_set audit event");
+    }
+
+    Ok(ApiJson(SetCredentialResponse {
+        saved: true,
+        slots,
+        verified: outcome.supported,
+        message: outcome.message,
     }))
 }
 
@@ -776,7 +1776,7 @@ pub async fn discover(
         &dial_info,
         query.schema.as_deref(),
         state.connector_secret_resolver.as_ref(),
-        state.config.connector_probe_allow_internal_hosts,
+        &state.config.connector_internal_hosts(),
     )
     .await?;
     Ok(ApiJson(result))
@@ -1276,16 +2276,53 @@ async fn deprovision_postgres_connector(
                      CDC dial"
                 )));
             };
-            deprovision_with_names(state, id, dial_info, &cdc.slot_name, &cdc.publication_name)
-                .await
-                .map(Some)
-        }
-        None if dial_info.kind.to_lowercase().contains("postgres") => {
-            let slug = connector_slug_for_id(id)?;
+            // Replication slots and publications are Postgres objects.
+            // A MySQL (binlog) or SQL Server (per-table CDC) source keeps
+            // no server-side state for this connector to drop.
+            if cdc.driver != SqlDriver::Postgres {
+                return Ok(None);
+            }
+            // The wizard stores `host` as a bare hostname; user, port and
+            // database live only in `dial` (same as `connector_probe`).
+            let target = PgHost {
+                host: cdc.host.clone(),
+                port: cdc.port,
+                user: cdc.user.clone(),
+                database: cdc.database.clone(),
+            };
             deprovision_with_names(
                 state,
                 id,
                 dial_info,
+                &target,
+                &cdc.slot_name,
+                &cdc.publication_name,
+            )
+            .await
+            .map(Some)
+        }
+        None if dial_info.kind.to_lowercase().contains("postgres") => {
+            let slug = connector_slug_for_id(id)?;
+            // A pre-WS3 row: its only record of the target is the legacy
+            // `<user>@<host>:<port>/<database>` host string.
+            let Some(parsed) = connector_probe::parse_postgres_host(&dial_info.host) else {
+                return Err(ApiError::Internal(format!(
+                    "connector {id} is registered as PostgreSQL but its host is not shaped \
+                     \"<user>@<host>:<port>/<database>\", so CDC deprovisioning cannot even \
+                     attempt to dial it"
+                )));
+            };
+            let target = PgHost {
+                host: parsed.host.to_owned(),
+                port: parsed.port,
+                user: parsed.user.to_owned(),
+                database: parsed.database.to_owned(),
+            };
+            deprovision_with_names(
+                state,
+                id,
+                dial_info,
+                &target,
                 &format!("{slug}_slot"),
                 &format!("{slug}_pub"),
             )
@@ -1301,46 +2338,68 @@ async fn deprovision_postgres_connector(
     }
 }
 
+/// Where a Postgres CDC source lives, resolved by
+/// [`deprovision_postgres_connector`] from whichever record the connector
+/// has: its parsed `dial` (every connector this build creates) or the
+/// legacy host string (a pre-WS3 row).
+struct PgHost {
+    host: String,
+    port: u16,
+    user: String,
+    database: String,
+}
+
 /// The shared body behind every [`deprovision_postgres_connector`] arm that
-/// actually attempts a drop: resolve `dial_info`'s host/credential exactly
-/// the way [`crate::connector_probe::probe`] does for `POST
-/// /api/connectors/{id}/test` (same parser, same allowlisted resolver),
-/// then drop `slot_name`/`publication_name` on that target. Unchanged from
-/// [`deprovision_postgres_connector`]'s body before this task, just
-/// parameterized on the two names instead of a single `&ConnectorSlug`.
+/// actually attempts a drop: resolve `dial_info`'s credential through the
+/// same allowlisted resolver [`crate::connector_probe::probe`] uses for
+/// `POST /api/connectors/{id}/test`, then drop
+/// `slot_name`/`publication_name` on `target`.
 async fn deprovision_with_names(
     state: &AppState,
     id: &str,
     dial_info: &ConnectorDialInfo,
+    target: &PgHost,
     slot_name: &str,
     publication_name: &str,
 ) -> Result<Deprovisioned, ApiError> {
-    let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
-        return Err(ApiError::Internal(format!(
-            "connector {id} is registered as PostgreSQL but its host is not shaped \
-             \"<user>@<host>:<port>/<database>\", so CDC deprovisioning cannot even attempt to \
-             dial it"
-        )));
-    };
+    // SEC-15: the clean-up dials the host a caller registered, so it gets the
+    // same address check as a connection test, BEFORE the credential is
+    // resolved, and dials the address the check approved. A refused target
+    // is never dialled (feature page decision 7); `delete` turns the refusal
+    // into a fixed 409, and `?force=true` removes the row without dialling.
+    let approved = connector_probe::resolve_checked(
+        &target.host,
+        target.port,
+        &state.config.connector_internal_hosts(),
+    )
+    .await
+    .map_err(|message| {
+        ApiError::Conflict(format!("the source database was not contacted: {message}"))
+    })?;
     let password = state
         .connector_secret_resolver
         .resolve_dyn(&dial_info.secret_ref)
         .await
         .map_err(|err| {
+            // The resolver's text is for the log, not the response.
+            tracing::warn!(connector_id = %id, error = %err, "could not resolve a connector's credential to deprovision its CDC slot");
             ApiError::Internal(format!(
-                "could not resolve connector {id}'s credential to deprovision its CDC slot: {err}"
+                "could not resolve connector {id}'s credential to deprovision its CDC slot"
             ))
         })?;
     let pg_target = PgTarget {
-        host: target.host.to_owned(),
-        port: target.port,
-        user: target.user.to_owned(),
+        host: approved.primary_host(),
+        port: approved.primary().port(),
+        user: target.user.clone(),
         password,
-        database: target.database.to_owned(),
+        database: target.database.clone(),
     };
     connector_deprovision::drop_slot_and_publication(&pg_target, slot_name, publication_name)
         .await
         .map_err(|err| {
+            // SEC-15: `sqlx`'s own text stays in the log; the response gets
+            // `DeprovisionError::summary`.
+            tracing::warn!(connector_id = %id, error = %err, "CDC deprovisioning failed");
             ApiError::Internal(deprovision_error_message(
                 id,
                 slot_name,
@@ -1352,9 +2411,9 @@ async fn deprovision_with_names(
 
 /// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
 /// a log line — never the credential [`deprovision_with_names`] resolved,
-/// only the slot/publication names and the error's own `Display` (which,
-/// per [`DeprovisionError`]'s doc comment, never includes connection
-/// credentials).
+/// and (`SEC-15`) never the error's own `Display`, which carries `sqlx`'s
+/// text: only the slot/publication names and
+/// [`DeprovisionError::summary`]'s fixed sentence.
 fn deprovision_error_message(
     id: &str,
     slot_name: &str,
@@ -1363,7 +2422,8 @@ fn deprovision_error_message(
 ) -> String {
     format!(
         "deprovisioning connector {id}'s CDC replication slot ({slot_name:?}) and publication \
-         ({publication_name:?}) failed: {err}"
+         ({publication_name:?}) failed: {}",
+        err.summary()
     )
 }
 
@@ -1400,12 +2460,27 @@ fn deprovision_error_message(
 ///   never succeed there, and an operator who already knows that needs a
 ///   way to remove the row anyway rather than being stuck forever.
 ///
+/// # The clean-up goes through the address check (`SEC-15`)
+///
+/// The clean-up dials the host the connector was registered with, so it runs
+/// [`connector_probe::resolve_checked`] first and dials the address that
+/// approved (feature page decision 7). A target the check refuses (an
+/// internal address while the block is on, or a name that does not resolve)
+/// is never dialled: without `force` the delete is a 409 carrying the fixed
+/// refusal, with `?force=true` the row is removed and nothing is dialled.
+/// The 409 text is a fixed sentence either way, never driver text.
+///
+/// # Pipelines that read from the connector block the delete
+///
+/// Checked first, before any deprovisioning: while a pipeline still names
+/// this connector the delete is a 409 listing them, `force` or not.
+///
 /// # Errors
 ///
 /// 401 if no principal is present (see [`create`]'s doc comment on why
 /// this is `Option`, not a bare `Extension`); 404 if `id` is unknown; 409
-/// if CDC deprovisioning failed and `force` was not given; 503/500 as
-/// above.
+/// if a pipeline still reads from it, or if CDC deprovisioning failed and
+/// `force` was not given; 503/500 as above.
 pub async fn delete(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1419,6 +2494,26 @@ pub async fn delete(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
+
+    // Before anything irreversible: a pipeline still reading from this
+    // connector would be left pointing at nothing (no foreign key guards
+    // `pipeline_definition.connector_id`). `force` does not override this
+    // — it exists for an unreachable CDC source, not for orphaning
+    // pipelines.
+    let dependents = connectors::dependent_pipelines(pool(&state)?, &id).await?;
+    if !dependents.is_empty() {
+        let names = dependents
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ApiError::Conflict(format!(
+            "connector {id} was NOT deleted: {} pipeline(s) still read from it ({names}). \
+             Delete those pipelines or point them at another connector first.",
+            dependents.len()
+        ))
+        .into());
+    }
 
     if let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await {
         if query.force {
@@ -1438,11 +2533,13 @@ pub async fn delete(
                 |_| "its CDC slot/publication".to_owned(),
                 |s| format!("slot {s}_slot / publication {s}_pub"),
             );
+            // SEC-15: `err` is a fixed sentence (a refusal of the target by
+            // the address check, or a classified failure), never driver text.
             return Err(ApiError::Conflict(format!(
-                "connector {id} was NOT deleted: dropping {slug_hint} failed ({err}); the \
-                 registry row is kept deliberately so this orphaned slot stays visible instead \
-                 of silently pinning WAL on the source database forever. Retry once the source \
-                 is reachable, or pass ?force=true to delete the row anyway (the \
+                "connector {id} was NOT deleted: dropping {slug_hint} did not complete ({err}); \
+                 the registry row is kept deliberately so this orphaned slot stays visible \
+                 instead of silently pinning WAL on the source database forever. Retry once the \
+                 source is reachable, or pass ?force=true to delete the row anyway (the \
                  slot/publication will then have to be cleaned up manually)."
             ))
             .into());
@@ -1452,6 +2549,25 @@ pub async fn delete(
     let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    }
+    // ADR 0002 Addendum 4: a managed credential belongs to this connector
+    // alone, so it goes with it. An operator's env/file credential is left
+    // exactly where the operator put it.
+    remove_managed_credentials(
+        &state,
+        &id,
+        Some(&dial_info.secret_ref),
+        dial_info.secret_ref_secondary.as_deref(),
+    )
+    .await;
+    // Also every other name a managed credential of this connector could
+    // have: a credential change that raced this delete may have written
+    // one after the refs above were read. Every managed name is derived
+    // from the id and a kind, so this list is complete.
+    for kind in connectors::CredentialKind::ALL {
+        let secret_ref =
+            connectors::derive_secret_ref(&id, connectors::CredentialSource::Managed, kind);
+        remove_managed_credentials(&state, &id, Some(&secret_ref), None).await;
     }
     // WS5 item D3: best-effort, after the row is already gone — a failed
     // audit write here must never resurrect the 404/409 branches above or
@@ -1533,11 +2649,40 @@ pub async fn assign_connector_tenant(
 pub async fn ingest_spec_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let spec = connectors::get_ingest_spec(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
-    Ok(ApiJson(spec))
+    Ok(ApiJson(IngestSpecResponse::new(
+        spec,
+        time::OffsetDateTime::now_utc(),
+    )))
+}
+
+/// A connector's ingest spec as the console reads it: the stored spec plus
+/// when its schedule next fires. Mirrors `IngestSpec` in
+/// `contracts/connectors.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSpecResponse {
+    #[serde(flatten)]
+    spec: connectors::IngestSpec,
+    /// The next time the schedule sensor launches this connector (UTC,
+    /// [`crate::next_run::next_run_at`]); `null` with no schedule, and for
+    /// `cdc`, which streams on its own.
+    #[serde(with = "time::serde::rfc3339::option")]
+    next_run_at: Option<time::OffsetDateTime>,
+}
+
+impl IngestSpecResponse {
+    fn new(spec: connectors::IngestSpec, now: time::OffsetDateTime) -> Self {
+        let next_run_at = spec
+            .schedule_cron
+            .as_deref()
+            .filter(|_| spec.adapter.as_deref() != Some("cdc"))
+            .and_then(|cron| crate::next_run::next_run_at(cron, now));
+        Self { spec, next_run_at }
+    }
 }
 
 /// The `PUT /api/connectors/{id}/ingest-spec` body. Mirrors
@@ -1553,6 +2698,22 @@ pub struct IngestSpecBody {
     source_objects: serde_json::Value,
     #[serde(default)]
     schedule_cron: Option<String>,
+    /// The connector's credentials, sent again when this save changes where
+    /// it points (`SEC-14`). Absent for any other save.
+    #[serde(default)]
+    credential: Option<IngestCredentialBody>,
+}
+
+/// `credential` on the `PUT /api/connectors/{id}/ingest-spec` body: the
+/// same slots as `PUT .../credential` (without a `dial`, which is the spec
+/// itself). Write-only values, never echoed back.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngestCredentialBody {
+    #[serde(default)]
+    primary: Option<CredentialSlotBody>,
+    #[serde(default)]
+    secondary: Option<CredentialSlotBody>,
 }
 
 /// A second, non-authoritative SSRF check on `dial`'s host, run at
@@ -1565,17 +2726,21 @@ pub struct IngestSpecBody {
 /// parsed the same way [`connector_probe::probe_s3`] parses an S3
 /// endpoint) against [`connector_probe::resolve_checked`], gated the SAME
 /// way [`connector_probe::probe`] already is by
-/// `state.config.connector_probe_allow_internal_hosts`. Never checks
+/// `&state.config.connector_internal_hosts()`. Never checks
 /// `sheets`: its dial names a spreadsheet id, not a caller-chosen host —
 /// every `sheets` connector targets Google's own fixed hosts.
 ///
 /// # Errors
 ///
-/// Returns `ApiError::BadRequest` naming the offending resolved address
-/// (the same message [`connector_probe::resolve_checked`] already produces
-/// for `POST .../test`) if a checked host resolves to a private/internal
-/// address and `allow_internal_hosts` is `false`.
-async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), ApiError> {
+/// Returns `ApiError::BadRequest` with the fixed message
+/// [`connector_probe::resolve_checked`] produces for `POST .../test` (the
+/// caller's own host, never the address it resolved to: `SEC-15`) if a
+/// checked host resolves to a private/internal address that
+/// `internal_hosts` does not permit, or does not resolve.
+async fn check_dial_ssrf(
+    dial: &Dial,
+    internal_hosts: &crate::internal_hosts::InternalHosts,
+) -> Result<(), ApiError> {
     let host_port: Option<(&str, u16)> = match dial {
         Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
         Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
@@ -1601,9 +2766,56 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
     let Some((host, port)) = host_port else {
         return Ok(());
     };
-    connector_probe::resolve_checked(host, port, allow_internal_hosts)
+    // The approved address is dropped on purpose: this is the advisory
+    // save-time check, and nothing is dialled here.
+    connector_probe::resolve_checked(host, port, internal_hosts)
         .await
+        .map(|_approved| ())
         .map_err(ApiError::BadRequest)
+}
+
+/// Refuse a spec whose `sourceObjects` land in a raw table name that uploaded
+/// files have reserved (plan task T8, ADR 0014, decision 5, review finding
+/// B4).
+///
+/// "Reserved" is [`lakehouse_store::uploads::table_claimed`]: a claim on the
+/// name by an upload of ANY tenant (raw table names are shared), whatever
+/// became of the load that made it. A claim is made when a load into the table
+/// is first requested and is never released, so a table whose load is still
+/// running, whose load failed, or whose upload was deleted is refused like one
+/// that loaded; a name whose claim belongs to a tenant that is gone too. A
+/// table an upload has never asked for is not.
+///
+/// `target` is stored unvalidated server-side (the console checks it), so a
+/// value that is not text is skipped here and left to whatever reads it
+/// later; every distinct text target is asked about once. The pool is only
+/// needed, and only required, when there is a target to ask about.
+///
+/// # Errors
+///
+/// 409 naming the first target an upload reserved; 503 if no pool is
+/// configured; the store's fixed `database error` when the question cannot
+/// be asked.
+async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Result<(), ApiError> {
+    let targets: std::collections::BTreeSet<&str> = source_objects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("target").and_then(Value::as_str))
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let pool = pool(state)?;
+    for target in targets {
+        if uploads::table_claimed(pool, target).await? {
+            return Err(ApiError::Conflict(format!(
+                "The table {target} is reserved for uploaded files, so a connector cannot \
+                 load into it. Choose another target."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `PUT /api/connectors/{id}/ingest-spec` — set a connector's ingest
@@ -1630,26 +2842,97 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
 /// pastes an obviously-internal host and finds out immediately, at save
 /// time, rather than on the next scheduled run (WS3 plan judge review Z1).
 ///
+/// # A connector may not take a table uploads have reserved
+///
+/// A `sourceObjects[].target` that is a raw table name an upload has claimed
+/// is refused with a 409 ([`refuse_uploaded_targets`], ADR 0014, decision 5):
+/// an upload may never load into a connector's table, and the other direction
+/// would let a scheduled connector replace or append to what a person
+/// uploaded.
+///
+/// # Changing where the connector points needs its credentials (`SEC-14`)
+///
+/// The connector keeps its stored credential, and every later test,
+/// discovery, delete or scheduled ingest resolves it and sends it to
+/// whatever `dial` names. So a save that changes the connector's target
+/// identity ([`lakehouse_store::ingest_spec::is_repoint`]: adapter, host,
+/// port, database, endpoint, bucket, base URL, brokers…) must carry every
+/// credential slot the new `dial` reads, in `credential`. Without them it
+/// is refused with a fixed 409 ([`REPOINT_NEEDS_CREDENTIALS`]) BEFORE the
+/// save-time address check and before any connection: nothing is resolved,
+/// dialled or written. With them the new settings are probed with those
+/// credentials alone (a [`crate::connector_secret_store::CandidateSecretResolver`],
+/// as `PUT .../credential` does), a failed probe is a 422, and otherwise the
+/// credential files and the spec are written together
+/// ([`publish_credentials`] around
+/// [`lakehouse_store::connectors::repoint_ingest_spec`]): both or neither.
+/// The first dial of a connector that has none yet is not a re-point.
+///
+/// The assistant's `set_ingest_spec` tool calls this handler with no
+/// principal and never forwards a `credential`, so it reaches the 409 for a
+/// re-point and cannot carry a secret.
+///
 /// # Errors
 ///
 /// 404 if `id` is unknown; 400 if `dial` fails
 /// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
 /// refuses `dial`'s host (`StoreError::Validation` maps to
 /// `ApiError::BadRequest`, never `Internal` — both messages are safe to
-/// surface); 503/500 as above.
+/// surface), or a credential value is unusable; 409 if a target is a table
+/// name uploads have reserved, or the save re-points the connector without
+/// every credential slot ([`REPOINT_NEEDS_CREDENTIALS`]); 401 if
+/// credentials arrive without a principal; 422 if the probe dialled and the
+/// source rejected the credentials; 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let body: IngestSpecBody = parse_body(&body)?;
+    // Refused here rather than at the first tick: the schedule sensor
+    // would otherwise skip a malformed cron without a word, forever.
+    if let Some(problem) = body
+        .schedule_cron
+        .as_deref()
+        .and_then(crate::next_run::ingest_cron_problem)
+    {
+        return Err(ApiError::BadRequest(problem).into());
+    }
+    // A load mode the ingest job cannot run is refused here too, rather
+    // than surfacing as a rejected run later.
+    lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    check_dial_ssrf(&dial, state.config.connector_probe_allow_internal_hosts).await?;
+
+    // SEC-14: decide whether this save re-points the connector BEFORE the
+    // address check below, which resolves the new host. A re-point without
+    // the credentials is refused here, so nothing is looked up or dialled.
+    let stored = connectors::get_connector_dial_info(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, &dial);
+    let required = credential_slots_read(&body.adapter, &dial);
+    if repoint
+        && !body.credential.as_ref().is_some_and(|credential| {
+            slots_cover(
+                required,
+                credential.primary.is_some(),
+                credential.secondary.is_some(),
+            )
+        })
+    {
+        return Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into());
+    }
+
+    let credential = body.credential;
     let input = connectors::IngestSpecInput {
         adapter: body.adapter,
         ingest_mode: body.ingest_mode,
@@ -1657,13 +2940,146 @@ pub async fn ingest_spec_put(
         source_objects: body.source_objects,
         schedule_cron: body.schedule_cron,
     };
-    match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
-        Ok(spec) => Ok(ApiJson(spec)),
-        Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
-        }
-        Err(err) => Err(ApiError::from(err).into()),
+    let Some(credential) = credential else {
+        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+            Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
+                spec,
+                time::OffsetDateTime::now_utc(),
+            ))),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+            }
+            // The stored target changed between the read above and the
+            // store's own locked comparison: this save is now a re-point
+            // without credentials.
+            Err(lakehouse_store::StoreError::Conflict) => {
+                Err(ApiError::Conflict(REPOINT_NEEDS_CREDENTIALS.to_owned()).into())
+            }
+            Err(err) => Err(ApiError::from(err).into()),
+        };
+    };
+    save_with_credentials(&state, principal, &id, stored, &dial, input, credential).await
+}
+
+/// The credential-carrying half of [`ingest_spec_put`]: probe the new
+/// settings with the request's credentials alone, then write the credential
+/// files and the spec together.
+///
+/// # Errors
+///
+/// 401 without a principal (the audit event needs one); 400 for an unusable
+/// credential value, a slot the connector does not read, or a refused
+/// address; 422 when the probe dialled and the source rejected the
+/// credentials; 409/404/503/500 from the write.
+async fn save_with_credentials(
+    state: &AppState,
+    principal: Option<Extension<Principal>>,
+    id: &str,
+    stored: ConnectorDialInfo,
+    dial: &Dial,
+    input: connectors::IngestSpecInput,
+    credential: IngestCredentialBody,
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    if credential_slots_read(&input.adapter, dial) == 0 {
+        return Err(ApiError::BadRequest(
+            "this connection signs in with no credential, so there is none to send".to_owned(),
+        )
+        .into());
     }
+    let repoint =
+        lakehouse_store::ingest_spec::is_repoint(stored.adapter.as_deref(), &stored.dial, dial);
+
+    // The connector as it will be once saved, so the slot rules (which
+    // adapters have a second credential) are those of the NEW adapter.
+    let mut after = stored;
+    after.adapter = Some(input.adapter.clone());
+    after.dial = input.dial.clone();
+    let changes = slot_changes(
+        id,
+        &after,
+        SetCredentialBody {
+            primary: credential.primary,
+            secondary: credential.secondary,
+            dial: None,
+        },
+    )?;
+    let candidate = candidate_dial_info(&after, &changes, None)?;
+
+    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .map(|c| (c.new_ref.clone(), c.value.clone()))
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    );
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        &resolver,
+        &state.config.connector_internal_hosts(),
+    )
+    .await;
+    if outcome.supported && !outcome.ok {
+        return Err(ApiError::Unprocessable(format!(
+            "the change was NOT saved: {}",
+            outcome.message
+        ))
+        .into());
+    }
+
+    // Every slot sent is a swap, including one whose ref name stays the same
+    // (its file is replaced): the store counts the slots to know the
+    // credentials were supplied, and the swap still checks nobody changed
+    // the ref since it was read.
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    let spec = publish_credentials(state, id, &changes, async {
+        match connectors::repoint_ingest_spec(pool(state)?, id, &input, &swaps).await {
+            Ok(spec) => Ok(spec),
+            Err(lakehouse_store::StoreError::NotFound) => {
+                Err(ApiError::NotFound(format!("Connector {id} not found")))
+            }
+            Err(lakehouse_store::StoreError::Conflict) => Err(ApiError::Conflict(
+                "the connector changed since it was read; reload and retry".to_owned(),
+            )),
+            Err(err) => Err(ApiError::from(err)),
+        }
+    })
+    .await?;
+
+    // The slots and whether the probe really dialled — never a ref name,
+    // never a value (same convention as `connector.credential_set`).
+    let event = connector_audit_event(
+        &principal,
+        if repoint {
+            "connector.repoint"
+        } else {
+            "connector.credential_set"
+        },
+        id,
+        json!({
+            "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
+            "verified": outcome.supported,
+        }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record the connector credential audit event");
+    }
+    Ok(ApiJson(IngestSpecResponse::new(
+        spec,
+        time::OffsetDateTime::now_utc(),
+    )))
 }
 
 /// `POST /api/connectors/{id}/ingest/run`'s response for a `cdc`-adapter
@@ -1727,8 +3143,10 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// # Errors
 ///
 /// 404 if `id` is unknown or has no ingest spec set (`adapter IS NULL`);
-/// 422 if `Dagster` reports a launch-time failure; 503 on a `Dagster`
-/// transport failure; 503/500 as above for the database pool.
+/// 409 if a run for this connector is still queued or running (see
+/// [`ingest_run_history`]); 422 if `Dagster` reports a launch-time
+/// failure; 503 on a `Dagster` transport failure; 503/500 as above for the
+/// database pool.
 pub async fn ingest_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1747,6 +3165,30 @@ pub async fn ingest_run(
         })));
     }
 
+    // One run at a time per connector. Bronze is append-only, so a second
+    // run started while the first is still going copies every table into
+    // Bronze a second time — a double click was enough to do it. Checked
+    // against Dagster's own run list, so a run started by the schedule
+    // counts too. Not a lock: two requests in the same instant can both
+    // pass, which the console's disabled button covers.
+    let recent = state
+        .dagster
+        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    if let Some(active) = connector_runs(&recent, &id)
+        .into_iter()
+        .find(ConnectorIngestRun::is_active)
+    {
+        return Err(ApiError::Conflict(format!(
+            "a run for this connector is already {} (run {}); wait for it to finish before \
+             starting another",
+            active.status,
+            active.run_id.get(..8).unwrap_or(&active.run_id),
+        ))
+        .into());
+    }
+
     // Mirrors `agent_runs.py`'s `_employee_run_config` shape: one static
     // job (`ingest_job`), the launched run's only per-run input is this
     // connector's id, which `run_ingest`'s Dagster op re-fetches the
@@ -1754,7 +3196,7 @@ pub async fn ingest_run(
     let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": id}}}});
     match state
         .dagster
-        .launch_run_with_config("ingest_job", &run_config)
+        .launch_run_with_config(INGEST_JOB, &run_config)
         .await
     {
         Ok(outcome) => {
@@ -1767,11 +3209,129 @@ pub async fn ingest_run(
     }
 }
 
+/// The one Dagster job every connector's ingest runs as
+/// (`dagster/dispar_orchestrate/ingest_factory.py`).
+const INGEST_JOB: &str = "ingest_job";
+
+/// How many of `ingest_job`'s most recent runs, across every connector,
+/// are searched for one connector's runs.
+const RECENT_INGEST_RUNS: u32 = 100;
+
+/// How many of one connector's runs [`ingest_run_history`] returns.
+const CONNECTOR_RUN_HISTORY: usize = 20;
+
+/// One `ingest_job` run of one connector.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorIngestRun {
+    /// `Dagster`'s run id.
+    pub run_id: String,
+    /// `queued | running | completed | failed | cancelled | unknown`
+    /// ([`map_run_status`], the vocabulary the pipelines pages use).
+    pub status: &'static str,
+    /// ISO-8601, `None` until the run starts.
+    pub started_at: Option<String>,
+    /// ISO-8601, `None` until the run ends.
+    pub ended_at: Option<String>,
+}
+
+impl ConnectorIngestRun {
+    /// Whether the run has not finished yet.
+    fn is_active(&self) -> bool {
+        matches!(self.status, "queued" | "running")
+    }
+}
+
+/// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
+/// order. Every connector runs the same `ingest_job`; only the run config
+/// (`ops.run_ingest.config.connector_id`) tells whose run it is.
+fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<ConnectorIngestRun> {
+    runs.iter()
+        .filter(|run| {
+            run.run_config
+                .pointer("/ops/run_ingest/config/connector_id")
+                .and_then(Value::as_str)
+                == Some(connector_id)
+        })
+        .take(CONNECTOR_RUN_HISTORY)
+        .map(|run| ConnectorIngestRun {
+            run_id: run.run_id.clone(),
+            status: map_run_status(&run.status),
+            started_at: run.start_time.map(iso_from_unix_seconds),
+            ended_at: run.end_time.map(iso_from_unix_seconds),
+        })
+        .collect()
+}
+
+/// `GET /api/connectors/{id}/ingest/runs` — this connector's recent
+/// `ingest_job` runs, newest first, with their status.
+///
+/// The per-table results (`GET /api/governance/ingest-runs`) are written
+/// only once a run reaches a table, so a run that fails before that — an
+/// unreachable API, a refused credential — leaves no result at all. This
+/// is the list that still shows it, and the one the console watches to
+/// know a run is still going.
+///
+/// # Errors
+///
+/// 503 when `Dagster` cannot be reached.
+pub async fn ingest_run_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Vec<ConnectorIngestRun>>> {
+    let runs = state
+        .dagster
+        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    Ok(ApiJson(connector_runs(&runs, &id)))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
+
+    fn dg_run(id: &str, status: &str, connector: &str) -> DgConfiguredRun {
+        DgConfiguredRun {
+            run_id: id.to_owned(),
+            status: status.to_owned(),
+            start_time: Some(1_790_670_111.0),
+            end_time: (status == "SUCCESS").then_some(1_790_670_153.0),
+            run_config: json!({ "ops": { "run_ingest": { "config": { "connector_id": connector } } } }),
+        }
+    }
+
+    #[test]
+    fn connector_runs_keeps_only_this_connectors_runs_newest_first() {
+        let runs = [
+            dg_run("run-3", "STARTED", "conn-a"),
+            dg_run("run-2", "SUCCESS", "conn-b"),
+            dg_run("run-1", "SUCCESS", "conn-a"),
+        ];
+        let mine = connector_runs(&runs, "conn-a");
+        assert_eq!(
+            mine.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            ["run-3", "run-1"]
+        );
+        assert_eq!(mine[0].status, "running");
+        assert!(mine[0].is_active());
+        assert_eq!(mine[0].ended_at, None);
+        assert_eq!(mine[1].status, "completed");
+        assert!(!mine[1].is_active());
+        assert_eq!(
+            mine[1].started_at.as_deref(),
+            Some("2026-09-29T08:21:51.000Z")
+        );
+    }
+
+    #[test]
+    fn connector_runs_ignores_a_run_without_a_connector_id() {
+        let mut run = dg_run("run-1", "SUCCESS", "conn-a");
+        run.run_config = json!({});
+        assert!(connector_runs(&[run], "conn-a").is_empty());
+    }
 
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -1945,9 +3505,11 @@ mod tests {
                 source: connectors::CredentialSource::Env,
                 primary: connectors::CredentialKind::Token,
                 secondary: None,
+                values: None,
             },
             environment: "production".to_owned(),
             tenant: "t".to_owned(),
+            tenant_id: None,
             residency: String::new(),
             capabilities: vec![],
             owner: None,
@@ -2107,7 +3669,17 @@ mod tests {
     /// reaches the real dial attempt (and its slot/publication names),
     /// never a real database.
     fn state_with_stub_secret_resolver() -> AppState {
-        let mut state = state_without_pool();
+        // SEC-15: these tests are about which slot/publication names are
+        // attempted, so they aim at a loopback port nothing listens on and
+        // must be allowed to reach it; the refusal of an internal target is
+        // covered by `deprovision_refuses_an_internal_target_before_anything_else`.
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).unwrap());
         state.connector_secret_resolver = std::sync::Arc::new(
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::from([(
                 "TEST_CONNECTOR_PASSWORD".to_owned(),
@@ -2134,8 +3706,11 @@ mod tests {
             Some("cdc"),
             serde_json::json!({
                 "driver": "postgres",
-                "host": "source.example.internal",
-                "port": 5432,
+                // A loopback port nothing listens on (the connect fails
+                // fast), rather than a made-up name that no longer reaches
+                // the dial now that the target is resolved first (SEC-15).
+                "host": "127.0.0.1",
+                "port": 1,
                 "database": "oms",
                 "user": "replicator",
                 "slotName": "dial_supplied_slot",
@@ -2150,6 +3725,10 @@ mod tests {
             text.contains("dial_supplied_slot") && text.contains("dial_supplied_pub"),
             "expected the error to name dial's own slot/publication: {text}"
         );
+        // SEC-15: the failure is a fixed, classified sentence, never the
+        // driver's own text.
+        assert!(text.contains("connection refused"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
         // The slug this connector's `id` would derive to must never appear
         // -- proves `dial` won with NO fallback, not merely that it was
         // tried first.
@@ -2157,6 +3736,42 @@ mod tests {
             !text.contains("conn_cdc_dial_wins"),
             "the slug-derived name must never appear once adapter=cdc: {text}"
         );
+    }
+
+    /// `SEC-15` (K4): with the internal-address block on (the default), the
+    /// clean-up of a connector aimed at a loopback host is refused with the
+    /// fixed message BEFORE the credential is resolved (this state's
+    /// resolver resolves nothing, so a late check would answer with the
+    /// credential error instead) and BEFORE anything is dialled. `localhost`
+    /// is used so the test can also assert that the resolved address is not
+    /// in the message.
+    #[tokio::test]
+    async fn deprovision_refuses_an_internal_target_before_anything_else() {
+        let state = state_without_pool();
+        let info = dial_info(
+            "Custom CDC System",
+            Some("cdc"),
+            serde_json::json!({
+                "driver": "postgres",
+                "host": "localhost",
+                "port": 1,
+                "database": "oms",
+                "user": "replicator",
+                "slotName": "refused_slot",
+                "publicationName": "refused_pub",
+            }),
+        );
+        let err = deprovision_postgres_connector(&state, "conn-cdc-refused", &info)
+            .await
+            .expect_err("a loopback target must be refused");
+        let ApiError::Conflict(text) = err else {
+            panic!("expected the refusal as a Conflict, got {err:?}");
+        };
+        assert!(text.contains("private/internal"), "{text}");
+        assert!(text.contains("\"localhost\""), "{text}");
+        for resolved in ["127.0.0.1", "::1"] {
+            assert!(!text.contains(resolved), "no resolved address: {text}");
+        }
     }
 
     /// The exact defect this rule fixes: a `sql`-adapter connector must never
@@ -2286,6 +3901,210 @@ mod tests {
             .await
             .expect_err("a foreign X-Tenant must be refused");
         assert_eq!(err.0.status(), 404);
+    }
+
+    // ── PATCH validation (pure) ──────────────────────────────────────────
+
+    fn update_body(json: serde_json::Value) -> UpdateConnectorBody {
+        serde_json::from_value(json).expect("valid PATCH body")
+    }
+
+    #[test]
+    fn update_input_keeps_only_the_fields_sent() {
+        let input = update_input(update_body(
+            json!({ "name": " renamed ", "residency": "id" }),
+        ))
+        .unwrap();
+        assert_eq!(input.name.as_deref(), Some("renamed"));
+        assert_eq!(input.residency.as_deref(), Some("id"));
+        assert!(input.direction.is_none() && input.environment.is_none() && input.host.is_none());
+    }
+
+    #[test]
+    fn update_input_refuses_blank_fields_bad_directions_and_empty_updates() {
+        for body in [
+            json!({ "name": "  " }),
+            json!({ "direction": "sideways" }),
+            json!({}),
+        ] {
+            assert!(update_input(update_body(body.clone())).is_err(), "{body}");
+        }
+    }
+
+    /// Type, tenant, credential and dial each have their own route; naming
+    /// one in a PATCH gets a pointer to it, not a silent drop.
+    #[test]
+    fn patch_refuses_fields_owned_by_other_routes_with_a_pointer() {
+        for (body, route) in [
+            (json!({ "type": "MySQL" }), "create a new connector"),
+            (json!({ "tenantId": "x" }), "/tenant"),
+            (json!({ "credential": {} }), "/credential"),
+            (json!({ "dial": {} }), "/ingest-spec"),
+        ] {
+            let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+            let Err(ApiError::BadRequest(message)) = reject_non_patchable_fields(&bytes) else {
+                panic!("{body} must be refused");
+            };
+            assert!(message.contains(route), "{message}");
+        }
+        let fine = Bytes::from(serde_json::to_vec(&json!({ "name": "n" })).unwrap());
+        assert!(reject_non_patchable_fields(&fine).is_ok());
+    }
+
+    mod create_and_update_routes {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::identity::{self, CreateTenantInput};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = std::collections::HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn seed_tenant(pool: &sqlx::PgPool, name: &str, slug: &str) -> uuid::Uuid {
+            identity::create_tenant(
+                pool,
+                &CreateTenantInput {
+                    name: name.to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "Standard".to_owned(),
+                    residency: "ID".to_owned(),
+                },
+            )
+            .await
+            .expect("create a test tenant")
+            .id
+            .parse()
+            .expect("create_tenant returns a UUID-shaped id")
+        }
+
+        fn principal_in(tenant_ids: &[uuid::Uuid]) -> Extension<Principal> {
+            Extension(Principal {
+                id: PrincipalId::User(uuid::Uuid::nil()),
+                tenant_ids: tenant_ids.to_vec(),
+                display_name: "Creator".to_owned(),
+                permissions: PermissionSet::parse("connector:manage"),
+                provider: "local".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            })
+        }
+
+        /// An operator-provisioned (`env`) credential, so these tests never
+        /// touch the managed store's fixed `/run/secrets` directory.
+        fn create_body(name: &str, tenant_id: Option<uuid::Uuid>) -> Bytes {
+            let mut body = json!({
+                "name": name, "type": "PostgreSQL", "direction": "source",
+                "host": "db.internal",
+                "credential": { "source": "env", "primary": "password" },
+                "environment": "staging", "tenant": "typed by the user", "residency": "ID",
+            });
+            if let Some(tenant_id) = tenant_id {
+                body["tenantId"] = json!(tenant_id.to_string());
+            }
+            Bytes::from(serde_json::to_vec(&body).expect("serialize"))
+        }
+
+        /// The bug this closes: a console-created connector used to have
+        /// `tenant_id = NULL` and was invisible to everyone, its creator
+        /// included. It now lands in the caller's active tenant, named
+        /// after the tenant row — not whatever text was typed.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_lands_in_the_callers_active_tenant(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant = seed_tenant(&pool, "Acme Co", "acme-create").await;
+
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Some(principal_in(&[tenant])),
+                HeaderMap::new(),
+                create_body("visible to its creator", None),
+            )
+            .await
+            .expect("create should succeed");
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.connector.tenant, "Acme Co");
+
+            let listed = connectors::list_connectors(
+                &pool,
+                &connectors::ConnectorFilter {
+                    tenant_id: Some(tenant),
+                },
+            )
+            .await
+            .expect("list");
+            assert!(listed.iter().any(|c| c.id == created.connector.id));
+        }
+
+        /// A tenant the caller does not belong to is refused as "not
+        /// found", and no connector row is left behind.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_tenant_the_caller_is_not_in(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let mine = seed_tenant(&pool, "Mine", "mine").await;
+            let theirs = seed_tenant(&pool, "Theirs", "theirs").await;
+
+            let err = create(
+                State(state),
+                Some(principal_in(&[mine])),
+                HeaderMap::new(),
+                create_body("smuggled", Some(theirs)),
+            )
+            .await
+            .expect_err("a foreign tenant must be refused");
+            assert_eq!(err.0.status(), 404);
+            let all = connectors::list_connectors(&pool, &connectors::ConnectorFilter::default())
+                .await
+                .expect("list");
+            assert!(all.iter().all(|c| c.name != "smuggled"));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn patch_renames_and_the_detail_reads_the_new_values_back(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant = seed_tenant(&pool, "Acme Co", "acme-patch").await;
+            let (_, ApiJson(created)) = create(
+                State(state.clone()),
+                Some(principal_in(&[tenant])),
+                HeaderMap::new(),
+                create_body("before rename", None),
+            )
+            .await
+            .expect("create");
+            let id = created.connector.id.clone();
+
+            let ApiJson(updated) = update(
+                State(state.clone()),
+                Some(principal_in(&[tenant])),
+                Path(id.clone()),
+                Bytes::from_static(br#"{"name":"after rename","residency":"id-jakarta"}"#),
+            )
+            .await
+            .expect("patch should succeed");
+            assert_eq!(updated.name, "after rename");
+
+            let ApiJson(detail) = super::super::detail(State(state), Path(id))
+                .await
+                .expect("detail");
+            assert_eq!(detail.residency, "id-jakarta");
+            assert_eq!(detail.tenant_id, Some(tenant.to_string()));
+        }
     }
 
     /// `PUT /api/connectors/{id}/tenant` route tests.
@@ -2565,5 +4384,528 @@ mod tests {
             target.connector_class,
             "io.debezium.connector.oracle.OracleConnector"
         );
+    }
+
+    // ── ADR 0002 Addendum 4: user-supplied (managed) credentials ────────
+
+    fn values_body(json: serde_json::Value) -> CredentialValuesBody {
+        serde_json::from_value(json).expect("valid credential.values body")
+    }
+
+    #[test]
+    fn credential_values_are_optional() {
+        let result = credential_values(connectors::CredentialSource::Managed, false, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn managed_credential_values_are_accepted() {
+        let result = credential_values(
+            connectors::CredentialSource::Managed,
+            true,
+            Some(values_body(
+                json!({ "primary": "access", "secondary": "secret" }),
+            )),
+        )
+        .unwrap()
+        .expect("values present");
+        assert_eq!(result.primary.expose_secret(), "access");
+        assert_eq!(result.secondary.unwrap().expose_secret(), "secret");
+    }
+
+    /// A value sent with an operator-provisioned source would be silently
+    /// dropped (the API never writes env/file credentials) — refused.
+    #[test]
+    fn values_with_an_operator_source_are_refused() {
+        for source in [
+            connectors::CredentialSource::Env,
+            connectors::CredentialSource::File,
+        ] {
+            let err =
+                credential_values(source, false, Some(values_body(json!({ "primary": "pw" }))))
+                    .err()
+                    .expect("must be refused");
+            assert!(matches!(err, ApiError::BadRequest(_)), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_secondary_value_without_a_secondary_slot_is_refused() {
+        let err = credential_values(
+            connectors::CredentialSource::Managed,
+            false,
+            Some(values_body(json!({ "primary": "pw", "secondary": "x" }))),
+        )
+        .err()
+        .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// A two-part credential stored half would be reported as stored and
+    /// never authenticate — refused before any row exists.
+    #[test]
+    fn a_declared_secondary_slot_without_its_value_is_refused() {
+        let err = credential_values(
+            connectors::CredentialSource::Managed,
+            true,
+            Some(values_body(json!({ "primary": "access-only" }))),
+        )
+        .err()
+        .expect("must be refused");
+        let ApiError::BadRequest(message) = err else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("secondary is required"), "{message}");
+    }
+
+    fn credential_info(
+        adapter: Option<&str>,
+        primary: &str,
+        secondary: Option<&str>,
+    ) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: "test".to_owned(),
+            host: "unused".to_owned(),
+            secret_ref: primary.to_owned(),
+            secret_ref_secondary: secondary.map(str::to_owned),
+            adapter: adapter.map(str::to_owned),
+            dial: json!({}),
+        }
+    }
+
+    fn set_body(json: serde_json::Value) -> SetCredentialBody {
+        serde_json::from_value(json).expect("valid set-credential body")
+    }
+
+    fn managed(kind: connectors::CredentialKind) -> String {
+        connectors::derive_secret_ref("conn-x", connectors::CredentialSource::Managed, kind)
+    }
+
+    /// A `PostgreSQL` connector reads one password; a second credential
+    /// would be stored and never used.
+    #[test]
+    fn slot_changes_refuses_a_secondary_for_a_one_credential_connector() {
+        let info = credential_info(
+            Some("sql"),
+            &managed(connectors::CredentialKind::Password),
+            None,
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "pw" },
+                "secondary": { "kind": "token", "value": "t" }
+            })),
+        )
+        .err()
+        .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// A REST connector moving to basic auth gains a second credential.
+    #[test]
+    fn slot_changes_accepts_a_new_secondary_for_a_rest_connector() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .expect("a rest connector can have two credentials");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[1].old_ref, None);
+    }
+
+    /// Changing one slot to the kind the other slot already has would make
+    /// both name one file, and each write overwrite the other.
+    #[test]
+    fn slot_changes_refuses_a_kind_the_other_slot_already_has() {
+        let info = credential_info(
+            Some("files"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::SecretKey)),
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "secret_key", "value": "v" } })),
+        )
+        .err()
+        .expect("must be refused");
+        let ApiError::BadRequest(message) = err else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("different kinds"), "{message}");
+    }
+
+    #[test]
+    fn slot_changes_refuses_the_same_kind_for_both_slots() {
+        let info = credential_info(
+            Some("files"),
+            &managed(connectors::CredentialKind::AccessKey),
+            None,
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "a" },
+                "secondary": { "kind": "password", "value": "b" }
+            })),
+        )
+        .err()
+        .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// Changing the sign-in method (REST bearer to basic) in the same edit:
+    /// the probe must test the new credential with the NEW settings.
+    #[test]
+    fn candidate_dial_info_tests_with_the_pending_connection_settings() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .unwrap();
+        let basic = json!({
+            "baseUrl": "https://api.example.com",
+            "auth": { "type": "basic" },
+            "pagination": { "type": "none" },
+            "endpoints": [{ "path": "/orders", "recordsPath": null }]
+        });
+        let candidate = candidate_dial_info(&info, &changes, Some(basic.clone())).unwrap();
+        assert_eq!(candidate.dial, basic);
+        assert_eq!(
+            candidate.secret_ref,
+            managed(connectors::CredentialKind::AccessKey)
+        );
+        assert_eq!(
+            candidate.secret_ref_secondary,
+            Some(managed(connectors::CredentialKind::Password))
+        );
+    }
+
+    #[test]
+    fn candidate_dial_info_refuses_settings_that_do_not_parse() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let err = candidate_dial_info(&info, &[], Some(json!({ "baseUrl": 42 })))
+            .err()
+            .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    fn rest_dial(base_url: &str, auth: &str) -> serde_json::Value {
+        json!({
+            "baseUrl": base_url,
+            "auth": { "type": auth },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        })
+    }
+
+    /// `SEC-14`: settings that move a two-credential connector to another
+    /// host, sent with only one of its credentials, are refused with the
+    /// fixed 409 before any probe — the stored other slot would otherwise be
+    /// resolved and sent to the new host.
+    #[test]
+    fn candidate_dial_info_refuses_a_re_pointing_dial_without_every_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let moved = rest_dial("https://elsewhere.example.com", "basic");
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        let err = candidate_dial_info(&info, &primary_only, Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        let ApiError::Conflict(message) = err else {
+            panic!("expected 409");
+        };
+        assert_eq!(message, REPOINT_NEEDS_CREDENTIALS);
+
+        let neither = candidate_dial_info(&info, &[], Some(moved.clone()))
+            .err()
+            .expect("must be refused");
+        assert!(matches!(neither, ApiError::Conflict(_)));
+
+        let both = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .unwrap();
+        let candidate = candidate_dial_info(&info, &both, Some(moved.clone())).unwrap();
+        assert_eq!(candidate.dial, moved);
+    }
+
+    /// Settings that keep the target (same host, default port written out,
+    /// other pagination) are tested with the stored credentials as before.
+    #[test]
+    fn candidate_dial_info_accepts_settings_that_keep_the_target_with_one_slot() {
+        let mut info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        info.dial = rest_dial("https://api.example.com", "basic");
+        let mut same = rest_dial("https://API.example.com:443/v2", "basic");
+        same["pagination"] = json!({ "type": "page", "param": "p" });
+
+        let primary_only = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "access_key", "value": "user" } })),
+        )
+        .unwrap();
+        candidate_dial_info(&info, &primary_only, Some(same))
+            .expect("the target is the same, so one slot may change alone");
+    }
+
+    #[test]
+    fn slots_cover_names_what_each_slot_count_needs() {
+        assert!(slots_cover(0, false, false));
+        assert!(!slots_cover(1, false, false));
+        assert!(slots_cover(1, true, false));
+        assert!(!slots_cover(2, true, false));
+        assert!(!slots_cover(2, false, true));
+        assert!(slots_cover(2, true, true));
+    }
+
+    fn host_row(adapter: Option<&str>, host: &str) -> ConnectorDialInfo {
+        let mut info = credential_info(adapter, "env:X", None);
+        info.host = host.to_owned();
+        info
+    }
+
+    /// `SEC-14` (D4): a connector that dials from its `host` column cannot
+    /// have it changed through `PATCH`; one that dials from `dial` can (the
+    /// column is a label), and so can a `PATCH` that repeats the stored
+    /// value.
+    #[test]
+    fn host_change_refusal_covers_the_rows_that_dial_from_host() {
+        let legacy = host_row(None, "lakehouse@db:5432/lakehouse");
+        let files = host_row(Some("files"), "http://rustfs:9000|bucket");
+        let sql = host_row(Some("sql"), "label");
+
+        for stored in [&legacy, &files] {
+            let err = host_change_refusal(stored, "lakehouse@other:5432/lakehouse")
+                .expect("a changed host must be refused");
+            let ApiError::Conflict(message) = err else {
+                panic!("expected 409");
+            };
+            assert_eq!(message, HOST_CHANGE_NEEDS_CREDENTIALS);
+        }
+        assert!(host_change_refusal(&legacy, " LAKEHOUSE@db:5432/lakehouse ").is_none());
+        assert!(host_change_refusal(&sql, "another label").is_none());
+        for adapter in ["cdc", "rest", "sheets", "mongodb", "kafka", "sftp"] {
+            assert!(host_change_refusal(&host_row(Some(adapter), "x"), "y").is_none());
+        }
+    }
+
+    /// Two slots trading kinds end up naming different files, so it is
+    /// allowed.
+    #[test]
+    fn slot_changes_allows_two_slots_to_trade_kinds() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "a" },
+                "secondary": { "kind": "access_key", "value": "b" }
+            })),
+        )
+        .expect("trading kinds is allowed");
+        assert_eq!(
+            changes[0].new_ref,
+            managed(connectors::CredentialKind::Password)
+        );
+        assert_eq!(
+            changes[1].new_ref,
+            managed(connectors::CredentialKind::AccessKey)
+        );
+    }
+
+    /// A value the resolvers would read back trimmed is refused before any
+    /// row is created, and the error names the slot but never the value.
+    #[test]
+    fn a_padded_value_is_refused_without_echoing_it() {
+        let err = credential_values(
+            connectors::CredentialSource::Managed,
+            false,
+            Some(values_body(json!({ "primary": " hunter2 " }))),
+        )
+        .err()
+        .expect("must be refused");
+        let ApiError::BadRequest(message) = err else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("credential.values.primary"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_values_slot_is_refused() {
+        let parsed: Result<CredentialValuesBody, _> =
+            serde_json::from_value(json!({ "primary": "pw", "tertiary": "x" }));
+        assert!(parsed.is_err());
+    }
+
+    /// Every request body that carries a credential derives `Debug`; none
+    /// of them may print the value.
+    #[test]
+    fn debug_of_a_body_carrying_a_credential_never_prints_it() {
+        let create: CreateConnectorBody = serde_json::from_value(json!({
+            "name": "n", "type": "PostgreSQL", "direction": "source", "host": "db.internal",
+            "credential": {
+                "source": "managed", "primary": "password",
+                "values": { "primary": "hunter2-create" }
+            },
+            "environment": "production", "tenant": "t"
+        }))
+        .unwrap();
+        let set: SetCredentialBody = serde_json::from_value(json!({
+            "primary": { "kind": "password", "value": "hunter2-set" }
+        }))
+        .unwrap();
+        let rendered = format!("{create:?} {set:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn set_credential_body_refuses_unknown_fields() {
+        for body in [
+            json!({ "primary": { "kind": "password", "value": "pw" }, "source": "env" }),
+            json!({ "primary": { "kind": "password", "value": "pw", "slot": "primary" } }),
+        ] {
+            let parsed: Result<SetCredentialBody, _> = serde_json::from_value(body.clone());
+            assert!(parsed.is_err(), "{body}");
+        }
+    }
+
+    fn ingestible(id: &str, adapter: &str, cron: Option<&str>) -> connectors::IngestibleConnector {
+        connectors::IngestibleConnector {
+            id: id.to_owned(),
+            adapter: adapter.to_owned(),
+            ingest_mode: if adapter == "cdc" { "cdc" } else { "batch" }.to_owned(),
+            dial: json!({}),
+            source_objects: json!([]),
+            schedule_cron: cron.map(str::to_owned),
+            secret_ref: format!("file:/run/secrets/connector_managed_{id}_password"),
+            secret_ref_secondary: None,
+        }
+    }
+
+    /// The schedule sensor's window: a connector is due when its cron
+    /// fires after `dueAfter` and no later than `dueUntil`; `cdc` and an
+    /// unscheduled connector never are.
+    #[test]
+    fn is_due_follows_the_cron_and_leaves_out_cdc_and_manual_connectors() {
+        let until = time::macros::datetime!(2026 - 09 - 30 02:00:00 UTC);
+        let after = until - time::Duration::minutes(1);
+        assert!(is_due(
+            &ingestible("a", "sql", Some("0 2 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(
+            &ingestible("b", "sql", Some("0 3 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(
+            &ingestible("c", "cdc", Some("0 2 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(&ingestible("d", "sql", None), after, until));
+    }
+
+    #[test]
+    fn due_window_takes_both_bounds_or_neither() {
+        let query = |after: Option<&str>, until: Option<&str>| IngestibleQuery {
+            due_after: after.map(str::to_owned),
+            due_until: until.map(str::to_owned),
+        };
+        assert!(due_window(&query(None, None)).unwrap().is_none());
+        let (after, until) = due_window(&query(
+            Some("2026-09-30T01:59:00+00:00"),
+            Some("2026-09-30T02:00:00+00:00"),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(until - after, time::Duration::minutes(1));
+        assert!(due_window(&query(Some("2026-09-30T01:59:00+00:00"), None)).is_err());
+        assert!(due_window(&query(Some("yesterday"), Some("2026-09-30T02:00:00+00:00"))).is_err());
+    }
+
+    fn spec(adapter: &str, cron: Option<&str>) -> connectors::IngestSpec {
+        connectors::IngestSpec {
+            adapter: Some(adapter.to_owned()),
+            ingest_mode: Some("batch".to_owned()),
+            dial: json!({}),
+            source_objects: json!([]),
+            schedule_cron: cron.map(str::to_owned),
+            secret_refs: connectors::IngestSecretRefs {
+                primary: "file:/run/secrets/x".to_owned(),
+                secondary: None,
+            },
+        }
+    }
+
+    /// `nextRunAt` sits next to the stored spec's own fields, and is `null`
+    /// where nothing is scheduled to run.
+    #[test]
+    fn ingest_spec_response_adds_the_next_run() {
+        let now = time::macros::datetime!(2026 - 09 - 30 01:30:00 UTC);
+        let body =
+            serde_json::to_value(IngestSpecResponse::new(spec("sql", Some("0 2 * * *")), now))
+                .unwrap();
+        assert_eq!(body["nextRunAt"], "2026-09-30T02:00:00Z");
+        assert_eq!(body["scheduleCron"], "0 2 * * *");
+        assert_eq!(body["adapter"], "sql");
+        let manual = serde_json::to_value(IngestSpecResponse::new(spec("sql", None), now)).unwrap();
+        assert!(manual["nextRunAt"].is_null());
+        let cdc =
+            serde_json::to_value(IngestSpecResponse::new(spec("cdc", Some("0 2 * * *")), now))
+                .unwrap();
+        assert!(cdc["nextRunAt"].is_null());
     }
 }

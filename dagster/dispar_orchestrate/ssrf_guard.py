@@ -35,6 +35,19 @@ Widened by ONE class beyond the Rust original: multicast (IPv4
 `is_blocked_ip` does not check multicast today; this is a DELIBERATE
 widening (WS3 plan judge review Z1), stated here explicitly so the two
 guards' divergence reads as an intentional difference, not drift.
+
+Two operator switches lift the block, mirroring the API's own pair
+(`rust/crates/lakehouse-api/src/internal_hosts.rs`):
+
+- `INGEST_ALLOW_INTERNAL_HOSTS=true` lifts it for every internal address.
+- `INGEST_ALLOWED_CIDRS` (e.g. `192.168.18.0/24`, comma- or space-separated;
+  a bare address is one host) lifts it only for the listed networks, so a
+  customer's LAN can be reached while the compose network and this host
+  stay refused. The list never opens loopback, link-local (where cloud
+  instance metadata lives), multicast or the unspecified address: listing
+  `0.0.0.0/0` opens private ranges, not those. A malformed entry refuses
+  every internal address with a message naming it, rather than being
+  dropped.
 """
 
 from __future__ import annotations
@@ -74,6 +87,43 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return is_unique_local or is_link_local
 
 
+Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_allowed_cidrs(raw: str) -> list[Network]:
+    """`INGEST_ALLOWED_CIDRS` as networks. A network written with host bits
+    set (`192.168.18.5/24`) is refused rather than widened to the whole
+    `/24`: it usually means one host was meant.
+
+    Raises `SsrfBlocked` naming the first entry that is neither a network
+    nor an address -- fail closed, never silently skipped."""
+    networks: list[Network] = []
+    for entry in raw.replace(",", " ").split():
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=True))
+        except ValueError as exc:
+            raise SsrfBlocked(
+                f"INGEST_ALLOWED_CIDRS entry {entry!r} is not a network (e.g. 192.168.18.0/24) "
+                "or a single address without host bits set, so no internal address is allowed"
+            ) from exc
+    return networks
+
+
+def _allowed_networks(allowed_cidrs: str | None) -> list[Network]:
+    raw = os.environ.get("INGEST_ALLOWED_CIDRS", "") if allowed_cidrs is None else allowed_cidrs
+    return _parse_allowed_cidrs(raw)
+
+
+def _listed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, networks: list[Network]) -> bool:
+    """Whether the allowlist opens `ip`, an address `_is_blocked_ip`
+    refuses. Loopback, link-local, multicast and unspecified never are."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return False
+    return any(ip.version == net.version and ip in net for net in networks)
+
+
 @dataclass(frozen=True)
 class ResolvedAddress:
     """The ONE address `resolve_checked` validated -- the address the
@@ -89,6 +139,7 @@ def resolve_checked(
     port: int,
     *,
     allow_internal_hosts: bool | None = None,
+    allowed_cidrs: str | None = None,
     getaddrinfo: Callable = socket.getaddrinfo,
 ) -> ResolvedAddress:
     """Resolve `host:port`; refuse it if ANY resolved address is blocked,
@@ -105,6 +156,8 @@ def resolve_checked(
     since `lakehouse-api` and `dagster-code-location` are configured
     independently (an operator may want interactive API probes permissive
     while unattended scheduled ingestion stays strict, or vice versa).
+    `allowed_cidrs` likewise defaults to `INGEST_ALLOWED_CIDRS`: an address
+    inside a listed network passes even when internal hosts are refused.
     """
     if allow_internal_hosts is None:
         allow_internal_hosts = os.environ.get("INGEST_ALLOW_INTERNAL_HOSTS", "").strip() == "true"
@@ -115,14 +168,16 @@ def resolve_checked(
     if not infos:
         raise SsrfBlocked(f"host {host!r} did not resolve to any address")
     if not allow_internal_hosts:
+        networks = _allowed_networks(allowed_cidrs)
         for _family, _socktype, _proto, _canon, sockaddr in infos:
             ip = ipaddress.ip_address(sockaddr[0])
-            if _is_blocked_ip(ip):
+            if _is_blocked_ip(ip) and not _listed(ip, networks):
                 raise SsrfBlocked(
                     f"refusing to dial {host!r}: it resolves to {ip}, a private/internal/"
-                    "multicast address this build blocks by default (set "
-                    "INGEST_ALLOW_INTERNAL_HOSTS=true to allow this for a trusted internal "
-                    "deployment)"
+                    "multicast address this build blocks by default (list its network in "
+                    "INGEST_ALLOWED_CIDRS, e.g. 192.168.18.0/24, or set "
+                    "INGEST_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a "
+                    "trusted internal deployment)"
                 )
     family, _socktype, _proto, _canon, sockaddr = infos[0]
     return ResolvedAddress(ip=sockaddr[0], port=sockaddr[1], family=family)
@@ -186,7 +241,12 @@ def pinned_resolution(host: str, resolved: ResolvedAddress):
 
 
 @contextlib.contextmanager
-def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: Callable = socket.getaddrinfo):
+def checking_resolver(
+    *,
+    allow_internal_hosts: bool | None = None,
+    allowed_cidrs: str | None = None,
+    getaddrinfo: Callable = socket.getaddrinfo,
+):
     """Wraps `socket.getaddrinfo` for the WHOLE context, validating every
     result any caller receives -- not one host pinned in advance (see
     `pinned_resolution` above for that narrower case). Use this whenever
@@ -196,9 +256,10 @@ def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: 
     module does not control directly, such as the one `oracledb`'s thin
     mode uses internally -- see `adapters/oracle.py`).
 
-    `allow_internal_hosts` follows the SAME env-var default
-    (`INGEST_ALLOW_INTERNAL_HOSTS`) `resolve_checked` already reads --
-    one operator-facing switch for both primitives, not two.
+    `allow_internal_hosts` and `allowed_cidrs` follow the SAME env-var
+    defaults (`INGEST_ALLOW_INTERNAL_HOSTS`, `INGEST_ALLOWED_CIDRS`)
+    `resolve_checked` already reads -- one pair of operator-facing
+    switches for both primitives, not two.
 
     PROCESS-GLOBAL monkeypatch, like `pinned_resolution` above and safe
     for the same stated reason: each `ingest_job` RUN processes exactly
@@ -216,6 +277,7 @@ def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: 
     result only when THIS check itself finds a blocked address."""
     if allow_internal_hosts is None:
         allow_internal_hosts = os.environ.get("INGEST_ALLOW_INTERNAL_HOSTS", "").strip() == "true"
+    networks = [] if allow_internal_hosts else _allowed_networks(allowed_cidrs)
     real_getaddrinfo = socket.getaddrinfo
 
     def _checking(host, port, *args, **kwargs):
@@ -241,7 +303,7 @@ def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: 
                         f"{raw!r}, which is not an address this guard can evaluate "
                         "(checking_resolver)"
                     ) from exc
-                if _is_blocked_ip(ip):
+                if _is_blocked_ip(ip) and not _listed(ip, networks):
                     raise SsrfBlocked(
                         f"refusing to dial {host!r}: connect-time resolution returned {ip}, "
                         "a private/internal/multicast address (checking_resolver)"

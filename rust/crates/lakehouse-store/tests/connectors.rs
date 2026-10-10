@@ -24,9 +24,10 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretSlot, create_connector, delete_connector, get_connector,
+    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
+    connector_in_tenants, create_connector, delete_connector, get_connector,
     get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref,
+    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -180,6 +181,7 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             max_retries: None,
             tenant_id: None,
             depends_on: Vec::new(),
+            connector_id: Some(connector.id.clone()),
             // PR #57 review F1.7: `None` lets the store derive the id
             // itself via `slug_id` — this fixture is the "dependent
             // pipeline" the connector's reverse-lookup assertion uses,
@@ -190,12 +192,6 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     )
     .await
     .unwrap();
-    sqlx::query("UPDATE pipeline_definition SET connector_id = $1 WHERE id = $2")
-        .bind(&connector.id)
-        .bind(&pipeline.id)
-        .execute(&pool)
-        .await
-        .unwrap();
 
     let after = get_connector(&pool, &connector.id).await.unwrap().unwrap();
     assert_eq!(after.dependent_pipelines.len(), 1);
@@ -602,6 +598,67 @@ async fn get_connector_audit_event_id_resolves_a_real_event(pool: PgPool) -> sql
         .unwrap()
         .unwrap();
     assert_eq!(after.audit_event_id.as_deref(), Some(event.id.as_str()));
+    Ok(())
+}
+
+/// `PATCH /api/connectors/{id}`'s write: only the fields given change, the
+/// rest keep their values, the detail reads the new residency back, and a
+/// rename onto a taken name is a 409-shaped conflict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_connector_changes_only_the_given_fields(pool: PgPool) -> sqlx::Result<()> {
+    let (created, _) = create_connector(&pool, &minimal_input("editable one"))
+        .await
+        .expect("create");
+    create_connector(&pool, &minimal_input("taken name"))
+        .await
+        .expect("create second");
+
+    let updated = update_connector(
+        &pool,
+        &created.id,
+        &UpdateConnectorInput {
+            name: Some("renamed".to_owned()),
+            residency: Some("id-jakarta".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await
+    .expect("update");
+    assert_eq!(updated.name, "renamed");
+    assert_eq!(
+        updated.direction, "source",
+        "untouched field keeps its value"
+    );
+    assert_eq!(
+        updated.environment, "staging",
+        "untouched field keeps its value"
+    );
+
+    let detail = get_connector(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(detail.residency, "id-jakarta");
+    assert_eq!(detail.tenant_id, None, "a new connector starts unassigned");
+
+    let clash = update_connector(
+        &pool,
+        &created.id,
+        &UpdateConnectorInput {
+            name: Some("taken name".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await;
+    assert!(matches!(clash, Err(StoreError::Conflict)), "{clash:?}");
+
+    let missing = update_connector(
+        &pool,
+        "conn-does-not-exist",
+        &UpdateConnectorInput {
+            name: Some("x".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await;
+    assert!(matches!(missing, Err(StoreError::NotFound)), "{missing:?}");
     Ok(())
 }
 
@@ -1363,6 +1420,88 @@ async fn swap_secret_ref_on_an_unknown_id_is_not_found(pool: PgPool) -> sqlx::Re
     Ok(())
 }
 
+/// Two slots change together or not at all: when the second swap's
+/// `expected_old` is stale, the first (which on its own would apply) is
+/// rolled back too, so an S3 key pair can never end up half-changed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_refs_rolls_back_every_slot_when_one_conflicts(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (created, credential_names) = create_connector(&pool, &minimal_input("rotate pair target"))
+        .await
+        .unwrap();
+
+    let err = swap_secret_refs(
+        &pool,
+        &created.id,
+        &[
+            SecretRefSwap {
+                slot: SecretSlot::Primary,
+                expected_old: Some(&credential_names.primary),
+                new_ref: "env:NEW_PRIMARY_REF",
+            },
+            SecretRefSwap {
+                slot: SecretSlot::Secondary,
+                expected_old: Some("env:NOT_THE_CURRENT_SECONDARY"),
+                new_ref: "env:NEW_SECONDARY_REF",
+            },
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.secret_ref, credential_names.primary,
+        "the primary swap must be rolled back with the failed secondary one"
+    );
+    assert_eq!(after.secret_ref_secondary, None);
+    Ok(())
+}
+
+/// Both slots change in one call when every `expected_old` holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_refs_applies_every_slot_together(pool: PgPool) -> sqlx::Result<()> {
+    let (created, credential_names) =
+        create_connector(&pool, &minimal_input("rotate pair applies"))
+            .await
+            .unwrap();
+
+    swap_secret_refs(
+        &pool,
+        &created.id,
+        &[
+            SecretRefSwap {
+                slot: SecretSlot::Primary,
+                expected_old: Some(&credential_names.primary),
+                new_ref: "env:PAIR_PRIMARY_REF",
+            },
+            SecretRefSwap {
+                slot: SecretSlot::Secondary,
+                expected_old: None,
+                new_ref: "env:PAIR_SECONDARY_REF",
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.secret_ref, "env:PAIR_PRIMARY_REF");
+    assert_eq!(
+        after.secret_ref_secondary.as_deref(),
+        Some("env:PAIR_SECONDARY_REF")
+    );
+    Ok(())
+}
+
 /// A connector whose secondary slot has never been set (`NULL`) can still
 /// be rotated by passing `expected_old: None` -- `IS NOT DISTINCT FROM`
 /// (rather than `=`) is what makes a `NULL`-to-`NULL` comparison match.
@@ -1401,5 +1540,146 @@ async fn swap_secret_ref_sets_a_null_secondary_slot_when_expected_old_is_none(
         after.secret_ref_secondary.as_deref(),
         Some("env:NEW_SECONDARY_REF")
     );
+    Ok(())
+}
+
+/// The per-connector routes' access rule: the connector's own tenant is
+/// in, any other tenant, no tenant at all and an unknown id are all out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connector_in_tenants_admits_only_the_connectors_own_tenant(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("seeded tenant id");
+    let retail = Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("seeded tenant id");
+    assert!(
+        connector_in_tenants(&pool, "conn-pg-lakehouse", &[retail, group])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[retail])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-does-not-exist", &[group])
+            .await
+            .expect("query")
+    );
+
+    sqlx::query("UPDATE connector SET tenant_id = NULL WHERE id = 'conn-pg-lakehouse'")
+        .execute(&pool)
+        .await?;
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[group])
+            .await
+            .expect("query")
+    );
+    Ok(())
+}
+
+/// A SQL connector's ingest spec with the given `source_objects`.
+fn sql_spec_with_objects(source_objects: serde_json::Value) -> IngestSpecInput {
+    IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "postgres",
+            "host": "source.example.internal",
+            "port": 5432,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects,
+        schedule_cron: None,
+    }
+}
+
+/// An upload may never load into a table a connector loads (ADR 0014,
+/// decision 5). `any_connector_targets` answers for every connector, by the
+/// `target` of each source object and by nothing else: not a prefix, not a
+/// different case, not the object's `name`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_targets_matches_a_target_exactly_and_nothing_else(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (created, _) = create_connector(&pool, &minimal_input("targets lookup"))
+        .await
+        .unwrap();
+    let spec = sql_spec_with_objects(serde_json::json!([
+        { "name": "public.orders", "target": "sales_orders", "loadMode": "replace" },
+        { "name": "public.items", "target": "sales_items" },
+    ]));
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    for hit in ["sales_orders", "sales_items"] {
+        assert!(
+            any_connector_targets(&pool, hit).await.unwrap(),
+            "{hit} is a target"
+        );
+    }
+    // `0034_seed_connector_ingest_spec.sql` seeds `conn-pg-lakehouse` with
+    // the target `orders`: a row no test here wrote is found too.
+    assert!(any_connector_targets(&pool, "orders").await.unwrap());
+
+    for miss in [
+        "sales_order",
+        "sales_orders_2",
+        "Sales_Orders",
+        "public.orders",
+        "public.items",
+        "customers",
+        "",
+    ] {
+        assert!(
+            !any_connector_targets(&pool, miss).await.unwrap(),
+            "{miss:?} is not a target"
+        );
+    }
+
+    // The connector goes: its targets go with it.
+    delete_connector(&pool, &created.id).await.unwrap();
+    assert!(!any_connector_targets(&pool, "sales_orders").await.unwrap());
+    Ok(())
+}
+
+/// `source_objects` is a plain JSONB with no CHECK that it is an array.
+/// A value that is not one (or holds elements that are not objects) is
+/// never a match, and never an error: one odd row must not turn every
+/// upload into a 500.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_targets_ignores_a_source_objects_value_that_is_not_a_list_of_objects(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for malformed in [
+        serde_json::json!({ "target": "sales_orders" }),
+        serde_json::json!("sales_orders"),
+        serde_json::json!(5),
+        serde_json::Value::Null,
+        serde_json::json!([1, "sales_orders", null, { "name": "no target" }]),
+        serde_json::json!([{ "target": 5 }, { "target": ["sales_orders"] }]),
+    ] {
+        sqlx::query("UPDATE connector SET source_objects = $1 WHERE id = 'conn-s3-warehouse'")
+            .bind(&malformed)
+            .execute(&pool)
+            .await?;
+        assert!(
+            !any_connector_targets(&pool, "sales_orders").await.unwrap(),
+            "{malformed} must not match"
+        );
+    }
+
+    // The same row, once it holds a real list, matches: the query is not
+    // simply answering `false`.
+    sqlx::query("UPDATE connector SET source_objects = $1 WHERE id = 'conn-s3-warehouse'")
+        .bind(serde_json::json!([{ "name": "landing/a.csv", "target": "sales_orders" }]))
+        .execute(&pool)
+        .await?;
+    assert!(any_connector_targets(&pool, "sales_orders").await.unwrap());
     Ok(())
 }

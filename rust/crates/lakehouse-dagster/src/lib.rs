@@ -95,6 +95,29 @@ impl ReexecutionStrategy {
     }
 }
 
+/// A `Dagster` run together with the run config it was launched with, as
+/// returned by `runsOrError { results { runConfig } }` — for a caller that
+/// needs to tell apart runs of one shared job by their config (every
+/// connector's ingest runs the same `ingest_job`, told apart only by
+/// `ops.run_ingest.config.connector_id`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DgConfiguredRun {
+    /// The run's unique id.
+    pub run_id: String,
+    /// The run's `Dagster` status string (e.g. `"SUCCESS"`, `"STARTED"`).
+    pub status: String,
+    /// Unix seconds the run started, or `None` if it hasn't started yet.
+    #[serde(default)]
+    pub start_time: Option<f64>,
+    /// Unix seconds the run ended, or `None` if it hasn't finished yet.
+    #[serde(default)]
+    pub end_time: Option<f64>,
+    /// The run config, as `Dagster` returns it (a JSON object).
+    #[serde(default)]
+    pub run_config: Value,
+}
+
 /// One `Dagster` schedule attached to a job, as returned by
 /// `repositoriesOrError`. Ported from the `DgJob["schedules"]` element
 /// shape in `src/services/clients/dagster.ts`.
@@ -195,6 +218,18 @@ struct RunsOrErrorData {
 struct RunsOrError {
     #[serde(default)]
     results: Option<Vec<DgRun>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfiguredRunsOrErrorData {
+    #[serde(rename = "runsOrError")]
+    runs_or_error: ConfiguredRunsOrError,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfiguredRunsOrError {
+    #[serde(default)]
+    results: Option<Vec<DgConfiguredRun>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -862,6 +897,28 @@ impl DgClient {
         let data: RunsOrErrorData = self
             .execute(query, Some(json!({ "job": job_name, "limit": limit })))
             .await?;
+        Ok(data.runs_or_error.results.unwrap_or_default())
+    }
+
+    /// [`DgClient::list_runs_for_job`], with each run's config — see
+    /// [`DgConfiguredRun`]. Most recent first.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_for_job_with_config(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<DgConfiguredRun>, DgError> {
+        // `job_name` is interpolated for the same reason, and under the
+        // same caller contract, as `list_runs_for_job` above.
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId status startTime endTime runConfig }} }} \
+             }} }}"
+        );
+        let data: ConfiguredRunsOrErrorData = self.execute(&query, None).await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
     }
 
@@ -3249,6 +3306,37 @@ mod tests {
         assert_eq!(runs[0].rows, Some(350));
         // r2: nothing reported rows, so the run reports None — not 0.
         assert_eq!(runs[1].rows, None);
+    }
+
+    #[tokio::test]
+    async fn list_runs_for_job_with_config_returns_each_runs_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r2", "status": "STARTED", "startTime": 5.0, "endTime": null,
+                      "runConfig": { "ops": { "run_ingest": { "config": { "connector_id": "conn-a" } } } } },
+                    { "runId": "r1", "status": "SUCCESS", "startTime": 1.0, "endTime": 3.0,
+                      "runConfig": {} }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_config("ingest_job", 50)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].end_time, None);
+        assert_eq!(
+            runs[0]
+                .run_config
+                .pointer("/ops/run_ingest/config/connector_id"),
+            Some(&json!("conn-a"))
+        );
     }
 
     #[tokio::test]

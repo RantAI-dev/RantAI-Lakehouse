@@ -43,11 +43,12 @@ use lakehouse_core::ApiError;
 use lakehouse_core::secret::DynSecretResolver;
 use lakehouse_store::connectors::ConnectorDialInfo;
 use lakehouse_store::ingest_spec::{Dial, IngestSpecError, SqlDriver};
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::mysql::MySqlPoolOptions;
+use sqlx::postgres::PgPoolOptions;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_probe::{self, DIAL_TIMEOUT, DialTarget};
+use crate::internal_hosts::InternalHosts;
 
 /// One discovered column.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -131,7 +132,7 @@ pub enum DiscoverError {
     #[error("connector's dial is invalid: {0}")]
     InvalidDial(#[from] IngestSpecError),
     /// The dial's `host` resolves to (or is) a private/internal address
-    /// and `allow_internal_hosts` is not set — see
+    /// that `internal_hosts` does not permit — see
     /// `connector_probe::resolve_checked`.
     #[error("{0}")]
     Blocked(String),
@@ -300,9 +301,9 @@ async fn discover_dial(
     secret_ref: &str,
     schema: &str,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Result<Vec<DiscoveredObject>, DiscoverError> {
-    connector_probe::resolve_checked(target.host, target.port, allow_internal_hosts)
+    let approved = connector_probe::resolve_checked(target.host, target.port, internal_hosts)
         .await
         .map_err(DiscoverError::Blocked)?;
     let password = resolver
@@ -313,13 +314,12 @@ async fn discover_dial(
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
         match target.driver {
             SqlDriver::Postgres => {
-                let options = PgConnectOptions::new()
-                    .host(target.host)
-                    .port(target.port)
-                    .username(target.user)
-                    .password(password.expose_secret())
-                    .database(target.database)
-                    .ssl_mode(PgSslMode::Prefer);
+                let options = connector_probe::pg_connect_options(
+                    &approved,
+                    target.user,
+                    password.expose_secret(),
+                    target.database,
+                );
                 let pool = PgPoolOptions::new()
                     .max_connections(1)
                     .connect_with(options)
@@ -329,13 +329,12 @@ async fn discover_dial(
                 Ok(objects)
             }
             SqlDriver::Mysql => {
-                let options = MySqlConnectOptions::new()
-                    .host(target.host)
-                    .port(target.port)
-                    .username(target.user)
-                    .password(password.expose_secret())
-                    .database(target.database)
-                    .ssl_mode(MySqlSslMode::Preferred);
+                let options = connector_probe::mysql_connect_options(
+                    &approved,
+                    target.user,
+                    password.expose_secret(),
+                    target.database,
+                );
                 let pool = MySqlPoolOptions::new()
                     .max_connections(1)
                     .connect_with(options)
@@ -356,7 +355,8 @@ async fn discover_dial(
                 // Same "state the TLS posture explicitly" reasoning as
                 // `connector_probe::probe_mssql`.
                 config.trust_cert();
-                let addr = config.get_addr();
+                // SEC-15: the socket goes to the approved address;
+                // `config.host` keeps the name for the TDS handshake.
                 // `TcpStream::connect`/`set_nodelay` return `std::io::Error`,
                 // not `tiberius::error::Error` — routed through
                 // `tiberius::error::Error::from` explicitly (a single `?`
@@ -365,10 +365,8 @@ async fn discover_dial(
                 // directly) rather than adding a second `#[from]` variant
                 // for an error class `connector_probe::probe_mssql` already
                 // folds into its own `tiberius::error::Error::Io` handling.
-                let tcp = tokio::net::TcpStream::connect(&addr)
+                let tcp = connector_probe::connect_pinned(&approved)
                     .await
-                    .map_err(tiberius::error::Error::from)?;
-                tcp.set_nodelay(true)
                     .map_err(tiberius::error::Error::from)?;
                 let mut client =
                     Box::pin(tiberius::Client::connect(config, tcp.compat_write())).await?;
@@ -413,7 +411,7 @@ pub async fn discover(
     dial_info: &ConnectorDialInfo,
     schema: Option<&str>,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Result<DiscoverResult, DiscoverError> {
     match dial_info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
@@ -443,7 +441,7 @@ pub async fn discover(
                 &dial_info.secret_ref,
                 schema,
                 resolver,
-                allow_internal_hosts,
+                internal_hosts,
             )
             .await?;
             Ok(DiscoverResult::ok(objects))

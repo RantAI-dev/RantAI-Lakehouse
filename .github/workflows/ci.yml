@@ -18,9 +18,91 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Frontend ──────────────────────────────────────────────────────────
+  # ── Change Scope Detection ──────────────────────────────────────────
+  # Classifies the pull request diff or push into change scopes. Downstream
+  # jobs condition their execution on these scope outputs, allowing docs-only
+  # or frontend-only PRs to skip expensive Rust builds and acceptance tests.
+  changes:
+    name: Detect Change Scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      frontend: ${{ steps.scope.outputs.frontend }}
+      dagster: ${{ steps.scope.outputs.dagster }}
+      stack: ${{ steps.scope.outputs.stack }}
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+      all: ${{ steps.scope.outputs.all }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Self-test runs before the scope script is executed to ensure
+      # classification invariants are preserved.
+      - name: Self-test change-scope detection
+        run: bash ./scripts/ci/tests/test_detect_change_scope.sh
+
+      - name: Detect change scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: ./scripts/ci/detect_change_scope.sh
+
+  # ── Repo Lints (merged: parity corpus, R11, compose init, Dagster imports) ──
+  # Folded into a single job with one step each: these four fast static checks
+  # (5-8 seconds each) run unconditionally on every push/PR without wasting
+  # separate runner slots.
+  repo-lints:
+    name: Repo lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The parity corpus is captured from a live system and committed to git.
+      # capture.ts strips credentials on every run; this is the backstop that
+      # catches a corpus sanitized by hand or captured with a stale script.
+      - name: Scan corpus for credential-shaped values (parity corpus)
+        run: ./rust/tests/parity/check-no-secrets.sh
+
+      # docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §5, R11 (measured in
+      # docs/plans/P5-RESULT.md): ClickHouse 26.3's bare, unqualified
+      # count() against a merge-on-read Iceberg table silently overcounts
+      # once equality deletes are present — a wrong number, not an error.
+      # See ops/lint/check_bare_iceberg_count.py for exactly what this
+      # does and does not cover.
+      - name: Check for bare count() against Bronze Iceberg tables (R11)
+        run: python3 ops/lint/check_bare_iceberg_count.py
+
+      # WS0 items 8-9: the postgres healthcheck must probe TCP (not the
+      # image's temporary init-phase Unix-socket-only server), and
+      # openfga-db-init must retry its CREATE DATABASE instead of
+      # failing outright on a transient race. See
+      # ops/lint/check_compose_init_readiness.py for exactly what this
+      # does and does not cover — it is a static check on the checked-in
+      # YAML, not a substitute for the `docker compose up` proof in this
+      # task's own commit body.
+      - name: Check compose init-container readiness (WS0)
+        run: python3 ops/lint/check_compose_init_readiness.py
+
+      # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
+      # code-location load, which takes down EVERY job in the location — the
+      # visible symptom is G3a failing with "'bronze_ingest_job' not in
+      # GET /api/pipelines", which points nowhere near the cause. `py_compile`
+      # cannot catch it (per-file syntax only, no import resolution). See
+      # ops/lint/check_intra_package_imports.py for the limits of this check.
+      - name: Check intra-package imports (Dagster)
+        run: python3 ops/lint/check_intra_package_imports.py
+
+  # ── Frontend ────────────────────────────────────────────────────────
   verify:
     name: Frontend · Lint · Typecheck · Test · Build
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -48,75 +130,10 @@ jobs:
       - name: Build
         run: bun run build
 
-  parity-corpus-secrets:
-    name: Parity corpus · no leaked credentials
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # The parity corpus is captured from a live system and committed to git.
-      # capture.ts strips credentials on every run; this is the backstop that
-      # catches a corpus sanitized by hand or captured with a stale script.
-      - name: Scan corpus for credential-shaped values
-        run: ./rust/tests/parity/check-no-secrets.sh
-
-  r11-bare-iceberg-count:
-    name: R11 · no bare count() against Bronze Iceberg tables
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §5, R11 (measured in
-      # docs/plans/P5-RESULT.md): ClickHouse 26.3's bare, unqualified
-      # count() against a merge-on-read Iceberg table silently overcounts
-      # once equality deletes are present — a wrong number, not an error.
-      # See ops/lint/check_bare_iceberg_count.py for exactly what this
-      # does and does not cover.
-      - name: Check for bare count() against Bronze Iceberg tables
-        run: python3 ops/lint/check_bare_iceberg_count.py
-
-  compose-init-readiness:
-    name: WS0 · compose init containers probe TCP and retry
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # WS0 items 8-9: the postgres healthcheck must probe TCP (not the
-      # image's temporary init-phase Unix-socket-only server), and
-      # openfga-db-init must retry its CREATE DATABASE instead of
-      # failing outright on a transient race. See
-      # ops/lint/check_compose_init_readiness.py for exactly what this
-      # does and does not cover — it is a static check on the checked-in
-      # YAML, not a substitute for the `docker compose up` proof in this
-      # task's own commit body.
-      - name: Check compose init-container readiness
-        run: python3 ops/lint/check_compose_init_readiness.py
-
-  dagster-intra-package-imports:
-    name: Dagster · intra-package imports resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
-      # code-location load, which takes down EVERY job in the location — the
-      # visible symptom is G3a failing with "'bronze_ingest_job' not in
-      # GET /api/pipelines", which points nowhere near the cause. `py_compile`
-      # cannot catch it (per-file syntax only, no import resolution). See
-      # ops/lint/check_intra_package_imports.py for the limits of this check.
-      - name: Check intra-package imports
-        run: python3 ops/lint/check_intra_package_imports.py
-
   dagster-unit-tests:
     name: Dagster · unit tests
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -147,9 +164,11 @@ jobs:
         run: python -m pytest dispar_orchestrate -v
         working-directory: dagster
 
-  # ── Rust: fast feedback ──────────────────────────────────────────────
+  # ── Rust: fast feedback ─────────────────────────────────────────────
   fmt:
     name: Rust · fmt
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -172,6 +191,8 @@ jobs:
 
   clippy:
     name: Rust · clippy
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -194,6 +215,8 @@ jobs:
 
   build:
     name: Rust · build
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -212,33 +235,25 @@ jobs:
         run: cargo build --locked
         working-directory: rust
 
-  # ── Rust: tests (Docker/testcontainers required — Postgres) ─────────
+  # ── Rust: tests (Docker/testcontainers required — Postgres) ───────────
   test:
-    name: Rust · test (${{ matrix.toolchain }})
+    name: Rust · test (stable)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        # "stable" for the current toolchain the project actually ships
-        # with; the workspace's declared MSRV (rust/Cargo.toml
-        # `rust-version`) so a regression there fails CI honestly instead
-        # of silently drifting. See docs/CI.md for how 1.88 was derived.
-        toolchain: ["stable", "1.88.0"]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          key: ${{ matrix.toolchain }}
+          key: stable
 
       # Needed by lakehouse-bi's specs_match_typescript drift guard, which
       # shells out to `bun` to cross-check lakehouse_bi::specs against
@@ -255,6 +270,35 @@ jobs:
         run: cargo test --workspace --locked
         working-directory: rust
 
+  # ── Rust: MSRV compile check ─────────────────────────────────────────
+  # In PR 1, the 1.88.0 MSRV test run is converted into a fast compile check
+  # (cargo check --workspace --all-targets --locked) so we ensure MSRV
+  # compatibility without duplicating the full integration test run time.
+  msrv:
+    name: Rust · MSRV check (1.88.0)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: msrv-1.88.0
+
+      - name: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
+        working-directory: rust
+
   # ── Rust: G1 acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
   # G1-RESULT.md) — half (a) only, run INSIDE the compose network via the
   # `g1-test-runner` service (docker-compose.yml). Half (b) stays
@@ -262,6 +306,8 @@ jobs:
   # something this job should chase. ──
   g1-rustfs:
     name: Rust · G1 acceptance (RustFS)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -297,6 +343,8 @@ jobs:
   # API, not a specific store, is the architectural boundary. ──
   g2-seaweedfs:
     name: Rust · G2 storage boundary (SeaweedFS)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -354,6 +402,8 @@ jobs:
   # ops/g3a/g3a_test.py. ──
   g3a-dagster:
     name: Rust · G3a Dagster + dlt Bronze ingest
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -405,6 +455,8 @@ jobs:
   # above; see ops/g3/g3_test.py. ──
   g3-maintenance:
     name: Rust · G3 Bronze maintenance job
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -458,6 +510,8 @@ jobs:
   # same reason. See ops/g4/g4_test.py. ──
   g4-cdc:
     name: Rust · G4 Debezium CDC into Bronze
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -525,6 +579,8 @@ jobs:
   # ops/g6/g6_linklocal_test.py. ──
   g6-ingest:
     name: Rust · G6 ingest matrix
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -644,6 +700,8 @@ jobs:
   # ops/gold_export/gold_export_test.py. ──
   gold-export:
     name: Rust · Gold export to Iceberg (ADR 0010)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -683,6 +741,8 @@ jobs:
   # CDC/dagster chain for unrelated reasons this gate has no part of). ──
   g8-governance:
     name: Rust · G8 governance masking
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -709,3 +769,65 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p g8ci down -v
+
+  # ── CI Required Gate ────────────────────────────────────────────────
+  # The single gate job that evaluates the entire CI run and enforces that
+  # all required jobs passed or were legitimately skipped based on the
+  # detected change scope.
+  ci-required:
+    name: ci-required
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - changes
+      - repo-lints
+      - verify
+      - fmt
+      - clippy
+      - build
+      - test
+      - msrv
+      - dagster-unit-tests
+      - g1-rustfs
+      - g2-seaweedfs
+      - g3a-dagster
+      - g3-maintenance
+      - g4-cdc
+      - g6-ingest
+      - gold-export
+      - g8-governance
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Self-test required gate
+        run: bash ./scripts/ci/tests/test_required_gate.sh
+
+      - name: Enforce required gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCOPE_RUST: ${{ needs.changes.outputs.rust }}
+          SCOPE_FRONTEND: ${{ needs.changes.outputs.frontend }}
+          SCOPE_DAGSTER: ${{ needs.changes.outputs.dagster }}
+          SCOPE_STACK: ${{ needs.changes.outputs.stack }}
+          SCOPE_DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          SCOPE_ALL: ${{ needs.changes.outputs.all }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          REPO_LINTS_RESULT: ${{ needs.repo-lints.result }}
+          FRONTEND_RESULT: ${{ needs.verify.result }}
+          RUST_FMT_RESULT: ${{ needs.fmt.result }}
+          RUST_CLIPPY_RESULT: ${{ needs.clippy.result }}
+          RUST_BUILD_RESULT: ${{ needs.build.result }}
+          RUST_TEST_RESULT: ${{ needs.test.result }}
+          RUST_MSRV_RESULT: ${{ needs.msrv.result }}
+          DAGSTER_TESTS_RESULT: ${{ needs.dagster-unit-tests.result }}
+          G1_RUSTFS_RESULT: ${{ needs.g1-rustfs.result }}
+          G2_SEAWEEDFS_RESULT: ${{ needs.g2-seaweedfs.result }}
+          G3A_DAGSTER_RESULT: ${{ needs.g3a-dagster.result }}
+          G3_MAINTENANCE_RESULT: ${{ needs.g3-maintenance.result }}
+          G4_CDC_RESULT: ${{ needs.g4-cdc.result }}
+          G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
+          GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
+          G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
+        run: ./scripts/ci/required_gate.sh

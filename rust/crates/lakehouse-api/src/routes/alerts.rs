@@ -572,7 +572,34 @@ pub async fn run(
         }
     }
 
-    Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
+    // The same tick keeps quality verdicts current: every runnable rule
+    // whose verdict is over an hour old is run again, in the background —
+    // a table scan must not hold up this response (the scheduler waits 30
+    // seconds for it). Not on a single-rule run (`?id=`), which is someone
+    // testing one alert, not the tick.
+    let quality_started =
+        query.id.is_none() && crate::routes::quality::spawn_scheduled_pass(&state);
+
+    // And records the schema a Silver or Gold table has now when it differs
+    // from the last one recorded (ADR 0015), in the background for the same
+    // reason, and not on a single-rule run either.
+    let schema_started = query.id.is_none() && crate::routes::schema_versions::spawn_pass(&state);
+
+    // The semantic layer's drafting pass (AI-16): asks the deployment's
+    // model for a description of each table that has none, up to ten per
+    // tick, in the background for the same reason. The response does not
+    // report it: it changes no verdict, and a pass that starts nothing
+    // (switch off, no key, one already running) is not a fault to show.
+    if query.id.is_none() {
+        crate::routes::ai::semantic::spawn_pass(&state);
+    }
+
+    Ok(ApiJson(json!({
+        "ran": results.len(),
+        "results": results,
+        "qualityPassStarted": quality_started,
+        "schemaPassStarted": schema_started,
+    })))
 }
 
 /// Plan 1f: list every distinct `pipeline_id` referenced by an enabled
@@ -1066,6 +1093,107 @@ mod tests {
                 row_count, 1,
                 "still only the original silenced row — no fresh instance while silenced"
             );
+        }
+    }
+
+    /// ADR 0015 — the tick records the schema versions of Silver and Gold
+    /// tables beside the quality pass; a single-rule run (`?id=`), which is
+    /// someone testing one alert and not the tick, does not.
+    mod schema_pass {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use axum::extract::{Query, State};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use super::service_principal;
+        use crate::config::Config;
+
+        /// A state with no `PostgreSQL` pool (a malformed `DATABASE_URL`,
+        /// the idiom `routes::gold`'s tests use) and `ClickHouse` at `ch_url`.
+        fn state_for(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn call_run(state: &AppState, id: Option<&str>) -> Value {
+            run(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(RunQuery {
+                    id: id.map(str::to_owned),
+                    token: None,
+                }),
+                Some(Extension(service_principal())),
+            )
+            .await
+            .expect("a service-identity principal must pass the run-token guard")
+            .0
+        }
+
+        async fn reads_of_system_columns(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("FROM system.columns"))
+                .count()
+        }
+
+        #[tokio::test]
+        async fn a_single_rule_run_does_not_start_a_schema_pass() {
+            let server = MockServer::start().await;
+            // Every statement answers `200` with no rows: no rules, no tables.
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let state = state_for(&server.uri());
+
+            let body = call_run(&state, Some("al-no-such-rule")).await;
+
+            assert_eq!(body["schemaPassStarted"], json!(false));
+            assert_eq!(body["qualityPassStarted"], json!(false));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(reads_of_system_columns(&server).await, 0);
+        }
+
+        #[tokio::test]
+        async fn the_tick_starts_a_schema_pass_that_reads_the_engine() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let state = state_for(&server.uri());
+
+            // One pass runs at a time in the whole process, and a pass that
+            // another test started (a run-finished report starts one too) may
+            // still be running when this tick comes: that answers `false`,
+            // so ask again until a pass of ours starts.
+            let mut started = false;
+            for _ in 0..100 {
+                if call_run(&state, None).await["schemaPassStarted"] == json!(true) {
+                    started = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(started, "a tick must start the schema pass");
+
+            // The pass is in the background: wait for it to reach the engine.
+            for _ in 0..200 {
+                if reads_of_system_columns(&server).await > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the schema pass the tick started never read the engine's columns");
         }
     }
 

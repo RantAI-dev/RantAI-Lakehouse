@@ -11,10 +11,9 @@ use super::{api_result_to_value, arg_str};
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 use crate::state::AppState;
 
-// WS7 item F5: `pub(in crate::routes)` so `routes::agent::schema_context`
-// can run this SAME union query for its new Bronze catalog section,
-// rather than re-deriving an equivalent string that could drift from this
-// one.
+// `pub(in crate::routes)` so `routes::lineage`, which sits outside
+// `routes::ai`, runs this SAME union query rather than re-deriving an
+// equivalent string that could drift from this one.
 pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
@@ -42,7 +41,7 @@ pub(super) async fn run_sql(
     args: &Map<String, Value>,
 ) -> Value {
     let sql = arg_str(args, "sql");
-    if !crate::routes::agent::is_read_only_sql(&sql) {
+    if !is_read_only_sql(&sql) {
         return json!({ "error": "Only a read-only SELECT is allowed." });
     }
     // Same fail-closed shape `tools::queries::run_saved_query` uses for a
@@ -149,6 +148,60 @@ pub(super) fn clean_sql_error(err: &str) -> String {
     body.chars().take(400).collect()
 }
 
+/// `/^\s*(with|select)\b/i.test(sql) && !/\b(insert|alter|drop|delete|update|create|truncate|rename|attach|detach|grant|revoke)\b/i.test(sql)`
+/// — the cheap first filter [`run_sql`] applies to the model's SQL. Distinct
+/// from `query/run`'s guard (`routes::query::is_read_only`): only
+/// `with`/`select` are allowed here (no `show`/`describe`/`explain`).
+fn is_read_only_sql(sql: &str) -> bool {
+    starts_with_with_or_select(sql) && !contains_denied_keyword_full(sql)
+}
+
+fn starts_with_with_or_select(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    ["with", "select"].iter().any(|kw| {
+        lower
+            .strip_prefix(kw)
+            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+    })
+}
+
+fn contains_denied_keyword_full(sql: &str) -> bool {
+    const DENIED: [&str; 12] = [
+        "insert", "alter", "drop", "delete", "update", "create", "truncate", "rename", "attach",
+        "detach", "grant", "revoke",
+    ];
+    word_occurs_any(sql, &DENIED)
+}
+
+fn word_occurs_any(sql: &str, denied: &[&str]) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    denied.iter().any(|kw| word_occurs(&chars, kw))
+}
+
+fn word_occurs(chars: &[char], word: &str) -> bool {
+    let word_chars: Vec<char> = word.chars().collect();
+    let n = word_chars.len();
+    if n == 0 || chars.len() < n {
+        return false;
+    }
+    for start in 0..=(chars.len() - n) {
+        if chars[start..start + n] == word_chars[..] {
+            let before_ok = start == 0 || !is_word_char(chars[start - 1]);
+            let after_ok = start + n == chars.len() || !is_word_char(chars[start + n]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
 /// Dry-runs `args["sql"]` via `ClickHouse`'s own `EXPLAIN AST`, refusing
 /// whenever the engine's OWN reported statement kind is not a `SELECT`
 /// (WS7 plan §0 item 6, verified live against `lake-clickhouse` during
@@ -158,7 +211,7 @@ pub(super) fn clean_sql_error(err: &str) -> String {
 /// `INSERT`, `AlterQuery` for an `ALTER`, `DropQuery` for a `DROP`, …).
 ///
 /// This is an ADDITIONAL, engine-verified check ahead of
-/// [`crate::routes::agent::is_read_only_sql`]'s regex-based guard
+/// [`is_read_only_sql`]'s regex-based guard
 /// (unchanged, still checked first by [`run_sql`] itself) — never a
 /// replacement for it: a third-party parser's dialect (or a hand-rolled
 /// regex) can disagree with what `ClickHouse` will actually execute, so
@@ -840,5 +893,28 @@ mod run_sql_delegation {
             }),
             "expected the honest no-principal refusal, got {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_guard {
+    use super::*;
+
+    #[test]
+    fn is_read_only_sql_allows_with_and_select_only() {
+        assert!(is_read_only_sql("SELECT 1"));
+        assert!(is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!is_read_only_sql("SHOW TABLES"));
+        assert!(!is_read_only_sql("EXPLAIN SELECT 1"));
+    }
+
+    #[test]
+    fn is_read_only_sql_rejects_full_dml_list() {
+        for kw in [
+            "insert", "alter", "drop", "delete", "update", "create", "truncate", "rename",
+            "attach", "detach", "grant", "revoke",
+        ] {
+            assert!(!is_read_only_sql(&format!("SELECT 1; {kw} x")));
+        }
     }
 }

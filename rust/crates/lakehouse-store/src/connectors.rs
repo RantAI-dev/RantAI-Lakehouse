@@ -148,6 +148,27 @@ pub struct ConnectorDetail {
     /// recording connector audit events; see `get_connector`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
+    /// Whether the primary credential is one the API stores itself
+    /// ([`CredentialSource::Managed`]), so the UI can offer "replace
+    /// credential" instead of telling the user to ask an operator. A
+    /// boolean derived from the ref on read — the ref itself is still never
+    /// returned (module doc comment, guarantee 1).
+    pub credential_managed: bool,
+    /// The primary credential's kind (password, access key, …), read from
+    /// its ref's suffix so the edit page asks for the right thing. `None`
+    /// for a ref whose name does not end in a known suffix (e.g. a
+    /// hand-seeded one). A kind, never the ref or its value.
+    pub credential_kind: Option<CredentialKind>,
+    /// The secondary slot's kind, or `None` when the connector has no
+    /// secondary credential (e.g. `PostgreSQL`; an S3 connector's
+    /// secret key is `Some`).
+    pub credential_secondary_kind: Option<CredentialKind>,
+    /// Residency policy label, as stored at create/update — read back so
+    /// the edit page can show the current value.
+    pub residency: String,
+    /// The owning tenant's id, or `None` for an unassigned connector
+    /// (`0042_tenant_provisioning.sql`) — the edit page's tenant select.
+    pub tenant_id: Option<String>,
 }
 
 /// Mirrors `DiscoveredSchema`. Never populated today — see
@@ -198,16 +219,17 @@ struct ConnectorRow {
                   doc comment"
     )]
     host: String,
-    #[allow(
-        dead_code,
-        reason = "selected so it round-trips through UPDATE...RETURNING, but never read: it \
-                  is a reference name a future connectivity-resolving component would read, \
-                  not a value this crate consumes or the Debug impl prints"
-    )]
+    /// A reference name, never a value. Read only by [`get_connector`], to
+    /// derive [`ConnectorDetail::credential_managed`]; never returned and
+    /// never printed by the `Debug` impl below.
     secret_ref: String,
     last_test_at: Option<OffsetDateTime>,
     capabilities: Vec<String>,
     owner: String,
+    /// Read only by [`get_connector`], for [`ConnectorDetail::residency`].
+    residency: String,
+    /// Read only by [`get_connector`], for [`ConnectorDetail::tenant_id`].
+    tenant_id: Option<Uuid>,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -230,6 +252,8 @@ impl std::fmt::Debug for ConnectorRow {
             .field("last_test_at", &self.last_test_at)
             .field("capabilities", &self.capabilities)
             .field("owner", &self.owner)
+            .field("residency", &self.residency)
+            .field("tenant_id", &self.tenant_id)
             .finish()
     }
 }
@@ -258,7 +282,7 @@ impl From<ConnectorRow> for Connector {
 // (see `Connector::last_activity_at`'s doc comment), so every read maps it
 // to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
-     secret_ref, last_test_at, capabilities, owner";
+     secret_ref, last_test_at, capabilities, owner, residency, tenant_id";
 
 /// Optional narrowing for [`list_connectors`] for tenant isolation: a
 /// caller must never see a connector outside its own tenant.
@@ -303,6 +327,29 @@ pub async fn list_connectors(
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(Connector::from).collect())
+}
+
+/// Whether connector `id` belongs to one of `tenant_ids`: the access rule
+/// every `/api/connectors/{id}/*` route applies
+/// (`routes::connectors::require_connector_in_tenants`). `false` for an
+/// unknown id, another tenant's connector and one with no tenant alike, so
+/// the answer says nothing about which connector ids exist.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_in_tenants(
+    pool: &PgPool,
+    id: &str,
+    tenant_ids: &[Uuid],
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector WHERE id = $1 AND tenant_id = ANY($2))",
+    )
+    .bind(id)
+    .bind(tenant_ids)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Assign (or reassign) a connector to a tenant — the write behind `PUT
@@ -362,22 +409,22 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
     let Some(row) = row else {
         return Ok(None);
     };
+    let credential_managed = is_managed_secret_ref(&row.secret_ref);
+    let credential_kind = credential_kind_of_ref(&row.secret_ref);
+    // Not in `CONNECTOR_COLUMNS` (list rows never need it); read here only
+    // to report its KIND — the ref itself is never returned.
+    let secondary_ref: Option<String> =
+        sqlx::query_scalar("SELECT secret_ref_secondary FROM connector WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let credential_secondary_kind = secondary_ref.as_deref().and_then(credential_kind_of_ref);
+    let residency = row.residency.clone();
+    let tenant_id = row.tenant_id.map(|id| id.to_string());
     let connector = Connector::from(row);
 
-    let dependents: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, name FROM pipeline_definition WHERE connector_id = $1 ORDER BY name",
-    )
-    .bind(id)
-    .fetch_all(pool)
-    .await?;
-    let dependent_pipelines = dependents
-        .into_iter()
-        .map(|(id, name)| ConnectorDependent {
-            id,
-            name,
-            kind: "pipeline".to_owned(),
-        })
-        .collect();
+    let dependent_pipelines = dependent_pipelines(pool, id).await?;
 
     let audit_event_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM audit_event WHERE resource_kind = 'connector' AND resource_id = $1 \
@@ -389,6 +436,11 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
 
     Ok(Some(ConnectorDetail {
         audit_event_id,
+        credential_managed,
+        credential_kind,
+        credential_secondary_kind,
+        residency,
+        tenant_id,
         connector,
         discovered_assets: 0,
         discovered_schemas: Vec::new(),
@@ -423,11 +475,7 @@ pub struct CreateConnectorInput {
     pub environment: String,
     /// Owning tenant's display name.
     pub tenant: String,
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility; no residency column is read back today"
-    )]
-    /// Residency policy label, accepted for contract compatibility.
+    /// Residency policy label; read back as [`ConnectorDetail::residency`].
     pub residency: String,
     /// Feature/capability labels this connector supports.
     pub capabilities: Vec<String>,
@@ -439,15 +487,62 @@ const DEFAULT_OWNER: &str = "Current user";
 
 /// Where a derived connector-credential reference name should be looked up
 /// at resolve time. Mirrors `CredentialSource` in `contracts/connectors.ts`
-/// — ADR 0002 Addendum 3's two schemes, `env:` and `file:`.
+/// — ADR 0002 Addendum 3's two operator-provisioned schemes, `env:` and
+/// `file:`, plus Addendum 4's `managed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSource {
     /// `env:CONNECTOR_<ID>_<SUFFIX>`, resolved by `EnvSecretResolver`.
+    /// The operator provisions the value.
     Env,
     /// `file:/run/secrets/connector_<id>_<suffix>`, resolved by
-    /// `FileSecretResolver`.
+    /// `FileSecretResolver`. The operator provisions the value.
     File,
+    /// `file:/run/secrets/connector_managed_<id>_<suffix>` (ADR 0002
+    /// Addendum 4): the USER supplies the value through the API, which
+    /// writes it to that file (`lakehouse-api`'s `connector_secret_store`).
+    /// Still a plain `file:` ref, so both resolvers — the API's and
+    /// Dagster's — read it unchanged. The distinct `connector_managed_`
+    /// prefix is what lets [`is_managed_secret_ref`] tell it apart from an
+    /// operator's `File` ref for the same id, and it cannot collide with
+    /// one: every id begins `conn-`, so a `File` name always begins
+    /// `connector_conn_`.
+    Managed,
+}
+
+/// The fixed prefix every [`CredentialSource::Managed`] ref starts with —
+/// see that variant's doc comment.
+pub const MANAGED_SECRET_REF_PREFIX: &str = "file:/run/secrets/connector_managed_";
+
+/// Whether `secret_ref` names a credential the API itself stores
+/// ([`CredentialSource::Managed`]) rather than one an operator provisions.
+/// A pure predicate over a reference NAME, never a value — this module's
+/// credential guarantees are unaffected.
+#[must_use]
+pub fn is_managed_secret_ref(secret_ref: &str) -> bool {
+    secret_ref.starts_with(MANAGED_SECRET_REF_PREFIX)
+}
+
+/// The credential kind a reference NAME ends in, e.g.
+/// `file:/run/secrets/connector_managed_conn_x_secret_key` →
+/// [`CredentialKind::SecretKey`]. Case-insensitive, since [`derive_secret_ref`]
+/// upper-cases `env:` names and lower-cases `file:` ones. Checked longest
+/// suffix first so `_secret_key`/`_private_key`/`_access_key`/`_api_key`
+/// are never mistaken for a shorter one. `None` when no known suffix
+/// matches — a best-effort label, never an authorization input.
+#[must_use]
+pub fn credential_kind_of_ref(secret_ref: &str) -> Option<CredentialKind> {
+    let lower = secret_ref.to_ascii_lowercase();
+    [
+        CredentialKind::PrivateKey,
+        CredentialKind::SecretKey,
+        CredentialKind::AccessKey,
+        CredentialKind::Password,
+        CredentialKind::ApiKey,
+        CredentialKind::Token,
+    ]
+    .into_iter()
+    .find(|kind| lower.ends_with(&format!("_{}", kind.suffix().to_ascii_lowercase())))
 }
 
 /// Which fixed credential-name suffix a slot derives. Mirrors
@@ -478,6 +573,17 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    /// Every kind, so a caller can name every credential a connector could
+    /// have (e.g. to clean up after one whose refs it did not read).
+    pub const ALL: [Self; 6] = [
+        Self::Password,
+        Self::SecretKey,
+        Self::AccessKey,
+        Self::ApiKey,
+        Self::Token,
+        Self::PrivateKey,
+    ];
+
     /// The upper-case suffix ADR 0002 Addendum 3 names, e.g. `"PASSWORD"`.
     /// [`derive_secret_ref`]'s `file:` form lower-cases this itself, rather
     /// than this method offering a second casing — one source of truth for
@@ -554,6 +660,13 @@ pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKin
             let key = id.replace('-', "_");
             format!(
                 "file:/run/secrets/connector_{key}_{}",
+                kind.suffix().to_ascii_lowercase()
+            )
+        }
+        CredentialSource::Managed => {
+            let key = id.replace('-', "_");
+            format!(
+                "{MANAGED_SECRET_REF_PREFIX}{key}_{}",
                 kind.suffix().to_ascii_lowercase()
             )
         }
@@ -951,6 +1064,13 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// (`dagster/dispar_orchestrate/secret_resolver.py`) when a Dagster
 /// ingest job actually runs.
 ///
+/// Third (`SEC-14`): this never changes where the connector points. The
+/// connector keeps its stored credential, so a different target
+/// ([`crate::ingest_spec::is_repoint`]) would receive it on the next dial;
+/// that change is [`repoint_ingest_spec`]'s, which takes the credentials.
+/// The first dial of a connector that has none yet is not a change of
+/// target.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Validation`] if `spec.dial` fails
@@ -958,13 +1078,64 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// connector's secret-ref count does not match
 /// [`crate::ingest_spec::secret_field_names`] for `spec.adapter`/the
 /// dial's auth type (`rest`, `kafka` or `sftp` — [`crate::ingest_spec::Dial::secret_map_auth_type`]).
-/// Returns [`StoreError::NotFound`] if `id` does not
-/// name a connector. Returns [`StoreError::Database`] on any other
-/// failure.
+/// Returns [`StoreError::Conflict`] if `spec` changes the connector's
+/// target identity (nothing is written). Returns [`StoreError::NotFound`]
+/// if `id` does not name a connector. Returns [`StoreError::Database`] on
+/// any other failure.
 pub async fn set_ingest_spec(
     pool: &PgPool,
     id: &str,
     spec: &IngestSpecInput,
+) -> Result<IngestSpec, StoreError> {
+    save_ingest_spec(pool, id, spec, None).await
+}
+
+/// Change where a connector points AND its credential refs, all or nothing
+/// (`SEC-14`): the spec write and the [`SecretRefSwap`]s commit in ONE
+/// transaction, or none of it does.
+///
+/// [`set_ingest_spec`] refuses a change of target identity
+/// ([`crate::ingest_spec::is_repoint`]) because the connector keeps its
+/// stored credential and the next dial would send it to the new place. This
+/// is the only write that can re-point: when the target changes, `swaps`
+/// must carry EVERY credential slot the new dial reads
+/// ([`crate::ingest_spec::secret_field_names`]: the primary slot for one
+/// field, both for two). A slot whose ref name does not change is passed as
+/// a swap with `new_ref == expected_old`, which still checks that nobody
+/// changed it since it was read. A re-point whose `swaps` leave a slot out
+/// is [`StoreError::Conflict`], so a caller that skips the route-level
+/// check still cannot re-point without credentials.
+///
+/// The connector row is locked (`FOR UPDATE`) while the stored target is
+/// compared, so a concurrent save cannot slip a different target in
+/// between the comparison and the write.
+///
+/// The credential VALUES are not this function's business: the caller puts
+/// them in place (and takes them back if this fails) around this call.
+///
+/// # Errors
+///
+/// As [`set_ingest_spec`] for validation and `NotFound`. Returns
+/// [`StoreError::Conflict`] when the target changes and `swaps` do not cover
+/// every credential slot the new dial reads, or when a swap's
+/// `expected_old` no longer matches the stored ref ([`swap_secret_refs`]).
+pub async fn repoint_ingest_spec(
+    pool: &PgPool,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<IngestSpec, StoreError> {
+    save_ingest_spec(pool, id, spec, Some(swaps)).await
+}
+
+/// The one write behind [`set_ingest_spec`] (`swaps` is `None`: a change of
+/// target is refused) and [`repoint_ingest_spec`] (`swaps` is `Some`: the
+/// change is allowed when the swaps carry the credentials).
+async fn save_ingest_spec(
+    pool: &PgPool,
+    id: &str,
+    spec: &IngestSpecInput,
+    swaps: Option<&[SecretRefSwap<'_>]>,
 ) -> Result<IngestSpec, StoreError> {
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
@@ -978,14 +1149,44 @@ pub async fn set_ingest_spec(
             ))
         })?;
 
+    let mut tx = pool.begin().await?;
+
+    // The stored target, read under a row lock so the comparison below and
+    // the write stay one decision (SEC-14).
+    let (stored_adapter, stored_dial): (Option<String>, serde_json::Value) =
+        sqlx::query_as("SELECT adapter, dial FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+
+    // SEC-14: a change of target needs the credentials in the same write.
+    // `set_ingest_spec` has none to offer, so it refuses; `repoint_ingest_spec`
+    // must cover every slot the new dial reads.
+    if crate::ingest_spec::is_repoint(stored_adapter.as_deref(), &stored_dial, &dial) {
+        let covered = swaps.is_some_and(|swaps| {
+            let has = |slot: SecretSlot| swaps.iter().any(|swap| swap.slot == slot);
+            (fields.is_empty() || has(SecretSlot::Primary))
+                && (fields.len() < 2 || has(SecretSlot::Secondary))
+        });
+        if !covered {
+            return Err(StoreError::Conflict);
+        }
+    }
+    if let Some(swaps) = swaps {
+        apply_swaps(&mut tx, id, swaps).await?;
+    }
+
     // Read the connector's OWN declared secret-ref count before writing —
     // never derived from `id` (the exact bug Z6 replaces on the Dagster
-    // side), only from the row this connector already carries.
+    // side), only from the row this connector already carries. After the
+    // swaps above, so a re-point that supplies the second slot is judged on
+    // the refs it leaves behind.
     let secret_ref_secondary = sqlx::query_scalar::<_, Option<String>>(
         "SELECT secret_ref_secondary FROM connector WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(StoreError::NotFound)?;
 
@@ -1010,11 +1211,12 @@ pub async fn set_ingest_spec(
     .bind(&spec.dial)
     .bind(&spec.source_objects)
     .bind(&spec.schedule_cron)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Err(StoreError::NotFound);
     };
+    tx.commit().await?;
     Ok(ingest_spec_from_row(row))
 }
 
@@ -1193,34 +1395,90 @@ pub async fn swap_secret_ref(
     expected_old: Option<&str>,
     new_ref: &str,
 ) -> Result<(), StoreError> {
-    let sql = match slot {
-        SecretSlot::Primary => {
-            "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT FROM $3"
+    swap_secret_refs(
+        pool,
+        id,
+        &[SecretRefSwap {
+            slot,
+            expected_old,
+            new_ref,
+        }],
+    )
+    .await
+}
+
+/// One slot's guarded ref change, for [`swap_secret_refs`].
+#[derive(Debug, Clone, Copy)]
+pub struct SecretRefSwap<'a> {
+    /// Which slot changes.
+    pub slot: SecretSlot,
+    /// What the slot must still hold for the change to apply.
+    pub expected_old: Option<&'a str>,
+    /// What the slot is set to.
+    pub new_ref: &'a str,
+}
+
+/// [`swap_secret_ref`] for several slots at once, in ONE transaction: an
+/// S3 access-key/secret-key pair changes together or not at all. Without
+/// it, the first slot could commit and the second hit a conflict, leaving
+/// the connector with a new access key and its old secret key — a pair
+/// that never authenticates.
+///
+/// # Errors
+///
+/// As [`swap_secret_ref`], for the first swap that does not apply; every
+/// swap before it is rolled back.
+pub async fn swap_secret_refs(
+    pool: &PgPool,
+    id: &str,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    apply_swaps(&mut tx, id, swaps).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The guarded `UPDATE`s of [`swap_secret_refs`], inside a transaction the
+/// caller owns: [`repoint_ingest_spec`] runs them in the same transaction as
+/// the spec write. Dropping the transaction without committing rolls back
+/// every swap that applied.
+async fn apply_swaps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<(), StoreError> {
+    for swap in swaps {
+        let sql = match swap.slot {
+            SecretSlot::Primary => {
+                "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT \
+                 FROM $3"
+            }
+            SecretSlot::Secondary => {
+                "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND \
+                 secret_ref_secondary IS NOT DISTINCT FROM $3"
+            }
+        };
+        let result = sqlx::query(sql)
+            .bind(swap.new_ref)
+            .bind(id)
+            .bind(swap.expected_old)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            // Zero rows: figure out which of the two honest reasons
+            // applies -- see `swap_secret_ref`'s doc comment.
+            let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            return Err(match exists {
+                Some(_) => StoreError::Conflict,
+                None => StoreError::NotFound,
+            });
         }
-        SecretSlot::Secondary => {
-            "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND secret_ref_secondary \
-             IS NOT DISTINCT FROM $3"
-        }
-    };
-    let result = sqlx::query(sql)
-        .bind(new_ref)
-        .bind(id)
-        .bind(expected_old)
-        .execute(pool)
-        .await?;
-    if result.rows_affected() > 0 {
-        return Ok(());
     }
-    // Zero rows: figure out which of the two honest reasons applies --
-    // see the doc comment above.
-    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    match exists {
-        Some(_) => Err(StoreError::Conflict),
-        None => Err(StoreError::NotFound),
-    }
+    Ok(())
 }
 
 /// Everything `dagster/dispar_orchestrate/ingest_factory.py` needs to build
@@ -1343,6 +1601,68 @@ pub async fn list_ingestible_connectors(
         .collect())
 }
 
+/// Whether any connector (of any tenant: raw table names are shared) lands
+/// rows in the table `table`, that is, whether its `source_objects` array
+/// holds an element whose `target` is exactly `table`.
+///
+/// The check an upload makes before it may load into a name: it may never
+/// load into a table a connector loads (ADR 0014, decision 5), whether or
+/// not that table exists yet.
+///
+/// `source_objects` is a JSONB array of `{ "name", "target", ... }` objects
+/// ([`crate::ingest_spec::SourceObject`], `0033_connector_ingest_spec.sql`),
+/// and `target` is the raw table the object lands in. The comparison is
+/// exact, no case folding: the caller passes the name as it will be loaded.
+/// `table` is bound, never spliced into the SQL.
+///
+/// Array containment (`@>`) does the matching, not `jsonb_array_elements`,
+/// on purpose: the column is a plain JSONB with no CHECK that it is an
+/// array, `jsonb_array_elements` raises on a value that is not one and
+/// would turn one odd row into an error for every upload, while containment
+/// answers `false` for it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn any_connector_targets(pool: &PgPool, table: &str) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector \
+         WHERE source_objects @> jsonb_build_array(jsonb_build_object('target', $1::text)))",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Pipelines that read from connector `id`, by name. There is no foreign
+/// key behind `pipeline_definition.connector_id`, so this is the only
+/// thing standing between a connector delete and a pipeline left pointing
+/// at nothing (`DELETE /api/connectors/{id}` refuses while it is
+/// non-empty).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn dependent_pipelines(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Vec<ConnectorDependent>, StoreError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, name FROM pipeline_definition WHERE connector_id = $1 ORDER BY name",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| ConnectorDependent {
+            id,
+            name,
+            kind: "pipeline".to_owned(),
+        })
+        .collect())
+}
+
 /// Delete a connector by id. Returns `Ok(false)` (not an error) if `id`
 /// does not name a connector — matching the idempotent-delete convention
 /// most of this codebase's `DELETE` handlers already use.
@@ -1373,6 +1693,75 @@ pub async fn delete_connector(pool: &PgPool, id: &str) -> Result<bool, StoreErro
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// The editable, non-credential fields of a connector — the write behind
+/// `PATCH /api/connectors/{id}`. `None` leaves a field unchanged.
+///
+/// Deliberately absent: `type` (it fixes the adapter, the `dial` shape and
+/// the derived credential names — changing it is a different connector),
+/// the credential (its own probe-first route), `dial` (the ingest spec's
+/// route), and the tenant (`assign_tenant`, a separately-audited
+/// governance decision).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateConnectorInput {
+    /// New display name; must not collide with another connector's.
+    pub name: Option<String>,
+    /// New `"source" | "sink" | "bidirectional"`.
+    pub direction: Option<String>,
+    /// New deployment environment.
+    pub environment: Option<String>,
+    /// New residency label.
+    pub residency: Option<String>,
+    /// New connection target label — kept in step with `dial` by the
+    /// console, since the legacy probe and CDC deprovisioning still read it.
+    pub host: Option<String>,
+}
+
+impl UpdateConnectorInput {
+    /// Whether this update changes nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.direction.is_none()
+            && self.environment.is_none()
+            && self.residency.is_none()
+            && self.host.is_none()
+    }
+}
+
+/// Apply an [`UpdateConnectorInput`]. Every value is bound, never
+/// interpolated; an absent field keeps its current value via `COALESCE`.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no connector has `id`;
+/// [`StoreError::Conflict`] if the new name is taken;
+/// [`StoreError::Database`] otherwise.
+pub async fn update_connector(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdateConnectorInput,
+) -> Result<Connector, StoreError> {
+    let sql = format!(
+        "UPDATE connector SET \
+           name = COALESCE($2, name), \
+           direction = COALESCE($3, direction), \
+           environment = COALESCE($4, environment), \
+           residency = COALESCE($5, residency), \
+           host = COALESCE($6, host) \
+         WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
+    );
+    let row: Option<ConnectorRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(input.name.as_deref())
+        .bind(input.direction.as_deref())
+        .bind(input.environment.as_deref())
+        .bind(input.residency.as_deref())
+        .bind(input.host.as_deref())
+        .fetch_optional(pool)
+        .await?;
+    row.map(Connector::from).ok_or(StoreError::NotFound)
 }
 
 /// A slug-based id, same shape `pipelines::slug_id` uses
@@ -1422,6 +1811,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn credential_kind_of_ref_reads_every_derived_suffix() {
+        for source in [
+            CredentialSource::Env,
+            CredentialSource::File,
+            CredentialSource::Managed,
+        ] {
+            for kind in [
+                CredentialKind::Password,
+                CredentialKind::SecretKey,
+                CredentialKind::AccessKey,
+                CredentialKind::ApiKey,
+                CredentialKind::Token,
+                CredentialKind::PrivateKey,
+            ] {
+                let r = derive_secret_ref("conn-orders-k3x9", source, kind);
+                assert_eq!(credential_kind_of_ref(&r), Some(kind), "{r}");
+            }
+        }
+        assert_eq!(credential_kind_of_ref("env:SOMETHING_ELSE"), None);
+    }
     use uuid::Uuid;
 
     #[test]
@@ -1491,12 +1902,22 @@ mod tests {
             // format), not the `aud-conn-<id>` label this crate used to
             // fabricate.
             audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
+            credential_managed: true,
+            credential_kind: Some(CredentialKind::Password),
+            credential_secondary_kind: None,
+            residency: "in-region".to_owned(),
+            tenant_id: None,
         };
         let value = serde_json::to_value(&detail).unwrap();
         assert!(value.get("host").is_none());
         assert!(value.get("secretRef").is_none());
         assert!(value.get("discoveredAssets").is_some());
         assert!(value.get("dependentPipelines").is_some());
+        // A boolean only — never the ref it was derived from.
+        assert_eq!(
+            value.get("credentialManaged"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     /// The `ConnectorRow::Debug` impl — the one type in this crate that
@@ -1517,6 +1938,8 @@ mod tests {
             last_test_at: Some(OffsetDateTime::now_utc()),
             capabilities: vec![],
             owner: "o".to_owned(),
+            residency: "in-region".to_owned(),
+            tenant_id: None,
         };
         let debug = format!("{row:?}");
         assert!(!debug.contains("super-secret-internal-host"));
@@ -1595,6 +2018,48 @@ mod tests {
             ),
             "file:/run/secrets/connector_conn_orders_k3x9_password"
         );
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::Managed,
+                CredentialKind::Password
+            ),
+            "file:/run/secrets/connector_managed_conn_orders_k3x9_password"
+        );
+    }
+
+    /// ADR 0002 Addendum 4: only a `Managed` ref is recognized as one the
+    /// API stores itself — never an operator's `File` or `Env` ref for the
+    /// same id, which the API must never overwrite or delete.
+    #[test]
+    fn only_a_managed_ref_is_recognized_as_managed() {
+        for kind in [
+            CredentialKind::Password,
+            CredentialKind::SecretKey,
+            CredentialKind::PrivateKey,
+        ] {
+            let id = "conn-orders-k3x9";
+            assert!(is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::Managed,
+                kind
+            )));
+            assert!(!is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::File,
+                kind
+            )));
+            assert!(!is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::Env,
+                kind
+            )));
+        }
+        // The seeded, deployment-owned refs are never managed.
+        assert!(!is_managed_secret_ref("env:CONNECTOR_PG_PASSWORD"));
+        assert!(!is_managed_secret_ref(
+            "file:/run/secrets/connector_pg_password"
+        ));
     }
 
     /// A pattern-match check, ported the same way
@@ -1631,7 +2096,11 @@ mod tests {
             "file:/run/secrets/connector_*",
         ];
         for id in ["conn-orders-k3x9", "conn-a", "conn-pg-lakehouse-2"] {
-            for source in [CredentialSource::Env, CredentialSource::File] {
+            for source in [
+                CredentialSource::Env,
+                CredentialSource::File,
+                CredentialSource::Managed,
+            ] {
                 for kind in [
                     CredentialKind::Password,
                     CredentialKind::SecretKey,
@@ -1716,7 +2185,11 @@ mod tests {
         ];
         for (left, right) in pairs {
             assert_ne!(left, right, "test fixture bug: ids must differ");
-            for source in [CredentialSource::Env, CredentialSource::File] {
+            for source in [
+                CredentialSource::Env,
+                CredentialSource::File,
+                CredentialSource::Managed,
+            ] {
                 for left_kind in KINDS {
                     for right_kind in KINDS {
                         let left_ref = derive_secret_ref(left, source, left_kind);

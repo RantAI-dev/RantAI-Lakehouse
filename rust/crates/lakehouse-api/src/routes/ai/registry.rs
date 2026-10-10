@@ -115,6 +115,21 @@ fn run_sql_schema() -> Value {
             "required": ["sql"] } } })
 }
 
+/// The tool that asks the person a question. Named once so the places that
+/// must treat it apart (the chat's switch, a Digital Employee's run) cannot
+/// misspell it; a test pins it to a registered tool.
+pub const ASK_USER: &str = "ask_user";
+
+fn ask_user_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "ask_user",
+        "description": "Ask the user which reading of an unclear word they mean, with two to four options taken from the DATA MAP. Use it only when a word fits two or more tables, columns or values and nothing in the DATA MAP or THIS USER'S WORDS settles it. Ask once, run no query in that turn, and write nothing else after the call.",
+        "parameters": { "type": "object", "properties": {
+            "term": { "type": "string", "description": "the unclear word, as the user wrote it (1 to 60 characters)" },
+            "question": { "type": "string", "description": "one sentence asking which they mean (at most 200 characters)" },
+            "options": { "type": "array", "minItems": 2, "maxItems": 4, "items": { "type": "string" }, "description": "the readings to choose from: names from the DATA MAP, each 1 to 80 characters" } },
+            "required": ["term", "question", "options"] } } })
+}
+
 fn list_datasets_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_datasets",
         "description": "List the datasets registered in the lakehouse catalog: slug, title, whether it comes from a primary or secondary source, and the Gold table it is served from. Optional keyword or source filter.",
@@ -615,7 +630,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses.",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
@@ -1174,6 +1189,15 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "catalog:read",
     },
+    // Asks the person a question and stores nothing, so it needs no
+    // permission beyond being signed in. The console's click is what saves
+    // the answer.
+    ToolSpec {
+        name: ASK_USER,
+        schema: ask_user_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -1224,15 +1248,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_sixty_three_entries() {
+    fn tool_schemas_has_sixty_four_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
-        // sources).
-        assert_eq!(tool_schemas().len(), 63);
+        // sources) + `ask_user`.
+        assert_eq!(tool_schemas().len(), 64);
+    }
+
+    #[test]
+    fn ask_user_is_a_read_tool_that_needs_no_permission() {
+        let spec = find(ASK_USER).expect("registered tool");
+        assert_eq!(ASK_USER, "ask_user");
+        assert_eq!(spec.risk, Risk::Read);
+        assert_eq!(spec.permission, "");
+        let schema = (spec.schema)();
+        let required = &schema["function"]["parameters"]["required"];
+        assert_eq!(required, &json!(["term", "question", "options"]));
     }
 
     /// One-off fixture writer, run by hand only after an intentional schema
@@ -1262,6 +1297,34 @@ mod tests {
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
         );
+    }
+
+    /// `SEC-14`: the assistant must never carry a secret, so
+    /// `set_ingest_spec` has no credential property, and the handler it
+    /// calls only ever receives the five spec keys the tool forwards.
+    #[test]
+    fn set_ingest_spec_has_no_credential_property() {
+        let schema = (find("set_ingest_spec").expect("registered tool").schema)();
+        let properties = schema["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object of properties");
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "adapter",
+                "dial",
+                "id",
+                "ingestMode",
+                "scheduleCron",
+                "sourceObjects"
+            ]
+        );
+        let description = schema["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("never carries a credential"));
     }
 
     #[test]
@@ -1356,8 +1419,9 @@ mod tests {
         // Tier 2 tools that carry no narrower permission than
         // `RequiresAuth` (C1) — every T2.1 governance read,
         // `run_bronze_maintenance`, `list_workloads`, both gold export
-        // tools, and the two rule-level draft tools (`draft_policy` needs
-        // `policy:write`, so it is NOT in this list).
+        // tools, the two rule-level draft tools (`draft_policy` needs
+        // `policy:write`, so it is NOT in this list), and `ask_user`, which
+        // stores and reads nothing.
         assert_eq!(
             offered_names,
             vec![
@@ -1374,6 +1438,7 @@ mod tests {
                 "get_gold_export".to_owned(),
                 "draft_classification_rule".to_owned(),
                 "draft_quality_rule".to_owned(),
+                "ask_user".to_owned(),
             ]
         );
     }

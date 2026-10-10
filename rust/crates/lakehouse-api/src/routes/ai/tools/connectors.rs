@@ -71,15 +71,40 @@ pub(super) async fn create_connector(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    if let Some(refusal) = managed_credential_refusal(args) {
+        return json!({ "error": refusal });
+    }
     let body = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
         Err(err) => return json!({ "error": err.to_string() }),
     };
     let extension = principal.cloned().map(Extension);
     api_result_to_value(
-        crate::routes::connectors::create(State(state.clone()), extension, Bytes::from(body)).await,
+        crate::routes::connectors::create(
+            State(state.clone()),
+            extension,
+            // No `X-Tenant` from a tool call: the connector lands in the
+            // principal's first tenant, the same default `list` uses.
+            axum::http::HeaderMap::new(),
+            Bytes::from(body),
+        )
+        .await,
     )
     .await
+}
+
+/// ADR 0002 Addendum 4: a credential VALUE is typed by the user into the
+/// console, never relayed through the copilot, whose conversation is
+/// logged and replayed to a model. The tool schema only offers `env`/`file`,
+/// but the args reach `routes::connectors::create` verbatim, so the same
+/// rule is enforced here, server-side, rather than trusted to the schema.
+fn managed_credential_refusal(args: &Map<String, Value>) -> Option<&'static str> {
+    let credential = args.get("credential")?.as_object()?;
+    let managed = credential.get("source").and_then(Value::as_str) == Some("managed");
+    (managed || credential.contains_key("values")).then_some(
+        "Kredensial managed (nilai password/secret) tidak bisa dibuat lewat copilot. \
+         Buat connector dari halaman Connectors agar nilainya diketik langsung di console.",
+    )
 }
 
 pub(super) async fn test_connector(
@@ -90,6 +115,13 @@ pub(super) async fn test_connector(
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
+    }
+    // Called without the router, so without its tenant route layer: the
+    // same rule, applied here.
+    if let Err(err) =
+        crate::routes::connectors::ensure_connector_in_tenants(state, principal, &id).await
+    {
+        return api_result_to_value::<()>(Err(err.into())).await;
     }
     let extension = principal.cloned().map(Extension);
     api_result_to_value(
@@ -106,6 +138,11 @@ pub(super) async fn delete_connector(
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
+    }
+    if let Err(err) =
+        crate::routes::connectors::ensure_connector_in_tenants(state, principal, &id).await
+    {
+        return api_result_to_value::<()>(Err(err.into())).await;
     }
     let extension = principal.cloned().map(Extension);
     // `DeleteQuery::default()` is `force: false`: if CDC deprovisioning
@@ -257,5 +294,24 @@ mod tests {
             delete_connector(&state, Some(&principal), &Map::new()).await,
             json!({ "error": "id is required" })
         );
+    }
+
+    fn args(v: &Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// ADR 0002 Addendum 4: no credential value through the copilot, even
+    /// though the tool schema never offers one.
+    #[test]
+    fn create_refuses_a_managed_credential_or_any_value() {
+        let managed =
+            args(&json!({ "credential": { "source": "managed", "primary": "password" } }));
+        assert!(managed_credential_refusal(&managed).is_some());
+        let values = args(&json!({
+            "credential": { "source": "env", "primary": "password", "values": { "primary": "x" } }
+        }));
+        assert!(managed_credential_refusal(&values).is_some());
+        let env = args(&json!({ "credential": { "source": "env", "primary": "password" } }));
+        assert!(managed_credential_refusal(&env).is_none());
     }
 }

@@ -72,6 +72,7 @@ export function KafkaDialForm({
               value={broker}
               onChange={(e) => setBroker(index, e.target.value)}
               placeholder="kafka-0.internal:9092"
+              autoComplete="off"
             />
             {dial.bootstrapServers.length > 1 ? (
               <button
@@ -91,11 +92,21 @@ export function KafkaDialForm({
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
           <Label htmlFor="kafka-dial-topic">Topic</Label>
-          <Input id="kafka-dial-topic" value={dial.topic} onChange={(e) => set("topic", e.target.value)} />
+          <Input
+            id="kafka-dial-topic"
+            value={dial.topic}
+            onChange={(e) => set("topic", e.target.value)}
+            autoComplete="off"
+          />
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="kafka-dial-group-id">Consumer group id</Label>
-          <Input id="kafka-dial-group-id" value={dial.groupId} onChange={(e) => set("groupId", e.target.value)} />
+          <Input
+            id="kafka-dial-group-id"
+            value={dial.groupId}
+            onChange={(e) => set("groupId", e.target.value)}
+            autoComplete="off"
+          />
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="kafka-dial-micro-batch-seconds">Micro-batch cap (seconds)</Label>
@@ -104,6 +115,7 @@ export function KafkaDialForm({
             type="number"
             value={dial.microBatchSeconds}
             onChange={(e) => set("microBatchSeconds", Number(e.target.value))}
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -130,6 +142,7 @@ export function KafkaDialForm({
               id="kafka-dial-auth-username"
               value={dial.auth.username}
               onChange={(e) => set("auth", { type: "sasl_plain", username: e.target.value })}
+              autoComplete="off"
             />
           </div>
         ) : (

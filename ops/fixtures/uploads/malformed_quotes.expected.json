@@ -1,0 +1,10 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["id", "text"],
+  "rows": [
+    ["1", "abcdef"],
+    ["2", "never closed\n3,still inside\n"]
+  ]
+}

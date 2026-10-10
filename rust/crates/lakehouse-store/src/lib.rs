@@ -36,6 +36,7 @@ pub mod agents;
 pub mod annotation;
 pub mod audit;
 pub mod cdc;
+pub mod chat_term;
 pub mod connector_probe_result;
 pub mod connector_type;
 pub mod connectors;
@@ -50,8 +51,10 @@ pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;
 pub mod queries;
+pub mod semantic;
 pub mod sessions;
 pub mod storage;
+pub mod uploads;
 
 pub use error::StoreError;
 

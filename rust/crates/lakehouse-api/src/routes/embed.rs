@@ -111,7 +111,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
 
     let payload = render_board_payload(
         &state.clickhouse,
-        state.pg.as_deref(),
+        &PolicyEngineObligations::from_state(&state),
         &board,
         &board_id,
         &filters,
@@ -181,7 +181,7 @@ pub async fn public_dashboard(
     let board_id = board.id.clone();
     let payload = render_board_payload(
         &state.clickhouse,
-        state.pg.as_deref(),
+        &PolicyEngineObligations::from_state(&state),
         &board,
         &board_id,
         &filters,
@@ -203,14 +203,13 @@ pub async fn public_dashboard(
 /// neither route accepts a `year` parameter).
 async fn render_board_payload(
     ch: &ChClient,
-    pg: Option<&lakehouse_store::PgPool>,
+    obligations: &PolicyEngineObligations<'_>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
-    let obligations = PolicyEngineObligations::new(pg, ch);
     let stored = store::list_stored_charts(ch).await?;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
@@ -237,7 +236,7 @@ async fn render_board_payload(
         match stored_chart_sql(c, &[], filters, &cols, &sources) {
             Ok(lakehouse_bi::builder::FilteredSql { sql, .. }) => {
                 let (id, val) =
-                    run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, &obligations).await;
+                    run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, obligations).await;
                 results.insert(id, val);
             }
             Err(msg) => {
@@ -390,9 +389,15 @@ mod typed_filters {
             folder_id: None,
         };
 
-        let body = render_board_payload(&ch, None, &board, "b1", &filters)
-            .await
-            .unwrap();
+        let body = render_board_payload(
+            &ch,
+            &PolicyEngineObligations::new(None, &ch),
+            &board,
+            "b1",
+            &filters,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(body["board"]["id"], "b1");
         let sent: Vec<String> = server

@@ -1,0 +1,13 @@
+{
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "headerRow": 0,
+  "columns": ["id", "note", "amount"],
+  "rows": [
+    ["1", "Bolt, hex, M6", "10"],
+    ["2", "First line\nsecond line", "4"],
+    ["3", "She said \"ok\"", "7"],
+    ["4", "", "0"],
+    ["5", "5\" pipe", "12"]
+  ]
+}

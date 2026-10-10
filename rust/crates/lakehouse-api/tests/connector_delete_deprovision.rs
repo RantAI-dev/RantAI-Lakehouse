@@ -47,7 +47,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lakehouse_store::connectors::{
     CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
-    create_connector, set_ingest_spec,
+    assign_tenant, create_connector, set_ingest_spec,
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -111,7 +111,17 @@ async fn create_connector_with_undeprovisionable_slot(pool: &PgPool, name: &str)
     )
     .await
     .expect("create connector");
+    in_bayus_tenant(pool, &created.id).await;
     created.id
+}
+
+/// Meridian Group (`0002_seed_identity.sql`), one of Bayu's tenants: the
+/// per-connector routes answer only for a connector in the caller's tenant.
+async fn in_bayus_tenant(pool: &PgPool, id: &str) {
+    let meridian_group = uuid::Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_0000_0001);
+    assign_tenant(pool, id, meridian_group)
+        .await
+        .expect("assign tenant");
 }
 
 async fn connector_row_exists(pool: &PgPool, id: &str) -> bool {
@@ -244,6 +254,92 @@ async fn postgres_connector_delete_with_force_bypasses_a_real_deprovision_failur
     );
 }
 
+/// A null-adapter `PostgreSQL` connector whose registered target is the
+/// loopback address of a listener this test owns, so the test can prove
+/// that nothing connected to it. `spin_up` leaves the internal-address
+/// block on (its default), which is the point.
+async fn create_connector_aimed_at(pool: &PgPool, name: &str, port: u16) -> String {
+    let (created, _credential_names) = create_connector(
+        pool,
+        &minimal_input(
+            name,
+            "PostgreSQL",
+            &format!("lakehouse@127.0.0.1:{port}/lakehouse"),
+        ),
+    )
+    .await
+    .expect("create connector");
+    in_bayus_tenant(pool, &created.id).await;
+    created.id
+}
+
+/// Whether anything connected to `listener` within a short wait.
+async fn saw_a_connection(listener: &tokio::net::TcpListener) -> bool {
+    tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+        .await
+        .is_ok()
+}
+
+/// `SEC-15` (K4): deleting a connector whose registered target is an
+/// internal address is refused with a fixed message before anything is
+/// dialled, and the row stays. The message names the slot and publication
+/// and the `force` escape hatch like any failed clean-up, and no address
+/// beyond the caller's own host string.
+#[tokio::test]
+async fn delete_of_a_connector_aimed_at_an_internal_address_is_refused_and_never_dialled() {
+    let app = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let id = create_connector_aimed_at(&app.pool, "internal target refused", port).await;
+    let response = delete(&app.router, &format!("/api/connectors/{id}"), &cookie).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("private/internal"), "{text}");
+    assert!(text.contains("force"), "{text}");
+    assert!(
+        text.contains(&format!("{}_slot", id.replace('-', "_"))),
+        "{text}"
+    );
+    assert!(
+        connector_row_exists(&app.pool, &id).await,
+        "a refused clean-up keeps the row"
+    );
+    assert!(
+        !saw_a_connection(&listener).await,
+        "a refused target must never be dialled"
+    );
+}
+
+/// `SEC-15` (K4, feature page decision 7): `?force=true` removes the row
+/// of a connector whose target is refused, and still dials nothing.
+#[tokio::test]
+async fn force_delete_of_a_connector_aimed_at_an_internal_address_removes_the_row_without_dialling()
+{
+    let app = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let id = create_connector_aimed_at(&app.pool, "internal target forced", port).await;
+    let response = delete(
+        &app.router,
+        &format!("/api/connectors/{id}?force=true"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!connector_row_exists(&app.pool, &id).await);
+    assert!(
+        !saw_a_connection(&listener).await,
+        "force removes the row; it does not dial a refused target"
+    );
+}
+
 /// A non-`PostgreSQL` connector (the seeded S3 warehouse) deletes exactly
 /// as before: no deprovision attempt, straight 204.
 #[tokio::test]
@@ -293,6 +389,7 @@ async fn deprovision_never_attempted_for_a_batch_sql_connector() {
     )
     .await
     .expect("create connector");
+    in_bayus_tenant(&app.pool, &created.id).await;
     let spec = IngestSpecInput {
         adapter: "sql".to_owned(),
         ingest_mode: "batch".to_owned(),

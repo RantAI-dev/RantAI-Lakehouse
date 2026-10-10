@@ -2,6 +2,7 @@ import type {
   GovernanceService,
   Policy,
   QualityRule,
+  QualityRunResult,
   LineageGraph,
   AuditEvent,
   ClassificationRule,
@@ -9,6 +10,7 @@ import type {
   ReplicationSlot,
   CreatePolicyInput,
   CreateQualityRuleInput,
+  UpdateQualityRuleInput,
   CreateClassificationRuleInput,
   DatasetSla,
 } from "../contracts/governance";
@@ -58,6 +60,13 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
   return json as T;
 }
 
+/** A DELETE whose answer carries nothing the caller needs. */
+async function del(url: string, failure: string, signal?: AbortSignal): Promise<void> {
+  const res = await apiFetch(url, { method: "DELETE", signal });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw errorFor(res.status, json?.error ?? failure);
+}
+
 // WS5 item E1 (judge amendment 2): the plan's `putDatasetSla` calls a
 // `put` helper this file never had — only `get`/`post` existed. Mirrors
 // `post` exactly (same `apiFetch` usage, same `errorFor` mapping) rather
@@ -105,8 +114,37 @@ export const clickhouseGovernanceService: GovernanceService = {
   createPolicy(input: CreatePolicyInput, signal) {
     return post<Policy>("/api/governance/policies", input, signal);
   },
+  setPolicyStatus(id, status, signal) {
+    return put<Policy>(`/api/governance/policies/${encodeURIComponent(id)}/status`, { status }, signal);
+  },
+  async deletePolicy(id, signal) {
+    const res = await apiFetch(`/api/governance/policies/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the policy");
+  },
   createQualityRule(input: CreateQualityRuleInput, signal) {
     return post<QualityRule>("/api/governance/quality", input, signal);
+  },
+  updateQualityRule(id, input: UpdateQualityRuleInput, signal) {
+    return put<QualityRule>(`/api/governance/quality/${encodeURIComponent(id)}`, input, signal);
+  },
+  async deleteQualityRule(id, signal) {
+    const res = await apiFetch(`/api/governance/quality/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the rule");
+  },
+  runQualityRule(id, signal) {
+    return post<QualityRunResult>(
+      `/api/governance/quality/${encodeURIComponent(id)}/run`,
+      undefined,
+      signal
+    );
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);
@@ -116,5 +154,15 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   putDatasetSla(input: DatasetSla, signal) {
     return put<DatasetSla>("/api/governance/sla", input, signal);
+  },
+  deleteDatasetSla(tableName, signal) {
+    return del(`/api/governance/sla/${encodeURIComponent(tableName)}`, "Failed to remove the freshness target", signal);
+  },
+  deleteClassificationRule(id, signal) {
+    return del(
+      `/api/governance/classification/${encodeURIComponent(id)}`,
+      "Failed to remove the classification",
+      signal
+    );
   },
 };

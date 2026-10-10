@@ -346,9 +346,9 @@ function buildDetail(asset: Asset): AssetDetail {
         ]
       : [],
     schemaVersions: [
-      { version: 3, at: daysAgoIso(2), change: "Added email_verified (Bool)" },
-      { version: 2, at: daysAgoIso(30), change: "Widened amount to Decimal(18,2)" },
-      { version: 1, at: daysAgoIso(120), change: "Initial registration" },
+      { version: 3, at: daysAgoIso(2), change: "Added email_verified (Bool)", current: true },
+      { version: 2, at: daysAgoIso(30), change: "Widened amount to Decimal(18,2)", current: false },
+      { version: 1, at: daysAgoIso(120), change: "Initial registration", current: false },
     ],
     upstream: asset.layer === "raw" ? [] : [
       { id: "tbl-orders-events", name: "orders_events" },

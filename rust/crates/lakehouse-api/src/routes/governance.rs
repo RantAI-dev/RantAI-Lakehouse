@@ -7,10 +7,12 @@
 //! `{kind}` dispatch, matching Next.js's separate `lineage/route.ts` file —
 //! it is never reached by [`Kind::parse`].
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
@@ -24,6 +26,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
 use crate::routes::support::{nullable_u64_col, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
@@ -202,52 +205,97 @@ fn severity_of(verdict: &str) -> &'static str {
 /// rather than erroring — an authored rule simply cannot exist in that
 /// configuration.
 async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict,
-                toString(argMax(nilai, dibuat_pada)) nilai,
-                toString(max(dibuat_pada)) at
-         FROM _silver_meta.quality GROUP BY tabel, cek ORDER BY tabel, cek LIMIT 500",
-            None,
-        )
-        .await?;
-    let mut quality: Vec<Value> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let cek = str_col(r, "cek");
-            let tabel = str_col(r, "tabel");
-            let verdict = str_col(r, "verdict");
-            let at = str_col(r, "at");
-            let (name, dimension) = if let Some(col) = cek.strip_prefix("null_rate:") {
-                (format!("Column conversion {col}"), "validity")
-            } else if cek == "row_count" {
-                (cek.to_owned(), "completeness")
-            } else {
-                (cek.to_owned(), "accuracy")
-            };
-            let threshold = if cek.starts_with("null_rate") {
-                "null <5%"
-            } else {
-                "row_count > 0 & does not drop >50%"
-            };
-            json!({
-                "id": format!("q-{i}"),
-                "name": name,
-                "asset": tabel,
-                "dimension": dimension,
-                "threshold": threshold,
-                "severity": severity_of(verdict),
-                "lastStatus": status_of(verdict),
-                "lastRunAt": at,
-            })
-        })
-        .collect();
+    let mut quality = observed_quality(ch, None).await?;
     if let Some(pg) = pg {
         let authored = governance::list_quality_rules(pg).await?;
-        quality.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
+        // An authored rule carries whether it can be run and what its
+        // latest run found (`routes::quality`); an observed one above
+        // already carries the verdict its job recorded.
+        let runs = crate::routes::quality::latest_runs(ch).await;
+        quality.extend(authored.iter().filter_map(|r| {
+            let mut rule = serde_json::to_value(r).ok()?;
+            crate::routes::quality::annotate_rule(&mut rule, &runs);
+            Some(rule)
+        }));
     }
     Ok(json!({ "quality": quality }))
+}
+
+/// True when `body` is `ClickHouse` saying the table, or its whole
+/// database, does not exist. `_silver_meta` is created by whatever job
+/// first records a quality verdict, so a deployment where none has run
+/// has no database at all (`Code: 81 ... (UNKNOWN_DATABASE)`), not just no
+/// table.
+fn is_missing_quality_source(body: &str) -> bool {
+    is_unknown_table_or_database_error(body) || body.contains("Code: 81.")
+}
+
+/// One observed check as a `QualityRule` (`contracts/governance.ts`): the
+/// latest verdict a quality job recorded for `(tabel, cek)`.
+fn observed_quality_json(index: usize, row: &Map<String, Value>) -> Value {
+    let cek = str_col(row, "cek");
+    let verdict = str_col(row, "verdict");
+    let (name, dimension) = if let Some(col) = cek.strip_prefix("null_rate:") {
+        (format!("Column conversion {col}"), "validity")
+    } else if cek == "row_count" {
+        (cek.to_owned(), "completeness")
+    } else {
+        (cek.to_owned(), "accuracy")
+    };
+    let threshold = if cek.starts_with("null_rate") {
+        "null <5%"
+    } else {
+        "row_count > 0 & does not drop >50%"
+    };
+    json!({
+        "id": format!("q-{index}"),
+        "name": name,
+        "asset": str_col(row, "tabel"),
+        "dimension": dimension,
+        "threshold": threshold,
+        "severity": severity_of(verdict),
+        "lastStatus": status_of(verdict),
+        "lastRunAt": str_col(row, "at"),
+    })
+}
+
+/// The latest observed verdict per `(tabel, cek)` from
+/// `_silver_meta.quality` — for every table, or only for `tables` (the
+/// catalog detail route asks about one asset) — with "nothing has recorded
+/// a verdict yet" as the empty list it is. Before this, a missing
+/// `_silver_meta` answered 503, so the Data Quality page could not even
+/// show the rules people authored. Every other failure still surfaces.
+///
+/// # Errors
+///
+/// Returns [`ChError`] for any failure other than a missing table or
+/// database.
+pub(crate) async fn observed_quality(
+    ch: &ChClient,
+    tables: Option<&[String]>,
+) -> Result<Vec<Value>, ChError> {
+    let only = tables.map_or_else(String::new, |tables| {
+        let names: Vec<String> = tables
+            .iter()
+            .map(|t| SqlLiteral::from(t.as_str()).to_string())
+            .collect();
+        format!("WHERE tabel IN ({}) ", names.join(", "))
+    });
+    let sql = format!(
+        "SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict,
+                toString(argMax(nilai, dibuat_pada)) nilai,
+                toString(max(dibuat_pada)) at
+         FROM _silver_meta.quality {only}GROUP BY tabel, cek ORDER BY tabel, cek LIMIT 500"
+    );
+    match ch.rows(&sql, None).await {
+        Ok(rows) => Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| observed_quality_json(i, r))
+            .collect()),
+        Err(ChError::Server(ref body)) if is_missing_quality_source(body) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
 }
 
 /// `principal_kind`/`outcome` on `audit_event` are a wider vocabulary than
@@ -618,18 +666,32 @@ pub struct IngestRunRow {
     pub error: String,
 }
 
-/// Build every `bronze_meta.ingest_run` row for `connector_id`.
+/// How many of a connector's most recent per-table results
+/// [`ingest_runs_for_connector`] returns.
+const INGEST_RUN_ROWS: u32 = 500;
+
+/// Build `connector_id`'s most recent `bronze_meta.ingest_run` rows, newest
+/// first.
+///
+/// `pub(crate)`: `routes::uploads` reads a file load's recorded outcome from
+/// the same table, under the id `upload:<upload id>`, instead of carrying
+/// its own copy of this query.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` transport or server failure.
-async fn ingest_runs_for_connector(
+pub(crate) async fn ingest_runs_for_connector(
     ch: &ChClient,
     connector_id: &str,
 ) -> Result<Vec<IngestRunRow>, ChError> {
+    // Newest first, bounded: the console groups these under the run each
+    // one belongs to, and a connector on an hourly schedule records a row
+    // per table every hour. `started_at` is ISO-8601 UTC from one writer
+    // (`record_ingest_run`), so ordering the text orders the time.
     let sql = format!(
         "SELECT connector_id, job, object, rows, started_at, ended_at, status, error \
-         FROM lake.`bronze_meta.ingest_run` WHERE connector_id = {}",
+         FROM lake.`bronze_meta.ingest_run` WHERE connector_id = {} \
+         ORDER BY started_at DESC LIMIT {INGEST_RUN_ROWS}",
         // WS3 plan review Z10: the workspace-wide literal-escaping helper,
         // used identically to `routes::ops::kill_query_sql`/`routes::catalog`
         // for a caller-supplied value in a hand-`format!`ed `ClickHouse`
@@ -653,12 +715,36 @@ async fn ingest_runs_for_connector(
         .collect())
 }
 
+/// [`ingest_runs_for_connector`], with "no run recorded yet" as the empty
+/// list it is. `bronze_meta.ingest_run` is created lazily by
+/// `dagster/dispar_orchestrate/bronze_catalog.py::record_ingest_run` on
+/// the first recorded run, so `ClickHouse` reporting the table does not
+/// exist ([`is_unknown_table_error`]) truthfully means nothing has been
+/// recorded for any connector — the same reasoning
+/// `routes::lakehouse::maintenance_verb_runs_or_empty` applies to its own
+/// lazily created table. Every other failure still surfaces.
+///
+/// `pub(crate)` for the same reason as [`ingest_runs_for_connector`].
+///
+/// # Errors
+///
+/// Returns [`ChError`] for any failure other than an unknown table.
+pub(crate) async fn ingest_runs_or_empty(
+    ch: &ChClient,
+    connector_id: &str,
+) -> Result<Vec<IngestRunRow>, ChError> {
+    match ingest_runs_for_connector(ch, connector_id).await {
+        Err(ChError::Server(ref body)) if is_unknown_table_error(body) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
 /// `GET /api/governance/ingest-runs?connectorId=<id>`.
 pub async fn ingest_runs(
     State(state): State<AppState>,
     Query(q): Query<IngestRunsQuery>,
 ) -> Response {
-    match ingest_runs_for_connector(&state.clickhouse, &q.connector_id).await {
+    match ingest_runs_or_empty(&state.clickhouse, &q.connector_id).await {
         Ok(rows) => (StatusCode::OK, ApiJson(rows)).into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -693,6 +779,44 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
+/// Records that something about a catalog table changed — a rule, a
+/// classification, a policy or a freshness target was added for it — so
+/// the table's asset page can show it in its Change history
+/// (`catalog_governance::change_history`). Keyed by the table as the rule
+/// names it, lower-cased; an asset is looked up under every key it goes
+/// by. Best-effort, like every audit write: it never fails the change it
+/// records.
+pub(crate) async fn audit_table_change(
+    state: &AppState,
+    actor: Option<&Principal>,
+    table: &str,
+    action: &str,
+    args: Value,
+) {
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    let table = table.trim().to_lowercase();
+    if table.is_empty() {
+        return;
+    }
+    let _ = lakehouse_store::audit::insert(
+        pg,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: actor.map(|p| p.id.uuid().to_string()),
+            principal_kind: actor.map(|_| "user".to_owned()),
+            actor_label: actor.map(|p| p.display_name.clone()),
+            action: action.to_owned(),
+            resource_kind: Some("catalog".to_owned()),
+            resource_id: Some(table),
+            args: Some(args),
+            outcome: "executed".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 /// `POST /api/governance/{kind}` — author a new rule for `kind` (`quality`,
 /// `classification`, or `residency`; `audit` has no writer, and anything
 /// else is unrecognized).
@@ -707,17 +831,43 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
 pub async fn create_rule(
     State(state): State<AppState>,
     Path(kind): Path<String>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> Response {
+    let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state), body).await {
-            Ok(resp) => resp.into_response(),
+        Kind::Quality => match create_quality_rule(State(state.clone()), body).await {
+            Ok(resp) => {
+                let rule = &resp.1.0;
+                audit_table_change(
+                    &state,
+                    actor,
+                    &rule.asset,
+                    "quality.rule_create",
+                    json!({ "name": rule.name, "threshold": rule.threshold }),
+                )
+                .await;
+                resp.into_response()
+            }
             Err(err) => err.into_response(),
         },
-        Kind::Classification => match create_classification_rule(State(state), body).await {
-            Ok(resp) => resp.into_response(),
-            Err(err) => err.into_response(),
-        },
+        Kind::Classification => {
+            match create_classification_rule(State(state.clone()), body).await {
+                Ok(resp) => {
+                    let rule = &resp.1.0;
+                    audit_table_change(
+                        &state,
+                        actor,
+                        &rule.asset,
+                        "catalog.classify",
+                        json!({ "column": rule.column, "classification": rule.classification }),
+                    )
+                    .await;
+                    resp.into_response()
+                }
+                Err(err) => err.into_response(),
+            }
+        }
         Kind::Residency => match create_residency_rule(State(state), body).await {
             Ok(resp) => resp.into_response(),
             Err(err) => err.into_response(),
@@ -812,6 +962,154 @@ pub async fn create_policy(
     let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// `POST /api/governance/policies` as the router mounts it:
+/// [`create_policy`], plus a Change-history entry on the table the new
+/// policy binds, when its condition names one.
+///
+/// # Errors
+///
+/// Exactly [`create_policy`]'s.
+pub async fn create_policy_route(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+    let created = create_policy(State(state.clone()), body).await?;
+    let policy = &created.1.0;
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+    {
+        audit_table_change(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &cond.table,
+            "policy.create",
+            json!({ "name": policy.name }),
+        )
+        .await;
+    }
+    Ok(created)
+}
+
+/// Records a change to a policy in the audit trail: on the table its
+/// condition binds, where that table's asset page shows it in its Change
+/// history ([`audit_table_change`]) — or, for a policy that binds no
+/// table, on the policy itself. One event either way.
+async fn audit_policy_change(
+    state: &AppState,
+    actor: Option<&Principal>,
+    policy: &Policy,
+    action: &str,
+    args: Value,
+) {
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+    {
+        audit_table_change(state, actor, &cond.table, action, args).await;
+        return;
+    }
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    let _ = lakehouse_store::audit::insert(
+        pg,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: actor.map(|p| p.id.uuid().to_string()),
+            principal_kind: actor.map(|_| "user".to_owned()),
+            actor_label: actor.map(|p| p.display_name.clone()),
+            action: action.to_owned(),
+            resource_kind: Some("policy".to_owned()),
+            resource_id: Some(policy.id.clone()),
+            args: Some(args),
+            outcome: "executed".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+/// The `PUT /api/governance/policies/{id}/status` body.
+#[derive(Debug, Deserialize)]
+pub struct PolicyStatusBody {
+    status: String,
+}
+
+/// `PUT /api/governance/policies/{id}/status` — enforce a policy
+/// (`"ready"`) or stop enforcing it (`"draft"`). Until this route a policy
+/// kept the status it was created with for life: a draft could never be
+/// enforced, and an enforced one could never be stopped. It takes effect
+/// on the next query — obligations are read from the store each time.
+///
+/// # Errors
+///
+/// `400` for a malformed body or any other status; `404` when no policy
+/// has that id; 503/500 as above.
+pub async fn set_policy_status(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Policy>> {
+    let body: PolicyStatusBody = parse_body(&body)?;
+    if !matches!(body.status.as_str(), "ready" | "draft") {
+        return Err(ApiError::BadRequest(
+            "status must be \"ready\" (enforced) or \"draft\" (not enforced)".to_owned(),
+        )
+        .into());
+    }
+    let pool = pool(&state)?;
+    let before = governance::list_policies(pool)
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    let policy = governance::set_policy_status(pool, &id, &body.status)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    if before.status != policy.status {
+        let action = if policy.status == "ready" {
+            "policy.enforce"
+        } else {
+            "policy.suspend"
+        };
+        audit_policy_change(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &policy,
+            action,
+            json!({ "name": policy.name }),
+        )
+        .await;
+    }
+    Ok(ApiJson(policy))
+}
+
+/// `DELETE /api/governance/policies/{id}` — remove a policy. An enforced
+/// one stops masking and filtering from the next query on, which is why
+/// the audit event says whether it was (`enforced`).
+///
+/// # Errors
+///
+/// `404` when no policy has that id; 503/500 as above.
+pub async fn delete_policy(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let policy = governance::delete_policy(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    audit_policy_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &policy,
+        "policy.delete",
+        json!({ "name": policy.name, "enforced": policy.status == "ready" }),
+    )
+    .await;
+    Ok(ApiJson(json!({ "ok": true, "id": policy.id })))
 }
 
 /// The `POST /api/governance/policies/preview` body — a `table`/`mask`/
@@ -1136,6 +1434,7 @@ pub struct PutDatasetSlaBody {
 /// guarantee this mirrors, not the other way around. 503/500 as above.
 pub async fn put_sla(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<governance::DatasetSla>> {
     let body: PutDatasetSlaBody = parse_body(&body)?;
@@ -1152,7 +1451,74 @@ pub async fn put_sla(
         owner: body.owner,
     };
     let saved = governance::upsert_dataset_sla(pool(&state)?, &input).await?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &saved.table_name,
+        "catalog.sla_set",
+        json!({ "minutes": saved.expected_interval_minutes }),
+    )
+    .await;
     Ok(ApiJson(saved))
+}
+
+/// `DELETE /api/governance/sla/{table}` — remove one table's freshness
+/// SLA. Until this route a target, once set, could only be changed: a
+/// table judged late against a target set by mistake stayed degraded.
+/// Gated by `governance:write`, like setting one.
+///
+/// # Errors
+///
+/// 404 when the table has no SLA; 503/500 as above.
+pub async fn delete_sla(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(table): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let removed = governance::delete_dataset_sla(pool(&state)?, &table)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound("No freshness target is set for this table".to_owned())
+        })?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &removed.table_name,
+        "catalog.sla_remove",
+        json!({ "minutes": removed.expected_interval_minutes }),
+    )
+    .await;
+    Ok(ApiJson(
+        json!({ "ok": true, "tableName": removed.table_name }),
+    ))
+}
+
+/// `DELETE /api/governance/classification/{id}` — remove a classification
+/// rule. A classification could only be overridden by adding a newer rule,
+/// never taken back; with the rule gone, an older rule for the same asset
+/// or column applies again, or the default level. Gated by
+/// `governance:write`.
+///
+/// # Errors
+///
+/// 404 when no rule has that id; 503/500 as above.
+pub async fn delete_classification_rule(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let rule = governance::delete_classification_rule(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Classification rule not found".to_owned()))?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &rule.asset,
+        "catalog.declassify",
+        json!({ "column": rule.column, "classification": rule.classification }),
+    )
+    .await;
+    Ok(ApiJson(json!({ "ok": true, "id": rule.id })))
 }
 
 #[cfg(test)]
@@ -1347,6 +1713,41 @@ mod tests {
         );
     }
 
+    /// Before any run has recorded an outcome, `bronze_meta.ingest_run`
+    /// does not exist yet: that is "no runs", not an outage.
+    #[tokio::test]
+    async fn ingest_runs_or_empty_reports_no_runs_before_the_table_exists() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string(
+                "Code: 60. DB::Exception: Unknown table expression identifier \
+                 'lake.bronze_meta.ingest_run' in scope SELECT connector_id FROM \
+                 lake.`bronze_meta.ingest_run`. (UNKNOWN_TABLE)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = ingest_runs_or_empty(&ch, "conn-x").await.unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_runs_or_empty_still_surfaces_any_other_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_string("Code: 210. DB::NetException: Connection refused"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        assert!(ingest_runs_or_empty(&ch, "conn-x").await.is_err());
+    }
+
     #[test]
     fn nullable_u64_col_accepts_a_quoted_string_a_bare_number_and_null() {
         let mut row = Map::new();
@@ -1410,6 +1811,23 @@ mod tests {
         // this dispatch; if it somehow did, it should NOT be treated as a
         // recognized governance kind.
         assert_eq!(Kind::parse("lineage"), Kind::Unknown);
+    }
+
+    /// No quality job has run on this stack yet: the whole `_silver_meta`
+    /// database is missing, which is "no verdicts", not an outage.
+    #[test]
+    fn a_missing_quality_database_or_table_is_no_verdicts_yet() {
+        assert!(is_missing_quality_source(
+            "Code: 81. DB::Exception: Database _silver_meta does not exist. \
+             (UNKNOWN_DATABASE) (version 26.8.9.10 (official build))"
+        ));
+        assert!(is_missing_quality_source(
+            "Code: 60. DB::Exception: Unknown table expression identifier \
+             '_silver_meta.quality' in scope SELECT 1. (UNKNOWN_TABLE)"
+        ));
+        assert!(!is_missing_quality_source(
+            "Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)"
+        ));
     }
 
     #[test]
