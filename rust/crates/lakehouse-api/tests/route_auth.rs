@@ -1006,6 +1006,33 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
     );
 }
 
+/// SEC-9: the natural-language box in Query Studio has no endpoint of its
+/// own. The old `/api/agent*` ask and text-to-SQL routes ran model-written SQL
+/// straight against the engine; #78 removed them, and the assistant now runs
+/// SQL only through the tool gate (`/api/ai/chat`, `/api/ai/tool`). A route
+/// of that shape coming back would be a path around the gate, so it fails
+/// here by name.
+#[test]
+fn no_route_runs_model_written_sql_outside_the_assistant_tool_gate() {
+    for (method, path, _) in POLICY_TABLE {
+        let lower = path.to_ascii_lowercase();
+        assert!(
+            lower != "/api/agent" && !lower.starts_with("/api/agent/"),
+            "{method} {path}: a standalone agent endpoint (SEC-9)"
+        );
+        assert!(
+            !lower.contains("text-to-sql")
+                && !lower.contains("text_to_sql")
+                && !lower.contains("nl2sql"),
+            "{method} {path}: a text-to-SQL endpoint (SEC-9)"
+        );
+        assert!(
+            !(lower.starts_with("/api/ai/") && lower.contains("sql")),
+            "{method} {path}: an AI route that names SQL outside the tool gate (SEC-9)"
+        );
+    }
+}
+
 /// Every route the router actually registers must have a `POLICY_TABLE`
 /// entry — the direction the two loops above do NOT cover.
 ///

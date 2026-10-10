@@ -1965,12 +1965,6 @@ pub fn classify_statement_for_principal(
 ///
 /// # Errors
 /// Same as [`classify_statement_for_principal`].
-#[allow(
-    dead_code,
-    reason = "no non-test caller exists yet in this commit (WS7 item B5); \
-              a future no-principal-context caller (or a test using it \
-              directly) is the first production caller"
-)]
 pub fn classify_statement(sql: &str, dialect: &dyn Dialect) -> Result<(), RewriteError> {
     classify_statement_for_principal(sql, dialect, &[], false)
 }

@@ -4,10 +4,13 @@
 
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
+use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
+use crate::error::ApiResult;
+use crate::json::ApiJson;
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 use crate::state::AppState;
 
@@ -56,6 +59,26 @@ pub(super) async fn run_sql(
                        which has no user to run as",
         });
     };
+    // SEC-9: the policy refusals that need no database (a table function, a
+    // refused system table) come BEFORE the engine dry run below. `EXPLAIN
+    // AST` parses and never fetches, but it still sends the caller's
+    // statement to the engine, and the engine's query log would then hold
+    // `url('http://…')` for a statement the policy refuses. This is
+    // `sql_rewrite::classify_statement`, the first step `sql_rewrite::enforce`
+    // itself runs with the same (empty) permissions, so the rule is not
+    // copied: it is synchronous, so it costs no round trip. The full
+    // rewrite (obligations, views) still runs once, in `routes::query::run`.
+    // `Unparseable` is left to the dry run, whose classified engine error is
+    // what an author sees today for a statement the parser cannot read.
+    match crate::sql_rewrite::classify_statement(&sql, &sqlparser::dialect::ClickHouseDialect {}) {
+        Err(crate::sql_rewrite::RewriteError::Unparseable) | Ok(()) => {}
+        Err(refusal) => {
+            // The same 422 body `routes::query::run` would have produced.
+            let message = crate::policy_engine::refusal_message(&refusal).to_owned();
+            let refused: ApiResult<ApiJson<Value>> = Err(ApiError::Unprocessable(message).into());
+            return api_result_to_value(refused).await;
+        }
+    }
     // WS7 item F4: `is_read_only_sql` above is a regex-shaped first
     // filter (unchanged, still checked first, defense-in-depth) — it can
     // disagree with what `ClickHouse` itself will actually execute for a
@@ -896,6 +919,177 @@ mod run_sql_delegation {
              never the original literal SQL — this is what closes the divergent-guard gap \
              (WS7 plan §0 item 7)"
         );
+        Ok(())
+    }
+
+    /// A mocked `ClickHouse` that records every request and, if one ever
+    /// arrives, answers `EXPLAIN AST` as a `SELECT` and anything else with
+    /// an empty result, so a refusal test fails on the recorded count and
+    /// not on a confusing downstream error.
+    async fn recording_clickhouse() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("EXPLAIN AST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [{"name": "one", "type": "UInt8"}],
+                "data": [{"one": 1}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn state_for(server: &MockServer, database_url: String) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url);
+        env.insert("CH_URL".to_owned(), server.uri());
+        AppState::new(Config::from_map(&env).expect("valid config from a map"))
+    }
+
+    /// SEC-9-AC3: a statement the policy refuses is stopped before ANY part
+    /// of it reaches the engine, not even as `EXPLAIN AST` (which parses and
+    /// never fetches, but still lands the statement text in the engine's
+    /// query log). The mock records requests; the count must be zero.
+    #[tokio::test]
+    async fn run_sql_refuses_a_table_function_before_anything_reaches_the_engine() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert(
+            "sql".to_owned(),
+            json!("SELECT * FROM url('http://192.0.2.1/planted-marker', 'RawBLOB')"),
+        );
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert_eq!(
+            result,
+            json!({
+                "error": crate::policy_engine::refusal_message(
+                    &crate::sql_rewrite::RewriteError::TableFunctionDenied {
+                        name: "url".to_owned(),
+                    }
+                ),
+            }),
+            "expected the policy refusal, got {result}"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(
+            requests.is_empty(),
+            "the engine received {} request(s) for a refused table function",
+            requests.len()
+        );
+    }
+
+    /// SEC-9-AC3, second refusal class: a refused system table. Reaching it
+    /// through the full `rewrite_sql_for_principal` would first ask the engine
+    /// for `system.tables` metadata about it, so the early check is the
+    /// synchronous classification, which needs no round trip.
+    #[tokio::test]
+    async fn run_sql_refuses_a_sensitive_system_table_before_anything_reaches_the_engine() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert(
+            "sql".to_owned(),
+            json!("SELECT query FROM system.query_log"),
+        );
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert_eq!(
+            result,
+            json!({
+                "error": crate::policy_engine::refusal_message(
+                    &crate::sql_rewrite::RewriteError::SensitiveSystemTable {
+                        table: "system.query_log".to_owned(),
+                    }
+                ),
+            }),
+            "expected the policy refusal, got {result}"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(
+            requests.is_empty(),
+            "the engine received {} request(s) for a refused system table",
+            requests.len()
+        );
+    }
+
+    /// The other half of SEC-9's ordering: a statement the policy admits
+    /// still gets the engine dry run first and is then executed.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_dry_runs_then_executes_a_statement_the_policy_admits(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, database_url_for(&pool));
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT 1 AS one"));
+        let result = run_sql(&state, Some(&principal), &args).await;
+        assert!(result.get("error").is_none(), "{result}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "expected dry run then execution: {bodies:?}"
+        );
+        assert!(bodies[0].contains("EXPLAIN AST"), "{bodies:?}");
+        assert!(!bodies[1].contains("EXPLAIN AST"), "{bodies:?}");
+        Ok(())
+    }
+
+    /// SEC-9-AC4: a statement that fails in the engine comes back to the
+    /// model as the trimmed diagnosis with a reference, never the engine
+    /// version or an address (SEC-11's query-author exception, reached
+    /// through the tool).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_failure_has_a_reference_and_no_engine_version_or_host(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("EXPLAIN AST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "Code: 47. DB::Exception: Unknown identifier 'nope', reached via \
+                 ch-internal.example.net:8123 (192.0.2.7). (UNKNOWN_IDENTIFIER) \
+                 (version 24.8.1.1)",
+            ))
+            .mount(&server)
+            .await;
+        let state = state_for(&server, database_url_for(&pool));
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT nope"));
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        let text = result.to_string();
+        assert!(text.contains("Reference: "), "{text}");
+        assert!(text.contains("UNKNOWN_IDENTIFIER"), "{text}");
+        for leaked in ["24.8.1.1", "ch-internal.example.net", "192.0.2.7"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
         Ok(())
     }
 
