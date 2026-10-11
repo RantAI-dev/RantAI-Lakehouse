@@ -224,6 +224,22 @@ Deviations and decisions the plan did not cover:
 Unsure: (1) the expected `certifiedAt` string in the overlay test (`2026-09-21T14:13:20Z` for Unix 1_790_000_000) is from Python's UTC conversion; the `time` crate's RFC 3339 output for a whole second UTC should be identical, but it has not run. (2) The group-order assertion in `certification_filters_sorts_and_groups` assumes `apply_grouping` keeps first-appearance order, as its doc says. (3) The 503 path for an unreadable catalog has no test.
 
 
+### Handoff: fix of SHOULD-FIX 1 (developer)
+
+Commit `264ecbe` `fix(catalog): name the replacement in the deprecation notice`.
+`apply_annotation` takes the replacement's name (list: from the assembled
+list; detail: from `search_snapshot`, absent on a failed read), writes
+`replacementName` only when found; contract and notice updated.
+
+Run: `cargo fmt --check` clean; `cargo clippy -p lakehouse-api -p
+lakehouse-store --all-targets -- -D warnings` clean (after `touch`);
+`bun run typecheck` exit 0; `bun run lint` 0 errors, 6 warnings (none in a
+changed file); `bun run test` 955 pass, 1 skip, 0 fail.
+
+Not verified: no Rust test ran (CI runs first); the two new Rust-side
+checks are `asset_name_in` and the absent-name case. The notice was not
+looked at in a browser.
+
 ## Review
 
 ### Reviewed 2026-10-09 at `bf58146`
