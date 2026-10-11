@@ -435,3 +435,32 @@ surface hop and no front fill light. The duplicate `theme-color` meta is
 harmless; leave the root layout alone.
 
 **Plan corrected** in §4 S2 and S6 to match BLOCKER 1.
+
+### Round 2 (reviewed at `c3e9cbc`)
+
+**Re-run by the reviewer, foreground:** `package-lock.json`, `package.json`
+and `bun.lock` byte-identical to `96e3c93` (SHOULD-FIX 6 withdrawn and
+reverted in `1486c7b`); `bun run typecheck` exit 0; `bun run lint` 0 errors,
+6 warnings (unchanged, none in this work); `bun run test` 954 pass, 1 skip,
+0 fail (955 tests, 105 files); `bun run build` exit 0, `/landing` static.
+Production server: 18 targeted screenshots at 1440×900 and 390×844 plus six
+phone frames through the depth stack with 4.5 s settle time; no page errors,
+horizontal overflow 0 at both widths.
+
+**Checked and correct:** BLOCKER 1 (no SFTP, no S3-compatible storage; the
+lineage and audit lines say only what is built; the remaining mentions are
+the comment explaining why). SHOULD-FIX 1 to 5 fixed as asked: pills settle
+above the caption at both widths; the canvas fades out over the end of the
+depths section with no seam into the assistant; the SVG mascot's rim light
+follows the dome edge; the phone eyebrow and the phone sources copy are
+legible. The extra depth-stack anchor change keeps the slabs clear of the
+desktop copy.
+
+Not a defect: a phone frame of the depth stack taken after 2.2 s came out
+empty under software GL (2 to 4 fps); with 4.5 s every frame shows its slab
+and copy.
+
+**No open BLOCKER.** Ready for the pull request. Not verified by anyone: a
+GPU or a real phone (frame rate, pixel-ratio caps, tilt), Safari and
+Firefox. The product owner checks those on their own devices before calling
+`WEB-1` accepted.
