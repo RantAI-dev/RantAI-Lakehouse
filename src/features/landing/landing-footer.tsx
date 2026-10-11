@@ -4,6 +4,7 @@ import * as React from "react";
 import { FOOTER } from "./landing-copy";
 import { Container } from "./landing-ui";
 import { MascotMark } from "./mascot-svg";
+import { Reveal } from "./reveal";
 
 type Column = { title: string; links: readonly { label: string; href: string }[] };
 
@@ -44,7 +45,9 @@ export function LandingFooter() {
         ))}
       </Container>
       <Container className="mt-14">
-        <p className="lk-mono text-[12px] text-[#E8F4FF]/55">{FOOTER.legal}</p>
+        <Reveal y={12}>
+          <p className="lk-mono text-[12px] text-[#E8F4FF]/55">{FOOTER.legal}</p>
+        </Reveal>
       </Container>
     </footer>
   );
