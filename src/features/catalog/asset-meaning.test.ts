@@ -108,6 +108,13 @@ describe("roleLabel", () => {
     expect(roleLabel("measure")).toBe("Measure")
     expect(roleLabel("geo")).toBe("geo")
   })
+
+  it("returns the short label of a role that has one, and the full label otherwise", () => {
+    expect(roleLabel("non_additive", "short")).toBe("Not additive")
+    expect(roleLabel("non_additive")).toBe("Number, not to be added up")
+    expect(roleLabel("measure", "short")).toBe("Measure")
+    expect(roleLabel("geo", "short")).toBe("geo")
+  })
 })
 
 describe("visibleColumns with an extra search text", () => {

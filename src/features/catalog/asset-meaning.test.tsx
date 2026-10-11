@@ -144,7 +144,7 @@ describe("the drafts line", () => {
 })
 
 describe("the meaning view", () => {
-  it("shows a draft's meaning, synonyms, role and status on one line", () => {
+  it("shows a draft's meaning, synonyms, role and status in a read-only row", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
@@ -163,7 +163,8 @@ describe("the meaning view", () => {
 
     const table = meaningTable()
     expect(within(table).getByText("Number of distinct customers")).toBeTruthy()
-    expect(within(table).getByText("Number, not to be added up")).toBeTruthy()
+    expect(within(table).getByText("Not additive")).toBeTruthy()
+    expect(within(table).getByTitle("Number, not to be added up")).toBeTruthy()
     expect(within(table).getByText("confirmed")).toBeTruthy()
   })
 
@@ -177,7 +178,7 @@ describe("the meaning view", () => {
     expect(within(row).getByText("No meaning written")).toBeTruthy()
   })
 
-  it("gives the narrow layout one track per cell that is shown below @lg, so a row stays one line", () => {
+  it("gives the narrow layout one track per cell that is shown below @lg", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
@@ -234,6 +235,26 @@ describe("the meaning view", () => {
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
     expect(within(meaningTable()).getAllByRole("row")).toHaveLength(4)
+  })
+
+  it("clamps a meaning to two lines, not one, for a reader who can write", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const classes = within(meaningTable()).getByText("Total order value in rupiah").className.split(/\s+/)
+    expect(classes).toContain("line-clamp-2")
+    expect(classes).not.toContain("truncate")
+  })
+
+  it("clamps a meaning to two lines, not one, for a reader who cannot write", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: false })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const classes = within(meaningTable()).getByText("Number of distinct customers").className.split(/\s+/)
+    expect(classes).toContain("line-clamp-2")
+    expect(classes).not.toContain("truncate")
   })
 })
 
@@ -301,12 +322,56 @@ describe("Drafts only", () => {
 
     rerender(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={confirmed} />)
     expect(screen.getByText("No draft left to review.")).toBeTruthy()
+    expect(screen.getByText("No drafts among 30 columns.")).toBeTruthy()
+    expect(screen.queryByText("0 drafts, in table order.")).toBeNull()
     const box = screen.getByRole("checkbox", { name: "Drafts only" })
     expect(box.getAttribute("data-state")).toBe("checked")
 
     fireEvent.click(box)
     expect(screen.getByText("Showing the first 25 of 30 columns, in table order.")).toBeTruthy()
     expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
+  })
+})
+
+describe("the role in the row", () => {
+  it("shows the short label of a non-additive role in its trigger, with the full label as title", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const trigger = roleSelect("customer_count")
+    expect(trigger.textContent).toContain("Not additive")
+    expect(trigger.textContent).not.toContain("Number,")
+    expect(trigger.getAttribute("title")).toBe("Number, not to be added up")
+  })
+
+  it("lists the full label of a non-additive role when the row's select is opened", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(roleSelect("customer_count"))
+    expect(screen.getByRole("option", { name: "Number, not to be added up" })).toBeTruthy()
+  })
+
+  it("shows the full label of a non-additive role in the edit dialog", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of customer_count" }))
+
+    expect(within(dialog()).getByRole("combobox", { name: "Role" }).textContent).toContain(
+      "Number, not to be added up",
+    )
+  })
+
+  it("gives the Meaning view's header a 7.5rem role track below @lg", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const header = within(meaningTable()).getAllByRole("row")[0]
+    expect(header.className).toContain("grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]")
   })
 })
 
