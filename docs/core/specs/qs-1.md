@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `QS-1` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Query Studio |
-| Who builds it | Query Studio |
-| When | Next |
+| Module | Query Studio |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -39,11 +37,10 @@ Databricks SQL editor: autocomplete for keywords, catalogs, tables, columns and 
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Typing a table alias followed by a dot lists its columns
-- [ ] Three statements run and show three result tabs
-- [ ] Closing and reopening the browser restores the open tabs
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `QS-1-AC1` Typing a table alias followed by a dot lists its columns
+- `QS-1-AC2` Three statements run and show three result tabs
+- `QS-1-AC3` Closing and reopening the browser restores the open tabs
+- `QS-1-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

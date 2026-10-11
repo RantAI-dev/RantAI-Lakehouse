@@ -1,13 +1,14 @@
-# `SEC-22` Adding a governance rule needs the permission changing one needs
+# `SEC-23` Adding a governance rule needs the permission changing one needs
 
 | | |
 | --- | --- |
-| Backlog | `SEC-22` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with Data |
-| When | Now |
+| Backlog | `SEC-23` in [BACKLOG.md](../BACKLOG.md) |
+| Module | Administration & Security |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Feature page [`governance-rule-create.md`](../features/governance-rule-create.md), decisions signed 2026-10-09. Plan written |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Spec checked | Against the code on 2026-10-09. Feature page [`governance-rule-create.md`](../features/governance-rule-create.md) |
+
+*This item was first numbered `SEC-22`; `main` gave that id to another item on 2026-10-09, and ids are never reused.*
 
 ## Why
 
@@ -35,10 +36,11 @@ None. Found by reading the code while planning `DATA-14`.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A user without `governance:write` sees no Add button and is refused by the API with a fixed message
-- [ ] A user with `governance:write` adds a quality rule and a classification as before
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-23-AC1` A user without `governance:write` sees no Add or Classify button for quality and classification rules
+- `SEC-23-AC2` That user is refused by `POST /api/governance/{kind}` with 403 and nothing is stored, for quality, classification and residency
+- `SEC-23-AC3` That user asking the assistant to add a rule is refused, and no rule appears
+- `SEC-23-AC4` A user with `governance:write` adds a quality rule and a classification as before
+- `SEC-23-AC5` Without a login the route answers 401
 
 ## Not included
 

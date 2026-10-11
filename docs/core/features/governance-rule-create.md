@@ -2,11 +2,18 @@
 
 | | |
 | --- | --- |
-| Module | Security (Governance) |
-| Backlog | `SEC-22` |
-| Spec | `docs/core/specs/sec-22.md` (no *(proposed)* numbers) |
-| Status | Decisions signed 2026-10-09. In build |
-| Plan | `docs/superpowers/plans/2026-10-09-sec-22-governance-rule-create.md` |
+| Module | Administration & Security |
+| Backlog | `SEC-23` |
+| Spec | `docs/core/specs/sec-23.md` (no *(proposed)* numbers) |
+| Kind | Task (it has an acceptance checklist because it changes what a user sees) |
+| Status | In Progress (the pull request is open; `BACKLOG.md` holds the status) |
+| Priority | P1 |
+| Owner | The module's owner, in the base. Not named here (the repo is public). |
+| Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
+| Started | 2026-10-09; also in `BACKLOG.md` Dates |
+| Shipped | Not yet |
+| Evidence | PR #97 |
+| Plan | `docs/superpowers/plans/2026-10-09-sec-23-governance-rule-create.md` |
 
 ## Problem
 
@@ -54,21 +61,23 @@ Signed by the product owner on 2026-10-09 ("run as proposed").
 
 Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 
-| # | Do this | Expect | Result |
+| ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | As a user with `governance:write`, add a quality rule on an asset's Quality tab and on the Data Quality page | Saved | |
-| 2 | As the same user, classify a column on an asset's Access tab and add a rule on the Classification page | Saved | |
-| 3 | As a user without `governance:write`, open the same four places | The rules are listed; there is no Add or Classify button | |
-| 4 | (operator) As that user, `POST /api/governance/quality` with a valid body | 403 with a fixed message; no rule appears | |
-| 5 | As that user, ask the assistant to add a quality rule | It says the user may not add rules; no rule appears | |
-| 6 | (operator) Without a login, `POST /api/governance/quality` | 401 | |
+| `SEC-23-AC1` | As a user with `governance:write`, add a quality rule on an asset's Quality tab and on the Data Quality page | Saved | Not run |
+| `SEC-23-AC2` | As the same user, classify a column on an asset's Access tab and add a rule on the Classification page | Saved | Not run |
+| `SEC-23-AC3` | As a user without `governance:write`, open the same four places | The rules are listed; there is no Add or Classify button | Not run |
+| `SEC-23-AC4` | (operator) As that user, `POST /api/governance/quality` with a valid body | 403 with a fixed message; no rule appears | Not run |
+| `SEC-23-AC5` | As that user, ask the assistant to add a quality rule | It says the user may not add rules; no rule appears | Not run |
+| `SEC-23-AC6` | (operator) Without a login, `POST /api/governance/quality` | 401 | Not run |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

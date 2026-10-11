@@ -3,11 +3,11 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-11` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec corrected against the code 2026-10-09. Feature page [`catalog-search.md`](../features/catalog-search.md) drafted, decisions signed 2026-10-09. Built, not merged |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Spec checked | Against the code on 2026-10-09 |
+| Feature page | [`catalog-search.md`](../features/catalog-search.md) (decisions signed 2026-10-09) |
 
 ## Why
 
@@ -38,11 +38,10 @@ Databricks search: names, comments, column names and comments, tag keys; filters
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Searching a column name finds its table
-- [ ] Searching 'revnue' finds 'revenue'
-- [ ] A user without access to a table does not see it in results
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-11-AC1` Searching a column name finds its table
+- `DATA-11-AC2` Searching 'revnue' finds 'revenue'
+- `DATA-11-AC3` A user without access to a table does not see it in results
+- `DATA-11-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

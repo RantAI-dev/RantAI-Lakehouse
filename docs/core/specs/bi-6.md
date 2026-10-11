@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `BI-6` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
-| When | Next |
+| Module | Dashboards |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -38,10 +36,9 @@ Metabase notebook editor: filters, summaries, multiple groupings, joins, custom 
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Visitors by province and month, filtered to domestic, top 10 provinces, is built without SQL
-- [ ] A second step filters the summarised result to totals over 1,000
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-6-AC1` Visitors by province and month, filtered to domestic, top 10 provinces, is built without SQL
+- `BI-6-AC2` A second step filters the summarised result to totals over 1,000
+- `BI-6-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

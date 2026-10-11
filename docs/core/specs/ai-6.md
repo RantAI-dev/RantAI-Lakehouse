@@ -3,12 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `AI-6` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
-| When | Next, with each BI phase-2 item |
+| Module | AI Copilot |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-6`](bi-6.md) (BI phase 2), [`BI-7`](bi-7.md) (BI phase 2), [`BI-10`](bi-10.md) (BI phase 2), [`BI-11`](bi-11.md) (BI phase 2), [`BI-13`](bi-13.md) (BI phase 2) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -44,8 +42,7 @@ BI-6, BI-7, BI-10, BI-11, BI-13.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request produces the described chart in one go
+- `AI-6-AC1` The quoted request produces the described chart in one go
 
 ## Not included
 

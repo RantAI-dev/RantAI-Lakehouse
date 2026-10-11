@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-17` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Upload) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -38,12 +36,11 @@ Databricks upload UI: CSV, TSV, JSON, Avro, Parquet, text; up to 10 files, under
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] 10 Parquet files totalling 1.9 GB upload in parallel and load
-- [ ] An .xlsx with three sheets asks which sheet
-- [ ] Killing the network mid-upload and reconnecting resumes
-- [ ] A 2.1 GB upload is refused with a clear message
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-17-AC1` 10 Parquet files totalling 1.9 GB upload in parallel and load
+- `DATA-17-AC2` An .xlsx with three sheets asks which sheet
+- `DATA-17-AC3` Killing the network mid-upload and reconnecting resumes
+- `DATA-17-AC4` A 2.1 GB upload is refused with a clear message
+- `DATA-17-AC5` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

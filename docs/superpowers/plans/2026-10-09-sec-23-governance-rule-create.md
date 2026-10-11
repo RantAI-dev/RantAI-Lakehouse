@@ -1,4 +1,4 @@
-# `SEC-22` Adding a governance rule needs `governance:write` — Implementation Plan
+# `SEC-23` Adding a governance rule needs `governance:write` — Implementation Plan
 
 **Status:** ready to build. Decision 1 on the feature page was signed by the
 product owner on 2026-10-09; decisions 2 and 3 are the planner's and are
@@ -6,7 +6,7 @@ flagged to the owner.
 Written 2026-10-09 by the planner (Claude Opus) for a developer agent, under
 the role split in `AGENTS.md`.
 
-**Spec:** `docs/core/specs/sec-22.md`. Backlog `SEC-22`.
+**Spec:** `docs/core/specs/sec-23.md`. Backlog `SEC-23`.
 **Feature page:** `docs/core/features/governance-rule-create.md`.
 
 **Why.** Adding a governance rule asks only for a login, while changing or
@@ -53,7 +53,7 @@ Anchors verified at `origin/main` `c338862`. `A` is
 
 ## 4. Tasks
 
-One task per commit. Cite `SEC-22` and the finding at each fix site and in
+One task per commit. Cite `SEC-23` and the finding at each fix site and in
 the commit body (rule 13).
 
 **T1. Route policy (F1, F2).** `A/policy.rs`. *Check:* the unit tests in
