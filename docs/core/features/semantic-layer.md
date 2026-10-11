@@ -16,13 +16,16 @@ A `serving` or `silver` table built by a pipeline, or from any source that gives
 1. Ask the copilot a question about a table using a column's synonym and get an answer.
 2. Wait for a drafting pass and see a `silver` or `serving` table's automatic descriptions within that pass.
 3. See the table's automatic descriptions through `GET /api/semantic/{table}`.
-4. Write a description of a table or column and confirm it through `PUT /api/semantic/{asset}`, replacing any draft.
-5. The chat uses a confirmed text or a draft when it writes SQL; a person's text wins over a draft, and a draft never overwrites a person's text.
+4. Read a table's meaning and every column's meaning, names, role and status in Data Explorer, a table's Schema tab, view Meaning.
+5. With `catalog:write`, change a role in its row, edit a meaning and its names in a dialog, and confirm a draft with one press, or do the same through `PUT /api/semantic/{asset}`, replacing any draft.
+6. The chat uses a confirmed text or a draft when it writes SQL; a person's text wins over a draft, and a draft never overwrites a person's text.
 
 ## Not included
 
 - Tables in the `raw` layer, such as an uploaded file, are not described because the chat does not read them.
-- A Catalog page to manage descriptions.
+- A control that confirms every draft of a table at once.
+- One list of the drafts of every table.
+- Turning a confirmed entry back into a draft.
 - Choosing which tables get drafts; a table is drafted once and left alone after.
 - A draft for a column added to a table after the table's first draft.
 - A request to re-draft a table.
@@ -42,6 +45,7 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 | 3 | A person's text always wins | none | Owner, 2026-10-07 |
 | 4 | The draft's language is the deployment's `AI_DEFAULT_REPLY_LANGUAGE` | English | Owner, 2026-10-07 |
 | 5 | The switch is `AI_SEMANTIC_LAYER` | on | Owner, 2026-10-07 |
+| 6 | The page is the Schema tab of a table in Data Explorer: a Meaning card for the table and a Meaning view of the Columns card. No "confirm all" | none | Owner, 2026-10-09 |
 
 ## Limits to tell a customer
 
@@ -54,10 +58,12 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 - A `flag` column holds 0/1 or yes/no values, and a `non_additive` column holds a number that must not be added up across rows, such as a distinct count, an average, a rate, a percentage or a price. In the chat's data map, a `flag` column is marked `[0/1 flag]` and a `non_additive` column `[never SUM across rows]`, and the table's summary of measures leaves out any column with a `flag`, `non_additive`, `key`, `dimension` or `time` role. A `flag` or `non_additive` column that would otherwise be a measure (a number whose name does not look like a key, such as a year, a month or an id) is also not part of the row's grain. Any other `flag` or `non_additive` column, such as a text or boolean one, still is. When the table has a `non_additive` column, the summary says which columns are not additive, so the chat does not total them.
 - When the switch is on, which is the default, the chat's system prompt also says that a count in a table grouped by several columns can overlap between rows, so the copilot counts distinct things in a detail table or gives a figure per row, and does not add the count up.
 - When the switch is off, the chat reads neither the semantic entries nor the table descriptions saved in the Catalog, and the drafting pass does nothing. The three `/api/semantic` routes still answer.
+- Saving a meaning, a name or a role through the page marks the entry as confirmed by a person.
+- The page shows meanings only for `serving` and `silver` tables.
 
 ## Acceptance checklist
 
-Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass. In rows 1 to 14, `<asset>` is a qualified table name, such as `silver.orders` or `serving.dashboard_users`, picked in row 1.
+Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass. In rows 1 to 20, `<asset>` is a qualified table name, such as `silver.orders` or `serving.dashboard_users`, picked in row 1.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -75,6 +81,12 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 | 12 | Call `PUT /api/semantic/<asset>` with body `{"column": "unknown", "description": "text"}`. | Response is 400 naming the unknown column. | |
 | 13 | Call `PUT /api/semantic/<asset>` with body `{"column": "<a real column>", "description": "x", "synonyms": ["a", "b", "c", "d", "e", "f", "g"]}` (seven synonyms) or `{"column": "<a real column>", "description": "x", "role": "bogus"}` (unknown role). | Response is 400 naming `synonyms` or `role`. | |
 | 14 | A user with `catalog:read` only calls `PUT /api/semantic/<asset>`. | Response is 403. | |
+| 15 | Open a `serving` or `silver` table in Data Explorer, tab Schema. | A card "Meaning" shows the table's meaning, marked `AI draft` for a draft, and the Columns card offers `Statistics` and `Meaning`. | |
+| 16 | Press `N drafts to review`. | The Meaning view lists every column with its role, meaning, names and status. | |
+| 17 | With `catalog:write`, choose another role in a draft's row. | The row turns to `confirmed`, and `GET /api/semantic/<asset>` shows that role with the description and synonyms unchanged. | |
+| 18 | Press a meaning, change the text, save. | The new text shows and the row is `confirmed`. | |
+| 19 | Tick `Drafts only` on a table with more columns than the page size, and confirm every draft listed. | Every draft of the table was listed, not only those on the first page; at the end the view says `No draft left to review.` and unticking the box lists every column. | |
+| 20 | Sign in with `catalog:read` only and open the same tab. | The meanings show; there is no role choice, no edit and no confirm control. | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
