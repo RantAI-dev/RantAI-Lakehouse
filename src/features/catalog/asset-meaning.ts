@@ -97,7 +97,7 @@ export type MeaningState =
       reload: () => void
     }
 
-export type RoleOption = { value: SemanticRole; label: string; help: string }
+export type RoleOption = { value: SemanticRole; label: string; help: string; short?: string }
 
 export const ROLE_OPTIONS: readonly RoleOption[] = [
   { value: "measure", label: "Measure", help: "A number that can be added up across rows." },
@@ -105,6 +105,8 @@ export const ROLE_OPTIONS: readonly RoleOption[] = [
     value: "non_additive",
     label: "Number, not to be added up",
     help: "A count of distinct things, a rate, a share, an average or a balance.",
+    // staging run 2026-10-11, item 1: the row is too narrow for the full label.
+    short: "Not additive",
   },
   { value: "dimension", label: "Dimension", help: "A value to group or filter by." },
   { value: "time", label: "Time", help: "A date or a period." },
@@ -116,7 +118,9 @@ export const ROLE_OPTIONS: readonly RoleOption[] = [
  * A role the options do not list is shown as its own text, so a role written
  * by a later version of the drafting pass is still readable.
  */
-export function roleLabel(role: SemanticRole | null): string {
+export function roleLabel(role: SemanticRole | null, form: "full" | "short" = "full"): string {
   if (role === null) return "Not set"
-  return ROLE_OPTIONS.find((o) => o.value === role)?.label ?? role
+  const option = ROLE_OPTIONS.find((o) => o.value === role)
+  if (form === "short" && option?.short) return option.short
+  return option?.label ?? role
 }

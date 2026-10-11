@@ -163,7 +163,8 @@ describe("the meaning view", () => {
 
     const table = meaningTable()
     expect(within(table).getByText("Number of distinct customers")).toBeTruthy()
-    expect(within(table).getByText("Number, not to be added up")).toBeTruthy()
+    expect(within(table).getByText("Not additive")).toBeTruthy()
+    expect(within(table).getByTitle("Number, not to be added up")).toBeTruthy()
     expect(within(table).getByText("confirmed")).toBeTruthy()
   })
 
@@ -307,6 +308,48 @@ describe("Drafts only", () => {
     fireEvent.click(box)
     expect(screen.getByText("Showing the first 25 of 30 columns, in table order.")).toBeTruthy()
     expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
+  })
+})
+
+describe("the role in the row", () => {
+  it("shows the short label of a non-additive role in its trigger, with the full label as title", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const trigger = roleSelect("customer_count")
+    expect(trigger.textContent).toContain("Not additive")
+    expect(trigger.textContent).not.toContain("Number,")
+    expect(trigger.getAttribute("title")).toBe("Number, not to be added up")
+  })
+
+  it("lists the full label of a non-additive role when the row's select is opened", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(roleSelect("customer_count"))
+    expect(screen.getByRole("option", { name: "Number, not to be added up" })).toBeTruthy()
+  })
+
+  it("shows the full label of a non-additive role in the edit dialog", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of customer_count" }))
+
+    expect(within(dialog()).getByRole("combobox", { name: "Role" }).textContent).toContain(
+      "Number, not to be added up",
+    )
+  })
+
+  it("gives the Meaning view's header a 7.5rem role track below @lg", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const header = within(meaningTable()).getAllByRole("row")[0]
+    expect(header.className).toContain("grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]")
   })
 })
 

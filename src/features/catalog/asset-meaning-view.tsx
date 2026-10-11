@@ -176,12 +176,14 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // an entry is a draft. The column name, the role, the meaning and the confirm
 // control never shed. Every breakpoint lists the cells that are shown, in
 // order, so the header and the rows agree. Below `@lg` the four shown cells
-// take one track each, so a row is one line (plan 10 review 2): the meaning
-// gets the widest track (2fr) of the three text cells, since it is what the
-// row is for, and the confirm control keeps its fixed 1.75rem.
+// take one track each: the role gets a fixed 7.5rem, wide enough for its short
+// label, so it is read whole (staging run 2026-10-11, item 1), and the meaning
+// gets `minmax(0, 1.6fr)`, the widest of the flexible tracks, since it is what
+// the row is for. The confirm control keeps its fixed 1.75rem. The row shows
+// the role's short label with the full one as its title.
 const MEANING_ROW = "grid items-center gap-x-3 px-3"
 const MEANING_TRACKS = [
-  "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,2fr)_1.75rem]",
+  "grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]",
   "@lg:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_1.75rem]",
   "@2xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_5rem_1.75rem]",
   "@3xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_5rem_1.75rem]",
@@ -203,6 +205,7 @@ function RoleSelect({
   label,
   disabled,
   size = "sm",
+  form = "full",
 }: {
   /** The stored role, or `null` for "Not set". */
   value: string | null
@@ -210,6 +213,7 @@ function RoleSelect({
   label: string
   disabled?: boolean
   size?: "sm" | "default"
+  form?: "full" | "short"
 }) {
   return (
     <Select
@@ -217,8 +221,13 @@ function RoleSelect({
       onValueChange={(v) => onChange(v === NOT_SET || v === null ? null : v)}
       disabled={disabled}
     >
-      <SelectTrigger size={size} aria-label={label} className="w-full">
-        <SelectValue>{roleLabel(value)}</SelectValue>
+      <SelectTrigger
+        size={size}
+        aria-label={label}
+        title={roleLabel(value)}
+        className={cn("w-full", form === "short" && "text-xs")}
+      >
+        <SelectValue>{roleLabel(value, form)}</SelectValue>
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={NOT_SET}>Not set</SelectItem>
@@ -268,9 +277,12 @@ function MeaningRow({
             onChange={onRole}
             label={`Role of ${name}`}
             disabled={!entry || busy}
+            form="short"
           />
         ) : (
-          <span className="block truncate text-xs">{roleLabel(role)}</span>
+          <span className="block truncate text-xs" title={roleLabel(role)}>
+            {roleLabel(role, "short")}
+          </span>
         )}
       </div>
       <div role="cell" className="min-w-0">
