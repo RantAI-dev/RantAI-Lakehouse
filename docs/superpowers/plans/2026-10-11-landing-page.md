@@ -348,3 +348,70 @@ All in the foreground from `/home/user/RantAI-Lakehouse`.
 - `package-lock.json` exists beside `bun.lock` and was not regenerated; only `bun.lock` and `package.json` carry `three` and `@types/three`.
 
 ## 9. Review (planner)
+
+### Round 1 (reviewed at `96e3c93`)
+
+**Re-run by the reviewer, foreground:** `bun run typecheck` exit 0;
+`bun run lint` 0 errors, 6 warnings (all in files this work did not touch);
+`bun run test` 954 pass, 1 skip, 0 fail (955 tests, 105 files); `bun run
+build` exit 0 with `/landing` static. Production server (`bun run start`):
+24 screenshots at 1440×900 and 390×844, no page errors, horizontal overflow
+0 at both widths. Fallback screenshots (no WebGL, reduced motion) checked.
+
+**Checked and correct:** `/landing` is public with no console chrome
+(`PUBLIC_PREFIXES` plus three tests, including the lookalike `/landingpage`);
+no API calls, no `@/services` import, no `dangerouslySetInnerHTML`, only the
+outside links plan §2.7 allows; `three` is the only new runtime dependency;
+CI and the Dockerfile install from `bun.lock`; illustrations are labelled.
+The hero, the dive, the three slabs, the chat, the rail, the masking table
+and the fallbacks match the plan and look the part.
+
+A note on screenshots: frames taken with `window.scrollTo` far jumps can come
+out black, because the page sets `scroll-behavior: smooth` and the capture
+lands mid-glide. Wheel scrolling renders every frame. Not a bug.
+
+**BLOCKER 1 — the copy claims more than the product does (principle 2).**
+Four of these lines come from the plan itself; the plan was wrong and is
+corrected below. Change `src/features/landing/landing-copy.ts`:
+1. Sources list: remove **"SFTP"** (the adapter exists but is *Not verified*
+   end to end, `PRODUCT.md` §2, `VER-1`) and **"S3-compatible storage"**
+   (connectors made in the wizard cannot be tested or have their keys
+   changed, `SRC-6`). Nine pills remain.
+2. Governance sub: replace "…and the lineage shows where every number came
+   from." with "…and lineage shows which tables each table is built from."
+   (lineage is Partial and not linked from dashboards, `BI-14`).
+3. Governance fact "Lineage from raw table to dashboard" → "Lineage from raw
+   table to curated table".
+4. Governance fact "Every assistant action logged and approvable" →
+   "Assistant actions logged; risky ones wait for approval" (only deletions
+   and pauses need approval today, `DEC-8`).
+5. Update any screen-reader caption that repeats these lines.
+
+**SHOULD-FIX**
+1. **Sources caption overlap.** The falling pills settle on top of "Live
+   change capture…" (desktop and phone). Reserve the grid's settled height so
+   the caption sits below it at every scroll position.
+2. **Hard edge under the Gold slab.** Where S3 ends, the fixed canvas is cut
+   by a hard horizontal line across the Gold slab. Fade the canvas out over
+   the last part of S3 instead of clipping it.
+3. **Stray rim arc on the SVG mascot.** `mascot-svg.tsx` draws a light-blue
+   rim stroke that is offset from the dome's edge on the right (visible in
+   the no-WebGL hero, the final section and on phones). Align it with the
+   dome path or drop it.
+4. **Phone hero eyebrow is illegible.** "RANTAI LAKEHOUSE" sits on the bright
+   moon reflection at 390 px. Move it above the reflection or give it a
+   readable backing (text shadow or a darker scrim under the copy).
+5. **Phone sources heading over the glow.** At 390 px the sources headline
+   and sub sit on the bright glow of the mascot's eye seen from below; lower
+   the glow or add a scrim so body text stays at 4.5:1.
+6. **Stale `package-lock.json`.** It does not list `three` or `@types/three`.
+   Regenerate it so both lockfiles agree (CI and Docker use `bun.lock`, so
+   this is consistency, not a build break).
+
+**Accepted deviations:** the longer section heights, the own scroll-progress
+hook, the extra illustration copy (all labelled), the lake-blue approval
+card, the phone top bar showing only the wordmark and the button, the
+surface hop and no front fill light. The duplicate `theme-color` meta is
+harmless; leave the root layout alone.
+
+**Plan corrected** in §4 S2 and S6 to match BLOCKER 1.
