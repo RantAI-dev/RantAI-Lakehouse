@@ -169,6 +169,8 @@ fn unprocessable(problem: &metrics::MetricProblem) -> ApiError {
 /// What a metric's name is used by, as sentences a refusal carries, and as
 /// structured lists for the usage route.
 struct Usage {
+    /// BI-2: alert rules that watch the metric, as `(id, name)`.
+    alerts: Vec<(String, String)>,
     charts: Vec<String>,
     chart_rows: Vec<Value>,
     metrics: Vec<String>,
@@ -177,12 +179,17 @@ struct Usage {
 
 impl Usage {
     fn is_empty(&self) -> bool {
-        self.charts.is_empty() && self.metrics.is_empty()
+        self.charts.is_empty() && self.metrics.is_empty() && self.alerts.is_empty()
     }
 
     fn sentence(&self) -> String {
         let mut all = self.charts.clone();
         all.extend(self.metrics.iter().map(|m| format!("the metric {m}")));
+        all.extend(
+            self.alerts
+                .iter()
+                .map(|(_, n)| format!("the alert rule \"{n}\"")),
+        );
         all.join(", ")
     }
 }
@@ -227,6 +234,7 @@ async fn usage_of(
     }
     dashboards.sort();
     Ok(Usage {
+        alerts: Vec::new(),
         charts: fields::name_charts(&charts, &boards, &id_refs),
         chart_rows,
         metrics: metrics_naming,
@@ -236,7 +244,16 @@ async fn usage_of(
 
 async fn metric_usage(ch: &ChClient, m: &MetricDef) -> Result<Usage, ApiError> {
     let (kind, source, name) = (m.source_kind, m.source_id.clone(), m.name.clone());
-    usage_of(
+    // BI-2: a rule that watches the metric uses it too. A rule list that cannot
+    // be read refuses the delete (nothing can be shown to be unused).
+    let alerts: Vec<(String, String)> = lakehouse_alerts::list_rules(ch)
+        .await
+        .map_err(|failure| classify_ch(&failure))?
+        .into_iter()
+        .filter(|r| r.metric.as_deref() == Some(m.name.as_str()))
+        .map(|r| (r.id, r.name))
+        .collect();
+    let mut used = usage_of(
         ch,
         move |charts| {
             metrics::charts_using_metric(charts, kind, &source, &name)
@@ -246,7 +263,9 @@ async fn metric_usage(ch: &ChClient, m: &MetricDef) -> Result<Usage, ApiError> {
         },
         Vec::new(),
     )
-    .await
+    .await?;
+    used.alerts = alerts;
+    Ok(used)
 }
 
 async fn segment_usage(ch: &ChClient, s: &SegmentDef) -> Result<Usage, ApiError> {
@@ -490,11 +509,10 @@ pub async fn usage(
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound("metric not found.".to_owned()))?;
     let used = metric_usage(ch, &current).await?;
-    // Alerts that watch a metric are listed once a rule can name one.
     Ok(ApiJson(json!({
         "metric": current.name,
         "charts": used.chart_rows,
-        "alerts": Vec::<Value>::new(),
+        "alerts": used.alerts.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
         "dashboards": used.dashboards,
     })))
 }
@@ -785,4 +803,32 @@ pub async fn delete_segment(
         .await
         .map_err(|failure| classify_ch(&failure))?;
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Usage;
+
+    /// BI-2 (T3): a metric watched by an alert rule cannot be deleted, and the
+    /// refusal names the rule.
+    #[test]
+    fn a_metric_watched_by_a_rule_is_in_use_and_the_refusal_names_the_rule() {
+        let used = Usage {
+            alerts: vec![("al_1".to_owned(), "Visitors too low".to_owned())],
+            charts: Vec::new(),
+            chart_rows: Vec::new(),
+            metrics: Vec::new(),
+            dashboards: Vec::new(),
+        };
+        assert!(!used.is_empty());
+        assert_eq!(used.sentence(), "the alert rule \"Visitors too low\"");
+        let none = Usage {
+            alerts: Vec::new(),
+            charts: Vec::new(),
+            chart_rows: Vec::new(),
+            metrics: Vec::new(),
+            dashboards: Vec::new(),
+        };
+        assert!(none.is_empty());
+    }
 }

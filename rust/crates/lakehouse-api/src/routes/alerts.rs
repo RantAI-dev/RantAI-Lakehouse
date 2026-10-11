@@ -387,6 +387,13 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
             "{} is stale: observed age {value} min",
             rule.mart.as_deref().unwrap_or("")
         ),
+        // BI-2: a rule that watches a metric says so, not a column.
+        AlertKind::Alert if rule.metric.is_some() => format!(
+            "metric {} {} {} — observed {value}",
+            rule.metric.as_deref().unwrap_or(""),
+            rule.op.as_str(),
+            rule.threshold
+        ),
         AlertKind::Alert | AlertKind::Digest => format!(
             "{}({}) on {} {} {} — observed {value}",
             rule.agg,
@@ -459,7 +466,11 @@ async fn persist_fired_results(
             title: &rule.name,
             severity: rule.severity.as_deref(),
             source: fired_source(rule.kind),
-            affected: rule.mart.as_deref().unwrap_or(""),
+            affected: rule
+                .mart
+                .as_deref()
+                .or(rule.metric.as_deref())
+                .unwrap_or(""),
             detail: &detail,
         };
         if let Err(err) = overview::insert_from_fired_rule(pg, &fired, now).await {

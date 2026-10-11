@@ -704,7 +704,22 @@ fn named_metrics<'a>(
     raw: &RelationColumns,
 ) -> Result<BTreeSet<&'a str>, String> {
     let mut metrics: BTreeSet<&str> = BTreeSet::new();
-    for (name, _) in refs.iter().filter(|(_, s)| *s == Slot::Metric) {
+    // BI-2 review fix (BLOCKER) R1: a chart saved before the stored definition
+    // kept its metric marker has the metric's name as a plain measure. A name
+    // that is no column and no calculated field, and is a metric of this
+    // source, is that metric, so such a chart heals on its next read.
+    let healed = |name: &str, slot: Slot| {
+        slot == Slot::Measure
+            && !raw.contains_key(name)
+            && !fields
+                .iter()
+                .any(|f| f.is_formula_field() && f.name == name)
+            && fields.iter().any(|f| f.is_metric() && f.name == name)
+    };
+    for (name, _) in refs
+        .iter()
+        .filter(|(n, s)| *s == Slot::Metric || healed(n, *s))
+    {
         if raw.contains_key(*name) {
             return Err(format!(
                 "the metric '{name}' has the name of a column of this source and cannot be read."

@@ -1880,6 +1880,13 @@ fn kpi_sql(
     }
 }
 
+/// The one measure of a KPI. BI-2 review fix (BLOCKER) R1: a KPI on a metric
+/// stays a metric in its stored definition.
+fn kpi_measure(input: &ChartInput, column: &str) -> MeasureList {
+    MeasureList::from_pairs(vec![(column.to_owned(), None)])
+        .keeping_metrics_of(&input.measures, None)
+}
+
 /// Assemble the `kpi`/`gauge` branch of `specFromInput` (single number, no
 /// dimension).
 fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChartSpec, BiError> {
@@ -1922,7 +1929,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
-        measures: vec![m.clone()].into(),
+        measures: kpi_measure(input, &m),
         breakdown: None,
         map: None,
         lat: None,
@@ -3113,7 +3120,8 @@ fn spec_from_param_chart(
                                 )
                             })
                             .collect(),
-                    );
+                    )
+                    .keeping_metrics_of(&effective.measures, Some(i));
                 }
             }
             spec_from_resolved(
@@ -3582,6 +3590,9 @@ fn stored_measures(measures: &MeasureList) -> MeasureList {
             .map(|(c, a)| (c.to_owned(), a.map(str::to_lowercase)))
             .collect(),
     )
+    // BI-2 review fix (BLOCKER) R1: the stored definition keeps which
+    // measures are metrics.
+    .keeping_metrics_of(measures, None)
 }
 
 /// `BI-6`: a chart that uses the chart builder's fields is saved with the
@@ -5649,6 +5660,60 @@ mod tests {
             geo_fields(input.kind, input).unwrap(),
             joined_resolved(input, fields),
         )
+    }
+
+    /// BI-2 review fix (BLOCKER) R1: a chart saved with metrics as measures
+    /// keeps them as metrics in its stored definition, so the dashboard read
+    /// (which rebuilds from the definition) builds the metric's formula and
+    /// not a `sum(<metric name>)` over a column that does not exist.
+    #[test]
+    fn a_saved_chart_keeps_its_metric_measures_and_the_read_builds_the_formula() {
+        use crate::builder::{ReadContext, sql_with_filters_report};
+        let metric = crate::metrics::MetricDef {
+            id: "m_total".to_owned(),
+            name: "total".to_owned(),
+            label: "Total".to_owned(),
+            description: String::new(),
+            source_kind: SourceKind::Mart,
+            source_id: "visits".to_owned(),
+            formula: "Sum([visitors])".to_owned(),
+            filters: Vec::new(),
+            time_column: None,
+            grain: None,
+            format: None,
+            created_by: "u".to_owned(),
+            updated_at: None,
+        };
+        let entries = crate::metrics::catalog_entries(&[metric], &[]);
+        let input = join_input(&serde_json::json!({
+            "limit": 10,
+            "measures": [{ "metric": "total" }, "visitors"],
+        }));
+        let spec = save_joined(&input, entries.clone()).unwrap();
+        assert!(spec.def.measures.is_metric(0) && !spec.def.measures.is_metric(1));
+        assert_eq!(
+            serde_json::to_value(&spec.def.measures).unwrap(),
+            serde_json::json!([{ "metric": "total" }, "visitors"])
+        );
+        // The dashboard's read: a stored chart, a catalog, the mart's columns.
+        let catalog = fields::FieldCatalog::from_fields(entries);
+        let time = TimeContext::default();
+        let read = ReadContext {
+            time: &time,
+            grain: None,
+            fields: &catalog,
+        };
+        let marts = HashMap::from([("visits".to_owned(), join_tables()["visits"].clone())]);
+        let sql = sql_with_filters_report(&spec, &[], &[], &marts, &read).sql;
+        assert!(sql.contains("sum(visitors) AS total"), "{sql}");
+        assert!(!sql.contains("sum(total)"), "{sql}");
+        // A chart saved before the fix holds the name as a plain measure; it
+        // heals on its next read.
+        let mut legacy = spec;
+        legacy.def.measures = vec!["total".to_owned(), "visitors".to_owned()].into();
+        let healed = sql_with_filters_report(&legacy, &[], &[], &marts, &read).sql;
+        assert!(healed.contains("sum(visitors) AS total"), "{healed}");
+        assert!(!healed.contains("sum(total)"), "{healed}");
     }
 
     #[test]

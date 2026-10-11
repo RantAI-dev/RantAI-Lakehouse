@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { alertRuleFormFields } from "./alerts-page"
+import { alertRuleFormFields, isMetricRule } from "./alerts-page"
 
 // Pure logic, no DOM (matching src/lib/*.test.ts's convention): which form
 // fields the rule editor shows for each `AlertRule.type`. `freshness`
@@ -29,5 +29,18 @@ describe("alertRuleFormFields", () => {
       board: true,
       freshnessTarget: false,
     })
+  })
+})
+
+describe("a rule that watches a metric (BI-2)", () => {
+  it("is a metric rule as soon as it has a metric field, even before one is picked, and not otherwise", () => {
+    expect(isMetricRule({ metric: "" })).toBe(true)
+    expect(isMetricRule({ metric: "total_visitors" })).toBe(true)
+    expect(isMetricRule({})).toBe(false)
+    expect(isMetricRule({ metric: undefined })).toBe(false)
+  })
+
+  it("still shows the condition fields of an alert rule, which hold the metric choice", () => {
+    expect(alertRuleFormFields("alert").martMeasure).toBe(true)
   })
 })

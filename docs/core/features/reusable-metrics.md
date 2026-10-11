@@ -46,6 +46,7 @@ definition for.
 - A metric belongs to one table; a chart on another table cannot pick it.
 - Comparisons need the metric's date column.
 - Certification is not available until `DATA-12`.
+- An alert rule on a metric is evaluated with the fixed viewer role that every alert rule runs with, not with the access of whoever wrote the rule (a rule has no owner); a metric that role cannot read makes the rule fail with a stated reason instead of firing.
 
 ## Acceptance checklist
 
@@ -54,4 +55,5 @@ definition for.
 - `BI-2-AC3` A KPI on a metric shows previous period and same period last year.
 - `BI-2-AC4` Changing the metric's formula lists the charts that use it and then changes all of them; deleting it while used is refused.
 - `BI-2-AC5` A user without `metric:write` cannot define a metric; a failure shows a plain message.
+- `BI-2-AC6` An alert rule "total visitors greater than 100,000" on the metric fires when the metric is above it and not when it is below; if the metric is deleted or cannot be read the rule is reported as failed with a reason, and a metric a rule watches cannot be deleted.
 - `AI-7-AC1` Asked for a number a metric defines, the assistant uses the metric and says which.

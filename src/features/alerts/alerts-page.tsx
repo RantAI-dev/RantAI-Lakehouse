@@ -38,7 +38,8 @@ import { apiFetch } from "@/services/http"
 import { getRuleColumns, type Rule } from "@/features/alerts/rules-columns"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { alertRuleService } from "@/services"
+import { alertRuleService, metricService } from "@/services"
+import type { Metric } from "@/services/contracts/metrics"
 import type { AlertRule, SaveAlertRuleInput, AlertRunResult } from "@/services/contracts/alerts"
 
 const OPS = [">", ">=", "<", "<=", "=="]
@@ -98,6 +99,11 @@ const EMPTY_FORM: AlertRule = {
  * for that kind (`lakehouse-alerts::normalize_input`). Kept pure and
  * DOM-free so it is unit-testable (WS5 item E3).
  */
+/** BI-2: a threshold rule that watches a metric (an empty name is a metric rule not yet filled in). */
+export function isMetricRule(rule: { metric?: string }): boolean {
+  return rule.metric !== undefined
+}
+
 export function alertRuleFormFields(type: string): {
   martMeasure: boolean;
   board: boolean;
@@ -116,7 +122,11 @@ type AlertConditionProps = {
   readonly fields: string[]
   readonly fieldsError: string | null
   readonly loadFields: (mart: string) => Promise<void>
+  /** BI-2: the saved metrics a rule can watch. */
+  readonly metrics: Metric[]
 }
+
+const WATCH_ITEMS = { column: "A column of a table", metric: "A metric" }
 
 function AlertConditionFields({
   f,
@@ -126,11 +136,54 @@ function AlertConditionFields({
   fields,
   fieldsError,
   loadFields,
+  metrics,
 }: AlertConditionProps) {
   const measurePlaceholder = fields.length > 0 ? "pick" : "pick mart first"
+  const watching = isMetricRule(f) ? "metric" : "column"
 
   return (
     <>
+      <div className="grid gap-1.5">
+        <Label>Watch</Label>
+        <Select
+          value={watching}
+          items={WATCH_ITEMS}
+          onValueChange={(v) =>
+            setF((prev) =>
+              v === "metric" ? { ...prev, metric: prev.metric ?? "", mart: undefined, measure: undefined } : { ...prev, metric: undefined },
+            )
+          }
+        >
+          <SelectTrigger className="w-full" aria-label="Watch">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="column">{WATCH_ITEMS.column}</SelectItem>
+            <SelectItem value="metric">{WATCH_ITEMS.metric}</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {watching === "metric" ? (
+        <div className="grid gap-1.5">
+          <Label>Metric</Label>
+          <Select
+            value={f.metric ?? ""}
+            onValueChange={(v) => setF((prev) => ({ ...prev, metric: v ?? "" }))}
+          >
+            <SelectTrigger className="w-full" aria-label="Metric">
+              <SelectValue placeholder={metrics.length ? "pick a metric" : "no metrics yet"} />
+            </SelectTrigger>
+            <SelectContent>
+              {metrics.map((m) => (
+                <SelectItem key={m.id} value={m.name}>
+                  {m.label || m.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
+      {watching === "metric" ? null : (
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="grid gap-1.5">
           <Label>Mart (Gold)</Label>
@@ -176,7 +229,9 @@ function AlertConditionFields({
           {fieldsError ? <p className="mt-1 text-xs text-destructive">{fieldsError}</p> : null}
         </div>
       </div>
+      )}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {watching === "metric" ? null : (
         <div className="grid gap-1.5">
           <Label>Aggregate</Label>
           <Select
@@ -195,6 +250,7 @@ function AlertConditionFields({
             </SelectContent>
           </Select>
         </div>
+        )}
         <div className="grid gap-1.5">
           <Label>Operator</Label>
           <Select
@@ -272,6 +328,7 @@ type RuleDialogProps = {
   readonly boards: { id: string; name: string }[]
   readonly boardsError: string | null
   readonly loadFields: (mart: string) => Promise<void>
+  readonly metrics: Metric[]
   readonly onSave: () => Promise<void>
   readonly busy: boolean
   readonly err: string | null
@@ -290,6 +347,7 @@ function RuleEditDialog({
   boards,
   boardsError,
   loadFields,
+  metrics,
   onSave,
   busy,
   err,
@@ -408,6 +466,7 @@ function RuleEditDialog({
               fields={fields}
               fieldsError={fieldsError}
               loadFields={loadFields}
+              metrics={metrics}
             />
           ) : (
             <DigestConditionFields f={f} setF={setF} boards={boards} boardsError={boardsError} />
@@ -453,6 +512,7 @@ export function AlertsPage() {
   const [formErr, setFormErr] = React.useState<string | null>(null);
   const [edit, setEdit] = React.useState<AlertRule | null>(null);
   const [f, setF] = React.useState<AlertRule>(EMPTY_FORM);
+  const [metrics, setMetrics] = React.useState<Metric[]>([]);
 
   const saveAction = useServiceAction(
     (signal, input: SaveAlertRuleInput, id: string | null) =>
@@ -485,6 +545,8 @@ export function AlertsPage() {
         setMarts((json.marts ?? []).map((m: { name: string }) => m.name));
       })
       .catch((e) => { if (active) setMartsError(e instanceof Error ? e.message : "Marts could not be loaded"); });
+    // BI-2: the metrics a rule can watch; a list that cannot be read is empty.
+    metricService.list().then((found) => { if (active) setMetrics(found); }).catch(() => { if (active) setMetrics([]); });
     return () => { active = false; };
   }, []);
 
@@ -516,6 +578,7 @@ export function AlertsPage() {
     setFormErr(null);
     if (!f.name.trim()) { setFormErr("Name required."); return; }
     if (!f.target.trim()) { setFormErr("Webhook URL / email required."); return; }
+    if (f.type === "alert" && isMetricRule(f) && !f.metric) { setFormErr("Pick a metric."); return; }
     const saved = await saveAction.run(f, edit ? edit.id : null);
     if (saved) { setOpen(false); state.reload(); }
   }
@@ -667,6 +730,7 @@ export function AlertsPage() {
         boards={boards}
         boardsError={boardsError}
         loadFields={loadFields}
+        metrics={metrics}
         onSave={save}
         busy={busy}
         err={formErr ?? saveAction.error?.message ?? null}

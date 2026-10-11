@@ -148,7 +148,8 @@ impl LayerDef {
                     .entries()
                     .map(|(c, a)| (c.to_owned(), a.map(str::to_lowercase)))
                     .collect(),
-            ),
+            )
+            .keeping_metrics_of(&self.measures, None),
             aggregate: self.aggregate.clone(),
             label: self
                 .label

@@ -149,6 +149,19 @@ impl MeasureList {
         self
     }
 
+    /// The same list marking as metrics the entries `from` marks (entry `i` of
+    /// both is the same measure), except `replaced`, an entry whose column was
+    /// swapped for another. BI-2 review fix (BLOCKER) R1: a list rebuilt from
+    /// `(column, aggregate)` pairs forgets which entries are metrics, and a
+    /// saved chart then reads its metric's name as a column.
+    #[must_use]
+    pub fn keeping_metrics_of(self, from: &Self, replaced: Option<usize>) -> Self {
+        let flags = (0..self.columns.len())
+            .map(|i| Some(i) != replaced && from.is_metric(i))
+            .collect();
+        self.with_metrics(flags)
+    }
+
     /// Whether entry `index` is a saved metric, by name.
     #[must_use]
     pub fn is_metric(&self, index: usize) -> bool {

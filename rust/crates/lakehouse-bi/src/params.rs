@@ -1153,7 +1153,8 @@ pub fn substitute(
                             )
                         })
                         .collect(),
-                );
+                )
+                .keeping_metrics_of(&def.measures, Some(i));
             }
         }
     }

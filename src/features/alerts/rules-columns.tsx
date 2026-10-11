@@ -99,6 +99,13 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        if (r.type === "alert" && r.metric) {
+          return (
+            <span className="font-mono text-xs text-muted-foreground">
+              metric {r.metric} {r.op} {r.threshold}
+            </span>
+          )
+        }
         if (r.type === "alert") {
           return (
             <span className="font-mono text-xs text-muted-foreground">

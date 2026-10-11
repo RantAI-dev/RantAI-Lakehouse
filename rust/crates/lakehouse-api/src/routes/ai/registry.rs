@@ -715,12 +715,13 @@ fn list_alert_rules_schema() -> Value {
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read with the fixed viewer role every alert uses, not with the user's access). Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
             "mart": { "type": "string", "description": "Gold mart name, for type=alert" },
             "measure": { "type": "string", "description": "measure column to watch, for type=alert" },
+            "metric": { "type": "string", "description": "the name of a metric to watch, for type=alert, instead of mart/measure/agg" },
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
@@ -740,6 +741,7 @@ fn update_alert_rule_schema() -> Value {
             "type": { "type": "string", "enum": ["alert", "digest"] },
             "mart": { "type": "string" },
             "measure": { "type": "string" },
+            "metric": { "type": "string", "description": "the name of a metric to watch instead of mart/measure/agg" },
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
