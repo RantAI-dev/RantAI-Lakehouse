@@ -376,6 +376,7 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
         latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
             .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
         table: None,
+        bins: Vec::new(),
     };
     annotate_grain(tile, &filtered, chart);
 }
@@ -425,6 +426,98 @@ pub(crate) fn annotate_grain(
     }
 }
 
+/// `BI-10`: what the tile of a binned chart carries so the console can label
+/// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
+/// statements the builder made over the same filtered relation as the bins,
+/// through the same role rewrite as the tile (the width of a viewer whose role
+/// filters rows comes from the rows that role may see). A read that fails or is
+/// refused leaves its column out: the tile then shows the bin's lower edges
+/// as plain numbers, and the failure is only logged under a reference id.
+pub(crate) async fn annotate_bins(
+    ch: &ChClient,
+    tile: &mut Value,
+    reads: &[lakehouse_bi::builder::BinRead],
+    context: (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    if let Value::Object(tile) = tile {
+        add_bins(ch, tile, reads, context).await;
+    }
+}
+
+async fn add_bins(
+    ch: &ChClient,
+    tile: &mut Map<String, Value>,
+    reads: &[lakehouse_bi::builder::BinRead],
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    if reads.is_empty() || !tile.contains_key("rows") {
+        return;
+    }
+    let mut out = Map::new();
+    for read in reads {
+        match try_run_spec_sql(ch, &read.sql, roles, placeholders, obligations).await {
+            Ok(result) => {
+                let row = &result["rows"][0];
+                out.insert(
+                    read.column.clone(),
+                    json!({
+                        "mode": read.mode,
+                        "width": row["width"],
+                        "min": row["min"],
+                        "max": row["max"],
+                    }),
+                );
+            }
+            Err(SpecRunFailure::Clickhouse(err)) => {
+                let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+            }
+            Err(SpecRunFailure::Refused(_)) => {}
+        }
+    }
+    if !out.is_empty() {
+        tile.insert("bins".to_owned(), Value::Object(out));
+    }
+}
+
+/// The bin reads of a chart that is not on a dashboard (the builder's
+/// preview): the statements its no-filter dashboard build would make. Empty
+/// for a chart without bins, and when the build cannot be made.
+pub(crate) async fn preview_bin_reads(
+    ch: &ChClient,
+    chart: &store::StoredChartSpec,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Vec<lakehouse_bi::builder::BinRead> {
+    if !chart.def.shape.has_bins() {
+        return Vec::new();
+    }
+    let Ok(cols) = mart_columns(ch).await else {
+        return Vec::new();
+    };
+    let Ok(sources) = sources_for(ch, [chart]).await else {
+        return Vec::new();
+    };
+    let catalog = match lakehouse_bi::fields::list_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(_) => return Vec::new(),
+    };
+    let read = lakehouse_bi::builder::ReadContext {
+        time,
+        grain: None,
+        fields: &catalog,
+    };
+    stored_chart_sql(chart, &[], &[], &cols, &sources, &read)
+        .map(|f| f.bins)
+        .unwrap_or_default()
+}
+
 /// What the tile of a raw table or a pivot carries beyond its rows
 /// (`BI-16` part A).
 ///
@@ -454,6 +547,7 @@ pub(crate) async fn annotate_table(
     if !tile.contains_key("rows") {
         return;
     }
+    add_bins(ch, tile, &filtered.bins, (roles, placeholders, obligations)).await;
     match &filtered.table {
         Some(TableRead::Rows { count_sql }) => {
             match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {

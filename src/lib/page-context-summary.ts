@@ -11,6 +11,7 @@
  */
 
 import type { FilterDef } from "@/services/clients/bi-store"
+import { type BinDef, type BinMeta, binLabel, binsOfTile } from "./chart-bins"
 import { filterLabel, isActiveFilter } from "./dashboard-filter-state"
 
 export type TileLike = {
@@ -20,12 +21,12 @@ export type TileLike = {
   source?: string
   mart?: string
   sqlSource?: string
-  /** BI-6: the chart's own filters, which the numbers on the tile already carry. */
-  def?: { filters?: FilterDef[] }
+  /** BI-6: the chart's own filters, which the numbers on the tile already carry. BI-10: its bins. */
+  def?: { filters?: FilterDef[]; dimension?: string; bin?: BinDef; breakdown?: string; breakdownBin?: BinDef; groupings?: { column: string; bin?: BinDef }[] }
 }
 
 export type CellLike =
-  | { columns: string[]; rows: Record<string, unknown>[] }
+  | { columns: string[]; rows: Record<string, unknown>[]; bins?: Record<string, BinMeta> }
   | { error: string }
   | undefined
   | null
@@ -84,7 +85,10 @@ export function summarizeTiles(
     // The numbers carry the chart's own filters; the assistant must know they do.
     const own = (t.def?.filters ?? []).filter(isActiveFilter).map((f) => filterLabel(f))
     const filtered = own.length ? `; filtered: ${own.join(", ")}` : ""
-    return `- "${t.title}" (${t.kind}${id}; ${from}${filtered}): ${data}`
+    // BI-10: a binned column holds each bin's lower edge; say what the numbers stand for.
+    const bins = cell && "rows" in cell ? Object.entries(binsOfTile(cell.bins, t.def)).map(([column, b]) => `${column} in bins of ${binLabel(0, b.width).split(" – ")[1]} (a value is the bin's lower edge)`) : []
+    const binned = bins.length ? `; binned: ${bins.join(", ")}` : ""
+    return `- "${t.title}" (${t.kind}${id}; ${from}${filtered}${binned}): ${data}`
   })
   return clip(lines.join("\n"), opts.maxChars ?? DEFAULT_CHARS)
 }

@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use lakehouse_core::ident::Ident;
 use serde::{Deserialize, Serialize};
 
+use crate::bin::BinMode;
 use crate::builder::{Relation, RelationColumns};
 use crate::filters::ColumnKind;
 use crate::grain::{Grain, TimeContext};
@@ -476,6 +477,27 @@ pub fn pivot_grain_field<H: std::hash::BuildHasher>(
     first_date_field(names.map(String::as_str), cols)
 }
 
+/// The first row or column field of a pivot that is a number column, the one a
+/// `BI-10` bin applies to (a pivot carries one bin, as it carries one grain).
+#[must_use]
+pub fn pivot_bin_field<H: std::hash::BuildHasher>(
+    fields: &TableFields,
+    cols: &RelationColumns<H>,
+) -> Option<(Ident, ColumnKind)> {
+    fields
+        .rows
+        .iter()
+        .flatten()
+        .chain(fields.columns.iter().flatten())
+        .find_map(|name| {
+            let kind = cols
+                .get(name.as_str())
+                .copied()
+                .filter(|k| *k == ColumnKind::Number)?;
+            Some((Ident::new(name.as_str()).ok()?, kind))
+        })
+}
+
 /// Check a pivot's definition against the relation.
 ///
 /// # Errors
@@ -557,6 +579,7 @@ pub fn pivot_row_cap(from: &Relation, values: usize) -> u32 {
             Relation::Mart(_) | Relation::Joined { .. } => false,
             Relation::Sql(_) => true,
             Relation::Filtered { base, .. }
+            | Relation::Ranged { base, .. }
             | Relation::Bucketed { base, .. }
             | Relation::Calculated { base, .. }
             | Relation::Fixed { base, .. } => is_sql(base),
@@ -605,6 +628,13 @@ fn grouping_sets(plan: &PivotPlan) -> Vec<Vec<String>> {
     sets
 }
 
+/// What a pivot's rows are cut by before they are grouped: the field a `BI-9`
+/// grain applies to, and the one a `BI-10` bin applies to.
+pub type PivotInner<'a> = (
+    Option<(Grain, &'a Ident, ColumnKind)>,
+    Option<(&'a Ident, BinMode)>,
+);
+
 /// Pivot SQL over `from`: the key fields, one `__v<i>` per value, and one
 /// `__g<j>` flag per key field that is `1` when that field is rolled up in
 /// the row (a total), `0` when the row is a group of it.
@@ -620,48 +650,60 @@ pub fn pivot_sql(
     from: &Relation,
     plan: &PivotPlan,
     predicates: Vec<String>,
-    grain: Option<(Grain, &Ident, ColumnKind)>,
+    inner: PivotInner<'_>,
     time: &TimeContext,
 ) -> Option<String> {
-    let (relation, where_sql) = match grain {
-        Some((g, field, kind)) => {
-            let expr = g.bucket_expr(field, kind, time)?;
-            let base = if predicates.is_empty() {
-                from.clone()
-            } else {
-                Relation::Filtered {
-                    base: Box::new(from.clone()),
-                    predicates,
-                }
-            };
-            let mut carried: Vec<String> = Vec::new();
-            for name in plan
-                .fields()
-                .chain(plan.values.iter().map(|(c, _)| c))
-                .map(ToString::to_string)
-            {
-                if name != field.as_str() && !carried.contains(&name) {
-                    carried.push(name);
-                }
-            }
-            (
-                Relation::Bucketed {
-                    base: Box::new(base),
-                    dimension: field.to_string(),
-                    expr,
-                    carried,
-                },
-                String::new(),
-            )
-        }
-        None => (
+    let (grain, bin) = inner;
+    let (relation, where_sql) = if grain.is_none() && bin.is_none() {
+        (
             from.clone(),
             if predicates.is_empty() {
                 String::new()
             } else {
                 format!(" WHERE {}", predicates.join(" AND "))
             },
-        ),
+        )
+    } else {
+        let mut relation = if predicates.is_empty() {
+            from.clone()
+        } else {
+            Relation::Filtered {
+                base: Box::new(from.clone()),
+                predicates,
+            }
+        };
+        let needed: Vec<String> = {
+            let mut names: Vec<String> = Vec::new();
+            for name in plan
+                .fields()
+                .chain(plan.values.iter().map(|(c, _)| c))
+                .map(ToString::to_string)
+            {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            names
+        };
+        if let Some((g, field, kind)) = grain {
+            let expr = g.bucket_expr(field, kind, time)?;
+            relation = Relation::Bucketed {
+                base: Box::new(relation),
+                dimension: field.to_string(),
+                expr,
+                carried: needed
+                    .iter()
+                    .filter(|n| n.as_str() != field.as_str())
+                    .cloned()
+                    .collect(),
+            };
+        }
+        // BI-10: the pivot's number field replaced by its bin, over the same
+        // filtered rows (the range is read under the pivot's predicates).
+        if let Some((field, mode)) = bin {
+            relation = crate::builder::binned_layer(relation, field, mode, &needed);
+        }
+        (relation, String::new())
     };
     let keys: Vec<String> = plan.fields().map(ToString::to_string).collect();
     let values = plan
@@ -1039,7 +1081,7 @@ mod tests {
             &mart(),
             &plan,
             vec!["v > 0".to_owned()],
-            None,
+            (None, None),
             &TimeContext::default(),
         )
         .unwrap();
@@ -1075,7 +1117,7 @@ mod tests {
             &mart(),
             &plan,
             vec!["p = 'a'".to_owned()],
-            Some((Grain::Month, &m, ColumnKind::Date)),
+            (Some((Grain::Month, &m, ColumnKind::Date)), None),
             &TimeContext::default(),
         )
         .unwrap();
@@ -1092,7 +1134,7 @@ mod tests {
                 &mart(),
                 &plan,
                 Vec::new(),
-                Some((Grain::Hour, &m, ColumnKind::Date)),
+                (Some((Grain::Hour, &m, ColumnKind::Date)), None),
                 &TimeContext::default()
             )
             .is_none()

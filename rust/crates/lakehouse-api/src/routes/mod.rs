@@ -21,9 +21,11 @@ mod connectors;
 mod dashboard;
 mod dashboard_folders;
 mod dashboard_sources;
+pub(crate) mod drill;
 mod embed;
 mod gold;
 mod governance;
+mod hierarchies;
 mod home;
 mod identity;
 mod knowledge;
@@ -819,6 +821,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dashboard/calc-fields/functions",
             get(calc_fields::functions),
+        )
+        .route(
+            "/api/dashboard/hierarchies",
+            get(hierarchies::list)
+                .post(hierarchies::create)
+                .put(hierarchies::update)
+                .delete(hierarchies::delete),
         )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route(

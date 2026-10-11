@@ -10,6 +10,7 @@ import type { FilterSkip } from "@/services/clients/bi-store";
 import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
+import type { BinMeta } from "@/lib/chart-bins";
 
 export type Rows = {
   columns: string[];
@@ -20,6 +21,8 @@ export type Rows = {
   grain?: string;
   /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */
   grainColumn?: string;
+  /** The bins of a binned chart, by column: the width and the data's range, read over the same rows as the bins (BI-10). */
+  bins?: Record<string, BinMeta>;
   /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
   grainSkipped?: string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */

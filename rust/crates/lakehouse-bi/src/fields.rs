@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::builder::{AggregateField, Relation, RelationColumns, TableCalc};
+use crate::filters::ColumnKind;
 use crate::formula::compile::{ChartCtx, FType, FixedJoin, Level, Scope, compile};
 use crate::grain::TimeContext;
 use crate::specs::ChartKind;
@@ -121,6 +122,13 @@ pub struct FieldDef {
 }
 
 impl FieldDef {
+    /// Whether this is a value group (`BI-10`), whose `formula` is the JSON of
+    /// a [`crate::groups::GroupDef`] and not formula text.
+    #[must_use]
+    pub fn is_group(&self) -> bool {
+        self.level == crate::groups::LEVEL
+    }
+
     /// Whether the stored level is aggregate.
     #[must_use]
     pub fn is_aggregate(&self) -> bool {
@@ -568,7 +576,9 @@ fn prepare_refs<H: std::hash::BuildHasher>(
     if let Some(chart) = &usage.chart {
         scope = scope.with_chart(chart.clone());
     }
-    for f in &live {
+    // BI-10: a value group is compiled on its own below; the formula language
+    // does not know it.
+    for f in live.iter().filter(|f| !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     let mut columns: Vec<(String, String)> = Vec::new();
@@ -580,6 +590,11 @@ fn prepare_refs<H: std::hash::BuildHasher>(
         let Some(field) = live.iter().find(|f| f.name == *name) else {
             continue;
         };
+        if field.is_group() {
+            columns.push((field.name.clone(), group_column(field, refs, &raw)?));
+            aug.insert(field.name.clone(), ColumnKind::Text);
+            continue;
+        }
         let compiled = compile(&field.formula, &scope, Some(&field.name)).map_err(|problem| {
             format!(
                 "the calculated field '{}' does not check out: {problem}",
@@ -650,6 +665,36 @@ fn prepare_refs<H: std::hash::BuildHasher>(
     }))
 }
 
+/// A value group used in a chart: its per-row expression, unless it stands
+/// only as a measure (it is text).
+fn group_column(
+    field: &FieldDef,
+    refs: &[(&str, Slot)],
+    raw: &RelationColumns,
+) -> Result<String, String> {
+    let name = field.name.as_str();
+    let only_measure = refs
+        .iter()
+        .filter(|(n, _)| *n == name)
+        .all(|(_, s)| *s == Slot::Measure);
+    if only_measure {
+        return Err(format!(
+            "'{name}' is a value group (text); it cannot be a value (measure)."
+        ));
+    }
+    group_sql(field, raw)
+}
+
+/// The per-row expression of a value group against the source's current
+/// columns: the column must still exist and still be text.
+fn group_sql(field: &FieldDef, raw: &RelationColumns) -> Result<String, String> {
+    let broken = || format!("the value group '{}' does not check out.", field.name);
+    let def = crate::groups::GroupDef::from_stored(&field.formula).ok_or_else(broken)?;
+    def.validate(raw)
+        .map_err(|why| format!("the value group '{}': {why}", field.name))?;
+    def.sql().ok_or_else(broken)
+}
+
 /// The inferred level and type of a formula over a source, for saving it.
 /// Every field of the source except the one being saved (`own`) is nameable.
 ///
@@ -665,7 +710,7 @@ pub fn check<H: std::hash::BuildHasher>(
 ) -> Result<(Level, FType), crate::formula::FormulaError> {
     let raw: RelationColumns = cols.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut scope = Scope::new(&raw, time);
-    for f in others.iter().filter(|f| f.name != own) {
+    for f in others.iter().filter(|f| f.name != own && !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     // The field being saved is in scope with its NEW formula, so a formula
@@ -755,12 +800,12 @@ pub fn fields_using<'a>(
     name: &str,
 ) -> Vec<&'a str> {
     let mut scope = Scope::new(cols, time);
-    for f in siblings {
+    for f in siblings.iter().filter(|f| !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     siblings
         .iter()
-        .filter(|f| f.name != name)
+        .filter(|f| f.name != name && !f.is_group())
         .filter(|f| {
             compile(&f.formula, &scope, Some(&f.name)).is_ok_and(|c| c.fields.contains(name))
         })
@@ -837,6 +882,51 @@ mod tests {
         };
         let marts = HashMap::from([("mart_x".to_owned(), cols())]);
         sql_with_filters_report(spec, &[], filters, &marts, &read)
+    }
+
+    fn group_field(name: &str, json: &str) -> FieldDef {
+        let mut f = field(name, json, Level::Row);
+        f.level = crate::groups::LEVEL.to_owned();
+        f.ty = "text".to_owned();
+        f
+    }
+
+    #[test]
+    fn a_value_group_is_a_text_column_of_the_relation_and_a_measure_cannot_be_one() {
+        let cat = FieldCatalog::from_fields(vec![group_field(
+            "region",
+            r#"{"column":"g","rest":"other","groups":[{"name":"A","values":["x","it's"]}]}"#,
+        )]);
+        let time = TimeContext::default();
+        let read = ReadContext {
+            time: &time,
+            grain: None,
+            fields: &cat,
+        };
+        let marts = HashMap::from([("mart_x".to_owned(), cols())]);
+        let got = sql_with_filters_report(
+            &spec(ChartKind::Bar, "region", &["v"]),
+            &[],
+            &[],
+            &marts,
+            &read,
+        );
+        assert!(
+            got.sql.contains(
+                "(SELECT *, multiIf(toString(g) IN ('x', 'it''s'), 'A', 'Other') AS region FROM serving.mart_x) AS calc"
+            ),
+            "{}",
+            got.sql
+        );
+        // As a measure it is refused, so the chart keeps its stored statement.
+        let measure = sql_with_filters_report(
+            &spec(ChartKind::Bar, "g", &["region"]),
+            &[],
+            &[],
+            &marts,
+            &read,
+        );
+        assert_eq!(measure.sql, "SELECT 1");
     }
 
     #[test]

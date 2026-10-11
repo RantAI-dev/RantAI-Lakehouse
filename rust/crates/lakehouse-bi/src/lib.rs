@@ -4,6 +4,7 @@
 //! Ports `src/lib/dashboard-specs.ts` and `src/services/clients/bi-store.ts`.
 //! This crate is a library only — no axum routes are wired here.
 
+pub mod bin;
 pub mod builder;
 pub mod click;
 pub mod embed_access;
@@ -12,6 +13,8 @@ pub mod filters;
 pub mod folders;
 pub mod formula;
 pub mod grain;
+pub mod groups;
+pub mod hierarchies;
 pub mod joins;
 pub mod shape;
 pub mod sources;

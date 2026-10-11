@@ -226,3 +226,38 @@ test("a joined column is labelled table.column in a tile's legend, including an 
     { max_capacity__rooms: "max of capacity.rooms" },
   )
 })
+
+test("a bin is sent for the dimension and the breakdown, never with a grain, and a grid only for a point map", () => {
+  const draft = { ...emptyShapeDraft(), bin: { mode: "width" as const, count: "10", width: "500" }, breakdownBin: { mode: "auto" as const, count: "10", width: "" }, grid: "1" }
+  const bar = shapePayload(draft, { kind: "bar", rowsMode: false, grained: false, breakdown: true })
+  assert.deepEqual(bar.bin, { mode: "width", width: 500 })
+  assert.deepEqual(bar.breakdownBin, { mode: "auto" })
+  assert.equal(bar.grid, undefined)
+  // Without a breakdown the breakdown's bin is not sent; with a grain, no bin at all.
+  assert.equal(shapePayload(draft, { kind: "bar", rowsMode: false, grained: false }).breakdownBin, undefined)
+  assert.equal(shapePayload(draft, { kind: "bar", rowsMode: false, grained: true }).bin, undefined)
+  assert.equal(shapePayload(draft, { kind: "kpi", rowsMode: false, grained: false }).bin, undefined)
+  assert.deepEqual(shapePayload(draft, { kind: "pointmap", rowsMode: false, grained: false }).grid, { size: 1 })
+  assert.deepEqual(shapePayload({ ...draft, grid: "auto" }, { kind: "geoheat", rowsMode: false, grained: false }).grid, { size: "auto" })
+})
+
+test("a grouped table sends the bin of a grouping and one grouping with a bin is already `groupings`", () => {
+  const draft = { ...emptyShapeDraft(), groupings: [{ column: "visitors", bin: { mode: "count" as const, count: "50" } }] }
+  const out = shapePayload(draft, { kind: "table", rowsMode: false, grained: false })
+  assert.deepEqual(out.groupings, [{ column: "visitors", bin: { mode: "count", count: 50 } }])
+  assert.equal(usesGroupings(draft.groupings), true)
+})
+
+test("a bin by width without its width is listed as still needed", () => {
+  const draft = { ...emptyShapeDraft(), bin: { mode: "width" as const, count: "10", width: "" } }
+  assert.deepEqual(shapeProblems(draft, { kind: "bar", rowsMode: false }), ["Dimension bin width"])
+  assert.deepEqual(shapeProblems({ ...draft, bin: { ...draft.bin, width: "5" } }, { kind: "bar", rowsMode: false }), [])
+})
+
+test("a saved bin and grid come back as a draft", () => {
+  const draft = shapeDraftFromDef({ bin: { mode: "count", count: 50 }, breakdownBin: { mode: "auto" }, grid: { size: 0.1 } })
+  assert.deepEqual(draft.bin, { mode: "count", count: "50", width: "" })
+  assert.equal(draft.breakdownBin?.mode, "auto")
+  assert.equal(draft.grid, "0.1")
+  assert.equal(shapeDraftFromDef({}).bin, null)
+})

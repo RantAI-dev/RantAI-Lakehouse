@@ -595,6 +595,37 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
     Ok(())
 }
 
+/// The tables behind saved fields and hierarchies (`BI-8`, `BI-10`). Split
+/// out of [`ensure_bi_table_uncached`] to keep it under clippy's line limit.
+async fn ensure_field_tables(ch: &ChClient) -> Result<(), ChError> {
+    // BI-8: calculated fields (`crate::fields`). Same versioned-insert shape
+    // as `bi_source`; `data_type` and `level` are what the server inferred
+    // when the formula was saved. Created here and not by a Postgres
+    // migration because dashboards live in ClickHouse.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_field (\n\
+           id String, source_kind String, source_id String, name String,\n\
+           formula String, level String DEFAULT 'row', data_type String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-10: hierarchies (`crate::hierarchies`), the same versioned-insert
+    // shape; only the ordered column names are kept.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_hierarchy (\n\
+           id String, source_kind String, source_id String, name String,\n\
+           levels_json String DEFAULT '[]', created_by String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 /// The actual DDL bootstrap, run at most once per process by
 /// [`ensure_bi_table`].
 async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
@@ -689,20 +720,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
-    // BI-8: calculated fields (`crate::fields`). Same versioned-insert shape
-    // as `bi_source`; `data_type` and `level` are what the server inferred
-    // when the formula was saved. Created here and not by a Postgres
-    // migration because dashboards live in ClickHouse.
-    ch.exec(
-        "CREATE TABLE IF NOT EXISTS console.bi_field (\n\
-           id String, source_kind String, source_id String, name String,\n\
-           formula String, level String DEFAULT 'row', data_type String DEFAULT '',\n\
-           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
-           is_deleted UInt8 DEFAULT 0\n\
-         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
-        None,
-    )
-    .await?;
+    ensure_field_tables(ch).await?;
     Ok(())
 }
 
@@ -3398,6 +3416,12 @@ fn spec_from_pivot_input(
     ctx: ChartCtx<'_>,
 ) -> Result<StoredChartSpec, BiError> {
     let plan = tables::plan_pivot(&input.tables, &ctx.cols).map_err(BiError::Validation)?;
+    // BI-10: a pivot bins its first number row or column field.
+    if input.shape.bin.is_some() && tables::pivot_bin_field(&input.tables, &ctx.kinds).is_none() {
+        return Err(BiError::Validation(
+            "a bin needs a number row or column field.".to_owned(),
+        ));
+    }
     let date_field = plan.grain_field(&ctx.kinds);
     let grain = match (ctx.grain, &date_field) {
         (None, _) => None,
@@ -3416,7 +3440,9 @@ fn spec_from_pivot_input(
         &ctx.from,
         &plan,
         Vec::new(),
-        grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+        // BI-10: a pivot's bin is applied when the shaped statement is built
+        // (`finish_shaping`), over the same relation.
+        (grain.as_ref().map(|(g, f, k)| (*g, f, *k)), None),
         ctx.time,
     )
     .ok_or_else(|| BiError::Validation("this grain does not fit the field.".to_owned()))?;
@@ -3644,10 +3670,11 @@ mod tests {
         // `embed_revoked_jti_json`, `embed_origins_json`). 17 = those 16 plus
         // the BI-18·B `bi_board.refresh_seconds` column. 18 = those 17 plus
         // the BI-9 `bi_board.grain` column. 19 = those 18 plus the BI-8
-        // `console.bi_field` table.
+        // `console.bi_field` table. 20 = those 19 plus the BI-10
+        // `console.bi_hierarchy` table.
         assert_eq!(
-            first_call_requests, 19,
-            "first call should issue all 19 DDL statements"
+            first_call_requests, 20,
+            "first call should issue all 20 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();

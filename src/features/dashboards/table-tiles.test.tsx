@@ -250,6 +250,23 @@ describe("TileBody", () => {
     expect(screen.getByText(/^Rp/)).toBeTruthy()
   })
 
+  it("labels a binned grouping 500 – 1,000 from the width the tile carries, and from a width the chart fixes when it carries none", () => {
+    const rows = [{ visitors: 0, n: 3 }, { visitors: 500, n: 4 }];
+    const cell: Rows = { columns: ["visitors", "n"], rows, bins: { visitors: { mode: "auto", width: 500, min: 44, max: 970 } } };
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "auto" } }] })} cell={cell} dark={false} loading={false} />);
+    expect(screen.getByText("0 – 500")).toBeTruthy();
+    expect(screen.getByText("500 – 1,000")).toBeTruthy();
+    cleanup();
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "width", width: 250 } }] })} cell={{ columns: ["visitors", "n"], rows }} dark={false} loading={false} />);
+    expect(screen.getByText("0 – 250")).toBeTruthy();
+    expect(screen.getByText("500 – 750")).toBeTruthy();
+    cleanup();
+    // Nothing is guessed: automatic bins without what the server read show the lower edges as numbers.
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "auto" } }] })} cell={{ columns: ["visitors", "n"], rows }} dark={false} loading={false} />);
+    expect(screen.queryByText("0 – 500")).toBeNull();
+    expect(screen.getByText("500")).toBeTruthy();
+  });
+
   it("draws a raw table from a stored definition, and a pivot too", () => {
     render(<TileBody spec={spec("table", SPEC.def)} cell={FIRST_PAGE} dark={false} loading={false} />)
     expect(screen.getByText("Ubud")).toBeTruthy()

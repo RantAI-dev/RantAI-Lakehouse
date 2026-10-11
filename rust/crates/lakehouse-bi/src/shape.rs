@@ -40,6 +40,7 @@ use serde::de::Error as _;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::bin::{BinSpec, GridSpec};
 use crate::builder::{Measure, Relation, filter_predicates};
 use crate::filters::{ColumnKind, FilterDef, MAX_FILTERS, validate_filters};
 use crate::grain::{Grain, TimeContext};
@@ -236,6 +237,9 @@ pub struct Grouping {
     /// A grain name, for a date or timestamp column.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grain: Option<String>,
+    /// How a number column is binned (`BI-10`); never with a grain.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bin: Option<BinSpec>,
 }
 
 /// One condition of a filter step, on a column of the result before it.
@@ -369,6 +373,20 @@ pub struct ShapeFields {
     /// the chart's mart (`BI-7`); the chart reads them as one flat table.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub joins: Option<Vec<JoinSpec>>,
+    /// How the number `dimension` (or a pivot's first number field) is binned
+    /// (`BI-10`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bin: Option<BinSpec>,
+    /// How the number `breakdown` is binned (`BI-10`).
+    #[serde(
+        rename = "breakdownBin",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub breakdown_bin: Option<BinSpec>,
+    /// `pointmap`, `geoheat`: group the points by grid cell (`BI-10`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grid: Option<GridSpec>,
 }
 
 impl ShapeFields {
@@ -376,6 +394,14 @@ impl ShapeFields {
     #[must_use]
     pub fn joins_list(&self) -> &[JoinSpec] {
         self.joins.as_deref().unwrap_or_default()
+    }
+
+    /// Whether any grouping of the chart is binned (`BI-10`).
+    #[must_use]
+    pub fn has_bins(&self) -> bool {
+        self.bin.is_some()
+            || self.breakdown_bin.is_some()
+            || self.groupings.iter().flatten().any(|g| g.bin.is_some())
     }
 
     /// The steps (none when absent).
@@ -406,6 +432,9 @@ impl ShapeFields {
             || self.groupings.is_some()
             || self.steps.is_some()
             || !self.joins_list().is_empty()
+            || self.bin.is_some()
+            || self.breakdown_bin.is_some()
+            || self.grid.is_some()
     }
 }
 
@@ -514,7 +543,74 @@ pub fn check_kind_fields(
         return Err("groupings are only for a grouped table.".to_owned());
     }
     check_joins_kind(shape, kind)?;
+    check_bins_kind(shape, kind, rows_mode)?;
     check_steps_kind(shape, kind, rows_mode)
+}
+
+/// Kinds whose dimension (and breakdown) can be binned: the charts that list
+/// groups along one dimension, a grouped table, and a pivot. A scatter, a
+/// bubble, a map, a heatmap, a calendar and a flow chart read their columns
+/// as coordinates or links, not as groups.
+fn takes_bin(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Bar
+            | ChartKind::Hbar
+            | ChartKind::Line
+            | ChartKind::Area
+            | ChartKind::Stacked
+            | ChartKind::Combo
+            | ChartKind::Pie
+            | ChartKind::Rose
+            | ChartKind::Funnel
+            | ChartKind::Treemap
+            | ChartKind::Radar
+            | ChartKind::Waterfall
+            | ChartKind::Table
+            | ChartKind::Pivot
+    )
+}
+
+/// `BI-10`: which kinds take a bin or a grid, and the combinations that make
+/// no sense. Whether the columns are numbers is checked against the relation
+/// ([`check_bins_against_relation`]).
+fn check_bins_kind(shape: &ShapeFields, kind: ChartKind, rows_mode: bool) -> Result<(), String> {
+    let any_bin = shape.bin.is_some()
+        || shape.breakdown_bin.is_some()
+        || shape.groupings.iter().flatten().any(|g| g.bin.is_some());
+    if any_bin && (rows_mode || !takes_bin(kind)) {
+        return Err(format!(
+            "a {} cannot group a number in bins; bins are for bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table and pivot charts.",
+            kind_word(kind)
+        ));
+    }
+    for spec in [&shape.bin, &shape.breakdown_bin].into_iter().flatten() {
+        spec.mode()?;
+    }
+    for g in shape.groupings.iter().flatten() {
+        if let Some(spec) = &g.bin {
+            spec.mode()?;
+            if g.grain.is_some() {
+                return Err(format!(
+                    "'{}' is grouped by a grain or by bins, not both.",
+                    g.column
+                ));
+            }
+        }
+    }
+    if shape.groupings.is_some() && (shape.bin.is_some() || shape.breakdown_bin.is_some()) {
+        return Err("a table grouped by several columns bins each grouping on its own.".to_owned());
+    }
+    if kind == ChartKind::Pivot && shape.breakdown_bin.is_some() {
+        return Err("a pivot bins one of its row or column fields.".to_owned());
+    }
+    if let Some(grid) = &shape.grid {
+        if !matches!(kind, ChartKind::Pointmap | ChartKind::Geoheat) {
+            return Err("a grid is for point maps and heat maps.".to_owned());
+        }
+        grid.checked()?;
+    }
+    Ok(())
 }
 
 /// `BI-7`: a text tile has no data to join, and the count of joins is bounded
@@ -623,6 +719,7 @@ pub fn check_against_relation(
         check_sort(shape, &resolved, check)?;
     }
     check_groupings(shape, cols, kinds)?;
+    check_bins_against_relation(shape, check)?;
     let has_table_calc = resolved
         .iter()
         .any(|m| from.table_calc(m.column.as_str()).is_some());
@@ -645,6 +742,58 @@ pub fn check_against_relation(
             "steps are not offered with a time grain or a breakdown; use a table grouped by several columns (a date can be cut by a grain there)."
                 .to_owned(),
         );
+    }
+    Ok(())
+}
+
+/// `BI-10`: a binned dimension, breakdown or grouping is a number column; a
+/// chart with a time grain on the same column cannot also be binned; and
+/// automatic or counted bins need a table, because a SQL source's rows are cut
+/// at a fixed cap and the range would be read from the cut result.
+fn check_bins_against_relation(
+    shape: &ShapeFields,
+    check: &RelationCheck<'_>,
+) -> Result<(), String> {
+    let number = |column: &str| check.kinds.get(column) == Some(&ColumnKind::Number);
+    let mut binned: Vec<(&str, &BinSpec)> = Vec::new();
+    if let Some(spec) = &shape.bin
+        && check.kind != ChartKind::Pivot
+    {
+        binned.push((check.dimension, spec));
+    }
+    if let Some(spec) = &shape.breakdown_bin {
+        binned.push((check.breakdown, spec));
+    }
+    for g in shape.groupings.iter().flatten() {
+        if let Some(spec) = &g.bin {
+            binned.push((g.column.as_str(), spec));
+        }
+    }
+    let specs = binned
+        .iter()
+        .map(|(_, s)| *s)
+        .chain(shape.bin.iter().filter(|_| check.kind == ChartKind::Pivot));
+    for spec in specs {
+        let auto = !matches!(spec.mode(), Ok(crate::bin::BinMode::Width(_)));
+        if auto && check.from.is_sql_source() {
+            return Err(
+                "automatic and counted bins need a table; for a SQL source choose a width."
+                    .to_owned(),
+            );
+        }
+    }
+    for (column, _) in binned {
+        if column.is_empty() {
+            return Err("a bin needs the column it groups; choose it first.".to_owned());
+        }
+        if !number(column) {
+            return Err(format!(
+                "'{column}' is not a number column; bins are for numbers (a date has a grain)."
+            ));
+        }
+    }
+    if check.grained && (shape.bin.is_some() || shape.breakdown_bin.is_some()) {
+        return Err("a chart groups by a grain or by bins, not both.".to_owned());
     }
     Ok(())
 }
@@ -913,6 +1062,7 @@ mod tests {
             groupings: Some(vec![Grouping {
                 column: "a".to_owned(),
                 grain: None,
+                bin: None,
             }]),
             ..ShapeFields::default()
         };
@@ -926,6 +1076,7 @@ mod tests {
             groupings: Some(vec![Grouping {
                 column: "a".to_owned(),
                 grain: None,
+                bin: None,
             }]),
             ..ShapeFields::default()
         };
@@ -1070,6 +1221,7 @@ mod tests {
                     .map(|(c, grain)| Grouping {
                         column: (*c).to_owned(),
                         grain: grain.map(str::to_owned),
+                        bin: None,
                     })
                     .collect(),
             ),
@@ -1113,5 +1265,81 @@ mod tests {
         };
         let err = check_against_relation(&measures(r#"["x"]"#), &shape, &check).unwrap_err();
         assert!(err.contains("time grain"), "{err}");
+    }
+
+    // ── BI-10 ───────────────────────────────────────────────────────────
+
+    fn shape_of(json: &str) -> ShapeFields {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn bins_and_grids_are_for_the_kinds_that_group_or_map() {
+        let bin = shape_of(r#"{"bin":{"mode":"auto"}}"#);
+        let none = MeasureList::default();
+        assert!(kind_check(&none, &bin, ChartKind::Bar).is_ok());
+        assert!(kind_check(&none, &bin, ChartKind::Pivot).is_ok());
+        for kind in [
+            ChartKind::Kpi,
+            ChartKind::Pointmap,
+            ChartKind::Scatter,
+            ChartKind::Text,
+        ] {
+            assert!(kind_check(&none, &bin, kind).is_err(), "{kind:?}");
+        }
+        assert!(check_kind_fields(&none, &bin, ChartKind::Table, true).is_err());
+        let grid = shape_of(r#"{"grid":{"size":0.1}}"#);
+        assert!(kind_check(&none, &grid, ChartKind::Pointmap).is_ok());
+        assert!(kind_check(&none, &grid, ChartKind::Geoheat).is_ok());
+        assert!(kind_check(&none, &grid, ChartKind::Bar).is_err());
+        let off_list = shape_of(r#"{"grid":{"size":0.3}}"#);
+        assert!(kind_check(&none, &off_list, ChartKind::Pointmap).is_err());
+    }
+
+    #[test]
+    fn a_bad_bin_or_a_bin_with_a_grain_is_refused_with_a_sentence() {
+        let none = MeasureList::default();
+        let bad = shape_of(r#"{"bin":{"mode":"count","count":7}}"#);
+        assert!(
+            kind_check(&none, &bad, ChartKind::Bar)
+                .unwrap_err()
+                .contains("count")
+        );
+        let both =
+            shape_of(r#"{"groupings":[{"column":"a","grain":"month","bin":{"mode":"auto"}}]}"#);
+        assert!(
+            kind_check(&none, &both, ChartKind::Table)
+                .unwrap_err()
+                .contains("not both")
+        );
+        let mixed = shape_of(r#"{"bin":{"mode":"auto"},"groupings":[{"column":"a"}]}"#);
+        assert!(kind_check(&none, &mixed, ChartKind::Table).is_err());
+    }
+
+    #[test]
+    fn a_bin_needs_a_number_column_and_a_table_for_automatic_edges() {
+        let c = cols(&[
+            ("p", ColumnKind::Text),
+            ("stay", ColumnKind::Number),
+            ("w", ColumnKind::Number),
+        ]);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["w"]"#);
+        let auto = shape_of(r#"{"bin":{"mode":"auto"}}"#);
+        assert!(
+            check_against_relation(&list, &auto, &relation_check(&c, &mart, &t, "stay")).is_ok()
+        );
+        let err =
+            check_against_relation(&list, &auto, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(err.contains("not a number"), "{err}");
+        let sql = Relation::Sql("SELECT 1".to_owned());
+        let err = check_against_relation(&list, &auto, &relation_check(&c, &sql, &t, "stay"))
+            .unwrap_err();
+        assert!(err.contains("SQL source"), "{err}");
+        let width = shape_of(r#"{"bin":{"mode":"width","width":5}}"#);
+        assert!(
+            check_against_relation(&list, &width, &relation_check(&c, &sql, &t, "stay")).is_ok()
+        );
     }
 }

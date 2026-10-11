@@ -12,9 +12,11 @@ import {
   MEASURE_AGGREGATES, MAX_GROUPINGS, MAX_STEPS, columnsAfterSteps, visibleColumns,
   type Grouping, type MeasureRow, type ResultColumns, type StepCondition, type StepDef,
 } from "@/lib/chart-shape";
+import { binDraftFromDef, binPayload, type BinDef } from "@/lib/chart-bins";
 import { moveItem } from "@/lib/table-draft";
 import { GRAIN_LABELS, grainChoices, type ColumnKind } from "@/lib/time-grain";
 import type { FilterDef } from "@/services/clients/bi-store";
+import { BinPicker } from "./bin-picker";
 import { ColumnList } from "./table-settings";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filters/filter-editors";
 
@@ -172,9 +174,16 @@ export function ChartFilters({
 
 const NO_GRAIN = "__no_grain__";
 
+/** A bin as the grouping keeps it while it is edited: a width still being typed stays as typed. */
+function asBinDef(draft: { mode: "auto" | "count" | "width"; count: string; width: string }): BinDef {
+  if (draft.mode === "auto") return { mode: "auto" };
+  if (draft.mode === "count") return { mode: "count", count: draft.count };
+  return binPayload(draft) ?? { mode: "width", width: draft.width };
+}
+
 /** A table's groupings: 1 to five columns, in order, a date column optionally cut by a grain. */
 export function GroupingsEditor({
-  value, onChange, columns, disabled, placeholder, fieldLabel,
+  value, onChange, columns, disabled, placeholder, fieldLabel, sqlSource = false,
 }: {
   readonly value: readonly Grouping[];
   readonly onChange: (next: Grouping[]) => void;
@@ -182,6 +191,8 @@ export function GroupingsEditor({
   readonly disabled: boolean;
   readonly placeholder: string;
   readonly fieldLabel: (name: string) => React.ReactNode;
+  /** A SQL source takes a bin width only (BI-10). */
+  readonly sqlSource?: boolean;
 }) {
   const free = columns.filter((c) => !value.some((g) => g.column === c.name));
   return (
@@ -192,8 +203,16 @@ export function GroupingsEditor({
           const kind = columns.find((c) => c.name === g.column)?.kind;
           const grains = grainChoices("bar", kind);
           return (
-            <li key={g.column} className="flex items-center gap-1 rounded-md border border-border px-2 py-1">
+            <li key={g.column} className="flex flex-wrap items-center gap-1 rounded-md border border-border px-2 py-1">
               <span className="min-w-0 flex-1 truncate text-sm">{fieldLabel(g.column)}</span>
+              {kind === "number" ? (
+                <div className="w-56 shrink-0">
+                  <BinPicker
+                    value={binDraftFromDef(g.bin)} sqlSource={sqlSource} aria={`Bins of ${g.column}`}
+                    onChange={(draft) => onChange(value.map((x, j) => (j === i ? { column: x.column, ...(draft ? { bin: asBinDef(draft) } : {}) } : x)))}
+                  />
+                </div>
+              ) : null}
               {grains.length ? (
                 <Select
                   value={g.grain || NO_GRAIN}
@@ -215,7 +234,10 @@ export function GroupingsEditor({
         })}
       </ul>
       {value.length < MAX_GROUPINGS && free.length ? (
-        <Select value="" onValueChange={(v) => { if (v) onChange([...value, { column: v }]); }} disabled={disabled}>
+        <Select value="" onValueChange={(v) => {
+          // A number column is grouped in bins, as a distinct value per number would be unreadable (BI-10).
+          if (v) onChange([...value, free.find((c) => c.name === v)?.kind === "number" ? { column: v, bin: { mode: "auto" } } : { column: v }]);
+        }} disabled={disabled}>
           <SelectTrigger className="w-full" aria-label="Group by"><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={value.length ? "Add another column" : placeholder} /></SelectTrigger>
           <SelectContent>{free.map((c) => <SelectItem key={c.name} value={c.name}>{fieldLabel(c.name)}</SelectItem>)}</SelectContent>
         </Select>

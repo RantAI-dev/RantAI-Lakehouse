@@ -29,9 +29,31 @@ use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
 use crate::tables;
 
+mod binned;
 mod ranked;
 mod staged;
 pub mod steps;
+
+pub use binned::BinRead;
+
+/// One more bin over a relation whose rows are already filtered
+/// ([`binned::add_layer`] for a caller outside this module).
+#[must_use]
+pub fn binned_layer(
+    relation: Relation,
+    column: &Ident,
+    mode: crate::bin::BinMode,
+    needed: &[String],
+) -> Relation {
+    binned::add_layer(
+        relation,
+        &binned::Layer {
+            column: column.clone(),
+            mode,
+        },
+        needed,
+    )
+}
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -89,6 +111,20 @@ pub enum Relation {
         base: Box<Relation>,
         /// Complete SQL fragments, joined with `AND`.
         predicates: Vec<String>,
+    },
+    /// `base` joined to the one-row range of a number column (`BI-10`): the
+    /// column's minimum, maximum and bin width over `base` itself, as
+    /// `__bmn_<c>`, `__bmx_<c>` and `__bw_<c>` beside every column of `base`.
+    /// A [`Relation::Bucketed`] over it turns the column into its bin. The
+    /// subquery reads the same `base` text as the outer query, so the edges
+    /// come from the rows the bins hold, and the role rewrite substitutes the
+    /// governed projection at both reads. Only [`crate::bin::layers`] creates
+    /// it.
+    Ranged {
+        /// What is binned (already filtered when predicates apply).
+        base: Box<Relation>,
+        /// The column and the rule for its width.
+        range: crate::bin::Range,
     },
     /// `base` with the grained dimension replaced by its bucket
     /// (`BI-9`): `SELECT <bucket> AS <dimension>, <carried columns> FROM
@@ -185,6 +221,13 @@ impl Relation {
                 joins,
             } => Self::render_joined(base, base_columns, joins),
             Self::Sql(sql) => format!("(\n{}\n) AS src", sql.trim()),
+            Self::Ranged { base, range } => {
+                let inner = base.render();
+                format!(
+                    "(SELECT * FROM {inner} CROSS JOIN ({}) AS rng) AS ranged",
+                    range.scalars_sql(&inner)
+                )
+            }
             Self::Filtered { base, predicates } => format!(
                 "(SELECT * FROM {} WHERE {}) AS flt",
                 base.render(),
@@ -241,6 +284,21 @@ impl Relation {
         }
     }
 
+    /// Whether the rows come from a dashboard SQL source, looking through the
+    /// wrappers a builder puts around it.
+    #[must_use]
+    pub fn is_sql_source(&self) -> bool {
+        match self {
+            Self::Mart(_) | Self::Joined { .. } => false,
+            Self::Sql(_) => true,
+            Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
+            | Self::Bucketed { base, .. }
+            | Self::Calculated { base, .. }
+            | Self::Fixed { base, .. } => base.is_sql_source(),
+        }
+    }
+
     /// The aggregate calculated field called `name` that this relation
     /// carries, looking through the wrappers a builder puts around it.
     #[must_use]
@@ -254,6 +312,7 @@ impl Relation {
                 .find(|a| a.name == name)
                 .or_else(|| base.aggregate_field(name)),
             Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Fixed { base, .. } => base.aggregate_field(name),
         }
@@ -271,6 +330,7 @@ impl Relation {
             Self::Joined { .. } => " SETTINGS join_use_nulls = 1".to_owned(),
             Self::Sql(_) => SQL_SOURCE_SETTINGS.to_owned(),
             Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Calculated { base, .. } => base.settings(),
             Self::Fixed { base, .. } => add_settings(&base.settings(), &["join_use_nulls = 1"]),
@@ -290,6 +350,7 @@ impl Relation {
                 .find(|t| t.name == name)
                 .or_else(|| base.table_calc(name)),
             Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Fixed { base, .. } => base.table_calc(name),
         }
@@ -908,6 +969,7 @@ pub fn point_limit(from: &Relation) -> u32 {
         Relation::Mart(_) | Relation::Joined { .. } => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
         Relation::Filtered { base, .. }
+        | Relation::Ranged { base, .. }
         | Relation::Bucketed { base, .. }
         | Relation::Calculated { base, .. }
         | Relation::Fixed { base, .. } => point_limit(base),
@@ -1010,6 +1072,9 @@ pub struct FilteredSql {
     /// What a raw table, a pivot or a comparing KPI needs beyond its rows
     /// (`BI-16` part A).
     pub table: Option<TableRead>,
+    /// `BI-10`: one statement per binned column, which reads the bins' width,
+    /// minimum and maximum so the tile can label them. Empty without bins.
+    pub bins: Vec<BinRead>,
 }
 
 /// What the tile of a raw table, a pivot or a KPI with a comparison carries
@@ -1161,6 +1226,7 @@ where
         grain_column: None,
         latest_limit: None,
         table: None,
+        bins: Vec::new(),
     };
     if spec.spec.kind == crate::specs::ChartKind::Text {
         return FilteredSql {
@@ -1171,6 +1237,7 @@ where
             grain_column: None,
             latest_limit: None,
             table: None,
+            bins: Vec::new(),
         };
     }
     let def: &ChartInput = &spec.def;
@@ -1328,6 +1395,11 @@ fn report_over<H: std::hash::BuildHasher>(
     let from = &from;
     let (g, grain_skipped) = grained(spec, cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
+    // BI-10: what the tile needs to label the chart's bins, read over the same
+    // filtered rows the bins are cut from.
+    let bins = binned::all_layers(&spec.def, spec.spec.kind, cols)
+        .map(|layers| binned::reads(from, &predicates, &layers))
+        .unwrap_or_default();
     let rebuilt = rebuild(
         spec,
         from,
@@ -1356,6 +1428,7 @@ fn report_over<H: std::hash::BuildHasher>(
         grain_column: g.as_ref().map(|g| g.column),
         latest_limit,
         table,
+        bins,
     })
 }
 
@@ -1414,6 +1487,7 @@ where
             grain_column: None,
             latest_limit: None,
             table: None,
+            bins: Vec::new(),
         });
     }
     let outcome = filter_predicates(source_cols, years, filters, read.time);
@@ -1463,6 +1537,17 @@ pub enum RecordsValue<'a> {
         /// The bucket as printed by the tile.
         text: &'a str,
     },
+    /// Rows whose number column falls in the clicked bin of a binned chart
+    /// (`BI-10`): `[lower, lower + width)`, closed above when that edge is the
+    /// maximum of the same filtered rows (the last bin holds the maximum).
+    Bin {
+        /// The raw number column.
+        column: &'a Ident,
+        /// The bin's lower edge.
+        lower: f64,
+        /// The bin's width.
+        width: f64,
+    },
 }
 
 /// SQL for the rows behind a clicked value, or behind a whole tile when
@@ -1495,9 +1580,28 @@ where
         skipped,
         ..
     } = filter_predicates(cols, &[], filters, time);
+    let from_sql = from.render();
     match value {
         Some(RecordsValue::Equals(column, value)) => {
             predicates.insert(0, format!("{column} = {}", SqlLiteral::from(value)));
+        }
+        Some(RecordsValue::Bin {
+            column,
+            lower,
+            width,
+        }) => {
+            // The maximum is read over the rows the other predicates leave, so
+            // the last bin is closed exactly as the tile's bins were cut.
+            let others = if predicates.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", predicates.join(" AND "))
+            };
+            let max = crate::bin::max_scalar_sql(column, &format!("{from_sql}{others}"));
+            predicates.insert(
+                0,
+                crate::bin::bin_records_predicate(column, lower, width, Some(&max)),
+            );
         }
         Some(RecordsValue::Bucket {
             column,
@@ -1521,7 +1625,6 @@ where
     } else {
         format!(" WHERE {}", predicates.join(" AND "))
     };
-    let from_sql = from.render();
     let settings = from.settings();
     RecordsSql {
         rows: format!(
@@ -1798,11 +1901,21 @@ fn rebuild<H: std::hash::BuildHasher>(
             }
             None => None,
         };
+        let bin = match &def.shape.bin {
+            Some(spec) => {
+                let (field, _) = tables::pivot_bin_field(&def.tables, ctx.cols)?;
+                Some((field, spec.mode().ok()?))
+            }
+            None => None,
+        };
         let sql = tables::pivot_sql(
             from,
             &plan,
             where_clauses,
-            grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+            (
+                grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+                bin.as_ref().map(|(f, m)| (f, *m)),
+            ),
             ctx.read.time,
         )?;
         let row_cap = tables::pivot_row_cap(from, plan.values.len());
@@ -1915,6 +2028,43 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
     grained: Option<&Grained>,
 ) -> Option<String> {
     let def: &ChartInput = &spec.def;
+    // BI-10: a chart whose dimension or breakdown is binned reads a relation
+    // in which that column already is its bin, with the predicates under it on
+    // the raw rows. Everything after this (sort, "Other", steps) is the
+    // statement the chart would have had on that column as it is.
+    let bins = binned::chart_layers(def)?;
+    if !bins.is_empty() && def.shape.groupings.is_none() {
+        let measures = shape::resolve_measures(&def.measures, from)?;
+        let groups: Vec<String> = [Some(def.dimension.as_str()), def.breakdown.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let needed = binned::needed_columns(from, &groups, &measures)?;
+        let relation = binned::binned(from, where_clauses, &bins, &needed);
+        return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), None);
+    }
+    rebuild_chart_over(
+        spec,
+        from,
+        where_clauses,
+        where_columns,
+        (read, cols),
+        grained,
+    )
+}
+
+/// [`rebuild_chart`] once any bin is already in the relation.
+fn rebuild_chart_over<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    where_clauses: Vec<String>,
+    where_columns: &[String],
+    (read, cols): (&ReadContext<'_>, &RelationColumns<H>),
+    grained: Option<&Grained>,
+) -> Option<String> {
+    let def: &ChartInput = &spec.def;
     if let Some(g) = grained {
         let chart = GrainedChart::from_def(def, spec.spec.kind, g.grain, from)?;
         return grained_sql(from, where_clauses, &chart, g.column, read.time);
@@ -1933,7 +2083,7 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
                 base: Box::new(from.clone()),
                 predicates: where_clauses,
             };
-            return rebuild_chart(spec, &wrapped, Vec::new(), &[], (read, cols), None);
+            return rebuild_chart_over(spec, &wrapped, Vec::new(), &[], (read, cols), None);
         }
     }
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
@@ -1960,6 +2110,9 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         let lat = Ident::new(def.lat.clone()?).ok()?;
         let lon = Ident::new(def.lon.clone()?).ok()?;
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        if let Some(grid) = &def.shape.grid {
+            return grid_sql(from, where_clauses, (&lat, &lon), &measure, (agg, grid));
+        }
         let label = if def.dimension.is_empty() {
             None
         } else {
@@ -2028,6 +2181,32 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         builder = builder.raw_where(clause);
     }
     Some(builder.build())
+}
+
+/// `BI-10`: a point map grouped by grid cell. The predicates and the
+/// coordinate null checks sit in an inner relation, so they read the raw
+/// coordinates and never the cell that is projected under their names.
+fn grid_sql(
+    from: &Relation,
+    mut predicates: Vec<String>,
+    (lat, lon): (&Ident, &Ident),
+    measure: &Ident,
+    (agg, grid): (Aggregate, &crate::bin::GridSpec),
+) -> Option<String> {
+    predicates.push(format!("{lat} IS NOT NULL"));
+    predicates.push(format!("{lon} IS NOT NULL"));
+    let src = Relation::Filtered {
+        base: Box::new(from.clone()),
+        predicates,
+    };
+    Some(crate::bin::grid_points_sql(
+        &src.render(),
+        (lat, lon),
+        measure,
+        agg,
+        grid.checked().ok()?,
+        (point_limit(from), &from.settings()),
+    ))
 }
 
 /// The sort of a stored definition as validated identifiers: `by` must be one
@@ -2141,7 +2320,10 @@ fn groupings_sql<H: std::hash::BuildHasher>(
     needed.dedup();
     let mut relation = from.clone();
     let mut predicates = where_clauses;
-    if grains.iter().any(Option::is_some) {
+    // BI-10: a grouping with a bin is replaced by its bin after the grains,
+    // over the same filtered rows.
+    let bins = binned::grouping_layers(def)?;
+    if grains.iter().any(Option::is_some) || !bins.is_empty() {
         if !predicates.is_empty() {
             relation = Relation::Filtered {
                 base: Box::new(relation),
@@ -2165,6 +2347,9 @@ fn groupings_sql<H: std::hash::BuildHasher>(
                     .collect(),
             };
         }
+    }
+    for layer in &bins {
+        relation = binned::add_layer(relation, layer, &needed);
     }
     let mut builder = QueryBuilder::over(relation)
         .groupings(idents)
@@ -4453,5 +4638,142 @@ mod tests {
             "{summed}"
         );
         assert!(summed.contains("ORDER BY kab LIMIT 7"), "{summed}");
+    }
+
+    // ── BI-10: bins and grids ───────────────────────────────────────────
+
+    #[test]
+    fn a_binned_dimension_reads_the_range_and_the_filters_under_the_bin() {
+        let got = sql_with_filters_report(
+            &bi6_spec(r#"{"dimension":"stay","bin":{"mode":"width","width":500}}"#),
+            &[],
+            &[filter(r#"{"column":"stay","op":"between","min":"10"}"#)],
+            &bi6_cols(),
+        );
+        // The bin carries the dimension's name; the filter on the same column
+        // is applied on the raw rows beneath it, and the range is read over
+        // those same rows.
+        assert!(
+            got.sql.starts_with(
+                "SELECT stay, round(sum(visitors)) AS visitors FROM (SELECT round(least(floor(toFloat64(stay) / __bw_stay)"
+            ),
+            "{}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains("FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.bins.len(), 1);
+        assert_eq!(got.bins[0].column, "stay");
+        assert_eq!(got.bins[0].mode, "width");
+        assert!(
+            got.bins[0]
+                .sql
+                .starts_with("SELECT w AS width, mn AS min, mx AS max FROM")
+        );
+        // The width statement reads the same filtered rows as the bins.
+        assert!(
+            got.bins[0]
+                .sql
+                .contains("(SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt")
+        );
+    }
+
+    #[test]
+    fn a_chart_without_a_bin_carries_none_and_builds_what_it_always_did() {
+        let got = sql_with_filters_report(&bi6_spec("{}"), &[], &[], &bi6_cols());
+        assert_eq!(got.sql, "SELECT stored");
+        assert!(got.bins.is_empty());
+        let filtered = sql_with_filters_report(
+            &bi6_spec("{}"),
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert!(!filtered.sql.contains("rng"), "{}", filtered.sql);
+        assert!(filtered.bins.is_empty());
+    }
+
+    #[test]
+    fn a_binned_breakdown_and_a_binned_dimension_nest_one_bin_each() {
+        let got = sql_with_filters_report(
+            &bi6_spec(
+                r#"{"dimension":"stay","bin":{"mode":"auto"},"breakdown":"visitors","breakdownBin":{"mode":"count","count":10}}"#,
+            ),
+            &[],
+            &[],
+            &bi6_cols(),
+        );
+        assert!(
+            got.sql.contains("__bw_stay") && got.sql.contains("__bw_visitors"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.bins.len(), 2);
+        // Both groupings are read by name from the nested bins.
+        assert!(
+            got.sql.contains("GROUP BY stay, visitors") || got.sql.contains("GROUP BY stay"),
+            "{}",
+            got.sql
+        );
+    }
+
+    #[test]
+    fn a_grouped_table_bins_one_of_its_groupings() {
+        let mut spec = bi6_spec(
+            r#"{"kind":"table","dimension":"","groupings":[{"column":"stay","bin":{"mode":"width","width":5}},{"column":"cat"}]}"#,
+        );
+        spec.spec.kind = ChartKind::Table;
+        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
+        assert!(got.sql.contains("__bw_stay"), "{}", got.sql);
+        assert!(got.sql.contains("GROUP BY stay, cat"), "{}", got.sql);
+        assert_eq!(got.bins.len(), 1);
+    }
+
+    #[test]
+    fn a_grid_map_groups_the_points_by_cell_under_the_filters() {
+        let mut spec = stored_spec(ChartKind::Pointmap, "mart_x", "", &["visitors"]);
+        spec.def.lat = Some("stay".to_owned());
+        spec.def.lon = Some("visitors".to_owned());
+        spec.def.shape.grid = Some(serde_json::from_str(r#"{"size":1}"#).unwrap());
+        let got = sql_with_filters_report(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert!(
+            got.sql.contains("FROM (SELECT * FROM serving.mart_x WHERE cat IN ('a') AND stay IS NOT NULL AND visitors IS NOT NULL) AS flt) GROUP BY __cy, __cx ORDER BY visitors DESC, __cy, __cx LIMIT 5000"),
+            "{}",
+            got.sql
+        );
+        assert!(got.sql.contains("count() AS cell_points"));
+    }
+
+    #[test]
+    fn a_clicked_bin_lists_the_rows_in_its_range_and_closes_the_last_bin_at_the_maximum() {
+        let time = TimeContext::default();
+        let cols = typed(&[("v", ColumnKind::Number), ("g", ColumnKind::Text)]);
+        let v = Ident::new("v").unwrap();
+        let got = super::records_sql(
+            &Relation::Mart(Ident::new("t").unwrap()),
+            &cols,
+            &[filter(r#"{"column":"g","values":["a"]}"#)],
+            Some(RecordsValue::Bin {
+                column: &v,
+                lower: 500.0,
+                width: 500.0,
+            }),
+            50,
+            0,
+            &time,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 500 AND toFloat64(v) < 1000) OR (toFloat64(v) = 1000 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')))) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(got.count.matches("SELECT max").count(), 1);
     }
 }

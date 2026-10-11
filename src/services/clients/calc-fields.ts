@@ -76,6 +76,22 @@ export const calcFieldService: CalcFieldService = {
     )
     return j.field
   },
+  async createGroup(source, name, group, signal) {
+    const j = await call<{ field: CalcField }>(
+      "/api/dashboard/calc-fields",
+      jsonInit("POST", { ...source, name, group }, signal),
+      "The group could not be saved."
+    )
+    return j.field
+  },
+  async updateGroup(id, group, signal) {
+    const j = await call<{ field: CalcField }>(
+      "/api/dashboard/calc-fields",
+      jsonInit("PUT", { id, group }, signal),
+      "The group could not be saved."
+    )
+    return j.field
+  },
   async remove(id, signal) {
     await call<{ ok: boolean }>(
       `/api/dashboard/calc-fields?id=${encodeURIComponent(id)}`,

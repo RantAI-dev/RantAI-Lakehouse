@@ -1,4 +1,5 @@
 import type { FilterDef } from "@/services/clients/bi-store"
+import { type BinDef, type BinDraft, type GridDef, binDraftFromDef, binPayload, binProblem, gridChoiceOf, gridPayload } from "./chart-bins"
 import { type JoinDef, type JoinDraft, displayColumn, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
 
 /**
@@ -15,7 +16,7 @@ import { type JoinDef, type JoinDraft, displayColumn, joinDraftsFromDef, joinPro
 export type MeasureEntry = string | { column: string; aggregate: string }
 export type SortDir = "asc" | "desc"
 export type SortSpec = { by: string; dir: SortDir }
-export type Grouping = { column: string; grain?: string }
+export type Grouping = { column: string; grain?: string; bin?: BinDef }
 
 /** A condition of a filter step, on a column of the result before it (`BI-6` part 2). */
 export type StepCondition = { column: string; op: string; value?: string; min?: string; max?: string }
@@ -34,6 +35,11 @@ export type ShapeDefFields = {
   steps?: StepDef[]
   /** Tables joined to the chart's mart (BI-7). */
   joins?: JoinDef[]
+  /** How the number dimension (or a pivot's first number field) is binned, and the number breakdown (BI-10). */
+  bin?: BinDef
+  breakdownBin?: BinDef
+  /** A point map grouped by grid cell (BI-10). */
+  grid?: GridDef
 }
 
 /** Most columns a table may be grouped by. */
@@ -179,10 +185,14 @@ export type ShapeDraft = {
   steps: StepDef[]
   /** Tables joined to the chart's mart (BI-7); only for a chart on a mart. */
   joins: JoinDraft[]
+  /** BI-10: the bin of the dimension (or of a pivot's number field), of the breakdown, and the map grid ("none", "auto", "0.01" ...). */
+  bin: BinDraft | null
+  breakdownBin: BinDraft | null
+  grid: string
 }
 
 export function emptyShapeDraft(): ShapeDraft {
-  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [], joins: [] }
+  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [], joins: [], bin: null, breakdownBin: null, grid: "none" }
 }
 
 /** A saved definition as a draft; anything absent keeps its default. */
@@ -195,6 +205,9 @@ export function shapeDraftFromDef(def: (ShapeDefFields & { order?: string }) | u
     groupings: (def.groupings ?? []).map((g) => ({ ...g })),
     steps: structuredClone(def.steps ?? []),
     joins: joinDraftsFromDef(def.joins),
+    bin: binDraftFromDef(def.bin),
+    breakdownBin: binDraftFromDef(def.breakdownBin),
+    grid: gridChoiceOf(def.grid),
   }
 }
 
@@ -205,6 +218,12 @@ export type ShapeContext = { kind: string; rowsMode: boolean; grained: boolean; 
 export function takesSteps(kind: string, rowsMode = false): boolean {
   if (rowsMode) return false
   return ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "radar", "waterfall", "table", "scatter", "bubble"].includes(kind)
+}
+
+/** Kinds whose dimension and breakdown can be binned (`lakehouse_bi::shape::takes_bin`). */
+export function takesBin(kind: string, rowsMode = false): boolean {
+  if (rowsMode) return false
+  return ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "radar", "waterfall", "table", "pivot"].includes(kind)
 }
 
 /** Whether the draft's steps are sent for this chart: not beside a time grain, a breakdown or "Other". */
@@ -225,21 +244,48 @@ export function shapePayload(d: ShapeDraft, ctx: ShapeContext): Record<string, u
   if (sort && takesSort(ctx.kind, ctx.rowsMode)) out.sort = sort
   if (stepsApply(d, ctx)) out.steps = d.steps.map(cleanStep)
   if (d.other && takesOther(ctx.kind, ctx.rowsMode) && !ctx.grained && !(ctx.kind === "table" && d.groupings.length > 1)) out.other = true
-  if (ctx.kind === "table" && !ctx.rowsMode && (d.groupings.length > 1 || d.groupings.some((g) => g.grain))) {
-    out.groupings = d.groupings.map((g) => (g.grain ? { column: g.column, grain: g.grain } : { column: g.column }))
+  if (ctx.kind === "table" && !ctx.rowsMode && usesGroupings(d.groupings)) {
+    out.groupings = d.groupings.map((g) => {
+      const bin = binPayload(binDraftFromDef(g.bin))
+      return { column: g.column, ...(g.grain ? { grain: g.grain } : {}), ...(bin ? { bin } : {}) }
+    })
+  }
+  // BI-10: a bin is for a number grouping and never beside a time grain; the grid is for the point maps.
+  if (takesBin(ctx.kind, ctx.rowsMode) && !ctx.grained && ctx.kind !== "table") {
+    const bin = binPayload(d.bin)
+    if (bin) out.bin = bin
+    const breakdownBin = ctx.breakdown ? binPayload(d.breakdownBin) : undefined
+    if (breakdownBin) out.breakdownBin = breakdownBin
+  }
+  if (ctx.kind === "pointmap" || ctx.kind === "geoheat") {
+    const grid = gridPayload(d.grid)
+    if (grid) out.grid = grid
   }
   return out
 }
 
 /** Whether a table's groupings need the `groupings` field (several, or a grain), rather than the plain `dimension`. */
 export function usesGroupings(groupings: readonly Grouping[]): boolean {
-  return groupings.length > 1 || groupings.some((g) => !!g.grain)
+  return groupings.length > 1 || groupings.some((g) => !!g.grain || !!g.bin)
 }
 
 /** What is still needed before the chart can be previewed, in the builder's own words. */
 export function shapeProblems(d: ShapeDraft, ctx: { kind: string; rowsMode: boolean; grained?: boolean; breakdown?: boolean }): string[] {
   const out: string[] = ctx.kind === "text" ? [] : joinProblems(d.joins)
   if (ctx.kind === "table" && !ctx.rowsMode && d.groupings.length === 0) out.push("Group by")
+  // BI-10: a bin by width needs its width.
+  if (takesBin(ctx.kind, ctx.rowsMode) && !ctx.grained) {
+    const dimensionBin = binProblem(d.bin, "Dimension")
+    if (dimensionBin) out.push(dimensionBin)
+    const breakdownBin = ctx.breakdown ? binProblem(d.breakdownBin, "Breakdown") : null
+    if (breakdownBin) out.push(breakdownBin)
+  }
+  if (ctx.kind === "table" && !ctx.rowsMode) {
+    for (const g of d.groupings) {
+      const problem = binProblem(binDraftFromDef(g.bin), g.column)
+      if (problem) out.push(problem)
+    }
+  }
   if (stepsApply(d, { ...ctx, grained: !!ctx.grained })) {
     d.steps.forEach((step, i) => {
       const n = i + 1

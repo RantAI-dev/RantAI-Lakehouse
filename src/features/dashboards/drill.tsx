@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ChevronLeft, ChevronRight, Filter, Table2 } from "lucide-react";
+import { ArrowDownToLine, ChevronLeft, ChevronRight, Filter, Table2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ErrorWithReference } from "@/components/error-reference";
@@ -16,13 +16,15 @@ export type DrillTarget = {
   label?: string;
   /** The grain of `name`, when it is a bucket (BI-9). */
   grain?: string;
+  /** `name` is the lower edge of a bin of this width; `last` when it is the last bin, which holds the maximum (BI-10). */
+  bin?: { width: number; last: boolean };
   /** BI-6: the tile, when it has filters of its own, so the rows listed carry them too. */
   chart?: string;
 };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
 export function DrillMenu({
-  drill, onClose, onFilter, onRecords,
+  drill, onClose, onFilter, onRecords, drillDown,
 }: {
   readonly drill: DrillTarget;
   readonly onClose: () => void;
@@ -30,6 +32,8 @@ export function DrillMenu({
   readonly onFilter?: () => void;
   /** Absent when the rows cannot be listed. */
   readonly onRecords?: () => void;
+  /** BI-10: go one level down a hierarchy, or the plain reason it cannot be done. Absent when the column is in no hierarchy. */
+  readonly drillDown?: { readonly label: string; readonly onSelect: () => void } | { readonly reason: string };
 }) {
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -45,7 +49,7 @@ export function DrillMenu({
       <div
         role="menu"
         className="fixed z-50 w-60 rounded-lg border border-border bg-card p-1 shadow-xl"
-        style={{ left: Math.min(drill.x, w - 250), top: Math.min(drill.y, h - 130) }}
+        style={{ left: Math.min(drill.x, w - 250), top: Math.min(drill.y, h - 170) }}
       >
         <p className="truncate px-2 py-1 text-[11px] text-muted-foreground">
           {drill.column}: <span className="font-medium text-foreground">{drill.label ?? drill.name}</span>
@@ -54,6 +58,15 @@ export function DrillMenu({
           <button role="menuitem" onClick={onFilter} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
             <Filter className="size-4" /> Filter dashboard by this
           </button>
+        ) : null}
+        {drillDown && "onSelect" in drillDown ? (
+          <button role="menuitem" onClick={drillDown.onSelect} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
+            <ArrowDownToLine className="size-4" /> {drillDown.label}
+          </button>
+        ) : drillDown ? (
+          <p className="flex items-start gap-2 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <ArrowDownToLine className="mt-0.5 size-3.5 shrink-0" aria-hidden /> Cannot drill down: {drillDown.reason}
+          </p>
         ) : null}
         {onRecords ? (
           <button role="menuitem" onClick={onRecords} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">

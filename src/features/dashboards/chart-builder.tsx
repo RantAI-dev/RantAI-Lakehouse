@@ -43,9 +43,11 @@ import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
   effectiveOrder, emptyShapeDraft, entriesFromRows, measureLabel, measureLimits, parseSortChoice, resultName,
-  rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortOptions, stepsApply, takesOther, takesSteps, usesGroupings, columnsAfterSteps,
+  rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, takesOther, takesSteps, usesGroupings, columnsAfterSteps,
   type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
+import { AUTO_BIN } from "@/lib/chart-bins";
+import { BinPicker, GridPicker } from "./bin-picker";
 import { ChartFilters, GroupingsEditor, MeasureRows, StepsEditor, PreviewRowsTable, type ColumnChoice } from "./chart-shape-section";
 import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
@@ -59,7 +61,10 @@ import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
 import { FormulaEditorDialog } from "./formula-editor";
-import type { CalcField } from "@/services/contracts/calc-fields";
+import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
+import type { Hierarchy } from "@/services/contracts/hierarchies";
+import { ValueGroupDialog } from "./value-group-dialog";
+import { HierarchyDialog } from "./hierarchy-dialog";
 import { TileBody } from "./tile-body";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -70,6 +75,8 @@ type Fields = {
   /** The source's own columns, apart from the calculated fields merged into `dimensions` and `measures` (BI-8). */
   columns?: string[];
   calculated?: CalcField[];
+  /** The source's hierarchies (BI-10). */
+  hierarchies?: Hierarchy[];
 };
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
@@ -284,12 +291,20 @@ export function ChartBuilder({
   // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
   const [formulaOpen, setFormulaOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<CalcField | undefined>(undefined);
-  const calcNames = React.useMemo(() => new Set((fields?.calculated ?? []).map((f) => f.name)), [fields]);
+  const calcNames = React.useMemo(() => new Set((fields?.calculated ?? []).filter((f) => !isValueGroup(f)).map((f) => f.name)), [fields]);
+  // BI-10: value groups and hierarchies are edited from the same strip as the calculated fields.
+  const groupNames = React.useMemo(() => new Set((fields?.calculated ?? []).filter(isValueGroup).map((f) => f.name)), [fields]);
+  const [groupOpen, setGroupOpen] = React.useState(false);
+  const [editingGroup, setEditingGroup] = React.useState<CalcField | undefined>(undefined);
+  const [hierarchyOpen, setHierarchyOpen] = React.useState(false);
+  const [editingHierarchy, setEditingHierarchy] = React.useState<Hierarchy | undefined>(undefined);
   /** A calculated field is marked "fx" wherever a column is picked. */
   // A joined column (`table__column`, BI-7) reads `table.column`.
   const fieldLabel = (name: string) => calcNames.has(name)
     ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
-    : displayColumn(name);
+    : groupNames.has(name)
+      ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">group</span></span>
+      : displayColumn(name);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -435,6 +450,27 @@ export function ChartBuilder({
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
+  // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
+  // that per grouping, a pivot on its first number row or column field.
+  const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
+  const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot;
+  const numberColumns = React.useMemo(
+    () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
+    [fields, wholeMeasure],
+  );
+  const dimensionChoices = binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
+  const breakdownChoices = (binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? []).filter((d) => d !== dimension);
+  const startingBin = onSqlSource ? ({ mode: "width", count: "10", width: "" } as const) : AUTO_BIN;
+  const isNumber = (column: string) => fields?.kinds?.[column] === "number";
+  function pickDimension(column: string) {
+    setDimension(column);
+    setShape((d) => ({ ...d, bin: binKind && isNumber(column) ? d.bin ?? startingBin : null }));
+  }
+  function pickBreakdown(column: string) {
+    setBreakdown(column);
+    setShape((d) => ({ ...d, breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null }));
+  }
+  const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
   const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : "Dimension (X)";
@@ -563,6 +599,7 @@ export function ChartBuilder({
       (j.columns ?? []).map((c: { name: string }) => c.name),
       j.calculated ?? [],
     );
+    f.hierarchies = j.hierarchies ?? [];
     setFields(f);
     return f;
   }
@@ -688,6 +725,13 @@ export function ChartBuilder({
   }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
   const showOther = takesOther(kind, rowsMode) && !grain && shape.steps.length === 0 && !(isGroupedTable && shape.groupings.length > 1) && limitHasEffect(grain, order);
 
+  /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
+  function shapeOut(): Record<string, unknown> {
+    const out = shapePayload(shape, shapeContext);
+    if (isPivot && !pivotNumberField) delete out.bin;
+    return out;
+  }
+
   function buildPayload(forPreview = false, withSource: ChartSourceChoice | null = choice): Record<string, unknown> {
     if (missing.length) throw new Error(`Still needed: ${missing.join(", ")}.`);
     const payloadTitle = title.trim() || suggestedTitle || (forPreview ? "Chart preview" : "");
@@ -701,7 +745,7 @@ export function ChartBuilder({
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),
-        ...shapePayload(shape, shapeContext),
+        ...shapeOut(),
       };
     } else if (ownColumns) {
       // BI-16 part A: no dimension, measures or aggregate; the columns travel in the table's own fields.
@@ -709,7 +753,7 @@ export function ChartBuilder({
         title: payloadTitle, ...sourcePayload(withSource), kind, span, board: targetBoard,
         ...draftPayload(kind, tableDraft),
         grain: isPivot && grain && grainOptions.includes(grain) ? grain : undefined,
-        ...shapePayload(shape, shapeContext),
+        ...shapeOut(),
       };
     } else {
       const measures = entriesFromRows(measureRows, limits.own);
@@ -727,7 +771,7 @@ export function ChartBuilder({
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
         ...draftPayload(kind, tableDraft, shownColumns),
-        ...shapePayload(shape, shapeContext),
+        ...shapeOut(),
       };
     }
     // A chart without marks to click (text, KPI, gauge, table, density map)
@@ -987,13 +1031,28 @@ export function ChartBuilder({
                 {(fields.calculated ?? []).map((f) => (
                   <Button
                     key={f.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 font-mono text-xs"
-                    title={f.formula} onClick={() => { setEditing(f); setFormulaOpen(true); }}
+                    title={isValueGroup(f) ? "Value group" : f.formula}
+                    onClick={() => (isValueGroup(f) ? (setEditingGroup(f), setGroupOpen(true)) : (setEditing(f), setFormulaOpen(true)))}
                   >
-                    <span className="text-muted-foreground">fx</span>{f.name}
+                    <span className="text-muted-foreground">{isValueGroup(f) ? "grp" : "fx"}</span>{f.name}
+                  </Button>
+                ))}
+                {(fields.hierarchies ?? []).map((h) => (
+                  <Button
+                    key={h.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 text-xs"
+                    title={h.levels.join(" > ")} onClick={() => { setEditingHierarchy(h); setHierarchyOpen(true); }}
+                  >
+                    <span className="text-muted-foreground">{">"}</span>{h.name}
                   </Button>
                 ))}
                 <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditing(undefined); setFormulaOpen(true); }}>
                   <Plus className="size-3" aria-hidden /> New calculated field
+                </Button>
+                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditingGroup(undefined); setGroupOpen(true); }}>
+                  <Plus className="size-3" aria-hidden /> New value group
+                </Button>
+                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditingHierarchy(undefined); setHierarchyOpen(true); }}>
+                  <Plus className="size-3" aria-hidden /> New hierarchy
                 </Button>
               </div>
             ) : null}
@@ -1024,6 +1083,7 @@ export function ChartBuilder({
                   disabled={!fields}
                   placeholder={fields ? "pick a column" : noFieldsHint}
                   fieldLabel={fieldLabel}
+                  sqlSource={onSqlSource}
                 />
               ) : (
               <div className="grid gap-1.5">
@@ -1037,24 +1097,32 @@ export function ChartBuilder({
                     </SelectContent>
                   </Select>
                 ) : (
-                  <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
+                  <Select value={dimension} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                    <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
+                    <SelectContent>{dimensionChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
                 {grainPicker}
+                {binKind && isNumber(dimension) ? (
+                  <BinPicker label="Group in" value={shape.bin} sqlSource={onSqlSource} aria="Group in bins"
+                    onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
+                ) : null}
               </div>
               )}
               {canBreakdown ? (
                 <div className="grid gap-1.5">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
-                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => setBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
-                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
+                      {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
+                  {binKind && breakdown && isNumber(breakdown) ? (
+                    <BinPicker label="Group in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                      onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -1077,6 +1145,7 @@ export function ChartBuilder({
               </div>
             </div>
           ) : null}
+          {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
           {isCalendar ? (
             <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
@@ -1182,6 +1251,10 @@ export function ChartBuilder({
             <>
               <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
               {grainPicker}
+              {pivotNumberField ? (
+                <BinPicker label={`Group ${pivotNumberField} in`} value={shape.bin} sqlSource={onSqlSource} aria="Group the pivot field in bins"
+                  onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
+              ) : null}
             </>
           ) : null}
 
@@ -1356,7 +1429,7 @@ export function ChartBuilder({
             onOpenChange={setFormulaOpen}
             source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
             columns={fields.columns}
-            fields={fields.calculated ?? []}
+            fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
             existing={editing}
             onSaved={() => { void loadFields(source); }}
             onDeleted={(gone) => {
@@ -1367,6 +1440,33 @@ export function ChartBuilder({
               });
             }}
           />
+        ) : null}
+        {fields?.columns && choice ? (
+          <>
+            <ValueGroupDialog
+              open={groupOpen}
+              onOpenChange={setGroupOpen}
+              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+              textColumns={fields.columns.filter((c) => fields.kinds?.[c] === "text")}
+              existing={editingGroup}
+              onSaved={() => { void loadFields(source); }}
+              onDeleted={(gone) => {
+                void loadFields(source).then((f) => {
+                  setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
+                  setBreakdown((v) => keepIfOffered(v, f.dimensions));
+                });
+              }}
+            />
+            <HierarchyDialog
+              open={hierarchyOpen}
+              onOpenChange={setHierarchyOpen}
+              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+              columns={fields.columns}
+              existing={editingHierarchy}
+              onSaved={() => { void loadFields(source); }}
+              onDeleted={() => { void loadFields(source); }}
+            />
+          </>
         ) : null}
       </DialogContent>
     </Dialog>

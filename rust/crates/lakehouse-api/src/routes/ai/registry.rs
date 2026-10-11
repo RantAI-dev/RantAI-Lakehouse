@@ -170,6 +170,15 @@ fn measures_schema() -> Value {
         "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}" })
 }
 
+/// How a number is binned (`BI-10`): the three modes of `lakehouse_bi::bin`.
+fn bin_schema(description: &str) -> Value {
+    json!({ "type": "object", "properties": {
+        "mode": { "type": "string", "enum": ["auto", "count", "width"], "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width" },
+        "count": { "type": ["number", "string"], "description": "mode count: 10, 50 or 100" },
+        "width": { "type": ["number", "string"], "description": "mode width: a positive number; the only mode for a SQL source" } },
+        "required": ["mode"], "description": description })
+}
+
 /// The `BI-6` fields of `create_chart` and `update_chart` (the chart's own
 /// filters, sort, "Other", groupings), inserted the way
 /// [`with_table_properties`] inserts the table fields. The limits are the ones
@@ -227,9 +236,16 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column" },
         "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
             "column": { "type": "string" },
-            "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" } },
+            "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" },
+            "bin": bin_schema("for a number column, instead of a grain") },
             "required": ["column"] },
-            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" }
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" },
+        "bin": bin_schema("group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"),
+        "breakdownBin": bin_schema("the same for a number `breakdown`"),
+        "grid": { "type": "object", "properties": {
+            "size": { "type": ["string", "number"], "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10" } },
+            "required": ["size"],
+            "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count" }
     });
     if let Some(props) = schema
         .pointer_mut("/function/parameters/properties")
@@ -467,6 +483,47 @@ fn update_calculated_field_schema() -> Value {
 fn delete_calculated_field_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_calculated_field",
         "description": "Delete one calculated field (by id). Refused while a chart or another field uses it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── BI-10 value groups and hierarchies (with AI-6) ───────────────────────
+
+fn create_value_group_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] = json!({ "type": "string", "description": "a name of letters, digits and _ (for example region_group), not a column of the source; charts pick the group by it like a column" });
+    properties["group"] = json!({ "type": "object", "properties": {
+        "column": { "type": "string", "description": "a text column of the source" },
+        "groups": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "what the values are shown as, for example Java" },
+            "values": { "type": "array", "items": { "type": "string" }, "description": "values of the column exactly as spelled; a value belongs to one group only; at most 2000 in all" } },
+            "required": ["name", "values"] } },
+        "rest": { "type": "string", "enum": ["keep", "other"], "description": "keep: values in no group keep their own name; other: they are shown as Other" } },
+        "required": ["column", "groups", "rest"] });
+    json!({ "type": "function", "function": { "name": "create_value_group",
+        "description": "Gather chosen values of a text column under names of your own (for example six provinces as Java) and save it as a field of the source. Then use its name in create_chart as dimension or breakdown, like a column. It is a text column, so not a measure. Take the values from run_sql or describe_mart, never invent them.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "group"] } } })
+}
+
+fn list_hierarchies_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_hierarchies",
+        "description": "The hierarchies of one mart or SQL source: named, ordered lists of columns (for example province, city, place) that a chart can be drilled down through by clicking a value.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn create_hierarchy_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] =
+        json!({ "type": "string", "description": "for example Geography (1 to 64 characters)" });
+    properties["levels"] = json!({ "type": "array", "minItems": 2, "maxItems": 6, "items": { "type": "string" }, "description": "2 to 6 columns of the source, outermost first (province, city, place)" });
+    json!({ "type": "function", "function": { "name": "create_hierarchy",
+        "description": "Save a hierarchy on a mart or SQL source. A viewer can then drill down a chart whose dimension is one of its levels. Charts do not store it, so it never breaks a chart.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "levels"] } } })
+}
+
+fn delete_hierarchy_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_hierarchy",
+        "description": "Delete one hierarchy (by id from list_hierarchies). No chart depends on it. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -1132,6 +1189,34 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // BI-10 / AI-6: value groups and hierarchies. The permissions mirror
+    // `/api/dashboard/calc-fields` and `/api/dashboard/hierarchies` in
+    // `POLICY_TABLE`: reading needs `dashboard:read`, saving `dashboard:write`;
+    // deleting a hierarchy asks for approval like `delete_calculated_field`.
+    ToolSpec {
+        name: "create_value_group",
+        schema: create_value_group_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "list_hierarchies",
+        schema: list_hierarchies_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_hierarchy",
+        schema: create_hierarchy_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_hierarchy",
+        schema: delete_hierarchy_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
     // ── T1.1 Alerts (Tier 1 of the copilot-operations-handover plan) ────
     // Permission strings verified against `policy.rs::POLICY_TABLE`
     // (plan section 3.7 C1): `GET /api/alerts` is `RequiresAuth` (no
@@ -1503,7 +1588,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_seventy_one_entries() {
+    fn tool_schemas_has_seventy_five_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -1511,8 +1596,22 @@ mod tests {
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
         // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
-        // `suggest_join` (`BI-7`).
-        assert_eq!(tool_schemas().len(), 71);
+        // `suggest_join` (`BI-7`) + `create_value_group`, `list_hierarchies`,
+        // `create_hierarchy` and `delete_hierarchy` (`BI-10`).
+        assert_eq!(tool_schemas().len(), 75);
+    }
+
+    #[test]
+    fn the_bi_10_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("create_value_group", Risk::WriteLow, "dashboard:write"),
+            ("list_hierarchies", Risk::Read, "dashboard:read"),
+            ("create_hierarchy", Risk::WriteLow, "dashboard:write"),
+            ("delete_hierarchy", Risk::WriteHigh, "dashboard:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!((spec.risk, spec.permission), (risk, permission), "{name}");
+        }
     }
 
     #[test]
@@ -1562,9 +1661,27 @@ mod tests {
         for tool in ["create_chart", "update_chart"] {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
-            for field in ["filters", "sort", "other", "groupings", "steps", "joins"] {
+            for field in [
+                "filters",
+                "sort",
+                "other",
+                "groupings",
+                "steps",
+                "joins",
+                "bin",
+                "breakdownBin",
+                "grid",
+            ] {
                 assert!(properties.get(field).is_some(), "{tool} lacks {field}");
             }
+            // BI-10: a bin is {mode, count?, width?}; a grouping may carry one.
+            assert_eq!(properties["bin"]["required"], json!(["mode"]), "{tool}");
+            assert!(
+                properties["groupings"]["items"]["properties"]
+                    .get("bin")
+                    .is_some(),
+                "{tool}"
+            );
             let item = &properties["measures"]["items"]["oneOf"];
             assert_eq!(item[0]["type"], "string", "{tool}");
             assert_eq!(

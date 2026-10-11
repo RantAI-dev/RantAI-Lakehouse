@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
+import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
 import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBucketFilter } from "@/lib/bucket-click";
 import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
@@ -42,6 +43,7 @@ import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, type DrillTarget } from "./drill";
+import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
@@ -101,13 +103,14 @@ function ownFilterChart(spec: ChartCard): string | undefined {
   return spec.source !== "builtin" && (spec.def?.filters?.length || spec.def?.joins?.length) ? spec.id : undefined;
 }
 
-function clickSpecOf(spec: ChartCard): ClickSpec {
+function clickSpecOf(spec: ChartCard, level?: string): ClickSpec {
   const own = spec.source !== "builtin";
   return {
     kind: spec.kind,
     source: spec.source,
     // BI-6 part 2: after steps a row is no longer a set of source rows: no value drill.
-    dimension: (own ? (spec.def?.steps?.length ? undefined : spec.def?.dimension) : spec.x) || undefined,
+    // BI-10: a drilled tile shows the next level of its hierarchy, and clicks on that.
+    dimension: (own ? (spec.def?.steps?.length ? undefined : level ?? spec.def?.dimension) : spec.x) || undefined,
     breakdown: (own ? spec.def?.breakdown : spec.series) || undefined,
     y: spec.y,
   };
@@ -167,7 +170,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   React.useEffect(() => { setFsDark(readFullscreenDark()); }, []);
   const dark = themeDark || (fullscreen && fsDark);
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
-  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean }) | null>(null);
+  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; tileId?: string }) | null>(null);
   const [records, setRecords] = React.useState<RecordsRequest | null>(null);
   // Tiles whose saved click destination the viewer set aside for the drill menu (this session only).
   const [menuTiles, setMenuTiles] = React.useState<ReadonlySet<string>>(new Set());
@@ -380,12 +383,18 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setDrill(null);
   }, [applyFilters, filters]);
 
+  // BI-10: a bin of a binned chart sets one numeric range on its column.
+  const crossFilterBin = React.useCallback((column: string, lower: number, bin: { width: number; last: boolean }) => {
+    applyFilters(toggleBinFilter(filters, binRangeFilter(column, lower, bin.width, bin.last)));
+    setDrill(null);
+  }, [applyFilters, filters]);
+
   // Drill-down: the rows behind the clicked value (or behind a whole tile),
   // for the filters in force so the list agrees with the number clicked. A
   // built-in tile ignores dashboard filters, so its rows are not narrowed.
-  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean) => {
+  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean, extra: FilterDef[] = NO_FILTERS) => {
     setDrill(null);
-    setRecords({ ...request, filters: builtin ? NO_FILTERS : filters });
+    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...filters, ...extra] });
   }, [filters]);
 
   // No "jump to the newest user dashboard" from the built-in board here.
@@ -464,6 +473,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
   const charts = data?.charts ?? NO_CHARTS;
+  // BI-10: a viewer's own, temporary drill down a hierarchy; nothing is saved.
+  const tileDrills = useTileDrills(charts, filters, !edit);
   const results = data?.results ?? NO_RESULTS;
 
   // Tell Copilot what is on this dashboard — the built-in one included.
@@ -548,7 +559,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       followClick(saved, target.value, target.grain);
       return;
     }
-    setDrill({ name: target.value, label: target.label, grain: target.grain, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec), x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
+    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max) } : undefined;
+    setDrill({ tileId: spec.id, name: target.value, label: target.label, grain: target.grain, bin, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec), x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
   };
   const toggleMenuTile = (id: string) => setMenuTiles((prev) => {
     const next = new Set(prev);
@@ -572,7 +584,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
-    const clickSpec = clickSpecOf(spec);
+    const drilled = tileDrills.drills[spec.id];
+    const level = drilled ? tileDrills.currentLevel(spec) : undefined;
+    const clickSpec = clickSpecOf(spec, level);
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
     const menu: TileMenuItem[] = [
@@ -647,7 +661,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ),
       menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
-      body: (
+      body: drilled ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <DrillTrail steps={drilled.steps} onClimb={(index) => tileDrills.climb(spec, index)} />
+          <div className="min-h-0 flex-1">
+            <TileBody spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
+              onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
+          </div>
+        </div>
+      ) : (
         <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
@@ -655,6 +677,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   });
 
   const dialogSpec = tileDialog ? charts.find((c) => c.id === tileDialog.id) : undefined;
+  const drillChart = drill?.tileId ? charts.find((c) => c.id === drill.tileId) : undefined;
+  const drillOffer = drillChart ? tileDrills.offer(drillChart) : null;
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
 
@@ -825,11 +849,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onClose={() => setDrill(null)}
           onFilter={
             drill.builtin ? undefined
+              : drill.bin
+                ? () => crossFilterBin(drill.column, Number(drill.name), drill.bin as { width: number; last: boolean })
               : drill.grain && isGrain(drill.grain)
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, chart: drill.chart }, drill.builtin)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart }, drill.builtin, drillChart ? tileDrills.fixed(drillChart) : NO_FILTERS)}
+          drillDown={drillOffer ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}
       <RecordsDialog request={records} onClose={() => setRecords(null)} />

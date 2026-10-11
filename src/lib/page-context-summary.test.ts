@@ -82,3 +82,11 @@ test("a tile with filters of its own says so, beside its numbers", () => {
   const plain = summarizeTiles([{ id: "u_2", title: "T", kind: "bar", source: "ui", mart: "m" }], {})
   assert.doesNotMatch(plain, /filtered/)
 })
+
+test("a tile with bins says what its numbers stand for", () => {
+  const out = summarizeTiles(
+    [{ id: "c1", title: "Visits by size", kind: "bar", source: "ui", mart: "m", def: { dimension: "visitors", bin: { mode: "auto" } } }],
+    { c1: { columns: ["visitors", "n"], rows: [{ visitors: 500, n: 4 }], bins: { visitors: { mode: "auto", width: 500, min: 44, max: 2377 } } } },
+  )
+  assert.match(out, /binned: visitors in bins of 500 \(a value is the bin's lower edge\)/)
+})

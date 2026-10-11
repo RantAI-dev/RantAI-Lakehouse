@@ -18,6 +18,7 @@ import { cellClass, CellValue, columnStyle } from "./table-cell";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
+import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
 
@@ -57,6 +58,8 @@ export function TileBody({
   const def = spec.def as (TableDefFields & ShapeDefFields) | undefined;
   // BI-6: "avg of stay" for a measure with its own aggregate.
   const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps);
+  // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
+  const bins = hasRows(cell) ? binsOfTile(cell.bins, def) : {};
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
@@ -89,14 +92,14 @@ export function TileBody({
     if (def?.tableMode === "rows") {
       return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def, chart: spec.source !== "builtin" && (def?.filters?.length || def?.joins?.length) ? spec.id : undefined }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
-    return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} labels={measureLabels} />;
+    return <TableView columns={cell.columns} rows={relabelBins(cell.rows, bins)} settings={def?.columnSettings} labels={measureLabels} />;
   }
 
   if (spec.kind === "pivot") {
     if (!hasRows(cell) || cell.rows.length === 0 || !def) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <PivotTable def={def} cell={cell} />;
+    return <PivotTable def={def} cell={{ ...cell, rows: relabelBins(cell.rows, bins) }} />;
   }
 
   // Map kinds — need the map registered first (local GeoJSON).
@@ -114,14 +117,15 @@ export function TileBody({
     // maps the label back through `rawRows` (the rows as the server sent them).
     const rawRows = cell.rows;
     const grain = isGrain(cell.grain) ? cell.grain : null;
-    const bucketed = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
+    const grained = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
+    const bucketed = relabelBins(grained, bins);
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
     const option = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) });
     return (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
-        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels }) : undefined} />
+        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;

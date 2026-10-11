@@ -1,4 +1,5 @@
-//! Calculated-field tools (`BI-8`, with `AI-4`): `list_formula_functions`,
+//! Calculated-field tools (`BI-8`, with `AI-4`), and the value-group and
+//! hierarchy tools of `BI-10` that ride the same routes: `list_formula_functions`,
 //! `list_calculated_fields`, `validate_formula`, `create_calculated_field`,
 //! `update_calculated_field` and `delete_calculated_field`.
 //!
@@ -15,7 +16,7 @@ use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::api_result_to_value;
-use crate::routes::calc_fields;
+use crate::routes::{calc_fields, hierarchies};
 use crate::state::AppState;
 
 /// The tool argument `sqlSource` is the route's `source`.
@@ -93,7 +94,72 @@ pub(super) async fn delete_calculated_field(state: &AppState, args: &Map<String,
     api_result_to_value(calc_fields::delete(State(state.clone()), Query(q)).await).await
 }
 
-/// Dispatch one of the six tools by name (one arm in `run_tool`, which is at
+/// `create_value_group` (`BI-10`): the calculated-field route with a `group`
+/// in place of a formula, so the same name rules, permissions and
+/// author recording apply.
+pub(super) async fn create_value_group(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    create_calculated_field(state, principal, args).await
+}
+
+/// The hierarchy tools call the console route's own handlers
+/// (`routes::hierarchies`), as the calculated-field tools do.
+pub(super) async fn list_hierarchies(state: &AppState, args: &Map<String, Value>) -> Value {
+    let q = match serde_json::from_value(Value::Object(route_args(args))) {
+        Ok(q) => q,
+        Err(_unparsed) => return json!({ "error": "give mart or sqlSource" }),
+    };
+    api_result_to_value(hierarchies::list(State(state.clone()), Query(q)).await).await
+}
+
+pub(super) async fn create_hierarchy(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let who = principal.cloned().map(Extension);
+    let result =
+        api_result_to_value(hierarchies::create(State(state.clone()), who, body(args)).await).await;
+    match result.pointer("/hierarchy/id").cloned() {
+        Some(id) => {
+            let mut out = result;
+            out["id"] = id;
+            out
+        }
+        None => result,
+    }
+}
+
+pub(super) async fn delete_hierarchy(state: &AppState, args: &Map<String, Value>) -> Value {
+    let q = match serde_json::from_value(Value::Object(route_args(args))) {
+        Ok(q) => q,
+        Err(_unparsed) => return json!({ "error": "id is required" }),
+    };
+    api_result_to_value(hierarchies::delete(State(state.clone()), Query(q)).await).await
+}
+
+/// Whether `name` is one of the ten tools [`run`] dispatches (one guard arm in
+/// `run_tool`, which is at clippy's line limit).
+pub(super) fn handles(name: &str) -> bool {
+    matches!(
+        name,
+        "list_formula_functions"
+            | "list_calculated_fields"
+            | "validate_formula"
+            | "create_calculated_field"
+            | "update_calculated_field"
+            | "delete_calculated_field"
+            | "create_value_group"
+            | "list_hierarchies"
+            | "create_hierarchy"
+            | "delete_hierarchy"
+    )
+}
+
+/// Dispatch one of the ten tools by name (one arm in `run_tool`, which is at
 /// clippy's line limit).
 pub(super) async fn run(
     state: &AppState,
@@ -108,6 +174,10 @@ pub(super) async fn run(
         "create_calculated_field" => create_calculated_field(state, principal, args).await,
         "update_calculated_field" => update_calculated_field(state, principal, args).await,
         "delete_calculated_field" => delete_calculated_field(state, args).await,
+        "create_value_group" => create_value_group(state, principal, args).await,
+        "list_hierarchies" => list_hierarchies(state, args).await,
+        "create_hierarchy" => create_hierarchy(state, principal, args).await,
+        "delete_hierarchy" => delete_hierarchy(state, args).await,
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
 }

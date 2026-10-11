@@ -550,7 +550,17 @@ pub async fn specs_preview(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
-    let input = parse_chart_input(&body)?;
+    // BI-10: a drill request names a saved chart and a level; the server builds
+    // the definition from the saved one (`routes::drill`), so a reader cannot
+    // use the preview to read another table or to drop the chart's filters.
+    let raw: Value = serde_json::from_slice(&body)
+        .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
+    let input = if raw.get("drillOf").is_some() {
+        crate::routes::drill::drill_input(&state.clickhouse, raw).await?
+    } else {
+        serde_json::from_value(raw)
+            .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?
+    };
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -582,6 +592,15 @@ pub async fn specs_preview(
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
     crate::routes::support::annotate_saved_table(&mut result, &spec);
+    let bin_reads =
+        crate::routes::support::preview_bin_reads(&state.clickhouse, &spec, &time).await;
+    crate::routes::support::annotate_bins(
+        &state.clickhouse,
+        &mut result,
+        &bin_reads,
+        (&principal.role_names, &placeholders, &obligations),
+    )
+    .await;
     // BI-6 part 2: the last result's rows for the table beside the chart.
     let rows = crate::routes::support::preview_rows(
         &state.clickhouse,
@@ -1164,12 +1183,14 @@ async fn joined_fields_body(ch: &ChClient, mart: &str, raw: &str) -> Result<Valu
         lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::Mart, &base)
             .await
             .map_err(|failure| classify_dashboard_ch_error(&failure))?;
+    let hierarchies = hierarchies_of(ch, lakehouse_bi::fields::SourceKind::Mart, &base).await;
     Ok(json!({
         "mart": base,
         "dimensions": dimensions,
         "measures": measures,
         "columns": columns_out,
         "calculated": calculated,
+        "hierarchies": hierarchies,
         "joined": planned.joined,
         "joins": joins,
     }))
@@ -1253,6 +1274,8 @@ async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> 
     )
     .await
     .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let hierarchies =
+        hierarchies_of(ch, lakehouse_bi::fields::SourceKind::SqlSource, &source.id).await;
     Ok(json!({
         "source": source.id,
         "title": source.title,
@@ -1260,6 +1283,7 @@ async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> 
         "measures": measures,
         "columns": source.columns,
         "calculated": calculated,
+        "hierarchies": hierarchies,
     }))
 }
 
@@ -1318,13 +1342,32 @@ async fn fields_body(
     let calculated =
         lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::Mart, &safe)
             .await?;
+    let hierarchies = hierarchies_of(ch, lakehouse_bi::fields::SourceKind::Mart, &safe).await;
     Ok(json!({
         "mart": safe,
         "dimensions": dimensions,
         "measures": measures,
         "columns": columns_out,
         "calculated": calculated,
+        "hierarchies": hierarchies,
     }))
+}
+
+/// `BI-10`: a source's hierarchies for the `fields` responses. An optional
+/// lookup: when it fails the list is empty and the failure is logged, because
+/// a hierarchy is a convenience and must not take the builder down with it.
+async fn hierarchies_of(
+    ch: &ChClient,
+    kind: lakehouse_bi::fields::SourceKind,
+    id: &str,
+) -> Vec<lakehouse_bi::hierarchies::HierarchyDef> {
+    match lakehouse_bi::hierarchies::list_for(ch, kind, id).await {
+        Ok(found) => found,
+        Err(err) => {
+            let _reference = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            Vec::new()
+        }
+    }
 }
 
 // ── /api/dashboard/join-suggestions (BI-7) ───────────────────────────────
@@ -1481,6 +1524,11 @@ pub struct RecordsQuery {
     /// without it the list is the relation's rows narrowed by `filters` only.
     #[serde(default)]
     chart: Option<String>,
+    /// `BI-10`: with `column` and `value`, `value` is the lower edge of a bin
+    /// of this width, and the rows are those whose raw number `column` falls in
+    /// it (closed above when the bin is the last).
+    #[serde(default, rename = "binWidth")]
+    bin_width: Option<String>,
 }
 
 /// Rows per page: the default and the maximum (BI-18·B; the owner confirms 50
@@ -1770,9 +1818,36 @@ fn records_number(raw: Option<&str>, name: &str, default: u64) -> Result<u64, Ap
 fn records_value<'a>(
     drill: Option<&'a (lakehouse_core::ident::Ident, &'a str)>,
     cols: &RelationColumns,
-    grain: Option<&str>,
+    (grain, bin_width): (Option<&str>, Option<&str>),
 ) -> Result<Option<lakehouse_bi::builder::RecordsValue<'a>>, ApiError> {
     use lakehouse_bi::builder::RecordsValue;
+    // BI-10: a bin is a number column, an edge and a width, all checked here;
+    // it is not a grain.
+    if let Some(width) = bin_width.map(str::trim).filter(|w| !w.is_empty()) {
+        let (Some((ident, text)), None) = (drill, grain) else {
+            return Err(ApiError::BadRequest(
+                "binWidth needs a column and a value, and no grain".to_owned(),
+            ));
+        };
+        let number = |raw: &str| raw.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        let (Some(lower), Some(width)) = (number(text), number(width)) else {
+            return Err(ApiError::BadRequest(
+                "a bin is a number and a width".to_owned(),
+            ));
+        };
+        if !(lakehouse_bi::bin::MIN_WIDTH..=lakehouse_bi::bin::MAX_WIDTH).contains(&width)
+            || cols.get(ident.as_str()) != Some(&ColumnKind::Number)
+        {
+            return Err(ApiError::BadRequest(
+                "bins are for number columns of a sensible width".to_owned(),
+            ));
+        }
+        return Ok(Some(RecordsValue::Bin {
+            column: ident,
+            lower,
+            width,
+        }));
+    }
     let bucket_grain = parse_grain_param(grain)?;
     match (drill, bucket_grain) {
         (Some((ident, text)), Some(grain)) => {
@@ -1873,7 +1948,11 @@ async fn records_for_roles(
         }
         None => None,
     };
-    let value = records_value(drill.as_ref(), &relation.cols, q.grain.as_deref())?;
+    let value = records_value(
+        drill.as_ref(),
+        &relation.cols,
+        (q.grain.as_deref(), q.bin_width.as_deref()),
+    )?;
     let sql = lakehouse_bi::builder::records_sql(
         &relation.from,
         &relation.cols,
@@ -2806,7 +2885,17 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
 /// groupings, steps) and the `BI-7` joins, present only on the charts that carry them. A measure's own
 /// aggregate is part of `measures`, which is always listed.
 fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 6] = ["filters", "sort", "other", "groupings", "steps", "joins"];
+    const NAMES: [&str; 9] = [
+        "filters",
+        "sort",
+        "other",
+        "groupings",
+        "steps",
+        "joins",
+        "bin",
+        "breakdownBin",
+        "grid",
+    ];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
         return;
     };
@@ -3127,6 +3216,22 @@ mod tests {
             chart_def_fields(&joined).into_iter().collect();
         assert_eq!(fields["joins"][0]["type"], "left");
         assert_eq!(fields["joins"][0]["on"][0]["op"], "=");
+        // BI-10: bins and grids are exported as written, and only when present.
+        assert!(!keys(&plain).contains(&"bin") && !keys(&plain).contains(&"grid"));
+        let binned = def(json!({
+            "dimension": "visitors", "bin": {"mode": "width", "width": 500},
+            "breakdown": "stay", "breakdownBin": {"mode": "count", "count": 10},
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&binned).into_iter().collect();
+        assert_eq!(fields["bin"], json!({"mode": "width", "width": 500}));
+        assert_eq!(fields["breakdownBin"]["count"], 10);
+        let mapped = def(json!({
+            "kind": "pointmap", "lat": "a", "lon": "b", "grid": {"size": "auto"},
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&mapped).into_iter().collect();
+        assert_eq!(fields["grid"], json!({"size": "auto"}));
         let table = def(json!({
             "kind": "table", "dimension": "",
             "groupings": [{"column": "kab"}, {"column": "d", "grain": "month"}],
@@ -5547,3 +5652,9 @@ mod chart_shapes_rewrite;
 #[cfg(test)]
 #[path = "join_rewrite.rs"]
 mod join_rewrite;
+
+// BI-10: the role rewrite on charts that bin a number or draw a grid; see
+// `chart_shapes_rewrite` above.
+#[cfg(test)]
+#[path = "bin_rewrite.rs"]
+mod bin_rewrite;

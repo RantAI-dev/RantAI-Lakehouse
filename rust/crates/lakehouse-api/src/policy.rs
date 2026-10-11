@@ -464,6 +464,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
     // BI-7: join suggestions read column metadata only, like `fields`.
     ("GET",    "/api/dashboard/join-suggestions", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),

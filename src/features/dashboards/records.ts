@@ -20,6 +20,8 @@ export type RecordsRequest = {
   value?: string;
   /** With `column` and `value`: `value` is a bucket of a chart grouped by this grain (BI-9), and the rows are those that fall in it. */
   grain?: string;
+  /** With `column` and `value`: `value` is the lower edge of a bin of this width (BI-10), and the rows are those whose number falls in it. */
+  binWidth?: number;
   /** The dashboard's active filters, so the list agrees with the number clicked. */
   filters: FilterDef[];
   /**
@@ -55,6 +57,7 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
     q.set("column", req.column);
     q.set("value", req.value);
     if (req.grain) q.set("grain", req.grain);
+    if (req.binWidth !== undefined) q.set("binWidth", String(req.binWidth));
   }
   if (req.columns?.length) {
     q.set("columns", req.columns.join(","));
