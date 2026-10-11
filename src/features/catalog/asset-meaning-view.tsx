@@ -169,8 +169,9 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // ── The Meaning view ──────────────────────────────────────────────────────
 //
 // Header and rows share one grid string, as the Columns card does: fixed
-// tracks in `rem`, flexible ones `minmax(0, …fr)`, so a row truncates and
-// never widens the list. Cells shed by container query, in this order
+// tracks in `rem`, flexible ones `minmax(0, …fr)`, so a cell never widens the
+// list. The meaning takes up to two lines; the other cells truncate to one.
+// Cells shed by container query, in this order
 // (PR #109 review, finding 4): the synonyms go first, below `@3xl`; the status
 // goes second, below `@2xl`, so a reader who cannot write still sees whether
 // an entry is a draft. The column name, the role, the meaning and the confirm
@@ -180,7 +181,8 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // label, so it is read whole (staging run 2026-10-11, item 1), and the meaning
 // gets `minmax(0, 1.6fr)`, the widest of the flexible tracks, since it is what
 // the row is for. The confirm control keeps its fixed 1.75rem. The row shows
-// the role's short label with the full one as its title.
+// the role's short label with the full one as its title. A meaning clamps to
+// two lines, so a long one is read in full (staging run 2026-10-11, item 2).
 const MEANING_ROW = "grid items-center gap-x-3 px-3"
 const MEANING_TRACKS = [
   "grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]",
@@ -297,10 +299,10 @@ function MeaningRow({
               onClick={onEdit}
               className="h-auto w-full min-w-0 justify-start px-1 py-0.5 text-left text-xs font-normal"
             >
-              <span className="block min-w-0 truncate">{entry.description}</span>
+              <span className="block min-w-0 line-clamp-2">{entry.description}</span>
             </Button>
           ) : (
-            <span className="block truncate text-xs" title={entry.description}>
+            <span className="block line-clamp-2 text-xs" title={entry.description}>
               {entry.description}
             </span>
           )

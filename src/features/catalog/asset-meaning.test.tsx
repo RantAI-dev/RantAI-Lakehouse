@@ -236,6 +236,26 @@ describe("the meaning view", () => {
     fireEvent.click(meaningTab())
     expect(within(meaningTable()).getAllByRole("row")).toHaveLength(4)
   })
+
+  it("clamps a meaning to two lines, not one, for a reader who can write", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const classes = within(meaningTable()).getByText("Total order value in rupiah").className.split(/\s+/)
+    expect(classes).toContain("line-clamp-2")
+    expect(classes).not.toContain("truncate")
+  })
+
+  it("clamps a meaning to two lines, not one, for a reader who cannot write", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: false })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const classes = within(meaningTable()).getByText("Number of distinct customers").className.split(/\s+/)
+    expect(classes).toContain("line-clamp-2")
+    expect(classes).not.toContain("truncate")
+  })
 })
 
 describe("Drafts only", () => {
