@@ -42,6 +42,8 @@ export type CombinedInput = {
   y: string | string[];
   /** Readable names for base result columns (`avg_stay` → "avg of stay"). */
   measureLabels?: Record<string, string>;
+  /** BI-2: the label of each metric by name, from the tile payload. */
+  metricLabels?: Record<string, string>;
   rows: Row[];
   layers: readonly LayerCell[];
   /** The layers' definitions, to name their measures. */
@@ -122,7 +124,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     if (!answered(l)) return;
     const dim = dimensionOf(l);
     const cols = l.columns.filter((c) => c !== dim && c !== "__other");
-    const labelsOf = tileMeasureLabels(input.layerMeasures?.[index], cols);
+    const labelsOf = tileMeasureLabels(input.layerMeasures?.[index], cols, undefined, input.metricLabels);
     for (const col of cols) {
       series.push({
         name: cols.length === 1 ? l.label : `${l.label} · ${labelsOf[col] ?? displayColumn(col)}`,

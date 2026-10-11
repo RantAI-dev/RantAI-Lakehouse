@@ -18,6 +18,8 @@ export type Rows = {
   rows: Record<string, unknown>[];
   /** Active filters this tile's data could not honour (BI-18). */
   filtersSkipped?: FilterSkip[];
+  /** The label of each metric the tile shows, by metric name; a metric with no label is absent and reads by its name (BI-2). */
+  metricLabels?: Record<string, string>;
   /** The grain the rows were bucketed with, when the chart has one (BI-9). */
   grain?: string;
   /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */

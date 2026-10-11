@@ -210,6 +210,11 @@ test("the labels of a tile with steps come from the last step, not from the meas
   const labels = tileMeasureLabels(["visitors"], ["sum_visitors"], [{ summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }] } }])
   assert.deepEqual(labels, { sum_visitors: "sum of visitors" })
   assert.deepEqual(tileMeasureLabels([{ column: "stay", aggregate: "avg" }], "avg_stay", [{ filter: [{ column: "avg_stay", op: "gt", value: "1" }] }]), { avg_stay: "avg of stay" })
+  // BI-2 review fix (SHOULD-FIX) R3: the tile payload's label wins for a metric; a column or an own aggregate keeps its reading.
+  assert.deepEqual(
+    tileMeasureLabels([{ metric: "total_visitors" }, "visitors", { column: "stay", aggregate: "avg" }], ["total_visitors", "visitors", "avg_stay"], undefined, { total_visitors: "Total visitors" }),
+    { total_visitors: "Total visitors", avg_stay: "avg of stay" },
+  )
 })
 
 test("internal columns are left out of every list a person reads", () => {

@@ -431,8 +431,14 @@ export function withResolvedSlots<D extends { dimension?: string; breakdown?: st
  * Result name → readable label ("avg of stay") for a tile, by position: the
  * tile's `y` names the result columns in the order of the definition's
  * measures, and a name that differs from its column is an own aggregate.
+ * `metricLabels` is the tile payload's label of each metric by name.
  */
-export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined, y: string | readonly string[], steps?: readonly StepDef[]): Record<string, string> {
+export function tileMeasureLabels(
+  measures: readonly MeasureEntry[] | undefined,
+  y: string | readonly string[],
+  steps?: readonly StepDef[],
+  metricLabels?: Readonly<Record<string, string>>,
+): Record<string, string> {
   const names = Array.isArray(y) ? y : [y as string]
   const out: Record<string, string> = {}
   // After steps the columns are the last step's, not the definition's measures by position.
@@ -448,7 +454,13 @@ export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined,
   }
   names.forEach((name, i) => {
     const entry = measures?.[i]
-    if (entry && typeof entry !== "string" && !("metric" in entry) && name !== entry.column) {
+    // BI-2 review fix (SHOULD-FIX) R3: a metric reads by its label ("Total
+    // visitors"), which the server sends with the tile; with no label the name
+    // stays, as before. Only a measure that is not an own aggregate can be one.
+    const metricLabel = metricLabels?.[name]
+    if (metricLabel && (!entry || typeof entry === "string" || "metric" in entry)) {
+      out[name] = metricLabel
+    } else if (entry && typeof entry !== "string" && !("metric" in entry) && name !== entry.column) {
       out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${displayColumn(entry.column)}`
     } else if (typeof name === "string" && displayColumn(name) !== name) {
       // BI-7: a measure from a joined table reads table.column.

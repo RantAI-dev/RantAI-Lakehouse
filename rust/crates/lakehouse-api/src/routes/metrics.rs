@@ -253,10 +253,19 @@ async fn metric_usage(ch: &ChClient, m: &MetricDef) -> Result<Usage, ApiError> {
         .filter(|r| r.metric.as_deref() == Some(m.name.as_str()))
         .map(|r| (r.id, r.name))
         .collect();
+    // BI-2 review fix (SHOULD-FIX) R2: the usage applies the reader's rule for
+    // a measure without the marker, which needs the source's fields and
+    // columns. A source that cannot be read leaves the columns empty: more
+    // charts count as users, so a delete is refused, never wrongly allowed.
+    let (fields, _) = of_source(ch, kind, &source).await?;
+    let cols = resolve_current(ch, kind, &source)
+        .await
+        .map(|r| r.cols)
+        .unwrap_or_default();
     let mut used = usage_of(
         ch,
         move |charts| {
-            metrics::charts_using_metric(charts, kind, &source, &name)
+            metrics::charts_using_metric(charts, (kind, &source), (&fields, &cols), &name)
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
@@ -292,6 +301,30 @@ async fn segment_usage(ch: &ChClient, s: &SegmentDef) -> Result<Usage, ApiError>
         named_by,
     )
     .await
+}
+
+/// The fields and columns of each source the metrics sit on, for the usage
+/// rule (`BI-2` review fix (SHOULD-FIX) R2). A source that cannot be read has
+/// none of either, as for the usage route: more charts count as users.
+type SourceRead = ((SourceKind, String), (Vec<FieldDef>, RelationColumns));
+
+async fn source_reads(ch: &ChClient, shown: &[MetricDef]) -> Vec<SourceRead> {
+    let mut read: Vec<SourceRead> = Vec::new();
+    for m in shown {
+        let key = (m.source_kind, m.source_id.clone());
+        if read.iter().any(|(k, _)| *k == key) {
+            continue;
+        }
+        let fields = fields::list_fields_for(ch, m.source_kind, &m.source_id)
+            .await
+            .unwrap_or_default();
+        let cols = resolve_current(ch, m.source_kind, &m.source_id)
+            .await
+            .map(|r| r.cols)
+            .unwrap_or_default();
+        read.push((key, (fields, cols)));
+    }
+    read
 }
 
 /// `GET /api/dashboard/metrics[?mart=|source=]` — the metrics, each with the
@@ -333,11 +366,23 @@ pub async fn list(
         .into_iter()
         .map(|s| (s.id, s.title))
         .collect();
+    // R2: the count follows the same rule as the usage route.
+    let read = source_reads(ch, &shown).await;
     let rows: Vec<Value> = shown
         .iter()
         .map(|m| {
-            let used =
-                metrics::charts_using_metric(&charts, m.source_kind, &m.source_id, &m.name).len();
+            let empty = (Vec::new(), RelationColumns::default());
+            let (fields, cols) = read
+                .iter()
+                .find(|(k, _)| k.0 == m.source_kind && k.1 == m.source_id)
+                .map_or(&empty, |(_, v)| v);
+            let used = metrics::charts_using_metric(
+                &charts,
+                (m.source_kind, &m.source_id),
+                (fields, cols),
+                &m.name,
+            )
+            .len();
             let title = match m.source_kind {
                 SourceKind::Mart => m.source_id.clone(),
                 SourceKind::SqlSource => titles

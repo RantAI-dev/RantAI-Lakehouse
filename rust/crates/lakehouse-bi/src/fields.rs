@@ -452,6 +452,49 @@ impl FieldCatalog {
         prepare(self.for_chart(def), def, from, cols, time).is_err()
     }
 
+    /// BI-2 review fix (SHOULD-FIX) R3: the label of each metric `def` reads
+    /// (as a measure of the chart or of one of its questions), by metric name,
+    /// so a tile can show "Total visitors" where its result column is called
+    /// `total_visitors`. A metric with no label, or whose label is its name, is
+    /// left out and the tile shows the name. `raw` is the chart's own source
+    /// columns: with them a plain measure that the reader would read as the
+    /// metric ([`plain_name_is_metric`]) is labelled too; without them only a
+    /// marked measure is.
+    #[must_use]
+    pub fn metric_labels(
+        &self,
+        def: &ChartInput,
+        raw: Option<&RelationColumns>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let mut take = |fields: &[FieldDef],
+                        measures: &crate::shape::MeasureList,
+                        raw: Option<&RelationColumns>| {
+            for (i, name) in measures.iter().enumerate() {
+                let is = measures.is_metric(i)
+                    || raw.is_some_and(|r| plain_name_is_metric(fields, r, name));
+                let label = fields
+                    .iter()
+                    .find(|f| f.is_metric() && f.name == *name)
+                    .and_then(crate::metrics::entry_label);
+                if let (true, Some(label)) = (is, label)
+                    && label != *name
+                {
+                    out.insert(name.clone(), label);
+                }
+            }
+        };
+        take(self.for_chart(def), &def.measures, raw);
+        for l in def.shape.layers_list() {
+            let fields = match l.sql_source.as_deref().filter(|s| !s.is_empty()) {
+                Some(id) => self.of(SourceKind::SqlSource, id),
+                None => self.of(SourceKind::Mart, &l.mart),
+            };
+            take(fields, &l.measures, None);
+        }
+        out
+    }
+
     /// Whether `def` names a field of its source (and so must be built at
     /// read time, with the source's columns at hand).
     #[must_use]
@@ -694,6 +737,25 @@ pub fn prepare_named<H: std::hash::BuildHasher>(
     prepare_refs(fields, &refs, &none, from, cols, time)
 }
 
+/// Whether a plain (unmarked) measure `name` is a metric of the source.
+///
+/// BI-2 review fix (BLOCKER) R1: a chart saved before the stored definition
+/// kept its metric marker has the metric's name as a plain measure. A name
+/// that is no column and no calculated field, and is a metric of the source,
+/// is that metric, so such a chart heals on its next read.
+///
+/// BI-2 review fix (SHOULD-FIX) R2: the reader ([`named_metrics`]) and the
+/// metric's usage (`metrics::charts_using_metric`, which the delete-in-use
+/// rule shares) both ask this one function, so they cannot disagree.
+#[must_use]
+pub fn plain_name_is_metric(fields: &[FieldDef], raw: &RelationColumns, name: &str) -> bool {
+    !raw.contains_key(name)
+        && !fields
+            .iter()
+            .any(|f| f.is_formula_field() && f.name == name)
+        && fields.iter().any(|f| f.is_metric() && f.name == name)
+}
+
 /// The metrics the measures name (`BI-2`). A measure that names a metric
 /// matches a metric and nothing else: a metric that is gone, or that has a
 /// column's name, is the tile's plain error, with no fallback to a column or
@@ -704,18 +766,8 @@ fn named_metrics<'a>(
     raw: &RelationColumns,
 ) -> Result<BTreeSet<&'a str>, String> {
     let mut metrics: BTreeSet<&str> = BTreeSet::new();
-    // BI-2 review fix (BLOCKER) R1: a chart saved before the stored definition
-    // kept its metric marker has the metric's name as a plain measure. A name
-    // that is no column and no calculated field, and is a metric of this
-    // source, is that metric, so such a chart heals on its next read.
-    let healed = |name: &str, slot: Slot| {
-        slot == Slot::Measure
-            && !raw.contains_key(name)
-            && !fields
-                .iter()
-                .any(|f| f.is_formula_field() && f.name == name)
-            && fields.iter().any(|f| f.is_metric() && f.name == name)
-    };
+    let healed =
+        |name: &str, slot: Slot| slot == Slot::Measure && plain_name_is_metric(fields, raw, name);
     for (name, _) in refs
         .iter()
         .filter(|(n, s)| *s == Slot::Metric || healed(n, *s))

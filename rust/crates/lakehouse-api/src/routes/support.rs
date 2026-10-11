@@ -310,6 +310,45 @@ pub(crate) async fn sources_for<'a>(
         .collect())
 }
 
+fn own_columns(
+    chart: &store::StoredChartSpec,
+    mart_cols: &HashMap<String, RelationColumns>,
+    sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+) -> Option<RelationColumns> {
+    match chart.def.sql_source.as_deref() {
+        Some(id) => sources
+            .get(id)
+            .map(lakehouse_bi::sources::SqlSource::column_kinds),
+        None => mart_cols.get(&chart.def.mart).cloned(),
+    }
+}
+
+/// The columns of the marts and the SQL sources a read loaded.
+pub(crate) type SourceColumns<'a> = (
+    &'a HashMap<String, RelationColumns>,
+    &'a HashMap<String, lakehouse_bi::sources::SqlSource>,
+);
+
+/// BI-2 review fix (SHOULD-FIX) R3: the label of each metric the tile shows,
+/// by metric name, as `metricLabels` on the tile's result, so the console
+/// labels a legend, an axis, a tooltip and a table header without a second
+/// request. Left out when no metric of the chart has a label.
+pub(crate) fn annotate_metric_labels(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    fields: &lakehouse_bi::fields::FieldCatalog,
+    columns: Option<SourceColumns<'_>>,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    let own = columns.and_then(|(marts, sources)| own_columns(chart, marts, sources));
+    let labels = fields.metric_labels(&chart.def, own.as_ref());
+    if !labels.is_empty() {
+        tile.insert("metricLabels".to_owned(), json!(labels));
+    }
+}
+
 /// The SQL to run for a stored chart right now: a mart chart through
 /// `sql_with_filters_report`, a SQL-source chart rebuilt from the source's
 /// CURRENT text (`sql_for_sql_source_report`), plus the active filters left
@@ -330,12 +369,7 @@ pub(crate) fn stored_chart_sql(
 ) -> Result<FilteredSql, &'static str> {
     // BI-2: a metric or segment that is gone is the tile's plain error; the
     // statement saved with the chart would show the old number or a wider set.
-    let own_cols = match chart.def.sql_source.as_deref() {
-        Some(id) => sources
-            .get(id)
-            .map(lakehouse_bi::sources::SqlSource::column_kinds),
-        None => mart_cols.get(&chart.def.mart).cloned(),
-    };
+    let own_cols = own_columns(chart, mart_cols, sources);
     if let Some(cols) = &own_cols
         && read.fields.broken_reference(&chart.def, cols, read.time)
     {

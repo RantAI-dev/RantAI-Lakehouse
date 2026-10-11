@@ -426,6 +426,10 @@ struct EntryBody {
     /// Why the metric cannot be used (a segment it names is gone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// BI-2 review fix (SHOULD-FIX) R3: the metric's label, so a tile can show
+    /// it where it would show the identifier. Empty when the metric has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    label: String,
     /// The date column and default grain of the metric's comparisons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_column: Option<String>,
@@ -454,6 +458,7 @@ pub fn entry_of_metric(def: &MetricDef, expanded: Result<Vec<FilterDef>, String>
             formula: def.formula.clone(),
             filters,
             error,
+            label: def.label.trim().to_owned(),
             time_column: def.time_column.clone(),
             grain: def.grain.clone(),
         }),
@@ -462,6 +467,19 @@ pub fn entry_of_metric(def: &MetricDef, expanded: Result<Vec<FilterDef>, String>
         created_by: def.created_by.clone(),
         updated_at: def.updated_at.clone(),
     }
+}
+
+/// The label a metric's catalog entry carries; `None` when it has none or is
+/// not a metric entry (the caller then shows the name).
+#[must_use]
+pub fn entry_label(entry: &FieldDef) -> Option<String> {
+    if !entry.is_metric() {
+        return None;
+    }
+    serde_json::from_str::<EntryBody>(&entry.formula)
+        .ok()
+        .map(|b| b.label)
+        .filter(|l| !l.is_empty())
 }
 
 /// The catalog entry of a segment.
@@ -722,25 +740,37 @@ pub fn value_chart(q: &ValueQuery<'_>) -> crate::store::StoredChartSpec {
 
 /// Stored charts that name the metric `name` of a source, as a measure of the
 /// chart or of one of its questions, by chart id.
+///
+/// BI-2 review fix (SHOULD-FIX) R2: a measure without the metric marker (a
+/// chart saved before the marker was kept) counts when the reader would read
+/// it as the metric, by [`crate::fields::plain_name_is_metric`]. `fields` and
+/// `cols` are the fields and columns of the source `(kind, source_id)` itself;
+/// they are only consulted for a measure of that source.
 #[must_use]
 pub fn charts_using_metric<'a>(
     charts: &'a [crate::store::StoredChartSpec],
-    kind: SourceKind,
-    source_id: &str,
+    (kind, source_id): (SourceKind, &str),
+    (fields, cols): (&[FieldDef], &RelationColumns),
     name: &str,
 ) -> Vec<&'a str> {
+    let on = |mart: &str, sql: Option<&str>| match kind {
+        SourceKind::SqlSource => sql == Some(source_id),
+        SourceKind::Mart => sql.is_none_or(str::is_empty) && mart == source_id,
+    };
+    let names = |m: &crate::shape::MeasureList| {
+        m.iter().enumerate().any(|(i, n)| {
+            n == name && (m.is_metric(i) || crate::fields::plain_name_is_metric(fields, cols, name))
+        })
+    };
     charts
         .iter()
         .filter(|c| {
-            let on = |mart: &str, sql: Option<&str>| match kind {
-                SourceKind::SqlSource => sql == Some(source_id),
-                SourceKind::Mart => sql.is_none_or(str::is_empty) && mart == source_id,
-            };
-            let own = on(&c.def.mart, c.def.sql_source.as_deref())
-                && c.def.measures.metric_names().any(|m| m == name);
-            own || c.def.shape.layers_list().iter().any(|l| {
-                on(&l.mart, l.sql_source.as_deref()) && l.measures.metric_names().any(|m| m == name)
-            })
+            (on(&c.def.mart, c.def.sql_source.as_deref()) && names(&c.def.measures))
+                || c.def
+                    .shape
+                    .layers_list()
+                    .iter()
+                    .any(|l| on(&l.mart, l.sql_source.as_deref()) && names(&l.measures))
         })
         .map(|c| c.spec.id.as_str())
         .collect()
@@ -1078,6 +1108,66 @@ mod tests {
             StoredChartSpec::for_test(ChartKind::Bar, "mart_x", "g", &[], "SELECT 1".to_owned());
         c.def.measures = serde_json::from_value(measures).unwrap();
         c
+    }
+
+    #[test]
+    fn a_bare_measure_that_is_a_metric_of_the_source_is_a_use_and_a_real_column_is_not() {
+        let m = metric("total", "Sum(v)", vec![]);
+        let fields = catalog_entries(&[m, metric("v2", "Sum(w)", vec![])], &[]);
+        let c = cols();
+        // A chart saved before the marker was kept: the metric is a bare name.
+        let mut bare =
+            StoredChartSpec::for_test(ChartKind::Bar, "mart_x", "g", &["total"], "S".to_owned());
+        bare.spec.id = "bare".to_owned();
+        let mut marked = chart_of_metrics(json!([{ "metric": "total" }]));
+        marked.spec.id = "marked".to_owned();
+        // A bare name that is a column of the source stays the column.
+        let mut column =
+            StoredChartSpec::for_test(ChartKind::Bar, "mart_x", "g", &["v"], "S".to_owned());
+        column.spec.id = "column".to_owned();
+        let mut other_source =
+            StoredChartSpec::for_test(ChartKind::Bar, "mart_y", "g", &["total"], "S".to_owned());
+        other_source.spec.id = "other".to_owned();
+        let charts = vec![bare, marked, column, other_source];
+        let used = |name: &str| {
+            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&fields, &c), name)
+        };
+        assert_eq!(used("total"), vec!["bare", "marked"]);
+        assert!(used("v2").is_empty());
+        // A metric that has a column's name never claims the column's users.
+        let clash = catalog_entries(&[metric("v", "Sum(w)", vec![])], &[]);
+        assert!(
+            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&clash, &c), "v")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_tile_carries_the_label_of_each_metric_and_leaves_out_one_with_no_label() {
+        let mut labelled = metric("total", "Sum(v)", vec![]);
+        labelled.label = "Total visitors".to_owned();
+        let mut blank = metric("w_sum", "Sum(w)", vec![]);
+        blank.label = String::new();
+        let catalog = FieldCatalog::from_fields(catalog_entries(&[labelled, blank], &[]));
+        let c = cols();
+        let marked = chart_of_metrics(json!([{ "metric": "total" }, { "metric": "w_sum" }, "v"]));
+        let labels = catalog.metric_labels(&marked.def, None);
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!(labels["total"], "Total visitors");
+        // A chart saved before the marker was kept: the bare name needs the
+        // source's columns to be read as the metric, and a column stays one.
+        let mut bare = StoredChartSpec::for_test(
+            ChartKind::Bar,
+            "mart_x",
+            "g",
+            &["total", "v"],
+            "S".to_owned(),
+        );
+        bare.spec.id = "bare".to_owned();
+        assert!(catalog.metric_labels(&bare.def, None).is_empty());
+        let healed = catalog.metric_labels(&bare.def, Some(&c));
+        assert_eq!(healed.len(), 1, "{healed:?}");
+        assert_eq!(healed["total"], "Total visitors");
     }
 
     #[test]

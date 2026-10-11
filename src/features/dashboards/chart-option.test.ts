@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
+import { tileMeasureLabels } from "@/lib/chart-shape"
 import { MARKER_LIMIT, buildOption, showsPointMarkers, withReferenceLines } from "./chart-option"
 
 const rowsOf = (n: number) => Array.from({ length: n }, (_, i) => ({ x: `p${i}`, v: i }))
@@ -120,3 +121,20 @@ test("BI-11: a line that is not a number is not drawn", () => {
   const base = buildOption({ kind: "line", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 1 }], false);
   assert.equal(withReferenceLines(base, [{ value: Number.NaN }], false, false), base);
 });
+
+// BI-2 review fix (SHOULD-FIX) R3: a metric reads by its label in the legend, the axis and the tooltip.
+test("a chart of metrics names its series and axes by the metric's label, and by its name when it has none", () => {
+  const rows = [{ c: "a", total_visitors: 10, office_visitors: 4, avg_stay: 2 }]
+  const y = ["total_visitors", "office_visitors", "avg_stay"]
+  const labels = tileMeasureLabels(
+    [{ metric: "total_visitors" }, { metric: "office_visitors" }, { column: "stay", aggregate: "avg" }],
+    y, undefined, { total_visitors: "Total visitors" },
+  )
+  const bar = buildOption({ kind: "bar", x: "c", y, measureLabels: labels }, rows, false)
+  assert.deepEqual((bar.series as { name: string }[]).map((s) => s.name), ["Total visitors", "office_visitors", "avg of stay"])
+  const combo = buildOption({ kind: "combo", x: "c", y: ["total_visitors", "office_visitors"], measureLabels: labels }, rows, false)
+  assert.equal(((combo.yAxis as { name: string }[])[0]).name, "Total visitors")
+  // A chart saved before the marker was kept lists the bare name; the label still follows the name.
+  const bare = tileMeasureLabels(["total_visitors"], ["total_visitors"], undefined, { total_visitors: "Total visitors" })
+  assert.deepEqual(bare, { total_visitors: "Total visitors" })
+})

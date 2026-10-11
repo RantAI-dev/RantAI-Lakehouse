@@ -22,7 +22,8 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
-    mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
+    annotate_metric_labels, mart_columns, render_stored_spec, run_spec_sql, sources_for,
+    stored_chart_sql,
 };
 use crate::state::AppState;
 use crate::upstream_error;
@@ -599,6 +600,7 @@ async fn render_board_payload(
                 .await;
                 crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain)
                     .await;
+                annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
                 results.insert(id, val);
             }
             Err(msg) => {

@@ -375,6 +375,12 @@ async fn get_body(
         )
         .await;
         crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain).await;
+        crate::routes::support::annotate_metric_labels(
+            &mut val,
+            c,
+            &field_catalog,
+            Some((&cols, &sources)),
+        );
         // The tile still renders; this only lets it say which active filters
         // its data cannot honour (no such column, or a type that does not fit).
         if !skipped.is_empty()
@@ -716,6 +722,14 @@ pub async fn specs_preview(
         && let Ok(entries) = lakehouse_bi::fields::list_catalog_fields(&state.clickhouse).await
     {
         crate::routes::support::annotate_metric_period(&mut result, &spec, &entries);
+        // BI-2 review fix (SHOULD-FIX) R3: the preview's measures are marked,
+        // so no source columns are needed.
+        crate::routes::support::annotate_metric_labels(
+            &mut result,
+            &spec,
+            &lakehouse_bi::fields::FieldCatalog::from_fields(entries),
+            None,
+        );
     }
     crate::routes::support::annotate_params(&mut result, &spec, time.params());
     // BI-13: the chart's other questions, each as the viewer.
