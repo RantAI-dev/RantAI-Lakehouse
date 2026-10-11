@@ -1,169 +1,227 @@
 # Backlog
 
-The one list of known work. Look at it weekly; pick what is next.
+The master list of Lakehouse work. Every item has a stable ID, and the IDs
+are never reused. The coding agents read this file, so it is the source of
+truth for the work (`DEC-11`).
 
-- **When:** Now, Next, Later, or Decide (needs a yes/no first).
-- **Source:** where the item comes from, so it can be checked. "PRODUCT §2"
+**This file and the Lark base.** The base mirrors this list. The repo holds
+everything about an item: its ID, kind, text, module, priority, status, PR,
+source, its dates (the **Dates** section), its spec in [`specs/`](specs/) and
+its QA-case results (the acceptance table on its feature page). The base adds
+only what a public repo must not hold: the people, Owner and Acceptor, held
+through each module's owner (`DEC-12`). When anything here changes, the base
+row is updated to match (`AGENTS.md` step 6). Nothing the repo holds is
+changed only in the base.
+
+## The columns
+
+- **Kind**: **Feature** (one thing a user can do or rely on; it has an
+  acceptance checklist and an Acceptor), **Task** (tracked work that is not
+  itself a user capability: a fix, a test, a check), or **Decision** (a choice
+  the product owner makes).
+- **Module**: from the base's list: Data, Dashboards, Query Studio
+  (`DEC-13`), AI Copilot, Build, Governance, Operations,
+  Administration & Security. Four names used here are **not yet in the
+  base**; the owner adds or remaps them: Platform, Delivery, Docs, Business.
+- **Priority**: P0 (blocks production), P1, P2, P3. The old When maps to it:
+  Now = P1, Next = P2, Later = P3. P0 today: `SEC-14`, `SEC-15` (`DEC-14`)
+  and `SEC-22`.
+- **Status**, by kind:
+  - Feature: the base's six: **Idea** (no spec yet), **Planned** (has a spec,
+    not started), **Building**, **In Acceptance** (merged, waiting for the
+    owner's checklist), **Released** (accepted on a real deployment, with
+    evidence), **Killed**. Merged is never Released.
+  - Task: **Todo**, **In Progress**, **Blocked**, **Done**.
+  - Decision: **Open**, **Decided**.
+  - Todo and Blocked are the base's words; **In Progress**, **Done**,
+    **Open** and **Decided** are the planner's until checked against the
+    base's lists, and are renamed here if the base uses other words.
+- **PR**: the pull request(s) that delivered it.
+- **Source**: where the item comes from, so it can be checked. "PRODUCT §2"
   is the coverage table in `PRODUCT.md`.
-- IDs are never reused. A finished or rejected item moves to the bottom with
-  the date and reason; it is not deleted.
-- **Specs:** every security, BI, assistant-for-dashboards, Data and Query
-  Studio item has its own spec file in [`specs/`](specs/), indexed under
-  "Specs" at the end of this file: target numbers against the best
-  competitor, an acceptance checklist and what is left out. A spec is not a
-  plan: each item still needs a feature page and a plan before anyone builds
-  it (`AGENTS.md`).
 
-## Now
+**Waits for.** An item that cannot start until another merges says so in its
+text (`AGENTS.md`). That is a dependency, not a status: the item stays
+**Planned** or **Todo**, never **Blocked**. Blocked means started work that
+is stopped, with the reason and who can unblock it. Specs carry the size
+estimate (S, M, L), which the base has no field for.
 
-| ID | Item | Area | Source |
+## Now (P0–P1)
+
+| ID | Kind | Item | Module | Priority | Status | PR | Source |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `AI-18` | Feature | Copilot Chat: ask a question or give an instruction in plain language, and the assistant answers or acts with the console's own tools; risky actions wait for approval. Built before this backlog tracked PRs; never accepted | AI Copilot | P1 | In Acceptance |  | `PRODUCT.md` §2 (Home, History) |
+| `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process | Administration & Security | P0 | Todo |  | PR #76 review, BLOCKER 1 (merged without the fix) |
+| `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
+| `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
+| `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history | Administration & Security | P1 | Todo |  | `SECURITY.md` |
+| `REL-1` | Task | Protect the main branch | Delivery | P1 | Todo |  | `docs/CI.md` |
+| `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Todo |  | PRODUCT §6 |
+| `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
+| `SEC-10` | Task | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver | Administration & Security | P1 | Todo |  | `lakehouse-notify` |
+| `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Todo |  | `routes/support.rs` |
+| `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server | Administration & Security | P0 | Building | #85 | `routes/connectors.rs`, `connector_probe.rs` |
+| `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | In Acceptance | #82 | `docker-compose.yml`, `connector_probe.rs` |
+| `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Todo |  | commit `7ec3a81` |
+
+## Next (P2)
+
+| ID | Kind | Item | Module | Priority | Status | PR | Source |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments | Dashboards | P2 | Planned |  | PRODUCT §2 |
+| `BI-1` | Feature | Export a dashboard as a server-made PDF and as Excel | Dashboards | P2 | Planned |  | PRODUCT §2 |
+| `BI-4` | Feature | Result caching for charts and queries; run a dashboard's tiles in parallel | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-5` | Feature | Configurable query timeouts and row limits; Stop cancels the query on the server | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-6` | Feature | A chart builder as capable as Metabase's and Tableau's: several dimensions, filters, sorting, multi-step questions. No drag and drop; the assistant covers that | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-7` | Feature | Joins in the chart builder without writing SQL | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-8` | Feature | Calculated fields and custom expressions: maths, text, dates, conditions, running totals | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-9` | Feature | Group by day, week, month, quarter, year | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-10` | Feature | Bins, groups and hierarchies | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-13` | Feature | Combine two sources on one chart | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-14` | Feature | Lineage from a chart to its sources, reachable from the dashboard | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-16` | Feature | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-17` | Feature | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-18` | Feature | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; favourites; version history; trash; personal space | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `AI-1` | Feature | The assistant manages the dashboards that exist today: rename boards, delete them (with approval), arrange and resize tiles, move charts between boards | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-2` | Feature | **Waits for `BI-18`**. The assistant adds and changes dashboard filters ("only 2025, only Bali") | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-3` | Feature | **Waits for `BI-9`**. The assistant picks the time grain ("monthly") | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-4` | Feature | **Waits for `BI-8`**. The assistant writes calculated fields in the product's formula language, not raw SQL | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-5` | Feature | **Waits for `BI-16`**, per chart type as it lands. The assistant creates every new chart type: raw and pivot tables, KPI with comparison, histogram, Gantt and the rest | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-6` | Feature | **Waits for `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13`**, each part with its BI item. The assistant builds charts with several dimensions and filters, joins tables, uses bins, groups, hierarchies and parameters, and combines two sources | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-7` | Feature | **Waits for `BI-2`**. The assistant uses named metrics before it writes SQL, so the same question gives the same number | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-8` | Feature | **Waits for `BI-17`**. The assistant changes number formats, colours, axes and labels, and adds trend and forecast lines | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-9` | Feature | **Waits for `BI-18`** (layout part). The assistant adds tabs and uses templates | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-10` | Feature | **Waits for `RPT-1`, `BI-1`**. The assistant schedules reports ("send this to me every Monday as PDF") and produces a PDF or Excel file on request | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-11` | Feature | **Waits for `BI-19`, `BI-26`, `DEC-8`**. The assistant creates share and embed links only with approval, respects dashboard permissions, and never grants permissions | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables **Waits for `QS-5`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-13` | Feature | **Waits for `BI-14`**. The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today) | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-14` | Feature | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | AI Copilot | P2 | Todo |  | `AGENTS.md` (assistant parity) |
+| `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BLD-1` | Feature | Joins and aggregations in the pipeline builder | Build | P2 | Idea |  | PRODUCT §2 |
+| `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
+| `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer) | Dashboards | P2 | Planned |  | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
+| `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
+| `OPS-8` | Feature | Usage and cost view | Operations | P2 | Idea |  | PRODUCT §2 |
+| `SEC-2` | Feature | Login rate limiting | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
+| `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Todo |  | PRODUCT §2 |
+| `SEC-7` | Task | A monitored security contact address | Administration & Security | P2 | Todo |  | `SECURITY.md` |
+| `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
+| `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
+| `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Todo |  | `README.md` |
+| `DATA-2` | Task | Trim old copies in published Gold tables | Build | P2 | Todo |  | `features/gold-publish-per-mart.md` |
+| `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Todo |  | Slice B review, gold-publish plan |
+| `DATA-6` | Feature | A "latest copy only" view for outside readers of published tables | Build | P2 | Idea |  | `features/gold-publish-per-mart.md` |
+| `SEC-4` | Task | Human security review | Administration & Security | P2 | Todo |  | PRODUCT §4 blocker 3 |
+| `SUP-1` | Decision | Decide a support commitment | Business | P2 | Open |  | PRODUCT §4 blocker 5 |
+| `OPS-7` | Task | Test and time a restore from backup | Operations | P2 | Todo |  | PRODUCT §2 |
+| `SEC-5` | Feature | Clean up old sessions and tokens | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
+| `SRC-6` | Feature | Fix the broken connectors: object-storage test and key change, Oracle credential change, Sheets shown as unsupported, Sources header text | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-7` | Feature | Alerts when a connector run or an upload load fails; health from real runs | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Todo |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-13` | Feature | Table discovery for every source type, not only databases | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07) | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter is built with `DATA-12` part 1 | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
+| `DATA-20` | Feature | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data | P2 | Idea |  | `features/catalog-search.md` |
+| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values. In three parts: marks in search, the Data Explorer and the asset page, set with `governance:write` (part 1, built); governed tags (part 2); marks in the chart builder and Query Studio (part 3) | Data | P2 | Building |  | `features/certification-and-governed-tags.md` |
+| `DATA-22` | Feature | A tag on a namespace applies to its tables. Split from `DATA-12` by the product owner (2026-10-09): a namespace is one of four fixed names with no stored record and no page to edit | Data | P3 | Idea |  | `features/certification-and-governed-tags.md` |
+| `DATA-23` | Task | The Catalog page's links to the Data Explorer filter by a namespace's display name where assets carry its id, so by reading the code they match nothing (found planning `DATA-12`; not run) | Data | P2 | Todo |  | `plans/2026-10-09-data-12-part-1-certification.md` |
+| `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-16` | Task | Time travel proven safe: a gate test that past-version queries pass the masking rewrite. By reading the code, the Trino form of a past-version query is refused before it reaches Trino, so this is also a fix (`specs/data-16.md`) | Data | P2 | Todo |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79 | `docs/core/features/semantic-layer.md` |
+| `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names | AI Copilot | P2 | In Acceptance | #81 | `features/chat-ask-back.md` |
+| `SEC-6` | Task | Stop older API handlers from returning internal error text | Administration & Security | P2 | Todo |  | `AGENTS.md` |
+| `SEC-16` | Task | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Administration & Security | P2 | Todo |  | Data module code audit |
+| `SEC-17` | Task | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Administration & Security | P2 | Todo |  | Data module code audit |
+| `SEC-18` | Task | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Administration & Security | P2 | Todo |  | `docker-compose.yml` |
+| `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | Planned |  | `lakehouse-embed` |
+
+## Later (P3)
+
+| ID | Kind | Item | Module | Priority | Status | PR | Source |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
+| `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | P3 | Planned |  | PRODUCT §2 |
+| `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
+| `BLD-2` | Feature | Tables that refresh themselves when their inputs change | Build | P3 | Idea |  | PRODUCT §2 |
+| `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
+| `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
+| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy | Build | P3 | Idea |  | ADR 0010 |
+| `DATA-4` | Feature | Publish Silver in open format | Build | P3 | Idea |  | `features/gold-publish-per-mart.md` |
+| `DATA-5` | Task | Measure outside readers of published tables | Build | P3 | Todo |  | `routes::gold::consumers` |
+| `BI-3` | Feature | Import dashboards from Tableau and Power BI | Dashboards | P3 | Idea |  | PRODUCT §2 |
+| `BI-20` | Feature | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | P3 | Idea |  | `reference/competitive-comparison.md` (BI matrix) |
+| `QRY-1` | Feature | Query other systems in place, without loading | Data | P3 | Idea |  | PRODUCT §2 |
+| `SRC-2` | Feature | Processing over streams | Data | P3 | Idea |  | PRODUCT §2 |
+| `INT-2` | Feature | Search over documents | AI Copilot | P3 | Idea |  | PRODUCT §2 |
+| `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
+| `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
+| `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
+| `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
+| `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
+| `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/FEATURE_COVERAGE.md` |
+| `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
+| `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
+
+## Dates
+
+Started is the date of the item's plan; Shipped is the merge date of the PR
+that delivered it; both come from the repository's history. **Due** dates are
+set by the product owner and are left empty until they are.
+
+| ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
-| `DATA-1` | Gold tables publish to open format automatically, as an option per table. **Built and merged (PRs #60, #63 and the slice C+D PR); waiting for the product owner to run the acceptance checklist** | Build | `features/gold-publish-per-mart.md` |
-| `QA-1` | Accept each built feature with a checklist, starting with what a demo shows | All | PRODUCT §4 blocker 1 |
-| `SEC-1` | Confirm the leaked key is rotated; decide on rewriting git history | Security | `SECURITY.md` |
-| `REL-1` | Protect the main branch | Delivery | `docs/CI.md` |
-| `DOC-1` | Archive or rewrite the old product documents that contradict the build | Docs | PRODUCT §6 |
-| `GOV-2` | Decide which role may publish a table in open format | Governance | PRODUCT §6 |
-| `SEC-10` | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver | Security | `lakehouse-notify` |
-| `SEC-11` | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Security | `routes/support.rs` |
-| `SEC-14` | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server | Security | `routes/connectors.rs`, `connector_probe.rs` |
-| `SEC-15` | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Security | `docker-compose.yml`, `connector_probe.rs` |
-| `SEC-13` | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Security | commit `7ec3a81` |
-
-## Next
-
-| ID | Item | Area | Source |
-| --- | --- | --- | --- |
-| `RPT-1` | Scheduled reports with PDF and spreadsheet attachments | Dashboards | PRODUCT §2 |
-| `BI-1` | Export a dashboard as a server-made PDF and as Excel | Dashboards | PRODUCT §2 |
-| `BI-4` | Result caching for charts and queries; run a dashboard's tiles in parallel | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-5` | Configurable query timeouts and row limits; Stop cancels the query on the server | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-6` | A chart builder as capable as Metabase's and Tableau's: several dimensions, filters, sorting, multi-step questions. No drag and drop; the assistant covers that | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-7` | Joins in the chart builder without writing SQL | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-8` | Calculated fields and custom expressions: maths, text, dates, conditions, running totals | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-9` | Group by day, week, month, quarter, year | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-10` | Bins, groups and hierarchies | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-11` | Parameters, usable in charts, SQL and dashboards | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-13` | Combine two sources on one chart | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-14` | Lineage from a chart to its sources, reachable from the dashboard | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-16` | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-17` | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-18` | Dashboards at both competitors' level: tabs; phone and tablet layouts; date-range, relative-date, number, text and linked filters; filter defaults that do not change silently; drill-down for every chart; click to another dashboard or URL; show and hide; saved auto-refresh; stories; templates; favourites; version history; trash; personal space | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `AI-1` | **Ready now**. The assistant manages the dashboards that exist today: rename boards, delete them (with approval), arrange and resize tiles, move charts between boards | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-2` | **Waits for `BI-18`**. The assistant adds and changes dashboard filters ("only 2025, only Bali") | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-3` | **Waits for `BI-9`**. The assistant picks the time grain ("monthly") | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-4` | **Waits for `BI-8`**. The assistant writes calculated fields in the product's formula language, not raw SQL | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-5` | **Waits for `BI-16`**, per chart type as it lands. The assistant creates every new chart type: raw and pivot tables, KPI with comparison, histogram, Gantt and the rest | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-6` | **Waits for `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13`**, each part with its BI item. The assistant builds charts with several dimensions and filters, joins tables, uses bins, groups, hierarchies and parameters, and combines two sources | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-7` | **Waits for `BI-2`**. The assistant uses named metrics before it writes SQL, so the same question gives the same number | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-8` | **Waits for `BI-17`**. The assistant changes number formats, colours, axes and labels, and adds trend and forecast lines | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-9` | **Waits for `BI-18`** (layout part). The assistant adds tabs and uses templates | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-10` | **Waits for `RPT-1`, `BI-1`**. The assistant schedules reports ("send this to me every Monday as PDF") and produces a PDF or Excel file on request | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-11` | **Waits for `BI-19`, `BI-26`, `DEC-8`**. The assistant creates share and embed links only with approval, respects dashboard permissions, and never grants permissions | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-12` | **Ready now** for fixing and explaining SQL inside the editor; variables **Waits for `QS-5`** | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-13` | **Waits for `BI-14`**. The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today) | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-14` | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `AI-15` | **Ready now**. A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | Ask AI (dashboards) | `AGENTS.md` (assistant parity) |
-| `BI-26` | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-19` | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `BLD-1` | Joins and aggregations in the pipeline builder | Build | PRODUCT §2 |
-| `VER-1` | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data, Governance | PRODUCT §2 |
-| `BI-2` | Metrics users can define once and reuse across dashboards (a semantic layer) | Dashboards | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
-| `DATA-9` | Upload a file from the console. **Built and merged (PR #71); waiting for the product owner to run the acceptance checklist** | Data | `features/upload-file.md` |
-| `OPS-8` | Usage and cost view | Monitoring | PRODUCT §2 |
-| `SEC-2` | Login rate limiting. **Built and merged (PR #67); waiting for the product owner to run the acceptance checklist** | Security | `features/login-protection-and-session-cleanup.md` |
-| `SEC-3` | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Security | PRODUCT §2 |
-| `SEC-7` | A monitored security contact address | Security | `SECURITY.md` |
-| `REL-2` | Adopt a version and release policy; cut a release from the unreleased work | Delivery | `reference/release-policy.md` |
-| `GOV-1` | Audit trail covers every console change | Governance | PRODUCT §3 |
-| `OPS-1` | Trim old versions of raw tables | Monitoring | `README.md` |
-| `DATA-2` | Trim old copies in published Gold tables | Build | `features/gold-publish-per-mart.md` |
-| `DATA-10` | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | Slice B review, gold-publish plan |
-| `DATA-6` | A "latest copy only" view for outside readers of published tables | Build | `features/gold-publish-per-mart.md` |
-| `SEC-4` | Human security review | Security | PRODUCT §4 blocker 3 |
-| `SUP-1` | Decide a support commitment | Business | PRODUCT §4 blocker 5 |
-| `OPS-7` | Test and time a restore from backup | Monitoring | PRODUCT §2 |
-| `SEC-5` | Clean up old sessions and tokens. **Built and merged (PR #67); waiting for the product owner to run the acceptance checklist** | Security | `features/login-protection-and-session-cleanup.md` |
-| `SRC-6` | Fix the broken connectors: object-storage test and key change, Oracle credential change, Sheets shown as unsupported, Sources header text | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-7` | Alerts when a connector run or an upload load fails; health from real runs | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-8` | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-9` | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-10` | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-11` | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-12` | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-13` | Table discovery for every source type, not only databases | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-4` | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07) | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-11` | Catalog search that finds columns and tags, with tolerant matching. **Built and merged (PR #98); the product owner passed acceptance rows 1 to 9 and 12 on 2026-10-09; rows 10, 11, 13 and the speed measurement on 10,000 tables are not run.** The certification filter is built with `DATA-12` part 1 | Data | `features/catalog-search.md` |
-| `DATA-20` | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data, Governance | `features/catalog-search.md` |
-| `DATA-12` | Certified and deprecated marks; governed tags with allowed values. In three parts. **Part 1 (marks in search, the Data Explorer and the asset page, set with `governance:write`) is built, waiting for the product owner's check.** Part 2: governed tags. Part 3: marks in the chart builder and Query Studio | Data | `features/certification-and-governed-tags.md` |
-| `DATA-22` | A tag on a namespace applies to its tables. Split from `DATA-12` by the product owner (2026-10-09): a namespace is one of four fixed names with no stored record and no page to edit | Data | `features/certification-and-governed-tags.md` |
-| `DATA-23` | The Catalog page's links to the Data Explorer filter by a namespace's display name where assets carry its id, so by reading the code they match nothing (found planning `DATA-12`; not run) | Data | `plans/2026-10-09-data-12-part-1-certification.md` |
-| `DATA-13` | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-14` | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-15` | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-16` | Time travel proven safe: a gate test that past-version queries pass the masking rewrite. By reading the code, the Trino form of a past-version query is refused before it reaches Trino, so this is also a fix (`specs/data-16.md`) | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-17` | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-18` | Column types on upload, with names and types editable before loading | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-19` | Uploaded tables can feed pipelines and so reach dashboards | Data | `reference/competitive-comparison.md` (Data matrix) |
-| `QS-1` | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-3` | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-4` | Query history page with filters, and a query profile | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-5` | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query | Query Studio | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `AI-16` | Hand-off to the AI team: AI features for the Data module. **First line (AI-written descriptions of tables and columns) built.** Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | Ask AI | `docs/core/features/semantic-layer.md` |
-| `AI-17` | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names. **Built; waiting for the product owner to run the acceptance checklist** | Ask AI | `features/chat-ask-back.md` |
-| `SEC-6` | Stop older API handlers from returning internal error text | Security | `AGENTS.md` |
-| `SEC-16` | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Security | Data module code audit |
-| `SEC-17` | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Security | Data module code audit |
-| `SEC-18` | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Security | `docker-compose.yml` |
-| `SEC-19` | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text | Security | `routes/query.rs` |
-| `SEC-20` | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Security | `routes/query.rs` |
-| `SEC-21` | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Security | `routes/query.rs` |
-| `SEC-12` | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Security | `lakehouse-embed` |
-
-## Later
-
-| ID | Item | Area | Source |
-| --- | --- | --- | --- |
-| `OPS-3` | Run on several servers; high availability | Platform | PRODUCT §1, §2 |
-| `SRC-3` | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | PRODUCT §2 |
-| `DATA-8` | Instant copies of a table for testing | Data | PRODUCT §2 |
-| `BLD-2` | Tables that refresh themselves when their inputs change | Build | PRODUCT §2 |
-| `SRC-5` | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | `connector_probe.rs` |
-| `DOC-2` | Step-by-step user guide checked against a running console | Docs | `reference/user-guide.md` |
-| `DATA-3` | Store Gold in open format first; serve from a fast copy | Build | ADR 0010 |
-| `DATA-4` | Publish Silver in open format | Build | `features/gold-publish-per-mart.md` |
-| `DATA-5` | Measure outside readers of published tables | Build | `routes::gold::consumers` |
-| `BI-3` | Import dashboards from Tableau and Power BI | Dashboards | PRODUCT §2 |
-| `BI-20` | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | `reference/competitive-comparison.md` (BI matrix) |
-| `QRY-1` | Query other systems in place, without loading | Data | PRODUCT §2 |
-| `SRC-2` | Processing over streams | Data | PRODUCT §2 |
-| `INT-2` | Search over documents | Ask AI | PRODUCT §2 |
-| `GOV-3` | Lineage that reaches outside systems | Governance | PRODUCT §2 |
-| `ADM-1` | Several organisations in one install | Administration | PRODUCT §2 |
-| `ADM-2` | Workspace settings that can be changed | Administration | `README.md` |
-| `OPS-2` | Install with no internet access | Platform | Sales playbook (older; re-check) |
-| `OPS-4` | Fail loudly when the application database is unreachable | Platform | `docs/OPERATIONS.md` |
-| `OPS-6` | Log and trace viewer | Monitoring | `docs/FEATURE_COVERAGE.md` |
-| `BIZ-1` | Enterprise edition | Business | PRODUCT §1 |
-| `BIZ-2` | Hosted cloud version | Business | PRODUCT §1 |
+| `DATA-1` | 2026-10-02 | 2026-10-03 | |
+| `SEC-2` | 2026-10-02 | 2026-10-03 | |
+| `SEC-5` | 2026-10-02 | 2026-10-03 | |
+| `DATA-9` | 2026-10-02 | 2026-10-07 | |
+| `DATA-17` | 2026-10-07 | partly, 2026-10-08 (Excel and Parquet) | |
+| `AI-16` | | first line, 2026-10-08 | |
+| `AI-17` | | 2026-10-08 | |
+| `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
+| `SEC-15` | 2026-10-08 | 2026-10-08 | |
+| `DATA-11` | 2026-10-09 | 2026-10-09 | |
+| `DATA-12` | 2026-10-09 | | |
 
 ## Decide
 
-Competitors have these. Each is large. A "no" is a valid answer.
+Decisions the product owner must make. Each is a base **Decision** record:
+the options, the recommendation, and who decides (the product owner through-
+out). `GOV-2` and `SUP-1` are also decisions, but carry a priority and sit in
+the lists above. A decision's outcome, once made, moves to **Done and
+rejected** with the date.
 
-| ID | Item | Recommendation |
-| --- | --- | --- |
-| `DEC-1` | Notebooks and Python | Defer |
-| `DEC-2` | dbt support | Defer |
-| `DEC-3` | AI functions inside SQL | Defer |
-| `DEC-4` | Train and serve models | No |
-| `DEC-5` | Mobile app | No |
-| `DEC-6` | Share data with another organisation | Defer |
-| `DEC-9` | How to get SaaS connectors: reuse dlt verified sources (our loader already runs on dlt) or another connector library | Reuse dlt verified sources first |
-| `DEC-10` | Data and Query Studio edge cases: entity relationship diagram, a no-code connector builder, business glossary and domains, table favourites, real-time query co-editing, Git for queries | Drop or defer all six |
-| `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Also: making a dashboard public or creating an embed link, changing who can see a dashboard, scheduling email to addresses outside the company, deleting a dashboard |
-| `INT-1` | Digital employees | Parked by the product owner, 2026-10-02 |
+| ID | Decision | Options | Recommendation | Decider |
+| --- | --- | --- | --- | --- |
+| `DEC-1` | Notebooks and Python | Build · Defer · No | Defer | Product owner |
+| `DEC-2` | dbt support | Build · Defer · No | Defer | Product owner |
+| `DEC-3` | AI functions inside SQL | Build · Defer · No | Defer | Product owner |
+| `DEC-4` | Train and serve models | Build · No | No | Product owner |
+| `DEC-5` | Mobile app | Build · No | No | Product owner |
+| `DEC-6` | Share data with another organisation | Build · Defer · No | Defer | Product owner |
+| `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Add: make a dashboard public or embeddable · change who can see a dashboard · email outside the company · delete a dashboard — each on or off | Add all four | Product owner |
+| `DEC-9` | How to get SaaS connectors | Reuse dlt verified sources (our loader already runs on dlt) · adopt another connector library · build each by hand | Reuse dlt verified sources first | Product owner |
+| `DEC-10` | Data and Query Studio edge cases: entity-relationship diagram, a no-code connector builder, business glossary and domains, table favourites, real-time query co-editing, Git for queries | Drop · Defer · Build, each of the six | Drop or defer all six | Product owner |
+| `INT-1` | Digital employees | Build · Park | Parked (product owner, 2026-10-02) | Product owner |
 
 ## Done and rejected
 
@@ -180,6 +238,10 @@ Competitors have these. Each is large. A "no" is a valid answer.
 | `DATA-7` | Query a table as of an earlier time | Superseded: the picker was built in PR #71; proving it safe is `DATA-16` | 2026-10-07 |
 | `BI-21` | Where charts read data | Decided: only data in the lakehouse, for now | 2026-10-06 |
 | `SEC-8` | Dependency security checks green on `main` | Done: PR #62. Three TLS-library vulnerabilities cleared by updating the SQL Server client; licence check fixed | 2026-10-02 |
+| `DEC-11` | Which of the repo and the Lark base is the master | Decided: the repo, for everything it holds (ID, kind, text, module, priority, status, PR, dates, QA results); the base mirrors it and adds the people | 2026-10-09 |
+| `DEC-12` | Name staff as Owner and Acceptor in the public repo | Decided: no. The repo names the module; the base holds the person through the module's owner | 2026-10-09 |
+| `DEC-13` | Query Studio as a module in the base | Decided: yes, its own module | 2026-10-09 |
+| `DEC-14` | Priority of `SEC-14` and `SEC-15` | Decided: P0 | 2026-10-09 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
 

@@ -2,10 +2,17 @@
 
 | | |
 | --- | --- |
-| Module | Data (Catalog) |
+| Module | Data |
 | Backlog | `DATA-12` |
 | Spec | `docs/core/specs/data-12.md` (no *(proposed)* numbers) |
-| Status | Decisions signed 2026-10-09. Part 1 in build |
+| Kind | Feature |
+| Status | Building (part 1 built; `BACKLOG.md` holds the status) |
+| Priority | P2 |
+| Owner | The module's owner, in the base. Not named here (the repo is public). |
+| Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
+| Started | 2026-10-09; also in `BACKLOG.md` Dates |
+| Shipped | Not yet |
+| Evidence | The pull request of each part |
 | Plan | Part 1: `docs/superpowers/plans/2026-10-09-data-12-part-1-certification.md`. Parts 2 and 3 get their own plans |
 
 ## Problem
@@ -84,24 +91,31 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 A step not performed is never Pass. Steps needing a terminal are marked
 (operator). Rows 1 to 9 are part 1; the later parts add theirs.
 
-| # | Do this | Expect | Result |
+| ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | As a user with `governance:write`, open a table and mark it certified | The page shows "Certified"; the change history says who and when | |
-| 2 | Search the table in the ⌘K box and in the Data Explorer | Both show the mark | |
-| 3 | In the Data Explorer, filter by certification: certified | Only certified tables | |
-| 4 | Mark another table deprecated, with a note and a replacement table | Its page shows the note and a link that opens the replacement | |
-| 5 | Give a replacement that does not exist, then the table itself | Each is refused with a plain message; nothing is saved | |
-| 6 | Take the mark off | The mark, the note and the link are gone everywhere; the history says who | |
-| 7 | As a user with `catalog:write` but not `governance:write`, open a table | No control to set a mark; the description and tags can still be edited, and editing them does not change the mark | |
-| 8 | (operator) As that user, call the certification route | 403; nothing is saved | |
-| 9 | As a user without `catalog:read`, search | No tables and no marks | |
+| `DATA-12-AC1` | As a user with `governance:write`, open a table and mark it certified | The page shows "Certified"; the change history says who and when | Pass 2026-10-11 |
+| `DATA-12-AC2` | Search the table in the ⌘K box and in the Data Explorer | Both show the mark | Pass 2026-10-11 |
+| `DATA-12-AC3` | In the Data Explorer, filter by certification: certified | Only certified tables | Pass 2026-10-11 |
+| `DATA-12-AC4` | Mark another table deprecated, with a note and a replacement table | Its page shows the note and a link that opens the replacement | Pass 2026-10-11 |
+| `DATA-12-AC5` | Give a replacement that does not exist, then the table itself | Each is refused with a plain message; nothing is saved | Pass 2026-10-11 |
+| `DATA-12-AC6` | Take the mark off | The mark, the note and the link are gone everywhere; the history says who | Pass 2026-10-11 |
+| `DATA-12-AC7` | As a user with `catalog:write` but not `governance:write`, open a table | No control to set a mark; the description and tags can still be edited, and editing them does not change the mark | Not run |
+| `DATA-12-AC8` | (operator) As that user, call the certification route | 403; nothing is saved | Not run |
+| `DATA-12-AC9` | As a user without `catalog:read`, search | No tables and no marks | Not run |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+
+The product owner checked `DATA-12-AC1` to `AC6` on 2026-10-11 on a separate
+instance of this branch and reported them as expected. `AC7` to `AC9` need a
+user without `governance:write`; the planner ran `AC8` through the API (403).
+Not yet accepted: parts 2 and 3 add their rows.
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

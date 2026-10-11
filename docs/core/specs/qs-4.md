@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `QS-4` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Query Studio |
-| Who builds it | Query Studio |
-| When | Next |
+| Module | Query Studio |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -36,10 +34,9 @@ Snowflake Query History: 14 days, many filters; Query Profile with operator stat
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A query run 10 days ago is found by filtering on its table
-- [ ] A slow query's profile names the step that took the most time
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `QS-4-AC1` A query run 10 days ago is found by filtering on its table
+- `QS-4-AC2` A slow query's profile names the step that took the most time
+- `QS-4-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-12` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Feature page [`certification-and-governed-tags.md`](../features/certification-and-governed-tags.md), decisions signed 2026-10-09. Built in three parts; part 1 planned. Inheritance is split off as `DATA-22` |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Spec checked | Against the code on 2026-10-09. Feature page [`certification-and-governed-tags.md`](../features/certification-and-governed-tags.md); built in three parts. Inheritance is split off as `DATA-22` |
 
 ## Why
 
@@ -37,11 +36,10 @@ Databricks: certified and deprecated system tags, governed tags with allowed val
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A certified table shows its mark in search and in the chart builder
-- [ ] Setting a tag value outside the allowed list is refused
-- [ ] A user without `governance:write` cannot certify
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-12-AC1` A certified table shows its mark in search, in the Data Explorer and on its page (part 1), and in the chart builder and Query Studio (part 3)
+- `DATA-12-AC2` Setting a tag value outside the allowed list is refused (part 2)
+- `DATA-12-AC3` A user without `governance:write` cannot certify
+- `DATA-12-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
