@@ -22,6 +22,8 @@ export type PreviewInputs = {
   shape: string
   /** BI-11: the parameter values the preview is drawn with, the limit's parameter and the reference lines. */
   params: string
+  /** BI-13: the chart's other questions and how its own series is drawn, as they would be sent. */
+  layers: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {

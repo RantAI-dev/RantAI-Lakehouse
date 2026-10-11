@@ -578,6 +578,287 @@
             },
             "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
           },
+          "layers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "the Gold mart this question reads (give this or sqlSource)"
+                },
+                "sqlSource": {
+                  "type": "string",
+                  "description": "the id of a saved SQL source (give this or mart)"
+                },
+                "dimension": {
+                  "type": "string",
+                  "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain"
+                },
+                "measures": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ],
+                        "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "object",
+                            "properties": {
+                              "param": {
+                                "type": "string",
+                                "description": "the name of a parameter from list_parameters"
+                              }
+                            },
+                            "required": [
+                              "param"
+                            ]
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ],
+                        "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      }
+                    ]
+                  },
+                  "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
+                },
+                "aggregate": {
+                  "type": "string",
+                  "enum": [
+                    "sum",
+                    "avg",
+                    "max",
+                    "min",
+                    "count"
+                  ],
+                  "description": "for the measures that have none of their own; default sum"
+                },
+                "filters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "in",
+                          "not_in",
+                          "between",
+                          "relative",
+                          "contains",
+                          "starts_with",
+                          "ends_with",
+                          "not_contains"
+                        ],
+                        "description": "default in"
+                      },
+                      "values": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "in / not_in"
+                      },
+                      "min": {
+                        "type": "string",
+                        "description": "between: a number or a date YYYY-MM-DD"
+                      },
+                      "max": {
+                        "type": "string"
+                      },
+                      "minExclusive": {
+                        "type": "boolean"
+                      },
+                      "maxExclusive": {
+                        "type": "boolean"
+                      },
+                      "text": {
+                        "type": "string",
+                        "description": "contains, starts_with, ends_with, not_contains"
+                      },
+                      "anchor": {
+                        "type": "string",
+                        "enum": [
+                          "last",
+                          "this",
+                          "previous",
+                          "next"
+                        ],
+                        "description": "relative"
+                      },
+                      "unit": {
+                        "type": "string",
+                        "enum": [
+                          "day",
+                          "week",
+                          "month",
+                          "quarter",
+                          "year"
+                        ]
+                      },
+                      "n": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "column"
+                    ]
+                  },
+                  "description": "this question's own filters (at most 20), on its own data"
+                },
+                "joins": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "mart": {
+                        "type": "string",
+                        "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "inner",
+                          "left",
+                          "right",
+                          "full"
+                        ],
+                        "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                      },
+                      "on": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "left": {
+                              "type": "string",
+                              "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                            },
+                            "op": {
+                              "type": "string",
+                              "enum": [
+                                "=",
+                                "<",
+                                "<=",
+                                ">",
+                                ">="
+                              ]
+                            },
+                            "right": {
+                              "type": "string",
+                              "description": "a column of the table being joined"
+                            }
+                          },
+                          "required": [
+                            "left",
+                            "op",
+                            "right"
+                          ]
+                        },
+                        "description": "the pairs to match, all of them; at least one uses ="
+                      }
+                    },
+                    "required": [
+                      "mart",
+                      "type",
+                      "on"
+                    ]
+                  },
+                  "description": "up to four more Gold marts joined to this question's mart; not for a SQL source"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "the legend name, at most 60 characters"
+                },
+                "draw": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line"
+                  ],
+                  "description": "how this question is drawn"
+                },
+                "axis": {
+                  "type": "string",
+                  "enum": [
+                    "left",
+                    "right"
+                  ],
+                  "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors"
+                }
+              },
+              "required": [
+                "dimension",
+                "measures",
+                "draw",
+                "axis"
+              ]
+            },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows"
+          },
+          "draw": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "line"
+            ],
+            "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)"
+          },
+          "axis": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ],
+            "description": "with layers: which value axis the chart's own series uses (default left)"
+          },
           "sort": {
             "type": "object",
             "properties": {
@@ -1369,6 +1650,287 @@
               ]
             },
             "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
+          },
+          "layers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "the Gold mart this question reads (give this or sqlSource)"
+                },
+                "sqlSource": {
+                  "type": "string",
+                  "description": "the id of a saved SQL source (give this or mart)"
+                },
+                "dimension": {
+                  "type": "string",
+                  "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain"
+                },
+                "measures": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ],
+                        "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "object",
+                            "properties": {
+                              "param": {
+                                "type": "string",
+                                "description": "the name of a parameter from list_parameters"
+                              }
+                            },
+                            "required": [
+                              "param"
+                            ]
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ],
+                        "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      }
+                    ]
+                  },
+                  "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
+                },
+                "aggregate": {
+                  "type": "string",
+                  "enum": [
+                    "sum",
+                    "avg",
+                    "max",
+                    "min",
+                    "count"
+                  ],
+                  "description": "for the measures that have none of their own; default sum"
+                },
+                "filters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "in",
+                          "not_in",
+                          "between",
+                          "relative",
+                          "contains",
+                          "starts_with",
+                          "ends_with",
+                          "not_contains"
+                        ],
+                        "description": "default in"
+                      },
+                      "values": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "in / not_in"
+                      },
+                      "min": {
+                        "type": "string",
+                        "description": "between: a number or a date YYYY-MM-DD"
+                      },
+                      "max": {
+                        "type": "string"
+                      },
+                      "minExclusive": {
+                        "type": "boolean"
+                      },
+                      "maxExclusive": {
+                        "type": "boolean"
+                      },
+                      "text": {
+                        "type": "string",
+                        "description": "contains, starts_with, ends_with, not_contains"
+                      },
+                      "anchor": {
+                        "type": "string",
+                        "enum": [
+                          "last",
+                          "this",
+                          "previous",
+                          "next"
+                        ],
+                        "description": "relative"
+                      },
+                      "unit": {
+                        "type": "string",
+                        "enum": [
+                          "day",
+                          "week",
+                          "month",
+                          "quarter",
+                          "year"
+                        ]
+                      },
+                      "n": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "column"
+                    ]
+                  },
+                  "description": "this question's own filters (at most 20), on its own data"
+                },
+                "joins": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "mart": {
+                        "type": "string",
+                        "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "inner",
+                          "left",
+                          "right",
+                          "full"
+                        ],
+                        "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                      },
+                      "on": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "left": {
+                              "type": "string",
+                              "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                            },
+                            "op": {
+                              "type": "string",
+                              "enum": [
+                                "=",
+                                "<",
+                                "<=",
+                                ">",
+                                ">="
+                              ]
+                            },
+                            "right": {
+                              "type": "string",
+                              "description": "a column of the table being joined"
+                            }
+                          },
+                          "required": [
+                            "left",
+                            "op",
+                            "right"
+                          ]
+                        },
+                        "description": "the pairs to match, all of them; at least one uses ="
+                      }
+                    },
+                    "required": [
+                      "mart",
+                      "type",
+                      "on"
+                    ]
+                  },
+                  "description": "up to four more Gold marts joined to this question's mart; not for a SQL source"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "the legend name, at most 60 characters"
+                },
+                "draw": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line"
+                  ],
+                  "description": "how this question is drawn"
+                },
+                "axis": {
+                  "type": "string",
+                  "enum": [
+                    "left",
+                    "right"
+                  ],
+                  "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors"
+                }
+              },
+              "required": [
+                "dimension",
+                "measures",
+                "draw",
+                "axis"
+              ]
+            },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows"
+          },
+          "draw": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "line"
+            ],
+            "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)"
+          },
+          "axis": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ],
+            "description": "with layers: which value axis the chart's own series uses (default left)"
           },
           "sort": {
             "type": "object",

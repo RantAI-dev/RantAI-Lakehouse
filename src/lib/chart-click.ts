@@ -28,6 +28,8 @@ export type ChartHit = {
   seriesType?: string
   /** Sankey: "node" or "edge". */
   dataType?: string
+  /** The series the mark belongs to (BI-13: which question of a combined chart). */
+  seriesIndex?: number
   /** Sunburst: the path from the root; its length less one is the ring. */
   treePathInfo?: { name: string }[]
 }
@@ -65,7 +67,15 @@ export type ClickContext = {
    * bin's lower edge, so a clicked label is mapped back to the bin it stands for.
    */
   bin?: BinInfo
+  /**
+   * BI-13: the mark belongs to one of the chart's other questions, not to the chart's own. The value
+   * is then one of that question's dimension, and the rows to list are from its own source.
+   */
+  layer?: LayerClick
 }
+
+/** The question of a combined chart that a click was on. */
+export type LayerClick = { index: number; mart: string; sqlSource?: string; dimension: string }
 
 export type ChartClickHandler = (hit: ChartHit, pos: { x: number; y: number }, ctx: ClickContext) => void
 

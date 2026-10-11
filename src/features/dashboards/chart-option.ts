@@ -15,7 +15,7 @@ type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target"> & {
 };
 
 /** The console's categorical palette (indigo-led). Used consistently across charts. */
-const PALETTE = [
+export const PALETTE = [
   "#6366f1", "#0ea5e9", "#10b981", "#f59e0b",
   "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899",
   "#84cc16", "#f97316",

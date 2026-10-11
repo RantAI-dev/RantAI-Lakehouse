@@ -10,6 +10,7 @@ import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { BinDef, GridDef } from "@/lib/chart-bins";
 import type { JoinDef } from "@/lib/chart-joins";
+import type { LayerDef } from "@/lib/chart-layers";
 import type { Grouping, MeasureEntry, SortSpec, StepDef } from "@/lib/chart-shape";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
@@ -68,6 +69,10 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     bin: args.bin && typeof args.bin === "object" ? (args.bin as BinDef) : undefined,
     breakdownBin: args.breakdownBin && typeof args.breakdownBin === "object" ? (args.breakdownBin as BinDef) : undefined,
     grid: args.grid && typeof args.grid === "object" ? (args.grid as GridDef) : undefined,
+    // BI-13: the chart's other questions, and how its own series is drawn, travel to the builder as the model sent them.
+    layers: Array.isArray(args.layers) ? (args.layers as LayerDef[]) : undefined,
+    draw: args.draw === "bar" || args.draw === "line" ? args.draw : undefined,
+    axis: args.axis === "left" || args.axis === "right" ? args.axis : undefined,
   };
 }
 

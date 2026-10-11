@@ -602,7 +602,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       return;
     }
     const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max) } : undefined;
-    setDrill({ tileId: spec.id, name: target.value, label: target.label, grain: target.grain, bin, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec), x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
+    // BI-13: a mark of one of the chart's other questions lists that question's own rows and
+    // filters the dashboard by that question's dimension; the server needs the chart and the question's index.
+    const layer = ctx.layer;
+    setDrill({
+      tileId: spec.id, name: target.value, label: target.label, grain: target.grain, bin,
+      column: layer ? layer.dimension : target.column,
+      mart: layer ? layer.mart : spec.mart, sqlSource: layer ? layer.sqlSource : spec.sqlSource,
+      chart: layer ? spec.id : ownFilterChart(spec), layer: layer?.index,
+      x: pos.x, y: pos.y, builtin: spec.source === "builtin",
+    });
   };
   const toggleMenuTile = (id: string) => setMenuTiles((prev) => {
     const next = new Set(prev);
@@ -913,8 +922,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart }, drill.builtin, drillChart ? tileDrills.fixed(drillChart) : NO_FILTERS)}
-          drillDown={drillOffer ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS)}
+          drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}
       <RecordsDialog request={records} onClose={() => setRecords(null)} />

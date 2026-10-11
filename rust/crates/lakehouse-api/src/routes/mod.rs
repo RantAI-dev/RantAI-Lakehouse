@@ -30,6 +30,7 @@ mod home;
 mod identity;
 mod knowledge;
 mod lakehouse;
+pub(crate) mod layers;
 mod lineage;
 mod notifications;
 mod ops;

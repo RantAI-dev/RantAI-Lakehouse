@@ -101,3 +101,17 @@ test("BI-11: summarizeParams lists each shown parameter with its value and type,
     "target = 1000 (number); pick = rooms (list)",
   )
 })
+
+test("a chart's other questions are listed beside its own rows, with their reason when they failed (BI-13)", () => {
+  const tile = { id: "c_1", title: "Visitors and rooms", kind: "bar", source: "ui", mart: "mart_x" }
+  const cell = {
+    columns: ["month", "visitors"], rows: [{ month: "2026-01-01", visitors: 5 }],
+    layers: [
+      { label: "Rooms", draw: "line", axis: "right", source: "mart_rooms", columns: ["month", "rooms"], rows: [{ month: "2026-01-01", rooms: 9 }] },
+      { label: "Occupancy", draw: "line", axis: "right", source: "mart_occ", columns: [], rows: [], error: "This chart could not be loaded." },
+    ],
+  }
+  const text = summarizeTiles([tile], { c_1: cell })
+  assert.match(text, /rows: 2026-01-01=5 \| also "Rooms" \(mart_rooms; line, right axis\): rows: 2026-01-01=9/)
+  assert.match(text, /also "Occupancy" \(mart_occ; line, right axis\): error: This chart could not be loaded\./)
+})

@@ -20,6 +20,8 @@ export type DrillTarget = {
   bin?: { width: number; last: boolean };
   /** BI-6: the tile, when it has filters of its own, so the rows listed carry them too. */
   chart?: string;
+  /** BI-13: the index of the chart's other question the click was on; `mart`, `sqlSource` and `column` are then that question's own. */
+  layer?: number;
 };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */

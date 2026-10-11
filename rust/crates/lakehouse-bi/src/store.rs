@@ -2870,11 +2870,98 @@ fn spec_before_relation(
 /// (no SQL) / `kpi`/`gauge` (single number) / table & chart (grouped). Ports
 /// `specFromInput`.
 ///
+/// `BI-13`: a chart with `layers` is checked as a whole ([`crate::layers`]):
+/// every layer is built as the chart it would be alone, over its own source
+/// and with the chart's grain, and its dimension must be of the chart's kind.
+/// The chart's own statement is the one it always had.
+///
 /// # Errors
 ///
 /// Returns [`BiError::Validation`] for any input/schema validation failure,
 /// or [`BiError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn spec_from_input(
+    ch: &ChClient,
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    id: Option<String>,
+    time: &TimeContext,
+) -> Result<StoredChartSpec, BiError> {
+    crate::layers::check_definition(input).map_err(BiError::Validation)?;
+    let mut spec = spec_from_input_base(ch, input, source, created_by, id, time).await?;
+    if !input.shape.layers_list().is_empty() {
+        spec.def.shape.layers = Some(checked_layers(ch, input, source, created_by, time).await?);
+    }
+    Ok(spec)
+}
+
+/// `BI-13`: the layers of `input` as they are stored, each validated by
+/// building it over its own source as a one-dimension bar chart (the way it is
+/// read), with the chart's grain, and its dimension compared with the chart's.
+async fn checked_layers(
+    ch: &ChClient,
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    time: &TimeContext,
+) -> Result<Vec<crate::layers::LayerDef>, BiError> {
+    let base = resolve_relation(ch, input).await?;
+    let base_kind = dimension_kind(&base, &input.dimension);
+    let grained = input.grain.is_some();
+    let mut stored = Vec::new();
+    for (i, layer) in input.shape.layers_list().iter().enumerate() {
+        let n = i + 1;
+        let prefixed = |err: BiError| match err {
+            BiError::Validation(why) => BiError::Validation(format!("question {n}: {why}")),
+            other @ BiError::Clickhouse(_) => other,
+        };
+        let layer = layer.normalized();
+        let as_chart = crate::layers::layer_input(
+            &layer,
+            &format!("question {n}"),
+            input.grain.as_deref(),
+            crate::layers::layer_order(input),
+            None,
+        );
+        let resolved = resolve_relation(ch, &as_chart).await.map_err(prefixed)?;
+        spec_from_input_base(ch, &as_chart, source, created_by, None, time)
+            .await
+            .map_err(prefixed)?;
+        crate::layers::same_dimension_kind(
+            base_kind,
+            dimension_kind(&resolved, &layer.dimension),
+            grained,
+        )
+        .map_err(|why| BiError::Validation(format!("question {n}: {}", why.as_str())))?;
+        stored.push(layer);
+    }
+    Ok(stored)
+}
+
+/// The kind of `name` in a resolved relation: a column of the table, of a
+/// joined table, or a calculated field of the source.
+fn dimension_kind(resolved: &Resolved, name: &str) -> Option<ColumnKind> {
+    resolved
+        .kinds
+        .get(name)
+        .or_else(|| resolved.joined.get(name))
+        .copied()
+        .or_else(|| {
+            resolved
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| match f.ty.as_str() {
+                    "number" => ColumnKind::Number,
+                    "date" => ColumnKind::Date,
+                    "datetime" => ColumnKind::DateTime,
+                    _ => ColumnKind::Text,
+                })
+        })
+}
+
+/// [`spec_from_input`] without the layers: one chart over one source.
+async fn spec_from_input_base(
     ch: &ChClient,
     input: &ChartInput,
     source: ChartSource,
@@ -3095,6 +3182,14 @@ pub fn spec_from_inline_sql(
     time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
     let click = validated_click(input)?;
+    crate::layers::check_definition(input).map_err(BiError::Validation)?;
+    if !input.shape.layers_list().is_empty() {
+        // BI-13: the questions of a combined chart are checked against the
+        // stored sources and tables; save the SQL first, then combine it.
+        return Err(BiError::Validation(
+            "save the SQL as a source before combining it with other questions.".to_owned(),
+        ));
+    }
     let grain = validated_grain(input)?;
     let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
         Stage::Done(spec) => return Ok(with_click(*spec, click)),

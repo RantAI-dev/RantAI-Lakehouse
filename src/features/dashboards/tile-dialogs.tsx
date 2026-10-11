@@ -11,6 +11,7 @@ import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import type { BinMeta } from "@/lib/chart-bins";
+import type { LayerCell } from "./combined-option";
 
 export type Rows = {
   columns: string[];
@@ -33,6 +34,8 @@ export type Rows = {
   offset?: number;
   /** Lines on the value axis, at the values this read gave their parameters (BI-11). */
   referenceLines?: { value: number; label?: string }[];
+  /** The chart's other questions, each answered on its own (BI-13). */
+  layers?: LayerCell[];
 };
 export type Cell = Rows | TileFailure;
 

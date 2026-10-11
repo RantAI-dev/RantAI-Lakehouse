@@ -30,6 +30,8 @@ export type RecordsRequest = {
    * clicked on the tile; the route reads a relation, not a tile, without it.
    */
   chart?: string;
+  /** BI-13: with `chart`, the index (from 0) of one of its other questions; the list is that question's own rows. */
+  layer?: number;
   /**
    * A raw table (BI-16 part A): list these columns of the whole tile, in this
    * order, sorted by `sortColumn`. Not combined with `column` and `value`.
@@ -68,7 +70,10 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
       if (req.sortDir) q.set("sortDir", req.sortDir);
     }
   }
-  if (req.chart) q.set("chart", req.chart);
+  if (req.chart) {
+    q.set("chart", req.chart);
+    if (req.layer !== undefined) q.set("layer", String(req.layer));
+  }
   if (req.params) q.set("params", req.params);
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));

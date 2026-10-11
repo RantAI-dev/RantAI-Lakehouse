@@ -408,9 +408,33 @@ pub struct ShapeFields {
     /// of serving the stored one. Never stored and never sent.
     #[serde(skip)]
     pub resolved_params: bool,
+    /// Up to [`crate::layers::MAX_LAYERS`] more questions drawn on the same
+    /// chart, each from a source of its own (`BI-13`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub layers: Option<Vec<crate::layers::LayerDef>>,
+    /// How the chart's own series is drawn, `bar` or `line`, when it has
+    /// layers (`BI-13`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub draw: Option<String>,
+    /// Which value axis the chart's own series uses, `left` or `right`, when it
+    /// has layers (`BI-13`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub axis: Option<String>,
+    /// Set on the synthetic chart a layer is read as (`BI-13`): the builder
+    /// then always rebuilds its statement from the definition (a layer has no
+    /// stored statement to fall back to) and a table calculation is refused.
+    /// Never stored and never sent.
+    #[serde(skip)]
+    pub layer_query: bool,
 }
 
 impl ShapeFields {
+    /// The layers (none when absent or empty).
+    #[must_use]
+    pub fn layers_list(&self) -> &[crate::layers::LayerDef] {
+        self.layers.as_deref().unwrap_or_default()
+    }
+
     /// The joins (none when absent or empty).
     #[must_use]
     pub fn joins_list(&self) -> &[JoinSpec] {
@@ -457,6 +481,7 @@ impl ShapeFields {
             || self.breakdown_bin.is_some()
             || self.grid.is_some()
             || self.resolved_params
+            || self.layer_query
     }
 }
 

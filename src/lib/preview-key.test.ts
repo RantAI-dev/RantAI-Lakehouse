@@ -6,7 +6,7 @@ import { previewKey, type PreviewInputs } from "./preview-key"
 const base: PreviewInputs = {
   title: "t", source: "mart:m", kind: "line", dimension: "d", measure: "v", measure2: "", measure3: "",
   breakdown: "", mapId: "", lat: "", lon: "", aggregate: "sum", span: 1, caption: "", target: "",
-  text: "", order: "none", limit: 20, targetBoard: "default", grain: "", tables: "", calc: "", shape: "", params: "",
+  text: "", order: "none", limit: 20, targetBoard: "default", grain: "", tables: "", calc: "", shape: "", params: "", layers: "",
 }
 
 test("the preview is requested again when Group by changes", () => {
@@ -60,4 +60,25 @@ test("BI-11: the parameter values, the limit's parameter and the reference lines
     withParams({ ...zero, lines: [{ value: "", param: "target", label: "" }] }),
   ])
   assert.equal(keys.size, 4)
+})
+
+test("BI-13: each question input and the chart's own drawing change the key", () => {
+  const layer = { source: "mart:b", dimension: "d", measures: [{ column: "w", aggregate: "" }], aggregate: "sum", filters: [], joins: [], label: "", draw: "line", axis: "right" }
+  const withLayers = (v: unknown) => previewKey({ ...base, layers: JSON.stringify(v) })
+  const wrap = (l: unknown, ownDraw = "", ownAxis = "") => ({ layers: [l], ownDraw, ownAxis })
+  const keys = new Set([
+    withLayers(null),
+    withLayers(wrap(layer)),
+    withLayers(wrap({ ...layer, source: "mart:c" })),
+    withLayers(wrap({ ...layer, dimension: "e" })),
+    withLayers(wrap({ ...layer, measures: [{ column: "x", aggregate: "" }] })),
+    withLayers(wrap({ ...layer, measures: [{ column: "w", aggregate: "avg" }] })),
+    withLayers(wrap({ ...layer, filters: [{ column: "c", values: ["a"] }] })),
+    withLayers(wrap({ ...layer, label: "Rooms" })),
+    withLayers(wrap({ ...layer, draw: "bar" })),
+    withLayers(wrap({ ...layer, axis: "left" })),
+    withLayers(wrap(layer, "bar")),
+    withLayers(wrap(layer, "", "right")),
+  ])
+  assert.equal(keys.size, 12)
 })

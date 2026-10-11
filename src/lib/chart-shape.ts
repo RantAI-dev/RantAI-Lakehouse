@@ -1,6 +1,7 @@
 import type { FilterDef } from "@/services/clients/bi-store"
 import { type BinDef, type BinDraft, type GridDef, binDraftFromDef, binPayload, binProblem, gridChoiceOf, gridPayload } from "./chart-bins"
 import { type JoinDef, type JoinDraft, displayColumn, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
+import type { LayerDef } from "./chart-layers"
 
 /**
  * The chart builder's own data fields (`BI-6`): a measure with its own
@@ -40,6 +41,10 @@ export type ShapeDefFields = {
   breakdownBin?: BinDef
   /** A point map grouped by grid cell (BI-10). */
   grid?: GridDef
+  /** More questions drawn on the same chart (BI-13), and how its own series is drawn. */
+  layers?: LayerDef[]
+  draw?: "bar" | "line"
+  axis?: "left" | "right"
 }
 
 /** Most columns a table may be grouped by. */

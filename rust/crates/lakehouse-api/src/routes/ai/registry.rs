@@ -190,6 +190,37 @@ fn bin_schema(description: &str) -> Value {
         "required": ["mode"], "description": description })
 }
 
+/// The filters a chart or a question carries (at most 20): the same filters a
+/// dashboard takes, on columns of the data they belong to.
+fn filters_schema(description: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
+            "values": { "type": "array", "items": { "type": "string" }, "description": "in / not_in" },
+            "min": { "type": "string", "description": "between: a number or a date YYYY-MM-DD" },
+            "max": { "type": "string" },
+            "minExclusive": { "type": "boolean" }, "maxExclusive": { "type": "boolean" },
+            "text": { "type": "string", "description": "contains, starts_with, ends_with, not_contains" },
+            "anchor": { "type": "string", "enum": ["last", "this", "previous", "next"], "description": "relative" },
+            "unit": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
+            "n": { "type": "number" } },
+            "required": ["column"] }, "description": description })
+}
+
+/// The joins of a chart or a question (`BI-7`): up to four more Gold marts.
+fn joins_schema(description: &str) -> Value {
+    json!({ "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)" },
+            "type": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too" },
+            "on": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+                "left": { "type": "string", "description": "a column of the chart's mart, or of an earlier join as <table>__<column>" },
+                "op": { "type": "string", "enum": ["=", "<", "<=", ">", ">="] },
+                "right": { "type": "string", "description": "a column of the table being joined" } },
+                "required": ["left", "op", "right"] },
+                "description": "the pairs to match, all of them; at least one uses =" } },
+            "required": ["mart", "type", "on"] }, "description": description })
+}
+
 /// The `BI-6` fields of `create_chart` and `update_chart` (the chart's own
 /// filters, sort, "Other", groupings), inserted the way
 /// [`with_table_properties`] inserts the table fields. The limits are the ones
@@ -207,19 +238,22 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "label": { "type": "string", "description": "at most 60 characters" } },
             "required": ["value"] },
             "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move" },
-        "filters": { "type": "array", "items": { "type": "object", "properties": {
-            "column": { "type": "string" },
-            "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
-            "values": { "type": "array", "items": { "type": "string" }, "description": "in / not_in" },
-            "min": { "type": "string", "description": "between: a number or a date YYYY-MM-DD" },
-            "max": { "type": "string" },
-            "minExclusive": { "type": "boolean" }, "maxExclusive": { "type": "boolean" },
-            "text": { "type": "string", "description": "contains, starts_with, ends_with, not_contains" },
-            "anchor": { "type": "string", "enum": ["last", "this", "previous", "next"], "description": "relative" },
-            "unit": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
-            "n": { "type": "number" } },
-            "required": ["column"] },
-            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\"" },
+        "filters": filters_schema("the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""),
+        "layers": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "the Gold mart this question reads (give this or sqlSource)" },
+            "sqlSource": { "type": "string", "description": "the id of a saved SQL source (give this or mart)" },
+            "dimension": { "type": "string", "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain" },
+            "measures": measures_schema(),
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"], "description": "for the measures that have none of their own; default sum" },
+            "filters": filters_schema("this question's own filters (at most 20), on its own data"),
+            "joins": joins_schema("up to four more Gold marts joined to this question's mart; not for a SQL source"),
+            "label": { "type": "string", "description": "the legend name, at most 60 characters" },
+            "draw": { "type": "string", "enum": ["bar", "line"], "description": "how this question is drawn" },
+            "axis": { "type": "string", "enum": ["left", "right"], "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors" } },
+            "required": ["dimension", "measures", "draw", "axis"] },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows" },
+        "draw": { "type": "string", "enum": ["bar", "line"], "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)" },
+        "axis": { "type": "string", "enum": ["left", "right"], "description": "with layers: which value axis the chart's own series uses (default left)" },
         "sort": { "type": "object", "properties": {
             "by": { "type": "string", "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)" },
             "dir": { "type": "string", "enum": ["asc", "desc"] } },
@@ -245,17 +279,7 @@ fn with_shape_properties(mut schema: Value) -> Value {
                 "description": "group the result before this step again" } },
             "description": "give exactly one of filter and summarise" },
             "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'" },
-        "joins": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)" },
-            "type": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too" },
-            "on": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
-                "left": { "type": "string", "description": "a column of the chart's mart, or of an earlier join as <table>__<column>" },
-                "op": { "type": "string", "enum": ["=", "<", "<=", ">", ">="] },
-                "right": { "type": "string", "description": "a column of the table being joined" } },
-                "required": ["left", "op", "right"] },
-                "description": "the pairs to match, all of them; at least one uses =" } },
-            "required": ["mart", "type", "on"] },
-            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column" },
+        "joins": joins_schema("up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"),
         "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
             "column": { "type": "string" },
             "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" },
@@ -1741,6 +1765,36 @@ mod tests {
                 json!(["column"]),
                 "{tool}"
             );
+        }
+    }
+
+    /// `BI-13` (with `AI-6`): the chart tools take layers, and how the chart's
+    /// own series is drawn.
+    #[test]
+    fn the_chart_tools_take_layers_draw_and_axis() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert_eq!(properties["layers"]["maxItems"], 4, "{tool}");
+            assert_eq!(
+                properties["layers"]["items"]["required"],
+                json!(["dimension", "measures", "draw", "axis"]),
+                "{tool}"
+            );
+            assert_eq!(properties["draw"]["enum"], json!(["bar", "line"]), "{tool}");
+            assert_eq!(
+                properties["axis"]["enum"],
+                json!(["left", "right"]),
+                "{tool}"
+            );
+            // A layer takes the same filters and joins a chart takes.
+            for field in ["filters", "joins"] {
+                assert_eq!(
+                    properties["layers"]["items"]["properties"][field]["items"],
+                    properties[field]["items"],
+                    "{tool} {field}"
+                );
+            }
         }
     }
 

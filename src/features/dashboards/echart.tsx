@@ -54,14 +54,14 @@ export function EChart({
     chartCbRef.current?.(chart);
     chart.on("click", (p: unknown) => {
       const o = p as {
-        name?: string; value?: unknown; dataIndex?: number; seriesType?: string; dataType?: string;
+        name?: string; value?: unknown; dataIndex?: number; seriesType?: string; dataType?: string; seriesIndex?: number;
         treePathInfo?: { name?: string }[]; event?: { event?: MouseEvent };
       };
       if (!clickRef.current) return;
       const ev = o.event?.event;
       clickRef.current(
         {
-          name: o.name ?? "", value: o.value, dataIndex: o.dataIndex, seriesType: o.seriesType, dataType: o.dataType,
+          name: o.name ?? "", value: o.value, dataIndex: o.dataIndex, seriesType: o.seriesType, dataType: o.dataType, seriesIndex: o.seriesIndex,
           treePathInfo: o.treePathInfo?.map((t) => ({ name: t.name ?? "" })),
         },
         { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 },

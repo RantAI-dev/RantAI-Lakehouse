@@ -64,3 +64,9 @@ test("a chart that cannot be drilled says why in the menu's words", async () => 
     { column: "kab_kota", values: ["Kota Bandung"] },
   ])
 })
+
+test("a chart that combines questions cannot be drilled down (BI-13)", async () => {
+  const { drillBlockReason } = await import("./hierarchies")
+  assert.match(String(drillBlockReason({ kind: "bar", dimension: "provinsi", layers: [{}] })), /combines several questions/)
+  assert.equal(drillBlockReason({ kind: "bar", dimension: "provinsi", layers: [] }), null)
+})

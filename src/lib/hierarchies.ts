@@ -86,7 +86,7 @@ export function drillRequest(
  */
 export function drillBlockReason(def: {
   kind?: string; dimension?: string; grain?: string; bin?: unknown; breakdownBin?: unknown
-  steps?: unknown[]; other?: boolean; groupings?: unknown[]
+  steps?: unknown[]; other?: boolean; groupings?: unknown[]; layers?: unknown[]
 } | undefined): string | null {
   if (!def) return "this chart has no definition to drill."
   if (!["bar", "hbar", "line", "area", "stacked", "pie", "rose", "funnel", "treemap"].includes(def.kind ?? "")) return "this kind of chart cannot be drilled down."
@@ -95,6 +95,8 @@ export function drillBlockReason(def: {
   if (def.steps?.length) return "a chart with steps cannot be drilled down."
   if (def.other) return "a chart with an 'Other' group cannot be drilled down."
   if (def.groupings?.length) return "a table with several groupings cannot be drilled down."
+  // BI-13: the other questions are matched on this dimension's values, which a drill changes.
+  if (def.layers?.length) return "a chart that combines several questions cannot be drilled down."
   if (!def.dimension) return "this chart has no dimension to drill."
   return null
 }

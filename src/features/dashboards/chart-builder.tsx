@@ -65,6 +65,8 @@ import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
+import { LayersSection } from "./layers-section";
+import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
@@ -373,6 +375,10 @@ export function ChartBuilder({
   const [paramDefs, setParamDefs] = React.useState<ParamDef[]>([]);
   const [limitParamName, setLimitParamName] = React.useState("");
   const [refLines, setRefLines] = React.useState<RefLineDraft[]>([]);
+  // BI-13: the chart's other questions, and how its own series is drawn when it has them ("" = the kind's default).
+  const [layers, setLayers] = React.useState<LayerDraft[]>([]);
+  const [ownDraw, setOwnDraw] = React.useState("");
+  const [ownAxis, setOwnAxis] = React.useState("");
   const [paramsOpen, setParamsOpen] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
@@ -575,6 +581,15 @@ export function ChartBuilder({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload only when the complete joins change
   }, [open, joinsKey]);
+  // BI-13: questions can be added to a bar, line, area or combo chart; they are matched on its
+  // dimension, so a breakdown, "Other", steps or bins on the chart are refused with the questions.
+  const layersApply = takesLayers(kind) && !rowsMode && layers.length > 0;
+  const layersBlocked = [
+    ...(canBreakdown && breakdown ? ["a breakdown"] : []),
+    ...(shape.other ? ["the 'Other' group"] : []),
+    ...(shape.steps.length ? ["steps"] : []),
+    ...(shape.bin || shape.breakdownBin ? ["bins"] : []),
+  ];
   const noFieldsHint = isNewSql ? "run the SQL first" : "pick a source first";
   // Required fields still empty: listed in the preview before the user
   // hits Create, and the same list is the save-time error.
@@ -588,6 +603,7 @@ export function ChartBuilder({
         ...(ownColumns ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
         ...draftProblems(kind, tableDraft),
+        ...(layersApply ? layerProblems(layers) : []),
         ...shapeProblems(shape, { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) }),
       ];
   const isEdit = !!editId;
@@ -670,6 +686,9 @@ export function ChartBuilder({
       setLimitParamName(limitParam(initial.limit) ?? "");
       setLimit(typeof initial.limit === "number" ? initial.limit : 20);
       setRefLines(refLinesFromDef(initial.referenceLines));
+      setLayers(layerDraftsFromDef(initial.layers));
+      setOwnDraw(initial.draw ?? "");
+      setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
@@ -694,7 +713,7 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]);
+    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
     setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
@@ -807,6 +826,9 @@ export function ChartBuilder({
         order: isCalendar ? "none" : isPoints ? undefined : legacyOrder,
         limit: isPoints ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
         referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
+        layers: layersApply ? layersPayload(layers) : undefined,
+        draw: layersApply && ownDraw ? ownDraw : undefined,
+        axis: layersApply && ownAxis ? ownAxis : undefined,
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
         ...draftPayload(kind, tableDraft, shownColumns),
@@ -836,6 +858,8 @@ export function ChartBuilder({
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
     // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
     params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
+    // BI-13: each question, and how the chart's own series is drawn, reaches the statements and the drawing.
+    layers: JSON.stringify(layersApply ? { layers, ownDraw, ownAxis } : null),
   });
   React.useEffect(() => {
     if (!open) return;
@@ -1304,6 +1328,17 @@ export function ChartBuilder({
           ) : null}
 
           <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} />
+
+          {takesLayers(kind) && !rowsMode && (choice || isNewSql) ? (
+            <LayersSection
+              layers={layers} onChange={setLayers}
+              baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
+              marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
+              ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
+              blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
+              disabled={!fields}
+            />
+          ) : null}
 
           {takesSteps(kind, rowsMode) && !grain && !shapeContext.breakdown && !shape.other ? (
             <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} />

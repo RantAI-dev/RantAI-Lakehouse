@@ -444,6 +444,12 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
 /// a pivot, a raw table, a map and a box plot have none.
 fn takes_table_calc(def: &ChartInput) -> bool {
     let kind = def.kind;
+    // BI-13: the questions of a combined chart are matched on their dimension
+    // values, so a calculation over the order of one question's groups has no
+    // meaning there.
+    if combines_questions(def) {
+        return false;
+    }
     matches!(
         kind,
         ChartKind::Bar
@@ -456,10 +462,31 @@ fn takes_table_calc(def: &ChartInput) -> bool {
     ) || (kind == ChartKind::Table && !def.tables.is_rows_mode(kind))
 }
 
+/// Whether the chart is one question of a combined chart, or carries layers
+/// (`BI-13`).
+fn combines_questions(def: &ChartInput) -> bool {
+    def.shape.layer_query || !def.shape.layers_list().is_empty()
+}
+
+/// The sentence for a table calculation used where the chart cannot have one.
+fn table_calc_refusal(name: &str, combined: bool) -> String {
+    if combined {
+        return format!(
+            "'{name}' is a table calculation; a chart that combines several questions takes none."
+        );
+    }
+    format!(
+        "'{name}' is a table calculation; it can only be a value (measure) of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart, not a dimension, breakdown, column, pivot value, map, KPI or gauge."
+    )
+}
+
 /// How a chart may use the fields it names, for [`prepare_refs`].
 struct Use {
     aggregate_measure_ok: bool,
     table_calc_ok: bool,
+    /// The chart combines questions (`BI-13`); only changes the sentence of a
+    /// refused table calculation.
+    combined: bool,
     chart: Option<ChartCtx>,
 }
 
@@ -519,6 +546,7 @@ pub fn prepare<H: std::hash::BuildHasher>(
         &Use {
             aggregate_measure_ok: takes_aggregate_measure(def),
             table_calc_ok: takes_table_calc(def),
+            combined: combines_questions(def),
             chart: Some(chart_ctx(def, time)),
         },
         from,
@@ -545,6 +573,7 @@ pub fn prepare_named<H: std::hash::BuildHasher>(
     let none = Use {
         aggregate_measure_ok: false,
         table_calc_ok: false,
+        combined: false,
         chart: None,
     };
     prepare_refs(fields, &refs, &none, from, cols, time)
@@ -611,9 +640,7 @@ fn prepare_refs<H: std::hash::BuildHasher>(
         match compiled.level {
             Level::Table => {
                 if !(usage.table_calc_ok && only_measure) {
-                    return Err(format!(
-                        "'{name}' is a table calculation; it can only be a value (measure) of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart, not a dimension, breakdown, column, pivot value, map, KPI or gauge."
-                    ));
+                    return Err(table_calc_refusal(name, usage.combined));
                 }
                 table_calcs.push(TableCalc {
                     name: field.name.clone(),

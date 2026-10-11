@@ -440,6 +440,65 @@ fn layout_json(board: &Board) -> Value {
     )
 }
 
+/// The calculated fields of every source.
+///
+/// BI-8: an embed or a public link shows a chart that uses a calculated field
+/// exactly as the dashboard does (same builder, same role rewrite with the
+/// embed viewer's role).
+///
+/// PR #104 CI fix: a catalog that cannot be read must not take the whole embed
+/// down (it used to render, with a per-tile fixed message for a tile that
+/// failed). Like the dashboard route, a failed read leaves the catalog empty: a
+/// chart that names a calculated field then fails on its own statement with the
+/// fixed tile message and a reference, never showing a wrong number, and the
+/// failure is logged under its own reference.
+async fn catalog_or_empty(ch: &ChClient) -> lakehouse_bi::fields::FieldCatalog {
+    match lakehouse_bi::fields::list_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            lakehouse_bi::fields::FieldCatalog::default()
+        }
+    }
+}
+
+/// The columns of every table, read only when something on the board needs
+/// them. Column types are what decides whether a chart's grain still fits its
+/// dimension (BI-9), and which filters apply.
+///
+/// BI-13: the questions of a combined chart need the columns of their own
+/// sources. That read is optional for the board (PR #104 lesson): when it
+/// fails the questions that need it say so and everything else renders.
+async fn board_columns(
+    ch: &ChClient,
+    charts: &[&StoredChartSpec],
+    filters: &[FilterDef],
+    fields: &lakehouse_bi::fields::FieldCatalog,
+) -> Result<
+    std::collections::HashMap<String, lakehouse_bi::builder::RelationColumns>,
+    lakehouse_clickhouse::ChError,
+> {
+    let need_cols = filters.iter().any(FilterDef::is_active)
+        || charts.iter().any(|c| {
+            c.def.needs_columns()
+                || fields.chart_uses(&c.def)
+                || lakehouse_bi::params::changes_statement(&c.def)
+        });
+    if need_cols {
+        return mart_columns(ch).await;
+    }
+    if charts.iter().any(|c| !c.def.shape.layers_list().is_empty()) {
+        return Ok(match mart_columns(ch).await {
+            Ok(found) => found,
+            Err(err) => {
+                let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+                std::collections::HashMap::new()
+            }
+        });
+    }
+    Ok(std::collections::HashMap::new())
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -455,23 +514,7 @@ async fn render_board_payload(
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     let stored = store::list_stored_charts(ch).await?;
-    // BI-8: an embed or a public link shows a chart that uses a calculated
-    // field exactly as the dashboard does (same builder, same role rewrite
-    // with the embed viewer's role).
-    //
-    // PR #104 CI fix: a catalog that cannot be read must not take the whole
-    // embed down (it used to render, with a per-tile fixed message for a tile
-    // that failed). Like the dashboard route, a failed read leaves the catalog
-    // empty: a chart that names a calculated field then fails on its own
-    // statement with the fixed tile message and a reference, never showing a
-    // wrong number, and the failure is logged under its own reference.
-    let field_catalog = match lakehouse_bi::fields::list_fields(ch).await {
-        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
-        Err(err) => {
-            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
-            lakehouse_bi::fields::FieldCatalog::default()
-        }
-    };
+    let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
         .filter(|c| {
@@ -483,19 +526,7 @@ async fn render_board_payload(
         })
         .collect();
 
-    // Column types are also what decides whether a chart's grain still fits
-    // its dimension (BI-9).
-    let need_cols = filters.iter().any(FilterDef::is_active)
-        || stored_for_board.iter().any(|c| {
-            c.def.needs_columns()
-                || field_catalog.chart_uses(&c.def)
-                || lakehouse_bi::params::changes_statement(&c.def)
-        });
-    let cols = if need_cols {
-        mart_columns(ch).await?
-    } else {
-        std::collections::HashMap::new()
-    };
+    let cols = board_columns(ch, &stored_for_board, filters, &field_catalog).await?;
 
     let mut results = serde_json::Map::new();
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
@@ -516,6 +547,23 @@ async fn render_board_payload(
             .and_then(lakehouse_bi::grain::Grain::parse)
             .filter(|g| g.is_truncation()),
         fields: &field_catalog,
+    };
+    let layer_sources =
+        crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
+    let layer_runner = crate::routes::layers::RoleRunner {
+        ch,
+        roles: &roles,
+        placeholders: &placeholders,
+        obligations,
+    };
+    let layer_ctx = crate::routes::layers::LayerContext {
+        runner: &layer_runner,
+        years: &[],
+        filters,
+        cols: &cols,
+        chart_sources: &sources,
+        layer_sources: &layer_sources,
+        read: &read,
     };
     for original in &stored_for_board {
         let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
@@ -549,6 +597,8 @@ async fn render_board_payload(
                     (&roles, &placeholders, obligations),
                 )
                 .await;
+                crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain)
+                    .await;
                 results.insert(id, val);
             }
             Err(msg) => {

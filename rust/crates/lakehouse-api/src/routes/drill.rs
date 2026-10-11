@@ -94,6 +94,11 @@ pub fn drillable(def: &ChartInput) -> Result<(), String> {
     if def.shape.groupings.is_some() {
         return Err("a table with several groupings cannot be drilled down.".to_owned());
     }
+    // BI-13: the other questions are matched on this dimension's values, which
+    // a drill changes.
+    if !def.shape.layers_list().is_empty() {
+        return Err("a chart that combines several questions cannot be drilled down.".to_owned());
+    }
     if def.dimension.is_empty() {
         return Err("this chart has no dimension to drill.".to_owned());
     }
