@@ -144,8 +144,9 @@ backdrop-blur and a 1 px foam/10% bottom border after 40 px of scroll.
 - The sources fall as **glowing droplets** through the water, each a pill
   label that drifts down and settles into a "sediment" grid on scroll. The
   list, all built today: PostgreSQL, MySQL, SQL Server, MongoDB, REST APIs,
-  Kafka, CSV and TSV files, Excel workbooks, Parquet files, S3-compatible
-  storage, SFTP. One pill per item, mono text.
+  Kafka, CSV and TSV files, Excel workbooks, Parquet files. One pill per
+  item, mono text. (SFTP and S3-compatible storage stay off until `VER-1`
+  and `SRC-6` are done; review round 1.)
 - A small caption under the grid: "Live change capture for PostgreSQL. File
   upload straight from the console." (both are built).
 
@@ -206,15 +207,15 @@ The signature scroll moment.
 ### S6. "Guarded by default" — governance (about 120 vh)
 - Headline: **Guarded by default.** Sub: "Roles decide who sees what.
   Sensitive columns are classified and masked for everyone who should not
-  see them, and the lineage shows where every number came from."
+  see them, and lineage shows which tables each table is built from."
 - An interactive **masking table** (DOM): 5 rows × 4 columns (name, email,
   city, amount). A toggle "View as: Analyst / Admin". As Analyst, the email
   and name cells **scramble** (random glyph cycling for 400 ms) into masked
   values (`a•••@•••.com`); switching to Admin unscrambles them. Starts in
   Admin and flips to Analyst once when the table scrolls into view.
 - Three small facts under it, each a mono label + one line: "Masking proven
-  end to end in an acceptance gate", "Every assistant action logged and
-  approvable", "Lineage from raw table to dashboard".
+  end to end in an acceptance gate", "Assistant actions logged; risky ones
+  wait for approval", "Lineage from raw table to curated table".
 
 ### S7. "Runs where you do" — open source and open formats (about 100 vh)
 - Headline: **Yours to keep.** Three large cards in a row (stacked on
