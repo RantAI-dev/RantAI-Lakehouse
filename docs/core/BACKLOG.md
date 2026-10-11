@@ -52,6 +52,7 @@ estimate (S, M, L), which the base has no field for.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `AI-18` | Feature | Copilot Chat: ask a question or give an instruction in plain language, and the assistant answers or acts with the console's own tools; risky actions wait for approval. Built before this backlog tracked PRs; never accepted | AI Copilot | P1 | In Acceptance |  | `PRODUCT.md` §2 (Home, History) |
 | `SEC-22` | Task | Converting an uploaded workbook can exhaust the API's memory and stop the API for every user; the conversion must not be able to end the API process | Administration & Security | P0 | Todo |  | PR #76 review, BLOCKER 1 (merged without the fix) |
+| `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | In Progress | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
 | `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history | Administration & Security | P1 | Todo |  | `SECURITY.md` |
@@ -198,6 +199,7 @@ set by the product owner and are left empty until they are.
 | `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
+| `SEC-23` | 2026-10-09 | | |
 
 ## Decide
 
@@ -267,6 +269,7 @@ builds it (`AGENTS.md`).
 | [`SEC-19`](specs/sec-19.md) | The query cost estimate runs only safe SQL | Next | S |
 | [`SEC-20`](specs/sec-20.md) | Queries are scoped to the tenant | Next | M |
 | [`SEC-21`](specs/sec-21.md) | Downloads and big results are safe | Next | S |
+| [`SEC-23`](specs/sec-23.md) | Adding a governance rule needs the permission changing one needs | Now | S |
 
 ### Dashboards (BI)
 

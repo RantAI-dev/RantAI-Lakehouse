@@ -827,6 +827,82 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
     );
 }
 
+/// SEC-23 (F1/F2): a principal holding other write permissions but NOT
+/// `governance:write` is refused (403) when it adds a quality,
+/// classification or residency rule, and nothing is stored. The bodies are
+/// valid, so a 403 can only come from the permission gate, and the row
+/// counts prove the handler never ran.
+#[tokio::test]
+async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(
+        &pool,
+        "catalog:read,catalog:write,policy:read,policy:write,query:read,pipeline:write",
+    )
+    .await;
+
+    let cases = [
+        (
+            "quality",
+            "quality_rule",
+            serde_json::json!({
+                "name": "sec23-no-write", "asset": "gold.orders", "dimension": "completeness",
+                "threshold": "99%", "severity": "high",
+            }),
+        ),
+        (
+            "classification",
+            "classification_rule",
+            serde_json::json!({
+                "asset": "gold.orders", "column": "email", "classification": "PII",
+                "maskingRule": "hash",
+            }),
+        ),
+        (
+            "residency",
+            "residency_rule",
+            serde_json::json!({
+                "tenant": "sec23", "classification": "PII", "approvedSites": ["site-a"],
+                "crossSiteAllowed": false, "allowedOutput": "none",
+            }),
+        ),
+    ];
+    for (kind, table, body) in cases {
+        // `table` is a constant from the array above, never user input.
+        let count_sql = format!("SELECT count(*) FROM {table}");
+        let before: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules before");
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/governance/{kind}"))
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("serialize body"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "adding a {kind} rule without governance:write must be refused"
+        );
+        let after: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules after");
+        assert_eq!(before, after, "a refused {kind} rule must store nothing");
+    }
+}
+
 /// # Input validation: `expectedIntervalMinutes: 0` is refused at the
 /// route, never reaching the database (WS5 plan review U12 — both layers
 /// tested, not just the store-level `CHECK` in
