@@ -750,10 +750,13 @@ export function ColumnsCard({
   const sizes = [...COLUMN_PAGE_SIZES.filter((n) => n < rows.length), ALL]
   // The drafts line counts over every row, so it says what is left to review whatever the filter hides.
   const drafts = ready ? draftCount(rows, byColumn) : 0
-  // In the meaning view a filter reaches the synonyms and the meaning too, so "penjualan" finds its column.
+  // The filter also reaches the meaning written for each column (its description and synonyms, the
+  // Meaning cell and "Also called"), so "revenue" or a word of the meaning finds its column in both views (plan 10 review 1).
   const extra = ready
-    ? (r: SchemaRow) =>
-        [r.column.description ?? "", (byColumn.get(r.column.name)?.synonyms ?? []).join(", ")].join(" ")
+    ? (r: SchemaRow) => {
+        const entry = byColumn.get(r.column.name)
+        return [entry?.description ?? "", (entry?.synonyms ?? []).join(", ")].join(" ")
+      }
     : undefined
   const { shown: listed, matched } = visibleColumns(rows, query, paged ? limit : ALL, extra)
   const shown = view === "meaning" && draftsOnly ? listed.filter((r) => byColumn.get(r.column.name)?.status === "draft") : listed

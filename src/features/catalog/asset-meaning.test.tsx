@@ -177,6 +177,22 @@ describe("the meaning view", () => {
     expect(within(row).getByText("No meaning written")).toBeTruthy()
   })
 
+  it("gives the narrow layout one track per cell that is shown below @lg, so a row stays one line", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    // Below @lg the Also called and Status cells are `hidden`; Column, Role, Meaning and Confirm are shown.
+    const header = within(meaningTable()).getAllByRole("row")[0] as HTMLElement
+    const shownBelowLg = within(header)
+      .getAllByRole("columnheader")
+      .filter((h) => !/(^|\s)hidden(\s|$)/.test(h.className))
+    const base = header.className.split(/\s+/).find((c) => c.startsWith("grid-cols-["))
+    expect(base).toBeTruthy()
+    const tracks = base?.slice("grid-cols-[".length, -1).split("_") ?? []
+    expect(tracks).toHaveLength(shownBelowLg.length)
+  })
+
   it("lists the same rows as the statistics view, so the filter applies to both", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
@@ -264,6 +280,25 @@ describe("the filter in both views", () => {
 
     fireEvent.click(meaningTab())
     expect(within(meaningTable()).getByText("col_05")).toBeTruthy()
+    expect(within(meaningTable()).queryByText("col_01")).toBeNull()
+  })
+})
+
+describe("the filter reaches a meaning's own words", () => {
+  // The column's name and its column description hold no "returns"; only the entry's description does.
+  const eleven = Array.from({ length: 11 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+  const meant = entry({ column: "col_05", description: "Gross margin after returns", status: "confirmed" })
+
+  it("shows a column whose meaning holds the typed word, in the statistics view and in the meaning view", () => {
+    const { state } = readyMeanings([meant])
+    renderCard(eleven, state)
+
+    fireEvent.change(screen.getByLabelText("Filter columns"), { target: { value: "returns" } })
+    expect(screen.getByRole("button", { name: "col_05" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "col_01" })).toBeNull()
+
+    fireEvent.click(meaningTab())
+    expect(within(meaningTable()).getByText("Gross margin after returns")).toBeTruthy()
     expect(within(meaningTable()).queryByText("col_01")).toBeNull()
   })
 })

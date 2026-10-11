@@ -42,7 +42,7 @@ const MAX_SYNONYMS = 6
 const MAX_SYNONYM_LENGTH = 40
 
 /**
- * Splits on commas only, since a synonym can hold a space ("total omzet").
+ * Splits on commas only, since a synonym can hold a space ("total revenue").
  * The shape copies `parseTags` in `asset-about.tsx`.
  */
 export function parseSynonyms(raw: string): { synonyms: string[] } | { error: string } {
@@ -54,7 +54,8 @@ export function parseSynonyms(raw: string): { synonyms: string[] } | { error: st
         .filter((s) => s.length > 0)
     ),
   ]
-  const long = synonyms.find((s) => s.length > MAX_SYNONYM_LENGTH)
+  // The API counts code points, so a count by `length` would disagree for a character outside the BMP (plan 10 review 3).
+  const long = synonyms.find((s) => [...s].length > MAX_SYNONYM_LENGTH)
   if (long) {
     return { error: `"${long}" is longer than ${MAX_SYNONYM_LENGTH} characters.` }
   }

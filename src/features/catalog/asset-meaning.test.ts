@@ -69,6 +69,13 @@ describe("parseSynonyms", () => {
     expect(parseSynonyms("a,b,c,d,e,f,g")).toEqual({ error: "At most 6 names." })
   })
 
+  it("accepts a name of 21 astral characters, which is 21 code points though 42 UTF-16 units", () => {
+    // U+1D400 (mathematical bold capital A) is outside the BMP: two UTF-16 units, one code point.
+    const astral = "\u{1D400}".repeat(21)
+    expect(astral.length).toBe(42)
+    expect(parseSynonyms(astral)).toEqual({ synonyms: [astral] })
+  })
+
   it("returns an error that names a piece longer than 40 characters", () => {
     const long = "x".repeat(41)
     const result = parseSynonyms(`omzet,${long}`)

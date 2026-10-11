@@ -174,9 +174,12 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // first, below `@2xl`; the status goes second, below `@3xl`. The column name,
 // the role, the meaning and the confirm control never shed. Every breakpoint
 // lists the cells that are shown, in order, so the header and the rows agree.
+// Below `@lg` the four shown cells take one track each, so a row is one line (plan 10 review 2):
+// the meaning gets the widest track (2fr) of the three text cells, since it is
+// what the row is for, and the confirm control keeps its fixed 1.75rem.
 const MEANING_ROW = "grid items-center gap-x-3 px-3"
 const MEANING_TRACKS = [
-  "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.75rem]",
+  "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,2fr)_1.75rem]",
   "@lg:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_1.75rem]",
   "@2xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_1.75rem]",
   "@3xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_5rem_1.75rem]",
@@ -432,7 +435,7 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
               id={`${id}-synonyms`}
               value={synonyms}
               onChange={(e) => setSynonyms(e.target.value)}
-              placeholder="omzet, penjualan"
+              placeholder="revenue, sales, gross"
               aria-invalid={"error" in parsed}
             />
             <p className={cn("text-xs", "error" in parsed ? "text-destructive" : "text-muted-foreground")}>
