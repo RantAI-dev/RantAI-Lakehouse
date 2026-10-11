@@ -72,8 +72,13 @@ function Caustics() {
   return (
     <div aria-hidden="true" className="absolute inset-0 overflow-hidden">
       <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_50%_0%,#0B1A4A_0%,#050A30_55%,#030824_100%)]" />
+
       <div className="lk-caustic-a absolute -top-1/4 -left-1/4 size-[80%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.20)_0%,transparent_62%)] blur-2xl" />
       <div className="lk-caustic-b absolute -right-1/4 -bottom-1/3 size-[90%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.14)_0%,transparent_60%)] blur-3xl" />
+      {/* WEB-1 review round 1 SHOULD-FIX 2: meets the abyss the canvas fades to at
+          the end of S3 with no seam. Last, so the glow blobs above cannot show a
+          clipped edge at the top of the stage. */}
+      <div className="absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-[#020514] via-[#020514]/60 to-transparent" />
     </div>
   );
 }

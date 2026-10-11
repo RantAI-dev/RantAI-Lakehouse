@@ -326,6 +326,13 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     shafts.update(t, uw * 0.55 * Math.exp(-below / 14), camera);
     snow.update(t, uw * 0.85, camera, dpr);
     slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr });
+
+    // WEB-1 review round 1 SHOULD-FIX 2: the canvas layer is sticky only inside
+    // the zone, so where S3 ends it used to be cut by a hard horizontal edge
+    // across the Gold slab. Fade it to the page's abyss over the last part of
+    // the pinned range so it is gone before that edge arrives. (On the canvas
+    // itself, not its layer: the layer has its own opacity transition.)
+    if (!still) canvas.style.opacity = String(1 - smoothstep(0.82, 1, state.depthProgress));
   }
 
   function renderFrame(): void {
