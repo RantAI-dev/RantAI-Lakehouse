@@ -76,6 +76,26 @@ export function inputOf(entry: SemanticEntry, over: Partial<SemanticEntryInput> 
   }
 }
 
+/**
+ * What the Schema tab knows about the meanings of its table, as one value the
+ * components take. `none` is a table the semantic route never serves: the
+ * console makes no request and shows no meaning at all.
+ */
+export type MeaningState =
+  | { kind: "none" }
+  | { kind: "loading" }
+  | { kind: "error"; message: string; retry: () => void }
+  | { kind: "unsupported"; reason: string }
+  | {
+      kind: "ready"
+      table: SemanticEntry | null
+      byColumn: Map<string, SemanticEntry>
+      canEdit: boolean
+      /** Saves one entry. The components call nothing else to write. */
+      save: (input: SemanticEntryInput, signal?: AbortSignal) => Promise<void>
+      reload: () => void
+    }
+
 export type RoleOption = { value: SemanticRole; label: string; help: string }
 
 export const ROLE_OPTIONS: readonly RoleOption[] = [
