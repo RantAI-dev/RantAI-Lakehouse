@@ -144,7 +144,7 @@ describe("the drafts line", () => {
 })
 
 describe("the meaning view", () => {
-  it("shows a draft's meaning, synonyms, role and status on one line", () => {
+  it("shows a draft's meaning, synonyms, role and status in a read-only row", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
@@ -178,7 +178,7 @@ describe("the meaning view", () => {
     expect(within(row).getByText("No meaning written")).toBeTruthy()
   })
 
-  it("gives the narrow layout one track per cell that is shown below @lg, so a row stays one line", () => {
+  it("gives the narrow layout one track per cell that is shown below @lg", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())

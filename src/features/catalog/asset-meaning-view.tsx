@@ -494,9 +494,10 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
 }
 
 /**
- * The Meaning view: one line per listed column, with its role, its meaning,
- * its synonyms and its status. A column without an entry says so in place.
- * A role is saved from its row at once; a meaning is edited in the dialog.
+ * The Meaning view: a row per listed column, with its role, its meaning (up
+ * to two lines), its synonyms and its status. A column without an entry says
+ * so in place. A role is saved from its row at once; a meaning is edited in
+ * the dialog.
  */
 export function MeaningView({ rows, state }: { rows: SchemaRow[]; state: Ready }) {
   const { byColumn, canEdit, save, reload } = state
