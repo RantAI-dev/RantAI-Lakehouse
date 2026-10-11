@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-16` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with the Data stream |
-| When | Next |
+| Module | Administration & Security |
+| Also involves | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -36,9 +35,8 @@ From the Data audit; not re-checked.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A cross-tenant test for each of the four cases fails before the fix and passes after
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-16-AC1` A cross-tenant test for each of the four cases fails before the fix and passes after
+- `SEC-16-AC2` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

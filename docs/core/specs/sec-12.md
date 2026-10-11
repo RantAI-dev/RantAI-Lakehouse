@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-12` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with the dashboards team |
-| When | Next |
+| Module | Administration & Security |
+| Also involves | Dashboards |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -36,11 +35,10 @@ Tableau connected apps and Metabase guest embeds both expire tokens; Metabase re
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A token without exp is refused
-- [ ] A revoked token stops working within a minute
-- [ ] The embed page refuses to render inside a site not on the allowlist
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-12-AC1` A token without exp is refused
+- `SEC-12-AC2` A revoked token stops working within a minute
+- `SEC-12-AC3` The embed page refuses to render inside a site not on the allowlist
+- `SEC-12-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

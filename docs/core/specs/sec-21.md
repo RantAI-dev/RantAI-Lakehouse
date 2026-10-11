@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-21` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, with Query Studio |
-| When | Next |
+| Module | Administration & Security |
+| Also involves | Query Studio |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -34,10 +33,9 @@ From the Data audit; not re-checked.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A mask added after a run applies to its re-download
-- [ ] SELECT * on a very large table does not raise the API's memory beyond the cap
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-21-AC1` A mask added after a run applies to its re-download
+- `SEC-21-AC2` SELECT * on a very large table does not raise the API's memory beyond the cap
+- `SEC-21-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

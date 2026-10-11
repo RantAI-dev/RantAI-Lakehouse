@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `BI-4` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
-| When | Next |
+| Module | Dashboards |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -38,11 +36,10 @@ Metabase caching: adaptive, duration, schedule, per database/dashboard/question 
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A second open of a dashboard is served from the cache and says so
-- [ ] Two users with different masks never see each other's cached results
-- [ ] A RESULT document records the before/after timings
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-4-AC1` A second open of a dashboard is served from the cache and says so
+- `BI-4-AC2` Two users with different masks never see each other's cached results
+- `BI-4-AC3` A RESULT document records the before/after timings
+- `BI-4-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

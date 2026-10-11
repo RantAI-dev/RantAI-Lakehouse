@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-16` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec corrected against the code and a running instance 2026-10-09. Feature page [`time-travel.md`](../features/time-travel.md), decisions signed 2026-10-09. Plan written. Trino is split off as `DATA-21` |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Spec checked | Against the code and a running instance on 2026-10-09. Feature page [`time-travel.md`](../features/time-travel.md). Trino is split off as `DATA-21` |
 
 ## Why
 
@@ -37,10 +36,9 @@ Supersedes DATA-7. Snowflake: Time Travel 1 day on all editions, up to 90 days o
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A masked column stays masked when queried at an older version on ClickHouse
-- [ ] A past-version query on Trino is refused with a plain message
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-16-AC1` A masked column stays masked, and a row filter applied, when a raw table is queried at an older version on ClickHouse
+- `DATA-16-AC2` A past-version query on Trino is refused with a plain message
+- `DATA-16-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

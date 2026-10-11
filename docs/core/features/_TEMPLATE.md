@@ -6,11 +6,18 @@ can observe; how it is built belongs in the engineering plan.
 
 | | |
 | --- | --- |
-| Module | <module> |
+| Module | <one name from the base's list: Data, Dashboards, Query Studio, AI Copilot, Build, Governance, Operations, Administration & Security> |
 | Backlog | <ID> |
+| Kind | Feature |
 | Spec | `docs/core/specs/<id>.md` (target numbers; every *(proposed)* one is signed under Decisions) |
-| Status | Draft / Decisions signed <date> / In build / Accepted <date> |
+| Status | Idea / Planned / Building / In Acceptance / Released / Killed (the base's six; "merged" is **In Acceptance**, never Released) |
+| Priority | P0 / P1 / P2 / P3 |
+| Owner | The module's owner, in the base. Not named here (the repo is public). |
+| Acceptor | Who runs the acceptance checklist. Must not be the Owner; for a feature the owner built, a second person. Held in the base. |
 | Plan | `docs/superpowers/plans/<date>-<slug>.md` |
+| Started | <date of the plan>; also in `BACKLOG.md` Dates |
+| Shipped | <merge date of the delivering PR>; also in `BACKLOG.md` Dates |
+| Evidence | The PR(s), and a link to the accepted build or its checklist run |
 
 ## Problem
 
@@ -47,22 +54,31 @@ when accepted.
 
 ## Acceptance checklist
 
-Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
-A step not performed is never Pass. Steps needing a terminal are marked
-(operator).
+One row per check. Each has a stable ID (`<BACKLOG-ID>-AC<n>`, e.g. `BI-1-AC1`)
+so it maps to one QA Case in the base and keeps that ID for life. Run on a real
+deployment. **Result** uses the base's values: **Pass**, **Fail**, or
+**Not run** (with the reason). A step not performed is never Pass. Steps needing
+a terminal are marked (operator).
+
+This list is the self-contained acceptance criteria. Do not write "every target
+row works"; write the checks out in full here, so the row means something on its
+own once it is a QA Case in the base.
 
 Always include: the normal path, a failure being visible, a user without
 permission, switching it off, and an unknown value shown honestly.
 
-| # | Do this | Expect | Result |
+| ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
+| `<ID>-AC1` | ... | ... | Not run |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-19` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Upload) |
-| Who builds it | Data, with the pipelines stream |
-| When | Next |
+| Module | Data |
+| Also involves | Build |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -35,9 +34,8 @@ Both competitors treat an uploaded table like any other table.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Upload, build a Silver table from it, chart the Gold table: all from the console
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-19-AC1` Upload, build a Silver table from it, chart the Gold table: all from the console
+- `DATA-19-AC2` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

@@ -3,12 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `AI-4` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
-| When | Next, with BI-8 |
+| Module | AI Copilot |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`BI-8`](bi-8.md) (BI phase 1) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -42,9 +40,8 @@ BI-8.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request adds a working profit field
-- [ ] An impossible request is explained, not faked
+- `AI-4-AC1` The quoted request adds a working profit field
+- `AI-4-AC2` An impossible request is explained, not faked
 
 ## Not included
 

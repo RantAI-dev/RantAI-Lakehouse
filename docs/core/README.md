@@ -6,7 +6,7 @@ stays current.
 | File | What it is | When you touch it |
 | --- | --- | --- |
 | [PRODUCT.md](PRODUCT.md) | The one product document: what it is, what is in it, what it lacks, what blocks production, what is next, open decisions | When a feature is accepted; before a release |
-| [BACKLOG.md](BACKLOG.md) | The one list of work | Weekly |
+| [BACKLOG.md](BACKLOG.md) | The master list of work (ID, kind, item, module, priority, status, PR); the Lark base mirrors it | Weekly, and on every merge |
 | [specs/](specs/) | One spec per backlog task: target numbers against the best competitor, acceptance checklist, what is left out | When a task is added or its targets change |
 | [features/](features/) | One page per feature: what the user can do, decisions, limits, acceptance checklist. Written only when a feature is built | Starting and finishing a feature |
 | [HANDOFF.md](HANDOFF.md) | Current state for a planner or reviewer taking over: what is merged, what is in flight, how to review, what to watch for | When the planner role changes hands |
@@ -14,14 +14,24 @@ stays current.
 
 ## How a feature moves
 
-1. It is in `BACKLOG.md` under Now.
+1. It is in `BACKLOG.md` with Kind **Feature**, a Module, a Priority and
+   Status **Planned**.
 2. It gets a page in `features/` (copy `_TEMPLATE.md`). The planner agent
-   may draft it; the product owner answers its decisions.
-3. The agents plan, build, review and merge it (`AGENTS.md`).
+   may draft it; the product owner answers its decisions and names the
+   Acceptor in the base.
+3. The agents plan, build, review and merge it (`AGENTS.md`). On merge its
+   Status becomes **In Acceptance**, with the PR recorded.
 4. The product owner runs the acceptance checklist on that page.
-5. `PRODUCT.md` and `BACKLOG.md` are updated.
+5. `PRODUCT.md` and `BACKLOG.md` are updated (Status **Released**), and the
+   base row is updated to match.
 
 Merged is not accepted. A feature counts as done at step 4.
+
+**The repo and the base.** `BACKLOG.md` is the master list the agents read.
+The Lark base mirrors it: status, PR, dates and QA-case results are kept in
+the repo and copied to the base. The base adds only what a public repo must
+not hold: the people (Owner, Acceptor). When the repo changes, the base row
+is updated to match; nothing the repo holds is changed only in the base.
 
 ## Rules
 

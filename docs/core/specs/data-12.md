@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `DATA-12` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Catalog) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec corrected against the code 2026-10-09. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Spec checked | Against the code on 2026-10-09 |
 
 ## Why
 
@@ -37,11 +36,10 @@ Databricks: certified and deprecated system tags, governed tags with allowed val
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A certified table shows its mark in search and in the chart builder
-- [ ] Setting a tag value outside the allowed list is refused
-- [ ] A user without the owner role cannot certify
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-12-AC1` A certified table shows its mark in search and in the chart builder
+- `DATA-12-AC2` Setting a tag value outside the allowed list is refused
+- `DATA-12-AC3` A user without the owner role cannot certify
+- `DATA-12-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
