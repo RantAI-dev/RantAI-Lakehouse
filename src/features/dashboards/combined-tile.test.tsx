@@ -48,6 +48,13 @@ describe("a tile with more questions on its chart", () => {
     expect(screen.getByText("ab12cd")).toBeTruthy()
   })
 
+  it("says under the chart which question was cut off and nothing for one that was not (BI-13 review fix R1)", () => {
+    const cutCell: Rows = { ...CELL, layers: [{ ...CELL.layers![0], truncated: true }, { ...CELL.layers![0], label: "Beds" }] }
+    render(<TileBody spec={SPEC} cell={cutCell} dark={false} loading={false} />)
+    expect(screen.getByText("Rooms: not every value is shown")).toBeTruthy()
+    expect(screen.queryByText(/Beds: not every/)).toBeNull()
+  })
+
   it("tells a click which question the mark belongs to, with that question's own source and dimension", () => {
     const clicks: Parameters<ChartClickHandler>[] = []
     render(<TileBody spec={SPEC} cell={CELL} dark={false} loading={false} onDataClick={(...args) => { clicks.push(args) }} />)

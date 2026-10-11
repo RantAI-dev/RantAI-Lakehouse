@@ -14,7 +14,16 @@ import type { LayerDef } from "./chart-layers"
  */
 
 /** A measure as stored: a column (the chart's aggregate applies) or a column with its own aggregate. */
-export type MeasureEntry = string | { column: string; aggregate: string }
+export type MeasureEntry = string | { column: string; aggregate: string } | { metric: string }
+
+/**
+ * A measure row that names a saved metric (BI-2) holds `metric:<name>` as its column, so the
+ * pickers and rows need no second field; a column or calculated field never has a colon.
+ */
+export const METRIC_PREFIX = "metric:"
+export const metricColumn = (name: string) => `${METRIC_PREFIX}${name}`
+export const isMetricColumn = (column: string) => column.startsWith(METRIC_PREFIX)
+export const metricNameOf = (column: string) => column.slice(METRIC_PREFIX.length)
 export type SortDir = "asc" | "desc"
 export type SortSpec = { by: string; dir: SortDir }
 export type Grouping = { column: string; grain?: string; bin?: BinDef }
@@ -67,7 +76,11 @@ const AGGREGATE_WORDS: Record<string, string> = {
 /** The measures a saved definition lists, as builder rows. */
 export function rowsFromEntries(entries: readonly MeasureEntry[] | undefined): MeasureRow[] {
   const rows = (entries ?? []).map((e) =>
-    typeof e === "string" ? { column: e, aggregate: "" } : { column: e.column, aggregate: e.aggregate })
+    typeof e === "string"
+      ? { column: e, aggregate: "" }
+      : "metric" in e
+        ? { column: metricColumn(e.metric), aggregate: "" }
+        : { column: e.column, aggregate: e.aggregate })
   return rows.length ? rows : [{ column: "", aggregate: "" }]
 }
 
@@ -75,7 +88,8 @@ export function rowsFromEntries(entries: readonly MeasureEntry[] | undefined): M
 export function entriesFromRows(rows: readonly MeasureRow[], own: boolean): MeasureEntry[] {
   return rows
     .filter((r) => r.column)
-    .map((r) => (own && r.aggregate ? { column: r.column, aggregate: r.aggregate } : r.column))
+    .map((r): MeasureEntry =>
+      isMetricColumn(r.column) ? { metric: metricNameOf(r.column) } : own && r.aggregate ? { column: r.column, aggregate: r.aggregate } : r.column)
 }
 
 /**
@@ -85,12 +99,14 @@ export function entriesFromRows(rows: readonly MeasureRow[], own: boolean): Meas
  * (`lakehouse_bi::shape::resolve_measures`).
  */
 export function resultName(row: MeasureRow, wholeMeasure: ReadonlySet<string>): string {
+  if (isMetricColumn(row.column)) return metricNameOf(row.column)
   if (!row.aggregate || wholeMeasure.has(row.column)) return row.column
   return `${row.aggregate}_${row.column}`
 }
 
 /** "avg of stay" for a measure with its own aggregate; the plain name otherwise. */
 export function measureLabel(row: MeasureRow, wholeMeasure: ReadonlySet<string>): string {
+  if (isMetricColumn(row.column)) return metricNameOf(row.column)
   if (!row.aggregate || wholeMeasure.has(row.column)) return row.column
   return `${AGGREGATE_WORDS[row.aggregate] ?? row.aggregate} of ${row.column}`
 }
@@ -392,6 +408,26 @@ export function labelOtherRows<R extends Record<string, unknown>>(rows: readonly
 }
 
 /**
+ * BI-11 review fix (BLOCKER) R1: the definition a tile is read with. A stored
+ * definition keeps a column switch as `{name}` text; the server says which
+ * column each slot took in this response (`resolved`), and the tile's series
+ * names, labels and clicks must follow that, not the unresolved text. Without
+ * `resolved` the definition is returned as it is.
+ */
+export function withResolvedSlots<D extends { dimension?: string; breakdown?: string; measures?: MeasureEntry[] }>(
+  def: D | undefined,
+  resolved: { dimension?: string; breakdown?: string | null; measures?: unknown[] } | undefined,
+): D | undefined {
+  if (!def || !resolved) return def
+  return {
+    ...def,
+    ...(resolved.dimension !== undefined ? { dimension: resolved.dimension } : {}),
+    ...(resolved.breakdown !== undefined ? { breakdown: resolved.breakdown ?? undefined } : {}),
+    ...(Array.isArray(resolved.measures) ? { measures: resolved.measures as MeasureEntry[] } : {}),
+  }
+}
+
+/**
  * Result name → readable label ("avg of stay") for a tile, by position: the
  * tile's `y` names the result columns in the order of the definition's
  * measures, and a name that differs from its column is an own aggregate.
@@ -403,8 +439,8 @@ export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined,
   if (steps?.length) {
     const base: ResultColumns = {
       groups: [],
-      measures: (measures ?? []).map((m) => (typeof m === "string" ? m : `${m.aggregate}_${m.column}`)),
-      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${m.column}`]]))),
+      measures: (measures ?? []).map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : `${m.aggregate}_${m.column}`)),
+      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${m.column}`]]))),
     }
     const after = columnsAfterSteps({ ...base, groups: steps.flatMap((s) => (s.summarise?.by ?? []).map((name) => ({ name, kind: "text" }))) }, steps)
     for (const name of names) if (after.labels[name]) out[name] = after.labels[name]
@@ -412,7 +448,7 @@ export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined,
   }
   names.forEach((name, i) => {
     const entry = measures?.[i]
-    if (entry && typeof entry !== "string" && name !== entry.column) {
+    if (entry && typeof entry !== "string" && !("metric" in entry) && name !== entry.column) {
       out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${displayColumn(entry.column)}`
     } else if (typeof name === "string" && displayColumn(name) !== name) {
       // BI-7: a measure from a joined table reads table.column.

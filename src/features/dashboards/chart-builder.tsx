@@ -29,7 +29,8 @@ import { useAuth } from "@/features/auth/auth-provider";
 import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
-import { dashboardService, paramService } from "@/services";
+import { dashboardService, metricService, paramService } from "@/services";
+import type { Metric, Segment } from "@/services/contracts/metrics";
 import {
   columnSwitchParams, limitParam, numberParams, refLinesFromDef, refLinesPayload, slotParam, slotText,
   type ParamDef, type ParamValue, type RefLineDef, type RefLineDraft,
@@ -48,7 +49,7 @@ import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
-  effectiveOrder, emptyShapeDraft, entriesFromRows, measureLabel, measureLimits, parseSortChoice, resultName,
+  effectiveOrder, emptyShapeDraft, entriesFromRows, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
   rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, takesOther, takesSteps, usesGroupings, columnsAfterSteps,
   type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
@@ -85,6 +86,10 @@ type Fields = {
   calculated?: CalcField[];
   /** The source's hierarchies (BI-10). */
   hierarchies?: Hierarchy[];
+  /** The metrics saved on this source (BI-2): picked as a measure, by name. */
+  metrics?: Metric[];
+  /** The segments saved on this source (BI-2): added to the chart's filters by name. */
+  segments?: Segment[];
 };
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
@@ -313,7 +318,12 @@ export function ChartBuilder({
   const [editingHierarchy, setEditingHierarchy] = React.useState<Hierarchy | undefined>(undefined);
   /** A calculated field is marked "fx" wherever a column is picked. */
   // A joined column (`table__column`, BI-7) reads `table.column`.
-  const fieldLabel = (name: string) => slotParam(name)
+  const fieldLabel = (name: string) => isMetricColumn(name)
+    ? (() => {
+        const m = (fields?.metrics ?? []).find((x) => x.name === metricNameOf(name));
+        return <span className="flex items-center gap-1.5" title={m?.description || undefined}>{m?.label || metricNameOf(name)}<span className="rounded bg-primary/10 px-1 text-[10px] font-medium text-primary">metric</span></span>;
+      })()
+    : slotParam(name)
     ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">param</span></span>
     : calcNames.has(name)
     ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
@@ -416,9 +426,15 @@ export function ChartBuilder({
   /** The legacy order, read by the limit and grain rules: a sort by a grouping is "none", by a measure a value order. */
   const order = effectiveOrder(shape.sortChoice, groupingNames);
   const wholeMeasure = React.useMemo(
-    () => new Set((fields?.calculated ?? []).filter((f) => f.level === "aggregate" || f.level === "table").map((f) => f.name)),
+    () => new Set([
+      ...(fields?.calculated ?? []).filter((f) => f.level === "aggregate" || f.level === "table").map((f) => f.name),
+      // BI-2: a metric has its own aggregate, so the row's aggregate does not apply to it.
+      ...(fields?.metrics ?? []).map((m) => metricColumn(m.name)),
+    ]),
     [fields],
   );
+  const metricRow = measureRows.find((r) => isMetricColumn(r.column));
+  const pickedMetric = metricRow ? (fields?.metrics ?? []).find((m) => m.name === metricNameOf(metricRow.column)) : undefined;
   // Fix the number of measure rows to what the kind takes.
   React.useEffect(() => {
     setMeasureRows((rows) => {
@@ -602,7 +618,7 @@ export function ChartBuilder({
         ...(isPoints && !lon ? ["Longitude"] : []),
         ...(ownColumns ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
-        ...draftProblems(kind, tableDraft),
+        ...draftProblems(kind, tableDraft, !!pickedMetric?.timeColumn),
         ...(layersApply ? layerProblems(layers) : []),
         ...shapeProblems(shape, { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) }),
       ];
@@ -643,6 +659,11 @@ export function ChartBuilder({
       j.calculated ?? [],
     );
     f.hierarchies = j.hierarchies ?? [];
+    // BI-2: the metrics of this source; a source with none (or a viewer who cannot list them) just has none.
+    f.segments = (await metricService.listSegments().catch(() => [] as Segment[])).filter((g) =>
+      picked.kind === "mart" ? g.sourceKind === "mart" && g.sourceId === picked.name : g.sourceKind === "sql_source" && g.sourceId === picked.id);
+    f.metrics = (await metricService.list().catch(() => [] as Metric[])).filter((m) =>
+      picked.kind === "mart" ? m.sourceKind === "mart" && m.sourceId === picked.name : m.sourceKind === "sql_source" && m.sourceId === picked.id);
     // BI-11: a list parameter can stand for a column; it is offered wherever a column is picked,
     // and the server checks every one of its values as a column of this chart's data when it is saved.
     const defs = await paramService.list().catch(() => [] as ParamDef[]);
@@ -748,7 +769,12 @@ export function ChartBuilder({
   const resultNames = measureRows.filter((r) => r.column).map((r) => resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure));
   const shownColumns = [...new Set([...groupingNames, ...resultNames])];
   const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) };
-  const measureColumns = (fields?.measures ?? []).filter((m) => !isPoints || (m !== lat && m !== lon));
+  // BI-2: saved metrics of the source are offered where an aggregate field is (not maps, box plots, pivots or raw rows).
+  const takesMetrics = !ownColumns && !isPoints && kind !== "boxplot" && kind !== "text";
+  const measureColumns = [
+    ...(fields?.measures ?? []).filter((m) => !isPoints || (m !== lat && m !== lon)),
+    ...(takesMetrics ? (fields?.metrics ?? []).map((m) => metricColumn(m.name)) : []),
+  ];
   // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
   const columnChoices = React.useMemo<ColumnChoice[]>(() => {
     const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
@@ -1263,7 +1289,7 @@ export function ChartBuilder({
                 <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
                 <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
               </div>
-              <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
+              <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} />
             </>
           ) : isGauge ? (
             <div className="grid gap-1.5">
@@ -1327,7 +1353,7 @@ export function ChartBuilder({
             </Label>
           ) : null}
 
-          <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} />
+          <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} />
 
           {takesLayers(kind) && !rowsMode && (choice || isNewSql) ? (
             <LayersSection

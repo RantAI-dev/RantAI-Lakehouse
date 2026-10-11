@@ -453,7 +453,7 @@ fn layout_json(board: &Board) -> Value {
 /// fixed tile message and a reference, never showing a wrong number, and the
 /// failure is logged under its own reference.
 async fn catalog_or_empty(ch: &ChClient) -> lakehouse_bi::fields::FieldCatalog {
-    match lakehouse_bi::fields::list_fields(ch).await {
+    match lakehouse_bi::fields::list_catalog_fields(ch).await {
         Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
         Err(err) => {
             let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);

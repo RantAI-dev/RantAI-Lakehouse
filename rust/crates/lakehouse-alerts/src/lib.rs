@@ -1030,7 +1030,7 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         lakehouse_bi::fields::FieldCatalog::default()
     } else {
         lakehouse_bi::fields::FieldCatalog::from_fields(
-            lakehouse_bi::fields::list_fields(ch).await?,
+            lakehouse_bi::fields::list_catalog_fields(ch).await?,
         )
     };
     let time = lakehouse_bi::grain::TimeContext::default();

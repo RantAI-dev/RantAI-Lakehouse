@@ -346,6 +346,7 @@ pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one. A parameter (list_parameters, create_parameter) is a value a viewer changes on the dashboard: a formula reads it as {name}, `limit` and a reference line (`referenceLines`) can take {param: name}, and a list parameter can switch the dimension, breakdown or a measure's column; to draw a target line, create a number parameter and pass it in referenceLines. Reuse an existing one. To draw two sources on one chart (visitors next to hotel rooms by month), keep the first question as the chart and add the other as `layers` (its own mart or sqlSource, a dimension of the same kind, measures, draw bar or line, axis left or right; right for numbers on another scale); do not join tables that should stay apart, and a chart with layers has no breakdown, 'Other' or steps.
+- Named metrics come first: when the user asks for a number a company defines once (revenue, active customers, total visitors), call list_metrics BEFORE writing a query or a chart. If a metric matches, use it: query_metric gives its value (by one column or by a period, filtered if asked) as the person you are helping, a chart or KPI takes it as the measure {metric: name}, and your answer NAMES the metric you used (its label and name). If none matches, say so in one sentence before you write SQL. create_metric saves a new one (only when asked; the user needs the metric:write permission); update_metric changes every chart that uses it, so say so; delete_metric needs approval.
 - Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
@@ -355,7 +356,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_calculated_field, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
 
@@ -377,6 +378,11 @@ const ALWAYS: &[&str] = &[
     "list_boards",
     "list_alert_rules",
     "get_cdc_health",
+    // BI-2 / AI-7: a question for a number may be answered by a named metric,
+    // and the model can only prefer one if it can see them on every turn.
+    "list_metrics",
+    "describe_metric",
+    "query_metric",
 ];
 
 /// One domain of tools and the words (English and Indonesian, lowercase
@@ -424,6 +430,8 @@ const DOMAINS: &[Domain] = &[
             "visual",
             "plot",
             "kpi",
+            "metric",
+            "metrik",
             "card",
             "kartu",
             "tile",
@@ -456,6 +464,9 @@ const DOMAINS: &[Domain] = &[
             "update_chart",
             "create_board",
             "delete_chart",
+            "create_metric",
+            "update_metric",
+            "delete_metric",
             "list_formula_functions",
             "list_calculated_fields",
             "validate_formula",

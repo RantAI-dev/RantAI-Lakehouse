@@ -205,6 +205,13 @@ pub struct AggregateField {
     pub sql: String,
     /// The source columns it reads, which a bucketing inner query must carry.
     pub reads: Vec<String>,
+    /// `BI-2`: the expression reads columns whose names a measure of the same
+    /// statement may also use as its result name (`visitors`), which the engine
+    /// resolves to the measure and rejects as an aggregate inside an aggregate.
+    /// The statement then asks for `prefer_column_name_to_alias`. Only a
+    /// metric sets it, so a chart that uses a calculated aggregate keeps the
+    /// statement it always had.
+    pub prefer_columns: bool,
 }
 
 impl Relation {
@@ -329,10 +336,18 @@ impl Relation {
             // type's default; the engine's own join memory limit stays.
             Self::Joined { .. } => " SETTINGS join_use_nulls = 1".to_owned(),
             Self::Sql(_) => SQL_SOURCE_SETTINGS.to_owned(),
+            Self::Calculated {
+                base, aggregates, ..
+            } => {
+                if aggregates.iter().any(|a| a.prefer_columns) {
+                    add_settings(&base.settings(), &["prefer_column_name_to_alias = 1"])
+                } else {
+                    base.settings()
+                }
+            }
             Self::Filtered { base, .. }
             | Self::Ranged { base, .. }
-            | Self::Bucketed { base, .. }
-            | Self::Calculated { base, .. } => base.settings(),
+            | Self::Bucketed { base, .. } => base.settings(),
             Self::Fixed { base, .. } => add_settings(&base.settings(), &["join_use_nulls = 1"]),
         }
     }
@@ -1351,13 +1366,17 @@ fn with_own_filters<H: std::hash::BuildHasher>(
     def: &ChartInput,
     cols: &RelationColumns<H>,
     mut outcome: FilterOutcome,
-    time: &TimeContext,
+    read: &ReadContext<'_>,
 ) -> Option<FilterOutcome> {
+    let time = read.time;
     let own = def.shape.own_filters();
     if own.is_empty() {
         return Some(outcome);
     }
-    let mut mine = filter_predicates(cols, &[], own, time);
+    // BI-2: a segment is replaced by its filters; one that is gone fails the
+    // tile like a filter that cannot apply, never shows more rows.
+    let own = read.fields.expand_chart_filters(def, own).ok()?;
+    let mut mine = filter_predicates(cols, &[], &own, time);
     if !mine.skipped.is_empty() {
         return None;
     }
@@ -1385,7 +1404,7 @@ fn report_over<H: std::hash::BuildHasher>(
         predicates,
         skipped,
         columns,
-    } = with_own_filters(&spec.def, cols, outcome, read.time)?;
+    } = with_own_filters(&spec.def, cols, outcome, read)?;
     // BI-8 part 2: a `Fixed` aggregate is computed over the filtered rows, so
     // the filters go inside the join. Nothing is left for the outer query,
     // which also means no filter column can be mistaken for an alias there.
@@ -1938,8 +1957,15 @@ fn rebuild<H: std::hash::BuildHasher>(
         });
     }
     if def.tables.compares_to_previous(kind) {
-        let plan = tables::plan_compare(&def.tables, &col_set(), ctx.cols).ok()??;
-        let tables::ComparePlan::Previous { period, .. } = &plan else {
+        let filled = crate::metrics::fill_compare(
+            &def.tables,
+            &def.measures,
+            ctx.read.fields.for_chart(def),
+        );
+        let plan = tables::plan_compare(&filled, &col_set(), ctx.cols).ok()??;
+        let (tables::ComparePlan::Previous { period, .. }
+        | tables::ComparePlan::LastYear { period, .. }) = &plan
+        else {
             return None;
         };
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
@@ -1972,9 +1998,15 @@ pub fn stored_sql<H: std::hash::BuildHasher>(
     from: &Relation,
     cols: &RelationColumns<H>,
     time: &TimeContext,
+    fields: &FieldCatalog,
 ) -> Option<String> {
-    let read = ReadContext::new(time);
-    let outcome = with_own_filters(&spec.def, cols, FilterOutcome::default(), time)?;
+    // BI-2: the catalog is what expands a chart's segments; the saved
+    // statement must be buildable with them or the save is refused.
+    let read = ReadContext {
+        fields,
+        ..ReadContext::new(time)
+    };
+    let outcome = with_own_filters(&spec.def, cols, FilterOutcome::default(), &read)?;
     let FilterOutcome {
         predicates,
         columns,

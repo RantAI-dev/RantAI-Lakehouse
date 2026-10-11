@@ -17,6 +17,7 @@ pub mod groups;
 pub mod hierarchies;
 pub mod joins;
 pub mod layers;
+pub mod metrics;
 pub mod params;
 pub mod shape;
 pub mod sources;

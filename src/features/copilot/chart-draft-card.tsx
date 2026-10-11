@@ -34,7 +34,10 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
   // BI-6: a measure is a column name, or a column with its own aggregate.
   const measures = Array.isArray(args.measures)
     ? args.measures.filter((m): m is MeasureEntry =>
-        typeof m === "string" || (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
+        typeof m === "string" ||
+        // BI-2: a measure may be a saved metric by name.
+        (typeof m === "object" && m !== null && typeof (m as { metric?: unknown }).metric === "string") ||
+        (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
   return {
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? "",
@@ -168,7 +171,7 @@ export function ChartDraftCard({
         ) : null}
         {def.dimension ? <span>by {def.dimension}</span> : null}
         {def.measures?.length ? (
-          <span>· {def.aggregate ?? "sum"}({def.measures.join(", ")})</span>
+          <span>· {def.aggregate ?? "sum"}({def.measures.map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : m.column)).join(", ")})</span>
         ) : null}
       </div>
 

@@ -23,7 +23,9 @@ export const CAPABILITIES: Capability[] = [
     label: "Query Data",
     desc: "Query & explore catalog, lineage, quality",
     icon: Database,
-    tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart"],
+    tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart",
+      // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
+      "list_metrics", "describe_metric", "query_metric"],
   },
   {
     key: "dashboard",
@@ -37,7 +39,9 @@ export const CAPABILITIES: Capability[] = [
       // BI-10: value groups and hierarchies.
       "create_value_group", "list_hierarchies", "create_hierarchy", "delete_hierarchy",
       // BI-11: parameters.
-      "list_parameters", "create_parameter", "update_parameter", "delete_parameter"],
+      "list_parameters", "create_parameter", "update_parameter", "delete_parameter",
+      // BI-2 / AI-7: reusable metrics (a tool missing here never reaches the model, see BI-8 R1 above).
+      "list_metrics", "describe_metric", "query_metric", "create_metric", "update_metric", "delete_metric"],
   },
   {
     key: "pipeline",

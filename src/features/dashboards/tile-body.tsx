@@ -9,7 +9,7 @@ import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, fmtInt, withReferenceLines } from "./chart-option";
-import { buildCombinedOption, failedLayers } from "./combined-option";
+import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
 import { useReporting } from "./reporting-context";
@@ -21,7 +21,7 @@ import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
-import { labelOtherRows, tileMeasureLabels, visibleColumns, type ShapeDefFields } from "@/lib/chart-shape";
+import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
 
 type Cell = Rows | TileFailure;
@@ -57,7 +57,7 @@ export function TileBody({
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
-  const def = spec.def as (TableDefFields & ShapeDefFields) | undefined;
+  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields) | undefined, spec.resolved);
   // BI-6: "avg of stay" for a measure with its own aggregate.
   const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps);
   // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
@@ -169,6 +169,7 @@ function CombinedBody({
   }, dark);
   const option = withReferenceLines(combined.option, cell.referenceLines, false, dark);
   const failed = failedLayers(layers);
+  const cut = cutLayers(layers);
   const click = onDataClick
     ? (hit: Parameters<ChartClickHandler>[0], pos: { x: number; y: number }) => {
         const owner = combined.owners[hit.seriesIndex ?? -1] ?? -1;
@@ -185,6 +186,11 @@ function CombinedBody({
       <div className="min-h-0 flex-1">
         <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click} />
       </div>
+      {cut.length ? (
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground" aria-label="Questions that were cut off">
+          {cut.map((label) => `${label}: not every value is shown`).join(" · ")}
+        </p>
+      ) : null}
       {failed.length ? (
         <ul className="px-1 pt-1 text-[11px] text-destructive" aria-label="Questions that could not be drawn">
           {failed.map((f, i) => (

@@ -129,7 +129,7 @@ pub struct PivotValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Compare {
-    /// `previous` or `goal`.
+    /// `previous`, `last_year` (`BI-2`) or `goal`.
     pub kind: String,
     /// `previous`: the date or timestamp column the periods are cut from.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -207,7 +207,11 @@ impl TableFields {
     /// the deployment's time settings, so it is rebuilt at read time).
     #[must_use]
     pub fn compares_to_previous(&self, kind: ChartKind) -> bool {
-        kind == ChartKind::Kpi && self.compare.as_ref().is_some_and(|c| c.kind == "previous")
+        kind == ChartKind::Kpi
+            && self
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.kind == "previous" || c.kind == "last_year")
     }
 }
 
@@ -757,6 +761,17 @@ pub enum ComparePlan {
         /// The period.
         period: Grain,
     },
+    /// `BI-2`: the latest period that has data against the same period one
+    /// year earlier (a calendar shift; a week is 52 weeks back, as
+    /// `SamePeriodLastYear` does).
+    LastYear {
+        /// The date or timestamp column the periods are cut from.
+        column: Ident,
+        /// Its kind.
+        kind: ColumnKind,
+        /// The period.
+        period: Grain,
+    },
     /// The KPI against a number.
     Goal(f64),
 }
@@ -781,9 +796,9 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
         return Ok(None);
     };
     match c.kind.as_str() {
-        "previous" => {
+        "previous" | "last_year" => {
             if c.value.is_some() {
-                return Err("a comparison with the previous period takes no value.".to_owned());
+                return Err("a comparison with a period takes no value.".to_owned());
             }
             let (Some(column), Some(period)) = (c.date_column.as_deref(), c.period.as_deref())
             else {
@@ -807,6 +822,18 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
             if !matches!(kind, ColumnKind::Date | ColumnKind::DateTime) {
                 return Err("a comparison needs a date or timestamp column.".to_owned());
             }
+            if c.kind == "last_year" {
+                if matches!(period, Grain::Year) {
+                    return Err(
+                        "the same period last year needs a period shorter than a year.".to_owned(),
+                    );
+                }
+                return Ok(Some(ComparePlan::LastYear {
+                    column: ident,
+                    kind,
+                    period,
+                }));
+            }
             Ok(Some(ComparePlan::Previous {
                 column: ident,
                 kind,
@@ -823,7 +850,7 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
             }
         }
         other => Err(format!(
-            "invalid comparison '{other}': use previous or goal."
+            "invalid comparison '{other}': use previous, last_year or goal."
         )),
     }
 }
@@ -843,13 +870,20 @@ pub fn kpi_trend_sql(
     compare: &ComparePlan,
     time: &TimeContext,
 ) -> Option<String> {
-    let ComparePlan::Previous {
-        column,
-        kind,
-        period,
-    } = compare
-    else {
-        return None;
+    let (column, kind, period, limit) = match compare {
+        ComparePlan::Previous {
+            column,
+            kind,
+            period,
+        } => (column, kind, period, TREND_PERIODS),
+        // BI-2: enough periods with data to reach back a year from the
+        // latest; gaps in the data only reach further back.
+        ComparePlan::LastYear {
+            column,
+            kind,
+            period,
+        } => (column, kind, period, last_year_periods(*period)),
+        ComparePlan::Goal(_) => return None,
     };
     let expr = period.bucket_expr(column, *kind, time)?;
     let base = if predicates.is_empty() {
@@ -860,10 +894,18 @@ pub fn kpi_trend_sql(
             predicates,
         }
     };
-    let carried = if measure.as_str() == column.as_str() {
-        Vec::new()
-    } else {
-        vec![measure.to_string()]
+    // BI-2: a metric (or any aggregate field) is the number itself; the
+    // bucketing query must carry the columns it reads.
+    let aggregate = from.aggregate_field(measure.as_str());
+    let carried = match aggregate {
+        Some(a) => a
+            .reads
+            .iter()
+            .filter(|c| c.as_str() != column.as_str())
+            .cloned()
+            .collect(),
+        None if measure.as_str() == column.as_str() => Vec::new(),
+        None => vec![measure.to_string()],
     };
     let bucketed = Relation::Bucketed {
         base: Box::new(base),
@@ -871,17 +913,30 @@ pub fn kpi_trend_sql(
         expr,
         carried,
     };
-    let value = if agg == Aggregate::Count {
+    let value = if let Some(a) = aggregate {
+        a.sql.clone()
+    } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
         format!("round({agg}({measure}))")
     };
     Some(format!(
         "SELECT * FROM (SELECT {column}, {value} AS v FROM {} WHERE {column} IS NOT NULL \
-         GROUP BY {column} ORDER BY {column} DESC LIMIT {TREND_PERIODS}) ORDER BY {column}{}",
+         GROUP BY {column} ORDER BY {column} DESC LIMIT {limit}) ORDER BY {column}{}",
         bucketed.render(),
         bucketed.settings(),
     ))
+}
+
+/// How many periods with data reach back a year from the latest one.
+fn last_year_periods(period: Grain) -> u32 {
+    match period {
+        Grain::Day => 400,
+        Grain::Week => 60,
+        Grain::Month => 14,
+        Grain::Quarter => 6,
+        _ => 2,
+    }
 }
 
 #[cfg(test)]

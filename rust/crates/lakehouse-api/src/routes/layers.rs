@@ -341,6 +341,16 @@ async fn ask<R: LayerRunner>(
     if let (Matching::Range(range), Some(Value::Array(rows))) = (how, answer.get_mut("rows")) {
         layers::trim_to_range(rows, &layer.dimension, range);
     }
+    // BI-13 review fix (SHOULD-FIX) R1: a layer asked for its own values was
+    // built with one row more than it may return; the extra row is the proof
+    // that it was cut, and the tile says so like any cut tile. (A grained
+    // layer is marked by `annotate_grain`.)
+    if let Some(Value::Array(rows)) = answer.get_mut("rows")
+        && rows.len() > layers::LAYER_ROW_LIMIT as usize
+    {
+        rows.truncate(layers::LAYER_ROW_LIMIT as usize);
+        answer.insert("truncated".to_owned(), json!(true));
+    }
     answer.remove("grain");
     answer.remove("grainColumn");
     if !filtered.skipped.is_empty() {
@@ -371,7 +381,7 @@ pub(crate) async fn annotate_preview_layers(
             HashMap::new()
         }
     };
-    let catalog = match lakehouse_bi::fields::list_fields(ch).await {
+    let catalog = match lakehouse_bi::fields::list_catalog_fields(ch).await {
         Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
         Err(err) => {
             let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
@@ -404,4 +414,9 @@ pub(crate) async fn annotate_preview_layers(
 // (`tests/sec11_guard.rs`), as `dashboard.rs` does for its own.
 #[cfg(test)]
 #[path = "layers_rewrite.rs"]
-mod layers_rewrite;
+pub(crate) mod layers_rewrite;
+
+// BI-2: the same harness, for metrics and segments.
+#[cfg(test)]
+#[path = "metrics_rewrite.rs"]
+mod metrics_rewrite;

@@ -91,6 +91,24 @@ describe("ChartFilters", () => {
   })
 })
 
+describe("ChartFilters with segments (BI-2)", () => {
+  const columns = [{ name: "category", kind: "text" as const }]
+  const segments = [{ name: "domestic", label: "Domestic visitors" }, { name: "foreign", label: "Foreign visitors" }]
+  it("adds a segment as a reference by name and lists it as a chip that can be removed", () => {
+    const onChange = mock<(filters: unknown[]) => void>(() => {})
+    const { rerender } = render(<ChartFilters value={[]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    expect(screen.getByLabelText("Add a segment")).toBeTruthy()
+    rerender(<ChartFilters value={[{ column: "", values: [], segment: "domestic" }]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    expect(screen.getByText("Segment: Domestic visitors")).toBeTruthy()
+    fireEvent.click(screen.getByLabelText("Remove segment domestic"))
+    expect(onChange.mock.calls[0][0]).toEqual([])
+  })
+  it("offers no segment picker when the table has none", () => {
+    render(<ChartFilters value={[]} onChange={() => {}} columns={columns} disabled={false} />)
+    expect(screen.queryByLabelText("Add a segment")).toBeNull()
+  })
+})
+
 describe("OwnFiltersMarker", () => {
   it("says on the tile that the chart is filtered and how", () => {
     render(<OwnFiltersMarker filters={[{ column: "category", values: ["Office", "Retail"] }]} />)

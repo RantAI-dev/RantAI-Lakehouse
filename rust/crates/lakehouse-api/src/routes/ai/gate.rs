@@ -132,6 +132,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -262,6 +263,21 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "update_calculated_field" => format!(
             "Mengubah rumus kolom hitung {} menjadi {}.",
+            s("id"),
+            s("formula")
+        ),
+        "create_metric" => format!(
+            "Membuat metrik \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_metric" => format!(
+            "Mengubah metrik {} menjadi {}; semua chart yang memakainya ikut berubah.",
             s("id"),
             s("formula")
         ),

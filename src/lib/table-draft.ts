@@ -20,7 +20,7 @@ export type TableDraft = {
   pivotValues: PivotValue[]
   totals: PivotTotals
   settings: Record<string, ColumnSetting>
-  compareKind: "none" | "previous" | "goal"
+  compareKind: "none" | "previous" | "last_year" | "goal"
   compareColumn: string
   comparePeriod: ComparePeriod
   /** Text, so a half-typed number is not lost. */
@@ -54,8 +54,8 @@ export function draftFromDef(def: TableDefFields | undefined): TableDraft {
     totals: def.totals ?? "none",
     settings: Object.fromEntries(Object.entries(def.columnSettings ?? {}).map(([k, v]) => [k, { ...v }])),
     compareKind: compare?.kind ?? "none",
-    compareColumn: compare?.kind === "previous" ? compare.dateColumn : "",
-    comparePeriod: compare?.kind === "previous" ? (compare.period as ComparePeriod) : "month",
+    compareColumn: compare?.kind === "previous" || compare?.kind === "last_year" ? (compare.dateColumn ?? "") : "",
+    comparePeriod: compare?.kind === "previous" || compare?.kind === "last_year" ? ((compare.period as ComparePeriod) ?? "month") : "month",
     goal: compare?.kind === "goal" ? String(compare.value) : "",
     goodDirection: def.goodDirection === "down" ? "down" : "up",
   }
@@ -117,8 +117,9 @@ export function draftPayload(kind: string, d: TableDraft, groupedColumns: readon
   if (kind === "kpi") {
     const goal = Number(d.goal)
     return {
-      compare: d.compareKind === "previous" && d.compareColumn
-        ? { kind: "previous", dateColumn: d.compareColumn, period: d.comparePeriod }
+      // BI-2: with no date column chosen, a KPI on a metric takes the metric's own column and grain.
+      compare: d.compareKind === "previous" || d.compareKind === "last_year"
+        ? (d.compareColumn ? { kind: d.compareKind, dateColumn: d.compareColumn, period: d.comparePeriod } : { kind: d.compareKind })
         : d.compareKind === "goal" && d.goal.trim() !== "" && Number.isFinite(goal)
           ? { kind: "goal", value: goal }
           : undefined,
@@ -129,7 +130,7 @@ export function draftPayload(kind: string, d: TableDraft, groupedColumns: readon
 }
 
 /** What is still needed before the chart can be previewed, in the builder's own words. */
-export function draftProblems(kind: string, d: TableDraft): string[] {
+export function draftProblems(kind: string, d: TableDraft, usesMetric = false): string[] {
   if (kind === "table" && d.mode === "rows") {
     return d.columns.length ? [] : ["Columns"]
   }
@@ -140,7 +141,7 @@ export function draftProblems(kind: string, d: TableDraft): string[] {
     ]
   }
   if (kind === "kpi") {
-    if (d.compareKind === "previous" && !d.compareColumn) return ["Date column"]
+    if ((d.compareKind === "previous" || d.compareKind === "last_year") && !d.compareColumn && !usesMetric) return ["Date column"]
     if (d.compareKind === "goal" && (d.goal.trim() === "" || !Number.isFinite(Number(d.goal)))) return ["Goal"]
   }
   return []

@@ -167,6 +167,11 @@ pub struct Scope<'a> {
     fields: BTreeMap<String, String>,
     time: &'a TimeContext,
     chart: Option<ChartCtx>,
+    /// `BI-2`: a SQL condition every aggregate of the formula takes (the
+    /// engine's conditional form of that aggregate), so a metric's own filters
+    /// narrow that metric's number alone. Built by the predicate builder from
+    /// validated filters, never from formula text.
+    condition: Option<String>,
 }
 
 /// What a formula needs to know about the chart it is built into, for the
@@ -195,7 +200,16 @@ impl<'a> Scope<'a> {
             fields: BTreeMap::new(),
             time,
             chart: None,
+            condition: None,
         }
+    }
+
+    /// `BI-2`: make every aggregate of the formula count only the rows that
+    /// meet `condition` (a predicate over the source's columns).
+    #[must_use]
+    pub fn with_condition(mut self, condition: String) -> Self {
+        self.condition = Some(condition);
+        self
     }
 
     /// Build the formula into this chart.
@@ -730,7 +744,8 @@ impl Cx<'_> {
             {
                 return Err(err(n, "an aggregate cannot be inside another aggregate."));
             }
-            let (sql, ty) = Self::aggregate(info.name, &args, nodes)?;
+            let (sql, ty) =
+                Self::aggregate(self.scope.condition.as_deref(), info.name, &args, nodes)?;
             (sql, ty, Level::Aggregate)
         } else {
             let level = join_levels(&pairs)?;
@@ -1035,51 +1050,77 @@ impl Cx<'_> {
         }
     }
 
-    fn aggregate(name: &str, a: &[Typed], n: &[Node]) -> Result<(String, FType), FormulaError> {
-        let cond = |i: usize| want(&a[i], &n[i], FType::Boolean);
+    /// The SQL of aggregate `name`. With a `cond` (BI-2: a metric's filters)
+    /// the engine's `-If` form is used, so only the rows meeting it count; the
+    /// formula's own condition, when the function has one (`SumIf`), is
+    /// AND-ed with it.
+    fn aggregate(
+        cond: Option<&str>,
+        name: &str,
+        a: &[Typed],
+        n: &[Node],
+    ) -> Result<(String, FType), FormulaError> {
+        let test = |i: usize| want(&a[i], &n[i], FType::Boolean);
+        // `f(x)` or, under a condition, `fIf(x, cond)`.
+        let one = |func: &str, arg: &str| match cond {
+            Some(c) => format!("{func}If({arg}, {c})"),
+            None => format!("{func}({arg})"),
+        };
         match name {
             "Count" => Ok((
-                a.first()
-                    .map_or_else(|| "count()".to_owned(), |t| format!("count({})", t.sql)),
+                match (a.first(), cond) {
+                    (None, None) => "count()".to_owned(),
+                    (None, Some(c)) => format!("countIf({c})"),
+                    (Some(t), _) => one("count", &t.sql),
+                },
                 FType::Number,
             )),
-            "CountDistinct" => Ok((format!("uniqExact({})", a[0].sql), FType::Number)),
+            "CountDistinct" => Ok((one("uniqExact", &a[0].sql), FType::Number)),
             "CountIf" => {
-                cond(0)?;
-                Ok((format!("countIf({})", a[0].sql), FType::Number))
+                test(0)?;
+                let sql = match cond {
+                    Some(c) => format!("countIf(({}) AND ({c}))", a[0].sql),
+                    None => format!("countIf({})", a[0].sql),
+                };
+                Ok((sql, FType::Number))
             }
             "Min" | "Max" => {
                 if a[0].ty == FType::Boolean {
                     return Err(err(&n[0], "Min and Max read numbers, text or dates."));
                 }
-                Ok((
-                    format!("{}({})", name.to_ascii_lowercase(), a[0].sql),
-                    a[0].ty,
-                ))
+                Ok((one(&name.to_ascii_lowercase(), &a[0].sql), a[0].ty))
             }
             _ => {
                 want(&a[0], &n[0], FType::Number)?;
-                let x = &a[0].sql;
+                let col = &a[0].sql;
                 let sql = match name {
-                    "Sum" => format!("sum({x})"),
-                    "Avg" => format!("avg({x})"),
-                    "Median" => format!("medianExact({x})"),
-                    "StdDev" => format!("stddevSamp({x})"),
+                    "Sum" => one("sum", col),
+                    "Avg" => one("avg", col),
+                    "Median" => one("medianExact", col),
+                    "StdDev" => one("stddevSamp", col),
                     "Percentile" => {
-                        let p = literal_number(&n[1])
-                            .filter(|p| (0.0..=1.0).contains(p))
+                        let share = literal_number(&n[1])
+                            .filter(|v| (0.0..=1.0).contains(v))
                             .ok_or_else(|| {
                                 err(
                                     &n[1],
                                     "write the share as a number from 0 to 1, such as 0.9.",
                                 )
                             })?;
-                        format!("quantileExact({})({x})", print_number(p))
+                        match cond {
+                            Some(c) => {
+                                format!("quantileExactIf({})({col}, {c})", print_number(share))
+                            }
+                            None => format!("quantileExact({})({col})", print_number(share)),
+                        }
                     }
                     "SumIf" | "AvgIf" => {
-                        cond(1)?;
-                        let f = if name == "SumIf" { "sumIf" } else { "avgIf" };
-                        format!("{f}({x}, {})", a[1].sql)
+                        test(1)?;
+                        let func = if name == "SumIf" { "sumIf" } else { "avgIf" };
+                        match cond {
+                            Some(c) => format!("{func}({col}, ({}) AND ({c}))", a[1].sql),
+                            None => format!("{func}({col}, {})", a[1].sql),
+                        }
                     }
                     _ => return Err(unsupported(&n[0])),
                 };
@@ -1184,6 +1225,30 @@ mod tests {
 
     fn err_at(formula: &str) -> FormulaError {
         run(formula).expect_err(formula)
+    }
+
+    /// BI-2: every aggregate of the catalog takes a condition: its conditional
+    /// form carries the condition and the formula's own test, and nothing is
+    /// left unconditioned.
+    #[test]
+    fn every_aggregate_in_the_catalog_compiles_under_a_condition() {
+        let cols = sample_columns();
+        let time = TimeContext::default();
+        let cond = "(qty > 3)";
+        for f in catalog::CATALOG.iter().filter(|f| f.aggregate) {
+            let scope = Scope::new(&cols, &time).with_condition(cond.to_owned());
+            let c = compile(f.example, &scope, None).unwrap_or_else(|e| panic!("{}: {e}", f.name));
+            assert_eq!(c.level, Level::Aggregate, "{}", f.name);
+            assert!(c.sql.contains(cond), "{}: {}", f.name, c.sql);
+            assert!(c.sql.contains("If("), "{}: {}", f.name, c.sql);
+        }
+        let scope = Scope::new(&cols, &time).with_condition(cond.to_owned());
+        let sum_if = compile("SumIf(amount, qty = 1)", &scope, None).unwrap();
+        assert_eq!(sum_if.sql, "sumIf(amount, ((qty = 1)) AND ((qty > 3)))");
+        assert_eq!(
+            compile("Count()", &scope, None).unwrap().sql,
+            "countIf((qty > 3))"
+        );
     }
 
     #[test]

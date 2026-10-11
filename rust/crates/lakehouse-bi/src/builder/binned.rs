@@ -272,6 +272,7 @@ mod tests {
                 name: "f".to_owned(),
                 sql: "sum(v)".to_owned(),
                 reads: vec!["v".to_owned()],
+                prefer_columns: false,
             }],
             table_calcs: Vec::new(),
         };

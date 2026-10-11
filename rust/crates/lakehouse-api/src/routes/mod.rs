@@ -32,6 +32,7 @@ mod knowledge;
 mod lakehouse;
 pub(crate) mod layers;
 mod lineage;
+pub(crate) mod metrics;
 mod notifications;
 mod ops;
 mod overview;
@@ -823,6 +824,25 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dashboard/calc-fields/functions",
             get(calc_fields::functions),
+        )
+        .route(
+            "/api/dashboard/metrics",
+            get(metrics::list)
+                .post(metrics::create)
+                .put(metrics::update)
+                .delete(metrics::delete),
+        )
+        .route(
+            "/api/dashboard/metrics/validate",
+            axum::routing::post(metrics::validate),
+        )
+        .route("/api/dashboard/metrics/{id}/usage", get(metrics::usage))
+        .route(
+            "/api/dashboard/segments",
+            get(metrics::list_segments)
+                .post(metrics::create_segment)
+                .put(metrics::update_segment)
+                .delete(metrics::delete_segment),
         )
         .route(
             "/api/dashboard/hierarchies",

@@ -153,23 +153,25 @@ fn with_param_id(mut result: Value) -> Value {
 /// Whether `name` is one of the fourteen tools [`run`] dispatches (one guard arm in
 /// `run_tool`, which is at clippy's line limit).
 pub(super) fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "list_formula_functions"
-            | "list_calculated_fields"
-            | "validate_formula"
-            | "create_calculated_field"
-            | "update_calculated_field"
-            | "delete_calculated_field"
-            | "create_value_group"
-            | "list_hierarchies"
-            | "create_hierarchy"
-            | "delete_hierarchy"
-            | "list_parameters"
-            | "create_parameter"
-            | "update_parameter"
-            | "delete_parameter"
-    )
+    // BI-2: the metric tools ride the same single guard arm in `run_tool`.
+    super::metrics::handles(name)
+        || matches!(
+            name,
+            "list_formula_functions"
+                | "list_calculated_fields"
+                | "validate_formula"
+                | "create_calculated_field"
+                | "update_calculated_field"
+                | "delete_calculated_field"
+                | "create_value_group"
+                | "list_hierarchies"
+                | "create_hierarchy"
+                | "delete_hierarchy"
+                | "list_parameters"
+                | "create_parameter"
+                | "update_parameter"
+                | "delete_parameter"
+        )
 }
 
 /// Dispatch one of the fourteen tools by name (one arm in `run_tool`, which is at
@@ -180,6 +182,9 @@ pub(super) async fn run(
     name: &str,
     args: &Map<String, Value>,
 ) -> Value {
+    if super::metrics::handles(name) {
+        return super::metrics::run(state, principal, name, args).await;
+    }
     match name {
         "list_formula_functions" => list_formula_functions(),
         "list_calculated_fields" => list_calculated_fields(state, args).await,

@@ -254,7 +254,7 @@ async fn get_body(
     // A failed read leaves the catalog empty, so a chart that names a field
     // shows its stored statement's error instead of the whole dashboard
     // failing; the failure is reported like the chart store's.
-    let field_catalog = match lakehouse_bi::fields::list_fields(ch).await {
+    let field_catalog = match lakehouse_bi::fields::list_catalog_fields(ch).await {
         Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
         Err(err) => {
             store_error.get_or_insert_with(|| {
@@ -712,6 +712,11 @@ pub async fn specs_preview(
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
     crate::routes::support::annotate_saved_table(&mut result, &spec);
+    if spec.def.measures.has_metrics()
+        && let Ok(entries) = lakehouse_bi::fields::list_catalog_fields(&state.clickhouse).await
+    {
+        crate::routes::support::annotate_metric_period(&mut result, &spec, &entries);
+    }
     crate::routes::support::annotate_params(&mut result, &spec, time.params());
     // BI-13: the chart's other questions, each as the viewer.
     let layer_runner = crate::routes::layers::RoleRunner {
@@ -1963,7 +1968,38 @@ async fn chart_own_filters(
             "this tile does not read this data".to_owned(),
         ));
     }
+    // BI-2: a segment in the tile's filters is its filters here too, so the
+    // records behind a mark are the rows the mark was drawn from.
+    let own = expand_tile_segments(ch, own, sql_source, mart).await?;
     Ok((own, joins))
+}
+
+/// `filters` with each `{ "segment": … }` replaced by the segment's filters,
+/// read for the tile's source (`BI-2`). A segment that is gone is a 422 with
+/// our sentence, never a records list that ignores the condition.
+async fn expand_tile_segments(
+    ch: &ChClient,
+    filters: Vec<FilterDef>,
+    sql_source: Option<&str>,
+    mart: &str,
+) -> Result<Vec<FilterDef>, ApiError> {
+    if filters.iter().all(|f| f.segment.is_none()) {
+        return Ok(filters);
+    }
+    let (kind, id) = match sql_source {
+        Some(s) => (lakehouse_bi::fields::SourceKind::SqlSource, s),
+        None => (lakehouse_bi::fields::SourceKind::Mart, mart),
+    };
+    let segments = lakehouse_bi::metrics::list_segments(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    lakehouse_bi::metrics::expand_segments(&filters, &|name| {
+        segments
+            .iter()
+            .find(|s| s.name == name && s.source_kind == kind && s.source_id == id)
+            .map(|s| s.filters.clone())
+    })
+    .map_err(ApiError::Unprocessable)
 }
 
 /// The question `layer` names on `chart` (`BI-13`), or `None` when it names
@@ -2514,7 +2550,15 @@ pub async fn table_export(
     };
     let relation = records_relation(ch, &relation_query, chart.def.shape.joins_list()).await?;
     // BI-6: the chart's own filters narrow the file as they narrow the tile.
-    let own = chart.def.shape.own_filters();
+    // BI-2: a segment is its filters in the file too.
+    let own = expand_tile_segments(
+        ch,
+        chart.def.shape.own_filters().to_vec(),
+        chart.def.sql_source.as_deref(),
+        &chart.def.mart,
+    )
+    .await?;
+    let own = own.as_slice();
     let relation = with_calculated_columns(ch, relation, (&relation_query, own), &time).await?;
     let filters = with_chart_filters(own, dashboard_filters, &relation.cols, &time)?;
 
@@ -3531,6 +3575,27 @@ mod tests {
         assert_eq!(fields["layers"][0]["mart"], "mart_y");
         assert_eq!(fields["layers"][0]["axis"], "right");
         assert_eq!(fields["layers"][0]["label"], "Rooms");
+    }
+
+    /// BI-2: the YAML export lists a measure that is a metric and a filter that
+    /// is a segment by name, in the form they are written with, and nothing
+    /// is added to a chart that uses neither.
+    #[test]
+    fn the_yaml_export_lists_metrics_and_segments_by_name() {
+        let def: ChartInput = serde_json::from_value(json!({
+            "title": "t", "kind": "bar", "mart": "mart_x", "dimension": "month",
+            "measures": [{ "metric": "total_visitors" }, "rooms"],
+            "filters": [{ "segment": "domestic" }, { "column": "category", "values": ["a"] }],
+        }))
+        .unwrap();
+        let fields: std::collections::HashMap<_, _> = chart_def_fields(&def).into_iter().collect();
+        assert_eq!(
+            fields["measures"],
+            json!([{ "metric": "total_visitors" }, "rooms"])
+        );
+        assert_eq!(fields["filters"][0]["segment"], "domestic");
+        assert!(fields["filters"][0].get("column").is_none());
+        assert_eq!(fields["filters"][1]["column"], "category");
     }
 
     /// BI-13: a records list for one of a chart's other questions reads that

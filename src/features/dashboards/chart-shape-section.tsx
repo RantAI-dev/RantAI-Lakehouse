@@ -113,18 +113,20 @@ function FilterEditor({ kind, ...props }: EditorProps & { kind: string }) {
  * dashboard filter can only narrow them further.
  */
 export function ChartFilters({
-  value, onChange, columns, disabled,
+  value, onChange, columns, disabled, segments = [],
 }: {
   readonly value: readonly FilterDef[];
   readonly onChange: (next: FilterDef[]) => void;
   readonly columns: readonly ColumnChoice[];
   readonly disabled: boolean;
+  /** BI-2: the saved segments of the chart's table; one is added as a reference by name and stands for its filters. */
+  readonly segments?: readonly { name: string; label: string }[];
 }) {
   // `null`: nothing open; a column: a new filter on it; a number: editing that one.
   const [open, setOpen] = React.useState<{ column: string } | { index: number } | null>(null);
   const kindOf = (column: string) => columns.find((c) => c.name === column)?.kind ?? "text";
-  const unused = columns.filter((c) => !value.some((f) => f.column === c.name));
-  const others = (column: string) => value.filter((f) => f.column !== column && isActiveFilter(f));
+  const unused = columns.filter((c) => !value.some((f) => !f.segment && f.column === c.name));
+  const others = (column: string) => value.filter((f) => !f.segment && f.column !== column && isActiveFilter(f));
   const editing = open && "index" in open ? value[open.index] : undefined;
   const column = open ? ("column" in open ? open.column : editing?.column ?? "") : "";
   return (
@@ -133,20 +135,26 @@ export function ChartFilters({
       {value.length ? (
         <ul className="flex flex-wrap gap-1.5">
           {value.map((f, i) => (
-            <li key={`${f.column}:${f.op ?? "in"}`} className="inline-flex h-7 items-center rounded-md border border-border bg-background text-sm">
+            <li key={f.segment ? `segment:${f.segment}` : `${f.column}:${f.op ?? "in"}`} className="inline-flex h-7 items-center rounded-md border border-border bg-background text-sm">
               <Button
-                type="button" variant="ghost" size="sm" className="h-7 max-w-64 rounded-r-none px-2 font-normal"
-                title={filterLabel(f, kindOf(f.column))} onClick={() => setOpen(open && "index" in open && open.index === i ? null : { index: i })}
+                type="button" variant="ghost" size="sm" className="h-7 max-w-64 rounded-r-none px-2 font-normal" disabled={!!f.segment}
+                title={f.segment ? `Segment ${segments.find((s) => s.name === f.segment)?.label ?? f.segment}` : filterLabel(f, kindOf(f.column))} onClick={() => setOpen(open && "index" in open && open.index === i ? null : { index: i })}
               >
-                <span className="truncate">{filterLabel(f, kindOf(f.column))}</span>
+                <span className="truncate">{f.segment ? `Segment: ${segments.find((s) => s.name === f.segment)?.label ?? f.segment}` : filterLabel(f, kindOf(f.column))}</span>
               </Button>
-              <Button type="button" variant="ghost" size="icon-sm" className="size-7 rounded-l-none" aria-label={`Remove ${f.column} filter`}
+              <Button type="button" variant="ghost" size="icon-sm" className="size-7 rounded-l-none" aria-label={f.segment ? `Remove segment ${f.segment}` : `Remove ${f.column} filter`}
                 onClick={() => { onChange(value.filter((_, j) => j !== i)); setOpen(null); }}>
                 <X className="size-3.5" />
               </Button>
             </li>
           ))}
         </ul>
+      ) : null}
+      {!open && segments.some((s) => !value.some((f) => f.segment === s.name)) ? (
+        <Select value="" onValueChange={(v) => { if (v) onChange([...value, { column: "", values: [], segment: v }]); }} disabled={disabled}>
+          <SelectTrigger className="w-full" aria-label="Add a segment"><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder="Add a segment" /></SelectTrigger>
+          <SelectContent>{segments.filter((s) => !value.some((f) => f.segment === s.name)).map((s) => <SelectItem key={s.name} value={s.name}>{s.label || s.name}</SelectItem>)}</SelectContent>
+        </Select>
       ) : null}
       {open ? (
         <div className="rounded-md border border-border p-2.5" aria-label={`Filter on ${column}`}>

@@ -668,6 +668,30 @@ async fn ensure_field_tables(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // BI-2: metrics and segments (`crate::metrics`), the same versioned-insert
+    // shape; the filters are one JSON document.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_metric (\n\
+           id String, name String, label String DEFAULT '', description String DEFAULT '',\n\
+           source_kind String, source_id String, formula String,\n\
+           filters_json String DEFAULT '[]', time_column String DEFAULT '',\n\
+           grain String DEFAULT '', format String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_segment (\n\
+           id String, name String, label String DEFAULT '',\n\
+           source_kind String, source_id String, filters_json String DEFAULT '[]',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1828,6 +1852,9 @@ struct KpiCtx<'a> {
     cols: std::collections::HashSet<String>,
     kinds: std::collections::HashMap<String, ColumnKind>,
     time: &'a TimeContext,
+    /// The comparison with a metric's date column and period filled in
+    /// (`BI-2`); the stored definition keeps the comparison as written.
+    compare_fill: TableFields,
 }
 
 /// The stored SQL of a KPI. BI-16 part A: one that compares with its previous
@@ -1844,7 +1871,7 @@ fn kpi_sql(
     time: &TimeContext,
 ) -> Result<String, BiError> {
     match compare {
-        Some(plan @ ComparePlan::Previous { .. }) => {
+        Some(plan @ (ComparePlan::Previous { .. } | ComparePlan::LastYear { .. })) => {
             tables::kpi_trend_sql(from, measure, agg, Vec::new(), plan, time).ok_or_else(|| {
                 BiError::Validation("this period does not fit the date column.".to_owned())
             })
@@ -1874,10 +1901,11 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         cols,
         kinds,
         time,
+        compare_fill,
     } = ctx;
     let m = measures[0].clone();
     let compare =
-        tables::plan_compare(&input.tables, &cols, &kinds).map_err(BiError::Validation)?;
+        tables::plan_compare(&compare_fill, &cols, &kinds).map_err(BiError::Validation)?;
     let target = (kind == ChartKind::Gauge)
         .then(|| input.target.filter(|t| *t > 0.0))
         .flatten();
@@ -2749,7 +2777,8 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
             .await?
             .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
         let mut resolved = resolved_from_stored(source);
-        resolved.fields = crate::fields::list_fields_for(ch, SourceKind::SqlSource, id).await?;
+        resolved.fields =
+            crate::fields::list_catalog_fields_for(ch, SourceKind::SqlSource, id).await?;
         return Ok(resolved);
     }
     let mart = input
@@ -2761,7 +2790,7 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
     let kinds = validated_mart_columns(ch, &mart).await?;
     let cols = kinds.keys().cloned().collect();
-    let fields = crate::fields::list_fields_for(ch, SourceKind::Mart, &mart).await?;
+    let fields = crate::fields::list_catalog_fields_for(ch, SourceKind::Mart, &mart).await?;
     let (from, joined) = joined_from(ch, input, &mart, mart_ident, &kinds).await?;
     Ok(Resolved {
         mart,
@@ -3255,6 +3284,11 @@ fn check_measures(
     Ok(())
 }
 
+/// A KPI's comparison with the metric's date column and period filled in.
+fn metric_compare(input: &ChartInput, catalog: &fields::FieldCatalog) -> TableFields {
+    crate::metrics::fill_compare(&input.tables, &input.measures, catalog.for_chart(input))
+}
+
 /// [`shape::check_against_relation`] for the chart `input` reads over `from`.
 fn check_shaping(
     input: &ChartInput,
@@ -3265,10 +3299,25 @@ fn check_shaping(
         &HashMap<String, ColumnKind>,
     ),
     (grain, time): (Option<Grain>, &TimeContext),
+    catalog: &fields::FieldCatalog,
 ) -> Result<(), BiError> {
+    // BI-2: the chart's own filters are checked as they will apply, with each
+    // segment replaced by its filters.
+    let mut checked = input.shape.clone();
+    if input
+        .shape
+        .own_filters()
+        .iter()
+        .any(|f| f.segment.is_some())
+    {
+        let expanded = catalog
+            .expand_chart_filters(input, input.shape.own_filters())
+            .map_err(BiError::Validation)?;
+        checked.filters = Some(expanded);
+    }
     shape::check_against_relation(
         &input.measures,
-        &input.shape,
+        &checked,
         &RelationCheck {
             kind,
             from,
@@ -3440,10 +3489,14 @@ fn spec_from_resolved(
     check_measures(input, kind, &measures, &cols)?;
     // BI-6: the chart's own filters, sort, groupings and measures with their
     // own aggregate are checked against the relation they read.
-    check_shaping(input, (kind, &from, &cols, &kinds), (grain, time))?;
+    let catalog = fields::FieldCatalog::from_fields(fields);
+    check_shaping(input, (kind, &from, &cols, &kinds), (grain, time), &catalog)?;
+    let compare_fill = metric_compare(input, &catalog);
     // Kept for `finish_shaping`, which builds the stored statement of a chart
     // that uses any of it from the same relation.
-    let shaping = input.uses_shaping().then(|| (from.clone(), kinds.clone()));
+    let shaping = input
+        .uses_shaping()
+        .then(|| (from.clone(), kinds.clone(), catalog));
 
     // ── KPI / GAUGE — single number (no dimension) ──────────────────
     if kind == ChartKind::Kpi || kind == ChartKind::Gauge {
@@ -3467,6 +3520,7 @@ fn spec_from_resolved(
                 cols,
                 kinds,
                 time,
+                compare_fill,
             },
         )?;
         return finish_shaping(spec, shaping, time);
@@ -3538,17 +3592,19 @@ fn stored_measures(measures: &MeasureList) -> MeasureList {
 /// statement it was always built with, untouched.
 fn finish_shaping(
     mut spec: StoredChartSpec,
-    shaping: Option<(Relation, HashMap<String, ColumnKind>)>,
+    shaping: Option<(Relation, HashMap<String, ColumnKind>, fields::FieldCatalog)>,
     time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
-    let Some((from, kinds)) = shaping else {
+    let Some((from, kinds, catalog)) = shaping else {
         return Ok(spec);
     };
-    spec.spec.sql = crate::builder::stored_sql(&spec, &from, &kinds, time).ok_or_else(|| {
-        BiError::Validation(
-            "this combination of filters, sort, groupings and measures cannot be built.".to_owned(),
-        )
-    })?;
+    spec.spec.sql =
+        crate::builder::stored_sql(&spec, &from, &kinds, time, &catalog).ok_or_else(|| {
+            BiError::Validation(
+                "this combination of filters, sort, groupings and measures cannot be built."
+                    .to_owned(),
+            )
+        })?;
     // BI-6 part 2: after steps the chart draws the last step's columns.
     if let Ok(Some(plan)) = steps_plan(&spec.def, &from, &kinds) {
         spec.spec.x = plan
@@ -4038,9 +4094,11 @@ mod tests {
         // `console.bi_field` table. 20 = those 19 plus the BI-10
         // `console.bi_hierarchy` table. 22 = those 20 plus the BI-11
         // `bi_board.params_json` column and the `console.bi_param` table.
+        // 24 = those 22 plus the BI-2 `console.bi_metric` and
+        // `console.bi_segment` tables.
         assert_eq!(
-            first_call_requests, 22,
-            "first call should issue all 22 DDL statements"
+            first_call_requests, 24,
+            "first call should issue all 24 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();

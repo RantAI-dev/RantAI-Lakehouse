@@ -29,6 +29,7 @@ export function opOf(f: FilterDef): FilterOp {
  * hold; they are neither sent nor shown as chips. Mirrors `FilterDef::is_active`.
  */
 export function isActiveFilter(f: FilterDef): boolean {
+  if (f.segment) return true
   switch (opOf(f)) {
     case "in":
     case "not_in":
@@ -253,6 +254,7 @@ function betweenLabel(f: FilterDef): string {
  * separates "is not 5" on a text column from "≠ 5" on a number column.
  */
 export function filterLabel(f: FilterDef, kind?: string): string {
+  if (f.segment) return `Segment ${f.segment}`
   // BI-7: a joined column reads table.column.
   const c = displayColumn(f.column)
   switch (opOf(f)) {

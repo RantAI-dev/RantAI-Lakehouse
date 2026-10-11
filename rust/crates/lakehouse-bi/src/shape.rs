@@ -61,7 +61,16 @@ fn aggregate_allowed(raw: &str) -> bool {
 #[serde(untagged)]
 enum MeasureEntry {
     Name(String),
+    /// `BI-2`: `{ "metric": <name> }`.
+    Metric(MetricRef),
     Own(OwnAggregate),
+}
+
+/// A measure that is a saved metric, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricRef {
+    metric: String,
 }
 
 /// A measure with its own aggregation.
@@ -83,6 +92,9 @@ struct OwnAggregate {
 pub struct MeasureList {
     columns: Vec<String>,
     aggregates: Vec<Option<String>>,
+    /// `BI-2`: whether the entry is a metric (its "column" is the metric's
+    /// name). Empty or shorter than `columns` reads as `false`.
+    metrics: Vec<bool>,
 }
 
 impl Deref for MeasureList {
@@ -99,6 +111,7 @@ impl From<Vec<String>> for MeasureList {
         Self {
             columns,
             aggregates,
+            metrics: Vec::new(),
         }
     }
 }
@@ -107,7 +120,7 @@ impl From<Vec<String>> for MeasureList {
 /// an aggregate of its own.
 impl PartialEq<Vec<String>> for MeasureList {
     fn eq(&self, other: &Vec<String>) -> bool {
-        self.columns == *other && !self.has_own_aggregates()
+        self.columns == *other && !self.has_own_aggregates() && !self.has_metrics()
     }
 }
 
@@ -119,7 +132,42 @@ impl MeasureList {
         Self {
             columns,
             aggregates,
+            metrics: Vec::new(),
         }
+    }
+
+    /// A list where entry `i` is a metric when `is_metric[i]` (`BI-2`).
+    #[must_use]
+    pub fn with_metrics(mut self, is_metric: Vec<bool>) -> Self {
+        // Kept empty when no entry is a metric, so two lists with the same
+        // entries compare equal however they were built.
+        self.metrics = if is_metric.contains(&true) {
+            is_metric
+        } else {
+            Vec::new()
+        };
+        self
+    }
+
+    /// Whether entry `index` is a saved metric, by name.
+    #[must_use]
+    pub fn is_metric(&self, index: usize) -> bool {
+        self.metrics.get(index) == Some(&true)
+    }
+
+    /// The names of the metrics the list names, in order.
+    pub fn metric_names(&self) -> impl Iterator<Item = &str> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.is_metric(*i))
+            .map(|(_, c)| c.as_str())
+    }
+
+    /// Whether any entry is a saved metric.
+    #[must_use]
+    pub fn has_metrics(&self) -> bool {
+        self.metrics.contains(&true)
     }
 
     /// The columns and their own aggregates, in order.
@@ -128,6 +176,20 @@ impl MeasureList {
             .iter()
             .map(String::as_str)
             .zip(self.aggregates.iter().map(Option::as_deref))
+    }
+
+    /// The name each measure's result column has, without a relation to look
+    /// at: `avg_stay` for a measure with its own aggregate, the column's name
+    /// otherwise. (A calculated aggregate field ignores its own aggregate and
+    /// keeps its name; that needs the relation, see [`resolve_measures`].)
+    #[must_use]
+    pub fn result_names(&self) -> Vec<String> {
+        self.entries()
+            .map(|(column, own)| match own {
+                Some(raw) => own_alias(Aggregate::from_str_lossy(raw), column),
+                None => column.to_owned(),
+            })
+            .collect()
     }
 
     /// Whether any measure has an aggregate of its own.
@@ -142,6 +204,7 @@ impl MeasureList {
         Self {
             columns: self.columns.iter().take(n).cloned().collect(),
             aggregates: self.aggregates.iter().take(n).cloned().collect(),
+            metrics: self.metrics.iter().take(n).copied().collect(),
         }
     }
 }
@@ -149,7 +212,13 @@ impl MeasureList {
 impl Serialize for MeasureList {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.columns.len()))?;
-        for (column, aggregate) in self.entries() {
+        for (i, (column, aggregate)) in self.entries().enumerate() {
+            if self.is_metric(i) {
+                seq.serialize_element(&MetricRef {
+                    metric: column.to_owned(),
+                })?;
+                continue;
+            }
             match aggregate {
                 // BI-11: a column switch is written as an object even without
                 // an aggregate of its own.
@@ -169,17 +238,23 @@ impl Serialize for MeasureList {
 impl<'de> Deserialize<'de> for MeasureList {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let entries = Vec::<MeasureEntry>::deserialize(deserializer).map_err(|_| {
-            D::Error::custom("measures must be column names or {column, aggregate}")
+            D::Error::custom("measures must be column names, {column, aggregate} or {metric}")
         })?;
+        let is_metric = entries
+            .iter()
+            .map(|e| matches!(e, MeasureEntry::Metric(_)))
+            .collect();
         Ok(Self::from_pairs(
             entries
                 .into_iter()
                 .map(|e| match e {
                     MeasureEntry::Name(column) => (column, None),
+                    MeasureEntry::Metric(m) => (m.metric, None),
                     MeasureEntry::Own(own) => (own.column, own.aggregate),
                 })
                 .collect(),
-        ))
+        )
+        .with_metrics(is_metric))
     }
 }
 

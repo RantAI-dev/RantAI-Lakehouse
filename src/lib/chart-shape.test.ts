@@ -261,3 +261,15 @@ test("a saved bin and grid come back as a draft", () => {
   assert.equal(draft.grid, "0.1")
   assert.equal(shapeDraftFromDef({}).bin, null)
 })
+
+test("a metric is a measure row named metric:<name> and is sent as { metric }, with no aggregate of its own (BI-2)", async () => {
+  const { entriesFromRows, rowsFromEntries, resultName, measureLabel, tileMeasureLabels } = await import("./chart-shape")
+  const rows = rowsFromEntries([{ metric: "total_visitors" }, "rooms", { column: "stay", aggregate: "avg" }])
+  assert.deepEqual(rows.map((r) => r.column), ["metric:total_visitors", "rooms", "stay"])
+  // Own aggregates are on, yet the metric is sent by name alone.
+  assert.deepEqual(entriesFromRows(rows, true), [{ metric: "total_visitors" }, "rooms", { column: "stay", aggregate: "avg" }])
+  assert.equal(resultName(rows[0], new Set()), "total_visitors")
+  assert.equal(measureLabel(rows[0], new Set()), "total_visitors")
+  // A tile of a chart with a metric names its series by the metric, not "undefined of undefined".
+  assert.deepEqual(tileMeasureLabels([{ metric: "total_visitors" }, { column: "stay", aggregate: "avg" }], ["total_visitors", "avg_stay"]), { avg_stay: "avg of stay" })
+})

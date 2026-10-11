@@ -328,6 +328,19 @@ pub(crate) fn stored_chart_sql(
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
     read: &lakehouse_bi::builder::ReadContext<'_>,
 ) -> Result<FilteredSql, &'static str> {
+    // BI-2: a metric or segment that is gone is the tile's plain error; the
+    // statement saved with the chart would show the old number or a wider set.
+    let own_cols = match chart.def.sql_source.as_deref() {
+        Some(id) => sources
+            .get(id)
+            .map(lakehouse_bi::sources::SqlSource::column_kinds),
+        None => mart_cols.get(&chart.def.mart).cloned(),
+    };
+    if let Some(cols) = &own_cols
+        && read.fields.broken_reference(&chart.def, cols, read.time)
+    {
+        return Err("this chart uses a metric or segment that is missing or no longer checks out");
+    }
     let Some(id) = chart.def.sql_source.as_deref() else {
         // BI-7: a join that no longer checks out (a table or column went away)
         // is the tile's error, never the stored statement run unfiltered.
@@ -584,7 +597,7 @@ pub(crate) async fn preview_bin_reads(
     let Ok(sources) = sources_for(ch, [chart]).await else {
         return Vec::new();
     };
-    let catalog = match lakehouse_bi::fields::list_fields(ch).await {
+    let catalog = match lakehouse_bi::fields::list_catalog_fields(ch).await {
         Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
         Err(_) => return Vec::new(),
     };
@@ -695,6 +708,28 @@ pub(crate) fn annotate_saved_table(tile: &mut Value, chart: &store::StoredChartS
             .as_ref()
             .and_then(|c| c.period.as_deref())
     {
+        tile.insert("grain".to_owned(), json!(period));
+    }
+}
+
+/// BI-2: the period of a comparing KPI that measures a metric and leaves its
+/// date column and period to the metric's defaults. `annotate_saved_table`
+/// reads the period from the comparison as written, which is absent then; the
+/// preview reads the metric's from the catalog.
+pub(crate) fn annotate_metric_period(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    entries: &[lakehouse_bi::fields::FieldDef],
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if tile.contains_key("grain") || !chart.def.tables.compares_to_previous(chart.spec.kind) {
+        return;
+    }
+    let filled =
+        lakehouse_bi::metrics::fill_compare(&chart.def.tables, &chart.def.measures, entries);
+    if let Some(period) = filled.compare.as_ref().and_then(|c| c.period.as_deref()) {
         tile.insert("grain".to_owned(), json!(period));
     }
 }

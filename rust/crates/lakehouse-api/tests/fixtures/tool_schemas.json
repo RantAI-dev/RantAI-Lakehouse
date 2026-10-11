@@ -281,6 +281,19 @@
                     "column"
                   ],
                   "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "metric": {
+                      "type": "string",
+                      "description": "the name of a metric from list_metrics"
+                    }
+                  },
+                  "required": [
+                    "metric"
+                  ],
+                  "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
                 }
               ]
             },
@@ -505,75 +518,91 @@
           "filters": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "column": {
-                  "type": "string"
-                },
-                "op": {
-                  "type": "string",
-                  "enum": [
-                    "in",
-                    "not_in",
-                    "between",
-                    "relative",
-                    "contains",
-                    "starts_with",
-                    "ends_with",
-                    "not_contains"
-                  ],
-                  "description": "default in"
-                },
-                "values": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
                   },
-                  "description": "in / not_in"
-                },
-                "min": {
-                  "type": "string",
-                  "description": "between: a number or a date YYYY-MM-DD"
-                },
-                "max": {
-                  "type": "string"
-                },
-                "minExclusive": {
-                  "type": "boolean"
-                },
-                "maxExclusive": {
-                  "type": "boolean"
-                },
-                "text": {
-                  "type": "string",
-                  "description": "contains, starts_with, ends_with, not_contains"
-                },
-                "anchor": {
-                  "type": "string",
-                  "enum": [
-                    "last",
-                    "this",
-                    "previous",
-                    "next"
-                  ],
-                  "description": "relative"
-                },
-                "unit": {
-                  "type": "string",
-                  "enum": [
-                    "day",
-                    "week",
-                    "month",
-                    "quarter",
-                    "year"
+                  "required": [
+                    "segment"
                   ]
                 },
-                "n": {
-                  "type": "number"
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
                 }
-              },
-              "required": [
-                "column"
               ]
             },
             "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
@@ -657,6 +686,19 @@
                           "column"
                         ],
                         "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "metric": {
+                            "type": "string",
+                            "description": "the name of a metric from list_metrics"
+                          }
+                        },
+                        "required": [
+                          "metric"
+                        ],
+                        "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
                       }
                     ]
                   },
@@ -676,75 +718,91 @@
                 "filters": {
                   "type": "array",
                   "items": {
-                    "type": "object",
-                    "properties": {
-                      "column": {
-                        "type": "string"
-                      },
-                      "op": {
-                        "type": "string",
-                        "enum": [
-                          "in",
-                          "not_in",
-                          "between",
-                          "relative",
-                          "contains",
-                          "starts_with",
-                          "ends_with",
-                          "not_contains"
-                        ],
-                        "description": "default in"
-                      },
-                      "values": {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "segment": {
+                            "type": "string",
+                            "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                          }
                         },
-                        "description": "in / not_in"
-                      },
-                      "min": {
-                        "type": "string",
-                        "description": "between: a number or a date YYYY-MM-DD"
-                      },
-                      "max": {
-                        "type": "string"
-                      },
-                      "minExclusive": {
-                        "type": "boolean"
-                      },
-                      "maxExclusive": {
-                        "type": "boolean"
-                      },
-                      "text": {
-                        "type": "string",
-                        "description": "contains, starts_with, ends_with, not_contains"
-                      },
-                      "anchor": {
-                        "type": "string",
-                        "enum": [
-                          "last",
-                          "this",
-                          "previous",
-                          "next"
-                        ],
-                        "description": "relative"
-                      },
-                      "unit": {
-                        "type": "string",
-                        "enum": [
-                          "day",
-                          "week",
-                          "month",
-                          "quarter",
-                          "year"
+                        "required": [
+                          "segment"
                         ]
                       },
-                      "n": {
-                        "type": "number"
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "op": {
+                            "type": "string",
+                            "enum": [
+                              "in",
+                              "not_in",
+                              "between",
+                              "relative",
+                              "contains",
+                              "starts_with",
+                              "ends_with",
+                              "not_contains"
+                            ],
+                            "description": "default in"
+                          },
+                          "values": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "in / not_in"
+                          },
+                          "min": {
+                            "type": "string",
+                            "description": "between: a number or a date YYYY-MM-DD"
+                          },
+                          "max": {
+                            "type": "string"
+                          },
+                          "minExclusive": {
+                            "type": "boolean"
+                          },
+                          "maxExclusive": {
+                            "type": "boolean"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "contains, starts_with, ends_with, not_contains"
+                          },
+                          "anchor": {
+                            "type": "string",
+                            "enum": [
+                              "last",
+                              "this",
+                              "previous",
+                              "next"
+                            ],
+                            "description": "relative"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": [
+                              "day",
+                              "week",
+                              "month",
+                              "quarter",
+                              "year"
+                            ]
+                          },
+                          "n": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ]
                       }
-                    },
-                    "required": [
-                      "column"
                     ]
                   },
                   "description": "this question's own filters (at most 20), on its own data"
@@ -1348,6 +1406,19 @@
                     "column"
                   ],
                   "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "metric": {
+                      "type": "string",
+                      "description": "the name of a metric from list_metrics"
+                    }
+                  },
+                  "required": [
+                    "metric"
+                  ],
+                  "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
                 }
               ]
             },
@@ -1578,75 +1649,91 @@
           "filters": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "column": {
-                  "type": "string"
-                },
-                "op": {
-                  "type": "string",
-                  "enum": [
-                    "in",
-                    "not_in",
-                    "between",
-                    "relative",
-                    "contains",
-                    "starts_with",
-                    "ends_with",
-                    "not_contains"
-                  ],
-                  "description": "default in"
-                },
-                "values": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
                   },
-                  "description": "in / not_in"
-                },
-                "min": {
-                  "type": "string",
-                  "description": "between: a number or a date YYYY-MM-DD"
-                },
-                "max": {
-                  "type": "string"
-                },
-                "minExclusive": {
-                  "type": "boolean"
-                },
-                "maxExclusive": {
-                  "type": "boolean"
-                },
-                "text": {
-                  "type": "string",
-                  "description": "contains, starts_with, ends_with, not_contains"
-                },
-                "anchor": {
-                  "type": "string",
-                  "enum": [
-                    "last",
-                    "this",
-                    "previous",
-                    "next"
-                  ],
-                  "description": "relative"
-                },
-                "unit": {
-                  "type": "string",
-                  "enum": [
-                    "day",
-                    "week",
-                    "month",
-                    "quarter",
-                    "year"
+                  "required": [
+                    "segment"
                   ]
                 },
-                "n": {
-                  "type": "number"
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
                 }
-              },
-              "required": [
-                "column"
               ]
             },
             "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
@@ -1730,6 +1817,19 @@
                           "column"
                         ],
                         "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "metric": {
+                            "type": "string",
+                            "description": "the name of a metric from list_metrics"
+                          }
+                        },
+                        "required": [
+                          "metric"
+                        ],
+                        "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
                       }
                     ]
                   },
@@ -1749,75 +1849,91 @@
                 "filters": {
                   "type": "array",
                   "items": {
-                    "type": "object",
-                    "properties": {
-                      "column": {
-                        "type": "string"
-                      },
-                      "op": {
-                        "type": "string",
-                        "enum": [
-                          "in",
-                          "not_in",
-                          "between",
-                          "relative",
-                          "contains",
-                          "starts_with",
-                          "ends_with",
-                          "not_contains"
-                        ],
-                        "description": "default in"
-                      },
-                      "values": {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "segment": {
+                            "type": "string",
+                            "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                          }
                         },
-                        "description": "in / not_in"
-                      },
-                      "min": {
-                        "type": "string",
-                        "description": "between: a number or a date YYYY-MM-DD"
-                      },
-                      "max": {
-                        "type": "string"
-                      },
-                      "minExclusive": {
-                        "type": "boolean"
-                      },
-                      "maxExclusive": {
-                        "type": "boolean"
-                      },
-                      "text": {
-                        "type": "string",
-                        "description": "contains, starts_with, ends_with, not_contains"
-                      },
-                      "anchor": {
-                        "type": "string",
-                        "enum": [
-                          "last",
-                          "this",
-                          "previous",
-                          "next"
-                        ],
-                        "description": "relative"
-                      },
-                      "unit": {
-                        "type": "string",
-                        "enum": [
-                          "day",
-                          "week",
-                          "month",
-                          "quarter",
-                          "year"
+                        "required": [
+                          "segment"
                         ]
                       },
-                      "n": {
-                        "type": "number"
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "op": {
+                            "type": "string",
+                            "enum": [
+                              "in",
+                              "not_in",
+                              "between",
+                              "relative",
+                              "contains",
+                              "starts_with",
+                              "ends_with",
+                              "not_contains"
+                            ],
+                            "description": "default in"
+                          },
+                          "values": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "in / not_in"
+                          },
+                          "min": {
+                            "type": "string",
+                            "description": "between: a number or a date YYYY-MM-DD"
+                          },
+                          "max": {
+                            "type": "string"
+                          },
+                          "minExclusive": {
+                            "type": "boolean"
+                          },
+                          "maxExclusive": {
+                            "type": "boolean"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "contains, starts_with, ends_with, not_contains"
+                          },
+                          "anchor": {
+                            "type": "string",
+                            "enum": [
+                              "last",
+                              "this",
+                              "previous",
+                              "next"
+                            ],
+                            "description": "relative"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": [
+                              "day",
+                              "week",
+                              "month",
+                              "quarter",
+                              "year"
+                            ]
+                          },
+                          "n": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ]
                       }
-                    },
-                    "required": [
-                      "column"
                     ]
                   },
                   "description": "this question's own filters (at most 20), on its own data"
@@ -2516,6 +2632,484 @@
     "function": {
       "name": "delete_calculated_field",
       "description": "Delete one calculated field (by id). Refused while a chart or another field uses it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_metrics",
+      "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue. Call it BEFORE writing a query or a chart for a number the user names: if one matches, use it and name it in your answer; if none matches, say so before you write SQL.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_metric",
+      "description": "One metric in full: its formula, filters, date column and default grain, and the charts and dashboards that use it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "the metric's name from list_metrics"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "query_metric",
+      "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further. Say which metric you used.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "the metric's name from list_metrics"
+          },
+          "groupBy": {
+            "type": "string",
+            "description": "a column of the metric's table; with grain, a date column"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ]
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "filters on columns of the metric's table, or a saved segment {segment}"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_metric",
+      "description": "Save a reusable metric on a mart or SQL source. Only when the user asks for one; check list_metrics first so there is one definition per number. Needs the metric:write permission.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "label": {
+            "type": "string",
+            "description": "what people read, for example Total visitors"
+          },
+          "description": {
+            "type": "string",
+            "description": "what it counts and how, at most 500 characters"
+          },
+          "formula": {
+            "type": "string",
+            "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the metric's own filters, applied to this metric's number only (or a saved segment {segment})"
+          },
+          "timeColumn": {
+            "type": "string",
+            "description": "a date or timestamp column its period comparisons run on"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "its default period"
+          },
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _ (for example total_visitors), unique, not a column; charts pick the metric by it and it cannot change later"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_metric",
+      "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "label": {
+            "type": "string",
+            "description": "what people read, for example Total visitors"
+          },
+          "description": {
+            "type": "string",
+            "description": "what it counts and how, at most 500 characters"
+          },
+          "formula": {
+            "type": "string",
+            "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the metric's own filters, applied to this metric's number only (or a saved segment {segment})"
+          },
+          "timeColumn": {
+            "type": "string",
+            "description": "a date or timestamp column its period comparisons run on"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "its default period"
+          },
+          "id": {
+            "type": "string",
+            "description": "from list_metrics"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_metric",
+      "description": "Delete one metric (by id). Refused while a chart uses it. Needs human approval before it runs.",
       "parameters": {
         "type": "object",
         "properties": {

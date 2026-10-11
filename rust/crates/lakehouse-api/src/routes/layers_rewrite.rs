@@ -41,22 +41,22 @@ use crate::sql_rewrite::{
     NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations, enforce,
 };
 
-const POINTS: &str = "mart_demo_map_points";
-const EVENTS: &str = "mart_demo_events";
-const CAPACITY: &str = "mart_demo_province_capacity";
+pub(crate) const POINTS: &str = "mart_demo_map_points";
+pub(crate) const EVENTS: &str = "mart_demo_events";
+pub(crate) const CAPACITY: &str = "mart_demo_province_capacity";
 
 /// What one governed table of the test role carries.
-struct Governed {
-    table: &'static str,
-    columns: &'static [&'static str],
-    mask: &'static [&'static str],
-    row_filter: Option<&'static str>,
+pub(crate) struct Governed {
+    pub(crate) table: &'static str,
+    pub(crate) columns: &'static [&'static str],
+    pub(crate) mask: &'static [&'static str],
+    pub(crate) row_filter: Option<&'static str>,
     /// The role cannot read the table: its real columns are unknown to the
     /// rewrite, which then refuses (`UnprovableSubstitution`).
-    unreadable: bool,
+    pub(crate) unreadable: bool,
 }
 
-struct Policies(Vec<Governed>);
+pub(crate) struct Policies(pub(crate) Vec<Governed>);
 
 impl ObligationsSource for Policies {
     fn obligations_for(&self, table: &str, _roles: &[String]) -> Option<TableObligations> {
@@ -76,13 +76,13 @@ impl ObligationsSource for Policies {
 }
 
 /// Runs a statement as the test role: the real rewrite, then the real engine.
-struct Engine {
-    ch: ChClient,
-    policies: Policies,
+pub(crate) struct Engine {
+    pub(crate) ch: ChClient,
+    pub(crate) policies: Policies,
 }
 
 impl Engine {
-    fn from_env(policies: Vec<Governed>) -> Self {
+    pub(crate) fn from_env(policies: Vec<Governed>) -> Self {
         let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
         Self {
             ch: ChClient::new(
@@ -96,7 +96,7 @@ impl Engine {
 
     /// A statement straight on the engine, no rewrite: the "direct single
     /// query" a series is compared with.
-    async fn direct(&self, sql: &str) -> Vec<Value> {
+    pub(crate) async fn direct(&self, sql: &str) -> Vec<Value> {
         let r = self.ch.query(sql, None).await.unwrap();
         r.data.into_iter().map(Value::Object).collect()
     }
@@ -130,11 +130,11 @@ impl LayerRunner for Engine {
     }
 }
 
-fn one_line(sql: &str) -> String {
+pub(crate) fn one_line(sql: &str) -> String {
     sql.replace('\n', " ")
 }
 
-fn marts() -> HashMap<String, RelationColumns> {
+pub(crate) fn marts() -> HashMap<String, RelationColumns> {
     let table = |cols: &[(&str, ColumnKind)]| -> RelationColumns {
         cols.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect()
     };
@@ -171,7 +171,10 @@ fn marts() -> HashMap<String, RelationColumns> {
     ])
 }
 
-fn points_policy(mask: &'static [&'static str], row_filter: Option<&'static str>) -> Governed {
+pub(crate) fn points_policy(
+    mask: &'static [&'static str],
+    row_filter: Option<&'static str>,
+) -> Governed {
     Governed {
         table: POINTS,
         columns: &[
@@ -190,7 +193,7 @@ fn points_policy(mask: &'static [&'static str], row_filter: Option<&'static str>
     }
 }
 
-fn events_unreadable() -> Governed {
+pub(crate) fn events_unreadable() -> Governed {
     Governed {
         table: EVENTS,
         columns: &["event_time", "channel", "orders"],
@@ -201,7 +204,7 @@ fn events_unreadable() -> Governed {
 }
 
 /// A chart as the store holds it, from the JSON the builder sends.
-fn chart(definition: &Value) -> StoredChartSpec {
+pub(crate) fn chart(definition: &Value) -> StoredChartSpec {
     let mut def: ChartInput = serde_json::from_value(definition.clone()).unwrap();
     // The statement is always built from the definition, as for a chart that
     // has any shaping: the stored text below is a placeholder.
@@ -276,11 +279,11 @@ async fn tile(
     tile
 }
 
-fn rows_of(v: &Value) -> Vec<Value> {
+pub(crate) fn rows_of(v: &Value) -> Vec<Value> {
     v["rows"].as_array().cloned().unwrap_or_default()
 }
 
-fn as_f64(v: &Value) -> f64 {
+pub(crate) fn as_f64(v: &Value) -> f64 {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(f64::NAN)
@@ -634,6 +637,13 @@ impl LayerRunner for Stub {
         if sql.contains("REFUSED") {
             return Err(SpecRunFailure::Refused("refused by the role rewrite"));
         }
+        if sql.contains("MANYROWS") {
+            // One row more than a layer may return, as the statement's over-fetch gives.
+            let rows: Vec<Value> = (0..101)
+                .map(|i| json!({ "provinsi": format!("P{i:03}"), "v": i }))
+                .collect();
+            return Ok(json!({ "columns": ["provinsi", "v"], "rows": rows }));
+        }
         Ok(json!({
             "columns": ["provinsi", "v"],
             "rows": [{ "provinsi": "A", "v": 1 }, { "provinsi": "B", "v": 2 }],
@@ -742,6 +752,23 @@ async fn a_failing_or_refused_statement_is_that_layers_sentence_and_its_neighbou
     );
     // The base rows are untouched.
     assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
+}
+
+/// BI-13 review fix (SHOULD-FIX) R1: a layer asked for its own values that has
+/// more than 100 of them is cut and says so; one with fewer says nothing.
+#[tokio::test]
+async fn a_layer_cut_at_one_hundred_rows_carries_truncated_and_one_that_is_not_does_not() {
+    let stub = Stub::new();
+    let base = by_province(5, &[capacity_layer("MANYROWS"), capacity_layer("hotels")]);
+    let tile = stub_tile(&stub, &base, tile_of(&["A", "B"])).await;
+    assert_eq!(tile["layers"][0]["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(tile["layers"][0]["truncated"], json!(true), "{tile}");
+    assert!(tile["layers"][1].get("truncated").is_none(), "{tile}");
+    assert!(
+        stub.asked()[0].contains("LIMIT 101"),
+        "the layer is over-fetched by one row: {:?}",
+        stub.asked()
+    );
 }
 
 /// The layer is asked for the base's values only when the base filled its

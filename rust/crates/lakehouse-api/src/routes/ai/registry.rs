@@ -170,7 +170,11 @@ fn measures_schema() -> Value {
             "column": param_ref_schema(),
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
             "required": ["column"],
-            "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}" }
+            "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}" },
+        { "type": "object", "properties": {
+            "metric": { "type": "string", "description": "the name of a metric from list_metrics" } },
+            "required": ["metric"],
+            "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches" }
     ] },
         "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}" })
 }
@@ -193,7 +197,11 @@ fn bin_schema(description: &str) -> Value {
 /// The filters a chart or a question carries (at most 20): the same filters a
 /// dashboard takes, on columns of the data they belong to.
 fn filters_schema(description: &str) -> Value {
-    json!({ "type": "array", "items": { "type": "object", "properties": {
+    json!({ "type": "array", "items": { "oneOf": [
+        { "type": "object", "properties": {
+            "segment": { "type": "string", "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters" } },
+            "required": ["segment"] },
+        { "type": "object", "properties": {
             "column": { "type": "string" },
             "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
             "values": { "type": "array", "items": { "type": "string" }, "description": "in / not_in" },
@@ -204,7 +212,8 @@ fn filters_schema(description: &str) -> Value {
             "anchor": { "type": "string", "enum": ["last", "this", "previous", "next"], "description": "relative" },
             "unit": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
             "n": { "type": "number" } },
-            "required": ["column"] }, "description": description })
+            "required": ["column"] }
+    ] }, "description": description })
 }
 
 /// The joins of a chart or a question (`BI-7`): up to four more Gold marts.
@@ -491,6 +500,68 @@ fn list_formula_functions_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_formula_functions",
         "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
         "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_metrics_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_metrics",
+        "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue. Call it BEFORE writing a query or a chart for a number the user names: if one matches, use it and name it in your answer; if none matches, say so before you write SQL.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn describe_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "describe_metric",
+        "description": "One metric in full: its formula, filters, date column and default grain, and the charts and dashboards that use it.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "the metric's name from list_metrics" } },
+            "required": ["name"] } } })
+}
+
+fn query_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "query_metric",
+        "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further. Say which metric you used.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "the metric's name from list_metrics" },
+            "groupBy": { "type": "string", "description": "a column of the metric's table; with grain, a date column" },
+            "grain": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
+            "filters": filters_schema("filters on columns of the metric's table, or a saved segment {segment}") },
+            "required": ["name"] } } })
+}
+
+fn metric_properties() -> Value {
+    let mut properties = calc_source_properties();
+    properties["label"] =
+        json!({ "type": "string", "description": "what people read, for example Total visitors" });
+    properties["description"] = json!({ "type": "string", "description": "what it counts and how, at most 500 characters" });
+    properties["formula"] = json!({ "type": "string", "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)" });
+    properties["filters"] = filters_schema(
+        "the metric's own filters, applied to this metric's number only (or a saved segment {segment})",
+    );
+    properties["timeColumn"] = json!({ "type": "string", "description": "a date or timestamp column its period comparisons run on" });
+    properties["grain"] = json!({ "type": "string", "enum": ["day", "week", "month", "quarter", "year"], "description": "its default period" });
+    properties
+}
+
+fn create_metric_schema() -> Value {
+    let mut properties = metric_properties();
+    properties["name"] = json!({ "type": "string", "description": "letters, digits and _ (for example total_visitors), unique, not a column; charts pick the metric by it and it cannot change later" });
+    json!({ "type": "function", "function": { "name": "create_metric",
+        "description": "Save a reusable metric on a mart or SQL source. Only when the user asks for one; check list_metrics first so there is one definition per number. Needs the metric:write permission.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "label", "formula"] } } })
+}
+
+fn update_metric_schema() -> Value {
+    let mut properties = metric_properties();
+    properties["id"] = json!({ "type": "string", "description": "from list_metrics" });
+    json!({ "type": "function", "function": { "name": "update_metric",
+        "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition.",
+        "parameters": { "type": "object", "properties": properties, "required": ["id", "label", "formula"] } } })
+}
+
+fn delete_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_metric",
+        "description": "Delete one metric (by id). Refused while a chart uses it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
 }
 
 fn list_calculated_fields_schema() -> Value {
@@ -1282,6 +1353,46 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // BI-2 / AI-7: reusable metrics. Reading, describing and querying need
+    // `dashboard:read` (query_metric runs as the caller); the writes mirror
+    // `/api/dashboard/metrics` and need `metric:write`; deleting asks for
+    // approval like `delete_calculated_field`.
+    ToolSpec {
+        name: "list_metrics",
+        schema: list_metrics_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "describe_metric",
+        schema: describe_metric_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "query_metric",
+        schema: query_metric_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_metric",
+        schema: create_metric_schema,
+        risk: Risk::WriteLow,
+        permission: "metric:write",
+    },
+    ToolSpec {
+        name: "update_metric",
+        schema: update_metric_schema,
+        risk: Risk::WriteLow,
+        permission: "metric:write",
+    },
+    ToolSpec {
+        name: "delete_metric",
+        schema: delete_metric_schema,
+        risk: Risk::WriteHigh,
+        permission: "metric:write",
+    },
     // BI-10 / AI-6: value groups and hierarchies. The permissions mirror
     // `/api/dashboard/calc-fields` and `/api/dashboard/hierarchies` in
     // `POLICY_TABLE`: reading needs `dashboard:read`, saving `dashboard:write`;
@@ -1705,7 +1816,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_seventy_nine_entries() {
+    fn tool_schemas_has_eighty_five_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -1715,8 +1826,44 @@ mod tests {
         // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
         // `suggest_join` (`BI-7`) + `create_value_group`, `list_hierarchies`,
         // `create_hierarchy` and `delete_hierarchy` (`BI-10`) + `list_parameters`,
-        // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`).
-        assert_eq!(tool_schemas().len(), 79);
+        // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`)
+        // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
+        // `update_metric` and `delete_metric` (`BI-2`, `AI-7`).
+        assert_eq!(tool_schemas().len(), 85);
+    }
+
+    /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
+    /// changing and deleting one needs `metric:write`, the permission of the
+    /// routes they call, and a delete asks for approval.
+    #[test]
+    fn the_metric_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("list_metrics", Risk::Read, "dashboard:read"),
+            ("describe_metric", Risk::Read, "dashboard:read"),
+            ("query_metric", Risk::Read, "dashboard:read"),
+            ("create_metric", Risk::WriteLow, "metric:write"),
+            ("update_metric", Risk::WriteLow, "metric:write"),
+            ("delete_metric", Risk::WriteHigh, "metric:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, permission, "{name}");
+        }
+        // A measure may be a metric, and a filter a segment, on both chart tools.
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert_eq!(
+                properties["measures"]["items"]["oneOf"][3]["required"],
+                json!(["metric"]),
+                "{tool}"
+            );
+            assert_eq!(
+                properties["filters"]["items"]["oneOf"][0]["required"],
+                json!(["segment"]),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

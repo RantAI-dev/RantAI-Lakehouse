@@ -254,12 +254,16 @@ export function PivotSection({ draft, onChange, columns }: {
 }
 
 /** KPI: compare with the previous period of a date column, or with a goal. */
-export function KpiCompareSection({ draft, onChange, columns }: {
+export function KpiCompareSection({ draft, onChange, columns, metric }: {
   readonly draft: TableDraft;
   readonly onChange: (d: TableDraft) => void;
   readonly columns: SourceColumns;
+  /** BI-2: the metric the KPI measures; its date column and grain are the default of a period comparison. */
+  readonly metric?: { label: string; timeColumn?: string; grain?: string };
 }) {
-  const kinds = { none: "No comparison", previous: "Previous period", goal: "Goal" };
+  const kinds = { none: "No comparison", previous: "Previous period", last_year: "Same period last year", goal: "Goal" };
+  const byPeriod = draft.compareKind === "previous" || draft.compareKind === "last_year";
+  const defaultNote = metric?.timeColumn ? `${metric.timeColumn}, ${metric.grain ?? "month"} (from ${metric.label})` : "";
   return (
     <div className="grid gap-3">
       <div className="grid gap-1.5">
@@ -271,12 +275,12 @@ export function KpiCompareSection({ draft, onChange, columns }: {
           </SelectContent>
         </Select>
       </div>
-      {draft.compareKind === "previous" ? (
+      {byPeriod ? (
         <div className="grid grid-cols-2 gap-3">
           <div className="grid gap-1.5">
-            <Label>Date column <span aria-hidden className="text-destructive">*</span></Label>
+            <Label>Date column {defaultNote ? null : <span aria-hidden className="text-destructive">*</span>}</Label>
             <Select value={draft.compareColumn} onValueChange={(v) => onChange({ ...draft, compareColumn: v ?? "" })}>
-              <SelectTrigger className="w-full" aria-label="Date column"><SelectValue placeholder={columns.dates.length ? "pick a column" : "no date column"} /></SelectTrigger>
+              <SelectTrigger className="w-full" aria-label="Date column"><SelectValue placeholder={defaultNote || (columns.dates.length ? "pick a column" : "no date column")} /></SelectTrigger>
               <SelectContent>{columns.dates.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
             </Select>
           </div>

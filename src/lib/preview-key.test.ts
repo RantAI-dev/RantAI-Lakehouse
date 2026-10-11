@@ -82,3 +82,16 @@ test("BI-13: each question input and the chart's own drawing change the key", ()
   ])
   assert.equal(keys.size, 12)
 })
+
+test("picking a metric as a measure, and adding a segment to the filters, each change the key (BI-2)", () => {
+  const withShape = (shape: unknown) => previewKey({ ...base, shape: JSON.stringify(shape) })
+  const keys = new Set([
+    previewKey(base),
+    previewKey({ ...base, measure: "metric:total_visitors" }),
+    previewKey({ ...base, measure: "metric:other" }),
+    withShape({ measures: [{ column: "metric:total_visitors", aggregate: "" }] }),
+    withShape({ filters: [{ column: "", values: [], segment: "domestic" }] }),
+    withShape({ filters: [{ column: "", values: [], segment: "foreign" }] }),
+  ])
+  assert.equal(keys.size, 6)
+})

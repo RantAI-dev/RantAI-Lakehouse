@@ -75,6 +75,11 @@ export function failedLayers(layers: readonly LayerCell[] | undefined): { label:
   return (layers ?? []).filter((l) => l.error).map((l) => ({ label: l.label, error: l.error ?? "", errorId: l.errorId }));
 }
 
+/** The labels of the layers that were cut off (BI-13 review fix (SHOULD-FIX) R1): the tile says so under the chart. */
+export function cutLayers(layers: readonly LayerCell[] | undefined): string[] {
+  return (layers ?? []).filter((l) => !l.error && l.truncated).map((l) => l.label);
+}
+
 /**
  * The categories of the chart: the base's, then those only a layer has. Dates
  * (buckets or days) read best in date order, so they are sorted; anything else

@@ -34,6 +34,7 @@ mod gold;
 mod governance;
 mod ingest;
 mod lakehouse;
+mod metrics;
 mod ops;
 mod pipelines;
 mod queries;

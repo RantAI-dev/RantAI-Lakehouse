@@ -1207,7 +1207,11 @@ pub fn resolve_chart(
         known(column).then(|| column.to_owned())
     })?;
     let mut out = chart.clone();
-    let measure_names: Vec<String> = def.measures.to_vec();
+    // BI-11 review fix (BLOCKER) R1: the tile reads its rows by the result
+    // column, which for a measure with its own aggregate is `sum_hotels` and
+    // not `hotels`. The names are computed here, on the server, from the
+    // resolved definition, so the render spec cannot drift from the statement.
+    let measure_names: Vec<String> = def.measures.result_names();
     out.spec.x.clone_from(&def.dimension);
     out.spec.series.clone_from(&def.breakdown);
     out.spec.y = if measure_names.len() == 1 {
@@ -1594,6 +1598,46 @@ mod tests {
                 json!({ "title": "t", "kind": "bar", "dimension": { "param": "a b" } })
             )
             .is_err()
+        );
+    }
+
+    /// BI-11 review fix (BLOCKER) R1: the render spec of a resolved chart names
+    /// the columns the rows come back under. A switched measure with its own
+    /// aggregate comes back as `sum_hotels`, so the tile (which reads `y`)
+    /// drew nothing when `y` still said `hotels`. A switched dimension and
+    /// breakdown follow the same resolved definition.
+    #[test]
+    fn a_resolved_switch_names_the_result_columns_the_rows_come_back_under() {
+        let defs = [
+            validate_def(&list("m", &["hotels", "rooms"], "hotels")).unwrap(),
+            validate_def(&list("d", &["provinsi", "kab_kota"], "provinsi")).unwrap(),
+            validate_def(&list("b", &["category", "provinsi"], "category")).unwrap(),
+        ];
+        let c = chart(&json!({
+            "dimension": { "param": "d" }, "breakdown": { "param": "b" },
+            "measures": [{ "column": { "param": "m" }, "aggregate": "sum" }, "visitors"],
+        }));
+        let known = |n: &str| {
+            [
+                "hotels", "rooms", "provinsi", "kab_kota", "category", "visitors",
+            ]
+            .contains(&n)
+        };
+        let values = json!({ "m": "rooms", "d": "kab_kota", "b": "provinsi" });
+        let ok = resolve_chart(&c, &set(&defs, &values), &known).unwrap();
+        assert_eq!(
+            ok.spec.y,
+            crate::specs::ChartY::Multi(vec!["sum_rooms".to_owned(), "visitors".to_owned()])
+        );
+        assert_eq!(ok.spec.x, "kab_kota");
+        assert_eq!(ok.spec.series.as_deref(), Some("provinsi"));
+        let one = chart(&json!({
+            "dimension": "provinsi", "measures": [{ "column": { "param": "m" }, "aggregate": "sum" }],
+        }));
+        let first = resolve_chart(&one, &set(&defs, &json!({})), &known).unwrap();
+        assert_eq!(
+            first.spec.y,
+            crate::specs::ChartY::Single("sum_hotels".to_owned())
         );
     }
 

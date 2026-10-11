@@ -61,7 +61,7 @@ const MAX_LABEL_CHARS: usize = 60;
 
 /// Most rows a layer returns where the base is not cut: a chart's largest
 /// limit when it is not grained, and a grain's when it is.
-const LAYER_ROW_LIMIT: u32 = 100;
+pub const LAYER_ROW_LIMIT: u32 = 100;
 
 /// One more question on a chart.
 ///
@@ -412,12 +412,14 @@ pub fn layer_input(
 }
 
 /// The limit a layer is built with: all the buckets a grain may have, or the
-/// largest limit of an ungrained chart.
+/// largest limit of an ungrained chart plus one row, so the caller can tell a
+/// layer that was cut from one that has exactly that many values
+/// (`BI-13 review fix (SHOULD-FIX) R1`).
 fn row_limit(grain: Option<&str>) -> u32 {
     if grain.is_some() {
         crate::grain::MAX_GRAIN_LIMIT
     } else {
-        LAYER_ROW_LIMIT
+        LAYER_ROW_LIMIT + 1
     }
 }
 
@@ -757,7 +759,8 @@ mod tests {
             "desc",
             None,
         );
-        assert_eq!(plain.limit_value(), Some(100));
+        // BI-13 review fix (SHOULD-FIX) R1: one row more than the layer may return, to tell a cut from an exact fit.
+        assert_eq!(plain.limit_value(), Some(101));
         assert!(plain.shape.filters.is_none());
     }
 
@@ -837,7 +840,7 @@ mod tests {
             sql.contains(r"d IN ('a','O''Brien\\ x'') OR 1=1 --')"),
             "{sql}"
         );
-        assert!(sql.contains("LIMIT 100"), "{sql}");
+        assert!(sql.contains("LIMIT 101"), "{sql}");
     }
 
     #[test]

@@ -208,6 +208,29 @@ describe("KpiCard", () => {
     expect(container.querySelector(".text-emerald-600")).not.toBeNull()
   })
 
+  it("shows the change against the same period last year, and against the previous period, of a metric's KPI (BI-2-AC3)", () => {
+    const cell: Rows = {
+      columns: ["visit_date", "v"], grain: "month",
+      rows: [
+        { visit_date: "2025-11-01", v: 200 }, { visit_date: "2026-09-01", v: 300 }, { visit_date: "2026-10-01", v: 150 }, { visit_date: "2026-11-01", v: 250 },
+      ],
+    }
+    // The comparison names no date column: the metric's own is the one in the rows.
+    render(<KpiCard def={{ compare: { kind: "last_year" } }} cell={cell} />)
+    expect(screen.getByText("250")).toBeTruthy()
+    expect(screen.getByText(/\+50 \(\+25%\)/)).toBeTruthy()
+    expect(screen.getByText(/vs Nov 2025/)).toBeTruthy()
+    const previous = screen.getByLabelText("Change against the previous period")
+    expect(previous.textContent).toMatch(/\+100/)
+    expect(previous.textContent).toMatch(/vs Oct 2026/)
+  })
+
+  it("says so when no data exists a year earlier", () => {
+    const cell: Rows = { columns: [], grain: "month", rows: [{ d: "2026-10-01", v: 150 }, { d: "2026-11-01", v: 250 }] }
+    render(<KpiCard def={{ compare: { kind: "last_year", dateColumn: "d", period: "month" } }} cell={cell} />)
+    expect(screen.getByText("No data a year earlier.")).toBeTruthy()
+  })
+
   it("colours a rise as worse when down is good", () => {
     const cell: Rows = { columns: [], grain: "month", rows: [{ day: "2026-01-01", v: 10 }, { day: "2026-02-01", v: 12 }] }
     const { container } = render(<KpiCard def={{ compare: { kind: "previous", dateColumn: "day", period: "month" }, goodDirection: "down" }} cell={cell} />)
