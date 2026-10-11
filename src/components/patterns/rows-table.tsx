@@ -13,12 +13,15 @@ export function RowsTable({
   rows,
   maxRows,
   className,
+  onRowClick,
 }: {
   readonly columns: readonly string[]
   readonly rows: readonly Record<string, unknown>[]
   /** Show at most this many rows; the caller says so if it matters. */
   readonly maxRows?: number
   readonly className?: string
+  /** Makes each row open something (a one-record view); receives the row's index in `rows`. */
+  readonly onRowClick?: (index: number) => void
 }) {
   const shown = maxRows == null ? rows : rows.slice(0, maxRows)
   return (
@@ -43,7 +46,26 @@ export function RowsTable({
         </thead>
         <tbody>
           {shown.map((row, i) => (
-            <tr key={i} className="border-b border-border/40 last:border-0">
+            <tr
+              key={i}
+              className={
+                onRowClick
+                  ? "cursor-pointer border-b border-border/40 last:border-0 hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-none"
+                  : "border-b border-border/40 last:border-0"
+              }
+              tabIndex={onRowClick ? 0 : undefined}
+              onClick={onRowClick ? () => onRowClick(i) : undefined}
+              onKeyDown={
+                onRowClick
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault()
+                        onRowClick(i)
+                      }
+                    }
+                  : undefined
+              }
+            >
               {columns.map((c) => (
                 <td key={c} className="whitespace-nowrap px-2 py-1 tabular-nums">
                   {row[c] == null ? "" : String(row[c])}

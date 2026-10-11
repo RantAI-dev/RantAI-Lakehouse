@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// `POST` body.
 #[derive(Debug, Deserialize)]
@@ -60,11 +61,21 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))
 }
 
-/// A `ClickHouse` failure as a fixed 503; the detail is only logged.
+/// A `ClickHouse` failure as a fixed 503 with a reference id; the detail is
+/// only logged (SEC-11). Kept as a named wrapper because "the dashboard store
+/// is unavailable" is the one status every folder/board/source caller wants,
+/// failed statement or outage alike.
 pub(crate) fn classify_ch_error(err: &ChError) -> ApiError {
-    tracing::warn!(%err, "dashboard folder store failed");
-    ApiError::Unavailable("dashboard store unavailable".to_owned())
+    upstream_error::report_ch(&DASHBOARD_STORE, err)
+        .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
 }
+
+/// Fixed words for the dashboard store (folders, boards, SQL sources).
+pub(crate) const DASHBOARD_STORE: upstream_error::Context = upstream_error::Context::new(
+    "dashboard store",
+    "The dashboard store is unavailable.",
+    "The dashboard store is unavailable.",
+);
 
 /// A `lakehouse_bi` error: its validation text is fixed and written for the
 /// caller; a `ClickHouse` failure is classified.

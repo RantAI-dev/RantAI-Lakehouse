@@ -12,6 +12,7 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { clickhouseDashboardService } from "./clients/dashboards"
+import { calcFieldService as calcFieldClientService } from "./clients/calc-fields"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
@@ -19,6 +20,7 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { settingsService as settingsClientService } from "./clients/settings"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import * as authClient from "./clients/auth"
 
@@ -64,6 +66,8 @@ export const connectorService = postgresConnectorService
 // itself still calls `/api/dashboard/*` directly for charts/layout/filters.
 // No mock ever existed for this service.
 export const dashboardService = clickhouseDashboardService
+/** Calculated fields of a mart or SQL source (BI-8). */
+export const calcFieldService = calcFieldClientService
 // Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
 // ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this
 // service; the feature previously fetched `/api/alerts` directly with no
@@ -90,6 +94,9 @@ export const uploadService = uploadClientService
 // `/api/home/layout`; honest `supported: false` when no Postgres pool is
 // configured. No mock ever existed for this domain.
 export const homeService = homeClientService
+// The deployment's report time zone and first day of the week over
+// `/api/settings/reporting` (BI-9).
+export const settingsService = settingsClientService
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

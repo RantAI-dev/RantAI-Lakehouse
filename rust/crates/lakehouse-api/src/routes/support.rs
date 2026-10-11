@@ -1,12 +1,16 @@
 //! Small helpers shared by the route modules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Display;
 
+use lakehouse_bi::builder::{FilteredSql, RelationColumns};
+use lakehouse_bi::filters::ColumnKind;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store;
 use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Map, Value, json};
+
+use crate::upstream_error;
 
 /// Render any JSON value the way `String(x)` renders it in `TypeScript`,
 /// with `null`/missing treated as `""` (matching `String(row[name] ?? "")`
@@ -96,12 +100,24 @@ pub(crate) fn prettify(s: &str) -> String {
     out
 }
 
-/// Render an error the way `String(e)` renders a thrown `Error` in
-/// `TypeScript`: `"Error: <message>"`. Every ported route's outer
-/// `catch (e)` block builds its 503 body with `String(e)`.
+/// The text a route puts in an `error`/`unavailable` field when an upstream
+/// call failed: a fixed sentence and a reference id, never `err`'s own text.
+///
+/// SEC-11: this used to be `js_error`, which rendered `"Error: <message>"`
+/// the way the `TypeScript` ports did and so copied `ClickHouse`'s, Dagster's
+/// and the catalog's text into response bodies. The raw error is logged under
+/// the id instead (`upstream_error::report`). Use a typed
+/// `upstream_error::report_*` call where the caller needs the id or the
+/// unavailable/failed distinction as data; this is for the sites that only
+/// ever wanted a string.
 #[must_use]
-pub(crate) fn js_error(err: impl Display) -> String {
-    format!("Error: {err}")
+pub(crate) fn upstream_message(err: impl Display) -> String {
+    crate::upstream_error::report(
+        &crate::upstream_error::SERVICE,
+        crate::upstream_error::Class::Failed,
+        &err,
+    )
+    .to_string()
 }
 
 /// The outermost `{...}` in a model's reply, so a model that wraps its JSON
@@ -219,7 +235,11 @@ pub(crate) async fn run_spec_sql(
     let result = match try_run_spec_sql(ch, sql, roles, placeholders, obligations).await {
         Ok(result) => result,
         Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
-        Err(SpecRunFailure::Clickhouse(err)) => json!({ "error": err.to_string() }),
+        // SEC-11: a tile on a public or embed link is read by someone with
+        // no sign-in; the database's text goes to the log under the id.
+        Err(SpecRunFailure::Clickhouse(err)) => {
+            upstream_error::report_ch(&upstream_error::TILE, &err).to_json()
+        }
     };
     (id.to_owned(), result)
 }
@@ -291,10 +311,11 @@ pub(crate) async fn sources_for<'a>(
 }
 
 /// The SQL to run for a stored chart right now: a mart chart through
-/// `sql_with_filters` (unchanged), a SQL-source chart rebuilt from the
-/// source's CURRENT text (`sql_for_sql_source`). `Err` carries a fixed tile
-/// error when the source was deleted or the stored definition no longer
-/// validates — reported on that tile, never replaced by other SQL.
+/// `sql_with_filters_report`, a SQL-source chart rebuilt from the source's
+/// CURRENT text (`sql_for_sql_source_report`), plus the active filters left
+/// out of it. `Err` carries a fixed tile error when the source was deleted
+/// or the stored definition no longer validates — reported on that tile,
+/// never replaced by other SQL.
 ///
 /// # Errors
 ///
@@ -303,46 +324,217 @@ pub(crate) fn stored_chart_sql(
     chart: &store::StoredChartSpec,
     years: &[i64],
     filters: &[store::FilterDef],
-    mart_cols: &HashMap<String, HashSet<String>>,
+    mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
-) -> Result<String, &'static str> {
+    read: &lakehouse_bi::builder::ReadContext<'_>,
+) -> Result<FilteredSql, &'static str> {
     let Some(id) = chart.def.sql_source.as_deref() else {
-        return Ok(lakehouse_bi::builder::sql_with_filters(
-            chart, years, filters, mart_cols,
+        return Ok(lakehouse_bi::builder::sql_with_filters_report(
+            chart, years, filters, mart_cols, read,
         ));
     };
     let source = sources
         .get(id)
         .ok_or("this chart's SQL source no longer exists")?;
-    lakehouse_bi::builder::sql_for_sql_source(
+    lakehouse_bi::builder::sql_for_sql_source_report(
         chart,
         &source.sql,
-        &source.column_names(),
+        &source.column_kinds(),
         years,
         filters,
+        read,
     )
     .ok_or("this chart's definition is invalid")
 }
 
-/// `SELECT table, name FROM system.columns WHERE database='serving'`,
-/// grouped into a mart → column-set map — used to decide which dashboard
-/// filters apply to which tile.
+/// [`annotate_grain`] for a chart that is not on a dashboard (the builder's
+/// preview): its own grain, no dashboard switch, no filters.
+pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartSpec) {
+    let Some(grain) = chart
+        .def
+        .grain
+        .as_deref()
+        .and_then(lakehouse_bi::grain::Grain::parse)
+    else {
+        return;
+    };
+    let order = chart.def.order.as_deref().unwrap_or("none");
+    let filtered = FilteredSql {
+        sql: String::new(),
+        skipped: Vec::new(),
+        grain_skipped: None,
+        grain: Some(grain),
+        grain_column: None,
+        latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
+            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
+        table: None,
+    };
+    annotate_grain(tile, &filtered, chart);
+}
+
+/// What a grained chart's tile carries beyond its rows (`BI-9`): the grain it
+/// was bucketed with (`grain`), the grain a dashboard switch could not apply (`grainSkipped`, like `filtersSkipped`)
+/// and, when the chart keeps its latest buckets, the surplus bucket dropped
+/// and `truncated: true` if any bucket was cut off. The query asked for one
+/// bucket more than the chart's limit exactly so this can tell "the limit
+/// cut the result" from "it fits".
+///
+/// A tile that carries an error (no `rows`) is left alone.
+pub(crate) fn annotate_grain(
+    tile: &mut Value,
+    filtered: &FilteredSql,
+    chart: &store::StoredChartSpec,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    // The grain the rows were bucketed with, so the console labels them.
+    if let Some(grain) = filtered.grain {
+        tile.insert("grain".to_owned(), json!(grain.as_str()));
+    }
+    if let Some(kind) = filtered.grain_column {
+        tile.insert("grainColumn".to_owned(), json!(kind));
+    }
+    if let Some(grain) = filtered.grain_skipped {
+        tile.insert("grainSkipped".to_owned(), json!(grain.as_str()));
+    }
+    let Some(limit) = filtered.latest_limit else {
+        return;
+    };
+    let Some(Value::Array(rows)) = tile.get_mut("rows") else {
+        return;
+    };
+    let mut objects: Vec<Map<String, Value>> =
+        rows.iter().filter_map(|r| r.as_object().cloned()).collect();
+    if objects.len() != rows.len() {
+        return;
+    }
+    let cut =
+        lakehouse_bi::grain::trim_to_latest(&mut objects, &chart.def.dimension, limit as usize);
+    if cut {
+        *rows = objects.into_iter().map(Value::Object).collect();
+        tile.insert("truncated".to_owned(), json!(true));
+    }
+}
+
+/// What the tile of a raw table or a pivot carries beyond its rows
+/// (`BI-16` part A).
+///
+/// A raw table's first page gets `total` (the rows its pages walk through),
+/// `limit` and `offset`, from the count statement, which goes through the same
+/// role rewrite as the page. A count that fails or is refused leaves `total`
+/// out: the tile then shows its rows and offers no paging, and the failure is
+/// only logged (the page itself already told the caller if the table could not
+/// be read). A pivot keeps the first [`lakehouse_bi::tables::pivot_cap`] rows
+/// and is marked `truncated` when the statement returned more.
+///
+/// A tile that carries an error (no `rows`) is left alone.
+pub(crate) async fn annotate_table(
+    ch: &ChClient,
+    tile: &mut Value,
+    filtered: &FilteredSql,
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    use lakehouse_bi::builder::TableRead;
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    match &filtered.table {
+        Some(TableRead::Rows { count_sql }) => {
+            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+                Ok(counted) => {
+                    let total = counted["rows"][0]["n"].as_u64().or_else(|| {
+                        counted["rows"][0]["n"]
+                            .as_str()
+                            .and_then(|t| t.parse().ok())
+                    });
+                    if let Some(total) = total {
+                        tile.insert("total".to_owned(), json!(total));
+                        tile.insert(
+                            "limit".to_owned(),
+                            json!(lakehouse_bi::tables::ROWS_PAGE_SIZE),
+                        );
+                        tile.insert("offset".to_owned(), json!(0));
+                    }
+                }
+                Err(SpecRunFailure::Clickhouse(err)) => {
+                    // The page was read; only its total was not. Logged under
+                    // a reference id, nothing of it in the response.
+                    let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                }
+                Err(SpecRunFailure::Refused(_)) => {}
+            }
+        }
+        Some(TableRead::Pivot { row_cap }) => {
+            if let Some(Value::Array(rows)) = tile.get_mut("rows")
+                && lakehouse_bi::tables::pivot_trim(rows, *row_cap)
+            {
+                tile.insert("truncated".to_owned(), json!(true));
+            }
+        }
+        Some(TableRead::Trend { .. }) | None => {}
+    }
+}
+
+/// [`annotate_table`] for a chart that is not on a dashboard (the builder's
+/// preview): a pivot is cut like a tile; a comparing KPI says which period its
+/// buckets are cut by. A raw table's total is not counted, the preview shows
+/// its first page.
+pub(crate) fn annotate_saved_table(tile: &mut Value, chart: &store::StoredChartSpec) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if chart.spec.kind == lakehouse_bi::specs::ChartKind::Pivot {
+        let cap = lakehouse_bi::tables::pivot_cap(
+            chart.def.sql_source.is_some(),
+            chart.def.tables.values.as_ref().map_or(1, Vec::len),
+        );
+        if let Some(Value::Array(rows)) = tile.get_mut("rows")
+            && lakehouse_bi::tables::pivot_trim(rows, cap)
+        {
+            tile.insert("truncated".to_owned(), json!(true));
+        }
+    }
+    if chart.def.tables.compares_to_previous(chart.spec.kind)
+        && let Some(period) = chart
+            .def
+            .tables
+            .compare
+            .as_ref()
+            .and_then(|c| c.period.as_deref())
+    {
+        tile.insert("grain".to_owned(), json!(period));
+    }
+}
+
+/// `SELECT table, name, type FROM system.columns WHERE database='serving'`,
+/// grouped into a mart → column-kinds map — used to decide which dashboard
+/// filters apply to which tile, and whether their op fits the column. The
+/// kind comes from the type, never from the name (BI-18).
 pub(crate) async fn mart_columns(
     ch: &ChClient,
-) -> Result<HashMap<String, HashSet<String>>, ChError> {
+) -> Result<HashMap<String, RelationColumns>, ChError> {
     let rows = ch
         .rows(
-            "SELECT table, name FROM system.columns WHERE database='serving'",
+            "SELECT table, name, type FROM system.columns WHERE database='serving'",
             None,
         )
         .await?;
-    let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut m: HashMap<String, RelationColumns> = HashMap::new();
     for r in &rows {
         let table = r.get("table").and_then(Value::as_str).unwrap_or("");
         let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+        let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
         m.entry(table.to_owned())
             .or_default()
-            .insert(name.to_owned());
+            .insert(name.to_owned(), ColumnKind::from_clickhouse_type(ty));
     }
     Ok(m)
 }
@@ -388,6 +580,7 @@ mod tests {
             text: None,
             caption: None,
             target: None,
+            click: None,
         }
     }
 
@@ -461,8 +654,10 @@ mod tests {
     }
 
     #[test]
-    fn js_error_formats_like_string_of_error() {
-        assert_eq!(js_error("bad sql"), "Error: bad sql");
+    fn upstream_message_never_repeats_the_error_text() {
+        let text = upstream_message("planted-marker-bad-sql");
+        assert!(!text.contains("planted-marker-bad-sql"), "{text}");
+        assert!(text.contains("Reference: "), "{text}");
     }
 }
 
@@ -587,6 +782,73 @@ mod run_spec_sql_enforcement {
                     .contains("replaceRegexpOne(toString(`email`)")),
             "expected ClickHouse to receive the masked/rewritten query, never the raw one"
         );
+        Ok(())
+    }
+
+    /// SEC-11: a tile whose `ClickHouse` query fails shows a fixed message
+    /// and a reference id, never the database's own text (which names
+    /// tables and carries the server version, and reaches public and embed
+    /// links that have no sign-in).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failing_tile_query_reports_a_fixed_message_and_a_reference(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 999. DB::Exception: planted-marker-table-x (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let (id, val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT 1 AS n",
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        assert_eq!(id, "chart1");
+        assert_eq!(val["error"], "This chart could not be loaded.");
+        assert!(
+            val["errorId"].as_str().is_some_and(|r| r.len() == 10),
+            "{val:?}"
+        );
+        assert!(
+            !val.to_string().contains("planted-marker"),
+            "the database's text reached the tile: {val:?}"
+        );
+        Ok(())
+    }
+
+    /// SEC-11: an unreachable `ClickHouse` is "unavailable", not "failed"
+    /// (the wording and the status differ).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unreachable_database_reports_the_unavailable_message(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let (_id, val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT 1 AS n",
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+        assert_eq!(val["error"], "The database is unavailable.");
+        assert!(val["errorId"].is_string(), "{val:?}");
         Ok(())
     }
 

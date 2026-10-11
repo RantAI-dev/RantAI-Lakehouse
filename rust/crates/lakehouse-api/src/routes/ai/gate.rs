@@ -131,6 +131,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             "Menghapus chart {} dari dashboard secara permanen.",
             s("id")
         ),
+        "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -249,6 +250,21 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("kind")
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "create_calculated_field" => format!(
+            "Membuat kolom hitung \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_calculated_field" => format!(
+            "Mengubah rumus kolom hitung {} menjadi {}.",
+            s("id"),
+            s("formula")
+        ),
         _ => format!(
             "{} is ready: the user confirms it with the Confirm button under this message. This is not an approval and does not go to Approvals.",
             spec.name
@@ -681,6 +697,36 @@ mod tests {
             .expect("an Analyst must not be able to create a chart via the copilot");
         assert_eq!(refused["reason"], json!("permission"));
         assert_eq!(refused["required"], json!("dashboard:write"));
+    }
+
+    /// SEC-9-AC2: the assistant's two SQL tools need the same `query:read`
+    /// Query Studio's route needs, and the refusal names it. `decide` is the
+    /// only thing between a signed-in caller and the tool body, so a refusal
+    /// here is a refusal before any engine is contacted.
+    #[test]
+    fn the_sql_tools_are_refused_without_query_read_and_name_the_permission() {
+        let without = [
+            PermissionSet::default(),
+            PermissionSet::parse("catalog:read"),
+        ];
+        for tool in ["run_sql", "run_saved_query"] {
+            for perms in &without {
+                let refused = decide_by_name(true, Some(perms), tool, &no_args())
+                    .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
+                assert_eq!(refused["reason"], json!("permission"), "{tool}");
+                assert_eq!(refused["required"], json!("query:read"), "{tool}");
+            }
+            assert_eq!(
+                decide_by_name(
+                    true,
+                    Some(&PermissionSet::parse("query:read")),
+                    tool,
+                    &no_args()
+                ),
+                None,
+                "{tool} must be allowed with query:read"
+            );
+        }
     }
 
     /// Absent-principal case (fail closed): with no principal at all,

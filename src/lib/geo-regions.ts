@@ -147,3 +147,28 @@ export function matchRegionRows(
     unmatchedNames: [...unmatched],
   }
 }
+
+/**
+ * For each feature of the map, the distinct names exactly as the rows wrote
+ * them (first seen first) that join to it. A click on a region drills into
+ * the stored value, not the feature's own spelling; a feature reached by
+ * more than one spelling has no single stored value to drill into, and the
+ * caller says so rather than picking one (BI-18 part B).
+ */
+export function rawNamesByFeature(
+  rawNames: Iterable<string>,
+  level: RegionLevel,
+  featureNames: Iterable<string>
+): Map<string, string[]> {
+  const index = buildRegionIndex(featureNames)
+  const out = new Map<string, string[]>()
+  for (const raw of rawNames) {
+    const feature = matchRegion(raw, level, index)
+    if (feature === null) continue
+    const names = out.get(feature)
+    if (!names) out.set(feature, [raw])
+    else if (!names.includes(raw)) names.push(raw)
+  }
+  return out
+}
+

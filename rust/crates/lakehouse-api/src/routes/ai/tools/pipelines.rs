@@ -24,6 +24,7 @@ use axum::response::IntoResponse;
 use super::{api_result_to_value, arg_str, response_to_value};
 use crate::routes::pipelines::TriggerBody;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// The Dagster job the demo code location builds the whole lakehouse with.
 /// The product code location (`dagster/dispar_orchestrate`) has no such
@@ -54,7 +55,13 @@ pub(super) async fn trigger_build(state: &AppState, principal: Option<&Principal
     if jobs.iter().any(|j| j == DEMO_BUILD_JOB) {
         return match state.dagster.launch_run(DEMO_BUILD_JOB).await {
             Ok(outcome) => match outcome.error {
-                Some(error) => json!({ "error": error }),
+                // SEC-11: Dagster's launch message is the orchestrator's own text.
+                Some(error) => upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Failed,
+                    &error,
+                )
+                .to_json(),
                 None => json!({
                     "launched": true,
                     "runId": outcome.run_id,
@@ -95,7 +102,18 @@ pub(super) async fn trigger_build(state: &AppState, principal: Option<&Principal
                 launched.push(json!({ "step": step, "job": job, "runId": outcome.run_id }));
             }
             Ok(outcome) => {
-                skipped.push(json!({ "step": step, "job": job, "error": outcome.error }));
+                let mut entry = json!({ "step": step, "job": job });
+                if let Some(error) = outcome.error {
+                    // SEC-11: the orchestrator's own text goes to the log.
+                    let failure = upstream_error::report(
+                        &upstream_error::SERVICE,
+                        upstream_error::Class::Failed,
+                        &error,
+                    );
+                    entry["error"] = json!(failure.message());
+                    entry["errorId"] = json!(failure.reference());
+                }
+                skipped.push(entry);
             }
             Err(_) => skipped.push(
                 json!({ "step": step, "job": job, "error": "Dagster did not accept the run" }),
@@ -188,7 +206,12 @@ pub(super) async fn get_build_status(dagster: &lakehouse_dagster::DgClient) -> V
                 .collect();
             json!({ "jobs": jobs, "recentRuns": recent })
         }
-        (Err(err), _) | (_, Err(err)) => json!({ "error": err.to_string() }),
+        (Err(err), _) | (_, Err(err)) => upstream_error::report(
+            &upstream_error::SERVICE,
+            upstream_error::Class::Failed,
+            &err,
+        )
+        .to_json(),
     }
 }
 
@@ -204,7 +227,12 @@ pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient
     match dagster.launch_run("bronze_maintenance_job").await {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
-                return json!({ "error": error });
+                return upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Failed,
+                    &error,
+                )
+                .to_json();
             }
             json!({
                 "launched": true,
@@ -213,7 +241,12 @@ pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient
                          dihapus. Cek hasilnya dengan get_maintenance_metrics.",
             })
         }
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report(
+            &upstream_error::SERVICE,
+            upstream_error::Class::Failed,
+            &err,
+        )
+        .to_json(),
     }
 }
 

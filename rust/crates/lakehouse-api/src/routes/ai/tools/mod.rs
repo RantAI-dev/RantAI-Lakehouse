@@ -8,6 +8,7 @@
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
@@ -21,6 +22,7 @@
 
 mod alerts;
 mod ask;
+mod calc_fields;
 mod connectors;
 mod dashboards;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -121,17 +123,38 @@ pub(in crate::routes) async fn run_tool(
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(ch, args).await,
-        "create_chart" => dashboards::create_chart(ch, args, None).await,
-        "update_chart" => dashboards::update_chart(ch, args).await,
+        "create_chart" | "update_chart" => {
+            // BI-9: a chart's SQL is built with the report time zone, which
+            // is a deployment setting.
+            let Ok(time) = crate::routes::settings::time_context(state).await else {
+                // The cause was logged under a reference by `time_context`.
+                return json!({ "error": "The reporting settings could not be read." });
+            };
+            if name == "create_chart" {
+                dashboards::create_chart(ch, args, None, &time).await
+            } else {
+                dashboards::update_chart(ch, args, &time).await
+            }
+        }
         "create_board" => dashboards::create_board(ch, args).await,
         "list_boards" => dashboards::list_boards(ch).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
         "list_sql_sources" => dashboards::list_sql_sources(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "list_formula_functions"
+        | "list_calculated_fields"
+        | "validate_formula"
+        | "create_calculated_field"
+        | "update_calculated_field"
+        | "delete_calculated_field" => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(ch).await,
-        "create_alert_rule" => alerts::create_alert_rule(ch, args).await,
-        "update_alert_rule" => alerts::update_alert_rule(ch, args).await,
+        "create_alert_rule" => {
+            alerts::create_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await
+        }
+        "update_alert_rule" => {
+            alerts::update_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await
+        }
         "delete_alert_rule" => alerts::delete_alert_rule(ch, args).await,
         "run_alert_rule" => alerts::run_alert_rule(state, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,

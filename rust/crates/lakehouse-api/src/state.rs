@@ -16,7 +16,6 @@ use lakehouse_core::secret::{
     SecretError, SecretResolver, SecretValue,
 };
 use lakehouse_dagster::DgClient;
-use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
@@ -76,8 +75,6 @@ pub struct AppState {
     pub clickhouse: Arc<ChClient>,
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
-    /// Resolves and caches the signed-embedding (`JWT`) secret.
-    pub embed_secret: Arc<EmbedSecretResolver>,
     /// `OpenAI`-compatible chat-completions client.
     pub llm: Arc<LlmClient>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
@@ -501,8 +498,6 @@ impl AppState {
             config.dagster_location.clone(),
         );
         let clickhouse = Arc::new(clickhouse);
-        let embed_secret =
-            EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
         let llm = LlmClient::new(
             config.llm_url.clone(),
             config.llm_model.clone(),
@@ -586,7 +581,6 @@ impl AppState {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
             connector_secret_resolver: connector_secret_resolver(

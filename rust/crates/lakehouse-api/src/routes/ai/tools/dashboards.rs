@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 
 use super::arg_str;
 use crate::routes::support::is_numeric_type;
+use crate::upstream_error;
 
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
@@ -21,12 +22,13 @@ pub(super) async fn create_chart(
     ch: &ChClient,
     args: &Map<String, Value>,
     id: Option<String>,
+    time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
     let input = match parse_chart_input(args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
-    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id).await {
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => json!({
                 "created": true,
@@ -38,13 +40,17 @@ pub(super) async fn create_chart(
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
             }),
-            Err(err) => json!({ "error": err.to_string() }),
+            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn update_chart(
+    ch: &ChClient,
+    args: &Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
@@ -53,7 +59,7 @@ pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
-    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id)).await {
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => json!({
                 "updated": true,
@@ -62,9 +68,9 @@ pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
                 "kind": spec.spec.kind,
                 "mart": spec.spec.mart,
             }),
-            Err(err) => json!({ "error": err.to_string() }),
+            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -84,7 +90,7 @@ pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Va
             "created": true, "id": board.id, "name": board.name,
             "note": "Pakai id ini di create_chart.board.",
         }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -95,7 +101,7 @@ pub(super) async fn list_boards(ch: &ChClient) -> Value {
             out.extend(boards.iter().map(|b| json!({ "id": b.id, "name": b.name })));
             json!({ "boards": out })
         }
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -109,7 +115,7 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
         .await
     {
         Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
+        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     };
     let mut out = Vec::with_capacity(marts.len());
     for m in &marts {
@@ -122,7 +128,7 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
             .await
         {
             Ok(r) => r,
-            Err(err) => return json!({ "error": err.to_string() }),
+            Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         };
         let dimensions: Vec<&str> = cols
             .iter()
@@ -161,7 +167,7 @@ pub(super) async fn list_charts(ch: &ChClient) -> Value {
                 .collect();
             json!({ "total": out.len(), "charts": out })
         }
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -178,10 +184,23 @@ pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
                         .columns
                         .iter()
                         .partition(|c| crate::routes::support::is_numeric_type(&c.ty));
+                    // BI-9: each column's kind, so the assistant can tell which
+                    // dimensions take a `grain` (date, datetime).
+                    let columns: Vec<Value> = s
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "name": c.name,
+                                "kind": lakehouse_bi::filters::ColumnKind::from_clickhouse_type(&c.ty),
+                            })
+                        })
+                        .collect();
                     json!({
                         "id": s.id, "title": s.title,
                         "dimensions": dimensions.iter().map(|c| &c.name).collect::<Vec<_>>(),
                         "measures": measures.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                        "columns": columns,
                     })
                 })
                 .collect();
@@ -201,6 +220,47 @@ pub(super) async fn delete_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
     }
     match store::delete_chart(ch, &id).await {
         Ok(()) => json!({ "deleted": true, "id": id }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// SEC-11: the assistant's dashboard tools never relay `ClickHouse`'s
+    /// text; they return a fixed message and a reference id.
+    #[tokio::test]
+    async fn a_failing_dashboard_tool_reports_a_fixed_message_and_a_reference() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 60. DB::Exception: Table planted-marker-table-x doesn't exist (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        for result in [
+            list_boards(&ch).await,
+            list_charts(&ch).await,
+            suggest_dashboard(&ch).await,
+            delete_chart(&ch, &{
+                let mut a = Map::new();
+                a.insert("id".to_owned(), json!("c1"));
+                a
+            })
+            .await,
+        ] {
+            let text = result.to_string();
+            assert!(!text.contains("planted-marker"), "leaked: {text}");
+            assert!(!text.contains("version 0.0.0"), "{text}");
+            assert!(result["errorId"].is_string(), "{text}");
+        }
     }
 }

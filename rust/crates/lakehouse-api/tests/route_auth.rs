@@ -1006,6 +1006,33 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
     );
 }
 
+/// SEC-9: the natural-language box in Query Studio has no endpoint of its
+/// own. The old `/api/agent*` ask and text-to-SQL routes ran model-written SQL
+/// straight against the engine; #78 removed them, and the assistant now runs
+/// SQL only through the tool gate (`/api/ai/chat`, `/api/ai/tool`). A route
+/// of that shape coming back would be a path around the gate, so it fails
+/// here by name.
+#[test]
+fn no_route_runs_model_written_sql_outside_the_assistant_tool_gate() {
+    for (method, path, _) in POLICY_TABLE {
+        let lower = path.to_ascii_lowercase();
+        assert!(
+            lower != "/api/agent" && !lower.starts_with("/api/agent/"),
+            "{method} {path}: a standalone agent endpoint (SEC-9)"
+        );
+        assert!(
+            !lower.contains("text-to-sql")
+                && !lower.contains("text_to_sql")
+                && !lower.contains("nl2sql"),
+            "{method} {path}: a text-to-SQL endpoint (SEC-9)"
+        );
+        assert!(
+            !(lower.starts_with("/api/ai/") && lower.contains("sql")),
+            "{method} {path}: an AI route that names SQL outside the tool gate (SEC-9)"
+        );
+    }
+}
+
 /// Every route the router actually registers must have a `POLICY_TABLE`
 /// entry — the direction the two loops above do NOT cover.
 ///
@@ -1275,4 +1302,68 @@ async fn delete_session_writes_an_audit_event() {
          revoked (the request path's {{id}}, never the caller's bearer \
          token)"
     );
+}
+
+/// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
+/// policies the plan names, so the table-driven loops above walk them both
+/// ways (a `dashboard:read`-only principal is refused on the withdrawal; the
+/// frame answer is reachable with no credentials at all).
+#[test]
+fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(
+        policy_of("POST", "/api/embed/frame"),
+        Some(Policy::Public),
+        "the frame answer is read by the console's proxy with only the embed token"
+    );
+    assert_eq!(
+        policy_of("POST", "/api/dashboard/embed-revoke"),
+        Some(Policy::RequiresPermission("dashboard:write")),
+        "withdrawing a token is a write"
+    );
+}
+
+/// BI-16 part A (T8): the whole-result table export needs `dashboard:read` and
+/// nothing more, and not the Query Studio permission. Asserted both ways: a
+/// principal holding only `dashboard:read` gets past the gate, one holding only
+/// `query:read` is refused.
+#[tokio::test]
+async fn the_table_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/table-export")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/dashboard/table-export?chart=x",
+        &cookie,
+    )
+    .await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/dashboard/table-export?chart=x",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

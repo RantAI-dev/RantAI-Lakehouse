@@ -26,6 +26,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// The `{sql}` request body both routes accept.
 #[derive(Debug, Deserialize)]
@@ -167,7 +168,17 @@ async fn execute_query_against_engine(
         let (columns, rows) = trino_result_to_rows(&result);
         Ok((columns, rows, elapsed_ms(started), 0))
     } else {
-        let result = state.clickhouse.query(sql, None).await?;
+        // SEC-11, query-author exception (product owner, 2026-10-10): the
+        // signed-in author of this statement, holding `query:read`, gets the
+        // engine's diagnosis of it (version and addresses trimmed); the full
+        // text is logged under the reference. An unreachable engine or a
+        // non-query failure stays the fixed message. See
+        // `upstream_error::ch_error_for_author`.
+        let result = state
+            .clickhouse
+            .query(sql, None)
+            .await
+            .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
 
         let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
         let rows: Vec<Value> = result
@@ -420,16 +431,24 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
 
 /// Map a [`TrinoError`] to the [`ApiError`] `run` returns.
 ///
-/// [`TrinoError::Query`]'s message is forwarded verbatim — the ONE place
-/// this crate lets `Trino`'s own text reach a response, because the caller
-/// reading it is the same principal whose own `SQL` produced it (the exact
-/// posture `lakehouse_trino`'s crate doc comment documents as safe).
-/// Every other variant is classified into a fixed message before it
-/// reaches the caller, per this repository's "upstream error text never
-/// reaches a response" rule.
+/// SEC-11: [`TrinoError::Query`] is the one variant whose engine text
+/// reaches the caller, trimmed and with a reference id (the query-author
+/// exception, product owner decision 2026-10-10: the person who wrote the
+/// statement is entitled to the engine's diagnosis of it). Timeouts,
+/// transport and HTTP failures stay fixed messages.
 fn map_trino_error(err: TrinoError) -> ApiError {
     match err {
-        TrinoError::Query(msg) => ApiError::Unprocessable(msg),
+        // SEC-11, query-author exception (product owner, 2026-10-10): `Query`
+        // is Trino answering that the statement is wrong, and this route's
+        // caller wrote the statement; trimmed, with the reference.
+        TrinoError::Query(msg) => upstream_error::query_error_for_author(
+            &upstream_error::Context::new(
+                "trino query",
+                "The Trino query failed.",
+                "Trino is unavailable.",
+            ),
+            &msg,
+        ),
         TrinoError::Timeout => ApiError::Unavailable("trino query timed out".to_owned()),
         TrinoError::Transport(_) | TrinoError::HttpStatus(_) => {
             ApiError::Unavailable("trino unavailable".to_owned())
@@ -570,7 +589,11 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// way — but `estimatedBytes`/costs are `null` and the `ClickHouse` message
 /// is carried in `error`, rather than a zeroed estimate that looked
 /// identical to "this query reads nothing".
-pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn estimate(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let sql = match parsed.sql {
         Some(s) if !s.trim().is_empty() => s,
@@ -582,7 +605,15 @@ pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
     // query reads nothing" looked identical — and ClickHouse's message is
     // usually the most useful thing on the page (an unknown column, a
     // missing table) before anyone presses Run.
-    let estimated = estimate_body(&state.clickhouse, &sql).await;
+    //
+    // Review fix: the estimate explains the statement the run would send, i.e.
+    // the one rewritten for the caller's current roles (same function as the
+    // run), and a statement the rewrite refuses is refused here with the run's
+    // status and fixed message and is never sent to the engine. The planner
+    // reports the tables the statement reads, which the rewrite does not
+    // change, so the sources shown are what the run would show.
+    let rewritten = rewrite_sql_for_principal(&state, &sql, "clickhouse", &principal).await?;
+    let estimated = estimate_body(&state.clickhouse, &rewritten).await;
     let (estimated_bytes, sources, estimate_error) = match estimated {
         Ok((bytes, sources)) => (Some(bytes), sources, None),
         Err(message) => (None, Vec::new(), Some(message)),
@@ -697,23 +728,19 @@ fn escape_literal(value: &str) -> String {
 }
 
 /// Runs `EXPLAIN ESTIMATE <sql>` (with any trailing `;` stripped) and
-/// tallies `estimatedBytes`/`sources` from the result rows, or returns
-/// what `ClickHouse` said about why it could not plan the statement.
+/// tallies `estimatedBytes`/`sources` from the result rows, or returns a
+/// fixed message and a reference id when `ClickHouse` could not plan the
+/// statement.
 async fn estimate_body(ch: &ChClient, sql: &str) -> Result<(i64, Vec<String>), String> {
     let trimmed = strip_trailing_semicolon(sql);
     let query = format!("EXPLAIN ESTIMATE {trimmed}");
-    let result = ch.query(&query, None).await.map_err(|err| {
-        // Just the first line: ClickHouse follows its message with a stack
-        // of internal context nobody reading the console needs.
-        let message = err.to_string();
-        message
-            .lines()
-            .next()
-            .unwrap_or("could not plan this query")
-            .chars()
-            .take(240)
-            .collect::<String>()
-    })?;
+    // SEC-11, query-author exception (product owner, 2026-10-10): the editor
+    // shows the author the planner's diagnosis of their own statement,
+    // trimmed; an outage stays the fixed message.
+    let result = ch
+        .query(&query, None)
+        .await
+        .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))?;
     let mut estimated_bytes: i64 = 0;
     let mut sources = Vec::new();
     for row in &result.data {
@@ -970,7 +997,8 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// This is NOT the original result the caller once saw: it re-executes
 /// the stored statement against whatever `ClickHouse` holds right now,
 /// capped at [`DOWNLOAD_ROW_CAP`] rows. Data ingested or deleted since the
-/// original run changes what comes back.
+/// original run changes what comes back. The statement is rewritten for the
+/// caller's current roles first, exactly as the run route does.
 ///
 /// Only rows whose `engine` is `"clickhouse"` or the legacy `"hot-store"`
 /// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
@@ -992,7 +1020,8 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
 ///   one does but its recorded owner is not the calling principal
 ///   (including every legacy `"anonymous"` row — see this doc comment).
-/// - 422 [`ApiError::Unprocessable`] when the row's `engine` is not
+/// - 422 [`ApiError::Unprocessable`] when the policy rewrite refuses the
+///   statement (the run route's fixed message), when the row's `engine` is not
 ///   downloadable, when its stored `SQL` fails [`is_read_only`] (defense
 ///   in depth: `routes::query::run` already gated this at insert time),
 ///   or when `ClickHouse` rejects the re-run.
@@ -1044,7 +1073,17 @@ pub async fn download(
         return Err(ApiError::Unprocessable("stored query is not read-only".to_owned()).into());
     }
 
-    let capped_sql = build_capped_statement(&item.sql, format_clause);
+    // Review fix: the download applies the same policy rewrite as the run
+    // (same function, the caller's current roles), so a mask or row filter that
+    // governs the caller today governs the file. A refusal by the rewrite is a
+    // refusal of the download, with the run route's status and fixed message;
+    // nothing is sent to the engine then. The caller is present: the ownership
+    // check above already refused an absent principal.
+    let Some(Extension(caller)) = principal.as_ref() else {
+        return Err(ApiError::NotFound("query run not found".to_owned()).into());
+    };
+    let rewritten = rewrite_sql_for_principal(&state, &item.sql, &item.engine, caller).await?;
+    let capped_sql = build_capped_statement(&rewritten, format_clause);
     let bytes = state
         .clickhouse
         .raw_bytes(&capped_sql, None)
@@ -1553,10 +1592,17 @@ mod tests {
         }
 
         #[test]
-        fn maps_query_error_to_422_forwarding_the_message_verbatim() {
-            let err = map_trino_error(TrinoError::Query("line 1:1: mismatched input".to_owned()));
+        fn maps_query_error_to_422_with_the_engines_diagnosis_and_a_reference() {
+            // SEC-11 query-author exception: the author sees the engine's
+            // message for their own statement, trimmed, with a reference.
+            let err = map_trino_error(TrinoError::Query(
+                "line 1:1: mismatched input 'x' at trino-1.internal:8080".to_owned(),
+            ));
             assert_eq!(err.status(), 422);
-            assert!(err.to_string().contains("mismatched input"));
+            let text = err.to_string();
+            assert!(text.contains("line 1:1: mismatched input"), "{text}");
+            assert!(text.contains(" Reference: "), "{text}");
+            assert!(!text.contains("trino-1.internal"), "{text}");
         }
 
         #[test]

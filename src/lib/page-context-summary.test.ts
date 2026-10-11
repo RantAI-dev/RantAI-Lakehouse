@@ -54,11 +54,16 @@ test("long values are clipped so one cell cannot eat the budget", () => {
   assert.ok(out.length < 60, out)
 })
 
-test("summarizeFilters lists active filters and the year, or says none", () => {
-  assert.equal(summarizeFilters([], "all"), "none")
+test("summarizeFilters describes each active filter as its chip reads, or says none", () => {
+  assert.equal(summarizeFilters([]), "none")
   assert.equal(
-    summarizeFilters([{ column: "region", values: ["north", "south"] }, { column: "x", values: [] }], "2024"),
-    "region in [north, south]; year 2024"
+    summarizeFilters([
+      { column: "region", values: ["north", "south"] },
+      { column: "x", values: [] },
+      { column: "price", op: "between", values: [], min: "100" },
+      { column: "day", op: "relative", values: [], anchor: "last", n: 30, unit: "day" },
+    ]),
+    "region is north, south; price ≥ 100; day in the last 30 days"
   )
 })
 

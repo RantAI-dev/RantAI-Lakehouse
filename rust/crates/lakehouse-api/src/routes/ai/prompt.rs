@@ -346,6 +346,7 @@ pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart.
+- Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
 - Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets (it cannot change where a connector points: that needs its credentials again and is done in the console), run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
@@ -354,7 +355,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_calculated_field, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
 
@@ -428,6 +429,16 @@ const DOMAINS: &[Domain] = &[
             "tile",
             "sql source",
             "sumber sql",
+            "formula",
+            "rumus",
+            "calculated",
+            "kolom hitung",
+            "calculate",
+            "profit",
+            "margin",
+            "minus",
+            "ratio",
+            "selisih",
         ],
         tools: &[
             "list_charts",
@@ -437,6 +448,12 @@ const DOMAINS: &[Domain] = &[
             "update_chart",
             "create_board",
             "delete_chart",
+            "list_formula_functions",
+            "list_calculated_fields",
+            "validate_formula",
+            "create_calculated_field",
+            "update_calculated_field",
+            "delete_calculated_field",
         ],
     },
     Domain {

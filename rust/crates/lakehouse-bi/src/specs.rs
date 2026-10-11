@@ -67,8 +67,10 @@ pub enum ChartKind {
     Kpi,
     /// Single-number gauge tile.
     Gauge,
-    /// Raw data table.
+    /// Data table: the grouped summary, or (`tableMode: "rows"`) raw rows.
     Table,
+    /// Pivot table: row and column fields, values, totals (`BI-16` part A).
+    Pivot,
     /// Free-text markdown tile (no SQL).
     Text,
 }

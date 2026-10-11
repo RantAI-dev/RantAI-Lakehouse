@@ -10,6 +10,9 @@
  * applies its own hard cap (`PAGE_CONTEXT_MAX_CHARS` in routes/ai/mod.rs).
  */
 
+import type { FilterDef } from "@/services/clients/bi-store"
+import { filterLabel, isActiveFilter } from "./dashboard-filter-state"
+
 export type TileLike = {
   id: string
   title: string
@@ -25,7 +28,7 @@ export type CellLike =
   | undefined
   | null
 
-export type FilterLike = { column: string; values: string[] }
+export type FilterLike = FilterDef
 
 const DEFAULT_ROWS = 5
 const DEFAULT_CHARS = 5000
@@ -81,12 +84,13 @@ export function summarizeTiles(
   return clip(lines.join("\n"), opts.maxChars ?? DEFAULT_CHARS)
 }
 
-/** "region in [north, south]; year 2024" — or "none". */
-export function summarizeFilters(filters: FilterLike[], year?: string): string {
-  const parts = filters
-    .filter((f) => f.values.length)
-    .map((f) => `${f.column} in [${f.values.map(fmt).join(", ")}]`)
-  if (year && year !== "all") parts.push(`year ${year}`)
+/**
+ * "region is north, south; date in the last 30 days" — or "none". Each
+ * active filter reads as its chip does, so the assistant sees what the user
+ * sees.
+ */
+export function summarizeFilters(filters: FilterLike[]): string {
+  const parts = filters.filter(isActiveFilter).map((f) => filterLabel(f))
   return parts.length ? parts.join("; ") : "none"
 }
 

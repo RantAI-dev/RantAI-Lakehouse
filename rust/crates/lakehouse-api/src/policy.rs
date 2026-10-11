@@ -57,6 +57,14 @@
 //! `agent:approve`, `dashboard:read`) match `identity:*` under those
 //! semantics — see `identity_permissions_require_no_seed_change` below.
 //!
+//! # `settings:write`
+//!
+//! Introduced for `PUT /api/settings/reporting` (`BI-9`) by the same rules as
+//! `identity:*` and `storage:restore`: the string is listed in the table
+//! below, no seeded role is granted it (so no migration touches the role
+//! rows), and Platform Admin's `*:*` satisfies it by the resource-wildcard
+//! rule. Reading the settings stays `RequiresAuth`.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -126,12 +134,17 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY seven routes in the whole service. (Was "six" —
-    // corrected here, in the same commit that adds the seventh, since Task
-    // A5's `/api/auth/oidc/callback` had already made the old count
-    // stale.) ────────────────────────────────────────────────────────────
+    // ── Public: the ONLY eight routes in the whole service. (Was "six" —
+    // corrected when the seventh was added, since Task A5's
+    // `/api/auth/oidc/callback` had already made the old count stale; the
+    // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
+    // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
+    // page, with the token the page was opened with. Public because the
+    // token is the credential; it answers only an origin list, and the same
+    // empty list for a token that is invalid.
+    ("POST", "/api/embed/frame",                  Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     // Redirect-only, grants nothing — it only ever
@@ -439,11 +452,37 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("PUT",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("DELETE", "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
     ("POST",   "/api/dashboard/sources/preview", Policy::RequiresPermission("dashboard:sql")),
+    // BI-8: calculated fields. Validate and the function catalog only read
+    // (a source's column list, a fixed table); saving needs the same
+    // permission as saving a chart.
+    ("GET",    "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/calc-fields/validate", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/calc-fields/functions", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),
+    // BI-16 part A (T8): the whole result of a raw table as CSV. Same
+    // permission as seeing the tile; every export is audited.
+    ("GET",    "/api/dashboard/table-export", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // SEC-12: withdrawing a token changes who can read the dashboard, so it
+    // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
+    ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),
+
+    // ── Reporting settings (`BI-9`, `routes::settings`). Reading is auth-only:
+    //    the console needs the zone and the first day to label every date
+    //    axis, whoever is viewing. Changing them moves every date on every
+    //    dashboard, so it is its own permission, `settings:write`, introduced
+    //    by the same rules as `identity:*` and `storage:restore` above: no
+    //    seed grant, so only a `*:*` holder (Platform Admin) has it until an
+    //    operator grants it to a role; see
+    //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
+    ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
+    ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
 
     // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
@@ -762,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_seven_public_entries_exist() {
+    fn exactly_eight_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -776,7 +815,8 @@ mod tests {
             .iter()
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
-        assert_eq!(public_count, 7);
+        // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
+        assert_eq!(public_count, 8);
     }
 
     #[test]
@@ -871,6 +911,46 @@ mod tests {
         assert!(
             platform_admin.has(required),
             "a Platform Admin (*:*) must be allowed through POST /api/identity/roles"
+        );
+    }
+
+    /// `BI-9`: `settings:write` follows the rules for introducing a permission
+    /// string at the top of this file: it is satisfied by Platform Admin's
+    /// `*:*` and by none of the seeded roles' grants, so it needs no seed
+    /// migration, and the read route stays open to any signed-in caller.
+    #[test]
+    fn settings_write_needs_no_seed_change_and_no_seeded_role_has_it() {
+        use lakehouse_auth::PermissionSet;
+
+        let non_admin_roles = [
+            ("Analyst", "query:read, catalog:read, lineage:read"),
+            ("Approver", "agent:approve, policy:review"),
+            ("Governance Admin", "policy:*, residency:*, audit:read"),
+            (
+                "Data Engineer",
+                "pipeline:*, catalog:write, connector:manage",
+            ),
+            ("Data Scientist", "query:read, feature:write, notebook:run"),
+            ("Dashboard Viewer", "dashboard:read"),
+        ];
+        for (name, raw) in non_admin_roles {
+            assert!(
+                !PermissionSet::parse(raw).has("settings:write"),
+                "{name} unexpectedly grants settings:write"
+            );
+        }
+        // Holding `dashboard:write` is not enough either.
+        assert_denied_then_allowed(
+            "PUT",
+            "/api/settings/reporting",
+            &PermissionSet::parse("dashboard:write, dashboard:read"),
+            "an editor with dashboard:write",
+            &PermissionSet::parse("*:*"),
+            "a Platform Admin (*:*)",
+        );
+        assert_eq!(
+            policy_for("GET", "/api/settings/reporting"),
+            Some(Policy::RequiresAuth)
         );
     }
 
