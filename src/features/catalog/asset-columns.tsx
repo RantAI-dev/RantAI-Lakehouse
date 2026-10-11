@@ -758,22 +758,27 @@ export function ColumnsCard({
         return [entry?.description ?? "", (entry?.synonyms ?? []).join(", ")].join(" ")
       }
     : undefined
-  const { shown: listed, matched } = visibleColumns(rows, query, paged ? limit : ALL, extra)
-  const shown = view === "meaning" && draftsOnly ? listed.filter((r) => byColumn.get(r.column.name)?.status === "draft") : listed
+  // The statistics view is the card as it was; the meaning view replaces its table, not its filter.
+  const meaningView = ready !== null && view === "meaning"
+  // Drafts only narrows the rows before the filter and the page cut, so the page holds drafts and the count
+  // says how many drafts there are (PR #109 review, finding 1). A filter applied after the cut showed "No draft
+  // left to review." for a table whose drafts sat past the first page.
+  const draftsShown = meaningView && draftsOnly
+  const pool = draftsShown ? rows.filter((r) => byColumn.get(r.column.name)?.status === "draft") : rows
+  const { shown, matched } = visibleColumns(pool, query, paged ? limit : ALL, extra)
   const sortKeys = sortKeyColumns(
     sortingKey,
     rows.map((r) => r.column.name)
   )
-  const total = `${rows.length} column${rows.length === 1 ? "" : "s"}`
+  const noun = draftsShown ? "draft" : "column"
+  const total = `${pool.length} ${noun}${pool.length === 1 ? "" : "s"}`
   const summary =
     query.trim() !== ""
       ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
-      : shown.length < rows.length
+      : shown.length < pool.length
         ? `Showing the first ${shown.length} of ${total}, in table order.`
         : `${total}, in table order.`
 
-  // The statistics view is the card as it was; the meaning view replaces its table, not its filter.
-  const meaningView = ready !== null && view === "meaning"
   const hasControls = filterable || ready !== null
 
   return (
@@ -816,11 +821,15 @@ export function ColumnsCard({
                     {drafts === 1 ? "1 draft to review" : `${drafts} drafts to review`}
                   </Button>
                 ) : null}
-                {drafts > 0 && meaningView ? (
+                {(drafts > 0 || draftsOnly) && meaningView ? (
+                  // PR #109 review, finding 2: the box stays while Drafts only is on, so confirming the last draft
+                  // leaves a way back to every column instead of an empty view with no control.
                   <span className="flex items-center gap-2 text-xs">
-                    <span className="text-muted-foreground">
-                      {drafts === 1 ? "1 draft to review" : `${drafts} drafts to review`}
-                    </span>
+                    {drafts > 0 ? (
+                      <span className="text-muted-foreground">
+                        {drafts === 1 ? "1 draft to review" : `${drafts} drafts to review`}
+                      </span>
+                    ) : null}
                     <Checkbox
                       id={draftsId}
                       checked={draftsOnly}
@@ -852,8 +861,10 @@ export function ColumnsCard({
         ) : null}
         {rows.length === 0 ? (
           <EmptyState title="No columns registered" className="py-4" />
-        ) : shown.length === 0 && meaningView && draftsOnly ? (
+        ) : shown.length === 0 && draftsShown && pool.length === 0 ? (
           <EmptyState title="No draft left to review." className="py-4" />
+        ) : shown.length === 0 && draftsShown ? (
+          <EmptyState title={`No draft matches "${query.trim()}"`} className="py-4" />
         ) : shown.length === 0 ? (
           <EmptyState title={`No column matches "${query.trim()}"`} className="py-4" />
         ) : meaningView && ready ? (

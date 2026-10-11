@@ -214,8 +214,9 @@ describe("Drafts only", () => {
     expect(within(meaningTable()).queryByText("customer_count")).toBeNull()
   })
 
-  it("says no draft is left when the rows that remain are all confirmed", () => {
-    // Eleven columns, so the filter box is shown; "customer" then leaves only the confirmed one.
+  it("says no draft matches the filter when the drafts left do not match it", () => {
+    // Eleven columns, so the filter box is shown; "customer" matches the confirmed column only, and the draft
+    // elsewhere in the table is still in the drafts-only pool, so the view names the filter, not an empty review.
     const eleven = [...ROWS, ...Array.from({ length: 8 }, (_, i) => schemaRow(column(`col_${i}`)))]
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(eleven, state)
@@ -223,7 +224,53 @@ describe("Drafts only", () => {
 
     fireEvent.change(screen.getByLabelText("Filter columns"), { target: { value: "customer" } })
     fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(screen.getByText('No draft matches "customer"')).toBeTruthy()
+  })
+
+  it("lists a draft beyond the first page and says it is the one draft shown", () => {
+    // Thirty columns is paged at 25 by default; the only draft is the 28th, so it is on no first page.
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const { state } = readyMeanings([entry({ column: "col_28", description: "A draft past the first page", status: "draft" })])
+    renderCard(thirty, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(within(meaningTable()).getByText("col_28")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(2)
+    expect(screen.getByText("1 draft, in table order.")).toBeTruthy()
+  })
+
+  it("pages the drafts, not the columns, and says how many drafts there are", () => {
+    // Thirty columns, drafts on columns 4 to 30 (twenty-seven), so columns 1 to 3 hold no draft. The first page
+    // of 25 then holds 22 drafts, and a filter applied after the page cut would show 22 and say so. The
+    // summary must count the 27 and show the first 25 of them (PR #109 review, finding 1).
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const drafts = thirty.slice(3).map((r) => entry({ column: r.column.name, description: "A draft", status: "draft" }))
+    const { state } = readyMeanings(drafts)
+    renderCard(thirty, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(screen.getByText("Showing the first 25 of 27 drafts, in table order.")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
+  })
+
+  it("keeps the drafts-only box and says no draft is left once the last draft is confirmed, and unticking lists every column", () => {
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const draft = readyMeanings([entry({ column: "col_28", description: "A draft", status: "draft" })]).state
+    const confirmed = readyMeanings([entry({ column: "col_28", description: "A draft", status: "confirmed" })]).state
+    const { rerender } = render(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={draft} />)
+    fireEvent.click(meaningTab())
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+
+    rerender(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={confirmed} />)
     expect(screen.getByText("No draft left to review.")).toBeTruthy()
+    const box = screen.getByRole("checkbox", { name: "Drafts only" })
+    expect(box.getAttribute("data-state")).toBe("checked")
+
+    fireEvent.click(box)
+    expect(screen.getByText("Showing the first 25 of 30 columns, in table order.")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
   })
 })
 
