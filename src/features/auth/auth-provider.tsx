@@ -17,8 +17,12 @@ import { readActiveTenantId, writeActiveTenantId } from "@/services/http";
  * session). `/public` and `/embed` back the two product surfaces meant to
  * be shared with people who never sign in (Metabase-style public dashboard
  * links and embeds) — gating them would silently break that feature.
+ *
+ * `/landing` is the marketing page (WEB-1, `docs/superpowers/plans/
+ * 2026-10-11-landing-page.md`). It is static, calls no API and must render
+ * for a visitor who has no session, without the console chrome.
  */
-const PUBLIC_PREFIXES = ["/login", "/public", "/embed"];
+const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/landing"];
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
