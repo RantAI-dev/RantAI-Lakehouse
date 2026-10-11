@@ -772,12 +772,15 @@ export function ColumnsCard({
   )
   const noun = draftsShown ? "draft" : "column"
   const total = `${pool.length} ${noun}${pool.length === 1 ? "" : "s"}`
+  // No draft left: a search over zero drafts matches nothing, so this wins over the query text (staging run 2026-10-11, item 3).
   const summary =
-    query.trim() !== ""
-      ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
-      : shown.length < pool.length
-        ? `Showing the first ${shown.length} of ${total}, in table order.`
-        : `${total}, in table order.`
+    draftsShown && pool.length === 0
+      ? `No drafts among ${rows.length} column${rows.length === 1 ? "" : "s"}.`
+      : query.trim() !== ""
+        ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
+        : shown.length < pool.length
+          ? `Showing the first ${shown.length} of ${total}, in table order.`
+          : `${total}, in table order.`
 
   const hasControls = filterable || ready !== null
 

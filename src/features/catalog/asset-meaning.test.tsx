@@ -322,6 +322,8 @@ describe("Drafts only", () => {
 
     rerender(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={confirmed} />)
     expect(screen.getByText("No draft left to review.")).toBeTruthy()
+    expect(screen.getByText("No drafts among 30 columns.")).toBeTruthy()
+    expect(screen.queryByText("0 drafts, in table order.")).toBeNull()
     const box = screen.getByRole("checkbox", { name: "Drafts only" })
     expect(box.getAttribute("data-state")).toBe("checked")
 
