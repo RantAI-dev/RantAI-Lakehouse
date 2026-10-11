@@ -5,7 +5,14 @@
 | Module | Data (Catalog, Query Studio) |
 | Backlog | `DATA-16` |
 | Spec | `docs/core/specs/data-16.md` (no *(proposed)* numbers) |
-| Status | Decisions signed 2026-10-09. In build |
+| Kind | Task (it has an acceptance checklist because it changes what a user sees) |
+| Status | In Progress (the pull request is open;  holds the status) |
+| Priority | P2 |
+| Owner | The module's owner, in the base. Not named here (the repo is public). |
+| Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
+| Started | 2026-10-09; also in `BACKLOG.md` Dates |
+| Shipped | Not yet |
+| Evidence | PR #100, with the first run of the `g8-time-travel` gate |
 | Plan | `docs/superpowers/plans/2026-10-09-data-16-time-travel.md` |
 
 ## Problem
@@ -69,25 +76,27 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 A step not performed is never Pass. Steps needing a terminal are marked
 (operator).
 
-| # | Do this | Expect | Result |
+| ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | Open a raw table loaded at least twice; Activity tab; "Query this version" on the oldest | Query Studio opens on ClickHouse and returns the rows of that load | |
-| 2 | In Query Studio (ClickHouse), write `SELECT count() FROM` a raw table, pick the table and an older version in the picker, run | The count of that version; the picker listed each version with its time and operation | |
-| 3 | Pick another version for the same query | The earlier pin is replaced, not added twice | |
-| 4 | As a user whose role masks a column of that table, repeat step 1 | The column is masked at the older version | |
-| 5 | Switch the engine to Trino | The picker is switched off and says past versions are available on ClickHouse | |
-| 6 | On Trino, type a query with `FOR VERSION AS OF` and run | A plain message saying past versions are available on ClickHouse; not "policy cannot be evaluated" | |
-| 7 | Look at the Snapshots card and the picker | Each states how many versions the table has and the date of the oldest | |
-| 8 | Read the picker's note | It says one version applies to every raw table in the query | |
-| 9 | As a user without `query:read`, open the Activity tab | No "Query this version" that runs; the page says access is missing | |
-| 10 | (operator) Open the CI run of the pull request | The time-travel gate passed | |
+| `DATA-16-AC1` | Open a raw table loaded at least twice; Activity tab; "Query this version" on the oldest | Query Studio opens on ClickHouse and returns the rows of that load | Not run |
+| `DATA-16-AC2` | In Query Studio (ClickHouse), write `SELECT count() FROM` a raw table, pick the table and an older version in the picker, run | The count of that version; the picker listed each version with its time and operation | Not run |
+| `DATA-16-AC3` | Pick another version for the same query | The earlier pin is replaced, not added twice | Not run |
+| `DATA-16-AC4` | As a user whose role masks a column of that table, repeat step 1 | The column is masked at the older version | Not run |
+| `DATA-16-AC5` | Switch the engine to Trino | The picker is switched off and says past versions are available on ClickHouse | Not run |
+| `DATA-16-AC6` | On Trino, type a query with `FOR VERSION AS OF` and run | A plain message saying past versions are available on ClickHouse; not "policy cannot be evaluated" | Not run |
+| `DATA-16-AC7` | Look at the Snapshots card and the picker | Each states how many versions the table has and the date of the oldest | Not run |
+| `DATA-16-AC8` | Read the picker's note | It says one version applies to every raw table in the query | Not run |
+| `DATA-16-AC9` | As a user without `query:read`, open the Activity tab | No "Query this version" that runs; the page says access is missing | Not run |
+| `DATA-16-AC10` | (operator) Open the CI run of the pull request | The time-travel gate passed | Not run |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read
