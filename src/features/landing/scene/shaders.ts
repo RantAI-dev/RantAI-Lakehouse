@@ -366,3 +366,110 @@ void main(){
   ${OUTPUT_GLSL}
 }
 `;
+
+/**
+ * The data surface on top of each slab. One program, three looks, so the
+ * stack tells the story without a word: Bronze is noisy and uneven, Silver is
+ * ordered into rows, Gold is a few bright, evenly spaced points.
+ */
+export const SLAB_SURFACE_VERT = /* glsl */ `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+export const SLAB_SURFACE_FRAG = /* glsl */ `
+uniform float uTime;
+uniform float uStyle;
+uniform float uGlow;
+uniform float uReveal;
+uniform vec3 uColor;
+varying vec2 vUv;
+float hash21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+void main(){
+  vec2 uv = vUv;
+  float a = 0.0;
+  if (uStyle < 0.5) {
+    // Bronze: uneven blobs of random size, jittered off any grid, flickering.
+    vec2 g = uv * vec2(26.0, 18.0);
+    vec2 id = floor(g);
+    vec2 f = fract(g) - 0.5;
+    vec2 j = (vec2(hash21(id), hash21(id + 7.3)) - 0.5) * 0.7;
+    float r = mix(0.07, 0.3, hash21(id + 3.1));
+    float d = length(f - j);
+    float tw = 0.5 + 0.5 * sin(uTime * (1.0 + hash21(id) * 3.0) + hash21(id + 1.7) * 30.0);
+    a = (1.0 - smoothstep(r * 0.4, r, d)) * (0.25 + 0.75 * tw) * step(0.3, hash21(id + 9.0));
+  } else if (uStyle < 1.5) {
+    // Silver: the same rows everywhere, dashes sweeping along them in step.
+    vec2 g = uv * vec2(30.0, 12.0);
+    vec2 id = floor(g);
+    float row = abs(fract(g.y) - 0.5);
+    float line = 1.0 - smoothstep(0.05, 0.13, row);
+    float dash = smoothstep(0.35, 0.5, fract(g.x * 0.18 + id.y * 0.21 - uTime * 0.35));
+    float base = 0.22 * (1.0 - smoothstep(0.04, 0.1, row));
+    a = line * (base + 0.78 * dash);
+  } else {
+    // Gold: a sparse lattice of bright points, each with a soft halo.
+    vec2 g = uv * vec2(9.0, 6.0);
+    vec2 id = floor(g);
+    vec2 f = fract(g) - 0.5;
+    float d = length(f);
+    float tw = 0.7 + 0.3 * sin(uTime * 1.2 + hash21(id) * 6.2831);
+    a = ((1.0 - smoothstep(0.02, 0.1, d)) + 0.35 * exp(-d * d * 55.0)) * tw;
+  }
+  vec2 e = min(uv, 1.0 - uv);
+  a *= smoothstep(0.0, 0.07, min(e.x, e.y));
+  float k = (0.3 + 1.0 * uGlow) * uReveal;
+  gl_FragColor = vec4(uColor * a * k, a * k);
+  ${OUTPUT_GLSL}
+}
+`;
+
+/** Rows falling from the slab above into this one; fewer and more ordered at each depth. */
+export const STREAM_VERT = /* glsl */ `
+attribute vec4 aSeed;
+uniform float uTime;
+uniform float uTop;
+uniform float uBottom;
+uniform float uOrder;
+uniform float uHalfW;
+uniform float uHalfD;
+uniform float uCols;
+uniform float uRows;
+uniform float uSpeed;
+uniform float uSize;
+uniform float uPx;
+uniform float uAlpha;
+varying float vA;
+void main(){
+  float t = fract(aSeed.x + uTime * uSpeed * (0.7 + aSeed.w * 0.6));
+  float y = mix(uTop, uBottom, t);
+  float cx = (aSeed.y - 0.5) * 2.0 * uHalfW;
+  float cz = (aSeed.z - 0.5) * 2.0 * uHalfD;
+  float qx = ((floor(aSeed.y * uCols) + 0.5) / uCols - 0.5) * 2.0 * uHalfW;
+  float qz = ((floor(aSeed.z * uRows) + 0.5) / uRows - 0.5) * 2.0 * uHalfD;
+  vec3 p = vec3(mix(cx, qx, uOrder), y, mix(cz, qz, uOrder));
+  p.x += sin(uTime * 1.3 + aSeed.w * 40.0) * 0.28 * (1.0 - uOrder);
+  p.z += cos(uTime * 1.1 + aSeed.x * 40.0) * 0.28 * (1.0 - uOrder);
+  vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  gl_Position = projectionMatrix * mv;
+  float fadeIn = smoothstep(0.0, 0.12, t);
+  float land = smoothstep(0.88, 1.0, t);
+  float fadeOut = 1.0 - smoothstep(0.97, 1.0, t);
+  vA = uAlpha * fadeIn * fadeOut * (0.55 + 0.9 * land);
+  gl_PointSize = clamp(uSize * uPx * (10.0 / max(-mv.z, 1.0)) * (0.8 + 0.6 * land), 1.0, 14.0 * uPx);
+}
+`;
+
+export const STREAM_FRAG = /* glsl */ `
+uniform vec3 uColor;
+varying float vA;
+void main(){
+  float d = length(gl_PointCoord - 0.5);
+  float a = (1.0 - smoothstep(0.0, 0.5, d)) * vA;
+  gl_FragColor = vec4(uColor * a, a);
+  ${OUTPUT_GLSL}
+}
+`;

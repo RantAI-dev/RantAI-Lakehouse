@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { motion } from "motion/react";
 import { cn } from "@/lib/utils";
+import { useReducedMotionSafe } from "./use-reduced-motion";
 
 /**
  * Scroll-into-view reveals shared by the sections.
@@ -28,16 +29,23 @@ export function Reveal({
   y?: number;
   as?: "div" | "p" | "li" | "ul" | "span";
 }) {
-  const reduced = useReducedMotion();
+  const reduced = useReducedMotionSafe();
   const Tag = motion[as] as typeof motion.div;
   return (
     <Tag
       data-reveal
       className={className}
-      initial={{ opacity: 0, y: reduced ? 0 : y }}
+      initial={{ opacity: 0, y }}
       whileInView={{ opacity: 1, y: 0 }}
       viewport={{ once: true, amount: 0.25, margin: "0px 0px -6% 0px" }}
-      transition={{ duration: reduced ? 0.4 : 0.9, delay: reduced ? 0 : delay, ease: EASE_OUT }}
+      // Reduced motion: a plain fade. The offset above is applied while the
+      // node is still invisible, so snapping it back costs nothing.
+      transition={{
+        duration: reduced ? 0.4 : 0.9,
+        delay: reduced ? 0 : delay,
+        ease: EASE_OUT,
+        y: reduced ? { duration: 0 } : undefined,
+      }}
     >
       {children}
     </Tag>
@@ -60,16 +68,13 @@ export function SplitWords({
   delay?: number;
   stagger?: number;
 }) {
-  const reduced = useReducedMotion();
+  const reduced = useReducedMotionSafe();
   const words = text.split(" ");
   return (
     <motion.span
       data-reveal
       className={cn("inline", className)}
-      initial={reduced ? { opacity: 0 } : undefined}
-      whileInView={reduced ? { opacity: 1 } : undefined}
       viewport={{ once: true, amount: 0.6 }}
-      transition={{ duration: 0.4 }}
     >
       {words.map((word, i) => (
         <React.Fragment key={`${word}-${i}`}>
@@ -77,10 +82,15 @@ export function SplitWords({
             <motion.span
               data-reveal
               className="inline-block will-change-transform"
-              initial={reduced ? false : { y: "112%", rotate: 3 }}
-              whileInView={reduced ? undefined : { y: "0%", rotate: 0 }}
+              initial={{ y: "112%", rotate: 3 }}
+              whileInView={{ y: "0%", rotate: 0 }}
               viewport={{ once: true, amount: 0.6 }}
-              transition={{ duration: 1.05, delay: delay + i * stagger, ease: EASE_OUT }}
+              // Reduced motion: the words are simply there (no rise, no stagger).
+              transition={
+                reduced
+                  ? { duration: 0 }
+                  : { duration: 1.05, delay: delay + i * stagger, ease: EASE_OUT }
+              }
             >
               {word}
             </motion.span>

@@ -1,10 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { motion, useReducedMotion, useTransform, type MotionValue } from "motion/react";
+import { motion, useTransform, type MotionValue } from "motion/react";
 import { SOURCES } from "./landing-copy";
 import { Container, DisplayHeading, LeadText } from "./landing-ui";
 import { Reveal } from "./reveal";
+import { useReducedMotionSafe } from "./use-reduced-motion";
 import { useSectionProgress } from "./use-section-progress";
 
 /**
@@ -17,7 +18,7 @@ import { useSectionProgress } from "./use-section-progress";
  */
 export function SourcesSection() {
   const ref = React.useRef<HTMLElement>(null);
-  const reduced = useReducedMotion();
+  const reduced = useReducedMotionSafe();
   // 0 when the section's top meets the bottom of the viewport; 1 at the end of the pin.
   const scrollYProgress = useSectionProgress(ref, ["start end", "end end"]);
   const headOpacity = useTransform(scrollYProgress, [0.04, 0.2], [0, 1]);
@@ -29,7 +30,7 @@ export function SourcesSection() {
         <Container className="text-center">
           <motion.div
             className="relative z-10"
-            style={reduced ? undefined : { opacity: headOpacity, y: headY }}
+            style={reduced ? { opacity: 1, y: 0 } : { opacity: headOpacity, y: headY }}
           >
             <DisplayHeading>{SOURCES.headline}</DisplayHeading>
             <LeadText className="mx-auto mt-5 max-w-[36rem]">{SOURCES.sub}</LeadText>

@@ -3,6 +3,7 @@ import { sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "../
 import { createMascot, type Aim } from "./mascot";
 import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
 import { buildEnvironment, createSkyDome, createSkyUniforms, createStars } from "./sky";
+import { createSlabs, SLAB_SIZE } from "./slabs";
 import { createShafts, createSnow } from "./underwater";
 import { createWater } from "./water";
 
@@ -104,6 +105,10 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const snow = createSnow(phone ? 700 : 1500);
   scene.add(snow.points);
 
+  // ---- Medallion slabs ----------------------------------------------------
+  const slabs = createSlabs(phone);
+  scene.add(slabs.group);
+
   // ---- Lights ------------------------------------------------------------
   // Moonlight from behind the creature rims its dome. There is deliberately no
   // front fill: a directional light in front of a clearcoated dome shows up as
@@ -190,12 +195,15 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const wide = aspect > 1.1;
     anchorHero.x = wide ? 0.42 : 0;
     anchorHero.y = wide ? 0 : 0.42;
-    anchorDepths.x = wide ? 0.4 : 0;
-    anchorDepths.y = wide ? 0 : -0.3;
+    anchorDepths.x = wide ? 0.3 : 0;
+    anchorDepths.y = wide ? 0 : -0.5;
     const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
-    distScaleDepths = distScaleHero;
+    // The slabs shrink sideways to fit a narrow screen rather than pushing the
+    // camera away, which the fog would swallow.
+    distScaleDepths = wide ? 1.12 : 1;
+    slabs.setFootprint(Math.min(1, ((wide ? 0.84 : 0.7) * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
     viewKey = "";
     measure();
     camera.updateProjectionMatrix();
@@ -299,8 +307,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (depthK < 0.35) underColor.copy(UNDER_NEAR).lerp(UNDER_MID, depthK / 0.35);
     else underColor.copy(UNDER_MID).lerp(UNDER_DEEP, (depthK - 0.35) / 0.65);
     fogColor.copy(skyUniforms.uSkyHorizon.value).lerp(underColor, smoothstep(0, 1, uw));
-    const density = lerp(0.021, 0.05, uw);
-    (scene.fog as THREE.FogExp2).density = lerp(0.003, 0.05, uw);
+    const density = lerp(0.021, 0.036, uw);
+    (scene.fog as THREE.FogExp2).density = lerp(0.003, 0.036, uw);
     (scene.fog as THREE.FogExp2).color.copy(fogColor);
     water.uniforms.uFogDensity.value = density;
     skyUniforms.uUnder.value = smoothstep(0, 1, uw);
@@ -317,6 +325,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const below = Math.max(0, -camera.position.y);
     shafts.update(t, uw * 0.55 * Math.exp(-below / 14), camera);
     snow.update(t, uw * 0.85, camera, dpr);
+    slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr });
   }
 
   function renderFrame(): void {
@@ -407,6 +416,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       water.dispose();
       shafts.dispose();
       snow.dispose();
+      slabs.dispose();
       sky.geometry.dispose();
       (sky.material as THREE.Material).dispose();
       stars.points.geometry.dispose();

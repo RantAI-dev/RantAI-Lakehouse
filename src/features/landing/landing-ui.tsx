@@ -24,16 +24,15 @@ export function Container({
 export function Eyebrow({
   className,
   children,
-}: {
-  className?: string;
-  children: React.ReactNode;
-}) {
+  ...rest
+}: React.HTMLAttributes<HTMLParagraphElement>) {
   return (
     <p
       className={cn(
         "lk-mono text-[12px] leading-4 font-medium tracking-[0.22em] text-[#44A6FA] uppercase",
         className,
       )}
+      {...rest}
     >
       {children}
     </p>

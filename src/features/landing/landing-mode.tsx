@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { hasWebGL2 } from "./scene/webgl-support";
+import { useReducedMotionSafe } from "./use-reduced-motion";
 
 /**
  * Which hero the visitor gets, decided once on the client.
@@ -35,14 +36,6 @@ const LandingModeContext = React.createContext<LandingModeValue>({
   markFailed: () => {},
 });
 
-const REDUCED_QUERY = "(prefers-reduced-motion: reduce)";
-
-function subscribeReduced(onChange: () => void): () => void {
-  const mq = window.matchMedia(REDUCED_QUERY);
-  mq.addEventListener("change", onChange);
-  return () => mq.removeEventListener("change", onChange);
-}
-
 const noopSubscribe = () => () => {};
 
 /** Probing creates a context, so it runs once and the answer is kept. */
@@ -56,11 +49,7 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
   // Both reads are client-only; `useSyncExternalStore` gives the server and the
   // first hydration pass the neutral value and then switches, with no
   // mismatch and no setState-in-effect.
-  const reduced = React.useSyncExternalStore(
-    subscribeReduced,
-    () => window.matchMedia(REDUCED_QUERY).matches,
-    () => false,
-  );
+  const reduced = useReducedMotionSafe();
   const webgl = React.useSyncExternalStore<"unknown" | "yes" | "no">(
     noopSubscribe,
     () => (probeWebgl() ? "yes" : "no"),
