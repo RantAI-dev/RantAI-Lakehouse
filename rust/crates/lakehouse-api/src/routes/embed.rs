@@ -428,9 +428,20 @@ async fn render_board_payload(
     // BI-8: an embed or a public link shows a chart that uses a calculated
     // field exactly as the dashboard does (same builder, same role rewrite
     // with the embed viewer's role).
-    let field_catalog = lakehouse_bi::fields::FieldCatalog::from_fields(
-        lakehouse_bi::fields::list_fields(ch).await?,
-    );
+    //
+    // PR #104 CI fix: a catalog that cannot be read must not take the whole
+    // embed down (it used to render, with a per-tile fixed message for a tile
+    // that failed). Like the dashboard route, a failed read leaves the catalog
+    // empty: a chart that names a calculated field then fails on its own
+    // statement with the fixed tile message and a reference, never showing a
+    // wrong number, and the failure is logged under its own reference.
+    let field_catalog = match lakehouse_bi::fields::list_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            lakehouse_bi::fields::FieldCatalog::default()
+        }
+    };
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
         .filter(|c| {
