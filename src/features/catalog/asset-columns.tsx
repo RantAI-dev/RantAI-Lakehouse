@@ -854,7 +854,7 @@ export function ColumnsCard({
         ) : shown.length === 0 ? (
           <EmptyState title={`No column matches "${query.trim()}"`} className="py-4" />
         ) : meaningView && ready ? (
-          <MeaningView rows={shown} byColumn={ready.byColumn} canEdit={ready.canEdit} />
+          <MeaningView rows={shown} state={ready} />
         ) : (
           <>
             <div className="@container overflow-hidden rounded-lg border border-border">

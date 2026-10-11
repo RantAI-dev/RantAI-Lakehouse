@@ -8,6 +8,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react"
 import { describe, expect, it, mock } from "bun:test"
 import type { AssetColumn } from "@/services/contracts/assets"
 import type { SemanticEntry, SemanticEntryInput } from "@/services/contracts/semantic"
+import { ServiceError } from "@/services/errors"
 import { ColumnsCard, type ProfileState, type SchemaRow } from "./asset-columns"
 import type { MeaningState } from "./asset-meaning"
 import { TableMeaningCard } from "./asset-meaning-view"
@@ -38,9 +39,9 @@ type Ready = Extract<MeaningState, { kind: "ready" }>
 /** A ready state built by hand: the entries are given, the save and reload are stubs. */
 function readyMeanings(
   entries: SemanticEntry[] = [],
-  over: { table?: SemanticEntry | null; canEdit?: boolean } = {}
+  over: { table?: SemanticEntry | null; canEdit?: boolean; save?: (input: SemanticEntryInput) => Promise<void> } = {}
 ): { state: Ready; save: ReturnType<typeof mock<(input: SemanticEntryInput) => Promise<void>>> } {
-  const save = mock<(input: SemanticEntryInput) => Promise<void>>(async () => {})
+  const save = mock<(input: SemanticEntryInput) => Promise<void>>(over.save ?? (async () => {}))
   const reload = mock(() => {})
   const state: Ready = {
     kind: "ready",
@@ -336,5 +337,205 @@ describe("the table's meaning card", () => {
     const { state } = readyMeanings([], { table: null, canEdit: true })
     render(<TableMeaningCard state={state} />)
     expect(screen.getByRole("button", { name: "Add a meaning" })).toBeTruthy()
+  })
+})
+
+// ── Step 4: a person corrects and confirms ─────────────────────────────────
+
+/**
+ * Chooses an option of a base-ui Select the way a pointer does: the list opens,
+ * the option takes focus (which makes it the active one), and it is clicked.
+ * In this jsdom a click on an option that was not focused first does not reach
+ * `onValueChange`, so the focus step is part of the choice.
+ */
+function choose(trigger: HTMLElement, option: string) {
+  fireEvent.click(trigger)
+  const target = screen.getByRole("option", { name: option })
+  fireEvent.focus(target)
+  fireEvent.click(target)
+}
+
+const roleSelect = (name: string) => within(meaningTable()).getByRole("combobox", { name: `Role of ${name}` })
+const rowOf = (name: string) => within(meaningTable()).getByText(name).closest("[role=row]") as HTMLElement
+const dialog = () => screen.getByRole("dialog")
+const isDisabled = (el: HTMLElement) => (el as HTMLButtonElement).disabled || el.getAttribute("aria-disabled") === "true"
+
+describe("a person changes a role in the row", () => {
+  it("saves the new role with the entry's own meaning and synonyms", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    choose(roleSelect("orders_total"), "Number, not to be added up")
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({
+      column: "orders_total",
+      description: "Total order value in rupiah",
+      synonyms: ["omzet", "penjualan"],
+      role: "non_additive",
+    })
+  })
+
+  it("saves a null role when the role is set to Not set", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    choose(roleSelect("orders_total"), "Not set")
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0].role).toBeNull()
+    expect(save.mock.calls[0][0].synonyms).toEqual(["omzet", "penjualan"])
+  })
+
+  it("confirms a draft with its own role, meaning and synonyms", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Confirm the draft of orders_total" }))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({
+      column: "orders_total",
+      description: "Total order value in rupiah",
+      synonyms: ["omzet", "penjualan"],
+      role: "measure",
+    })
+  })
+
+  it("disables every role select, confirm and edit control while a save is unresolved", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], {
+      canEdit: true,
+      save: () => new Promise<void>(() => {}),
+    })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    choose(roleSelect("customer_count"), "Dimension")
+
+    const table = meaningTable()
+    const controls = [
+      ...within(table).getAllByRole("combobox"),
+      ...within(table).getAllByRole("button", { name: /^Confirm the draft of|^Edit the meaning of|^Add a meaning$/ }),
+    ]
+    expect(controls.length).toBeGreaterThan(0)
+    for (const control of controls) expect(isDisabled(control)).toBe(true)
+  })
+
+  it("shows the failure under the table and keeps the stored role on the row", async () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], {
+      canEdit: true,
+      save: async () => {
+        throw new ServiceError("invalid_request", "`role` must be one of measure, dimension")
+      },
+    })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    choose(roleSelect("orders_total"), "Dimension")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Could not save orders_total: `role` must be one of measure, dimension")
+    expect(within(rowOf("orders_total")).getByText("Measure")).toBeTruthy()
+  })
+})
+
+describe("a person edits a meaning in the dialog", () => {
+  it("saves the new meaning and keeps both synonyms and the role", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+    expect(screen.getByText("Edit the meaning of orders_total")).toBeTruthy()
+    fireEvent.change(within(dialog()).getByLabelText("Meaning"), { target: { value: "Gross order value" } })
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({
+      column: "orders_total",
+      description: "Gross order value",
+      synonyms: ["omzet", "penjualan"],
+      role: "measure",
+    })
+  })
+
+  it("has no role field for the table and saves it with a null column role", () => {
+    const table = entry({ description: "Orders placed", synonyms: ["pesanan"], status: "draft", model: "MiniMax-M3" })
+    const { state, save } = readyMeanings([], { table, canEdit: true })
+    render(<TableMeaningCard state={state} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }))
+    expect(screen.getByText("Edit the table's meaning")).toBeTruthy()
+    expect(within(dialog()).queryByRole("combobox")).toBeNull()
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }))
+
+    expect(save.mock.calls[0][0]).toEqual({ column: null, description: "Orders placed", synonyms: ["pesanan"], role: null })
+  })
+
+  it("keeps Save disabled for an empty meaning", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+
+    fireEvent.change(within(dialog()).getByLabelText("Meaning"), { target: { value: "   " } })
+    expect(isDisabled(within(dialog()).getByRole("button", { name: "Save" }))).toBe(true)
+  })
+
+  it("keeps Save disabled for a column meaning of 201 characters, and turns the counter red", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+
+    fireEvent.change(within(dialog()).getByLabelText("Meaning"), { target: { value: "x".repeat(201) } })
+    expect(isDisabled(within(dialog()).getByRole("button", { name: "Save" }))).toBe(true)
+    expect(within(dialog()).getByText("201/200").className).toContain("text-destructive")
+  })
+
+  it("keeps Save disabled for seven names, and says why", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+
+    fireEvent.change(within(dialog()).getByLabelText("Also called"), {
+      target: { value: "a, b, c, d, e, f, g" },
+    })
+    expect(isDisabled(within(dialog()).getByRole("button", { name: "Save" }))).toBe(true)
+    expect(within(dialog()).getByText("At most 6 names.")).toBeTruthy()
+  })
+
+  it("shows a rejected save under the fields and leaves the dialog open", async () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED], {
+      canEdit: true,
+      save: async () => {
+        throw new ServiceError("invalid_request", "`synonyms` must be at most 6")
+      },
+    })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }))
+
+    expect(await within(dialog()).findByText("`synonyms` must be at most 6")).toBeTruthy()
+    expect(screen.getByRole("dialog")).toBeTruthy()
+  })
+})
+
+describe("the table's card confirms and edits the table", () => {
+  it("confirms the table's draft with its description and synonyms", () => {
+    const table = entry({ description: "Orders placed", synonyms: ["pesanan"], status: "draft", model: "MiniMax-M3" })
+    const { state, save } = readyMeanings([], { table, canEdit: true })
+    render(<TableMeaningCard state={state} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({ column: null, description: "Orders placed", synonyms: ["pesanan"], role: null })
   })
 })
