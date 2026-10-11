@@ -195,7 +195,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const wide = aspect > 1.1;
     anchorHero.x = wide ? 0.42 : 0;
     anchorHero.y = wide ? 0 : 0.42;
-    anchorDepths.x = wide ? 0.36 : 0;
+    anchorDepths.x = wide ? 0.42 : 0;
     anchorDepths.y = wide ? -0.1 : -0.5;
     const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
@@ -203,7 +203,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // The slabs shrink sideways to fit a narrow screen rather than pushing the
     // camera away, which the fog would swallow.
     distScaleDepths = wide ? 1.25 : 1;
-    slabs.setFootprint(Math.min(1, ((wide ? 0.84 : 0.7) * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
+    // On wide screens also cap it below 1 so the stack stays clear of the copy.
+    slabs.setFootprint(Math.min(wide ? 0.86 : 1, (0.7 * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
     viewKey = "";
     measure();
     camera.updateProjectionMatrix();
