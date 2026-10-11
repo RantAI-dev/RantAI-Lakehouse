@@ -188,8 +188,10 @@ const MEANING_TRACKS = [
 /**
  * The role choice shared by a row and the dialog. `NOT_SET` is the "Not set"
  * item: base-ui does not report an empty-string item to `onValueChange`, so the
- * item carries a sentinel and the caller turns it into `null`. The value shown
+ * item carries a sentinel. It stays private to this component: `null` goes in
+ * and comes out, and the caller never sees the sentinel. The value shown
  * is the entry's own, so a failed save shows the stored role again.
+ * PR #109 review, finding 3.
  */
 const NOT_SET = "none"
 
@@ -200,16 +202,21 @@ function RoleSelect({
   disabled,
   size = "sm",
 }: {
-  value: string
-  onChange: (role: string) => void
+  /** The stored role, or `null` for "Not set". */
+  value: string | null
+  onChange: (role: string | null) => void
   label: string
   disabled?: boolean
   size?: "sm" | "default"
 }) {
   return (
-    <Select value={value === "" ? NOT_SET : value} onValueChange={(v) => onChange(v ?? NOT_SET)} disabled={disabled}>
+    <Select
+      value={value ?? NOT_SET}
+      onValueChange={(v) => onChange(v === NOT_SET || v === null ? null : v)}
+      disabled={disabled}
+    >
       <SelectTrigger size={size} aria-label={label} className="w-full">
-        <SelectValue>{roleLabel(value === "" ? null : value)}</SelectValue>
+        <SelectValue>{roleLabel(value)}</SelectValue>
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={NOT_SET}>Not set</SelectItem>
@@ -238,7 +245,7 @@ function MeaningRow({
   canEdit: boolean
   /** A save is running: every control of the row is off, since a second save would abort the first. */
   busy: boolean
-  onRole: (role: string) => void
+  onRole: (role: string | null) => void
   onConfirm: () => void
   onEdit: () => void
 }) {
@@ -255,7 +262,7 @@ function MeaningRow({
       <div role="cell" className="min-w-0">
         {canEdit ? (
           <RoleSelect
-            value={role ?? ""}
+            value={role}
             onChange={onRole}
             label={`Role of ${name}`}
             disabled={!entry || busy}
@@ -377,7 +384,7 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
   const max = column === null ? TABLE_TEXT_MAX : COLUMN_TEXT_MAX
   const [description, setDescription] = React.useState(base.description)
   const [synonyms, setSynonyms] = React.useState(base.synonyms.join(", "))
-  const [role, setRole] = React.useState(base.role ?? "")
+  const [role, setRole] = React.useState<string | null>(base.role)
   const save = useServiceAction((signal, input: SemanticEntryInput) => state.save(input, signal))
   const parsed = parseSynonyms(synonyms)
   const text = description.trim()
@@ -394,7 +401,7 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
       description: text,
       synonyms: parsed.synonyms,
       // The table has no role at all; the API refuses one on a table.
-      role: column === null || role === "" || role === NOT_SET ? null : role,
+      role: column === null ? null : role,
     })
     const ok = await save.run(input)
     // `run` resolves to `null` only on failure, which `save.error` shows.
@@ -510,7 +517,7 @@ export function MeaningView({ rows, state }: { rows: SchemaRow[]; state: Ready }
                   canEdit={canEdit}
                   busy={busy}
                   onRole={(v) => {
-                    if (entry) void saveRow(name, inputOf(entry, { role: v === NOT_SET ? null : v }))
+                    if (entry) void saveRow(name, inputOf(entry, { role: v }))
                   }}
                   onConfirm={() => {
                     if (entry) void saveRow(name, inputOf(entry))

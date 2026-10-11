@@ -544,6 +544,29 @@ describe("a person edits a meaning in the dialog", () => {
     })
   })
 
+  it("shows Not set on the dialog's role trigger and saves a null role for it", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+    choose(within(dialog()).getByRole("combobox", { name: "Role" }), "Not set")
+
+    // The trigger's text also holds the chevron glyph, so the words are checked, not an exact match.
+    const trigger = within(dialog()).getByRole("combobox", { name: "Role" }).textContent ?? ""
+    expect(trigger).toContain("Not set")
+    expect(trigger).not.toContain("none")
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({
+      column: "orders_total",
+      description: "Total order value in rupiah",
+      synonyms: ["omzet", "penjualan"],
+      role: null,
+    })
+  })
+
   it("has no role field for the table and saves it with a null column role", () => {
     const table = entry({ description: "Orders placed", synonyms: ["pesanan"], status: "draft", model: "MiniMax-M3" })
     const { state, save } = readyMeanings([], { table, canEdit: true })
