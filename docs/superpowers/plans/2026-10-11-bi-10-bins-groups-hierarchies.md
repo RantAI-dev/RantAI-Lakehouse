@@ -148,3 +148,15 @@ Built in a separate worktree while the dev console was frozen for a product demo
 Planner answers to the handoff: deviations 1 to 4 are accepted (min and max read inside the statement; the drill definition built on the server from the saved chart, which is stricter than the plan; value groups not usable inside a formula or as a measure; storage and bin scope as built). Deviation 5: the acceptance wording follows the data's own spellings.
 
 Owed: the smoke check; the drill preview route has never been called over HTTP; `security_regressions` and `upstream_errors` at the end of the phase.
+
+### BI-10 — smoke check, done after the demo (reviewer, 2026-10-11)
+
+On the dev API rebuilt from `845ae01`, against the real engine:
+
+- Bins of width 500 over `visitors`: five bins whose counts add up to 237 (48, 54, 55, 41, 39), with the bin metadata (`width`, `min` 44, `max` 2377) on the result.
+- A hierarchy province > city > place created over HTTP; the drill preview, called over HTTP for the first time, returns for Jawa Barat the two cities and totals of a direct query (Kota Bogor 8,736, Kota Bandung 5,100), then seven places adding up to 8,736 for Kota Bogor. Skipping a level, and drilling a chart with an "Other" group, are refused with plain sentences.
+- The demo dashboard's existing tiles return no error.
+
+- `SHOULD-FIX` R1 — A binned chart saved without a `sort` comes back ordered by its measure, descending (the bar default), not by bin ascending as the plan's decision table says. The server default for a binned dimension, with no `sort` and no explicit `order`, is bin order. To be fixed at the start of the next item.
+
+Not looked at by anyone: the Bin control, the value-group editor, the hierarchy editor, the drill menu and trail on a tile, the grid map.
