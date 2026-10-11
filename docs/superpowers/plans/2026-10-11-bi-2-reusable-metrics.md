@@ -181,3 +181,11 @@ Open, for the product owner:
 3. Metric and segment definitions (name, formula, filter values, table name) are readable by anyone with `dashboard:read`, as calculated fields are; only the numbers go through the viewer's policy rewrite.
 
 The reviewer's smoke check on a running API is recorded in the next entry.
+
+### BI-2 — smoke check (reviewer, 2026-10-11)
+
+On the dev API rebuilt from `b18a5c1`, over HTTP against the real engine.
+
+Passed: two metrics created (`Sum([visitors])`, and the same with a filter on `category` = Office); the preview of a bar chart by category with both metrics returns 89,447 / 76,111 / 63,696 / 49,701 for the first and 63,696 for Office and 0 elsewhere for the second, as a direct query does; a KPI on a metric with `last_year` saves and returns its monthly series; the `BI-11` R1 fix holds on the dashboard payload (the switched tile's `y` is `sum_hotels`, as its rows are).
+
+- `BLOCKER` R1 — A chart saved with metrics as measures fails on the dashboard: "This chart could not be loaded." The engine is sent `round(sum(total_visitors_demo)) AS total_visitors_demo … FROM serving.mart_demo_map_points`, the metric's name used as a column: the saved-tile read path does not resolve metrics, while the preview path does (same definition, same moment). Demo tile `u_0a8c305e` ("Total vs Office visitors per category (BI-2 QA)"), measures `[{"metric":"total_visitors_demo"},{"metric":"office_visitors_demo"}]`. Fix the saved-tile path (dashboard, and check embed, public, records, export and the alert digest for the same gap), and add a test that goes through the same function the dashboard read uses, with a metric in the catalog, asserting the statement carries the metric's formula. The KPI path works; find out why the two differ.
