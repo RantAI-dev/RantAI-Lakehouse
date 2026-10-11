@@ -43,7 +43,11 @@ export const HERO = {
 export const SOURCES = {
   headline: "Everything flows in.",
   sub: "Databases, files, streams and APIs land in one place, on a schedule or as they change.",
-  /** One pill per item; every entry is built today. */
+  /**
+   * One pill per item. WEB-1 review round 1 BLOCKER 1: SFTP (not verified end
+   * to end, VER-1) and S3-compatible storage (connectors cannot be tested or
+   * re-keyed, SRC-6) stay off until those items are done.
+   */
   items: [
     "PostgreSQL",
     "MySQL",
@@ -54,8 +58,6 @@ export const SOURCES = {
     "CSV and TSV files",
     "Excel workbooks",
     "Parquet files",
-    "S3-compatible storage",
-    "SFTP",
   ],
   caption:
     "Live change capture for PostgreSQL. File upload straight from the console.",
@@ -133,7 +135,7 @@ export const DASHBOARDS = {
 
 export const GOVERNANCE = {
   headline: "Guarded by default.",
-  sub: "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and the lineage shows where every number came from.",
+  sub: "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and lineage shows which tables each table is built from.",
   viewAs: "View as",
   roles: ["Analyst", "Admin"] as const,
   columns: ["Name", "Email", "City", "Amount"] as const,
@@ -147,8 +149,8 @@ export const GOVERNANCE = {
   ],
   facts: [
     { label: "Proof", text: "Masking proven end to end in an acceptance gate" },
-    { label: "Audit", text: "Every assistant action logged and approvable" },
-    { label: "Lineage", text: "Lineage from raw table to dashboard" },
+    { label: "Audit", text: "Assistant actions logged; risky ones wait for approval" },
+    { label: "Lineage", text: "Lineage from raw table to curated table" },
   ],
 } as const;
 
