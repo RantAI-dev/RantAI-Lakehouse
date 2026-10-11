@@ -94,6 +94,23 @@ async fn mount(ch: &MockServer, data: Vec<Value>) {
                 }),
             ),
             chart_row("c_bar", "bar", &json!({ "dimension": "region", "measures": ["email"] })),
+            // BI-6: raw tables with filters of their own.
+            chart_row(
+                "c_own",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "region"],
+                    "filters": [{ "column": "region", "values": ["south", "east"] }],
+                }),
+            ),
+            chart_row(
+                "c_gone",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "region"],
+                    "filters": [{ "column": "gone", "values": ["x"] }],
+                }),
+            ),
         ],
     )
     .await;
@@ -251,6 +268,79 @@ async fn the_export_writes_every_visible_column_masked_filtered_sorted_and_audit
     assert_eq!(args["board"], "b1");
     assert_eq!(args["rows"], 2);
     assert_eq!(args["cut"], false);
+}
+
+/// BI-6: a raw table's own filters narrow its file as they narrow the tile, ahead
+/// of the dashboard's, under the same mask and row filter; one that no longer
+/// applies refuses the export and nothing is read or audited.
+#[tokio::test]
+async fn the_export_carries_the_tiles_own_filters_and_refuses_one_that_no_longer_applies() {
+    let ch = MockServer::start().await;
+    mount(&ch, vec![json!({"email": "***", "region": "south"})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+    governance::create_policy(
+        &pool,
+        &CreatePolicyInput {
+            name: "export-own-test".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "Exporter".to_owned(),
+            resources: "serving.mart_x".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                r#"{"roles":["Exporter"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let filters = urlencoding_free(r#"[{"column":"region","values":["south","west"]}]"#);
+    let resp = get(
+        &router,
+        &format!("/api/dashboard/table-export?chart=c_own&filters={filters}"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent: Vec<String> = statements(&ch)
+        .await
+        .into_iter()
+        .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("region IN ('south', 'east') AND region IN ('south', 'west')"),
+        "own filters ahead of the dashboard's: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("replaceRegexpOne(toString(`email`)"),
+        "mask: {}",
+        sent[0]
+    );
+
+    let before = statements(&ch).await.len();
+    let refused = get(&router, "/api/dashboard/table-export?chart=c_gone", &cookie).await;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let after = statements(&ch).await;
+    assert!(
+        !after[before..]
+            .iter()
+            .any(|s| s.contains("serving.mart_x") && !s.contains("system.")),
+        "a refused export reads nothing: {after:?}"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.table_export'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audited, 1,
+        "only the export that was handed over is audited"
+    );
 }
 
 /// Query strings need `%`-escapes; this keeps the test free of a dependency.

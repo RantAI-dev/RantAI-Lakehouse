@@ -237,6 +237,61 @@ pub struct Grouping {
     pub grain: Option<String>,
 }
 
+/// One condition of a filter step, on a column of the result before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepCondition {
+    /// A grouping or a measure of the result the step reads.
+    pub column: String,
+    /// `eq`, `ne`, `gt`, `gte`, `lt`, `lte` or `between`.
+    pub op: String,
+    /// The number, date or text compared with (all but `between`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub value: Option<String>,
+    /// `between`: the lower bound, included.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub min: Option<String>,
+    /// `between`: the upper bound, included.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max: Option<String>,
+}
+
+/// One measure of a summarise step: an aggregate of a measure of the result before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepMeasure {
+    /// A measure of the result the step reads.
+    pub column: String,
+    /// `sum`, `avg`, `max`, `min` or `count`.
+    pub aggregate: String,
+}
+
+/// A summarise step: group the result before by a subset of its groupings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Summarise {
+    /// The groupings kept, a subset of the result before's.
+    pub by: Vec<String>,
+    /// The measures computed, named `<aggregate>_<column>`.
+    pub measures: Vec<StepMeasure>,
+}
+
+/// A step applied to the result of the one before (`BI-6` part 2): exactly one
+/// of `filter` (conditions, AND-ed) and `summarise`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    /// Keep the rows that meet every condition.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filter: Option<Vec<StepCondition>>,
+    /// Summarise the rows again.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub summarise: Option<Summarise>,
+}
+
+/// Most steps a chart takes after its summary.
+pub const MAX_STEPS: usize = 2;
+
 /// The fields `BI-6` adds to a chart definition (all but the measures' own
 /// aggregates, which live in [`MeasureList`]). Flattened into
 /// [`crate::store::ChartInput`] so the wire shape stays flat and a chart saved
@@ -255,9 +310,18 @@ pub struct ShapeFields {
     /// `table`: the columns it is grouped by (1 to 5).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub groupings: Option<Vec<Grouping>>,
+    /// Up to [`MAX_STEPS`] steps applied to the grouped result (`BI-6` part 2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub steps: Option<Vec<Step>>,
 }
 
 impl ShapeFields {
+    /// The steps (none when absent).
+    #[must_use]
+    pub fn steps_list(&self) -> &[Step] {
+        self.steps.as_deref().unwrap_or_default()
+    }
+
     /// Whether the chart asks for an "Other" group.
     #[must_use]
     pub fn wants_other(&self) -> bool {
@@ -278,6 +342,7 @@ impl ShapeFields {
             || self.sort.is_some()
             || self.wants_other()
             || self.groupings.is_some()
+            || self.steps.is_some()
     }
 }
 
@@ -385,6 +450,39 @@ pub fn check_kind_fields(
     if shape.groupings.is_some() && (kind != ChartKind::Table || rows_mode) {
         return Err("groupings are only for a grouped table.".to_owned());
     }
+    check_steps_kind(shape, kind, rows_mode)
+}
+
+/// Where steps are offered: the charts and tables grouped by one dimension (or
+/// the groupings of a table), whose last result is a list of groups. A pivot, a
+/// raw table, a single number and a map have none; "Other" and a breakdown
+/// would change what a step's row stands for.
+fn check_steps_kind(shape: &ShapeFields, kind: ChartKind, rows_mode: bool) -> Result<(), String> {
+    let Some(steps) = &shape.steps else {
+        return Ok(());
+    };
+    if rows_mode
+        || !is_grouped_kind(kind)
+        || matches!(
+            kind,
+            ChartKind::Geomap
+                | ChartKind::Calendar
+                | ChartKind::Heatmap
+                | ChartKind::Sankey
+                | ChartKind::Sunburst
+        )
+    {
+        return Err(format!(
+            "a {} takes no steps; they are for bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall and grouped table charts.",
+            kind_word(kind)
+        ));
+    }
+    if steps.is_empty() || steps.len() > MAX_STEPS {
+        return Err(format!("a chart takes 1 to {MAX_STEPS} steps."));
+    }
+    if shape.wants_other() {
+        return Err("steps cannot be combined with 'Other': a step's rows are no longer the source's groups.".to_owned());
+    }
     Ok(())
 }
 
@@ -440,12 +538,19 @@ pub fn check_against_relation(
         .ok_or_else(|| "invalid or missing measure column.".to_owned())?;
     check_aliases(&resolved, check)?;
     check_own_filters(shape, cols, kinds, time)?;
-    check_sort(shape, &resolved, check)?;
+    // With steps the sort names the last step's columns; the steps' own check does it.
+    if shape.steps.is_none() {
+        check_sort(shape, &resolved, check)?;
+    }
     check_groupings(shape, cols, kinds)?;
     let has_table_calc = resolved
         .iter()
         .any(|m| from.table_calc(m.column.as_str()).is_some());
-    if has_table_calc && (shape.sort.is_some() || shape.wants_other() || shape.groupings.is_some())
+    if has_table_calc
+        && (shape.sort.is_some()
+            || shape.wants_other()
+            || shape.groupings.is_some()
+            || shape.steps.is_some())
     {
         return Err(
             "a chart with a table calculation keeps its order and its groups: no sort, 'Other' or groupings."
@@ -454,6 +559,12 @@ pub fn check_against_relation(
     }
     if shape.wants_other() && check.grained {
         return Err("'Other' is not offered with a time grain.".to_owned());
+    }
+    if shape.steps.is_some() && (check.grained || !check.breakdown.is_empty()) {
+        return Err(
+            "steps are not offered with a time grain or a breakdown; use a table grouped by several columns (a date can be cut by a grain there)."
+                .to_owned(),
+        );
     }
     Ok(())
 }

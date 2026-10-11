@@ -30,6 +30,7 @@ use crate::tables;
 
 mod ranked;
 mod staged;
+pub mod steps;
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -359,6 +360,8 @@ pub struct QueryBuilder<S> {
     /// `BI-6`: the columns of a table grouped by several (replaces
     /// `dimension`).
     groupings: Vec<Ident>,
+    /// `BI-6` part 2: steps applied to the grouped result.
+    steps: Option<steps::StepsSql>,
     _state: PhantomData<S>,
 }
 
@@ -387,6 +390,7 @@ impl QueryBuilder<NeedsProjection> {
             sort: None,
             other: false,
             groupings: Vec::new(),
+            steps: None,
             _state: PhantomData,
         }
     }
@@ -459,6 +463,14 @@ impl QueryBuilder<NeedsProjection> {
         self
     }
 
+    /// Apply steps to the grouped result (`BI-6` part 2); the sort and limit
+    /// then belong to the last step's result.
+    #[must_use]
+    pub fn steps(mut self, steps: Option<steps::StepsSql>) -> Self {
+        self.steps = steps;
+        self
+    }
+
     /// Supply the measure columns, completing the projection and unlocking
     /// [`QueryBuilder::filter_in`]/[`QueryBuilder::build`]. Each takes the
     /// chart's aggregate and its column's name.
@@ -483,6 +495,7 @@ impl QueryBuilder<NeedsProjection> {
             sort: self.sort,
             other: self.other,
             groupings: self.groupings,
+            steps: self.steps,
             _state: PhantomData,
         }
     }
@@ -541,6 +554,9 @@ impl QueryBuilder<Ready> {
         // has its own, staged statement.
         if let Some(sql) = self.staged_sql() {
             return sql;
+        }
+        if self.steps.is_some() {
+            return self.steps_sql();
         }
         if self.other {
             return self.other_sql();
@@ -1782,6 +1798,30 @@ pub fn stored_sql<H: std::hash::BuildHasher>(
     .map(|r| r.sql)
 }
 
+/// The names a chart's statement gives its result columns, which a predicate on
+/// a column of the same name would otherwise resolve to (`BI-18·A` review
+/// BLOCKER 1).
+fn result_aliases(
+    kind: crate::specs::ChartKind,
+    def: &ChartInput,
+    measures: &[Measure],
+) -> Vec<String> {
+    match kind {
+        crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v".to_owned()],
+        crate::specs::ChartKind::Boxplot => def
+            .measures
+            .first()
+            .cloned()
+            .into_iter()
+            .chain(["__n".to_owned()])
+            .collect(),
+        crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat => {
+            def.measures.first().cloned().into_iter().collect()
+        }
+        _ => measures.iter().map(|m| m.alias.to_string()).collect(),
+    }
+}
+
 /// [`rebuild`] for the kinds that are a plain `GROUP BY` chart, a single
 /// number or a point map.
 fn rebuild_chart<H: std::hash::BuildHasher>(
@@ -1805,20 +1845,7 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
     // Only then are the predicates moved into an inner relation; otherwise
     // the SQL is exactly what it was before.
     if !where_clauses.is_empty() {
-        let aliases: Vec<String> = match spec.spec.kind {
-            crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v".to_owned()],
-            crate::specs::ChartKind::Boxplot => def
-                .measures
-                .first()
-                .cloned()
-                .into_iter()
-                .chain(["__n".to_owned()])
-                .collect(),
-            crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat => {
-                def.measures.first().cloned().into_iter().collect()
-            }
-            _ => measures.iter().map(|m| m.alias.to_string()).collect(),
-        };
+        let aliases = result_aliases(spec.spec.kind, def, &measures);
         if where_columns.iter().any(|c| aliases.contains(c)) {
             let wrapped = Relation::Filtered {
                 base: Box::new(from.clone()),
@@ -1884,14 +1911,21 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         .breakdown
         .as_ref()
         .and_then(|b| Ident::new(b.clone()).ok());
-    let sort = sort_of(def, &measures, std::slice::from_ref(&dimension)).ok()?;
+    let steps = plan_steps_of(def, &measures, &[(dimension.to_string(), None)], cols).ok()?;
+    let sort = sort_of(
+        def,
+        &measures,
+        std::slice::from_ref(&dimension),
+        steps.as_ref(),
+    )
+    .ok()?;
     // BI-6: a chart that names a table calculation keeps the order and the
     // groups its calculation is defined over; a sort, "Other" or groupings
     // saved beside one (the field changed level since) is not built.
     let has_table_calc = measures
         .iter()
         .any(|m| from.table_calc(m.column.as_str()).is_some());
-    if has_table_calc && (sort.is_some() || def.shape.wants_other()) {
+    if has_table_calc && (sort.is_some() || def.shape.wants_other() || steps.is_some()) {
         return None;
     }
 
@@ -1902,6 +1936,7 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         .limit(def.limit.unwrap_or(20))
         .breakdown(breakdown)
         .sort(sort)
+        .steps(steps)
         .other(def.shape.wants_other())
         .measure_list(measures);
     for clause in where_clauses {
@@ -1916,12 +1951,22 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
 /// The sort of a stored definition as validated identifiers: `by` must be one
 /// of `groups` or a measure's result name, else `Err` (a definition that no
 /// longer checks out is not built). `Ok(None)` is no sort at all.
-fn sort_of(def: &ChartInput, measures: &[Measure], groups: &[Ident]) -> Result<Option<Sort>, ()> {
+fn sort_of(
+    def: &ChartInput,
+    measures: &[Measure],
+    groups: &[Ident],
+    steps: Option<&steps::StepsSql>,
+) -> Result<Option<Sort>, ()> {
     let Some(sort) = &def.shape.sort else {
         return Ok(None);
     };
     let by = Ident::new(sort.by.clone()).map_err(|_| ())?;
-    if groups.contains(&by) || measures.iter().any(|m| m.alias == by) {
+    // With steps the sort names a column of the last step's result.
+    let known = match steps {
+        Some(plan) => plan.groups.contains(&by) || plan.measures.contains(&by),
+        None => groups.contains(&by) || measures.iter().any(|m| m.alias == by),
+    };
+    if known {
         Ok(Some(Sort {
             by,
             desc: sort.descending(),
@@ -1929,6 +1974,32 @@ fn sort_of(def: &ChartInput, measures: &[Measure], groups: &[Ident]) -> Result<O
     } else {
         Err(())
     }
+}
+
+/// The steps of `def` planned over the groupings `groups` (each with the grain
+/// it is cut by) and `measures` of its grouped result (`BI-6` part 2); `Ok(None)`
+/// for a chart without steps, `Err` when they no longer check out.
+fn plan_steps_of<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    measures: &[Measure],
+    groups: &[(String, Option<Grain>)],
+    cols: &RelationColumns<H>,
+) -> Result<Option<steps::StepsSql>, ()> {
+    let Some(list) = &def.shape.steps else {
+        return Ok(None);
+    };
+    if def.grain.is_some() || def.breakdown.is_some() {
+        return Err(());
+    }
+    let kinds = groups
+        .iter()
+        .map(|(name, grain)| {
+            let kind = cols.get(name).copied().ok_or(())?;
+            Ok((name.clone(), steps::group_kind(kind, *grain)))
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    let names: Vec<String> = measures.iter().map(|m| m.alias.to_string()).collect();
+    steps::plan(list, &kinds, &names).map(Some).map_err(|_| ())
 }
 
 /// The statement of a table grouped by several columns (`BI-6`). A grouping
@@ -1955,7 +2026,18 @@ fn groupings_sql<H: std::hash::BuildHasher>(
             Some(parsed) => parsed.map(Some),
         })
         .collect::<Option<_>>()?;
-    let sort = sort_of(def, measures, &idents).ok()?;
+    let steps = plan_steps_of(
+        def,
+        measures,
+        &groupings
+            .iter()
+            .zip(&grains)
+            .map(|(g, grain)| (g.column.clone(), *grain))
+            .collect::<Vec<_>>(),
+        cols,
+    )
+    .ok()?;
+    let sort = sort_of(def, measures, &idents, steps.as_ref()).ok()?;
     let mut needed: Vec<String> = idents.iter().map(ToString::to_string).collect();
     for m in measures {
         match from.aggregate_field(m.column.as_str()) {
@@ -2008,6 +2090,7 @@ fn groupings_sql<H: std::hash::BuildHasher>(
         .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
         .limit(def.limit.unwrap_or(20))
         .sort(sort)
+        .steps(steps)
         .measure_list(measures.to_vec());
     for clause in predicates {
         builder = builder.raw_where(clause);
@@ -2050,7 +2133,7 @@ impl GrainedChart {
     ) -> Option<Self> {
         let measures = shape::resolve_measures(&def.measures, from)?;
         let dimension = Ident::new(def.dimension.clone()).ok()?;
-        let sort = sort_of(def, &measures, std::slice::from_ref(&dimension)).ok()?;
+        let sort = sort_of(def, &measures, std::slice::from_ref(&dimension), None).ok()?;
         let order = def.effective_order();
         let limit = grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit));
         Some(Self {
@@ -4262,5 +4345,31 @@ mod tests {
              (SELECT * FROM serving.mart_x WHERE cat IN ('a')) AS flt) AS bkt \
              GROUP BY d, cat ORDER BY visitors DESC, d, cat LIMIT 20"
         );
+    }
+
+    #[test]
+    fn steps_are_nested_statements_and_the_sort_and_limit_belong_to_the_last_one() {
+        let sql = bi6_sql(
+            r#"{"measures":["visitors"],"limit":7,"sort":{"by":"visitors","dir":"desc"},
+                "steps":[{"filter":[{"column":"visitors","op":"gt","value":"1000"}]}]}"#,
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM (SELECT kab, round(sum(visitors)) AS visitors FROM \
+             serving.mart_x WHERE cat IN ('a') GROUP BY kab) WHERE visitors > 1000) \
+             ORDER BY visitors DESC, kab LIMIT 7 \
+             SETTINGS max_rows_to_group_by = 10000, group_by_overflow_mode = 'throw'"
+        );
+        let summed = bi6_sql(
+            r#"{"measures":["visitors"],"order":"none","limit":7,
+                "steps":[{"summarise":{"by":["kab"],"measures":[{"column":"visitors","aggregate":"max"}]}}]}"#,
+            &[],
+        );
+        assert!(
+            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors)) AS __s0 FROM (SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
+            "{summed}"
+        );
+        assert!(summed.contains("ORDER BY kab LIMIT 7"), "{summed}");
     }
 }

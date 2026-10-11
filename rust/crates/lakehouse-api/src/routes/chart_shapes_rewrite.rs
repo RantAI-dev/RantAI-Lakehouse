@@ -479,3 +479,167 @@ fn the_statements_for_the_new_shapes_for_a_real_engine_run_are_built() {
     .sql;
     record_raw("intersection, over a SQL source", &sql);
 }
+
+/// `BI-6-AC2`: visitors by province and month, then summarised by province, then
+/// the provinces whose total is over 1,000.
+fn ac2_chart() -> StoredChartSpec {
+    chart(&serde_json::json!({
+        "kind": "table", "dimension": "",
+        "groupings": [{"column": "provinsi"}, {"column": "visit_date", "grain": "month"}],
+        "measures": ["visitors"],
+        "steps": [
+            {"summarise": {"by": ["provinsi"], "measures": [{"column": "visitors", "aggregate": "sum"}]}},
+            {"filter": [{"column": "sum_visitors", "op": "gt", "value": "1000"}]},
+        ],
+        "sort": {"by": "sum_visitors", "dir": "desc"}, "limit": 100,
+    }))
+}
+
+/// Summarise twice: by province and category taking the largest cell, then by
+/// province adding those up.
+fn summarise_twice_chart() -> StoredChartSpec {
+    chart(&serde_json::json!({
+        "kind": "table", "dimension": "",
+        "groupings": [{"column": "provinsi"}, {"column": "category"}, {"column": "visit_date", "grain": "month"}],
+        "measures": ["visitors"],
+        "steps": [
+            {"summarise": {"by": ["provinsi", "category"], "measures": [{"column": "visitors", "aggregate": "max"}]}},
+            {"summarise": {"by": ["provinsi"], "measures": [{"column": "max_visitors", "aggregate": "sum"}]}},
+        ],
+        "sort": {"by": "sum_max_visitors", "dir": "desc"}, "limit": 100,
+    }))
+}
+
+/// A filter step on the cells, then a filter step on a grouping, over a plain bar.
+fn filter_filter_chart() -> StoredChartSpec {
+    chart(&serde_json::json!({
+        "measures": ["visitors"],
+        "steps": [
+            {"filter": [{"column": "visitors", "op": "between", "min": "5000", "max": "50000"}]},
+            {"filter": [{"column": "provinsi", "op": "ne", "value": "Bali"}]},
+        ],
+        "sort": {"by": "visitors", "dir": "desc"}, "limit": 100,
+    }))
+}
+
+#[test]
+fn nested_steps_read_the_governed_table_only_through_its_projection() {
+    for policy in [&MASK_MEASURE, &MASK_TEXT] {
+        rewritten("steps: AC2", &ac2_chart(), &[], policy);
+        rewritten(
+            "steps: summarise twice",
+            &summarise_twice_chart(),
+            &[],
+            policy,
+        );
+        rewritten("steps: two filters", &filter_filter_chart(), &[], policy);
+        rewritten(
+            "steps: own filter and dashboard filter under steps",
+            &chart(&serde_json::json!({
+                "measures": ["visitors"],
+                "filters": [{"column": "category", "values": ["Office"]}],
+                "steps": [{"filter": [{"column": "visitors", "op": "gt", "value": "10"}]}],
+                "limit": 100,
+            })),
+            &[dashboard_filter(
+                &serde_json::json!({"column": "category", "values": ["Office", "Retail"]}),
+            )],
+            policy,
+        );
+    }
+}
+
+/// The nested statements, for a real-engine run.
+#[test]
+fn the_statements_with_steps_for_a_real_engine_run_are_built() {
+    let time = TimeContext::default();
+    let read = ReadContext::new(&time);
+    for (label, c) in [
+        (
+            "steps AC2: by province and month, summarise by province, keep totals over 1000",
+            ac2_chart(),
+        ),
+        ("steps: summarise twice", summarise_twice_chart()),
+        ("steps: two filters", filter_filter_chart()),
+    ] {
+        let sql = sql_with_filters_report(&c, &[], &[], &columns(), &read).sql;
+        assert!(sql.starts_with("SELECT * FROM ("), "{label}: {sql}");
+        record_raw(label, &sql);
+    }
+}
+
+/// `BI-6` part 2, T7: the builder's preview shows up to 2,000 rows of the last
+/// step's result, read with a larger limit than the chart keeps, and says when
+/// more exist; a chart without steps shows the rows its tile has.
+#[tokio::test]
+async fn the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_cut() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let rows: Vec<serde_json::Value> = (0..2001)
+        .map(|i| serde_json::json!({ "provinsi": format!("p{i}"), "visitors": i }))
+        .collect();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [{"name": "provinsi", "type": "String"}, {"name": "visitors", "type": "UInt32"}],
+            "data": rows, "rows": 2001,
+        })))
+        .mount(&server)
+        .await;
+    let ch = lakehouse_clickhouse::ChClient::new(server.uri(), "default".to_owned(), String::new());
+    let obligations = crate::policy_engine::PolicyEngineObligations::new(None, &ch);
+    let time = TimeContext::default();
+    let mut stepped = filter_filter_chart();
+    stepped.spec.sql =
+        sql_with_filters_report(&stepped, &[], &[], &columns(), &ReadContext::new(&time)).sql;
+    let shown_tile = serde_json::json!({ "columns": ["provinsi", "visitors"], "rows": [{"provinsi": "a", "visitors": 1}] });
+    let shown = crate::routes::support::preview_rows(
+        &ch,
+        &stepped,
+        &shown_tile,
+        (&[], &PlaceholderValues::none(), &obligations),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shown["rows"].as_array().unwrap().len(), 2000);
+    assert_eq!(shown["truncated"], true);
+    assert_eq!(shown["limit"], 2000);
+    let sent: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(sent.iter().any(|s| s.contains("LIMIT 2001")), "{sent:?}");
+    assert!(
+        stepped.def.limit == Some(100),
+        "the saved chart's own limit is not changed"
+    );
+
+    // Without steps the rows are the shown_tile's own, and nothing more is read.
+    let plain = chart(&serde_json::json!({"limit": 5}));
+    let shown = crate::routes::support::preview_rows(
+        &ch,
+        &plain,
+        &shown_tile,
+        (&[], &PlaceholderValues::none(), &obligations),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shown["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(shown["truncated"], false);
+    assert_eq!(server.received_requests().await.unwrap().len(), sent.len());
+    // A shown_tile that carries an error has no rows to show.
+    assert!(
+        crate::routes::support::preview_rows(
+            &ch,
+            &plain,
+            &serde_json::json!({ "error": "x" }),
+            (&[], &PlaceholderValues::none(), &obligations),
+        )
+        .await
+        .is_none()
+    );
+}

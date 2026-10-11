@@ -142,3 +142,79 @@ test("a tile labels a measure with its own aggregate by position", () => {
   assert.deepEqual(tileMeasureLabels([{ column: "ratio", aggregate: "avg" }], "ratio"), {})
   assert.deepEqual(tileMeasureLabels(undefined, "v"), {})
 })
+
+// ── BI-6 part 2: steps ───────────────────────────────────────────────────
+
+import {
+  cleanStep, columnsAfterSteps, conditionComplete, isInternalColumn, stepsApply, takesSteps, visibleColumns,
+  type ResultColumns, type StepDef,
+} from "./chart-shape"
+
+const base: ResultColumns = {
+  groups: [{ name: "kab", kind: "text" }, { name: "d", kind: "date" }],
+  measures: ["visitors", "avg_stay"],
+  labels: { avg_stay: "avg of stay" },
+}
+const summarise: StepDef = { summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }, { column: "avg_stay", aggregate: "max" }] } }
+
+test("a summary leaves the groupings it keeps and measures named by aggregate and column", () => {
+  const after = columnsAfterSteps(base, [summarise])
+  assert.deepEqual(after.groups, [{ name: "kab", kind: "text" }])
+  assert.deepEqual(after.measures, ["sum_visitors", "max_avg_stay"])
+  assert.equal(after.labels.sum_visitors, "sum of visitors")
+  assert.equal(after.labels.max_avg_stay, "max of avg of stay")
+})
+
+test("a filter step leaves the columns as they were and a second summary reads the first", () => {
+  const filter: StepDef = { filter: [{ column: "sum_visitors", op: "gt", value: "1000" }] }
+  assert.deepEqual(columnsAfterSteps(base, [filter]), base)
+  const twice = columnsAfterSteps(base, [summarise, { summarise: { by: ["kab"], measures: [{ column: "sum_visitors", aggregate: "avg" }] } }])
+  assert.deepEqual(twice.measures, ["avg_sum_visitors"])
+})
+
+test("the steps are sent only where the chart takes them", () => {
+  const draft = { ...emptyShapeDraft(), steps: [summarise] }
+  const ctx = { kind: "bar", rowsMode: false, grained: false }
+  assert.deepEqual(shapePayload(draft, ctx).steps, [summarise])
+  for (const blocked of [{ ...ctx, grained: true }, { ...ctx, breakdown: true }, { ...ctx, kind: "kpi" }, { ...ctx, kind: "pivot" }, { ...ctx, kind: "table", rowsMode: true }, { ...ctx, kind: "geomap" }]) {
+    assert.equal(shapePayload(draft, blocked).steps, undefined, JSON.stringify(blocked))
+  }
+  assert.equal(stepsApply({ ...draft, other: true }, ctx), false)
+  // "Other" wins when both are set: steps are not sent beside it.
+  assert.equal(shapePayload({ ...draft, other: true }, ctx).steps, undefined)
+  assert.equal(shapePayload({ ...draft, other: true }, ctx).other, true)
+  assert.equal(takesSteps("bar"), true)
+  assert.equal(takesSteps("kpi"), false)
+})
+
+test("a step with nothing filled in is a problem to fix before the preview", () => {
+  const ctx = { kind: "bar", rowsMode: false }
+  const withSteps = (steps: StepDef[]) => ({ ...emptyShapeDraft(), steps })
+  assert.deepEqual(shapeProblems(withSteps([{ filter: [{ column: "visitors", op: "gt", value: "" }] }]), ctx), ["Step 1 value"])
+  assert.deepEqual(shapeProblems(withSteps([{ filter: [] }]), ctx), ["Step 1 condition"])
+  assert.deepEqual(shapeProblems(withSteps([{ summarise: { by: [], measures: [] } }]), ctx), ["Step 1 grouping", "Step 1 measure"])
+  assert.deepEqual(shapeProblems(withSteps([{ filter: [{ column: "visitors", op: "gt", value: "5" }] }]), ctx), [])
+  // Steps that are not sent are not a problem.
+  assert.deepEqual(shapeProblems(withSteps([{ filter: [] }]), { ...ctx, grained: true }), [])
+  assert.equal(conditionComplete({ column: "v", op: "between", min: "", max: "5" }), true)
+  assert.equal(conditionComplete({ column: "v", op: "between" }), false)
+})
+
+test("a step is sent trimmed and without the empty fields of the other operator", () => {
+  assert.deepEqual(cleanStep({ filter: [{ column: "v", op: "gt", value: " 5 ", min: "1" }, { column: "v", op: "between", min: " 1", max: "" }] }), {
+    filter: [{ column: "v", op: "gt", value: "5" }, { column: "v", op: "between", min: "1" }],
+  })
+})
+
+test("the labels of a tile with steps come from the last step, not from the measures by position", () => {
+  const labels = tileMeasureLabels(["visitors"], ["sum_visitors"], [{ summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }] } }])
+  assert.deepEqual(labels, { sum_visitors: "sum of visitors" })
+  assert.deepEqual(tileMeasureLabels([{ column: "stay", aggregate: "avg" }], "avg_stay", [{ filter: [{ column: "avg_stay", op: "gt", value: "1" }] }]), { avg_stay: "avg of stay" })
+})
+
+test("internal columns are left out of every list a person reads", () => {
+  assert.equal(isInternalColumn("__other"), true)
+  assert.equal(isInternalColumn("__s0"), true)
+  assert.equal(isInternalColumn("_x"), false)
+  assert.deepEqual(visibleColumns(["kab", "visitors", "__other", "__n"]), ["kab", "visitors"])
+})

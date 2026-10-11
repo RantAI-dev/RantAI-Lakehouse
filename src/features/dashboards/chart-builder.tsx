@@ -43,15 +43,15 @@ import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
   effectiveOrder, emptyShapeDraft, entriesFromRows, measureLabel, measureLimits, parseSortChoice, resultName,
-  rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortOptions, takesOther, usesGroupings,
-  type MeasureRow, type ShapeDefFields, type ShapeDraft,
+  rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortOptions, stepsApply, takesOther, takesSteps, usesGroupings, columnsAfterSteps,
+  type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
-import { ChartFilters, GroupingsEditor, MeasureRows, type ColumnChoice } from "./chart-shape-section";
+import { ChartFilters, GroupingsEditor, MeasureRows, StepsEditor, PreviewRowsTable, type ColumnChoice } from "./chart-shape-section";
 import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
-  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
@@ -82,7 +82,10 @@ export type ChartDef = {
 } & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
   & ShapeDefFields; // measures with their own aggregate, the chart's own filters, sort, "Other", groupings (BI-6)
 type BoardOpt = { id: string; name: string };
+/** The rows of the chart's last result beside the chart (BI-6 part 2). */
+type PreviewRows = { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; limit: number };
 type Preview = {
+  previewRows?: PreviewRows | null;
   spec: ChartRenderSpec & { text?: string; caption?: string };
   result: { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 };
@@ -475,7 +478,7 @@ export function ChartBuilder({
         ...(ownColumns ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
         ...draftProblems(kind, tableDraft),
-        ...shapeProblems(shape, { kind, rowsMode }),
+        ...shapeProblems(shape, { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) }),
       ];
   const isEdit = !!editId;
   // Why no chart can be drawn yet while the SQL is new or edited (null = it
@@ -596,19 +599,30 @@ export function ChartBuilder({
   // which its column settings are kept for.
   const resultNames = measureRows.filter((r) => r.column).map((r) => resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure));
   const shownColumns = [...new Set([...groupingNames, ...resultNames])];
-  const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)) };
+  const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) };
   const measureColumns = (fields?.measures ?? []).filter((m) => !isPoints || (m !== lat && m !== lon));
   // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
   const columnChoices = React.useMemo<ColumnChoice[]>(() => {
     const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
     return names.map((name) => ({ name, kind: fields?.kinds?.[name] ?? "text" }));
   }, [fields, wholeMeasure]);
-  const sortChoices = sortOptions(
-    groupingNames,
-    measureRows.filter((r) => r.column).map((r) => {
-      const row = limits.own ? r : { ...r, aggregate: "" };
-      return { name: resultName(row, wholeMeasure), label: measureLabel(row, wholeMeasure) };
+  // The chart's grouped result, and (BI-6 part 2) what is left after its steps: the sort names the last one's columns.
+  const baseResult: ResultColumns = {
+    groups: (isGroupedTable ? shape.groupings : [{ column: dimension } as { column: string; grain?: string }]).filter((g) => g.column).map((g) => {
+      const kind = fields?.kinds?.[g.column] ?? "text";
+      return { name: g.column, kind: g.grain ? (isGrain(g.grain) && !isTruncation(g.grain) ? "number" : kind === "datetime" && (g.grain === "minute" || g.grain === "hour") ? "datetime" : "date") : kind };
     }),
+    measures: resultNames,
+    labels: Object.fromEntries(measureRows.filter((r) => r.column).map((r) => {
+      const row = limits.own ? r : { ...r, aggregate: "" };
+      return [resultName(row, wholeMeasure), measureLabel(row, wholeMeasure)];
+    })),
+  };
+  const stepsOn = stepsApply(shape, shapeContext);
+  const finalResult = stepsOn ? columnsAfterSteps(baseResult, shape.steps) : baseResult;
+  const sortChoices = sortOptions(
+    finalResult.groups.map((g) => g.name),
+    finalResult.measures.map((name) => ({ name, label: finalResult.labels[name] ?? name })),
   );
   const sortLabels = Object.fromEntries(sortChoices.map((o) => [o.value, o.label]));
   // A sort by a measure or grouping the chart no longer has goes back to the default order.
@@ -617,7 +631,7 @@ export function ChartBuilder({
     if (shape.sortChoice.startsWith("by:") && !sortChoices.some((o) => o.value === shape.sortChoice)) setSortChoice("order:desc");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `sortChoices` is rebuilt every render; its content is what matters
   }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
-  const showOther = takesOther(kind, rowsMode) && !grain && !(isGroupedTable && shape.groupings.length > 1) && limitHasEffect(grain, order);
+  const showOther = takesOther(kind, rowsMode) && !grain && shape.steps.length === 0 && !(isGroupedTable && shape.groupings.length > 1) && limitHasEffect(grain, order);
 
   function buildPayload(forPreview = false, withSource: ChartSourceChoice | null = choice): Record<string, unknown> {
     if (missing.length) throw new Error(`Still needed: ${missing.join(", ")}.`);
@@ -1092,6 +1106,10 @@ export function ChartBuilder({
 
           <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} />
 
+          {takesSteps(kind, rowsMode) && !grain && !shapeContext.breakdown && !shape.other ? (
+            <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} />
+          ) : null}
+
           {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {isPivot ? (
             <>
@@ -1136,7 +1154,12 @@ export function ChartBuilder({
               )}
             </div>
           ) : preview ? (
-            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
+            <div className="flex h-full flex-col gap-2">
+              <div className="min-h-0 flex-1">
+                <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
+              </div>
+              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
+            </div>
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
           ) : (

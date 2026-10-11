@@ -7,6 +7,7 @@ import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import type { FilterSkip } from "@/services/clients/bi-store";
+import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
@@ -36,11 +37,13 @@ export function hasRows(c: Cell | undefined): c is Rows {
 
 /** A tile's result as a CSV download, named after the chart. */
 export function downloadRowsCsv(title: string, data: Rows): void {
+  // BI-6 R1: the server's internal columns (`__other`, ...) are not in the file.
+  const columns = visibleColumns(data.columns);
   const rows = data.rows.map((r) =>
-    Object.fromEntries(data.columns.map((c) => [c, r[c] == null ? "" : String(r[c])]))
+    Object.fromEntries(columns.map((c) => [c, r[c] == null ? "" : String(r[c])]))
   );
   const name = title.replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").toLowerCase() || "chart";
-  downloadCsv(`${name}.csv`, toCsv(data.columns, rows));
+  downloadCsv(`${name}.csv`, toCsv(columns, rows));
 }
 
 /** The numbers behind one chart, with a CSV download. */
@@ -59,7 +62,7 @@ export function TileDataDialog({
         </DialogHeader>
         {hasRows(cell) && cell.rows.length ? (
           <>
-            <RowsTable columns={cell.columns} rows={cell.rows} />
+            <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} />
             <div className="flex items-center justify-between">
               <p className="text-[11px] text-muted-foreground">{cell.rows.length} rows</p>
               <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>

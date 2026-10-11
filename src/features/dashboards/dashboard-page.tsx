@@ -103,7 +103,8 @@ function clickSpecOf(spec: ChartCard): ClickSpec {
   return {
     kind: spec.kind,
     source: spec.source,
-    dimension: (own ? spec.def?.dimension : spec.x) || undefined,
+    // BI-6 part 2: after steps a row is no longer a set of source rows: no value drill.
+    dimension: (own ? (spec.def?.steps?.length ? undefined : spec.def?.dimension) : spec.x) || undefined,
     breakdown: (own ? spec.def?.breakdown : spec.series) || undefined,
     y: spec.y,
   };
@@ -579,7 +580,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
         : []),
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
-      ...(offersTileRecords(spec.kind) && (spec.mart || spec.sqlSource)
+      ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
         ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin") }]
         : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to

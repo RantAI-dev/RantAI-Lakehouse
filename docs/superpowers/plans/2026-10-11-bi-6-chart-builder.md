@@ -164,6 +164,64 @@ Table `serving.mart_demo_map_points` (237 rows, `visitors` 278,955, 26 provinces
 9. As a user without `dashboard:write`: the builder's save fails with a plain message and nothing is stored (`BI-6-AC3`).
 10. Ask the assistant: "Visitors by province and month, one category only, top 10". It should call `create_chart` with `filters`, `sort`, `limit` in one go (`AI-6-AC1`); not run in a browser or with the model by me.
 
+### Partial notes — part 2 (developer, uncommitted)
+
+- 2026-10-11 T6 done: `lakehouse-bi` new `builder/steps.rs` (`plan`, `PlannedStep`, `StepsSql`, `steps_sql`, `with_limit`), `shape.rs` (`Step`, `StepCondition`, `Summarise`; `steps` on `ShapeFields`; kind rules), `store.rs` (`check_steps`, `steps_plan`; the saved `x`/`y` are the last step's columns), `builder.rs` (steps through `plan_steps_of`, sort checked against the last step's columns). Real-engine: AC2 and a summarise-twice statement equal the direct nested queries; the role rewrite holds on all nested shapes.
+- 2026-10-11 T7 done: `routes/support.rs::preview_rows` (the same statement with a larger limit, through the same rewrite), `previewRows` on `POST /api/dashboard/specs/preview` and on the SQL-source preview, `PreviewRowsTable` in the builder.
+- 2026-10-11 T8 done: `StepsEditor`, `chart-builder.tsx`, `lib/chart-shape.ts`, schemas + fixture, YAML export, CHANGELOG. R1 done (`visibleColumns` in the tile, View data and CSV). The table-export test with own filters is in `tests/dashboard_export.rs`.
+
+### Handoff — part 2 (developer, 2026-10-11, uncommitted, on top of `75c1f47`)
+
+T6, T7, T8 are built in the working tree, with R1 and the missing table-export test. Nothing is committed, pushed or stashed; the dev servers were not restarted (old build), so nothing here was seen in a browser.
+
+**Files, by task**
+- T6, `lakehouse-bi`: new `builder/steps.rs` (`plan`: checks each step against the result of the one before and renders it; `PlannedStep`, `StepsSql`, `QueryBuilder::steps_sql`, `with_limit`), `shape.rs` (`Step`, `StepCondition`, `Summarise`, `StepMeasure`, `steps` on `ShapeFields`, `MAX_STEPS`, the kind rules), `builder.rs` (`plan_steps_of`; the sort is checked against the last step's columns; `result_aliases` extracted), `store.rs` (`check_steps`, `steps_plan`; the saved chart draws the last step's columns: `x`, `y`, no `series`).
+- T7, API: `routes/support.rs::preview_rows` (one more read of the same statement with a larger limit, through the same guard and role rewrite), `previewRows` on `POST /api/dashboard/specs/preview` and on the SQL-source preview, in `routes/dashboard.rs` and `dashboard_sources.rs`. Console: `PreviewRowsTable` under the chart in the builder.
+- T8: `steps` on the `create_chart` and `update_chart` schemas and `tool_schemas.json` (regenerated, 198 lines added), YAML export lists `steps`, console `StepsEditor` (`chart-shape-section.tsx`), `chart-builder.tsx` (steps in `previewKey` through `shape`, the sort offers the last step's columns, "Other" and steps exclude each other), `lib/chart-shape.ts` (`columnsAfterSteps`, `stepsApply`, `cleanStep`, problems, labels after steps), `dashboard-page.tsx` (a chart with steps: no value drill, "View records" for the whole tile), `chart-draft-card.tsx`, CHANGELOG.
+- R1: `isInternalColumn` / `visibleColumns` in `lib/chart-shape.ts`, used by the tile's table, **View data**, the per-tile CSV and the preview rows table; a test downloads a CSV and checks it.
+- Table export test: `tests/dashboard_export.rs::the_export_carries_the_tiles_own_filters_and_refuses_one_that_no_longer_applies` (own filters ahead of the dashboard's, under the mask; a filter on a missing column is 422, nothing is read, nothing audited).
+
+**Commands run, with counts** (rust from `/home/hv/lakehouse-uiux/rust`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2`, one command at a time, `-p` scoped, both `lib.rs` touched before the clippy run)
+- `cargo fmt --check -p lakehouse-api -p lakehouse-bi`: clean. `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets -- -D warnings`: clean (it found and I fixed two lints: a similar-names binding, a function over 100 lines).
+- `cargo test -p lakehouse-bi`: 329 lib pass, 1 ignored, + 1. `cargo test -p lakehouse-api --lib`: 1600 pass, 1 ignored (the fixture writer).
+- Integration files, each alone on the final tree: `route_auth` 33, `sec11_guard` 4, `security_regressions` 10, `embed_tokens` 21, `query_author_exception` 6, `dashboard_export` 5 (4 + the new own-filters test), `ai_tool` 9, `upstream_errors` 6; all passed, none failed.
+- `bun run typecheck` clean; `bun run lint` 0 errors, the same 6 warnings; `bun run test`: 1278 pass, 1 skip, 0 fail, 139 files. New tests: `builder::steps::tests` 6, `store::tests` 2 (steps saved / refused), `builder::tests` 1 (nested statements pinned), `routes::chart_shapes_rewrite` +2 (nested rewrite, preview rows), `lib/chart-shape.test.ts` +7, `chart-shape-section.test.tsx` +6.
+
+**Section 5, part 2 (dev `ClickHouse` 26.8, `serving.mart_demo_map_points`; the statements are printed by `chart_shapes_rewrite` with `CHART_SHAPES_OUT`)**
+1. `BI-6-AC2`. A table grouped by `provinsi` and `visit_date` (month), measure `visitors`; step 1 summarise by `provinsi` (sum of `visitors`); step 2 filter `sum_visitors > 1000`; sort `sum_visitors` desc. Statement:
+   `SELECT * FROM (SELECT * FROM (SELECT provinsi, __s0 AS sum_visitors FROM (SELECT provinsi, round(sum(visitors)) AS __s0 FROM (SELECT provinsi, visit_date, round(sum(visitors)) AS visitors FROM (SELECT date_trunc('month', visit_date) AS visit_date, provinsi, visitors FROM serving.mart_demo_map_points) AS bkt GROUP BY provinsi, visit_date) GROUP BY provinsi)) WHERE sum_visitors > 1000) ORDER BY sum_visitors DESC, provinsi LIMIT 100 SETTINGS max_rows_to_group_by = 10000, group_by_overflow_mode = 'throw'`
+   Result 25 rows (Dki Jakarta 82,088; Jawa Tengah 18,834; Jawa Barat 13,836; ...); the 26th province, Nusa Tenggara Timur (913), is correctly out. Identical, row for row, to `SELECT provinsi, sum(visitors) sum_visitors FROM serving.mart_demo_map_points GROUP BY provinsi HAVING sum(visitors) > 1000 ORDER BY sum_visitors DESC, provinsi LIMIT 100`.
+2. Summarise again. Groupings `provinsi`, `category`, month; step 1 summarise by `provinsi`, `category` taking the maximum of `visitors`; step 2 summarise by `provinsi` adding up `max_visitors` (statement: two nested `SELECT by, __s0 AS name FROM (SELECT by, agg AS __s0 FROM (<before>) GROUP BY by)` over the grouped result). 26 rows (Dki Jakarta 18,283; Sulawesi Selatan 8,759; Sumatera Barat 8,567; Jawa Tengah 7,933; ...), identical to the direct nested query `SELECT provinsi, sum(m) ... FROM (SELECT provinsi, category, max(v) m FROM (SELECT provinsi, category, date_trunc('month', visit_date) d, sum(visitors) v FROM ... GROUP BY provinsi, category, d) GROUP BY provinsi, category) GROUP BY provinsi`.
+3. Two filter steps over a bar (visitors between 5,000 and 50,000, then province is not Bali): 19 rows, identical to the direct `HAVING` query.
+4. Role rewrite on the nested statements (real `sql_rewrite::enforce`; `routes/chart_shapes_rewrite.rs`): AC2, summarise-twice, two filters, and a steps chart with an own filter plus a dashboard filter; under both obligation sets of part 1 (A masks `place`, `visitors`; B masks `place`, `category`; both with the row filter `provinsi = 'Dki Jakarta'`). All 8 combinations pass: the table name appears as many times in the rewritten statement as in the original, with its mask and its row filter once per read. On the engine under B: AC2 returned `Dki Jakarta 82088` (only the governed province), summarise-twice `Dki Jakarta 10193`, the two filters nothing (Jakarta's 82,088 is over the 50,000 bound), the own-plus-dashboard filter on the masked `category` nothing (the mask precedes the filter, as in part 1). Under A the engine refuses every sum over the masked text (`Code: 43`), as a plain chart does. The rewrite saw into every nested shape; I found no way a role reads what it would mask, filter or deny.
+5. Injection. `builder::steps::tests::a_value_never_reaches_the_statement_outside_a_literal_or_a_parsed_number`: quote, comment, semicolon, backslash, hex and `NaN` values are each a literal or a refusal.
+6. Preview rows. `the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_cut`: a stub engine returns 2,001 rows; the preview shows 2,000 with `truncated: true`, the statement sent has `LIMIT 2001`, the saved chart's limit is still 100; a chart without steps reads nothing more; a tile with an error has no rows. Not timed on a large table.
+
+**Defaults and deviations** (the planner defaults held; where the code argues otherwise)
+1. Also refused with steps (plain sentence): a time grain on the chart, a breakdown, heatmap, sankey, sunburst, calendar. A grouped table may group a date by a grain in its `groupings`, which covers "by month".
+2. The grouped result is read whole before a step (no limit of its own); over 10,000 groups the engine refuses (`group_by_overflow_mode = 'throw'`) instead of cutting silently. The chart's sort and limit (1 to 100) apply to the last step.
+3. A filter step's grouping conditions: text takes equal / not equal; numbers and dates take the comparisons and `between`; a date column is compared as a day. A summary needs at least one grouping kept (a grand total is not a chart).
+4. Output names are `<aggregate>_<column>` (`sum_visitors`); two the same, or one equal to a kept grouping, is refused. After steps the chart draws the first kept grouping as its axis and every output measure as a series; a kind that needs two or three measures (stacked, combo, scatter, bubble) must end with that many.
+5. Preview rows: the extra read is for charts with steps (their tile keeps only the chart's limit); for any other chart the rows are the tile's own result, up to 2,000, with no second read.
+6. "Other" and steps exclude each other in the builder (the switch hides when a step exists; the steps hide while it is on); if both reach the server, `Other` is sent and steps are refused.
+
+**Not verified**
+- Anything in a browser (the builder dialog, the steps editor, the rows panel, the tile menu), including embeds, a masked role, and a user without `dashboard:write`.
+- The steps through the assistant (`AI-6`): schema, fixture and the draft card prefill only; no model call.
+- The preview-rows read over a SQL source (the 1,999 cap is by construction, not run); the 10,000-group refusal on a real result (the settings are in the statement, not triggered).
+- Workspace-wide clippy and test, `docker compose`, the gates (CI).
+
+**Browser checklist ("Map demo", `/dashboards/b_980236ed`; restart the API and console on this tree first; demo table: 237 rows, `visitors` 278,955, 26 provinces)**
+1. **New chart**, **Data table**. Data source `mart_demo_map_points`. Under **Group by** pick `provinsi`, then add `visit_date` and set it to **Month**. Measure `visitors`. Under **Steps** press **Add a step**, change its type to **Summarise again**: **Keep** `provinsi` (remove `visit_date`), measure 1 `visitors` / `sum`. Press **Add a step**: type **Filter the result**, condition `sum_visitors` **is greater than** `1000`. Set **Limit** 100 and **Sort** "sum of visitors, highest first". Expect the preview table to show 25 provinces: Dki Jakarta 82,088; Jawa Tengah 18,834; Jawa Barat 13,836; Sulawesi Selatan 12,799; Sumatera Barat 11,593; ... and no Nusa Tenggara Timur (913). The column header reads "sum of visitors". Under the chart, **Rows (25)** is open and lists the same 25.
+2. Set **Limit** to 5: the chart/table shows 5 rows, **Rows** still lists 25 (the saved chart keeps its limit). Set it back to 100.
+3. Change the condition to `sum_visitors` **is between** 5,000 and 20,000: Jawa Tengah 18,834, Jawa Barat 13,836, Sulawesi Selatan 12,799, Sumatera Barat 11,593, ... (every province from 5,000 to 20,000); Dki Jakarta gone. Remove the filter step, remove the summary step: the table is back to province by month rows. (Each edit re-draws the preview.)
+4. Create the chart, then **Edit chart**: both steps, the sort and the limit come back as saved.
+5. A summarise-twice table: groups `provinsi`, `category`, `visit_date` Month; steps: summarise keeping `provinsi` and `category` with `visitors` / `max`; summarise keeping `provinsi` with `max_visitors` / `sum`. Expect Dki Jakarta 18,283; Sulawesi Selatan 8,759; Sumatera Barat 8,567; Jawa Tengah 7,933.
+6. A bar: dimension `provinsi`, measure `visitors`, steps: filter `visitors` **is between** 5000 and 50000, then filter `provinsi` **is not** `Bali`; Sort "visitors, highest first". Expect 19 bars, Jawa Tengah 18,834 first; no Dki Jakarta (82,088), no Bali.
+7. Add this bar to the dashboard. Click a bar: nothing opens (no value drill). Open the tile's menu: **View records** lists the whole tile's rows (237 rows, 50 a page).
+8. R1: on the top-5-with-Other chart of part 1, open **View data** and **Download CSV**: no `__other` column in either.
+9. Add `steps` in the assistant: ask "Visitors by province and month, then only provinces whose total is over 1000"; it should call `create_chart` with `groupings`, a `summarise` step and a `filter` step (`AI-6-AC1`, not run by me).
+
 ## 8. Review (planner appends)
 
 ### BI-6 part 1 — smoke check and planner answers (reviewer, 2026-10-11)
@@ -178,3 +236,12 @@ By the owner's instruction for phase 2, there is no per-item browser QA and no r
 Not looked at by anyone: the builder dialog (measure rows, Filters section, sort, the `Other` switch, table groupings), the tile's list of its own filters when opened, embeds, a masked role.
 
 Planner answers to the handoff: deviations 1, 2, 3, 5, 6, 7 and 8 are accepted as built. Deviation 4: `__other`, and any result column whose name starts with two underscores, is internal — hide it from "View data" and from the per-tile CSV as well (`SHOULD-FIX` R1, with part 2).
+
+### BI-6 part 2 — smoke check and planner answers (reviewer, 2026-10-11)
+
+No per-item browser QA and no reviewer re-run of the suites (owner's instruction for phase 2). On the dev API rebuilt from this tree, against the real engine: a bar chart of visitors by province with one step keeping totals over 10,000 returns the same eight provinces and totals as a direct `HAVING` query, with `previewRows` present; the demo dashboard's existing tiles return no error.
+
+- `SHOULD-FIX` R2 — A step condition's `value`, `min` or `max` sent as a JSON number (`"value": 10000`) is refused with "body JSON is invalid"; only a string is taken. The assistant's model and any API caller will send numbers. Accept a number or a string, and say which field is wrong when neither fits. To be fixed at the start of the next item.
+- Deviations 1 to 6 of the handoff: accepted as built.
+
+Not looked at by anyone: the steps editor, the rows panel, the builder as a whole.

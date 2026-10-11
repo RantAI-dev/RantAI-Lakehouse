@@ -16,12 +16,21 @@ export type SortDir = "asc" | "desc"
 export type SortSpec = { by: string; dir: SortDir }
 export type Grouping = { column: string; grain?: string }
 
+/** A condition of a filter step, on a column of the result before it (`BI-6` part 2). */
+export type StepCondition = { column: string; op: string; value?: string; min?: string; max?: string }
+export type StepMeasure = { column: string; aggregate: string }
+/** A step: exactly one of `filter` (conditions, all must hold) and `summarise`. */
+export type StepDef = { filter?: StepCondition[]; summarise?: { by: string[]; measures: StepMeasure[] } }
+/** Most steps a chart takes. */
+export const MAX_STEPS = 2
+
 export type ShapeDefFields = {
   measures?: MeasureEntry[]
   filters?: FilterDef[]
   sort?: SortSpec
   other?: boolean
   groupings?: Grouping[]
+  steps?: StepDef[]
 }
 
 /** Most columns a table may be grouped by. */
@@ -164,10 +173,11 @@ export type ShapeDraft = {
   sortChoice: SortChoice
   other: boolean
   groupings: Grouping[]
+  steps: StepDef[]
 }
 
 export function emptyShapeDraft(): ShapeDraft {
-  return { filters: [], sortChoice: "order:desc", other: false, groupings: [] }
+  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [] }
 }
 
 /** A saved definition as a draft; anything absent keeps its default. */
@@ -178,11 +188,23 @@ export function shapeDraftFromDef(def: (ShapeDefFields & { order?: string }) | u
     sortChoice: sortChoiceOf(def),
     other: def.other === true,
     groupings: (def.groupings ?? []).map((g) => ({ ...g })),
+    steps: structuredClone(def.steps ?? []),
   }
 }
 
 /** Which of the draft's fields this kind sends. */
-export type ShapeContext = { kind: string; rowsMode: boolean; grained: boolean }
+export type ShapeContext = { kind: string; rowsMode: boolean; grained: boolean; breakdown?: boolean }
+
+/** Kinds that take steps: the grouped charts and tables whose last result is a list of groups (`lakehouse_bi::shape::check_steps_kind`). */
+export function takesSteps(kind: string, rowsMode = false): boolean {
+  if (rowsMode) return false
+  return ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "radar", "waterfall", "table", "scatter", "bubble"].includes(kind)
+}
+
+/** Whether the draft's steps are sent for this chart: not beside a time grain, a breakdown or "Other". */
+export function stepsApply(d: ShapeDraft, ctx: ShapeContext): boolean {
+  return d.steps.length > 0 && takesSteps(ctx.kind, ctx.rowsMode) && !ctx.grained && !ctx.breakdown && !d.other
+}
 
 /**
  * The fields to merge into the payload. `order` is sent by the caller (it is
@@ -194,6 +216,7 @@ export function shapePayload(d: ShapeDraft, ctx: ShapeContext): Record<string, u
   if (ctx.kind !== "text" && d.filters.length) out.filters = d.filters
   const { sort } = parseSortChoice(d.sortChoice)
   if (sort && takesSort(ctx.kind, ctx.rowsMode)) out.sort = sort
+  if (stepsApply(d, ctx)) out.steps = d.steps.map(cleanStep)
   if (d.other && takesOther(ctx.kind, ctx.rowsMode) && !ctx.grained && !(ctx.kind === "table" && d.groupings.length > 1)) out.other = true
   if (ctx.kind === "table" && !ctx.rowsMode && (d.groupings.length > 1 || d.groupings.some((g) => g.grain))) {
     out.groupings = d.groupings.map((g) => (g.grain ? { column: g.column, grain: g.grain } : { column: g.column }))
@@ -207,13 +230,84 @@ export function usesGroupings(groupings: readonly Grouping[]): boolean {
 }
 
 /** What is still needed before the chart can be previewed, in the builder's own words. */
-export function shapeProblems(d: ShapeDraft, ctx: { kind: string; rowsMode: boolean }): string[] {
+export function shapeProblems(d: ShapeDraft, ctx: { kind: string; rowsMode: boolean; grained?: boolean; breakdown?: boolean }): string[] {
   const out: string[] = []
   if (ctx.kind === "table" && !ctx.rowsMode && d.groupings.length === 0) out.push("Group by")
+  if (stepsApply(d, { ...ctx, grained: !!ctx.grained })) {
+    d.steps.forEach((step, i) => {
+      const n = i + 1
+      if (step.filter && !step.filter.length) out.push(`Step ${n} condition`)
+      else if (step.filter && step.filter.some((c) => !conditionComplete(c))) out.push(`Step ${n} value`)
+      if (step.summarise) {
+        if (!step.summarise.by.length) out.push(`Step ${n} grouping`)
+        if (!step.summarise.measures.length || step.summarise.measures.some((m) => !m.column)) out.push(`Step ${n} measure`)
+      }
+    })
+  }
   return out
 }
 
+/** A condition that can be sent: a value (or a bound of a range) is filled in. */
+export function conditionComplete(c: StepCondition): boolean {
+  if (!c.column) return false
+  if (c.op === "between") return !!(c.min?.trim() || c.max?.trim())
+  return !!c.value?.trim()
+}
+
+/** A step as sent: empty fields dropped. */
+export function cleanStep(step: StepDef): StepDef {
+  if (step.summarise) return { summarise: { by: [...step.summarise.by], measures: step.summarise.measures.map((m) => ({ ...m })) } }
+  return {
+    filter: (step.filter ?? []).map((c) => (c.op === "between"
+      ? { column: c.column, op: c.op, ...(c.min?.trim() ? { min: c.min.trim() } : {}), ...(c.max?.trim() ? { max: c.max.trim() } : {}) }
+      : { column: c.column, op: c.op, value: (c.value ?? "").trim() })),
+  }
+}
+
+// ── the columns after each step ──────────────────────────────────────────
+
+/** The columns of a grouped result a step reads: groupings with their kinds, measures by result name, and their labels. */
+export type ResultColumns = {
+  groups: { name: string; kind: string }[]
+  measures: string[]
+  labels: Record<string, string>
+}
+
+/** The columns after `steps`, each applied to the result before it; a step that names a column the result lacks keeps what it can. */
+export function columnsAfterSteps(base: ResultColumns, steps: readonly StepDef[]): ResultColumns {
+  let cur = base
+  for (const step of steps) {
+    const sum = step.summarise
+    if (!sum) continue
+    const groups = sum.by.flatMap((b) => cur.groups.filter((g) => g.name === b))
+    const measures: string[] = []
+    const labels: Record<string, string> = {}
+    for (const m of sum.measures) {
+      if (!m.column || !m.aggregate) continue
+      const name = `${m.aggregate}_${m.column}`
+      measures.push(name)
+      labels[name] = `${m.aggregate} of ${cur.labels[m.column] ?? m.column}`
+    }
+    cur = { groups, measures, labels }
+  }
+  return cur
+}
+
 // ── what comes back ──────────────────────────────────────────────────────
+
+/**
+ * A result column whose name starts with two underscores is the server's own
+ * (`__other`, the steps' and the ranking's working columns): it is not data
+ * for a person, so no list of a tile's columns shows it or exports it.
+ */
+export function isInternalColumn(name: string): boolean {
+  return name.startsWith("__")
+}
+
+/** The columns of a result a person reads: the internal ones left out. One helper for every place a tile's columns are listed. */
+export function visibleColumns(columns: readonly string[]): string[] {
+  return columns.filter((c) => !isInternalColumn(c))
+}
 
 /** Whether a result row is the computed "Other" group. */
 export function isOtherRow(row: Record<string, unknown> | undefined): boolean {
@@ -244,9 +338,20 @@ export function labelOtherRows<R extends Record<string, unknown>>(rows: readonly
  * tile's `y` names the result columns in the order of the definition's
  * measures, and a name that differs from its column is an own aggregate.
  */
-export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined, y: string | readonly string[]): Record<string, string> {
+export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined, y: string | readonly string[], steps?: readonly StepDef[]): Record<string, string> {
   const names = Array.isArray(y) ? y : [y as string]
   const out: Record<string, string> = {}
+  // After steps the columns are the last step's, not the definition's measures by position.
+  if (steps?.length) {
+    const base: ResultColumns = {
+      groups: [],
+      measures: (measures ?? []).map((m) => (typeof m === "string" ? m : `${m.aggregate}_${m.column}`)),
+      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${m.column}`]]))),
+    }
+    const after = columnsAfterSteps({ ...base, groups: steps.flatMap((s) => (s.summarise?.by ?? []).map((name) => ({ name, kind: "text" }))) }, steps)
+    for (const name of names) if (after.labels[name]) out[name] = after.labels[name]
+    return out
+  }
   names.forEach((name, i) => {
     const entry = measures?.[i]
     if (entry && typeof entry !== "string" && name !== entry.column) {

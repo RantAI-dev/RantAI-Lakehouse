@@ -514,6 +514,58 @@ pub(crate) fn annotate_saved_table(tile: &mut Value, chart: &store::StoredChartS
     }
 }
 
+/// Most rows of a chart's last result the builder's preview table shows
+/// (`BI-6` part 2). Over a SQL source the engine itself returns at most 2,000
+/// rows ([`lakehouse_bi::builder::SQL_SOURCE_SETTINGS`]), so the cap is one
+/// below and a cut is seen instead of hidden by the engine.
+pub(crate) const PREVIEW_RESULT_ROWS: usize = 2000;
+
+/// The rows beside the chart in the builder's preview: up to
+/// [`PREVIEW_RESULT_ROWS`] of the chart's last result, with `truncated` when
+/// more exist. A chart with steps keeps only its limit in the tile, so the
+/// preview reads the same statement with a larger limit (through the same role
+/// rewrite); any other chart's last result is the rows the tile already has.
+/// The saved chart's own limit is not touched. `None` when the tile carries an
+/// error or the longer read fails (the failure is logged under a reference).
+pub(crate) async fn preview_rows(
+    ch: &ChClient,
+    chart: &store::StoredChartSpec,
+    result: &Value,
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) -> Option<Value> {
+    let cap = if chart.def.sql_source.is_some() {
+        PREVIEW_RESULT_ROWS - 1
+    } else {
+        PREVIEW_RESULT_ROWS
+    };
+    let mut shown = result.clone();
+    if chart.def.shape.steps.is_some() {
+        let limit = chart.def.limit.unwrap_or(20);
+        let sql = lakehouse_bi::builder::steps::with_limit(
+            &chart.spec.sql,
+            limit,
+            u32::try_from(cap + 1).ok()?,
+        )?;
+        shown = match try_run_spec_sql(ch, &sql, roles, placeholders, obligations).await {
+            Ok(rows) => rows,
+            Err(SpecRunFailure::Refused(_)) => return None,
+            Err(SpecRunFailure::Clickhouse(err)) => {
+                let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                return None;
+            }
+        };
+    }
+    let columns = shown.get("columns")?.clone();
+    let mut rows = shown.get("rows")?.as_array()?.clone();
+    let truncated = rows.len() > cap;
+    rows.truncate(cap);
+    Some(json!({ "columns": columns, "rows": rows, "truncated": truncated, "limit": cap }))
+}
+
 /// `SELECT table, name, type FROM system.columns WHERE database='serving'`,
 /// grouped into a mart → column-kinds map — used to decide which dashboard
 /// filters apply to which tile, and whether their op fits the column. The

@@ -569,9 +569,18 @@ pub async fn specs_preview(
     .await;
     crate::routes::support::annotate_saved_grain(&mut result, &spec);
     crate::routes::support::annotate_saved_table(&mut result, &spec);
+    // BI-6 part 2: the last result's rows for the table beside the chart.
+    let rows = crate::routes::support::preview_rows(
+        &state.clickhouse,
+        &spec,
+        &result,
+        (&principal.role_names, &placeholders, &obligations),
+    )
+    .await;
     Ok(ApiJson(json!({
         "spec": render_stored_spec(&spec.spec, ChartSource::Ui),
         "result": result,
+        "previewRows": rows,
     })))
 }
 
@@ -2512,7 +2521,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
 /// groupings), present only on the charts that carry them. A measure's own
 /// aggregate is part of `measures`, which is always listed.
 fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 4] = ["filters", "sort", "other", "groupings"];
+    const NAMES: [&str; 5] = ["filters", "sort", "other", "groupings", "steps"];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
         return;
     };
@@ -2815,6 +2824,12 @@ mod tests {
         assert_eq!(fields["filters"][0]["column"], "category");
         assert_eq!(fields["sort"], json!({"by": "visitors", "dir": "desc"}));
         assert_eq!(fields["other"], json!(true));
+        let stepped = def(json!({
+            "steps": [{"filter": [{"column": "visitors", "op": "gt", "value": "1000"}]}],
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&stepped).into_iter().collect();
+        assert_eq!(fields["steps"][0]["filter"][0]["op"], "gt");
         let table = def(json!({
             "kind": "table", "dimension": "",
             "groupings": [{"column": "kab"}, {"column": "d", "grain": "month"}],

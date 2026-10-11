@@ -2873,7 +2873,86 @@ fn check_shaping(
             grained: grain.is_some(),
         },
     )
-    .map_err(BiError::Validation)
+    .map_err(BiError::Validation)?;
+    check_steps(input, from, kinds)
+}
+
+/// `BI-6` part 2: the steps checked against the grouped result they start from,
+/// the last step's result against what the kind draws, and the sort against
+/// the last step's columns.
+fn check_steps(
+    input: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+) -> Result<(), BiError> {
+    let Some(plan) = steps_plan(input, from, kinds)? else {
+        return Ok(());
+    };
+    let need = match input.kind {
+        ChartKind::Stacked | ChartKind::Combo | ChartKind::Scatter => 2,
+        ChartKind::Bubble => 3,
+        _ => 1,
+    };
+    if plan.measures.len() < need {
+        return Err(BiError::Validation(format!(
+            "a {} needs {need} measures at the end of its steps; the last step returns {}.",
+            serde_json::to_value(input.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            plan.measures.len()
+        )));
+    }
+    if let Some(sort) = &input.shape.sort
+        && !plan
+            .groups
+            .iter()
+            .chain(&plan.measures)
+            .any(|c| c.as_str() == sort.by)
+    {
+        return Err(BiError::Validation(format!(
+            "cannot sort by '{}': after the steps the chart has {}.",
+            sort.by,
+            plan.groups
+                .iter()
+                .chain(&plan.measures)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The planned steps of `input` over its grouped result, or `None` without steps.
+fn steps_plan(
+    input: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+) -> Result<Option<crate::builder::steps::StepsSql>, BiError> {
+    let Some(list) = &input.shape.steps else {
+        return Ok(None);
+    };
+    let group_of = |name: &str, grain: Option<&str>| {
+        let kind = kinds.get(name).copied().unwrap_or(ColumnKind::Text);
+        (
+            name.to_owned(),
+            crate::builder::steps::group_kind(kind, grain.and_then(Grain::parse)),
+        )
+    };
+    let groups: Vec<(String, ColumnKind)> = match &input.shape.groupings {
+        Some(g) => g
+            .iter()
+            .map(|g| group_of(&g.column, g.grain.as_deref()))
+            .collect(),
+        None => vec![group_of(&input.dimension, None)],
+    };
+    let measures = shape::resolve_measures(&input.measures, from)
+        .ok_or_else(|| BiError::Validation("invalid or missing measure column.".to_owned()))?;
+    let names: Vec<String> = measures.iter().map(|m| m.alias.to_string()).collect();
+    crate::builder::steps::plan(list, &groups, &names)
+        .map(Some)
+        .map_err(BiError::Validation)
 }
 
 /// The part of [`spec_from_input`] that follows relation resolution, shared
@@ -3035,6 +3114,22 @@ fn finish_shaping(
             "this combination of filters, sort, groupings and measures cannot be built.".to_owned(),
         )
     })?;
+    // BI-6 part 2: after steps the chart draws the last step's columns.
+    if let Ok(Some(plan)) = steps_plan(&spec.def, &from, &kinds) {
+        spec.spec.x = plan
+            .groups
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        spec.spec.series = None;
+        let mut names: Vec<String> = plan.measures.iter().map(ToString::to_string).collect();
+        spec.spec.y = if names.len() == 1 {
+            ChartY::Single(names.remove(0))
+        } else {
+            ChartY::Multi(names)
+        };
+        return Ok(spec);
+    }
     // The result columns of a measure with its own aggregate are named by
     // aggregate and column (`avg_stay`), which is what the console reads.
     if spec.def.measures.has_own_aggregates()
@@ -4810,5 +4905,137 @@ mod tests {
         assert_eq!(off.def.shape.other, None);
         assert_eq!(off.def.shape.filters, None);
         assert!(!off.def.uses_shaping());
+    }
+
+    // ── BI-6 part 2: steps ──────────────────────────────────────────────
+
+    fn steps_chart(extra: &serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "kind": "table", "dimension": "",
+            "groupings": [{"column": "place"}, {"column": "d", "grain": "month"}],
+            "measures": ["visitors"],
+            "steps": [
+                {"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "sum"}]}},
+                {"filter": [{"column": "sum_visitors", "op": "gt", "value": "1000"}]},
+            ],
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+
+    #[test]
+    fn a_chart_with_steps_is_saved_drawing_the_last_steps_columns() {
+        let spec = bi6_save(&steps_chart(&serde_json::json!({
+            "sort": {"by": "sum_visitors", "dir": "desc"},
+        })))
+        .unwrap();
+        assert_eq!(spec.spec.x, "place");
+        assert_eq!(spec.spec.y, ChartY::Single("sum_visitors".to_owned()));
+        assert!(spec.spec.series.is_none());
+        assert!(
+            spec.spec.sql.contains("WHERE sum_visitors > 1000"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("ORDER BY sum_visitors DESC, place LIMIT 20"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(spec.def.uses_shaping());
+        assert_eq!(spec.def.shape.steps_list().len(), 2);
+        // A bar over a plain dimension takes the same steps.
+        let bar = bi6_save(&serde_json::json!({
+            "kind": "bar", "dimension": "place", "measures": ["visitors"],
+            "steps": [{"filter": [{"column": "visitors", "op": "gte", "value": "10"}]}],
+        }))
+        .unwrap();
+        assert_eq!(bar.spec.y, ChartY::Single("visitors".to_owned()));
+        assert!(
+            bar.spec.sql.contains("WHERE visitors >= 10"),
+            "{}",
+            bar.spec.sql
+        );
+    }
+
+    #[test]
+    fn steps_are_refused_with_a_plain_sentence_where_they_do_not_belong() {
+        let step =
+            serde_json::json!([{"filter": [{"column": "visitors", "op": "gt", "value": "1"}]}]);
+        let cases = [
+            (
+                serde_json::json!({"kind": "kpi", "measures": ["visitors"], "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "pivot", "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "table", "tableMode": "rows", "columns": ["place"], "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "geomap", "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "other": true, "limit": 3, "steps": step}),
+                "'Other'",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "dimension": "d", "grain": "month", "steps": step}),
+                "time grain or a breakdown",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "breakdown": "cat", "steps": step}),
+                "time grain or a breakdown",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": []}),
+                "1 to 2 steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": [step[0].clone(), step[0].clone(), step[0].clone()]}),
+                "1 to 2 steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": [{"filter": [{"column": "cat", "op": "eq", "value": "a"}]}]}),
+                "step 1",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "sort": {"by": "visitors", "dir": "asc"}, "steps": [{"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "avg"}]}}]}),
+                "cannot sort by 'visitors'",
+            ),
+            (
+                serde_json::json!({"kind": "stacked", "measures": ["visitors", "stay"], "steps": [{"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "avg"}]}}]}),
+                "needs 2 measures",
+            ),
+        ];
+        for (mut extra, expected) in cases {
+            if extra.get("dimension").is_none()
+                && extra["kind"] != "pivot"
+                && extra["kind"] != "geomap"
+            {
+                extra["dimension"] = serde_json::json!(if extra["kind"] == "table" {
+                    ""
+                } else {
+                    "place"
+                });
+            }
+            if extra.get("measures").is_none()
+                && extra["kind"] != "pivot"
+                && extra["tableMode"] != "rows"
+                && extra["kind"] != "geomap"
+            {
+                extra["measures"] = serde_json::json!(["visitors"]);
+            }
+            let got = bi6_refusal(&extra);
+            assert!(got.contains(expected), "{extra}: {got}");
+        }
     }
 }

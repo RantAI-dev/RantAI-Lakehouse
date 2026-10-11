@@ -195,6 +195,25 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "required": ["by", "dir"],
             "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" },
         "other": { "type": "boolean", "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain" },
+        "steps": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "type": "object", "properties": {
+            "filter": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "type": "object", "properties": {
+                "column": { "type": "string", "description": "a grouping or a measure of the result before this step" },
+                "op": { "type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "between"] },
+                "value": { "type": "string", "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)" },
+                "min": { "type": "string" }, "max": { "type": "string" } },
+                "required": ["column", "op"] },
+                "description": "keep the rows that meet every condition" },
+            "summarise": { "type": "object", "properties": {
+                "by": { "type": "array", "items": { "type": "string" }, "description": "the groupings to keep, a subset of the result before (at least one)" },
+                "measures": { "type": "array", "minItems": 1, "maxItems": 6, "items": { "type": "object", "properties": {
+                    "column": { "type": "string", "description": "a measure of the result before this step" },
+                    "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+                    "required": ["column", "aggregate"] },
+                    "description": "each is named <aggregate>_<column> in the result" } },
+                "required": ["by", "measures"],
+                "description": "group the result before this step again" } },
+            "description": "give exactly one of filter and summarise" },
+            "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'" },
         "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
             "column": { "type": "string" },
             "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" } },
@@ -1515,7 +1534,7 @@ mod tests {
         for tool in ["create_chart", "update_chart"] {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
-            for field in ["filters", "sort", "other", "groupings"] {
+            for field in ["filters", "sort", "other", "groupings", "steps"] {
                 assert!(properties.get(field).is_some(), "{tool} lacks {field}");
             }
             let item = &properties["measures"]["items"]["oneOf"];

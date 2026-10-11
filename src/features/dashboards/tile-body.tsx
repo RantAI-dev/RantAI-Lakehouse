@@ -17,7 +17,7 @@ import { cellClass, CellValue, columnStyle } from "./table-cell";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
-import { labelOtherRows, OTHER_FLAG, tileMeasureLabels, type ShapeDefFields } from "@/lib/chart-shape";
+import { labelOtherRows, tileMeasureLabels, visibleColumns, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
 
 type Cell = Rows | TileFailure;
@@ -55,7 +55,7 @@ export function TileBody({
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
   const def = spec.def as (TableDefFields & ShapeDefFields) | undefined;
   // BI-6: "avg of stay" for a measure with its own aggregate.
-  const measureLabels = tileMeasureLabels(def?.measures, spec.y);
+  const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps);
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
@@ -128,7 +128,7 @@ export function TileBody({
 
 function TableView({ columns, rows, settings = {}, labels = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string> }) {
   // The flag that marks the computed "Other" group is not a column to read.
-  const shown = columns.filter((c) => !settings[c]?.hidden && c !== OTHER_FLAG);
+  const shown = visibleColumns(columns).filter((c) => !settings[c]?.hidden);
   return (
     <div className="h-full overflow-auto">
       <table className="w-full border-collapse text-xs">

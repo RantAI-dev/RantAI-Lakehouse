@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
 import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
-import type { Grouping, MeasureEntry, SortSpec } from "@/lib/chart-shape";
+import type { Grouping, MeasureEntry, SortSpec, StepDef } from "@/lib/chart-shape";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -58,6 +58,7 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     sort: typeof args.sort === "object" && args.sort !== null ? (args.sort as SortSpec) : undefined,
     other: args.other === true ? true : undefined,
     groupings: Array.isArray(args.groupings) ? (args.groupings as Grouping[]) : undefined,
+    steps: Array.isArray(args.steps) ? (args.steps as StepDef[]) : undefined,
   };
 }
 

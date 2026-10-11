@@ -1,11 +1,11 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { ChartFilters, GroupingsEditor, MeasureRows } from "./chart-shape-section"
+import { ChartFilters, GroupingsEditor, MeasureRows, PreviewRowsTable, StepsEditor } from "./chart-shape-section"
 import { OwnFiltersMarker } from "./filters/own-filters-marker"
 import { TileBody } from "./tile-body"
 import { recordsQuery } from "./records"
 import type { ChartRenderSpec } from "@/lib/dashboard-specs"
-import type { MeasureRow } from "@/lib/chart-shape"
+import type { MeasureRow, StepDef } from "@/lib/chart-shape"
 
 afterEach(cleanup)
 
@@ -133,5 +133,85 @@ describe("TileBody with the BI-6 fields", () => {
     render(<TileBody spec={{ ...spec(), def: { measures: ["visitors", { column: "stay", aggregate: "avg" }], columnSettings: { avg_stay: { label: "Stay" } } } } as never} cell={cell} dark={false} loading={false} />)
     expect(screen.getByText("Stay")).toBeTruthy()
     expect(screen.queryByText("avg of stay")).toBeNull()
+  })
+})
+
+describe("StepsEditor", () => {
+  const base = {
+    groups: [{ name: "kab", kind: "text" }, { name: "d", kind: "date" }],
+    measures: ["visitors"], labels: {},
+  }
+  const noop = () => {}
+
+  it("starts a filter step on the first measure and offers at most two steps", () => {
+    const onChange = mock<(steps: StepDef[]) => void>(() => {})
+    const { rerender } = render(<StepsEditor value={[]} onChange={onChange} base={base} disabled={false} />)
+    fireEvent.click(screen.getByText("Add a step"))
+    expect(onChange.mock.calls[0][0]).toEqual([{ filter: [{ column: "visitors", op: "gt", value: "" }] }])
+    const two: StepDef[] = [
+      { filter: [{ column: "visitors", op: "gt", value: "1" }] },
+      { filter: [{ column: "visitors", op: "lt", value: "9" }] },
+    ]
+    rerender(<StepsEditor value={two} onChange={onChange} base={base} disabled={false} />)
+    expect(screen.queryByText("Add a step")).toBeNull()
+  })
+
+  it("types a value into a condition and removes a step", () => {
+    const onChange = mock<(steps: StepDef[]) => void>(() => {})
+    render(<StepsEditor value={[{ filter: [{ column: "visitors", op: "gt", value: "" }] }]} onChange={onChange} base={base} disabled={false} />)
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "1000" } })
+    expect(onChange.mock.calls[0][0]).toEqual([{ filter: [{ column: "visitors", op: "gt", value: "1000" }] }])
+    fireEvent.click(screen.getByLabelText("Remove step 1"))
+    expect(onChange.mock.calls[1][0]).toEqual([])
+  })
+
+  it("adds a second condition and a range shows two bounds", () => {
+    const onChange = mock<(steps: StepDef[]) => void>(() => {})
+    render(<StepsEditor value={[{ filter: [{ column: "visitors", op: "between" }] }]} onChange={onChange} base={base} disabled={false} />)
+    expect(screen.getByLabelText("From")).toBeTruthy()
+    expect(screen.getByLabelText("To")).toBeTruthy()
+    fireEvent.click(screen.getByText("Add condition"))
+    expect(onChange.mock.calls[0][0][0].filter).toHaveLength(2)
+  })
+
+  it("offers the second step the columns the first one left", () => {
+    render(
+      <StepsEditor
+        value={[
+          { summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }] } },
+          { filter: [{ column: "sum_visitors", op: "gt", value: "5" }] },
+        ]}
+        onChange={noop} base={base} disabled={false}
+      />,
+    )
+    // Step 2 reads the summary: its condition column is the summarised measure.
+    expect(screen.getAllByLabelText("Condition column").length).toBe(1)
+    // (The names it offers are pinned in chart-shape.test.ts, `columnsAfterSteps`.)
+    expect(screen.getByLabelText("Step 2")).toBeTruthy()
+  })
+})
+
+describe("PreviewRowsTable and the internal columns", () => {
+  it("lists the rows of the last result without internal columns and says when it was cut", () => {
+    render(<PreviewRowsTable open data={{ columns: ["kab", "v", "__other"], rows: [{ kab: "Bali", v: 3, __other: 0 }], truncated: true, limit: 2000 }} />)
+    expect(screen.getByText("Rows (1 of more than 2,000)")).toBeTruthy()
+    expect(screen.getByText("Only the first 2,000 rows are shown.")).toBeTruthy()
+    expect(screen.queryByText("__other")).toBeNull()
+    expect(screen.getByText("Bali")).toBeTruthy()
+  })
+
+  it("keeps the internal columns out of View data's file", async () => {
+    const saved: string[] = []
+    const { downloadRowsCsv } = await import("./tile-dialogs")
+    const original = URL.createObjectURL
+    URL.createObjectURL = ((blob: Blob) => { void blob.text().then((t) => saved.push(t)); return "blob:x" }) as typeof URL.createObjectURL
+    try {
+      downloadRowsCsv("t", { columns: ["kab", "v", "__other"], rows: [{ kab: "Bali", v: 3, __other: 1 }] })
+      await new Promise((r) => setTimeout(r, 20))
+    } finally {
+      URL.createObjectURL = original
+    }
+    expect(saved.join("")).not.toContain("__other")
+    expect(saved.join("")).toContain("kab,v")
   })
 })
