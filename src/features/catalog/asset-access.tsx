@@ -234,7 +234,7 @@ function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onCha
       title="Classification"
       description={classificationTitle(a)}
       action={
-        // SEC-22 (F4): adding a classification rule needs governance:write,
+        // SEC-23 (F4): adding a classification rule needs governance:write,
         // the same grant as removing one (`canRemove`).
         canRemove ? (
           <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>

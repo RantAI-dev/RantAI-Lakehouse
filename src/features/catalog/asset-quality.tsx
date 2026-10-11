@@ -455,7 +455,7 @@ export function AssetQuality({
               {running ? "Running…" : "Run checks"}
             </Button>
           ) : null}
-          {/* SEC-22 (F4): adding a rule needs governance:write, like editing and deleting one. */}
+          {/* SEC-23 (F4): adding a rule needs governance:write, like editing and deleting one. */}
           {canWrite ? (
             <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
               <Plus />

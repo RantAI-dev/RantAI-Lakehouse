@@ -168,7 +168,7 @@ export function DataQualityPage() {
         title="Data Quality"
         description="Rules, dimensions, thresholds, and remediation signals."
         actions={
-          // SEC-22 (F4): the API now refuses adding a rule without
+          // SEC-23 (F4): the API now refuses adding a rule without
           // governance:write, like editing and deleting one.
           hasPermission("governance:write") ? (
             <Button size="sm" onClick={() => setCreateOpen(true)}>

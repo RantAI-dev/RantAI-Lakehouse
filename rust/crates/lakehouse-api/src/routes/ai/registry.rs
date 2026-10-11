@@ -1085,7 +1085,7 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     // ── T2.5 Governance draft tools ─────────────────────────────────
     // `POST /api/governance/policies` requires `policy:write`
-    // (policy.rs:163). SEC-22 (F3): `POST /api/governance/{kind}` (quality,
+    // (policy.rs:163). SEC-23 (F3): `POST /api/governance/{kind}` (quality,
     // classification) now requires `governance:write` too, so the two rule
     // tools carry it — [`super::gate::decide`] refuses them without it. Before,
     // the tools were an unguarded path around the route policy.
@@ -1423,7 +1423,7 @@ mod tests {
         // `run_bronze_maintenance`, `list_workloads`, both gold export
         // tools, and `ask_user`, which stores and reads nothing. The three
         // draft tools are NOT in this list: `draft_policy` needs
-        // `policy:write`, and since SEC-22 the two rule drafts need
+        // `policy:write`, and since SEC-23 the two rule drafts need
         // `governance:write`.
         assert_eq!(
             offered_names,

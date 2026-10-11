@@ -130,7 +130,7 @@ export function ClassificationPage() {
         title="Classification & Masking"
         description="Classification taxonomy, confidence, and column masking rules."
         actions={
-          // SEC-22 (F4): the API now refuses adding a rule without
+          // SEC-23 (F4): the API now refuses adding a rule without
           // governance:write, like removing one.
           hasPermission("governance:write") ? (
             <Button size="sm" onClick={() => setCreateOpen(true)}>

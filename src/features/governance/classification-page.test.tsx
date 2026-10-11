@@ -1,4 +1,4 @@
-// SEC-22 (F4): the API refuses adding a rule without governance:write, so
+// SEC-23 (F4): the API refuses adding a rule without governance:write, so
 // the "Add Rule" button shows only with it, as the row actions beside it do.
 // `AuthProvider` and the table's URL state need `next/navigation`; stub it
 // before any import resolves (`mock.module` is hoisted).

@@ -827,7 +827,7 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
     );
 }
 
-/// SEC-22 (F1/F2): a principal holding other write permissions but NOT
+/// SEC-23 (F1/F2): a principal holding other write permissions but NOT
 /// `governance:write` is refused (403) when it adds a quality,
 /// classification or residency rule, and nothing is stored. The bodies are
 /// valid, so a 403 can only come from the permission gate, and the row
@@ -846,7 +846,7 @@ async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores
             "quality",
             "quality_rule",
             serde_json::json!({
-                "name": "sec22-no-write", "asset": "gold.orders", "dimension": "completeness",
+                "name": "sec23-no-write", "asset": "gold.orders", "dimension": "completeness",
                 "threshold": "99%", "severity": "high",
             }),
         ),
@@ -862,7 +862,7 @@ async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores
             "residency",
             "residency_rule",
             serde_json::json!({
-                "tenant": "sec22", "classification": "PII", "approvedSites": ["site-a"],
+                "tenant": "sec23", "classification": "PII", "approvedSites": ["site-a"],
                 "crossSiteAllowed": false, "allowedOutput": "none",
             }),
         ),

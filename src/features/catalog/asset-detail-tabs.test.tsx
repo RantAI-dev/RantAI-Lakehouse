@@ -474,7 +474,7 @@ describe("Quality tab", () => {
     url.search = "tab=quality"
     renderTabs(BRONZE, reloaded)
 
-    // The button waits for the session: it shows only with governance:write (SEC-22).
+    // The button waits for the session: it shows only with governance:write (SEC-23).
     fireEvent.click(await screen.findByText("Add rule"))
     fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
@@ -692,7 +692,7 @@ describe("Health and classification", () => {
 
     const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
     expect(within(card).getByText(/The default level/)).toBeTruthy()
-    // The button waits for the session: it shows only with governance:write (SEC-22).
+    // The button waits for the session: it shows only with governance:write (SEC-23).
     fireEvent.click(await within(card).findByText("Classify"))
     fireEvent.change(screen.getByLabelText("Applies to"), { target: { value: "amount" } })
     fireEvent.change(screen.getByLabelText("Classification"), { target: { value: "confidential" } })
@@ -737,7 +737,7 @@ describe("Quality tab: deleting a rule", () => {
   })
 })
 
-// SEC-22 (F4): the API refuses adding a rule without governance:write, so the
+// SEC-23 (F4): the API refuses adding a rule without governance:write, so the
 // buttons that add one show only with it, as Edit and Delete beside them do.
 describe("Quality and Access tabs: adding a rule needs governance:write", () => {
   const without = ["catalog:read", "query:read", "policy:read"]

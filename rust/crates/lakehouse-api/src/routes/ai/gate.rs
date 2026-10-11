@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:write"));
     }
 
-    /// SEC-22 (F3): the copilot was a second way to add a governance rule
+    /// SEC-23 (F3): the copilot was a second way to add a governance rule
     /// without `governance:write`. `POST /api/governance/{kind}` now needs
     /// it, and so do both rule-drafting tools: an Analyst is refused before
     /// `run_tool` runs, so nothing is stored; a principal with the grant
