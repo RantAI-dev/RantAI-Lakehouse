@@ -3,7 +3,9 @@
 import * as React from "react";
 import { CTA, HERO, LINKS } from "./landing-copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "./landing-ui";
+import { useLandingMode } from "./landing-mode";
 import { MascotLogo } from "./mascot-svg";
+import { cn } from "@/lib/utils";
 
 /**
  * S1 — hero. The DOM hero paints first: a CSS night lake with the logo as
@@ -14,6 +16,11 @@ export function HeroSection() {
   return (
     <section id="hero" className="relative isolate min-h-[100svh] overflow-hidden">
       <HeroBackdrop />
+      {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.85)_0%,rgba(2,5,20,0.6)_40%,transparent_70%)]"
+      />
       <Container className="relative z-10 flex min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
         <div className="max-w-[660px]">
           <Eyebrow>{HERO.eyebrow}</Eyebrow>
@@ -35,8 +42,12 @@ export function HeroSection() {
 }
 
 function HeroBackdrop() {
+  const { sceneReady } = useLandingMode();
   return (
-    <div aria-hidden="true" className="absolute inset-0 -z-10">
+    <div
+      aria-hidden="true"
+      className={cn("absolute inset-0 -z-10 transition-opacity duration-700", sceneReady && "opacity-0")}
+    >
       {/* Sky to horizon to lake, in the logo's own blues. */}
       <div className="absolute inset-0 bg-[linear-gradient(180deg,#020514_0%,#050A30_38%,#0A1F55_61%,#0B2A66_61.4%,#061440_74%,#030B2A_100%)]" />
       {/* Moon glow and its reflection streak on the water. */}

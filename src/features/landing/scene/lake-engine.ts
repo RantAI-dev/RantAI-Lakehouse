@@ -1,0 +1,314 @@
+import * as THREE from "three";
+import { createMascot, type Aim } from "./mascot";
+import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
+import { buildEnvironment, createSkyDome, createSkyUniforms, createStars } from "./sky";
+import { createWater } from "./water";
+
+/**
+ * Owns the renderer, the scene graph and the loop for the hero lake.
+ *
+ * Why plain three.js and not React Three Fiber: one canvas, one scene, and a
+ * loop that must stop when it cannot be seen. The engine is created in a
+ * `useEffect` by `lake-scene.tsx` and torn down by `dispose()`, which releases
+ * every geometry, material, texture and the renderer itself (plan §2.9).
+ *
+ * Budgets (plan §2.9): pixel ratio capped at 1.75, 1.25 on phones; the loop
+ * runs only while the page zone is on screen and the tab is visible;
+ * particle counts halve below 768 px. If frames run long for a while the
+ * pixel ratio steps down by itself.
+ */
+
+export type EngineMode = "full" | "still";
+
+export type EngineOptions = {
+  canvas: HTMLCanvasElement;
+  mode: EngineMode;
+  /** The page zone the canvas sits behind; the loop sleeps while it is off screen. */
+  observe: Element;
+  /** The WebGL context was lost; the page falls back to the DOM hero. */
+  onContextLost: () => void;
+};
+
+export type LakeEngine = { dispose: () => void };
+
+const clamp = THREE.MathUtils.clamp;
+
+export function createLakeEngine(opts: EngineOptions): LakeEngine {
+  const { canvas, mode, observe } = opts;
+  const host = canvas.parentElement ?? canvas;  // the host div sized by the page layer
+  const still = mode === "still";
+  let phone = window.innerWidth < 768;
+
+  const maxDpr = phone ? 1.25 : 1.75;
+  let dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
+
+  const renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: !phone,
+    powerPreference: "high-performance",
+  });
+  renderer.setPixelRatio(dpr);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 600);
+
+  // ---- Sky, stars, environment ------------------------------------------
+  const skyUniforms = createSkyUniforms();
+  const sky = createSkyDome(skyUniforms);
+  scene.add(sky);
+  const stars = createStars(phone ? 300 : 600, dpr);
+  scene.add(stars.points);
+  const envTarget = buildEnvironment(renderer, skyUniforms);
+  scene.environment = envTarget.texture;
+  scene.environmentIntensity = 0.95;
+  scene.background = skyUniforms.uSkyHorizon.value;
+
+  // ---- Water -------------------------------------------------------------
+  const water = createWater(skyUniforms, phone);
+  scene.add(water.mesh);
+
+  // ---- Mascot ------------------------------------------------------------
+  const mascot = createMascot({
+    pixelRatio: dpr,
+    onRipple: (amp) => water.spawnRipple(clock.t, amp),
+  });
+  mascot.still = still;
+  scene.add(mascot.group);
+  scene.add(mascot.extras);
+
+  // ---- Lights ------------------------------------------------------------
+  // Moonlight from behind the creature rims its dome. There is deliberately no
+  // front fill: a directional light in front of a clearcoated dome shows up as
+  // a hot spot on its face. The face is lit by the ambient term, the water
+  // bounce (a hemisphere light, diffuse only) and the eye's own glow.
+  const moonLight = new THREE.DirectionalLight(0xbcd8ff, 3.2);
+  moonLight.position.set(...MOON_DIR).multiplyScalar(10);
+  scene.add(moonLight);
+  scene.add(new THREE.AmbientLight(0x1b2f7a, 0.8));
+
+  const clock = { t: still ? STILL_TIME : 0, last: 0 };
+
+  // ---- Input -------------------------------------------------------------
+  const pointer = { x: 0, y: 0, seen: false, lastInput: -100 };
+  const tilt = { x: 0, y: 0, active: false };
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
+  const setPointer = (e: PointerEvent) => {
+    pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+    pointer.y = -((e.clientY / window.innerHeight) * 2 - 1);
+    pointer.seen = true;
+    pointer.lastInput = clock.t;
+  };
+  const isInteractive = (el: EventTarget | null) =>
+    el instanceof Element && el.closest("a,button,input,select,textarea,summary,[role='button']") !== null;
+  const onPointerDown = (e: PointerEvent) => {
+    setPointer(e);
+    if (still || isInteractive(e.target)) return;
+    // Only the hero's own screen area counts as "the dome".
+    ndc.set(pointer.x, pointer.y);
+    raycaster.setFromCamera(ndc, camera);
+    if (raycaster.intersectObject(mascot.dome, false).length > 0) mascot.dip(clock.t);
+  };
+  const onTilt = (e: DeviceOrientationEvent) => {
+    if (e.gamma == null || e.beta == null) return;
+    tilt.x = clamp(e.gamma / 22, -1, 1);
+    tilt.y = clamp(-(e.beta - 50) / 22, -1, 1);
+    tilt.active = true;
+    pointer.lastInput = clock.t;
+  };
+  if (!still) {
+    window.addEventListener("pointermove", setPointer, { passive: true });
+    window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    // Phones: the eye follows tilt when the browser already delivers it
+    // (Android, or iOS after a permission granted earlier). Without events
+    // the idle look-around takes over (plan §2.10).
+    if (phone) window.addEventListener("deviceorientation", onTilt, { passive: true });
+  }
+
+  // ---- Layout ------------------------------------------------------------
+  const anchor = { x: 0, y: 0 };
+  let distScale = 1;
+  const resize = () => {
+    const w = Math.max(1, host.clientWidth);
+    const h = Math.max(1, host.clientHeight);
+    phone = window.innerWidth < 768;
+    renderer.setSize(w, h, false);
+    const aspect = w / h;
+    camera.aspect = aspect;
+    // Desktop: the creature sits right of centre so the copy has the left.
+    // Portrait: it sits in the upper part, above the centred copy.
+    const wide = aspect > 1.1;
+    anchor.x = wide ? 0.42 : 0;
+    anchor.y = wide ? 0 : 0.42;
+    const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
+    // Pull the camera back until the dome fits the width of a narrow screen.
+    distScale = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
+    if (anchor.x !== 0 || anchor.y !== 0) {
+      camera.setViewOffset(w, h, (-anchor.x * w) / 2, (anchor.y * h) / 2, w, h);
+    } else {
+      camera.clearViewOffset();
+    }
+    camera.updateProjectionMatrix();
+    renderOnceIfStill();
+  };
+  const ro = new ResizeObserver(resize);
+  ro.observe(host);
+
+  // ---- Frame -------------------------------------------------------------
+  const aim: Aim = { x: 0, y: 0 };
+  const mascotNdc = new THREE.Vector3();
+  const camBase = new THREE.Vector3(0, 1.15, 7.2);
+  const camLook = new THREE.Vector3(0, 0.75, 0);
+  let lastBob = -1;
+  let ema = 1 / 60;
+  let slow = 0;
+
+  function update(dt: number): void {
+    const t = clock.t;
+
+    // Camera: the hero frame, nudged by the pointer.
+    const px = pointer.seen ? pointer.x : 0;
+    const py = pointer.seen ? pointer.y : 0;
+    camera.position.set(camBase.x + px * 0.35, camBase.y + py * 0.12, camBase.z);
+    camera.position.sub(camLook).multiplyScalar(distScale).add(camLook);
+    camera.lookAt(camLook);
+
+    // Where the creature is on screen decides what "looking at the pointer" means.
+    // The camera must be placed first: projecting through the default camera at
+    // the origin divides by zero and a NaN aim would stick in the eye smoothing.
+    camera.updateMatrixWorld();
+    mascotNdc.set(0, MASCOT_H * 0.45, 0).project(camera);
+    if (!Number.isFinite(mascotNdc.x) || !Number.isFinite(mascotNdc.y)) mascotNdc.set(0, 0, 0);
+    const idle = clamp((t - pointer.lastInput - 3) / 1.5, 0, 1);
+    const wanderX = Math.sin(t * 0.37) * 0.7 + Math.sin(t * 0.91) * 0.15;
+    const wanderY = Math.sin(t * 0.29 + 1.3) * 0.28;
+    let rawX: number;
+    let rawY: number;
+    if (still) {
+      // Reduced motion: the eye rests, looking slightly towards the copy.
+      rawX = -0.1;
+      rawY = 0.04;
+    } else if (tilt.active) {
+      rawX = tilt.x;
+      rawY = tilt.y;
+    } else if (pointer.seen) {
+      rawX = clamp((pointer.x - mascotNdc.x) * 1.1, -1, 1);
+      rawY = clamp((pointer.y - mascotNdc.y) * 1.3, -1, 1);
+    } else {
+      rawX = wanderX;
+      rawY = wanderY;
+    }
+    const w = still ? 0 : idle;
+    aim.x = rawX + (wanderX - rawX) * w;
+    aim.y = rawY + (wanderY - rawY) * w;
+    mascot.update(dt, t, aim, 1);
+
+    // One ring per bob, from the waterline at the trough.
+    const bobIndex = Math.floor((t - 3) / 4);
+    if (bobIndex !== lastBob) {
+      if (lastBob !== -1) water.spawnRipple(t, 0.34);
+      lastBob = bobIndex;
+    }
+
+    sky.position.copy(camera.position);
+    stars.points.position.copy(camera.position);
+    stars.uniforms.uTime.value = t;
+    water.uniforms.uTime.value = t;
+  }
+
+  function renderFrame(): void {
+    renderer.render(scene, camera);
+  }
+
+  function renderOnceIfStill(): void {
+    if (!still) return;
+    // The camera's matrices are built in `update`; run one with no elapsed time.
+    update(1 / 60);
+    for (let i = 0; i < 30; i++) mascot.update(1 / 60, clock.t, aim, 0);
+    renderFrame();
+  }
+
+  let raf = 0;
+  let onScreen = true;
+  const running = () => !still && onScreen && !document.hidden;
+  const loop = (now: number) => {
+    raf = 0;
+    if (!running()) return;
+    raf = requestAnimationFrame(loop);
+    const dt = Math.min((now - clock.last) / 1000, 0.05);
+    clock.last = now;
+    if (dt <= 0) return;
+    clock.t += dt;
+    update(dt);
+    renderFrame();
+
+    // Adaptive quality: after about 1.5 s of frames slower than 25 fps, drop
+    // the pixel ratio one step (never below 1).
+    ema += (dt - ema) * 0.05;
+    slow = ema > 0.04 ? slow + 1 : 0;
+    if (slow > 90 && dpr > 1) {
+      dpr = Math.max(1, dpr - 0.25);
+      renderer.setPixelRatio(dpr);
+      stars.uniforms.uPx.value = dpr;
+      renderer.setSize(host.clientWidth, host.clientHeight, false);
+      slow = 0;
+      ema = 1 / 60;
+    }
+  };
+  const start = () => {
+    if (raf || !running()) return;
+    clock.last = performance.now();
+    raf = requestAnimationFrame(loop);
+  };
+
+  const io = new IntersectionObserver(
+    (entries) => {
+      onScreen = entries.some((e) => e.isIntersecting);
+      if (onScreen) start();
+    },
+    { rootMargin: "0px" },
+  );
+  io.observe(observe);
+  const onVisibility = () => {
+    if (!document.hidden) start();
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+
+  const onLost = (e: Event) => {
+    e.preventDefault();
+    opts.onContextLost();
+  };
+  canvas.addEventListener("webglcontextlost", onLost);
+
+  // Still frame: a ring already out on the water, then a single render.
+  (window as unknown as Record<string, unknown>).__lk = { scene, camera, mascot, water, renderer };
+  if (still) water.spawnRipple(STILL_TIME - 2.2, 0.55);
+  resize();
+  if (!still) start();
+
+  return {
+    dispose() {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      ro.disconnect();
+      io.disconnect();
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pointermove", setPointer);
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("deviceorientation", onTilt);
+      canvas.removeEventListener("webglcontextlost", onLost);
+      mascot.dispose();
+      water.dispose();
+      sky.geometry.dispose();
+      (sky.material as THREE.Material).dispose();
+      stars.points.geometry.dispose();
+      (stars.points.material as THREE.Material).dispose();
+      envTarget.dispose();
+      renderer.dispose();
+      renderer.forceContextLoss();
+    },
+  };
+}
