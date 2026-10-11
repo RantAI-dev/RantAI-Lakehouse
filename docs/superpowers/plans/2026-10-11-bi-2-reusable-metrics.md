@@ -227,3 +227,17 @@ On the dev API rebuilt from `b18a5c1`, over HTTP against the real engine.
 Passed: two metrics created (`Sum([visitors])`, and the same with a filter on `category` = Office); the preview of a bar chart by category with both metrics returns 89,447 / 76,111 / 63,696 / 49,701 for the first and 63,696 for Office and 0 elsewhere for the second, as a direct query does; a KPI on a metric with `last_year` saves and returns its monthly series; the `BI-11` R1 fix holds on the dashboard payload (the switched tile's `y` is `sum_hotels`, as its rows are).
 
 - `BLOCKER` R1 — A chart saved with metrics as measures fails on the dashboard: "This chart could not be loaded." The engine is sent `round(sum(total_visitors_demo)) AS total_visitors_demo … FROM serving.mart_demo_map_points`, the metric's name used as a column: the saved-tile read path does not resolve metrics, while the preview path does (same definition, same moment). Demo tile `u_0a8c305e` ("Total vs Office visitors per category (BI-2 QA)"), measures `[{"metric":"total_visitors_demo"},{"metric":"office_visitors_demo"}]`. Fix the saved-tile path (dashboard, and check embed, public, records, export and the alert digest for the same gap), and add a test that goes through the same function the dashboard read uses, with a metric in the catalog, asserting the statement carries the metric's formula. The KPI path works; find out why the two differ.
+
+### BI-2 — second smoke check (reviewer, 2026-10-11)
+
+On the dev API rebuilt from `cc077d8`, over HTTP against the real engine.
+
+- R1 closed: the tile saved before the fix loads without a re-save, with the right numbers; no tile of the demo dashboard returns an error.
+- A chart saved after the fix is listed by the usage route, and deleting its metric is refused (409) naming the chart and dashboard. A metric alert rule saves and is listed in the metric's usage.
+- `BI-11` R1 closed: the column-switch tile draws its bars (screenshot).
+- Screenshots: a bar chart on one metric, a chart with a filtered metric beside an unfiltered one (only Office has the second bar), a KPI on a metric showing both comparisons (Nov 2026 against Nov 2025 and against Oct 2026).
+
+- `SHOULD-FIX` R2 — The usage route and the delete-in-use rule do not see a chart saved before the R1 fix (its stored measures carry no metric marker), although the reader now treats that chart's measure as the metric: the reviewer deleted a metric two such tiles used and got 200. Only charts saved on this unreleased branch between `b18a5c1` and `cc077d8` are affected; usage and delete must apply the same "is this measure a metric" rule as the reader.
+- `SHOULD-FIX` R3 — A chart's legend, axis and tooltip show a metric's identifier (`total_visitors_demo`) where its label ("Total visitors") is meant.
+
+Not looked at by anyone: the Metrics page, the metric and segment dialogs, the measure picker's metric mark, the rule form's Metric choice. No metric alert has been evaluated by the scheduler on a saved rule.
