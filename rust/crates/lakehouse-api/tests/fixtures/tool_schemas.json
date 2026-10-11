@@ -515,14 +515,23 @@
                         ]
                       },
                       "value": {
-                        "type": "string",
+                        "type": [
+                          "string",
+                          "number"
+                        ],
                         "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)"
                       },
                       "min": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "number"
+                        ]
                       },
                       "max": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "number"
+                        ]
                       }
                     },
                     "required": [
@@ -582,6 +591,70 @@
               "description": "give exactly one of filter and summarise"
             },
             "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'"
+          },
+          "joins": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "inner",
+                    "left",
+                    "right",
+                    "full"
+                  ],
+                  "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                },
+                "on": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "left": {
+                        "type": "string",
+                        "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ]
+                      },
+                      "right": {
+                        "type": "string",
+                        "description": "a column of the table being joined"
+                      }
+                    },
+                    "required": [
+                      "left",
+                      "op",
+                      "right"
+                    ]
+                  },
+                  "description": "the pairs to match, all of them; at least one uses ="
+                }
+              },
+              "required": [
+                "mart",
+                "type",
+                "on"
+              ]
+            },
+            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"
           },
           "groupings": {
             "type": "array",
@@ -1003,14 +1076,23 @@
                         ]
                       },
                       "value": {
-                        "type": "string",
+                        "type": [
+                          "string",
+                          "number"
+                        ],
                         "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)"
                       },
                       "min": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "number"
+                        ]
                       },
                       "max": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "number"
+                        ]
                       }
                     },
                     "required": [
@@ -1070,6 +1152,70 @@
               "description": "give exactly one of filter and summarise"
             },
             "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'"
+          },
+          "joins": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "inner",
+                    "left",
+                    "right",
+                    "full"
+                  ],
+                  "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                },
+                "on": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "left": {
+                        "type": "string",
+                        "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ]
+                      },
+                      "right": {
+                        "type": "string",
+                        "description": "a column of the table being joined"
+                      }
+                    },
+                    "required": [
+                      "left",
+                      "op",
+                      "right"
+                    ]
+                  },
+                  "description": "the pairs to match, all of them; at least one uses ="
+                }
+              },
+              "required": [
+                "mart",
+                "type",
+                "on"
+              ]
+            },
+            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"
           },
           "groupings": {
             "type": "array",
@@ -1179,6 +1325,30 @@
       "parameters": {
         "type": "object",
         "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "suggest_join",
+      "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first: both columns in their tables' sorting keys with the same name and kind, then the same name and kind, then the same name. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "type": "string",
+            "description": "the chart's mart, e.g. mart_visits"
+          },
+          "right": {
+            "type": "string",
+            "description": "the mart to join to it"
+          }
+        },
+        "required": [
+          "left",
+          "right"
+        ]
       }
     }
   },

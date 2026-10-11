@@ -1,4 +1,5 @@
 import type { FilterDef } from "@/services/clients/bi-store"
+import { type JoinDef, type JoinDraft, displayColumn, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
 
 /**
  * The chart builder's own data fields (`BI-6`): a measure with its own
@@ -31,6 +32,8 @@ export type ShapeDefFields = {
   other?: boolean
   groupings?: Grouping[]
   steps?: StepDef[]
+  /** Tables joined to the chart's mart (BI-7). */
+  joins?: JoinDef[]
 }
 
 /** Most columns a table may be grouped by. */
@@ -174,10 +177,12 @@ export type ShapeDraft = {
   other: boolean
   groupings: Grouping[]
   steps: StepDef[]
+  /** Tables joined to the chart's mart (BI-7); only for a chart on a mart. */
+  joins: JoinDraft[]
 }
 
 export function emptyShapeDraft(): ShapeDraft {
-  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [] }
+  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [], joins: [] }
 }
 
 /** A saved definition as a draft; anything absent keeps its default. */
@@ -189,6 +194,7 @@ export function shapeDraftFromDef(def: (ShapeDefFields & { order?: string }) | u
     other: def.other === true,
     groupings: (def.groupings ?? []).map((g) => ({ ...g })),
     steps: structuredClone(def.steps ?? []),
+    joins: joinDraftsFromDef(def.joins),
   }
 }
 
@@ -214,6 +220,7 @@ export function stepsApply(d: ShapeDraft, ctx: ShapeContext): boolean {
 export function shapePayload(d: ShapeDraft, ctx: ShapeContext): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   if (ctx.kind !== "text" && d.filters.length) out.filters = d.filters
+  if (ctx.kind !== "text") Object.assign(out, joinsPayload(d.joins))
   const { sort } = parseSortChoice(d.sortChoice)
   if (sort && takesSort(ctx.kind, ctx.rowsMode)) out.sort = sort
   if (stepsApply(d, ctx)) out.steps = d.steps.map(cleanStep)
@@ -231,7 +238,7 @@ export function usesGroupings(groupings: readonly Grouping[]): boolean {
 
 /** What is still needed before the chart can be previewed, in the builder's own words. */
 export function shapeProblems(d: ShapeDraft, ctx: { kind: string; rowsMode: boolean; grained?: boolean; breakdown?: boolean }): string[] {
-  const out: string[] = []
+  const out: string[] = ctx.kind === "text" ? [] : joinProblems(d.joins)
   if (ctx.kind === "table" && !ctx.rowsMode && d.groupings.length === 0) out.push("Group by")
   if (stepsApply(d, { ...ctx, grained: !!ctx.grained })) {
     d.steps.forEach((step, i) => {
@@ -355,7 +362,10 @@ export function tileMeasureLabels(measures: readonly MeasureEntry[] | undefined,
   names.forEach((name, i) => {
     const entry = measures?.[i]
     if (entry && typeof entry !== "string" && name !== entry.column) {
-      out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${entry.column}`
+      out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${displayColumn(entry.column)}`
+    } else if (typeof name === "string" && displayColumn(name) !== name) {
+      // BI-7: a measure from a joined table reads table.column.
+      out[name] = displayColumn(name)
     }
   })
   return out

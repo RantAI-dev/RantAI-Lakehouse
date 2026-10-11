@@ -171,6 +171,32 @@ pub(super) async fn list_charts(ch: &ChClient) -> Value {
     }
 }
 
+/// The two read tools that say what a chart can be built on beyond one mart:
+/// `list_sql_sources` and `suggest_join` (one dispatch arm, `run_tool` is at
+/// clippy's line limit).
+pub(super) async fn chart_sources(ch: &ChClient, name: &str, args: &Map<String, Value>) -> Value {
+    if name == "suggest_join" {
+        suggest_join(ch, args).await
+    } else {
+        list_sql_sources(ch).await
+    }
+}
+
+/// `suggest_join` (`BI-7`): the route's answer for two marts. A refusal that is
+/// ours (unknown mart, bad name) is told in its words; a database failure is
+/// the fixed message the route would give, never the database's text.
+pub(super) async fn suggest_join(ch: &ChClient, args: &Map<String, Value>) -> Value {
+    let (left, right) = (arg_str(args, "left"), arg_str(args, "right"));
+    match crate::routes::dashboard::join_suggestions_value(ch, Some(&left), Some(&right)).await {
+        Ok(body) => body,
+        Err(
+            lakehouse_core::ApiError::BadRequest(sentence)
+            | lakehouse_core::ApiError::NotFound(sentence),
+        ) => json!({ "error": sentence }),
+        Err(_) => json!({ "error": "the tables' columns could not be read right now" }),
+    }
+}
+
 /// `list_sql_sources`: every dashboard SQL source with its columns split
 /// into dimensions and measures, the same split `describe_mart` uses. A
 /// `ClickHouse` failure is a fixed message, never its text.

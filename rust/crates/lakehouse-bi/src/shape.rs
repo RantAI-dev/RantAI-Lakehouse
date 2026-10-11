@@ -43,6 +43,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::builder::{Measure, Relation, filter_predicates};
 use crate::filters::{ColumnKind, FilterDef, MAX_FILTERS, validate_filters};
 use crate::grain::{Grain, TimeContext};
+use crate::joins::{JoinSpec, MAX_JOINS};
 use crate::specs::{Aggregate, ChartKind};
 
 /// Most columns a table may be grouped by.
@@ -238,22 +239,73 @@ pub struct Grouping {
 }
 
 /// One condition of a filter step, on a column of the result before it.
+///
+/// `value`, `min` and `max` are read as a JSON number or a string (BI-6 review
+/// fix (SHOULD-FIX) R2: the assistant's model and API callers send numbers, and
+/// a typed `Option<String>` refused them as "body JSON is invalid"). Any other
+/// JSON type is not a decode error either: the field is recorded in `invalid`
+/// and the step check names it in a plain sentence, because the route's decode
+/// error carries no text (an upstream-style message must not reach a response).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawStepCondition")]
 pub struct StepCondition {
     /// A grouping or a measure of the result the step reads.
     pub column: String,
     /// `eq`, `ne`, `gt`, `gte`, `lt`, `lte` or `between`.
     pub op: String,
     /// The number, date or text compared with (all but `between`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// `between`: the lower bound, included.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min: Option<String>,
     /// `between`: the upper bound, included.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<String>,
+    /// Names of the fields (`value`, `min`, `max`) that were neither a number
+    /// nor a string. Never written back; the step check refuses the condition.
+    #[serde(skip)]
+    pub invalid: Vec<&'static str>,
+}
+
+/// The wire shape of [`StepCondition`]: the three values as loose JSON.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStepCondition {
+    column: String,
+    op: String,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+    #[serde(default)]
+    min: Option<serde_json::Value>,
+    #[serde(default)]
+    max: Option<serde_json::Value>,
+}
+
+impl From<RawStepCondition> for StepCondition {
+    fn from(raw: RawStepCondition) -> Self {
+        let mut invalid = Vec::new();
+        let mut text = |name: &'static str, v: Option<serde_json::Value>| match v {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s),
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            Some(_) => {
+                invalid.push(name);
+                None
+            }
+        };
+        let value = text("value", raw.value);
+        let min = text("min", raw.min);
+        let max = text("max", raw.max);
+        Self {
+            column: raw.column,
+            op: raw.op,
+            value,
+            min,
+            max,
+            invalid,
+        }
+    }
 }
 
 /// One measure of a summarise step: an aggregate of a measure of the result before.
@@ -313,9 +365,19 @@ pub struct ShapeFields {
     /// Up to [`MAX_STEPS`] steps applied to the grouped result (`BI-6` part 2).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub steps: Option<Vec<Step>>,
+    /// Up to [`crate::joins::MAX_JOINS`] tables of the serving layer joined to
+    /// the chart's mart (`BI-7`); the chart reads them as one flat table.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub joins: Option<Vec<JoinSpec>>,
 }
 
 impl ShapeFields {
+    /// The joins (none when absent or empty).
+    #[must_use]
+    pub fn joins_list(&self) -> &[JoinSpec] {
+        self.joins.as_deref().unwrap_or_default()
+    }
+
     /// The steps (none when absent).
     #[must_use]
     pub fn steps_list(&self) -> &[Step] {
@@ -343,6 +405,7 @@ impl ShapeFields {
             || self.wants_other()
             || self.groupings.is_some()
             || self.steps.is_some()
+            || !self.joins_list().is_empty()
     }
 }
 
@@ -450,7 +513,24 @@ pub fn check_kind_fields(
     if shape.groupings.is_some() && (kind != ChartKind::Table || rows_mode) {
         return Err("groupings are only for a grouped table.".to_owned());
     }
+    check_joins_kind(shape, kind)?;
     check_steps_kind(shape, kind, rows_mode)
+}
+
+/// `BI-7`: a text tile has no data to join, and the count of joins is bounded
+/// before any schema lookup. The tables and columns are checked against the
+/// schema by [`crate::joins::plan`].
+fn check_joins_kind(shape: &ShapeFields, kind: ChartKind) -> Result<(), String> {
+    let Some(joins) = &shape.joins else {
+        return Ok(());
+    };
+    if kind == ChartKind::Text {
+        return Err("a text tile has no data to join.".to_owned());
+    }
+    if joins.len() > MAX_JOINS {
+        return Err(format!("a chart joins 1 to {MAX_JOINS} tables."));
+    }
+    Ok(())
 }
 
 /// Where steps are offered: the charts and tables grouped by one dimension (or

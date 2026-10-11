@@ -56,6 +56,8 @@ import {
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { JoinsSection, type JoinTableInfo } from "./joins-section";
+import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
 import { FormulaEditorDialog } from "./formula-editor";
 import type { CalcField } from "@/services/contracts/calc-fields";
 import { TileBody } from "./tile-body";
@@ -284,9 +286,10 @@ export function ChartBuilder({
   const [editing, setEditing] = React.useState<CalcField | undefined>(undefined);
   const calcNames = React.useMemo(() => new Set((fields?.calculated ?? []).map((f) => f.name)), [fields]);
   /** A calculated field is marked "fx" wherever a column is picked. */
+  // A joined column (`table__column`, BI-7) reads `table.column`.
   const fieldLabel = (name: string) => calcNames.has(name)
     ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
-    : name;
+    : displayColumn(name);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -465,6 +468,50 @@ export function ChartBuilder({
   // SQL may no longer return.
   const previewSql = heldPreview && draft.phase === "fresh" ? draft.sql : null;
   const [paneTab, setPaneTab] = React.useState<"chart" | "rows">("chart");
+  // BI-7: what the join editor knows of each table (columns, sorting key), and the joins the pickers were last loaded for.
+  const [joinInfo, setJoinInfo] = React.useState<Record<string, JoinTableInfo>>({});
+  const joinsSeen = React.useRef("[]");
+  const baseMart = choice?.kind === "mart" ? choice.name : "";
+  async function learnTable(mart: string, against: string): Promise<{ info: JoinTableInfo; pairs?: JoinPairDef[] } | null> {
+    try {
+      const [meta, suggested] = await Promise.all([
+        apiFetch(`/api/dashboard/fields?mart=${encodeURIComponent(mart)}`).then((r) => r.json()),
+        against && against !== mart ? dashboardService.joinSuggestions(against, mart) : Promise.resolve(null),
+      ]);
+      const info = { columns: (meta.columns ?? []).map((c: { name: string }) => c.name), rightKey: suggested?.rightKey ?? [] };
+      setJoinInfo((prev) => ({ ...prev, [mart]: info }));
+      return { info, pairs: suggested ? pairsFromSuggestions(suggested) : undefined };
+    } catch { return null; }
+  }
+  // A table was picked for join `index`: learn its columns and apply the suggested pairs.
+  async function pickJoinTable(index: number, mart: string) {
+    setShape((d) => ({ ...d, joins: d.joins.map((j, k) => (k === index ? { ...j, mart, on: [{ left: "", op: "=", right: "" }] } : j)) }));
+    const learned = await learnTable(mart, baseMart);
+    if (learned?.pairs) {
+      setShape((d) => ({ ...d, joins: d.joins.map((j, k) => (k === index && j.mart === mart ? { ...j, on: learned.pairs ?? j.on } : j)) }));
+    }
+  }
+  // The tables of a chart being edited (or a base table just picked) are learned once.
+  const joinMarts = [...new Set([baseMart, ...shape.joins.map((j) => j.mart)].filter(Boolean))].join(",");
+  React.useEffect(() => {
+    if (!open) return;
+    for (const mart of joinMarts.split(",").filter(Boolean)) {
+      if (!joinInfo[mart]) void learnTable(mart, baseMart);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `joinInfo` and `learnTable` only cache what `joinMarts` names
+  }, [open, joinMarts]);
+  // The pickers list the flat relation's columns, so they follow the joins that are complete.
+  const joinsKey = JSON.stringify(joinsPayload(shape.joins).joins ?? []);
+  React.useEffect(() => {
+    if (!open || !baseMart || joinsSeen.current === joinsKey) return;
+    joinsSeen.current = joinsKey;
+    void loadFields(source).then((f) => {
+      setDimension((v) => keepIfOffered(v, f.dimensions));
+      keepMeasures(f.measures);
+      setBreakdown((v) => keepIfOffered(v, f.dimensions));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reload only when the complete joins change
+  }, [open, joinsKey]);
   const noFieldsHint = isNewSql ? "run the SQL first" : "pick a source first";
   // Required fields still empty: listed in the preview before the user
   // hits Create, and the same list is the save-time error.
@@ -501,10 +548,16 @@ export function ChartBuilder({
   ]);
   const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
 
-  async function loadFields(value: string): Promise<Fields> {
+  async function loadFields(value: string, joins: readonly JoinDraft[] = shape.joins): Promise<Fields> {
     const picked = decodeSourceChoice(value);
     if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
-    const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
+    // BI-7: with joins the columns are the flat relation's (`table__column`).
+    const sent = picked.kind === "mart" ? joinsPayload(joins).joins : undefined;
+    const query = sent ? `${fieldsQuery(picked)}&joins=${encodeURIComponent(JSON.stringify(sent))}` : fieldsQuery(picked);
+    const res = await apiFetch(`/api/dashboard/fields?${query}`);
+    // Joins the server refuses leave the pickers as they were; the preview says why.
+    if (sent && !res.ok) return fields ?? { dimensions: [], measures: [] };
+    const j = await res.json();
     const f = withCalculated(
       { dimensions: j.dimensions ?? [], measures: j.measures ?? [], kinds: kindsOf(j.columns ?? []) },
       (j.columns ?? []).map((c: { name: string }) => c.name),
@@ -551,7 +604,8 @@ export function ChartBuilder({
       const m = sourceValueFromDef(initial);
       setSource(m);
       if (m) {
-        void loadFields(m).then(() => {
+        joinsSeen.current = JSON.stringify(joinsPayload(savedShape.joins).joins ?? []);
+        void loadFields(m, savedShape.joins).then(() => {
           setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
           setMeasureRows(rowsFromEntries(initial.measures));
         });
@@ -569,6 +623,7 @@ export function ChartBuilder({
     setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false);
     setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
+    joinsSeen.current = "[]";
   }
 
   // User changes the data source → reset the column selections and reload.
@@ -896,6 +951,18 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {choice?.kind === "mart" ? (
+              <JoinsSection
+                baseMart={baseMart}
+                baseColumns={joinInfo[baseMart]?.columns ?? []}
+                marts={marts.map((m) => m.name)}
+                joins={shape.joins}
+                onChange={(joins) => setShape((d) => ({ ...d, joins }))}
+                onPickTable={(i, mart) => void pickJoinTable(i, mart)}
+                infoOf={(mart) => joinInfo[mart]}
+                disabled={false}
+              />
+            ) : null}
             {choice?.kind === "sql" && draft.mode !== "edit" ? (
               canWriteSql ? (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">

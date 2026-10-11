@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
 import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
+import type { JoinDef } from "@/lib/chart-joins";
 import type { Grouping, MeasureEntry, SortSpec, StepDef } from "@/lib/chart-shape";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
@@ -59,6 +60,8 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     other: args.other === true ? true : undefined,
     groupings: Array.isArray(args.groupings) ? (args.groupings as Grouping[]) : undefined,
     steps: Array.isArray(args.steps) ? (args.steps as StepDef[]) : undefined,
+    // BI-7: the joins travel to the builder as the model sent them.
+    joins: Array.isArray(args.joins) ? (args.joins as JoinDef[]) : undefined,
   };
 }
 

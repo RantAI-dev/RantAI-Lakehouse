@@ -1367,3 +1367,31 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// BI-7: the join suggestions need `dashboard:read` and nothing more. Asserted
+/// both ways: a principal holding only `dashboard:read` gets past the gate, one
+/// holding only `query:read` is refused.
+#[tokio::test]
+async fn the_join_suggestions_need_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/join-suggestions")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/join-suggestions?left=a&right=b";
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

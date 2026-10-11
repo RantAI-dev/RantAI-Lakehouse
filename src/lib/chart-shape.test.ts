@@ -218,3 +218,11 @@ test("internal columns are left out of every list a person reads", () => {
   assert.equal(isInternalColumn("_x"), false)
   assert.deepEqual(visibleColumns(["kab", "visitors", "__other", "__n"]), ["kab", "visitors"])
 })
+
+test("a joined column is labelled table.column in a tile's legend, including an own aggregate (BI-7)", () => {
+  assert.deepEqual(tileMeasureLabels(["visitors", "capacity__hotels"], ["visitors", "capacity__hotels"]), { capacity__hotels: "capacity.hotels" })
+  assert.deepEqual(
+    tileMeasureLabels(["visitors", { column: "capacity__rooms", aggregate: "max" }], ["visitors", "max_capacity__rooms"]),
+    { max_capacity__rooms: "max of capacity.rooms" },
+  )
+})

@@ -2520,6 +2520,11 @@ struct Resolved {
     kinds: std::collections::HashMap<String, ColumnKind>,
     /// The source's calculated fields (`BI-8`); empty for unsaved SQL.
     fields: Vec<FieldDef>,
+    /// `BI-7`: the columns the joined tables add to `from`, by their flat
+    /// names. `cols` and `kinds` stay the base table's own, because a
+    /// calculated field is compiled against those alone; the joined columns
+    /// are added after the fields are prepared. Empty without joins.
+    joined: std::collections::HashMap<String, ColumnKind>,
 }
 
 /// The `sqlSource` id a spec built over [`InlineSql`] carries. It marks the
@@ -2542,6 +2547,18 @@ pub struct InlineSql<'a> {
     pub columns: &'a [crate::sources::SourceColumn],
 }
 
+/// `BI-7`: a join is between tables of the serving layer; a chart on a SQL
+/// source (stored or not) cannot have one.
+fn no_joins_on_sql(input: &ChartInput) -> Result<(), BiError> {
+    if input.shape.joins_list().is_empty() {
+        Ok(())
+    } else {
+        Err(BiError::Validation(
+            "joins are for charts on a table of the serving layer, not on a SQL source.".to_owned(),
+        ))
+    }
+}
+
 /// A stored SQL source as a relation: its CURRENT text and the columns probed
 /// when it was saved.
 fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
@@ -2554,6 +2571,7 @@ fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
         cols,
         kinds,
         fields: Vec::new(),
+        joined: std::collections::HashMap::new(),
     }
 }
 
@@ -2561,6 +2579,7 @@ fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
 /// stored one. The chart names its columns only: a mart or a source id next
 /// to inline SQL would say two things about where the rows come from.
 fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Resolved, BiError> {
+    no_joins_on_sql(input)?;
     if !input.mart.trim().is_empty()
         || input
             .sql_source
@@ -2582,6 +2601,7 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
             .map(|c| (c.name.clone(), ColumnKind::from_clickhouse_type(&c.ty)))
             .collect(),
         fields: Vec::new(),
+        joined: std::collections::HashMap::new(),
     })
 }
 
@@ -2599,6 +2619,7 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
                 "choose either a mart or a SQL source, not both.".to_owned(),
             ));
         }
+        no_joins_on_sql(input)?;
         let source = crate::sources::get_source(ch, id)
             .await?
             .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
@@ -2616,14 +2637,52 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
     let kinds = validated_mart_columns(ch, &mart).await?;
     let cols = kinds.keys().cloned().collect();
     let fields = crate::fields::list_fields_for(ch, SourceKind::Mart, &mart).await?;
+    let (from, joined) = joined_from(ch, input, &mart, mart_ident, &kinds).await?;
     Ok(Resolved {
         mart,
         sql_source: None,
-        from: Relation::Mart(mart_ident),
+        from,
         cols,
         kinds,
         fields,
+        joined,
     })
+}
+
+/// `BI-7`: the relation a mart chart reads. Without joins it is the mart; with
+/// them, each joined table's columns are read from the schema (a table that
+/// does not exist is refused like a missing mart) and [`joins::plan`] checks
+/// every table, column and pair. Returns the relation and the columns the
+/// joined tables add.
+async fn joined_from(
+    ch: &ChClient,
+    input: &ChartInput,
+    mart: &str,
+    mart_ident: Ident,
+    base_kinds: &std::collections::HashMap<String, ColumnKind>,
+) -> Result<(Relation, std::collections::HashMap<String, ColumnKind>), BiError> {
+    let list = input.shape.joins_list();
+    if list.is_empty() {
+        return Ok((Relation::Mart(mart_ident), std::collections::HashMap::new()));
+    }
+    let mut lookup = std::collections::HashMap::new();
+    lookup.insert(mart.to_owned(), base_kinds.clone());
+    for j in list {
+        let name = j.mart.strip_prefix("serving.").unwrap_or(&j.mart);
+        if Ident::new(name).is_err() {
+            return Err(BiError::Validation("invalid joined table name.".to_owned()));
+        }
+        if !lookup.contains_key(name) {
+            lookup.insert(name.to_owned(), validated_mart_columns(ch, name).await?);
+        }
+    }
+    let planned = crate::joins::plan(mart, list, &lookup).map_err(BiError::Validation)?;
+    let joined = planned
+        .joined
+        .iter()
+        .filter_map(|n| planned.kinds.get(n).map(|k| (n.clone(), *k)))
+        .collect();
+    Ok((planned.from, joined))
 }
 
 /// What [`spec_before_relation`] leaves to do.
@@ -2955,6 +3014,31 @@ fn steps_plan(
         .map_err(BiError::Validation)
 }
 
+/// `BI-7`: the joined columns join the chart's columns after the fields are
+/// prepared, so a formula cannot name one (it is compiled against the base
+/// table's columns alone) and a field cannot take a joined column's name.
+fn add_joined_columns(
+    mut cols: std::collections::HashSet<String>,
+    mut kinds: HashMap<String, ColumnKind>,
+    joined: HashMap<String, ColumnKind>,
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        HashMap<String, ColumnKind>,
+    ),
+    BiError,
+> {
+    for (name, kind) in joined {
+        if kinds.insert(name.clone(), kind).is_some() {
+            return Err(BiError::Validation(format!(
+                "the calculated field '{name}' has the name of a joined column; rename the field."
+            )));
+        }
+        cols.insert(name);
+    }
+    Ok((cols, kinds))
+}
+
 /// The part of [`spec_from_input`] that follows relation resolution, shared
 /// by the stored and the inline path so a chart is validated and its SQL
 /// built by one piece of code whichever way its rows are named.
@@ -2983,6 +3067,7 @@ fn spec_from_resolved(
         cols,
         kinds,
         fields,
+        joined,
     } = resolved;
     let has_year = cols.contains("tahun");
     // BI-8: a chart that names a calculated field of its source is saved
@@ -2994,6 +3079,7 @@ fn spec_from_resolved(
         Some(p) => (p.from, p.cols.keys().cloned().collect(), p.cols),
         None => (from, cols, kinds),
     };
+    let (cols, kinds) = add_joined_columns(cols, kinds, joined)?;
     let agg = input
         .aggregate
         .clone()
@@ -3080,6 +3166,7 @@ fn stored_shape(input: &ChartInput) -> ShapeFields {
         other: input.shape.wants_other().then_some(true),
         // An empty list is no filters, not a second spelling of none.
         filters: Some(input.shape.own_filters().to_vec()).filter(|f| !f.is_empty()),
+        joins: Some(input.shape.joins_list().to_vec()).filter(|j| !j.is_empty()),
         ..input.shape.clone()
     }
 }
@@ -5037,5 +5124,248 @@ mod tests {
             let got = bi6_refusal(&extra);
             assert!(got.contains(expected), "{extra}: {got}");
         }
+    }
+
+    // ── BI-7: joins ──────────────────────────────────────────────────────
+
+    fn join_tables()
+    -> std::collections::HashMap<String, std::collections::HashMap<String, ColumnKind>> {
+        let table = |pairs: &[(&str, ColumnKind)]| {
+            pairs.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect()
+        };
+        std::collections::HashMap::from([
+            (
+                "visits".to_owned(),
+                table(&[
+                    ("provinsi", ColumnKind::Text),
+                    ("visitors", ColumnKind::Number),
+                    ("visit_date", ColumnKind::Date),
+                ]),
+            ),
+            (
+                "capacity".to_owned(),
+                table(&[
+                    ("provinsi", ColumnKind::Text),
+                    ("rooms", ColumnKind::Number),
+                ]),
+            ),
+        ])
+    }
+
+    fn join_input(extra: &serde_json::Value) -> ChartInput {
+        let mut base = serde_json::json!({
+            "title": "Joined", "kind": "bar", "mart": "visits",
+            "dimension": "capacity__provinsi", "measures": ["visitors"],
+            "joins": [{
+                "mart": "capacity", "type": "full",
+                "on": [{ "left": "provinsi", "op": "=", "right": "provinsi" }],
+            }],
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    /// The relation `joined_from` hands `spec_from_resolved`, without the
+    /// schema lookups.
+    fn joined_resolved(input: &ChartInput, fields: Vec<FieldDef>) -> Resolved {
+        let tables = join_tables();
+        let planned = crate::joins::plan("visits", input.shape.joins_list(), &tables).unwrap();
+        let kinds = tables["visits"].clone();
+        Resolved {
+            mart: "visits".to_owned(),
+            sql_source: None,
+            from: planned.from,
+            cols: kinds.keys().cloned().collect(),
+            kinds,
+            fields,
+            joined: planned
+                .joined
+                .iter()
+                .map(|n| (n.clone(), planned.kinds[n]))
+                .collect(),
+        }
+    }
+
+    fn save_joined(input: &ChartInput, fields: Vec<FieldDef>) -> Result<StoredChartSpec, BiError> {
+        spec_from_resolved(
+            input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(input, None).unwrap(),
+            geo_fields(input.kind, input).unwrap(),
+            joined_resolved(input, fields),
+        )
+    }
+
+    #[test]
+    fn a_chart_with_joins_is_saved_over_the_flat_relation_and_keeps_its_joins() {
+        let spec = save_joined(&join_input(&serde_json::json!({})), Vec::new()).unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("FULL JOIN serving.capacity AS __jn1 ON __jn0.provinsi = __jn1.provinsi"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("GROUP BY capacity__provinsi"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.ends_with("SETTINGS join_use_nulls = 1"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.shape.joins_list().len(), 1);
+        assert_eq!(spec.spec.mart, "visits");
+        // The joined columns are chart columns like any other.
+        let rooms = save_joined(
+            &join_input(
+                &serde_json::json!({ "measures": ["capacity__rooms"], "aggregate": "avg" }),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            rooms
+                .spec
+                .sql
+                .contains("round(avg(capacity__rooms)) AS capacity__rooms"),
+            "{}",
+            rooms.spec.sql
+        );
+    }
+
+    #[test]
+    fn a_calculated_field_of_the_base_table_works_and_one_naming_a_joined_column_is_refused() {
+        let field = |name: &str, formula: &str| {
+            let mut f = calc_field(name, formula, "row");
+            f.source_kind = SourceKind::Mart;
+            f.source_id = "visits".to_owned();
+            f
+        };
+        let ok = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["double"] })),
+            vec![field("double", "visitors * 2")],
+        )
+        .unwrap();
+        assert!(
+            ok.spec.sql.contains("(visitors * 2) AS double"),
+            "{}",
+            ok.spec.sql
+        );
+        assert!(
+            ok.spec.sql.contains("FULL JOIN serving.capacity"),
+            "{}",
+            ok.spec.sql
+        );
+        let err = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["double"] })),
+            vec![field("double", "capacity__rooms * 2")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("does not check out")),
+            "{err:?}"
+        );
+        // A field cannot take a joined column's name.
+        let err = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["capacity__rooms"] })),
+            vec![field("capacity__rooms", "visitors * 2")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("name of a joined column")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn joins_are_refused_on_a_text_tile_a_sql_source_and_unsaved_sql() {
+        let text = serde_json::json!({ "kind": "text", "title": "t", "text": "x", "joins": [] });
+        assert!(serde_json::from_value::<ChartInput>(text).is_ok());
+        let mut input = join_input(&serde_json::json!({ "kind": "text", "text": "x" }));
+        input.mart = String::new();
+        let err = spec_from_inline_sql_text(&input);
+        assert!(err.contains("no data to join"), "{err}");
+        let mut on_source = join_input(&serde_json::json!({}));
+        on_source.mart = String::new();
+        let err = no_joins_on_sql(&on_source).unwrap_err();
+        assert!(err.to_string().contains("not on a SQL source"), "{err}");
+        let cols = inline_cols();
+        let err = super::spec_from_inline_sql(
+            &join_input(&serde_json::json!({ "mart": "", "dimension": "place" })),
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+            &DEFAULT_TIME,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not on a SQL source"), "{err}");
+    }
+
+    fn spec_from_inline_sql_text(input: &ChartInput) -> String {
+        shape::check_kind_fields(&input.measures, &input.shape, input.kind, false).unwrap_err()
+    }
+
+    #[test]
+    fn a_chart_without_joins_is_stored_without_the_field_and_an_empty_list_is_no_joins() {
+        let plain = serde_json::to_value(inline_chart(&serde_json::json!({}))).unwrap();
+        assert!(plain.get("joins").is_none());
+        let empty = inline_chart(&serde_json::json!({ "joins": [] }));
+        assert!(!empty.uses_shaping());
+        assert!(stored_shape(&empty).joins.is_none());
+    }
+
+    #[test]
+    fn dashboard_and_chart_filters_read_the_flat_relation_and_a_base_name_stays_the_base_column() {
+        use crate::builder::{ReadContext, sql_with_filters_report};
+        let spec = save_joined(
+            &join_input(&serde_json::json!({
+                "filters": [{ "column": "capacity__provinsi", "values": ["Bali"] }],
+            })),
+            Vec::new(),
+        )
+        .unwrap();
+        let dashboard: Vec<crate::filters::FilterDef> = serde_json::from_value(serde_json::json!([
+            { "column": "provinsi", "values": ["Aceh"] },
+            { "column": "capacity__rooms", "op": "between", "min": "10" },
+        ]))
+        .unwrap();
+        let tables = join_tables();
+        let report = sql_with_filters_report(
+            &spec,
+            &[],
+            &dashboard,
+            &tables,
+            &ReadContext::new(&DEFAULT_TIME),
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Own filter first, then the dashboard's; `provinsi` is the base column.
+        assert!(
+            report.sql.contains(
+                "capacity__provinsi IN ('Bali') AND provinsi IN ('Aceh') AND capacity__rooms >= 10"
+            ),
+            "{}",
+            report.sql
+        );
+        // A chart whose joined table went away fails to build a new statement and
+        // keeps the one it was saved with.
+        let mut gone = join_tables();
+        gone.remove("capacity");
+        let report = sql_with_filters_report(
+            &spec,
+            &[],
+            &dashboard,
+            &gone,
+            &ReadContext::new(&DEFAULT_TIME),
+        );
+        assert_eq!(report.sql, spec.spec.sql);
     }
 }

@@ -23,6 +23,7 @@ use crate::filters::{
 };
 use crate::formula::compile::{FixedJoin, HiddenAgg, Shift};
 use crate::grain::{self, Grain, TimeContext, WeekStart};
+use crate::joins;
 use crate::shape;
 use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
@@ -56,6 +57,20 @@ pub const SQL_SOURCE_SETTINGS: &str =
 pub enum Relation {
     /// A Gold mart, unqualified (`mart_x`); rendered as `serving.mart_x`.
     Mart(Ident),
+    /// A table and the tables joined to it (`BI-7`), read as one flat table:
+    /// the base table's columns under their own names, each joined table's
+    /// under `<alias>__<column>`. Every table is a plain `serving.<table>`
+    /// reference in a `FROM` or `JOIN` position, so the role rewrite
+    /// substitutes its masked, filtered projection at each one. Only
+    /// [`crate::joins::plan`] creates it.
+    Joined {
+        /// The base table, unqualified.
+        base: Ident,
+        /// Its columns.
+        base_columns: Vec<Ident>,
+        /// The joined tables, in order.
+        joins: Vec<crate::joins::JoinedTable>,
+    },
     /// A dashboard SQL source's text. The API validates it (read-only,
     /// `serving.*` tables only, no `;`/`SETTINGS`/`FORMAT`) before storing
     /// it; here it is only ever wrapped as a derived table so this
@@ -164,6 +179,11 @@ impl Relation {
     pub fn render(&self) -> String {
         match self {
             Self::Mart(mart) => format!("serving.{mart}"),
+            Self::Joined {
+                base,
+                base_columns,
+                joins,
+            } => Self::render_joined(base, base_columns, joins),
             Self::Sql(sql) => format!("(\n{}\n) AS src", sql.trim()),
             Self::Filtered { base, predicates } => format!(
                 "(SELECT * FROM {} WHERE {}) AS flt",
@@ -226,7 +246,7 @@ impl Relation {
     #[must_use]
     pub fn aggregate_field(&self, name: &str) -> Option<&AggregateField> {
         match self {
-            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Mart(_) | Self::Sql(_) | Self::Joined { .. } => None,
             Self::Calculated {
                 base, aggregates, ..
             } => aggregates
@@ -246,6 +266,9 @@ impl Relation {
     pub(crate) fn settings(&self) -> String {
         match self {
             Self::Mart(_) => String::new(),
+            // BI-7: an outer join's missing side is empty (NULL), not the
+            // type's default; the engine's own join memory limit stays.
+            Self::Joined { .. } => " SETTINGS join_use_nulls = 1".to_owned(),
             Self::Sql(_) => SQL_SOURCE_SETTINGS.to_owned(),
             Self::Filtered { base, .. }
             | Self::Bucketed { base, .. }
@@ -259,7 +282,7 @@ impl Relation {
     #[must_use]
     pub fn table_calc(&self, name: &str) -> Option<&TableCalc> {
         match self {
-            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Mart(_) | Self::Sql(_) | Self::Joined { .. } => None,
             Self::Calculated {
                 base, table_calcs, ..
             } => table_calcs
@@ -292,7 +315,16 @@ impl Relation {
 
 /// `settings` (empty or ` SETTINGS a, b`) with more settings appended.
 pub(crate) fn add_settings(settings: &str, more: &[&str]) -> String {
-    if settings.is_empty() {
+    // BI-7: a joined relation under a `Fixed` join asks for the same setting
+    // twice; a setting already there is not repeated.
+    let more: Vec<&str> = more
+        .iter()
+        .copied()
+        .filter(|m| !settings.contains(*m))
+        .collect();
+    if more.is_empty() {
+        settings.to_owned()
+    } else if settings.is_empty() {
         format!(" SETTINGS {}", more.join(", "))
     } else {
         format!("{settings}, {}", more.join(", "))
@@ -873,7 +905,7 @@ const SQL_SOURCE_MAX_ROWS: u32 = 2000;
 #[must_use]
 pub fn point_limit(from: &Relation) -> u32 {
     match from {
-        Relation::Mart(_) => POINT_LIMIT,
+        Relation::Mart(_) | Relation::Joined { .. } => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
         Relation::Filtered { base, .. }
         | Relation::Bucketed { base, .. }
@@ -1147,7 +1179,12 @@ where
     }
     let empty_cols: RelationColumns<HCols> = RelationColumns::default();
     let cols = mart_cols.get(&def.mart).unwrap_or(&empty_cols);
-    let outcome = filter_predicates(cols, years, filters, read.time);
+    // BI-7: the dashboard's filters apply to the columns of the whole flat
+    // relation; one on a base column's name still means the base column.
+    let Ok((filter_cols, joined)) = joined_relation(def, cols, mart_cols) else {
+        return unfiltered(Vec::new());
+    };
+    let outcome = filter_predicates(&filter_cols, years, filters, read.time);
     // BI-16 part A: a raw table is rebuilt too, because its second statement
     // (the count) is built here and not stored; a comparing KPI because its
     // periods depend on the deployment's time settings. BI-8: so is a chart
@@ -1167,25 +1204,70 @@ where
     // only ever fail on data corruption; fall back to the stored SQL rather
     // than panicking, matching "SQL never comes raw from untrusted input"
     // without introducing a new failure mode.
-    let Ok(mart) = Ident::new(def.mart.clone()) else {
+    if Ident::new(def.mart.clone()).is_err() {
         return unfiltered(outcome.skipped);
-    };
-    let from = Relation::Mart(mart);
-    match fields::prepare(
+    }
+    // BI-7: a calculated field is compiled against the base table's columns
+    // alone, and the joined columns are added to what the chart can name
+    // afterwards.
+    let from = joined.from.clone();
+    let prepared = fields::prepare(
         read.fields.for_chart(def),
         def,
         from.clone(),
         cols,
         read.time,
-    ) {
-        Ok(None) => report_over(spec, &from, cols, outcome, read, Some(&spec.spec.sql)),
-        Ok(Some(p)) => report_over(spec, &p.from, &p.cols, outcome, read, Some(&spec.spec.sql)),
+    );
+    match prepared {
+        Ok(None) => report_over(
+            spec,
+            &from,
+            &filter_cols,
+            outcome,
+            read,
+            Some(&spec.spec.sql),
+        ),
+        Ok(Some(p)) => match joins::with_joined_columns(p.cols, &filter_cols, &joined.joined) {
+            Ok(all) => report_over(spec, &p.from, &all, outcome, read, Some(&spec.spec.sql)),
+            Err(_) => Some(unfiltered(outcome.skipped)),
+        },
         // A field that no longer checks out: the chart keeps the SQL it was
         // saved with and the dashboard's error is the field's, never other
         // SQL built from a half-understood definition.
         Err(_) => Some(unfiltered(outcome.skipped)),
     }
     .unwrap_or_else(|| unfiltered(Vec::new()))
+}
+
+/// The relation a mart chart reads, joins included, and the columns the
+/// dashboard's filters can name: the mart's own when it has no joins. `Err`
+/// when a join no longer checks out (a table or column went away).
+fn joined_relation<H, S>(
+    def: &ChartInput,
+    cols: &RelationColumns<H>,
+    mart_cols: &HashMap<String, RelationColumns<H>, S>,
+) -> Result<(RelationColumns, joins::ChartRelation), ()>
+where
+    H: std::hash::BuildHasher,
+    S: std::hash::BuildHasher,
+{
+    let Ok(mart) = Ident::new(def.mart.clone()) else {
+        return Err(());
+    };
+    if def.shape.joins_list().is_empty() {
+        return Ok((
+            cols.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            joins::ChartRelation {
+                from: Relation::Mart(mart),
+                cols: RelationColumns::default(),
+                joined: Vec::new(),
+                origins: HashMap::new(),
+            },
+        ));
+    }
+    let planned =
+        joins::chart_relation(&mart, def.shape.joins_list(), mart_cols).map_err(|_| ())?;
+    Ok((planned.cols.clone(), planned))
 }
 
 /// `outcome` (the year and the dashboard's filters) with the chart's own

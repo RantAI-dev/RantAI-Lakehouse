@@ -1,5 +1,6 @@
 "use client";
 
+import { displayColumn } from "@/lib/chart-joins";
 import * as React from "react";
 import type { ChartClickHandler } from "@/lib/chart-click";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
@@ -86,7 +87,7 @@ export function TileBody({
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
     if (def?.tableMode === "rows") {
-      return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def }} cell={cell} paging={paging} onSortChange={onTableSort} />;
+      return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def, chart: spec.source !== "builtin" && (def?.filters?.length || def?.joins?.length) ? spec.id : undefined }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
     return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} labels={measureLabels} />;
   }
@@ -134,7 +135,7 @@ function TableView({ columns, rows, settings = {}, labels = {} }: { columns: str
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 bg-card">
           <tr className="border-b border-border">
-            {shown.map((c) => <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{settings[c]?.label ?? labels[c] ?? c}</th>)}
+            {shown.map((c) => <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{settings[c]?.label ?? labels[c] ?? displayColumn(c)}</th>)}
           </tr>
         </thead>
         <tbody>

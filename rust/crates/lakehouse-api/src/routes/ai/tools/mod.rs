@@ -124,8 +124,7 @@ pub(in crate::routes) async fn run_tool(
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(ch, args).await,
         "create_chart" | "update_chart" => {
-            // BI-9: a chart's SQL is built with the report time zone, which
-            // is a deployment setting.
+            // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
                 // The cause was logged under a reference by `time_context`.
                 return json!({ "error": "The reporting settings could not be read." });
@@ -140,7 +139,7 @@ pub(in crate::routes) async fn run_tool(
         "list_boards" => dashboards::list_boards(ch).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
-        "list_sql_sources" => dashboards::list_sql_sources(ch).await,
+        "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
         "list_formula_functions"
         | "list_calculated_fields"

@@ -105,6 +105,14 @@ fn bound(kind: ColumnKind, column: &str, raw: Option<&str>, what: &str) -> Resul
 }
 
 fn condition(c: &StepCondition, kind: ColumnKind) -> Result<String, String> {
+    // BI-6 review fix (SHOULD-FIX) R2: a value that is neither a number nor a
+    // string is refused here, naming the field.
+    if let Some(field) = c.invalid.first() {
+        return Err(format!(
+            "the {field} of the condition on '{}' must be a number or text.",
+            c.column
+        ));
+    }
     let subject = match kind {
         ColumnKind::Date | ColumnKind::DateTime => format!("toDate32({})", c.column),
         _ => c.column.clone(),
@@ -409,6 +417,7 @@ mod tests {
             value: value.map(str::to_owned),
             min: None,
             max: None,
+            invalid: Vec::new(),
         }
     }
     fn filter(conditions: Vec<StepCondition>) -> Step {
@@ -628,6 +637,54 @@ mod tests {
         assert_eq!(
             with_limit("SELECT * FROM (SELECT 1 LIMIT 3) LIMIT 3", 3, 9),
             None
+        );
+    }
+
+    #[test]
+    fn a_condition_value_sent_as_a_json_number_is_taken_like_the_same_text() {
+        // BI-6 review fix (SHOULD-FIX) R2.
+        let from_json = |raw: &str| -> StepCondition { serde_json::from_str(raw).unwrap() };
+        let number = from_json(r#"{"column":"visitors","op":"gt","value":10000}"#);
+        let text = from_json(r#"{"column":"visitors","op":"gt","value":"10000"}"#);
+        assert_eq!(number, text);
+        let range = from_json(r#"{"column":"n","op":"between","min":1,"max":9.5}"#);
+        assert_eq!(
+            (range.min.as_deref(), range.max.as_deref()),
+            (Some("1"), Some("9.5"))
+        );
+        let planned = |c| plan(&[filter(vec![c])], &groups(), &measures());
+        assert_eq!(planned(number).unwrap().steps, planned(text).unwrap().steps);
+        // A condition read back is written with strings, as before.
+        let written = serde_json::to_value(&range).unwrap();
+        assert_eq!(written["min"], "1");
+        assert!(written.get("invalid").is_none());
+    }
+
+    #[test]
+    fn a_condition_value_that_is_neither_number_nor_text_is_refused_naming_the_field() {
+        // BI-6 review fix (SHOULD-FIX) R2.
+        for (raw, field) in [
+            (r#"{"column":"visitors","op":"gt","value":true}"#, "value"),
+            (r#"{"column":"visitors","op":"gt","value":[1]}"#, "value"),
+            (
+                r#"{"column":"n","op":"between","min":{"a":1},"max":3}"#,
+                "min",
+            ),
+            (
+                r#"{"column":"n","op":"between","min":1,"max":false}"#,
+                "max",
+            ),
+        ] {
+            let c: StepCondition = serde_json::from_str(raw).unwrap();
+            let err = plan(&[filter(vec![c])], &groups(), &measures()).unwrap_err();
+            assert!(
+                err.contains(&format!("the {field} of the condition")),
+                "{err}"
+            );
+        }
+        // Unknown keys are still a decode error.
+        assert!(
+            serde_json::from_str::<StepCondition>(r#"{"column":"a","op":"eq","other":1}"#).is_err()
         );
     }
 }

@@ -329,6 +329,14 @@ pub(crate) fn stored_chart_sql(
     read: &lakehouse_bi::builder::ReadContext<'_>,
 ) -> Result<FilteredSql, &'static str> {
     let Some(id) = chart.def.sql_source.as_deref() else {
+        // BI-7: a join that no longer checks out (a table or column went away)
+        // is the tile's error, never the stored statement run unfiltered.
+        if let Ok(mart) = lakehouse_core::ident::Ident::new(chart.def.mart.clone())
+            && lakehouse_bi::joins::chart_relation(&mart, chart.def.shape.joins_list(), mart_cols)
+                .is_err()
+        {
+            return Err("this chart's joined tables no longer match its definition");
+        }
         return Ok(lakehouse_bi::builder::sql_with_filters_report(
             chart, years, filters, mart_cols, read,
         ));

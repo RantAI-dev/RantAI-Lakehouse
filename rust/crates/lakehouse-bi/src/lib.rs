@@ -12,6 +12,7 @@ pub mod filters;
 pub mod folders;
 pub mod formula;
 pub mod grain;
+pub mod joins;
 pub mod shape;
 pub mod sources;
 pub mod specs;

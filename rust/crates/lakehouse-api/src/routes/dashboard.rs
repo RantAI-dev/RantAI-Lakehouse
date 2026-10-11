@@ -433,6 +433,19 @@ fn filter_fields(
             };
             source_cols = source.column_kinds();
             &source_cols
+        } else if !c.def.shape.joins_list().is_empty() {
+            // BI-7: a joined chart's columns are the flat relation's, so a
+            // dashboard filter can name a joined column as `table__column`.
+            let Ok(mart) = lakehouse_core::ident::Ident::new(c.def.mart.clone()) else {
+                continue;
+            };
+            let Ok(joined) =
+                lakehouse_bi::joins::chart_relation(&mart, c.def.shape.joins_list(), mart_cols)
+            else {
+                continue;
+            };
+            source_cols = joined.cols;
+            &source_cols
         } else if let Some(cols) = mart_cols.get(&c.def.mart) {
             cols
         } else {
@@ -1058,6 +1071,11 @@ pub struct FieldsQuery {
     /// of a mart's.
     #[serde(default)]
     source: Option<String>,
+    /// `BI-7`: with `mart`, a JSON list of joins; answers with the columns of
+    /// the flat relation they make (the mart's own, and each joined table's as
+    /// `table__column`).
+    #[serde(default)]
+    joins: Option<String>,
 }
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
@@ -1069,6 +1087,15 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
             Err(err) => crate::error::ApiRejection(err).into_response(),
         };
     }
+    if let (Some(mart), Some(raw)) = (
+        q.mart.as_deref(),
+        q.joins.as_deref().map(str::trim).filter(|j| !j.is_empty()),
+    ) {
+        return match joined_fields_body(&state.clickhouse, mart, raw).await {
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+            Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
+        };
+    }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
@@ -1077,6 +1104,126 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         )
             .into_response(),
     }
+}
+
+/// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
+/// mart and its joins make, with their types, split like a mart's own. Schema
+/// metadata only, exactly like the mart's own answer: it names the same
+/// tables and columns `?mart=` lists for any caller who can read dashboards,
+/// and reads no row. The sentence for a join that does not check out is ours
+/// (built from names in the request and the schema), never the database's.
+async fn joined_fields_body(ch: &ChClient, mart: &str, raw: &str) -> Result<Value, ApiError> {
+    let joins: Vec<lakehouse_bi::joins::JoinSpec> = serde_json::from_str(raw)
+        .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?;
+    let base = strip_non_ident(mart.strip_prefix("serving.").unwrap_or(mart));
+    let ident = lakehouse_core::ident::Ident::new(base.clone())
+        .map_err(|_| ApiError::BadRequest("invalid mart".to_owned()))?;
+    let (types, all) = tables_schema(
+        ch,
+        std::iter::once(base.as_str()).chain(
+            joins
+                .iter()
+                .map(|j| j.mart.strip_prefix("serving.").unwrap_or(&j.mart)),
+        ),
+    )
+    .await?;
+    let planned =
+        lakehouse_bi::joins::chart_relation(&ident, &joins, &all).map_err(ApiError::BadRequest)?;
+    let mut dimensions = Vec::new();
+    let mut measures = Vec::new();
+    let mut columns_out = Vec::new();
+    // The base table's columns in the table's own order, then each joined
+    // table's in the order of the joins.
+    let mut names: Vec<&String> = planned.cols.keys().collect();
+    names.sort_by_key(|n| {
+        let (table, column) = planned.origins.get(*n).cloned().unwrap_or_default();
+        (
+            table != base,
+            types
+                .get(&(table, column))
+                .map_or(usize::MAX, |(position, _)| *position),
+            (*n).clone(),
+        )
+    });
+    for name in names {
+        let ty = planned
+            .origins
+            .get(name)
+            .and_then(|o| types.get(o))
+            .map_or("", |(_, ty)| ty.as_str());
+        if is_numeric_type(ty) {
+            measures.push(name.clone());
+        } else {
+            dimensions.push(name.clone());
+        }
+        columns_out.push(json!({ "name": name, "type": ty }));
+    }
+    // BI-7: a calculated field belongs to the base table; joined columns are
+    // not offered to a formula.
+    let calculated =
+        lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::Mart, &base)
+            .await
+            .map_err(|failure| classify_dashboard_ch_error(&failure))?;
+    Ok(json!({
+        "mart": base,
+        "dimensions": dimensions,
+        "measures": measures,
+        "columns": columns_out,
+        "calculated": calculated,
+        "joined": planned.joined,
+        "joins": joins,
+    }))
+}
+
+/// The name, position and type of every column of the given tables of the
+/// serving layer (`(table, column)` to `(position, type)`), and their columns
+/// by kind for [`lakehouse_bi::joins::plan`]. Schema metadata only.
+async fn tables_schema<'a>(
+    ch: &ChClient,
+    tables: impl Iterator<Item = &'a str>,
+) -> Result<
+    (
+        HashMap<(String, String), (usize, String)>,
+        HashMap<String, RelationColumns>,
+    ),
+    ApiError,
+> {
+    use lakehouse_core::ident::SqlLiteral;
+    let names: Vec<String> = tables
+        .map(|t| SqlLiteral::from(strip_non_ident(t)).to_string())
+        .collect();
+    let sql = format!(
+        "SELECT table, name, type, position FROM system.columns WHERE database='serving' AND table IN ({}) ORDER BY position",
+        names.join(",")
+    );
+    let rows = ch
+        .rows(&sql, None)
+        .await
+        .map_err(|failure| classify_dashboard_ch_error(&failure))?;
+    let mut types = HashMap::new();
+    let mut kinds: HashMap<String, RelationColumns> = HashMap::new();
+    for r in &rows {
+        let table = r.get("table").and_then(Value::as_str).unwrap_or("");
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+        let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
+        let position = r
+            .get("position")
+            .and_then(|p| {
+                p.as_u64()
+                    .or_else(|| p.as_str().and_then(|t| t.parse().ok()))
+            })
+            .and_then(|p| usize::try_from(p).ok())
+            .unwrap_or(usize::MAX);
+        types.insert(
+            (table.to_owned(), name.to_owned()),
+            (position, ty.to_owned()),
+        );
+        kinds
+            .entry(table.to_owned())
+            .or_default()
+            .insert(name.to_owned(), ColumnKind::from_clickhouse_type(ty));
+    }
+    Ok((types, kinds))
 }
 
 /// `?source=` branch of [`fields`]: the SQL source's columns, split the same
@@ -1177,6 +1324,111 @@ async fn fields_body(
         "measures": measures,
         "columns": columns_out,
         "calculated": calculated,
+    }))
+}
+
+// ── /api/dashboard/join-suggestions (BI-7) ───────────────────────────────
+
+/// Query parameters for `GET /api/dashboard/join-suggestions`.
+#[derive(Debug, Deserialize)]
+pub struct JoinSuggestionsQuery {
+    #[serde(default)]
+    left: Option<String>,
+    #[serde(default)]
+    right: Option<String>,
+}
+
+/// `GET /api/dashboard/join-suggestions?left=<mart>&right=<mart>` — candidate
+/// column pairs for joining two tables of the serving layer, best first
+/// (`BI-7`): both in the tables' sorting keys with the same name and a
+/// compatible kind, then the same name and a compatible kind, then the same
+/// name. Answers also whether the suggested right-hand columns cover the right
+/// table's sorting key (the console warns that rows may multiply when they do
+/// not).
+///
+/// Schema metadata only, from `system.columns`: the names, kinds and sorting
+/// keys of tables whose columns `GET /api/dashboard/fields` lists to the same
+/// callers, so the route tells a caller nothing the fields route does not. It
+/// reads no row and so takes no role rewrite. A table that does not exist is a
+/// 404 with our sentence.
+///
+/// # Errors
+///
+/// 400 for a missing or malformed table name; 404 for a table the serving layer
+/// does not have; the database's failure is classified, never forwarded.
+pub async fn join_suggestions(
+    State(state): State<AppState>,
+    Query(q): Query<JoinSuggestionsQuery>,
+) -> Response {
+    match join_suggestions_value(&state.clickhouse, q.left.as_deref(), q.right.as_deref()).await {
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
+    }
+}
+
+/// [`join_suggestions`]' body, shared with the assistant's `suggest_join`.
+///
+/// # Errors
+///
+/// 400 for a missing or malformed table name, 404 for an unknown table, and the
+/// database's failure classified (never its text).
+pub(crate) async fn join_suggestions_value(
+    ch: &ChClient,
+    left: Option<&str>,
+    right: Option<&str>,
+) -> Result<Value, ApiError> {
+    use lakehouse_bi::joins::{ColumnMeta, suggest};
+    use lakehouse_core::ident::{Ident, SqlLiteral};
+    let table = |raw: Option<&str>| -> Result<String, ApiError> {
+        let raw = raw
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| ApiError::BadRequest("left and right are required".to_owned()))?;
+        let name = raw.strip_prefix("serving.").unwrap_or(raw);
+        Ident::new(name)
+            .map(|i| i.as_str().to_owned())
+            .map_err(|_| ApiError::BadRequest("invalid table name".to_owned()))
+    };
+    let (left, right) = (table(left)?, table(right)?);
+    let sql = format!(
+        "SELECT table, name, type, toString(is_in_sorting_key) AS key FROM system.columns \
+         WHERE database='serving' AND table IN ({}, {}) ORDER BY position",
+        SqlLiteral::from(left.as_str()),
+        SqlLiteral::from(right.as_str())
+    );
+    let rows = ch
+        .rows(&sql, None)
+        .await
+        .map_err(|failure| classify_dashboard_ch_error(&failure))?;
+    let meta = |name: &str| -> Vec<ColumnMeta> {
+        rows.iter()
+            .filter(|r| r.get("table").and_then(Value::as_str) == Some(name))
+            .filter_map(|r| {
+                Some(ColumnMeta {
+                    name: r.get("name").and_then(Value::as_str)?.to_owned(),
+                    kind: ColumnKind::from_clickhouse_type(
+                        r.get("type").and_then(Value::as_str).unwrap_or(""),
+                    ),
+                    in_sorting_key: r.get("key").and_then(Value::as_str) == Some("1"),
+                })
+            })
+            .collect()
+    };
+    let (left_cols, right_cols) = (meta(&left), meta(&right));
+    for (name, cols) in [(&left, &left_cols), (&right, &right_cols)] {
+        if cols.is_empty() {
+            return Err(ApiError::NotFound(format!(
+                "Gold mart '{name}' not found in serving."
+            )));
+        }
+    }
+    let suggestions = suggest(&left_cols, &right_cols);
+    Ok(json!({
+        "left": left,
+        "right": right,
+        "pairs": suggestions.pairs,
+        "rightKey": suggestions.right_key,
+        "coversRightKey": suggestions.covers_right_key,
     }))
 }
 
@@ -1316,7 +1568,11 @@ struct RecordsRelation {
 
 /// The relation named by `q`: a `serving` mart, or a SQL source passed
 /// through the same `check_sql_source` gate it passed when saved.
-async fn records_relation(ch: &ChClient, q: &RecordsQuery) -> Result<RecordsRelation, ApiError> {
+async fn records_relation(
+    ch: &ChClient,
+    q: &RecordsQuery,
+    joins: &[lakehouse_bi::joins::JoinSpec],
+) -> Result<RecordsRelation, ApiError> {
     use lakehouse_bi::builder::Relation;
     if let Some(id) = q.sql_source.as_deref().filter(|s| !s.trim().is_empty()) {
         let source = lakehouse_bi::sources::get_source(ch, id)
@@ -1365,6 +1621,22 @@ async fn records_relation(ch: &ChClient, q: &RecordsQuery) -> Result<RecordsRela
         .collect();
     let ident = lakehouse_core::ident::Ident::new(mart.clone())
         .map_err(|_| ApiError::BadRequest("invalid mart/column".to_owned()))?;
+    if !joins.is_empty() {
+        // BI-7: the tile joins other tables; the list reads the same flat
+        // relation, so the joined columns are there and every table is read
+        // through the caller's role rewrite.
+        let all = mart_columns(ch)
+            .await
+            .map_err(|err| classify_dashboard_ch_error(&err))?;
+        let joined = lakehouse_bi::joins::chart_relation(&ident, joins, &all).map_err(|_| {
+            ApiError::Unprocessable("this tile's joins no longer apply to its data".to_owned())
+        })?;
+        return Ok(RecordsRelation {
+            from: joined.from,
+            cols: joined.cols,
+            label: ("mart", mart),
+        });
+    }
     Ok(RecordsRelation {
         from: Relation::Mart(ident),
         cols,
@@ -1423,9 +1695,12 @@ async fn with_calculated_columns(
 /// The own filters of the tile `q.chart` names (`BI-6`), or none when it names
 /// no tile. The tile must read the relation the query names: its filters mean
 /// nothing over another one.
-async fn chart_own_filters(ch: &ChClient, q: &RecordsQuery) -> Result<Vec<FilterDef>, ApiError> {
+async fn chart_own_filters(
+    ch: &ChClient,
+    q: &RecordsQuery,
+) -> Result<(Vec<FilterDef>, Vec<lakehouse_bi::joins::JoinSpec>), ApiError> {
     let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let stored = store::list_stored_charts(ch)
         .await
@@ -1448,7 +1723,10 @@ async fn chart_own_filters(ch: &ChClient, q: &RecordsQuery) -> Result<Vec<Filter
             "this tile does not read this data".to_owned(),
         ));
     }
-    Ok(chart.def.shape.own_filters().to_vec())
+    Ok((
+        chart.def.shape.own_filters().to_vec(),
+        chart.def.shape.joins_list().to_vec(),
+    ))
 }
 
 /// `own` (the chart's filters) ahead of `dashboard`'s, after checking that
@@ -1547,7 +1825,7 @@ async fn records_for_roles(
     .clamp(1, RECORDS_PAGE_MAX);
     let offset = records_number(q.offset.as_deref(), "offset", 0)?;
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    let own = chart_own_filters(ch, &q).await?;
+    let (own, joins) = chart_own_filters(ch, &q).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -1562,7 +1840,7 @@ async fn records_for_roles(
             ));
         }
     };
-    let relation = records_relation(ch, &q).await?;
+    let relation = records_relation(ch, &q, &joins).await?;
     let relation = with_calculated_columns(ch, relation, (&q, &own), time).await?;
     let filters = with_chart_filters(&own, dashboard_filters, &relation.cols, time)?;
     if q.columns.is_some() {
@@ -1938,7 +2216,7 @@ pub async fn table_export(
         sql_source: chart.def.sql_source.clone(),
         ..RecordsQuery::default()
     };
-    let relation = records_relation(ch, &relation_query).await?;
+    let relation = records_relation(ch, &relation_query, chart.def.shape.joins_list()).await?;
     // BI-6: the chart's own filters narrow the file as they narrow the tile.
     let own = chart.def.shape.own_filters();
     let relation = with_calculated_columns(ch, relation, (&relation_query, own), &time).await?;
@@ -2161,16 +2439,23 @@ async fn board_value_selects(
             (format!("s:{id}"), from, source.column_kinds())
         } else {
             let mart = c.def.mart.as_str();
-            let (Ok(ident), Some(cols)) = (
-                lakehouse_core::ident::Ident::new(mart.to_owned()),
-                mart_cols.get(mart),
-            ) else {
+            let Ok(ident) = lakehouse_core::ident::Ident::new(mart.to_owned()) else {
                 continue;
             };
+            // BI-7: a joined chart's values come from its flat relation.
+            let Ok(joined) =
+                lakehouse_bi::joins::chart_relation(&ident, c.def.shape.joins_list(), &mart_cols)
+            else {
+                continue;
+            };
+            if joined.cols.is_empty() {
+                continue;
+            }
+            let joins_key = serde_json::to_string(c.def.shape.joins_list()).unwrap_or_default();
             (
-                format!("m:{mart}"),
-                lakehouse_bi::builder::Relation::Mart(ident).render(),
-                cols.clone(),
+                format!("m:{mart}:{joins_key}"),
+                joined.from.render(),
+                joined.cols,
             )
         };
         if !cols.contains_key(column) || !seen.insert(key) {
@@ -2518,10 +2803,10 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
 }
 
 /// The `BI-6` fields of a definition (the chart's own filters, sort, "Other",
-/// groupings), present only on the charts that carry them. A measure's own
+/// groupings, steps) and the `BI-7` joins, present only on the charts that carry them. A measure's own
 /// aggregate is part of `measures`, which is always listed.
 fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 5] = ["filters", "sort", "other", "groupings", "steps"];
+    const NAMES: [&str; 6] = ["filters", "sort", "other", "groupings", "steps", "joins"];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
         return;
     };
@@ -2830,6 +3115,18 @@ mod tests {
         let fields: std::collections::HashMap<_, _> =
             chart_def_fields(&stepped).into_iter().collect();
         assert_eq!(fields["steps"][0]["filter"][0]["op"], "gt");
+        // BI-7: the joins are exported as written, and only when present.
+        assert!(!keys(&plain).contains(&"joins"));
+        let joined = def(json!({
+            "joins": [{
+                "mart": "mart_y", "type": "left",
+                "on": [{"left": "kab", "op": "=", "right": "kab"}],
+            }],
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&joined).into_iter().collect();
+        assert_eq!(fields["joins"][0]["type"], "left");
+        assert_eq!(fields["joins"][0]["on"][0]["op"], "=");
         let table = def(json!({
             "kind": "table", "dimension": "",
             "groupings": [{"column": "kab"}, {"column": "d", "grain": "month"}],
@@ -4458,6 +4755,55 @@ mod records_pages {
         }
     }
 
+    /// BI-7: a tile that joins another table lists the joined relation, so the
+    /// joined columns are there and every table is read by the statement the
+    /// role rewrite governs.
+    #[tokio::test]
+    async fn the_records_of_a_joined_tile_read_the_joined_relation_with_its_columns() {
+        let server = MockServer::start().await;
+        let mut chart = own_filter_chart("mart_x", &json!([]));
+        let mut stored: Value = serde_json::from_str(chart["spec_json"].as_str().unwrap()).unwrap();
+        stored["def"]["joins"] = json!([{
+            "mart": "mart_y", "type": "left",
+            "on": [{"left": "region", "op": "=", "right": "region"}],
+        }]);
+        chart["spec_json"] = json!(stored.to_string());
+        mount_chart(&server, chart).await;
+        // The all-marts read comes first so it wins over the single-mart answer.
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            vec![
+                json!({ "table": "mart_x", "name": "region", "type": "String" }),
+                json!({ "table": "mart_x", "name": "visitors", "type": "UInt32" }),
+                json!({ "table": "mart_y", "name": "region", "type": "String" }),
+                json!({ "table": "mart_y", "name": "cap", "type": "UInt32" }),
+            ],
+        )
+        .await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            chart: Some("u_own".to_owned()),
+            column: Some("mart_y__cap".to_owned()),
+            value: Some("7".to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["total"], 120);
+        let (rows, count) = page_and_count(&server).await;
+        for statement in [&rows, &count] {
+            assert!(
+                statement
+                    .contains("LEFT JOIN serving.mart_y AS __jn1 ON __jn0.region = __jn1.region"),
+                "{statement}"
+            );
+            assert!(statement.contains("mart_y__cap = '7'"), "{statement}");
+            assert!(statement.contains("join_use_nulls = 1"), "{statement}");
+        }
+    }
+
     #[tokio::test]
     async fn a_tile_that_reads_other_data_than_the_query_names_is_refused() {
         let server = MockServer::start().await;
@@ -5196,3 +5542,8 @@ mod table_tiles {
 #[cfg(test)]
 #[path = "chart_shapes_rewrite.rs"]
 mod chart_shapes_rewrite;
+
+// BI-7: the role rewrite on charts that join tables; see `chart_shapes_rewrite` above.
+#[cfg(test)]
+#[path = "join_rewrite.rs"]
+mod join_rewrite;

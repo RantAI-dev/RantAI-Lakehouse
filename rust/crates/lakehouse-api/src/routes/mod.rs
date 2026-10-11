@@ -821,6 +821,10 @@ pub fn router(state: AppState) -> Router {
             get(calc_fields::functions),
         )
         .route("/api/dashboard/fields", get(dashboard::fields))
+        .route(
+            "/api/dashboard/join-suggestions",
+            get(dashboard::join_suggestions),
+        )
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))

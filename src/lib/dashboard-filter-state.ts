@@ -9,6 +9,7 @@
  */
 
 import type { FilterDef, FilterKind, FilterOp, RelativeUnit } from "@/services/clients/bi-store"
+import { displayColumn } from "./chart-joins"
 
 /** Query parameter holding the encoded filters. */
 export const FILTER_PARAM = "f"
@@ -220,7 +221,7 @@ function wholePeriod(f: FilterDef): { kind: "month"; year: number; month: number
 const numericEqual = (a: string, b: string) => a.trim() !== "" && b.trim() !== "" && Number(a) === Number(b)
 
 function betweenLabel(f: FilterDef): string {
-  const c = f.column
+  const c = displayColumn(f.column)
   const { min, max } = f
   const lowEx = Boolean(f.minExclusive && min)
   const highEx = Boolean(f.maxExclusive && max)
@@ -252,7 +253,8 @@ function betweenLabel(f: FilterDef): string {
  * separates "is not 5" on a text column from "≠ 5" on a number column.
  */
 export function filterLabel(f: FilterDef, kind?: string): string {
-  const c = f.column
+  // BI-7: a joined column reads table.column.
+  const c = displayColumn(f.column)
   switch (opOf(f)) {
     case "in":
       return `${c} is ${list(f.values)}`

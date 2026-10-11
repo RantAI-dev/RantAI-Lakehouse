@@ -199,8 +199,8 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "filter": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "type": "object", "properties": {
                 "column": { "type": "string", "description": "a grouping or a measure of the result before this step" },
                 "op": { "type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "between"] },
-                "value": { "type": "string", "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)" },
-                "min": { "type": "string" }, "max": { "type": "string" } },
+                "value": { "type": ["string", "number"], "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)" },
+                "min": { "type": ["string", "number"] }, "max": { "type": ["string", "number"] } },
                 "required": ["column", "op"] },
                 "description": "keep the rows that meet every condition" },
             "summarise": { "type": "object", "properties": {
@@ -214,6 +214,17 @@ fn with_shape_properties(mut schema: Value) -> Value {
                 "description": "group the result before this step again" } },
             "description": "give exactly one of filter and summarise" },
             "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'" },
+        "joins": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)" },
+            "type": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too" },
+            "on": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+                "left": { "type": "string", "description": "a column of the chart's mart, or of an earlier join as <table>__<column>" },
+                "op": { "type": "string", "enum": ["=", "<", "<=", ">", ">="] },
+                "right": { "type": "string", "description": "a column of the table being joined" } },
+                "required": ["left", "op", "right"] },
+                "description": "the pairs to match, all of them; at least one uses =" } },
+            "required": ["mart", "type", "on"] },
+            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column" },
         "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
             "column": { "type": "string" },
             "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" } },
@@ -379,6 +390,15 @@ fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
         "description": "List the chart cards saved on dashboards.",
         "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn suggest_join_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "suggest_join",
+        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first: both columns in their tables' sorting keys with the same name and kind, then the same name and kind, then the same name. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+        "parameters": { "type": "object", "properties": {
+            "left": { "type": "string", "description": "the chart's mart, e.g. mart_visits" },
+            "right": { "type": "string", "description": "the mart to join to it" } },
+            "required": ["left", "right"] } } })
 }
 
 fn list_sql_sources_schema() -> Value {
@@ -1059,6 +1079,13 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only, like `describe_mart`: column metadata of two marts.
+    ToolSpec {
+        name: "suggest_join",
+        schema: suggest_join_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
@@ -1476,15 +1503,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_seventy_entries() {
+    fn tool_schemas_has_seventy_one_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
-        // sources) + `ask_user` + 6 calculated-field tools (`BI-8`).
-        assert_eq!(tool_schemas().len(), 70);
+        // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
+        // `suggest_join` (`BI-7`).
+        assert_eq!(tool_schemas().len(), 71);
     }
 
     #[test]
@@ -1534,7 +1562,7 @@ mod tests {
         for tool in ["create_chart", "update_chart"] {
             let schema = (find(tool).expect("registered tool").schema)();
             let properties = &schema["function"]["parameters"]["properties"];
-            for field in ["filters", "sort", "other", "groupings", "steps"] {
+            for field in ["filters", "sort", "other", "groupings", "steps", "joins"] {
                 assert!(properties.get(field).is_some(), "{tool} lacks {field}");
             }
             let item = &properties["measures"]["items"]["oneOf"];

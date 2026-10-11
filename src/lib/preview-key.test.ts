@@ -34,3 +34,18 @@ test("each BI-6 field changes the key through the shape input", () => {
   ])
   assert.equal(keys.size, 6)
 })
+
+test("each join input changes the key through the shape input (BI-7)", () => {
+  const draft = (join: unknown) => previewKey({ ...base, shape: JSON.stringify({ measures: [], shape: { joins: [join] } }) })
+  const on = [{ left: "p", op: "=", right: "p" }]
+  const keys = new Set([
+    previewKey(base),
+    draft({ mart: "a", type: "left", on }),
+    draft({ mart: "b", type: "left", on }),
+    draft({ mart: "a", type: "inner", on }),
+    draft({ mart: "a", type: "left", on: [{ left: "p", op: "<=", right: "p" }] }),
+    draft({ mart: "a", type: "left", on: [{ left: "q", op: "=", right: "p" }] }),
+    draft({ mart: "a", type: "left", on: [...on, { left: "d", op: ">", right: "e" }] }),
+  ])
+  assert.equal(keys.size, 7)
+})

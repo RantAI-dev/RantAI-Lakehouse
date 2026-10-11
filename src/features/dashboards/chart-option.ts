@@ -1,3 +1,4 @@
+import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
 import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
@@ -73,7 +74,7 @@ export function buildOption(
   const cat = rows.map((r) => str(r[spec.x]));
   // BI-6: legend, axis and tooltip name a measure with its own aggregate as
   // "avg of stay", not by the `avg_stay` it is called in the result.
-  const labelOf = (column: string) => spec.measureLabels?.[column] ?? column;
+  const labelOf = (column: string) => spec.measureLabels?.[column] ?? displayColumn(column);
 
   // Pie / donut.
   if (spec.kind === "pie") {

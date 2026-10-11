@@ -93,9 +93,12 @@ function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
  * definition, but its `x` is a real mart column (`canDrill` leaves out the
  * built-in line and area, whose axis is a derived period).
  */
-/** The tile's id when it has filters of its own, so the records list it opens carries them (BI-6). */
+/**
+ * The tile's id when it has filters of its own (BI-6) or joined tables (BI-7), so the records list it
+ * opens carries them: the server reads the tile's definition and lists the same relation.
+ */
 function ownFilterChart(spec: ChartCard): string | undefined {
-  return spec.source !== "builtin" && spec.def?.filters?.length ? spec.id : undefined;
+  return spec.source !== "builtin" && (spec.def?.filters?.length || spec.def?.joins?.length) ? spec.id : undefined;
 }
 
 function clickSpecOf(spec: ChartCard): ClickSpec {
