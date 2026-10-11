@@ -85,13 +85,15 @@ const NOT_PROFILED = "Not profiled (type not supported)"
 const NO_VALUE_LISTED = "No value is listed: the profile states a value's count only where it is exact."
 
 /**
- * The columns to list: those whose name or description contains `query`,
- * cut to `limit`. `matched` is how many there are before the cut.
+ * The columns to list: those whose name or description contains `query`, or
+ * whose `extra` text does (the meaning written for the column, for the Schema
+ * tab), cut to `limit`. `matched` is how many there are before the cut.
  */
 export function visibleColumns<T extends { column: AssetColumn }>(
   rows: T[],
   query: string,
-  limit: number
+  limit: number,
+  extra?: (row: T) => string
 ): { shown: T[]; matched: number } {
   const needle = query.trim().toLowerCase()
   const matching =
@@ -100,7 +102,8 @@ export function visibleColumns<T extends { column: AssetColumn }>(
       : rows.filter(
           (r) =>
             r.column.name.toLowerCase().includes(needle) ||
-            (r.column.description ?? "").toLowerCase().includes(needle)
+            (r.column.description ?? "").toLowerCase().includes(needle) ||
+            (extra?.(r) ?? "").toLowerCase().includes(needle)
         )
   return { shown: matching.slice(0, limit), matched: matching.length }
 }
