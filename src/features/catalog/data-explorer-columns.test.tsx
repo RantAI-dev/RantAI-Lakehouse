@@ -80,3 +80,31 @@ describe("Data Explorer columns", () => {
     ])
   })
 })
+
+describe("Data Explorer certification mark (DATA-12)", () => {
+  it.each([
+    ["certified", "Certified"],
+    ["deprecated", "Deprecated"],
+  ])("shows the %s mark beside the name", (certification, label) => {
+    render(<>{cellOf("name", { name: "Sales", certification })}</>)
+    expect(screen.getByText("Sales")).toBeTruthy()
+    expect(screen.getByText(label)).toBeTruthy()
+  })
+
+  it("shows no mark beside the name of a table without one", () => {
+    render(<>{cellOf("name", { name: "Sales" })}</>)
+    expect(screen.queryByText("Certified")).toBeNull()
+    expect(screen.queryByText("Deprecated")).toBeNull()
+  })
+
+  it("filters on certification with a multi-select of the two marks", () => {
+    expect(column("certification").meta).toMatchObject({
+      variant: "multiSelect",
+      options: [
+        { value: "certified", label: "Certified" },
+        { value: "deprecated", label: "Deprecated" },
+      ],
+    })
+  })
+})
+

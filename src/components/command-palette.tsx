@@ -9,6 +9,7 @@ import {
   Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
+import { CertificationBadge } from "@/components/patterns/status-badge";
 import { assetService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
@@ -222,6 +223,7 @@ export function CommandPalette() {
                 forceMount
                 icon={Database}
                 label={a.name}
+                badge={<CertificationBadge certification={a.certification} />}
                 detail={matchedOnLabel(a.matchedOn)}
                 value={`asset ${a.id} ${a.name}`}
                 onSelect={() => go(`/data/assets/${a.id}`)}
@@ -255,10 +257,12 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, detail, value, forceMount, onSelect,
+  icon: Icon, label, badge, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
+  /** Shown after the label (a certified / deprecated mark). */
+  badge?: React.ReactNode;
   /** A second, smaller line under the label. */
   detail?: string | null;
   value: string;
@@ -274,7 +278,10 @@ function PaletteItem({
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
-        <span className="block truncate">{label}</span>
+        <span className="flex items-center gap-1.5">
+          <span className="truncate">{label}</span>
+          {badge}
+        </span>
         {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
       </span>
     </Command.Item>

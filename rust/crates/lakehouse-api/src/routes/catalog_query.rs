@@ -32,7 +32,8 @@ use crate::error::ApiRejection;
 /// Fields a client may filter on. Every entry is a key the asset objects
 /// `catalog::list_body` emits can carry; `tags` only exists on an asset
 /// someone annotated, and reads as an empty list on the others
-/// ([`ARRAY_FIELDS`]).
+/// ([`ARRAY_FIELDS`]). `certification` (`DATA-12`) likewise exists only on
+/// an asset with a mark and reads as empty on the others.
 pub const FILTERABLE_FIELDS: &[&str] = &[
     "id",
     "name",
@@ -53,6 +54,7 @@ pub const FILTERABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
     "tags",
 ];
 
@@ -84,6 +86,7 @@ pub const SORTABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
 ];
 
 /// Fields a client may group by. Restricted to the low-cardinality
@@ -100,6 +103,7 @@ pub const GROUPABLE_FIELDS: &[&str] = &[
     "engine",
     "health",
     "residency",
+    "certification",
 ];
 
 /// How multiple filters combine.
@@ -677,6 +681,47 @@ mod tests {
         ] {
             assert!(matches!(err.0, ApiError::BadRequest(_)));
         }
+    }
+
+    /// `DATA-12` F5: `certification` filters (`eq`, `inArray`), sorts and
+    /// groups; a row without a mark falls under the empty group.
+    #[test]
+    fn certification_filters_sorts_and_groups() {
+        let rows = vec![
+            json!({ "id": "a", "certification": "deprecated" }),
+            json!({ "id": "b" }),
+            json!({ "id": "c", "certification": "certified" }),
+            json!({ "id": "d", "certification": "certified" }),
+        ];
+        let certified = apply_filters(
+            &rows,
+            &[filter("certification", "eq", &["certified"])],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&certified), vec!["c", "d"]);
+        let marked = apply_filters(
+            &rows,
+            &[filter(
+                "certification",
+                "inArray",
+                &["certified", "deprecated"],
+            )],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&marked), vec!["a", "c", "d"]);
+
+        assert!(parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).is_ok());
+        let mut sorted = rows.clone();
+        apply_sort(
+            &mut sorted,
+            &parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).unwrap(),
+        );
+        assert_eq!(ids(&sorted), vec!["b", "c", "d", "a"]);
+
+        assert!(parse_group_by(Some("certification")).is_ok());
+        let (_, groups) = apply_grouping(&rows, "certification");
+        let counts: Vec<(&str, usize)> = groups.iter().map(|g| (g.id.as_str(), g.count)).collect();
+        assert_eq!(counts, vec![("deprecated", 1), ("—", 1), ("certified", 2)]);
     }
 
     #[test]

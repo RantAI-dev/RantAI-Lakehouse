@@ -51,6 +51,33 @@ pub struct AnnotationRow {
     pub tags: Vec<String>,
     /// Free-text description, or `None` if not set.
     pub description: Option<String>,
+    /// `DATA-12`: `"certified"`, `"deprecated"`, or `None` when the asset has
+    /// no mark. Written only by [`set_certification`].
+    pub certification: Option<String>,
+    /// Why the asset is deprecated; `None` unless it is.
+    pub certification_note: Option<String>,
+    /// The catalog id to use instead; `None` unless deprecated.
+    pub replacement_asset_id: Option<String>,
+    /// Display name of whoever set the mark; set exactly when the mark is.
+    pub certified_by: Option<String>,
+    /// When the mark was set; set exactly when the mark is.
+    pub certified_at: Option<time::OffsetDateTime>,
+}
+
+/// What [`set_certification`] writes: one asset's mark (`DATA-12`, F1).
+#[derive(Debug, Clone)]
+pub struct CertificationInput {
+    /// The full catalog id, at most 200 characters.
+    pub asset_id: String,
+    /// `"certified"` or `"deprecated"`.
+    pub status: String,
+    /// Why, at most 1000 characters; allowed only with `"deprecated"`.
+    pub note: Option<String>,
+    /// The catalog id to use instead, at most 200 characters; allowed only
+    /// with `"deprecated"`.
+    pub replacement_asset_id: Option<String>,
+    /// The display name of the caller, at most 128 characters.
+    pub certified_by: String,
 }
 
 /// Create this asset's annotation, or replace it if one already exists for
@@ -94,7 +121,9 @@ pub async fn get_annotation(
     asset_id: &str,
 ) -> Result<Option<AnnotationRow>, StoreError> {
     let row = sqlx::query_as(
-        "SELECT asset_id, owner, steward, tags, description \
+        "SELECT asset_id, owner, steward, tags, description, \
+         certification, certification_note, replacement_asset_id, \
+         certified_by, certified_at \
          FROM asset_annotation WHERE asset_id = $1",
     )
     .bind(asset_id)
@@ -111,9 +140,73 @@ pub async fn get_annotation(
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_all(pool: &PgPool) -> Result<Vec<AnnotationRow>, StoreError> {
-    let rows =
-        sqlx::query_as("SELECT asset_id, owner, steward, tags, description FROM asset_annotation")
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query_as(
+        "SELECT asset_id, owner, steward, tags, description, \
+         certification, certification_note, replacement_asset_id, \
+         certified_by, certified_at \
+         FROM asset_annotation",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
+}
+
+/// Set one asset's certified or deprecated mark (`DATA-12`, F1, F2).
+///
+/// An upsert that writes only the five mark columns (and `updated_at`): an
+/// asset with no annotation row gets one with empty details, and an asset
+/// with details keeps them, which is why this is not [`upsert_annotation`]
+/// (that statement never names the mark columns either, so neither
+/// direction overwrites the other). `certified_at` is the database clock.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the statement fails, including when
+/// the table's CHECK constraints refuse the row (an unknown status, a note
+/// or replacement with `"certified"`, an oversized field).
+pub async fn set_certification(
+    pool: &PgPool,
+    input: &CertificationInput,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO asset_annotation \
+         (asset_id, certification, certification_note, replacement_asset_id, \
+          certified_by, certified_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, now(), now()) \
+         ON CONFLICT (asset_id) DO UPDATE SET \
+           certification = EXCLUDED.certification, \
+           certification_note = EXCLUDED.certification_note, \
+           replacement_asset_id = EXCLUDED.replacement_asset_id, \
+           certified_by = EXCLUDED.certified_by, \
+           certified_at = EXCLUDED.certified_at, \
+           updated_at = now()",
+    )
+    .bind(&input.asset_id)
+    .bind(&input.status)
+    .bind(&input.note)
+    .bind(&input.replacement_asset_id)
+    .bind(&input.certified_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove one asset's mark (all five columns), leaving its details alone.
+/// An asset with no annotation row is left without one.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the update fails.
+pub async fn clear_certification(pool: &PgPool, asset_id: &str) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE asset_annotation SET \
+           certification = NULL, certification_note = NULL, \
+           replacement_asset_id = NULL, certified_by = NULL, \
+           certified_at = NULL, updated_at = now() \
+         WHERE asset_id = $1",
+    )
+    .bind(asset_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

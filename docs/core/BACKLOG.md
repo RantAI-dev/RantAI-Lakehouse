@@ -127,9 +127,11 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-13` | Feature | Table discovery for every source type, not only databases | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07) | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter waits for `DATA-12` | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
+| `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter is built with `DATA-12` part 1 | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
 | `DATA-20` | Feature | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data | P2 | Idea |  | `features/catalog-search.md` |
-| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values. In three parts: marks in search, the Data Explorer and the asset page, set with `governance:write` (part 1, built); governed tags (part 2); marks in the chart builder and Query Studio (part 3) | Data | P2 | Building |  | `features/certification-and-governed-tags.md` |
+| `DATA-22` | Feature | A tag on a namespace applies to its tables. Split from `DATA-12` by the product owner (2026-10-09): a namespace is one of four fixed names with no stored record and no page to edit | Data | P3 | Idea |  | `features/certification-and-governed-tags.md` |
+| `DATA-23` | Task | The Catalog page's links to the Data Explorer filter by a namespace's display name where assets carry its id, so by reading the code they match nothing (found planning `DATA-12`; not run) | Data | P2 | Todo |  | `plans/2026-10-09-data-12-part-1-certification.md` |
 | `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
@@ -198,6 +200,7 @@ set by the product owner and are left empty until they are.
 | `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
+| `DATA-12` | 2026-10-09 | | |
 
 ## Decide
 

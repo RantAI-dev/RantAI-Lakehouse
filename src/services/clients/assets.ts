@@ -129,6 +129,16 @@ export const clickhouseAssetService: AssetService = {
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the asset's details");
   },
+  async setCertification(id, input, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/certification`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the certification");
+  },
   async listNamespaces(signal) {
     return (await loadCatalog(undefined, signal)).namespaces;
   },

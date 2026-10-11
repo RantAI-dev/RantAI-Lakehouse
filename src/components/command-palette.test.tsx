@@ -70,6 +70,22 @@ describe("CommandPalette catalog search", () => {
     expect(requested[0]).toContain("/api/catalog?q=revenue_amount")
   })
 
+  it("shows an asset's certified or deprecated mark beside its name, and none without one", async () => {
+    stubCatalog({
+      assets: [
+        asset(1, { certification: "certified" }),
+        asset(2, { certification: "deprecated" }),
+        asset(3),
+      ],
+    })
+    await search("table")
+    await screen.findByText("Table 3")
+    const row = (name: string) => screen.getByText(name).closest('[cmdk-item=""]') as HTMLElement
+    expect(row("Table 1").textContent).toContain("Certified")
+    expect(row("Table 2").textContent).toContain("Deprecated")
+    expect(row("Table 3").textContent).not.toMatch(/Certified|Deprecated/)
+  })
+
   it("says an approximate match is approximate", async () => {
     stubCatalog({
       assets: [asset(1, { matchedOn: { field: "description", value: "", approximate: true } })],

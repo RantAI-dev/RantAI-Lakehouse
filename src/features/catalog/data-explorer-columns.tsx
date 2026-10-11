@@ -2,6 +2,7 @@
 
 import type { ColumnDef } from "@tanstack/react-table"
 import {
+  BadgeCheck,
   Boxes,
   CalendarClock,
   Database,
@@ -17,7 +18,7 @@ import { Copyable } from "@/components/copyable"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { AssetRowActions } from "./data-explorer-actions"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { Pill, TierBadge } from "@/components/patterns/status-badge"
+import { CertificationBadge, Pill, TierBadge } from "@/components/patterns/status-badge"
 import { formatBytes } from "@/lib/format"
 import { matchedOnLabel } from "@/lib/palette-search"
 import {
@@ -55,6 +56,12 @@ const tierOptions = Object.entries(STORAGE_TIER_LABEL).map(([value, label]) => (
   label,
   value,
 }))
+
+// DATA-12: the filter offers the two marks; an unmarked table has none to pick.
+const certificationOptions = [
+  { value: "certified", label: "Certified" },
+  { value: "deprecated", label: "Deprecated" },
+]
 
 const typeOptions = Object.entries(ASSET_TYPE_LABEL).map(([value, label]) => ({
   label,
@@ -95,14 +102,19 @@ export function getDataExplorerColumns({
               enough to push the last columns off a narrow screen on its own.
               The full name is still available on hover and on the detail
               page. */}
-          <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
-            <span
-              className="truncate font-medium tracking-tight text-foreground"
-              title={row.original.name}
-            >
-              {row.original.name}
-            </span>
-          </Copyable>
+          <div className="flex items-center gap-1.5">
+            <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
+              <span
+                className="truncate font-medium tracking-tight text-foreground"
+                title={row.original.name}
+              >
+                {row.original.name}
+              </span>
+            </Copyable>
+            {/* DATA-12: the Tags column is hidden on most screens, so the
+                mark rides the name instead of a column of its own. */}
+            <CertificationBadge certification={row.original.certification} />
+          </div>
           {/* Why a search returned this row (DATA-11); only a search with a
               term sends it, and a match on the name needs no reason. */}
           <MatchedOnLine matchedOn={row.original.matchedOn} />
@@ -277,6 +289,26 @@ export function getDataExplorerColumns({
         label: "Size",
         variant: "number",
         icon: HardDrive,
+      },
+    },
+    {
+      // Hidden by default (see `columnVisibility` on the page): the mark is
+      // shown beside the name, and this column exists to filter on it
+      // (`DATA-12`; `certification` is filterable, sortable and groupable on
+      // the server).
+      id: "certification",
+      accessorKey: "certification",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Certification" />
+      ),
+      cell: ({ row }) => <CertificationBadge certification={row.original.certification} />,
+      enableColumnFilter: true,
+      meta: {
+        label: "Certification",
+        variant: "multiSelect",
+        options: certificationOptions,
+        icon: BadgeCheck,
+        enableGrouping: true,
       },
     },
     {

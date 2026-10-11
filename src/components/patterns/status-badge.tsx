@@ -7,6 +7,8 @@ import {
   AUDIT_OUTCOME_LABEL,
   AUTONOMY_LABEL,
   CHECK_STATUS_LABEL,
+  CERTIFICATION_DESCRIPTION,
+  CERTIFICATION_LABEL,
   CLASSIFICATION_LABEL,
   ENTITY_STATUS_DESCRIPTION,
   ENTITY_STATUS_LABEL,
@@ -20,6 +22,7 @@ import {
   type ApprovalStatus,
   type AuditOutcome,
   type AutonomyLevel,
+  type CertificationStatus,
   type CheckStatus,
   type Classification,
   type EntityStatus,
@@ -165,6 +168,38 @@ export function TierBadge({
   return (
     <Pill tone={TIER_TONE[tier]} title={title} className={className}>
       {STORAGE_TIER_LABEL[tier]}
+    </Pill>
+  )
+}
+
+const CERTIFICATION_TONE: Record<CertificationStatus, Tone> = {
+  certified: "success",
+  deprecated: "warning",
+}
+
+/**
+ * Certified / deprecated mark of a table (`DATA-12`). Takes the server's
+ * string as it comes: anything but the two known marks (including none)
+ * renders nothing, so a future mark never shows as a wrong word.
+ */
+export function CertificationBadge({
+  certification,
+  title,
+  className,
+}: {
+  certification: string | null | undefined
+  /** Overrides the default explanation shown on hover. */
+  title?: string
+  className?: string
+}) {
+  if (certification !== "certified" && certification !== "deprecated") return null
+  return (
+    <Pill
+      tone={CERTIFICATION_TONE[certification]}
+      title={title ?? CERTIFICATION_DESCRIPTION[certification]}
+      className={className}
+    >
+      {CERTIFICATION_LABEL[certification]}
     </Pill>
   )
 }

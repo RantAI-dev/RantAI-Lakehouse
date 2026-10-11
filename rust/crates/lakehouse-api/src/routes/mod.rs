@@ -46,7 +46,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -705,6 +705,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
+        )
+        .route(
+            "/api/catalog/{id}/certification",
+            put(catalog::put_certification),
         )
         // The semantic layer: a table's and a column's plain-words
         // description. `{asset}` is `serving.<table>` or `silver.<table>`;

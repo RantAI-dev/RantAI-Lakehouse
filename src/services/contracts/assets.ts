@@ -79,6 +79,19 @@ export type Asset = {
   steward?: string | null
   tags?: string[]
   /**
+   * `DATA-12`: the mark a person with `governance:write` set. Absent when
+   * the asset has none. `certificationNote` and `replacementAssetId` come
+   * only with `"deprecated"`; `certifiedBy` is the display name of whoever
+   * set it and `certifiedAt` an RFC 3339 time.
+   */
+  certification?: "certified" | "deprecated" | string
+  certificationNote?: string
+  replacementAssetId?: string
+  /** The replacement's name; absent when it is no longer in the catalog. */
+  replacementName?: string
+  certifiedBy?: string
+  certifiedAt?: string
+  /**
    * Why a search returned this asset (`DATA-11`): present only on a result
    * of a search with a term, and absent when every word matched the name.
    * With several words it explains the first word, in typed order, that the
@@ -89,6 +102,17 @@ export type Asset = {
    * forgave a typo.
    */
   matchedOn?: { field: string; value: string; approximate: boolean }
+}
+
+/**
+ * What `PUT /api/catalog/{id}/certification` takes (`DATA-12`): `status:
+ * null` clears the mark; a note and a replacement are allowed only with
+ * `"deprecated"`.
+ */
+export type AssetCertificationInput = {
+  status: "certified" | "deprecated" | null
+  note?: string
+  replacementAssetId?: string
 }
 
 /** What `PUT /api/catalog/{id}/annotation` stores; `null` clears a field. */
@@ -424,6 +448,17 @@ export interface AssetService {
    * (needs `catalog:write`). Optional for the same dead-fixture reason.
    */
   updateAnnotation?(id: string, input: AssetAnnotation, signal?: AbortSignal): Promise<void>
+  /**
+   * `PUT /api/catalog/{id}/certification` — set, change or clear the
+   * certified / deprecated mark (needs `governance:write`, not the
+   * `catalog:write` of the details). Optional for the same dead-fixture
+   * reason; no mock implements it.
+   */
+  setCertification?(
+    id: string,
+    input: AssetCertificationInput,
+    signal?: AbortSignal
+  ): Promise<void>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
   /**
    * `POST /api/catalog/{id}/access-request` — ask for a permission not

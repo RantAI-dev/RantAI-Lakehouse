@@ -417,6 +417,47 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     }
 }
 
+/// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
+/// `governance:write`. A seeded Data Engineer holds `catalog:write` (which
+/// edits the details) but not `governance:write`, so the permission
+/// middleware refuses it with a 403 naming `governance:write`, and nothing
+/// is stored. The table-driven loops above cover the new `POLICY_TABLE` row
+/// both ways; this names the case the decision exists for.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_catalog_certification_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/catalog/commerce_orders/certification",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:write alone must not set a certification mark"
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: governance:write"),
+        "the 403 must come from the permission middleware, not the tenant gate"
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM asset_annotation WHERE asset_id = 'commerce_orders'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count rows");
+    assert_eq!(stored, 0, "a refused write must store nothing");
+}
+
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
 /// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
 /// reuse the catalog's read permission.
