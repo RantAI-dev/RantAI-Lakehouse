@@ -178,13 +178,13 @@ function Plate({ layer, index, active }: { layer: DepthLayer; index: number; act
       initial={false}
       animate={{
         translateZ: -lift,
-        opacity: isActive ? 1 : 0.55,
+        opacity: isActive ? 1 : 0.7,
         boxShadow: isActive ? `0 0 60px 6px ${layer.accent}55` : `0 0 0px 0px ${layer.accent}00`,
       }}
       transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
       style={{
         borderColor: `${layer.accent}${isActive ? "cc" : "55"}`,
-        background: `linear-gradient(135deg, ${layer.accent}${isActive ? "38" : "16"}, rgba(5,10,48,0.5))`,
+        background: `linear-gradient(135deg, ${layer.accent}${isActive ? "40" : "22"}, rgba(5,10,48,0.55))`,
       }}
     />
   );

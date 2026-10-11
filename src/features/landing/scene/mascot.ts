@@ -369,6 +369,3 @@ export function createMascot(opts: MascotOptions): Mascot {
   };
   return mascot;
 }
-
-/** Re-exported so the engine can place the contact-shading uniform on the same radius. */
-export { profile as domeProfile };

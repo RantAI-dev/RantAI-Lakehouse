@@ -195,14 +195,14 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const wide = aspect > 1.1;
     anchorHero.x = wide ? 0.42 : 0;
     anchorHero.y = wide ? 0 : 0.42;
-    anchorDepths.x = wide ? 0.3 : 0;
-    anchorDepths.y = wide ? 0 : -0.5;
+    anchorDepths.x = wide ? 0.36 : 0;
+    anchorDepths.y = wide ? -0.1 : -0.5;
     const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
     // The slabs shrink sideways to fit a narrow screen rather than pushing the
     // camera away, which the fog would swallow.
-    distScaleDepths = wide ? 1.12 : 1;
+    distScaleDepths = wide ? 1.25 : 1;
     slabs.setFootprint(Math.min(1, ((wide ? 0.84 : 0.7) * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
     viewKey = "";
     measure();
@@ -395,7 +395,6 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   canvas.addEventListener("webglcontextlost", onLost);
 
   // Still frame: a ring already out on the water, then a single render.
-  (window as unknown as Record<string, unknown>).__lk = { scene, camera, mascot, water, renderer, getState: () => state, snap: () => { smoothY = window.scrollY; } };
   if (still) water.spawnRipple(STILL_TIME - 2.2, 0.55);
   resize();
   if (!still) start();
@@ -423,7 +422,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       (stars.points.material as THREE.Material).dispose();
       envTarget.dispose();
       renderer.dispose();
-      renderer.forceContextLoss();
+      // Release the GPU context now rather than at garbage collection, unless
+      // the browser already took it (calling this on a lost context only warns).
+      if (!renderer.getContext().isContextLost()) renderer.forceContextLoss();
     },
   };
 }

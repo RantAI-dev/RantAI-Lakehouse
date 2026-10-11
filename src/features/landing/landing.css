@@ -51,7 +51,9 @@ html:has(.lk-root) {
 .lk-root :focus-visible {
   outline: 2px solid var(--lk-lake);
   outline-offset: 3px;
-  border-radius: 6px;
+}
+.lk-root #main:focus {
+  outline: none;
 }
 
 .lk-root ::selection {

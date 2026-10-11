@@ -38,7 +38,7 @@ export function HeroSection() {
         {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.85)_0%,rgba(2,5,20,0.6)_40%,transparent_70%)]"
+          className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.88)_0%,rgba(2,5,20,0.72)_45%,transparent_78%)]"
         />
         <Container className="relative z-10 flex h-full min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
           <motion.div

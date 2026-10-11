@@ -37,7 +37,7 @@ export function LandingPage() {
           Skip to content
         </a>
         <TopBar />
-        <main id="main">
+        <main id="main" tabIndex={-1}>
           <SceneZone />
           <AssistantSection />
           <DashboardsSection />
