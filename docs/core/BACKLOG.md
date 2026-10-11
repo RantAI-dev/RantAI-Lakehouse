@@ -144,7 +144,7 @@ estimate (S, M, L), which the base has no field for.
 | `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79 | `docs/core/features/semantic-layer.md` |
 | `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names | AI Copilot | P2 | In Acceptance | #81 | `features/chat-ask-back.md` |
-| `WEB-1` | Feature | Landing page at `/landing`: a 3D night lake with the logo's creature, and a scroll story through sources, the Bronze/Silver/Gold layers, the assistant, dashboards, governance and open source. Copy limited to what is built | Business | P2 | Building | | `superpowers/plans/2026-10-11-landing-page.md` |
+| `WEB-1` | Feature | Landing page at `/landing`: a 3D night lake with the logo's creature, and a scroll story through sources, the Bronze/Silver/Gold layers, the assistant, dashboards, governance and open source. Copy limited to what is built | Business | P2 | In Acceptance | #107 | `superpowers/plans/2026-10-11-landing-page.md` |
 | `REL-3` | Task | `package-lock.json` is stale: it lacks packages `package.json` lists (`@dnd-kit/core` and others). Delete it (bun is the package manager; CI and the Dockerfile read `bun.lock`) or regenerate it, in a PR of its own | Delivery | P3 | Todo | | WEB-1 review round 1 |
 | `SEC-6` | Task | Stop older API handlers from returning internal error text | Administration & Security | P2 | Todo |  | `AGENTS.md` |
 | `SEC-16` | Task | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Administration & Security | P2 | Todo |  | Data module code audit |
@@ -200,6 +200,7 @@ set by the product owner and are left empty until they are.
 | `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
+| `WEB-1` | 2026-10-11 | 2026-10-11 | |
 
 ## Decide
 
