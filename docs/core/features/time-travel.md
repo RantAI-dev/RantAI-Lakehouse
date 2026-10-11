@@ -2,11 +2,11 @@
 
 | | |
 | --- | --- |
-| Module | Data (Catalog, Query Studio) |
+| Module | Data |
 | Backlog | `DATA-16` |
 | Spec | `docs/core/specs/data-16.md` (no *(proposed)* numbers) |
 | Kind | Task (it has an acceptance checklist because it changes what a user sees) |
-| Status | In Progress (the pull request is open;  holds the status) |
+| Status | In Progress (the pull request is open; `BACKLOG.md` holds the status) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
