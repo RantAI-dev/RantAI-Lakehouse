@@ -87,6 +87,8 @@ export type Asset = {
   certification?: "certified" | "deprecated" | string
   certificationNote?: string
   replacementAssetId?: string
+  /** The replacement's name; absent when it is no longer in the catalog. */
+  replacementName?: string
   certifiedBy?: string
   certifiedAt?: string
   /**

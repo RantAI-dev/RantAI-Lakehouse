@@ -132,6 +132,44 @@ describe("AssetDetailPage deprecation notice", () => {
     expect(link.getAttribute("href")).toBe("/data/assets/serving.monthly_orders")
   })
 
+  // DATA-12 review SHOULD-FIX 1: the note is its own sentence.
+  it("adds a full stop to a note that has none, so it does not run into the next sentence", async () => {
+    stubApi({
+      certification: "deprecated",
+      certificationNote: "Old load, use the customers table",
+      replacementAssetId: "serving.monthly_orders",
+    })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).toBe(
+      "This table is deprecated. Old load, use the customers table. Use serving.monthly_orders instead.",
+    )
+  })
+
+  it("does not double the full stop of a note that ends a sentence", async () => {
+    stubApi({
+      certification: "deprecated",
+      certificationNote: "Superseded!",
+      replacementAssetId: "serving.monthly_orders",
+    })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).toContain("Superseded! Use")
+    expect(notice.textContent).not.toContain("!.")
+  })
+
+  it("names the replacement when the API sent its name, with the id as the link title", async () => {
+    stubApi({
+      certification: "deprecated",
+      replacementAssetId: "serving.monthly_orders",
+      replacementName: "Monthly orders",
+    })
+    renderPage()
+    const link = await screen.findByRole("link", { name: "Monthly orders" })
+    expect(link.getAttribute("href")).toBe("/data/assets/serving.monthly_orders")
+    expect(link.getAttribute("title")).toBe("serving.monthly_orders")
+  })
+
   it("shows no notice for a certified table or one without a mark", async () => {
     stubApi({ certification: "certified" })
     renderPage()

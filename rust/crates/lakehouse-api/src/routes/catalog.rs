@@ -1460,7 +1460,12 @@ fn set(value: Option<&String>) -> Option<&str> {
 /// registry row says: a set `owner` or `description` replaces the
 /// registry's (an ingest job's name is not an owner), and `steward` and
 /// `tags` are added. A blank annotation field changes nothing.
-fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
+///
+/// `replacement_name` is the `name` of the annotation's replacement asset
+/// as the caller found it in the assembled list; `None` when the
+/// replacement is no longer in the catalog (or could not be looked up), and
+/// then no `replacementName` is written.
+fn apply_annotation(row: &mut Value, annotation: &AnnotationRow, replacement_name: Option<&str>) {
     let Some(o) = row.as_object_mut() else {
         return;
     };
@@ -1486,6 +1491,11 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
         }
         if let Some(replacement) = set(annotation.replacement_asset_id.as_ref()) {
             o.insert("replacementAssetId".to_owned(), json!(replacement));
+            // DATA-12 review SHOULD-FIX 1: the notice names the replacement
+            // by its name; absent (never "") when it left the catalog.
+            if let Some(name) = replacement_name.map(str::trim).filter(|n| !n.is_empty()) {
+                o.insert("replacementName".to_owned(), json!(name));
+            }
         }
         if let Some(by) = set(annotation.certified_by.as_ref()) {
             o.insert("certifiedBy".to_owned(), json!(by));
@@ -1497,6 +1507,14 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
             o.insert("certifiedAt".to_owned(), json!(at));
         }
     }
+}
+
+/// The `name` of the asset `id` in an assembled list, if it is there.
+fn asset_name_in<'a>(assets: &'a [Value], id: &str) -> Option<&'a str> {
+    assets
+        .iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|a| a.get("name").and_then(Value::as_str))
 }
 
 /// [`apply_annotation`] over every row of a list body. They decorate the
@@ -1522,10 +1540,26 @@ async fn apply_annotations(state: &AppState, body: &mut Value) {
         .map(|row| (row.asset_id.as_str(), row))
         .collect();
     if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+        // Names first, from the list as assembled (DATA-12 review
+        // SHOULD-FIX 1): the loop below needs `assets` mutably.
+        let names: HashMap<String, String> = assets
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    a.get("id")?.as_str()?.to_owned(),
+                    a.get("name")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect();
         for asset in assets {
             let id = asset.get("id").and_then(Value::as_str).unwrap_or_default();
             if let Some(annotation) = by_id.get(id).copied() {
-                apply_annotation(asset, annotation);
+                let replacement_name = annotation
+                    .replacement_asset_id
+                    .as_deref()
+                    .and_then(|r| names.get(r.trim()))
+                    .map(String::as_str);
+                apply_annotation(asset, annotation, replacement_name);
             }
         }
     }
@@ -1555,7 +1589,20 @@ async fn mark_annotation_and_history(
         None => None,
     };
     if let Some(annotation) = &annotation {
-        apply_annotation(body, annotation);
+        // DATA-12 review SHOULD-FIX 1: the replacement's name comes from the
+        // search copy, not a second catalog assembly. A failed read leaves
+        // the name absent; it never fails the page.
+        let replacement_name = match annotation.replacement_asset_id.as_deref().map(str::trim) {
+            Some(replacement) if !replacement.is_empty() => match search_snapshot(state).await {
+                Ok(snapshot) => asset_name_in(&snapshot.assets, replacement).map(str::to_owned),
+                Err(err) => {
+                    tracing::warn!(%err, "catalog read failed; the deprecation notice shows the replacement id");
+                    None
+                }
+            },
+            _ => None,
+        };
+        apply_annotation(body, annotation, replacement_name.as_deref());
     }
     let mut keys = vec![id.to_owned()];
     keys.extend(tables.iter().cloned());
@@ -3410,6 +3457,7 @@ mod tests {
         apply_annotation(
             &mut row,
             &annotation(Some("Data Platform"), Some("  "), &["pii"]),
+            None,
         );
         assert_eq!(row["owner"], json!("Data Platform"));
         assert_eq!(row["description"], registry_description);
@@ -3422,7 +3470,11 @@ mod tests {
     #[test]
     fn a_mark_is_overlaid_on_the_row_and_an_unmarked_row_has_none() {
         let mut unmarked = silver_catalog_row("orders", "MergeTree", 0, None);
-        apply_annotation(&mut unmarked, &annotation(Some("Data Platform"), None, &[]));
+        apply_annotation(
+            &mut unmarked,
+            &annotation(Some("Data Platform"), None, &[]),
+            None,
+        );
         for key in [
             "certification",
             "certificationNote",
@@ -3440,12 +3492,33 @@ mod tests {
         row.replacement_asset_id = Some("silver.orders_v2".to_owned());
         row.certified_by = Some("Rina".to_owned());
         row.certified_at = time::OffsetDateTime::from_unix_timestamp(1_790_000_000).ok();
-        apply_annotation(&mut marked, &row);
+        apply_annotation(&mut marked, &row, Some("Orders v2"));
+        assert_eq!(marked["replacementName"], json!("Orders v2"));
         assert_eq!(marked["certification"], json!("deprecated"));
         assert_eq!(marked["certificationNote"], json!("Superseded"));
         assert_eq!(marked["replacementAssetId"], json!("silver.orders_v2"));
         assert_eq!(marked["certifiedBy"], json!("Rina"));
         assert_eq!(marked["certifiedAt"], json!("2026-09-21T14:13:20Z"));
+    }
+
+    /// DATA-12 review SHOULD-FIX 1: a replacement that left the catalog has
+    /// no name, and the key is absent rather than an empty string.
+    #[test]
+    fn a_replacement_that_left_the_catalog_has_no_name_and_a_list_finds_one_that_is_there() {
+        let mut row = silver_catalog_row("orders", "MergeTree", 0, None);
+        let mut marked = annotation(None, None, &[]);
+        marked.certification = Some("deprecated".to_owned());
+        marked.replacement_asset_id = Some("silver.orders_v2".to_owned());
+        apply_annotation(&mut row, &marked, None);
+        assert_eq!(row["replacementAssetId"], json!("silver.orders_v2"));
+        assert!(row.get("replacementName").is_none());
+
+        let assets = vec![json!({"id": "silver.orders_v2", "name": "Orders v2"})];
+        assert_eq!(
+            asset_name_in(&assets, "silver.orders_v2"),
+            Some("Orders v2")
+        );
+        assert_eq!(asset_name_in(&assets, "silver.gone"), None);
     }
 
     /// The audit trail names the fields an edit changed, and a save that

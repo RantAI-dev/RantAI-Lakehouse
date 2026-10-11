@@ -49,25 +49,33 @@ const CHOICES: { value: Choice; label: string; note: string }[] = [
 export function DeprecationNotice({
   asset,
 }: {
-  asset: Pick<Asset, "certification" | "certificationNote" | "replacementAssetId">
+  asset: Pick<
+    Asset,
+    "certification" | "certificationNote" | "replacementAssetId" | "replacementName"
+  >
 }) {
   if (asset.certification !== "deprecated") return null
+  // DATA-12 review SHOULD-FIX 1: the note is its own sentence, so it never
+  // runs into "Use ... instead."
+  const note = asset.certificationNote?.trim()
+  const noteSentence = note ? (/[.!?]$/.test(note) ? note : `${note}.`) : null
   return (
     <p
       role="note"
       className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
     >
       <span className="font-medium">This table is deprecated.</span>
-      {asset.certificationNote ? <> {asset.certificationNote}</> : null}
+      {noteSentence ? <> {noteSentence}</> : null}
       {asset.replacementAssetId ? (
         <>
           {" "}
           Use{" "}
           <Link
             href={`/data/assets/${asset.replacementAssetId}`}
-            className="font-mono underline underline-offset-2"
+            title={asset.replacementAssetId}
+            className="underline underline-offset-2"
           >
-            {asset.replacementAssetId}
+            {asset.replacementName ?? asset.replacementAssetId}
           </Link>{" "}
           instead.
         </>
