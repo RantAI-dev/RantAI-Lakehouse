@@ -156,3 +156,9 @@ No per-item browser QA and no reviewer re-run of the suites (owner's instruction
 - `SHOULD-FIX` R1 (deviation 5) — a layer asked for its own values is cut at 100 rows without a mark. A cut layer must carry `truncated` on its payload entry and the tile's legend must say so, like any cut tile. To be fixed at the start of the next item.
 
 The reviewer's smoke check on a running API is recorded in the next entry.
+
+### BI-13 — smoke check (reviewer, 2026-10-11)
+
+On the dev API rebuilt from `52ccac2`, over HTTP against the real engine: a bar chart of visitors by month with one layer (orders by month from a second table, line, right axis) saved; the dashboard returns 15 base rows and the layer's two months, 11,781 and 11,259, equal to a direct query; no tile of the demo dashboard returns an error. One headless screenshot: bars on the left axis, the layer's line on the right axis with its own scale, the other months left as gaps, both in the legend.
+
+Not looked at by anyone: the "Questions" section of the builder, a failed question's line under the chart, a click on a layer's mark.

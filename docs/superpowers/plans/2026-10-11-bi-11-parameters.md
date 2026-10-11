@@ -166,3 +166,9 @@ On the dev API rebuilt from `d94de16`, over HTTP against the real engine: a numb
 Not looked at by anyone: the controls in the filter row, the parameter dialog, the reference-line editor, a formula with `{name}` typed in the editor, a reference line drawn on a tile.
 
 Housekeeping found here: a 15 GB `rust/target` had appeared inside the build worktree (a cargo command run without the shared `CARGO_TARGET_DIR`); removed. Shell state does not persist between commands, so the variable must be set on every cargo command line.
+
+### BI-11 — finding from a later screenshot (reviewer, 2026-10-11)
+
+- `BLOCKER` R1 — A chart whose measure column is chosen by a list parameter draws nothing on its tile: the value axis runs 0 to 1 and there are no bars, although `GET /api/dashboard` returns the rows for it (`provinsi`, `sum_hotels`, first row 195). Seen on the demo tile "Capacity per provinsi, switchable (BI-11 QA)" (`u_47307cea`, measure `{ "column": { "param": "ukuran_demo" }, "aggregate": "sum" }`). The console is most likely reading the series under a name derived from the unresolved slot instead of the resolved result column. The tile, legend, axis and tooltip must follow the resolved column, and change when the parameter's value changes. Check the same for a switched `dimension` and `breakdown`. A test that renders the tile option from a payload with a resolved switch must fail without the fix.
+
+The reference line bound to a parameter draws correctly on its demo tile ("Target 20,000").
