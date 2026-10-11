@@ -379,6 +379,21 @@ fn referenced(def: &ChartInput) -> Vec<(&str, Slot)> {
     out.extend(def.measures.iter().map(|m| (m.as_str(), Slot::Measure)));
     out.extend(def.lat.iter().map(|c| (c.as_str(), Slot::Other)));
     out.extend(def.lon.iter().map(|c| (c.as_str(), Slot::Other)));
+    // BI-6: a chart's own filters and groupings read per-row fields like any
+    // other column slot.
+    out.extend(
+        def.shape
+            .own_filters()
+            .iter()
+            .map(|f| (f.column.as_str(), Slot::Other)),
+    );
+    out.extend(
+        def.shape
+            .groupings
+            .iter()
+            .flatten()
+            .map(|g| (g.column.as_str(), Slot::Other)),
+    );
     let t = &def.tables;
     for list in [&t.columns, &t.rows].into_iter().flatten() {
         out.extend(list.iter().map(|c| (c.as_str(), Slot::Other)));
@@ -1054,7 +1069,7 @@ mod tests {
             got.sql
         );
         assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"));
-        s.def.measures = vec!["bad".to_owned()];
+        s.def.measures = vec!["bad".to_owned()].into();
         assert!(
             sql_for_sql_source_report(
                 &s,

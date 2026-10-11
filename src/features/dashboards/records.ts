@@ -23,6 +23,12 @@ export type RecordsRequest = {
   /** The dashboard's active filters, so the list agrees with the number clicked. */
   filters: FilterDef[];
   /**
+   * BI-6: the tile the list belongs to, set when the tile has filters of its
+   * own. The server adds them to the list, so it agrees with the number
+   * clicked on the tile; the route reads a relation, not a tile, without it.
+   */
+  chart?: string;
+  /**
    * A raw table (BI-16 part A): list these columns of the whole tile, in this
    * order, sorted by `sortColumn`. Not combined with `column` and `value`.
    */
@@ -57,6 +63,7 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
       if (req.sortDir) q.set("sortDir", req.sortDir);
     }
   }
+  if (req.chart) q.set("chart", req.chart);
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));
   const active = normalizeFilters(req.filters);

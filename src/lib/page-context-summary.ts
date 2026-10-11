@@ -20,6 +20,8 @@ export type TileLike = {
   source?: string
   mart?: string
   sqlSource?: string
+  /** BI-6: the chart's own filters, which the numbers on the tile already carry. */
+  def?: { filters?: FilterDef[] }
 }
 
 export type CellLike =
@@ -79,7 +81,10 @@ export function summarizeTiles(
     else if (!cell) data = "not loaded"
     else if ("error" in cell) data = `error: ${fmt(cell.error)}`
     else data = summarizeRows(cell.columns, cell.rows, maxRows)
-    return `- "${t.title}" (${t.kind}${id}; ${from}): ${data}`
+    // The numbers carry the chart's own filters; the assistant must know they do.
+    const own = (t.def?.filters ?? []).filter(isActiveFilter).map((f) => filterLabel(f))
+    const filtered = own.length ? `; filtered: ${own.join(", ")}` : ""
+    return `- "${t.title}" (${t.kind}${id}; ${from}${filtered}): ${data}`
   })
   return clip(lines.join("\n"), opts.maxChars ?? DEFAULT_CHARS)
 }

@@ -1,0 +1,144 @@
+import assert from "node:assert/strict"
+import test from "node:test"
+
+import {
+  effectiveOrder, entriesFromRows, isOtherRow, labelOtherRows, measureLabel, measureLimits, parseSortChoice,
+  resultName, rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortChoiceOf, sortOptions,
+  tileMeasureLabels, usesGroupings, emptyShapeDraft,
+} from "./chart-shape"
+
+test("a plain name stays a name and an own aggregate becomes an object", () => {
+  const rows = [{ column: "visitors", aggregate: "" }, { column: "stay", aggregate: "avg" }, { column: "", aggregate: "" }]
+  assert.deepEqual(entriesFromRows(rows, true), ["visitors", { column: "stay", aggregate: "avg" }])
+  // A kind that takes the chart's aggregate only sends names.
+  assert.deepEqual(entriesFromRows(rows, false), ["visitors", "stay"])
+})
+
+test("saved measures come back as rows, and none gives one empty row", () => {
+  assert.deepEqual(rowsFromEntries(["a", { column: "b", aggregate: "max" }]), [
+    { column: "a", aggregate: "" }, { column: "b", aggregate: "max" },
+  ])
+  assert.deepEqual(rowsFromEntries(undefined), [{ column: "", aggregate: "" }])
+})
+
+test("two aggregations of one column get different result names and readable labels", () => {
+  const none = new Set<string>()
+  const avg = { column: "stay", aggregate: "avg" }
+  const max = { column: "stay", aggregate: "max" }
+  assert.equal(resultName(avg, none), "avg_stay")
+  assert.equal(resultName(max, none), "max_stay")
+  assert.equal(measureLabel(avg, none), "avg of stay")
+  assert.equal(resultName({ column: "stay", aggregate: "" }, none), "stay")
+})
+
+test("a calculated aggregate keeps its own name whatever aggregate is chosen", () => {
+  const whole = new Set(["ratio"])
+  assert.equal(resultName({ column: "ratio", aggregate: "avg" }, whole), "ratio")
+  assert.equal(measureLabel({ column: "ratio", aggregate: "avg" }, whole), "ratio")
+})
+
+test("the number of measures follows the kind and a fixed role takes no own aggregate beyond its count", () => {
+  assert.deepEqual(measureLimits("bar"), { min: 1, max: 6, own: true })
+  assert.deepEqual(measureLimits("combo"), { min: 2, max: 2, own: true })
+  assert.deepEqual(measureLimits("bubble"), { min: 3, max: 3, own: true })
+  assert.deepEqual(measureLimits("kpi"), { min: 1, max: 1, own: false })
+  assert.deepEqual(measureLimits("table", true), { min: 0, max: 0, own: false })
+})
+
+test("the sort control offers the three orders, then each grouping and measure both ways", () => {
+  const options = sortOptions(["kab"], [{ name: "avg_stay", label: "avg of stay" }])
+  assert.deepEqual(options.map((o) => o.value), [
+    "order:desc", "order:asc", "order:none", "by:kab:asc", "by:kab:desc", "by:avg_stay:desc", "by:avg_stay:asc",
+  ])
+  assert.equal(options.find((o) => o.value === "by:avg_stay:desc")?.label, "avg of stay, highest first")
+})
+
+test("a sort choice round-trips through the definition", () => {
+  assert.deepEqual(parseSortChoice("order:asc"), { order: "asc" })
+  assert.deepEqual(parseSortChoice("by:avg_stay:desc"), { sort: { by: "avg_stay", dir: "desc" } })
+  assert.equal(sortChoiceOf({ order: "none" }), "order:none")
+  assert.equal(sortChoiceOf({ sort: { by: "kab", dir: "asc" } }), "by:kab:asc")
+  assert.equal(sortChoiceOf({}), "order:desc")
+})
+
+test("a sort by a grouping reads as the natural order and by a measure as a value order", () => {
+  assert.equal(effectiveOrder("by:kab:desc", ["kab"]), "none")
+  assert.equal(effectiveOrder("by:avg_stay:asc", ["kab"]), "asc")
+  assert.equal(effectiveOrder("order:none", ["kab"]), "none")
+})
+
+test("the draft sends only what its kind and the other choices allow", () => {
+  const draft = {
+    ...emptyShapeDraft(),
+    filters: [{ column: "category", values: ["Office"] }],
+    sortChoice: "by:visitors:desc",
+    other: true,
+  }
+  const bar = shapePayload(draft, { kind: "bar", rowsMode: false, grained: false })
+  assert.deepEqual(bar, { filters: draft.filters, sort: { by: "visitors", dir: "desc" }, other: true })
+  // A time grain, a line chart and a raw table take no "Other".
+  assert.equal(shapePayload(draft, { kind: "bar", rowsMode: false, grained: true }).other, undefined)
+  assert.equal(shapePayload(draft, { kind: "line", rowsMode: false, grained: false }).other, undefined)
+  assert.equal(shapePayload(draft, { kind: "table", rowsMode: true, grained: false }).other, undefined)
+  // A KPI keeps its filters but takes no sort.
+  const kpi = shapePayload(draft, { kind: "kpi", rowsMode: false, grained: false })
+  assert.equal(kpi.sort, undefined)
+  assert.deepEqual(kpi.filters, draft.filters)
+  // A text tile has no data to filter.
+  assert.equal(shapePayload(draft, { kind: "text", rowsMode: false, grained: false }).filters, undefined)
+})
+
+test("a legacy order sends no sort and a table sends groupings only when it needs them", () => {
+  const one = { ...emptyShapeDraft(), groupings: [{ column: "kab" }] }
+  assert.equal(usesGroupings(one.groupings), false)
+  assert.equal(shapePayload(one, { kind: "table", rowsMode: false, grained: false }).groupings, undefined)
+  const two = { ...emptyShapeDraft(), groupings: [{ column: "kab" }, { column: "d", grain: "month" }], other: true }
+  assert.equal(usesGroupings(two.groupings), true)
+  const payload = shapePayload(two, { kind: "table", rowsMode: false, grained: false })
+  assert.deepEqual(payload.groupings, [{ column: "kab" }, { column: "d", grain: "month" }])
+  // "Other" needs one dimension.
+  assert.equal(payload.other, undefined)
+  assert.equal(usesGroupings([{ column: "d", grain: "month" }]), true)
+})
+
+test("a saved definition becomes a draft and a table needs a grouping", () => {
+  const draft = shapeDraftFromDef({
+    filters: [{ column: "c", values: ["a"] }], sort: { by: "v", dir: "desc" }, other: true, groupings: [{ column: "c" }],
+  })
+  assert.equal(draft.sortChoice, "by:v:desc")
+  assert.equal(draft.other, true)
+  assert.deepEqual(shapeProblems(emptyShapeDraft(), { kind: "table", rowsMode: false }), ["Group by"])
+  assert.deepEqual(shapeProblems(draft, { kind: "table", rowsMode: false }), [])
+  assert.deepEqual(shapeProblems(emptyShapeDraft(), { kind: "bar", rowsMode: false }), [])
+})
+
+test("the computed Other group is recognised by its flag, not by its label", () => {
+  assert.equal(isOtherRow({ __other: 1 }), true)
+  assert.equal(isOtherRow({ __other: "1" }), true)
+  assert.equal(isOtherRow({ __other: 0, kab: "Other" }), false)
+  assert.equal(isOtherRow({ kab: "Other" }), false)
+})
+
+test("a real value called Other is kept apart from the computed group", () => {
+  const rows = [
+    { kab: "Other", v: 100, __other: 0 },
+    { kab: "A", v: 50, __other: 0 },
+    { kab: "Other", v: 90, __other: 1 },
+  ]
+  const { rows: drawn, otherLabels } = labelOtherRows(rows, "kab")
+  assert.deepEqual(drawn.map((r) => r.kab), ["Other", "A", "Other (rest)"])
+  assert.deepEqual([...otherLabels], ["Other (rest)"])
+  // Without a collision the computed group is simply "Other".
+  const plain = labelOtherRows([{ kab: "A", v: 1, __other: 0 }, { kab: "x", v: 2, __other: 1 }], "kab")
+  assert.deepEqual(plain.rows.map((r) => r.kab), ["A", "Other"])
+  assert.deepEqual([...plain.otherLabels], ["Other"])
+  assert.equal(labelOtherRows([{ kab: "A", v: 1 }], "kab").otherLabels.size, 0)
+})
+
+test("a tile labels a measure with its own aggregate by position", () => {
+  const labels = tileMeasureLabels(["visitors", { column: "stay", aggregate: "avg" }], ["visitors", "avg_stay"])
+  assert.deepEqual(labels, { avg_stay: "avg of stay" })
+  // A calculated aggregate kept its name: no label to add.
+  assert.deepEqual(tileMeasureLabels([{ column: "ratio", aggregate: "avg" }], "ratio"), {})
+  assert.deepEqual(tileMeasureLabels(undefined, "v"), {})
+})

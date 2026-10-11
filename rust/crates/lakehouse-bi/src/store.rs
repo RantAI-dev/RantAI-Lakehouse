@@ -32,6 +32,7 @@ use crate::embed_access::{self, EmbedAccess};
 use crate::fields::{self, FieldDef, SourceKind};
 use crate::filters::ColumnKind;
 use crate::grain::{Grain, TimeContext};
+use crate::shape::{self, MeasureList, RelationCheck, ShapeFields};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 use crate::tables::{self, ComparePlan, TableFields};
 
@@ -282,9 +283,10 @@ pub struct ChartInput {
     /// X-axis / category column.
     #[serde(default)]
     pub dimension: String,
-    /// Value column(s); more than one only for `stacked`.
+    /// Value column(s); more than one only for `stacked`. An entry may be
+    /// `{"column": …, "aggregate": …}` to carry its own aggregate (`BI-6`).
     #[serde(default)]
-    pub measures: Vec<String>,
+    pub measures: MeasureList,
     /// Optional 2nd dimension: splits into multiple series.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub breakdown: Option<String>,
@@ -343,9 +345,35 @@ pub struct ChartInput {
     /// saved before they existed.
     #[serde(flatten)]
     pub tables: TableFields,
+    /// The chart's own filters, sort, top-N with "Other" and groupings
+    /// (`BI-6`), flat on the wire and all absent on a chart saved before.
+    #[serde(flatten)]
+    pub shape: ShapeFields,
 }
 
 impl ChartInput {
+    /// Whether the chart uses anything `BI-6` added (a measure with its own
+    /// aggregate, its own filters, a sort, "Other", groupings). Such a chart is
+    /// rebuilt from its definition at read time, like a grained one.
+    #[must_use]
+    pub fn uses_shaping(&self) -> bool {
+        self.measures.has_own_aggregates() || self.shape.is_used()
+    }
+
+    /// `order` in the words it always had (`none`, `asc`, `desc`) once a sort
+    /// is taken into account: a sort by the dimension is `none` (by bucket),
+    /// a sort by anything else a value order. The rules for a grain's latest
+    /// buckets and part ranges read this, not `order`.
+    #[must_use]
+    pub fn effective_order(&self) -> String {
+        match &self.shape.sort {
+            None => self.order.clone().unwrap_or_else(|| "none".to_owned()),
+            Some(s) if s.by == self.dimension => "none".to_owned(),
+            Some(s) if s.descending() => "desc".to_owned(),
+            Some(_) => "asc".to_owned(),
+        }
+    }
+
     /// Whether the statement of this chart is built from the relation's
     /// columns at read time (a grain, a raw table, a pivot, a comparing KPI),
     /// so a caller that skips reading them when no filter is active must read
@@ -353,6 +381,7 @@ impl ChartInput {
     #[must_use]
     pub fn needs_columns(&self) -> bool {
         self.grain.is_some()
+            || self.uses_shaping()
             || self.kind == ChartKind::Pivot
             || self.tables.is_rows_mode(self.kind)
             || self.tables.compares_to_previous(self.kind)
@@ -1586,7 +1615,7 @@ fn empty_chart_input() -> ChartInput {
         sql_source: None,
         kind: ChartKind::Table,
         dimension: String::new(),
-        measures: Vec::new(),
+        measures: MeasureList::default(),
         breakdown: None,
         map: None,
         lat: None,
@@ -1602,6 +1631,7 @@ fn empty_chart_input() -> ChartInput {
         click: None,
         grain: None,
         tables: TableFields::default(),
+        shape: ShapeFields::default(),
     }
 }
 
@@ -1730,11 +1760,9 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
     let m = measures[0].clone();
     let compare =
         tables::plan_compare(&input.tables, &cols, &kinds).map_err(BiError::Validation)?;
-    let target = if kind == ChartKind::Gauge {
-        input.target.filter(|t| *t > 0.0)
-    } else {
-        None
-    };
+    let target = (kind == ChartKind::Gauge)
+        .then(|| input.target.filter(|t| *t > 0.0))
+        .flatten();
     let caption = input
         .caption
         .as_deref()
@@ -1748,7 +1776,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
-        measures: vec![m.clone()],
+        measures: vec![m.clone()].into(),
         breakdown: None,
         map: None,
         lat: None,
@@ -1768,6 +1796,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
             good_direction: input.tables.good_direction.clone(),
             ..TableFields::default()
         },
+        shape: stored_shape(input),
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
@@ -1848,7 +1877,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         sql_source: None,
         kind,
         dimension: String::new(),
-        measures: Vec::new(),
+        measures: MeasureList::default(),
         breakdown: None,
         map: None,
         lat: None,
@@ -1864,6 +1893,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         click: None,
         grain: None,
         tables: TableFields::default(),
+        shape: ShapeFields::default(),
     };
     let spec = ChartSpec {
         id: new_id,
@@ -2196,11 +2226,13 @@ fn grained_chart_sql(
         measures: input
             .measures
             .iter()
-            .map(|m| ident(m, "measure"))
+            .map(|m| ident(m, "measure").map(crate::builder::Measure::plain))
             .collect::<Result<_, _>>()?,
         agg: Aggregate::from_str_lossy(input.agg),
         order: input.order.to_owned(),
         limit: crate::grain::effective_limit(grain, input.order, input.limit),
+        // A chart with a sort is saved by `finish_shaping`, which rebuilds it.
+        sort: None,
     };
     crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
         BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
@@ -2336,7 +2368,7 @@ fn spec_from_chart_input(
         sql_source: sql_source.clone(),
         kind,
         dimension: dimension.clone(),
-        measures: measures.clone(),
+        measures: stored_measures(&input.measures),
         breakdown: breakdown_opt.clone(),
         map: geo.map.clone(),
         lat: geo.lat.clone(),
@@ -2356,6 +2388,7 @@ fn spec_from_chart_input(
             column_settings: input.tables.column_settings.clone(),
             ..TableFields::default()
         },
+        shape: stored_shape(input),
     };
 
     let sql = if is_point_kind(kind) {
@@ -2612,6 +2645,13 @@ fn spec_before_relation(
     let common = derive_common_fields(input, id)?;
     let geo = geo_fields(common.kind, input)?;
     tables::check_kind_fields(&input.tables, common.kind).map_err(BiError::Validation)?;
+    shape::check_kind_fields(
+        &input.measures,
+        &input.shape,
+        common.kind,
+        input.tables.is_rows_mode(common.kind),
+    )
+    .map_err(BiError::Validation)?;
     // ── TEXT — no SQL/mart ────────────────────────────────────────────
     if common.kind == ChartKind::Text {
         let CommonFields {
@@ -2808,6 +2848,34 @@ fn check_measures(
     Ok(())
 }
 
+/// [`shape::check_against_relation`] for the chart `input` reads over `from`.
+fn check_shaping(
+    input: &ChartInput,
+    (kind, from, cols, kinds): (
+        ChartKind,
+        &Relation,
+        &std::collections::HashSet<String>,
+        &HashMap<String, ColumnKind>,
+    ),
+    (grain, time): (Option<Grain>, &TimeContext),
+) -> Result<(), BiError> {
+    shape::check_against_relation(
+        &input.measures,
+        &input.shape,
+        &RelationCheck {
+            kind,
+            from,
+            cols,
+            kinds,
+            time,
+            dimension: &input.dimension,
+            breakdown: input.breakdown.as_deref().unwrap_or(""),
+            grained: grain.is_some(),
+        },
+    )
+    .map_err(BiError::Validation)
+}
+
 /// The part of [`spec_from_input`] that follows relation resolution, shared
 /// by the stored and the inline path so a chart is validated and its SQL
 /// built by one piece of code whichever way its rows are named.
@@ -2855,12 +2923,18 @@ fn spec_from_resolved(
     if !aggregate_allowed(&agg) {
         return Err(BiError::Validation(format!("invalid aggregate: {agg}")));
     }
-    let measures = input.measures.clone();
+    let measures = input.measures.to_vec();
     check_measures(input, kind, &measures, &cols)?;
+    // BI-6: the chart's own filters, sort, groupings and measures with their
+    // own aggregate are checked against the relation they read.
+    check_shaping(input, (kind, &from, &cols, &kinds), (grain, time))?;
+    // Kept for `finish_shaping`, which builds the stored statement of a chart
+    // that uses any of it from the same relation.
+    let shaping = input.uses_shaping().then(|| (from.clone(), kinds.clone()));
 
     // ── KPI / GAUGE — single number (no dimension) ──────────────────
     if kind == ChartKind::Kpi || kind == ChartKind::Gauge {
-        return spec_from_kpi_input(
+        let spec = spec_from_kpi_input(
             input,
             KpiCtx {
                 title,
@@ -2881,7 +2955,8 @@ fn spec_from_resolved(
                 kinds,
                 time,
             },
-        );
+        )?;
+        return finish_shaping(spec, shaping, time);
     }
 
     // ── TABLE / CHART — needs a dimension ────────────────────────────
@@ -2906,13 +2981,73 @@ fn spec_from_resolved(
         grain,
         time,
     };
-    if kind == ChartKind::Pivot {
+    let spec = if kind == ChartKind::Pivot {
         spec_from_pivot_input(input, ctx)
     } else if input.tables.is_rows_mode(kind) {
         spec_from_rows_input(input, ctx)
+    } else if input.shape.groupings.is_some() {
+        spec_from_groupings_input(input, ctx)
     } else {
         spec_from_chart_input(input, ctx)
+    }?;
+    finish_shaping(spec, shaping, time)
+}
+
+/// The `BI-6` fields of `input` as they are stored: the filters (none when the
+/// list is empty), sort and groupings as given, and `other` only when it is on
+/// (an `other: false` is the same chart as none, not a second spelling of it).
+fn stored_shape(input: &ChartInput) -> ShapeFields {
+    ShapeFields {
+        other: input.shape.wants_other().then_some(true),
+        // An empty list is no filters, not a second spelling of none.
+        filters: Some(input.shape.own_filters().to_vec()).filter(|f| !f.is_empty()),
+        ..input.shape.clone()
     }
+}
+
+/// The measures as they are stored: the same list with each own aggregate in
+/// lower case, so `AVG` and `avg` are one measure and one result name.
+fn stored_measures(measures: &MeasureList) -> MeasureList {
+    MeasureList::from_pairs(
+        measures
+            .entries()
+            .map(|(c, a)| (c.to_owned(), a.map(str::to_lowercase)))
+            .collect(),
+    )
+}
+
+/// `BI-6`: a chart that uses the chart builder's fields is saved with the
+/// statement the dashboard will build for it (its own filters applied, the
+/// sort, "Other" and groupings in place), so the smoke test at save, the
+/// builder's preview and the fallback for a definition that no longer checks
+/// out all run the same shape. A chart that uses none of them keeps the
+/// statement it was always built with, untouched.
+fn finish_shaping(
+    mut spec: StoredChartSpec,
+    shaping: Option<(Relation, HashMap<String, ColumnKind>)>,
+    time: &TimeContext,
+) -> Result<StoredChartSpec, BiError> {
+    let Some((from, kinds)) = shaping else {
+        return Ok(spec);
+    };
+    spec.spec.sql = crate::builder::stored_sql(&spec, &from, &kinds, time).ok_or_else(|| {
+        BiError::Validation(
+            "this combination of filters, sort, groupings and measures cannot be built.".to_owned(),
+        )
+    })?;
+    // The result columns of a measure with its own aggregate are named by
+    // aggregate and column (`avg_stay`), which is what the console reads.
+    if spec.def.measures.has_own_aggregates()
+        && let Some(named) = shape::resolve_measures(&spec.def.measures, &from)
+    {
+        let mut aliases: Vec<String> = named.iter().map(|m| m.alias.to_string()).collect();
+        spec.spec.y = if aliases.len() == 1 {
+            ChartY::Single(aliases.remove(0))
+        } else {
+            ChartY::Multi(aliases)
+        };
+    }
+    Ok(spec)
 }
 
 /// The stored definition shared by a raw table and a pivot: no dimension,
@@ -2925,7 +3060,7 @@ fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> C
         sql_source: ctx.sql_source.clone(),
         kind: ctx.kind,
         dimension: String::new(),
-        measures: Vec::new(),
+        measures: MeasureList::default(),
         breakdown: None,
         map: None,
         lat: None,
@@ -2941,6 +3076,7 @@ fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> C
         click: input.click.clone(),
         grain: grain.map(|g| g.as_str().to_owned()),
         tables: input.tables.clone(),
+        shape: stored_shape(input),
     }
 }
 
@@ -2969,6 +3105,77 @@ fn tables_spec(ctx: ChartCtx<'_>, x: String, y: Vec<String>, sql: String) -> Cha
         target: None,
         click: None,
     }
+}
+
+/// Assemble a grouped `table` with several groupings (`BI-6`). The columns
+/// are named in `groupings`, so `dimension`, `breakdown` and `grain` are
+/// refused beside them; the statement is the one the dashboard rebuilds
+/// ([`finish_shaping`] sets it), and `x` names the first grouping.
+fn spec_from_groupings_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    if !input.dimension.is_empty() || input.breakdown.is_some() || input.grain.is_some() {
+        return Err(BiError::Validation(
+            "a table with groupings names its columns in groupings, not in dimension, breakdown or grain."
+                .to_owned(),
+        ));
+    }
+    let first = input
+        .shape
+        .groupings
+        .iter()
+        .flatten()
+        .next()
+        .map(|g| g.column.clone())
+        .unwrap_or_default();
+    let (limit, order) = limit_and_order(ctx.kind, input, &ctx.from, false);
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: String::new(),
+        measures: stored_measures(&input.measures),
+        breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: Some(ctx.agg.clone()),
+        limit: Some(limit),
+        order: Some(order),
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields {
+            column_settings: input.tables.column_settings.clone(),
+            ..TableFields::default()
+        },
+        shape: stored_shape(input),
+    };
+    let y = ChartY::Multi(ctx.measures.clone());
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let mut spec = tables_spec(ctx, first, Vec::new(), String::new());
+    spec.y = y;
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
 }
 
 /// Assemble a `table` in rows mode (`BI-16` part A): its columns, its saved
@@ -3159,7 +3366,7 @@ impl StoredChartSpec {
                 sql_source: None,
                 kind,
                 dimension: dimension.to_owned(),
-                measures,
+                measures: measures.into(),
                 breakdown: None,
                 map: None,
                 lat: None,
@@ -3175,6 +3382,7 @@ impl StoredChartSpec {
                 click: None,
                 grain: None,
                 tables: TableFields::default(),
+                shape: ShapeFields::default(),
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -4374,5 +4582,233 @@ mod tests {
             "compare": { "kind": "goal", "value": 1 },
         }));
         assert!(matches!(gauge, Err(BiError::Validation(m)) if m.contains("only for kpi")));
+    }
+
+    // ── BI-6: measures with their own aggregate, own filters, sort, "Other",
+    // groupings ──────────────────────────────────────────────────────────
+
+    fn bi6_cols() -> Vec<crate::sources::SourceColumn> {
+        source_columns(&[
+            ("place", "String"),
+            ("cat", "String"),
+            ("d", "Date"),
+            ("visitors", "UInt64"),
+            ("stay", "Float64"),
+        ])
+    }
+
+    fn bi6_save(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = bi6_cols();
+        spec_from_inline_sql(
+            &inline_chart(extra),
+            InlineSql {
+                sql: "SELECT place, cat, d, visitors, stay FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    fn bi6_refusal(extra: &serde_json::Value) -> String {
+        match bi6_save(extra) {
+            Err(BiError::Validation(m)) => m,
+            other => panic!("expected a validation message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_measure_with_its_own_aggregate_is_saved_named_by_aggregate_and_column() {
+        let spec = bi6_save(&serde_json::json!({
+            "measures": ["visitors", {"column": "stay", "aggregate": "AVG"}],
+            "kind": "bar",
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        // Stored as it was written, the aggregate in lower case.
+        let stored = serde_json::to_value(&spec.def).unwrap();
+        assert_eq!(
+            stored["measures"],
+            serde_json::json!(["visitors", {"column": "stay", "aggregate": "avg"}])
+        );
+        assert!(spec.def.uses_shaping());
+    }
+
+    #[test]
+    fn a_chart_without_any_bi_6_field_is_not_marked_as_shaped_and_keeps_its_wire_shape() {
+        let spec = bi6_save(&serde_json::json!({"kind": "bar"})).unwrap();
+        assert!(!spec.def.uses_shaping());
+        let stored = serde_json::to_value(&spec.def).unwrap();
+        for key in ["filters", "sort", "other", "groupings"] {
+            assert!(
+                stored.get(key).is_none(),
+                "{key} leaked into the stored shape"
+            );
+        }
+        assert_eq!(stored["measures"], serde_json::json!(["visitors"]));
+    }
+
+    #[test]
+    fn the_chart_own_filters_are_in_the_statement_a_chart_is_saved_with() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar",
+            "filters": [{"column": "cat", "values": ["Retail"]}],
+        }))
+        .unwrap();
+        assert!(
+            spec.spec.sql.contains("WHERE cat IN ('Retail')"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.shape.own_filters().len(), 1);
+    }
+
+    #[test]
+    fn a_save_is_refused_with_a_plain_sentence_for_each_unsupported_shape() {
+        let cases = [
+            (
+                serde_json::json!({"kind": "kpi", "measures": [{"column": "stay", "aggregate": "avg"}]}),
+                "takes the chart's aggregate",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "nope", "values": ["a"]}]}),
+                "names a column this data does not have",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "visitors", "op": "contains", "text": "a"}]}),
+                "does not fit the column's type",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "cat", "values": []}]}),
+                "has no value",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "sort": {"by": "stay", "dir": "asc"}}),
+                "cannot sort by 'stay'",
+            ),
+            (
+                serde_json::json!({"kind": "kpi", "sort": {"by": "visitors", "dir": "asc"}}),
+                "sort is for grouped charts",
+            ),
+            (
+                serde_json::json!({"kind": "line", "other": true}),
+                "has no 'Other' group",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "dimension": "d", "grain": "month", "other": true}),
+                "not offered with a time grain",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "groupings": [{"column": "cat"}]}),
+                "only for a grouped table",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "measures": ["visitors", "visitors"]}),
+                "listed twice",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "measures": [{"column": "stay", "aggregate": "median"}]}),
+                "invalid aggregate: median",
+            ),
+        ];
+        for (extra, expected) in cases {
+            let got = bi6_refusal(&extra);
+            assert!(got.contains(expected), "{extra}: {got}");
+        }
+    }
+
+    #[test]
+    fn a_table_grouped_by_several_columns_is_saved_with_its_groupings() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "table",
+            "dimension": "",
+            "groupings": [{"column": "cat"}, {"column": "d", "grain": "month"}],
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .unwrap();
+        assert_eq!(spec.spec.x, "cat");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            // A table's default order is by its first measure, as before.
+            spec.spec
+                .sql
+                .contains("GROUP BY cat, d ORDER BY visitors DESC, cat, d LIMIT 20"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("date_trunc('month', d) AS d"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    #[test]
+    fn groupings_are_refused_beside_a_dimension_too_many_or_a_grain_that_does_not_fit() {
+        let table = |g: serde_json::Value, dimension: &str| serde_json::json!({"kind": "table", "dimension": dimension, "groupings": g});
+        assert!(
+            bi6_refusal(&table(serde_json::json!([{"column": "cat"}]), "place"))
+                .contains("names its columns in groupings")
+        );
+        assert!(
+            bi6_refusal(&table(
+                serde_json::json!([{"column": "cat", "grain": "month"}]),
+                ""
+            ))
+            .contains("date or timestamp")
+        );
+        assert!(
+            bi6_refusal(&table(
+                serde_json::json!([{"column": "d", "grain": "hour"}]),
+                ""
+            ))
+            .contains("needs a timestamp")
+        );
+        let six: Vec<_> = ["place", "cat", "d", "visitors", "stay", "place"]
+            .iter()
+            .map(|c| serde_json::json!({"column": c}))
+            .collect();
+        assert!(bi6_refusal(&table(serde_json::Value::Array(six), "")).contains("1 to 5 columns"));
+        assert!(bi6_refusal(&table(serde_json::json!([]), "")).contains("1 to 5 columns"));
+    }
+
+    #[test]
+    fn a_top_n_with_other_is_saved_as_the_statement_the_dashboard_will_run() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar",
+            "sort": {"by": "visitors", "dir": "desc"},
+            "limit": 5,
+            "other": true,
+        }))
+        .unwrap();
+        assert!(
+            spec.spec.sql.contains("if(__o = 1, 'Other', __k) AS __d"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(spec.spec.sql.contains("LIMIT 5)"), "{}", spec.spec.sql);
+        assert_eq!(spec.def.shape.other, Some(true));
+        // `other: false` is the chart with none, not a second spelling of it.
+        let off =
+            bi6_save(&serde_json::json!({"kind": "bar", "other": false, "filters": []})).unwrap();
+        assert_eq!(off.def.shape.other, None);
+        assert_eq!(off.def.shape.filters, None);
+        assert!(!off.def.uses_shaping());
     }
 }

@@ -14,6 +14,7 @@ import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
@@ -40,6 +41,12 @@ import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
+import {
+  effectiveOrder, emptyShapeDraft, entriesFromRows, measureLabel, measureLimits, parseSortChoice, resultName,
+  rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortOptions, takesOther, usesGroupings,
+  type MeasureRow, type ShapeDefFields, type ShapeDraft,
+} from "@/lib/chart-shape";
+import { ChartFilters, GroupingsEditor, MeasureRows, type ColumnChoice } from "./chart-shape-section";
 import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
@@ -64,7 +71,7 @@ type Fields = {
 };
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
-  dimension?: string; measures?: string[]; breakdown?: string;
+  dimension?: string; breakdown?: string;
   map?: string; lat?: string; lon?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
@@ -72,7 +79,8 @@ export type ChartDef = {
   click?: ChartClick;
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
   grain?: string;
-} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
+} & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
+  & ShapeDefFields; // measures with their own aggregate, the chart's own filters, sort, "Other", groupings (BI-6)
 type BoardOpt = { id: string; name: string };
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
@@ -140,9 +148,6 @@ const AGGS = ["sum", "avg", "max", "min", "count"];
 const KIND_LABELS: Record<string, string> = Object.fromEntries(
   KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
 );
-const ORDER_LABELS: Record<string, string> = {
-  desc: "Highest first", asc: "Lowest first", none: "Natural (by dimension)",
-};
 const NO_BREAKDOWN = "__none__";
 const NO_GRAIN = "__no_grain__";
 const GRAIN_ITEMS: Record<string, string> = { [NO_GRAIN]: "No grouping", ...GRAIN_LABELS };
@@ -296,9 +301,26 @@ export function ChartBuilder({
   const [kindQuery, setKindQuery] = React.useState("");
   const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
   const [dimension, setDimension] = React.useState("");
-  const [measure, setMeasure] = React.useState("");
-  const [measure2, setMeasure2] = React.useState("");
-  const [measure3, setMeasure3] = React.useState("");
+  // The measures, each with an aggregate of its own or the chart's (BI-6). The
+  // first three are also read as `measure`, `measure2` and `measure3`.
+  const [measureRows, setMeasureRows] = React.useState<MeasureRow[]>([{ column: "", aggregate: "" }]);
+  const measure = measureRows[0]?.column ?? "";
+  const measure2 = measureRows[1]?.column ?? "";
+  const measure3 = measureRows[2]?.column ?? "";
+  function setColumnAt(i: number, update: string | ((v: string) => string)) {
+    setMeasureRows((rows) => {
+      const next = [...rows];
+      while (next.length <= i) next.push({ column: "", aggregate: "" });
+      next[i] = { ...next[i], column: typeof update === "function" ? update(next[i].column) : update };
+      return next;
+    });
+  }
+  const setMeasure = (u: string | ((v: string) => string)) => setColumnAt(0, u);
+  /** Keeps only the measures the source still offers (a re-run, a deleted field). */
+  const keepMeasures = (offered: readonly string[]) => setMeasureRows((rows) => rows.map((r) => ({ ...r, column: keepIfOffered(r.column, offered) })));
+  // BI-6: the chart's own filters, the sort (with the three orders a chart always had), "Other", and a table's groupings.
+  const [shape, setShape] = React.useState<ShapeDraft>(emptyShapeDraft);
+  const setSortChoice = (sortChoice: string) => setShape((d) => ({ ...d, sortChoice }));
   const [breakdown, setBreakdown] = React.useState("");
   // Map kinds. `mapId` empty = "the default for this kind", so switching
   // kind before picking a map follows the kind (Jakarta cities for a
@@ -311,7 +333,6 @@ export function ChartBuilder({
   const [caption, setCaption] = React.useState("");
   const [target, setTarget] = React.useState("");
   const [text, setText] = React.useState("");
-  const [order, setOrder] = React.useState<"desc" | "asc" | "none">("desc");
   const [limit, setLimit] = React.useState(20);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -340,6 +361,26 @@ export function ChartBuilder({
   const isPivot = kind === "pivot";
   // A pivot and a raw table name their columns in their own fields, not as a dimension and measures.
   const ownColumns = isPivot || (kind === "table" && tableDraft.mode === "rows");
+  const rowsMode = kind === "table" && tableDraft.mode === "rows";
+  // BI-6: a grouped table lists its groupings; the first is also its `dimension`.
+  const isGroupedTable = kind === "table" && !rowsMode;
+  const groupingNames = isGroupedTable ? shape.groupings.map((g) => g.column) : [dimension].filter(Boolean);
+  const limits = measureLimits(kind, rowsMode);
+  /** The legacy order, read by the limit and grain rules: a sort by a grouping is "none", by a measure a value order. */
+  const order = effectiveOrder(shape.sortChoice, groupingNames);
+  const wholeMeasure = React.useMemo(
+    () => new Set((fields?.calculated ?? []).filter((f) => f.level === "aggregate" || f.level === "table").map((f) => f.name)),
+    [fields],
+  );
+  // Fix the number of measure rows to what the kind takes.
+  React.useEffect(() => {
+    setMeasureRows((rows) => {
+      if (rows.length === Math.min(Math.max(rows.length, limits.min), limits.max || 1) && rows.length >= limits.min) return rows;
+      const next = rows.slice(0, Math.max(limits.max, 1));
+      while (next.length < limits.min) next.push({ column: "", aggregate: "" });
+      return next;
+    });
+  }, [limits.min, limits.max]);
   const sourceColumns = React.useMemo<SourceColumns>(() => ({
     all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
     dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
@@ -371,7 +412,7 @@ export function ChartBuilder({
   }, [fields, grainOptions, grainRequired]);
   function pickGrain(next: Grain | "") {
     // A grouped chart reads best in date order; the editor can still change it.
-    if (next && !grain && order === "desc") setOrder("none");
+    if (next && !grain && shape.sortChoice === "order:desc") setSortChoice("order:none");
     // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
     setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
     setGrain(next);
@@ -387,15 +428,14 @@ export function ChartBuilder({
     setLat((l) => l || guessed.lat || "");
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
-  const needsM2 = kind === "stacked" || kind === "scatter" || kind === "combo" || kind === "bubble";
-  const needsM3 = kind === "bubble";
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
+  const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
   const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : "Dimension (X)";
   const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
   const suggestedTitle = suggestChartTitle({
     kind, dimension: isSingle ? undefined : dimension,
-    measures: needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure],
+    measures: measureRows.slice(0, Math.max(limits.min, 1)).map((r) => r.column),
     breakdown: canBreakdown ? breakdown : undefined,
   });
   const canWriteSql = useAuth().hasPermission("dashboard:sql");
@@ -407,9 +447,8 @@ export function ChartBuilder({
     const any = [...f.measures, ...f.dimensions];
     setFields(f);
     setDimension((v) => keepIfOffered(v, f.dimensions));
-    setMeasure((v) => keepIfOffered(v, f.measures));
-    setMeasure2((v) => keepIfOffered(v, f.measures));
-    setMeasure3((v) => keepIfOffered(v, f.measures));
+    keepMeasures(f.measures);
+    setShape((d) => ({ ...d, groupings: d.groupings.filter((g) => f.dimensions.includes(g.column) || f.measures.includes(g.column)) }));
     setBreakdown((v) => keepIfOffered(v, f.dimensions));
     setLat((v) => keepIfOffered(v, any));
     setLon((v) => keepIfOffered(v, any));
@@ -430,14 +469,13 @@ export function ChartBuilder({
     ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
     : [
         ...(choice || isNewSql ? [] : ["Data source"]),
-        ...(!isSingle && !isPoints && !ownColumns && !dimension ? [dimensionLabel] : []),
+        ...(!isSingle && !isPoints && !ownColumns && !isGroupedTable && !dimension ? [dimensionLabel] : []),
         ...(isPoints && !lat ? ["Latitude"] : []),
         ...(isPoints && !lon ? ["Longitude"] : []),
-        ...(ownColumns || measure ? [] : [mLabels[0]]),
-        ...(needsM2 && !measure2 ? [mLabels[1] ?? "2nd measure"] : []),
-        ...(needsM3 && !measure3 ? [mLabels[2] ?? "3rd measure"] : []),
+        ...(ownColumns ? [] : measureRows.slice(0, limits.min).flatMap((r, i) => (r.column ? [] : [measureTitle(i)]))),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
         ...draftProblems(kind, tableDraft),
+        ...shapeProblems(shape, { kind, rowsMode }),
       ];
   const isEdit = !!editId;
   // Why no chart can be drawn yet while the SQL is new or edited (null = it
@@ -493,7 +531,14 @@ export function ChartBuilder({
       setCaption(initial.caption ?? "");
       setTarget(initial.target != null ? String(initial.target) : "");
       setText(initial.text ?? "");
-      setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
+      const savedShape = shapeDraftFromDef(initial);
+      // A grouped table saved with a plain dimension has that one grouping.
+      if (initial.kind === "table" && initial.tableMode !== "rows" && !savedShape.groupings.length && initial.dimension) savedShape.groupings = [{ column: initial.dimension }];
+      setShape(savedShape);
+      // At once, not after the columns load: a saved sort names a measure or a grouping, and the
+      // check that drops a sort the chart no longer has must see them.
+      setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
+      setMeasureRows(rowsFromEntries(initial.measures));
       setLimit(initial.limit ?? 20);
       setLimitTouched(true);
       setTargetBoard(initial.board ?? board);
@@ -504,10 +549,8 @@ export function ChartBuilder({
       setSource(m);
       if (m) {
         void loadFields(m).then(() => {
-          setDimension(initial.dimension ?? "");
-          setMeasure(initial.measures?.[0] ?? "");
-          setMeasure2(initial.measures?.[1] ?? "");
-          setMeasure3(initial.measures?.[2] ?? "");
+          setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
+          setMeasureRows(rowsFromEntries(initial.measures));
         });
       }
     } else {
@@ -518,9 +561,9 @@ export function ChartBuilder({
 
   function reset() {
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
-    setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setMapId(""); setLat(""); setLon("");
+    setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20); setLimitTouched(false);
+    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false);
     setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
   }
@@ -528,8 +571,10 @@ export function ChartBuilder({
   // User changes the data source → reset the column selections and reload.
   function onSourceChange(value: string) {
     draft.cancel();
-    setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
+    setSource(value); setDimension(""); setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown("");
     setLat(""); setLon("");
+    // The filters and groupings name the old source's columns.
+    setShape((d) => ({ ...emptyShapeDraft(), sortChoice: d.sortChoice, other: d.other }));
     // The columns of a raw table, a pivot or a comparison belong to the old source.
     setTableDraft((d) => ({ ...emptyTableDraft(), mode: d.mode, totals: d.totals, goodDirection: d.goodDirection, compareKind: d.compareKind }));
     if (value === NEW_SQL_CHOICE) { setFields(null); draft.startNew(); return; }
@@ -542,12 +587,37 @@ export function ChartBuilder({
     if (!source) return;
     void loadFields(source).then((f) => {
       setDimension((v) => keepIfOffered(v, f.dimensions));
-      setMeasure((v) => keepIfOffered(v, f.measures));
-      setMeasure2((v) => keepIfOffered(v, f.measures));
-      setMeasure3((v) => keepIfOffered(v, f.measures));
+      keepMeasures(f.measures);
       setBreakdown((v) => keepIfOffered(v, f.dimensions));
     });
   }
+
+  // The result names of the measures ("avg_stay") and the columns a grouped table shows,
+  // which its column settings are kept for.
+  const resultNames = measureRows.filter((r) => r.column).map((r) => resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure));
+  const shownColumns = [...new Set([...groupingNames, ...resultNames])];
+  const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)) };
+  const measureColumns = (fields?.measures ?? []).filter((m) => !isPoints || (m !== lat && m !== lon));
+  // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
+  const columnChoices = React.useMemo<ColumnChoice[]>(() => {
+    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
+    return names.map((name) => ({ name, kind: fields?.kinds?.[name] ?? "text" }));
+  }, [fields, wholeMeasure]);
+  const sortChoices = sortOptions(
+    groupingNames,
+    measureRows.filter((r) => r.column).map((r) => {
+      const row = limits.own ? r : { ...r, aggregate: "" };
+      return { name: resultName(row, wholeMeasure), label: measureLabel(row, wholeMeasure) };
+    }),
+  );
+  const sortLabels = Object.fromEntries(sortChoices.map((o) => [o.value, o.label]));
+  // A sort by a measure or grouping the chart no longer has goes back to the default order.
+  React.useEffect(() => {
+    if (!fields) return;
+    if (shape.sortChoice.startsWith("by:") && !sortChoices.some((o) => o.value === shape.sortChoice)) setSortChoice("order:desc");
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `sortChoices` is rebuilt every render; its content is what matters
+  }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
+  const showOther = takesOther(kind, rowsMode) && !grain && !(isGroupedTable && shape.groupings.length > 1) && limitHasEffect(grain, order);
 
   function buildPayload(forPreview = false, withSource: ChartSourceChoice | null = choice): Record<string, unknown> {
     if (missing.length) throw new Error(`Still needed: ${missing.join(", ")}.`);
@@ -562,6 +632,7 @@ export function ChartBuilder({
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),
+        ...shapePayload(shape, shapeContext),
       };
     } else if (ownColumns) {
       // BI-16 part A: no dimension, measures or aggregate; the columns travel in the table's own fields.
@@ -569,19 +640,25 @@ export function ChartBuilder({
         title: payloadTitle, ...sourcePayload(withSource), kind, span, board: targetBoard,
         ...draftPayload(kind, tableDraft),
         grain: isPivot && grain && grainOptions.includes(grain) ? grain : undefined,
+        ...shapePayload(shape, shapeContext),
       };
     } else {
-      const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
+      const measures = entriesFromRows(measureRows, limits.own);
+      const legacyOrder = parseSortChoice(shape.sortChoice).order;
       payload = {
-        title: payloadTitle, ...sourcePayload(withSource), kind, dimension, measures, aggregate, span, board: targetBoard,
+        title: payloadTitle, ...sourcePayload(withSource), kind,
+        // Several groupings (or a grain on one) travel in `groupings`, which takes the place of the dimension.
+        dimension: isGroupedTable && usesGroupings(shape.groupings) ? "" : dimension,
+        measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
         map: isMap ? effectiveMap : undefined,
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
-        order: isCalendar ? "none" : isPoints ? undefined : order, limit: isPoints ? undefined : Math.min(limit, maxLimit),
+        order: isCalendar ? "none" : isPoints ? undefined : legacyOrder, limit: isPoints ? undefined : Math.min(limit, maxLimit),
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
-        ...draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean)),
+        ...draftPayload(kind, tableDraft, shownColumns),
+        ...shapePayload(shape, shapeContext),
       };
     }
     // A chart without marks to click (text, KPI, gauge, table, density map)
@@ -596,9 +673,11 @@ export function ChartBuilder({
 
   const previewInputsKey = previewKey({
     title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon,
-    aggregate, span, caption, target, text, order, limit, targetBoard, grain,
+    aggregate, span, caption, target, text, order: shape.sortChoice, limit, targetBoard, grain,
     // BI-16 part A: every table, pivot and comparison setting reaches the SQL or the render spec.
-    tables: JSON.stringify(draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean))),
+    tables: JSON.stringify(draftPayload(kind, tableDraft, shownColumns)),
+    // BI-6: each measure's own aggregate, the chart's own filters, the sort, "Other" and the groupings.
+    shape: JSON.stringify({ measures: measureRows, shape }),
     // BI-8: a changed formula changes the rows a chart over the field returns.
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
   });
@@ -856,6 +935,16 @@ export function ChartBuilder({
           {/* Dimensions together, then the measure next to how it is aggregated. */}
           {!isSingle && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {isGroupedTable ? (
+                <GroupingsEditor
+                  value={shape.groupings}
+                  onChange={(groupings) => { setShape((d) => ({ ...d, groupings })); setDimension(groupings[0]?.column ?? ""); }}
+                  columns={columnChoices}
+                  disabled={!fields}
+                  placeholder={fields ? "pick a column" : noFieldsHint}
+                  fieldLabel={fieldLabel}
+                />
+              ) : (
               <div className="grid gap-1.5">
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
                 {isPoints ? (
@@ -874,6 +963,7 @@ export function ChartBuilder({
                 )}
                 {grainPicker}
               </div>
+              )}
               {canBreakdown ? (
                 <div className="grid gap-1.5">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
@@ -910,12 +1000,12 @@ export function ChartBuilder({
             <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
 
-          {ownColumns ? null : <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {ownColumns ? null : limits.max <= 1 ? <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>{mLabels[0]} <Req /></Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
                 <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
+                <SelectContent>{measureColumns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             {isBoxplot ? (
@@ -932,28 +1022,23 @@ export function ChartBuilder({
                 </Select>
               </div>
             )}
-          </div>}
-
-          {needsM2 && !ownColumns ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="grid gap-1.5">
-                <Label>{mLabels[1] ?? "2nd measure"} <Req /></Label>
-                <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
-                  <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
+          </div> : (
+            // BI-6: several measures, each with the chart's aggregate or one of its own.
+            <div className="grid gap-3">
+              <div className="grid max-w-xs gap-1.5">
+                <Label>Aggregation <span className="font-normal text-muted-foreground">(default)</span></Label>
+                <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
-              {needsM3 ? (
-                <div className="grid gap-1.5">
-                  <Label>{mLabels[2] ?? "3rd measure"} <Req /></Label>
-                  <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
-                  </Select>
-                </div>
-              ) : null}
+              <MeasureRows
+                rows={measureRows} onChange={setMeasureRows} labels={measureTitle}
+                min={limits.min} max={limits.max} own={limits.own} columns={measureColumns} defaultAggregate={aggregate}
+                disabled={!fields} placeholder={fields ? "pick a column" : noFieldsHint} wholeMeasure={wholeMeasure} fieldLabel={fieldLabel}
+              />
             </div>
-          ) : null}
+          )}
 
           {ownColumns ? null : isKpi ? (
             <>
@@ -983,12 +1068,10 @@ export function ChartBuilder({
               ) : (
                 <div className="grid gap-1.5">
                   <Label>Sort</Label>
-                  <Select value={order} items={ORDER_LABELS} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
-                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <Select value={shape.sortChoice} items={sortLabels} onValueChange={(v) => setSortChoice(v ?? "order:desc")}>
+                    <SelectTrigger className="w-full" aria-label="Sort"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="desc">Highest first</SelectItem>
-                      <SelectItem value="asc">Lowest first</SelectItem>
-                      <SelectItem value="none">Natural (by dimension)</SelectItem>
+                      {sortChoices.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>
@@ -1000,7 +1083,16 @@ export function ChartBuilder({
             </div>
           )}
 
-          {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={[dimension, measure].filter(Boolean)} /> : null}
+          {showOther ? (
+            <Label className="gap-2 text-sm font-normal">
+              <Switch size="sm" checked={shape.other} onCheckedChange={(c) => setShape((d) => ({ ...d, other: c === true }))} aria-label="Group the rest as Other" />
+              Group the rest as “Other”
+            </Label>
+          ) : null}
+
+          <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} />
+
+          {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {isPivot ? (
             <>
               <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
@@ -1180,9 +1272,7 @@ export function ChartBuilder({
             onDeleted={(gone) => {
               void loadFields(source).then((f) => {
                 setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
-                setMeasure((v) => keepIfOffered(v, f.measures));
-                setMeasure2((v) => keepIfOffered(v, f.measures));
-                setMeasure3((v) => keepIfOffered(v, f.measures));
+                keepMeasures(f.measures);
                 setBreakdown((v) => keepIfOffered(v, f.dimensions));
               });
             }}

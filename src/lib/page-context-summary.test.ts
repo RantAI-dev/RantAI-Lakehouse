@@ -72,3 +72,13 @@ test("summarizeQuery includes the SQL and the last result, or says it has not ru
   const out = summarizeQuery("SELECT a, b FROM t", { columns: ["a", "b"], rows: [{ a: 1, b: 2 }], rowCount: 1 })
   assert.ok(out.includes("Last result: 1 row(s), columns a, b; rows: 1=2"), out)
 })
+
+test("a tile with filters of its own says so, beside its numbers", () => {
+  const out = summarizeTiles(
+    [{ id: "u_1", title: "Visitors", kind: "bar", source: "ui", mart: "m", def: { filters: [{ column: "category", values: ["Office"] }] } }],
+    { u_1: { columns: ["kab", "v"], rows: [{ kab: "Bali", v: 3 }] } },
+  )
+  assert.match(out, /\(bar, id u_1; m; filtered: category is Office\): rows: Bali=3/)
+  const plain = summarizeTiles([{ id: "u_2", title: "T", kind: "bar", source: "ui", mart: "m" }], {})
+  assert.doesNotMatch(plain, /filtered/)
+})

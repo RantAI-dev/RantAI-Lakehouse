@@ -49,3 +49,48 @@ test("a bar of shares labels its value axis and tooltip with decimals, a bar of 
   assert.equal(whole.tick(10), "10")
   assert.equal(whole.tip(1234), "1,234")
 })
+
+// BI-6: several measures on one bar or line, and the readable name of a measure with its own aggregate.
+test("a bar with several measures draws one series per measure, named by its label", () => {
+  const rows = [{ c: "a", visitors: 10, avg_stay: 2 }, { c: "b", visitors: 7, avg_stay: 3 }]
+  const spec = { kind: "bar" as const, x: "c", y: ["visitors", "avg_stay"], measureLabels: { avg_stay: "avg of stay" } }
+  const option = buildOption(spec, rows, false)
+  const series = option.series as { name: string; data: number[] }[]
+  assert.deepEqual(series.map((s) => s.name), ["visitors", "avg of stay"])
+  assert.deepEqual(series.map((s) => s.data), [[10, 7], [2, 3]])
+  assert.ok(option.legend, "several series need a legend")
+})
+
+test("a bar with one measure keeps the unnamed series it always had unless the measure has a label", () => {
+  const rows = [{ c: "a", v: 10 }]
+  const plain = buildOption({ kind: "bar", x: "c", y: "v" }, rows, false).series as { name?: string }[]
+  assert.equal("name" in plain[0], false)
+  const labelled = buildOption({ kind: "bar", x: "c", y: "avg_v", measureLabels: { avg_v: "avg of v" } }, [{ c: "a", avg_v: 4 }], false)
+  assert.equal((labelled.series as { name?: string }[])[0].name, "avg of v")
+})
+
+test("a horizontal bar with several measures reverses every series with its categories", () => {
+  const rows = [{ c: "a", p: 1, q: 5 }, { c: "b", p: 2, q: 6 }]
+  const option = buildOption({ kind: "hbar", x: "c", y: ["p", "q"] }, rows, false)
+  const series = option.series as { data: number[] }[]
+  assert.deepEqual(series.map((s) => s.data), [[2, 1], [6, 5]])
+  assert.deepEqual((option.yAxis as { data: string[] }).data, ["b", "a"])
+})
+
+test("a combo and a stacked bar name their series and axes by the label", () => {
+  const rows = [{ c: "a", visitors: 10, avg_stay: 2 }]
+  const labels = { avg_stay: "avg of stay" }
+  const combo = buildOption({ kind: "combo", x: "c", y: ["visitors", "avg_stay"], measureLabels: labels }, rows, false)
+  assert.deepEqual((combo.series as { name: string }[]).map((s) => s.name), ["visitors", "avg of stay"])
+  assert.equal(((combo.yAxis as { name: string }[])[1]).name, "avg of stay")
+  const stacked = buildOption({ kind: "stacked", x: "c", y: ["visitors", "avg_stay"], measureLabels: labels }, rows, false)
+  assert.deepEqual((stacked.series as { name: string }[]).map((s) => s.name), ["visitors", "avg of stay"])
+})
+
+test("the decimals of a measure with a fraction apply to every measure on the chart", () => {
+  const rows = [{ c: "a", visitors: 1200, avg_stay: 2.5 }, { c: "b", visitors: 800, avg_stay: 1.25 }]
+  const option = buildOption({ kind: "bar", x: "c", y: ["visitors", "avg_stay"] }, rows, false)
+  const tip = option.tooltip as { valueFormatter: (v: number) => string }
+  // Largest value is over 1,000, so the compact rule keeps whole numbers; the tooltip stays consistent.
+  assert.equal(tip.valueFormatter(2.5), "3")
+})

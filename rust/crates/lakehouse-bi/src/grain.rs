@@ -399,6 +399,24 @@ impl Grain {
         }
     }
 
+    /// The column half of [`Self::validate`], for a grouping that is not a
+    /// chart's `dimension` (`BI-6`): whether a column of `column`'s kind can be
+    /// cut by this grain.
+    ///
+    /// # Errors
+    ///
+    /// The message to show the person who chose the grain.
+    pub fn validate_column(self, column: Option<ColumnKind>) -> Result<(), String> {
+        match column {
+            Some(ColumnKind::Date) if self.needs_time() => Err(format!(
+                "{} needs a timestamp column; this column has no time.",
+                self.label()
+            )),
+            Some(ColumnKind::Date | ColumnKind::DateTime) => Ok(()),
+            _ => Err("a grain needs a date or timestamp column.".to_owned()),
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::HourOfDay => "hour of day",

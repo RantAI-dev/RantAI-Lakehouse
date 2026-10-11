@@ -27,7 +27,7 @@
 
 use lakehouse_core::ident::Ident;
 
-use super::{QueryBuilder, Ready, add_settings};
+use super::{Measure, QueryBuilder, Ready, add_settings};
 use crate::formula::compile::{Shift, ShiftKind};
 use crate::grain::{self, Grain};
 
@@ -63,7 +63,7 @@ impl QueryBuilder<Ready> {
         let calcs: Vec<_> = self
             .measures
             .iter()
-            .filter_map(|m| self.from.table_calc(m.as_str()))
+            .filter_map(|m| self.from.table_calc(m.column.as_str()))
             .collect();
         if calcs.is_empty() {
             return None;
@@ -81,7 +81,7 @@ impl QueryBuilder<Ready> {
             .grain
             .is_some_and(|(g, _)| grain::cuts_to_latest(g, &self.order));
         let keep = self.limit + u32::from(latest);
-        let is_calc = |m: &Ident| calcs.iter().any(|c| c.name == m.as_str());
+        let is_calc = |m: &Measure| calcs.iter().any(|c| c.name == m.column.as_str());
 
         // 0. the grouped result with the hidden columns.
         // A plain measure is named `__m<i>` here and takes its own name in
@@ -123,7 +123,7 @@ impl QueryBuilder<Ready> {
         let staged = self.shifted(calcs, &grouped, &items)?;
 
         // 2. the measures, windows over the grouped result.
-        let names: Vec<String> = self.measures.iter().map(ToString::to_string).collect();
+        let names: Vec<String> = self.measures.iter().map(|m| m.alias.to_string()).collect();
         let wrapped_items: Vec<String> = self
             .measures
             .iter()
@@ -131,8 +131,11 @@ impl QueryBuilder<Ready> {
             .map(|(i, m)| {
                 calcs
                     .iter()
-                    .find(|c| c.name == m.as_str())
-                    .map_or_else(|| format!("__m{i} AS {m}"), |c| format!("{} AS {m}", c.sql))
+                    .find(|c| c.name == m.column.as_str())
+                    .map_or_else(
+                        || format!("__m{i} AS {}", m.alias),
+                        |c| format!("{} AS {}", c.sql, m.alias),
+                    )
             })
             .collect();
         let head = brk.map_or_else(|| dim.to_string(), |b| format!("{dim}, {b}"));

@@ -15,6 +15,11 @@ export type PreviewInputs = {
   tables: string
   /** The source's calculated fields as (name, formula), so editing a formula refreshes the preview (BI-8). */
   calc: string
+  /**
+   * BI-6: the measures with their own aggregate, the chart's own filters, the sort, "Other" and the
+   * groupings as they would be sent. Each reaches the SQL, so each must request a new preview.
+   */
+  shape: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {

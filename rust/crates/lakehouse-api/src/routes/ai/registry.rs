@@ -155,6 +155,62 @@ fn with_table_properties(mut schema: Value) -> Value {
     schema
 }
 
+/// The `measures` of `create_chart` and `update_chart` (`BI-6`): a column name,
+/// or a column with its own aggregate. A plain name takes the chart's
+/// `aggregate`, as before.
+fn measures_schema() -> Value {
+    json!({ "type": "array", "items": { "oneOf": [
+        { "type": "string" },
+        { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column", "aggregate"],
+            "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" }
+    ] },
+        "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}" })
+}
+
+/// The `BI-6` fields of `create_chart` and `update_chart` (the chart's own
+/// filters, sort, "Other", groupings), inserted the way
+/// [`with_table_properties`] inserts the table fields. The limits are the ones
+/// `lakehouse_bi::shape` enforces.
+fn with_shape_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "filters": { "type": "array", "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
+            "values": { "type": "array", "items": { "type": "string" }, "description": "in / not_in" },
+            "min": { "type": "string", "description": "between: a number or a date YYYY-MM-DD" },
+            "max": { "type": "string" },
+            "minExclusive": { "type": "boolean" }, "maxExclusive": { "type": "boolean" },
+            "text": { "type": "string", "description": "contains, starts_with, ends_with, not_contains" },
+            "anchor": { "type": "string", "enum": ["last", "this", "previous", "next"], "description": "relative" },
+            "unit": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
+            "n": { "type": "number" } },
+            "required": ["column"] },
+            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\"" },
+        "sort": { "type": "object", "properties": {
+            "by": { "type": "string", "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)" },
+            "dir": { "type": "string", "enum": ["asc", "desc"] } },
+            "required": ["by", "dir"],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" },
+        "other": { "type": "boolean", "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain" },
+        "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" } },
+            "required": ["column"] },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
+}
+
 fn run_sql_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_sql",
         "description": "Run a read-only ClickHouse SELECT and return its rows. Use it for every number you report. Query Gold marts (serving.mart_*) for totals and trends, Silver (silver.<table>) for detail rows. Compute totals, percentages, growth and rankings in the SQL itself. Tables and columns are in the DATA MAP.",
@@ -232,7 +288,7 @@ fn describe_mart_schema() -> Value {
 }
 
 fn create_chart_schema() -> Value {
-    with_table_properties(
+    with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
@@ -241,7 +297,7 @@ fn create_chart_schema() -> Value {
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
             "target": { "type": "number" }, "dimension": { "type": "string" },
-            "measures": { "type": "array", "items": { "type": "string" } },
+            "measures": measures_schema(),
             "breakdown": { "type": "string" },
             "map": { "type": "string", "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta (Jakarta cities), id-provinces (Indonesian provinces), id-regencies (Indonesian kabupaten/kota)" },
             "lat": { "type": "string", "description": "pointmap and geoheat only (required): the latitude column" },
@@ -252,11 +308,11 @@ fn create_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
-    )
+    ))
 }
 
 fn update_chart_schema() -> Value {
-    with_table_properties(
+    with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
@@ -264,7 +320,7 @@ fn update_chart_schema() -> Value {
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "dimension": { "type": "string" },
-            "measures": { "type": "array", "items": { "type": "string" } },
+            "measures": measures_schema(),
             "breakdown": { "type": "string" }, "caption": { "type": "string" },
             "map": { "type": "string", "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta, id-provinces, id-regencies" },
             "lat": { "type": "string", "description": "pointmap and geoheat only (required): the latitude column" },
@@ -276,7 +332,7 @@ fn update_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } }),
-    )
+    ))
 }
 
 fn create_board_schema() -> Value {
@@ -1450,6 +1506,31 @@ mod tests {
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
         );
+    }
+
+    /// `BI-6` (with `AI-6`): the chart tools take the chart builder's fields, and
+    /// `measures` accepts a column with its own aggregate beside a plain name.
+    #[test]
+    fn create_chart_and_update_chart_take_the_chart_builder_fields() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            for field in ["filters", "sort", "other", "groupings"] {
+                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
+            }
+            let item = &properties["measures"]["items"]["oneOf"];
+            assert_eq!(item[0]["type"], "string", "{tool}");
+            assert_eq!(
+                item[1]["required"],
+                json!(["column", "aggregate"]),
+                "{tool}"
+            );
+            assert_eq!(
+                properties["sort"]["required"],
+                json!(["by", "dir"]),
+                "{tool}"
+            );
+        }
     }
 
     /// `SEC-14`: the assistant must never carry a secret, so

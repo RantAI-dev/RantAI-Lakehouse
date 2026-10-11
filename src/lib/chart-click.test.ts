@@ -159,3 +159,12 @@ test("a chart with no grain keeps reading the clicked name as the stored value",
   const spec: ClickSpec = { kind: "bar", source: "ui", dimension: "kab", y: "v" }
   assert.deepEqual(drillTarget(spec, { name: "Bandung" }), { column: "kab", value: "Bandung" })
 })
+
+// BI-6: the computed "Other" group is not one stored value.
+test("a click on the computed Other group names no value, while the same label elsewhere still does", () => {
+  const bar = spec("bar", { dimension: "kab" })
+  const hit = { name: "Other (rest)", dataIndex: 3 }
+  assert.equal(drillTarget(bar, hit, { otherLabels: new Set(["Other (rest)"]) }), null)
+  assert.deepEqual(drillTarget(bar, { name: "Other" }, { otherLabels: new Set(["Other (rest)"]) }), { column: "kab", value: "Other" })
+  assert.deepEqual(drillTarget(bar, hit, {}), { column: "kab", value: "Other (rest)" })
+})

@@ -1214,6 +1214,12 @@ pub struct RecordsQuery {
     /// With `sortColumn`: `asc` (default) or `desc`.
     #[serde(default, rename = "sortDir")]
     sort_dir: Option<String>,
+    /// `BI-6`: the tile the list belongs to. The chart's own filters are part
+    /// of what its numbers mean, so they narrow the list too, ahead of the
+    /// dashboard's `filters`. The route reads a relation, not a tile, so
+    /// without it the list is the relation's rows narrowed by `filters` only.
+    #[serde(default)]
+    chart: Option<String>,
 }
 
 /// Rows per page: the default and the maximum (BI-18·B; the owner confirms 50
@@ -1366,7 +1372,7 @@ async fn records_relation(ch: &ChClient, q: &RecordsQuery) -> Result<RecordsRela
 async fn with_calculated_columns(
     ch: &ChClient,
     relation: RecordsRelation,
-    q: &RecordsQuery,
+    (q, own): (&RecordsQuery, &[FilterDef]),
     time: &TimeContext,
 ) -> Result<RecordsRelation, ApiError> {
     use lakehouse_bi::fields::{self, SourceKind};
@@ -1378,6 +1384,8 @@ async fn with_calculated_columns(
         .collect();
     names.extend(q.column.as_deref());
     names.extend(q.sort_column.as_deref());
+    // BI-6: a per-row field the chart filters on is a column of the list too.
+    names.extend(own.iter().map(|f| f.column.as_str()));
     names.retain(|n| !n.is_empty() && !relation.cols.contains_key(*n));
     if names.is_empty() {
         return Ok(relation);
@@ -1401,6 +1409,59 @@ async fn with_calculated_columns(
         },
         None => relation,
     })
+}
+
+/// The own filters of the tile `q.chart` names (`BI-6`), or none when it names
+/// no tile. The tile must read the relation the query names: its filters mean
+/// nothing over another one.
+async fn chart_own_filters(ch: &ChClient, q: &RecordsQuery) -> Result<Vec<FilterDef>, ApiError> {
+    let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let stored = store::list_stored_charts(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let chart = stored
+        .iter()
+        .find(|c| c.spec.id == id)
+        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
+    let reads_same = if let Some(source) = q.sql_source.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        chart.def.sql_source.as_deref() == Some(source)
+    } else {
+        chart.def.sql_source.is_none()
+            && q.mart
+                .as_deref()
+                .is_some_and(|m| m.strip_prefix("serving.").unwrap_or(m) == chart.def.mart)
+    };
+    if !reads_same {
+        return Err(ApiError::BadRequest(
+            "this tile does not read this data".to_owned(),
+        ));
+    }
+    Ok(chart.def.shape.own_filters().to_vec())
+}
+
+/// `own` (the chart's filters) ahead of `dashboard`'s, after checking that
+/// each of the chart's filters still applies to the relation's columns. A
+/// filter that does not is a 422 with our sentence, never the same list
+/// without it: the list would show rows the tile does not count.
+fn with_chart_filters(
+    own: &[FilterDef],
+    dashboard: Vec<FilterDef>,
+    cols: &RelationColumns,
+    time: &TimeContext,
+) -> Result<Vec<FilterDef>, ApiError> {
+    if own.is_empty() {
+        return Ok(dashboard);
+    }
+    let outcome = lakehouse_bi::builder::filter_predicates(cols, &[], own, time);
+    if !outcome.skipped.is_empty() {
+        return Err(ApiError::Unprocessable(
+            "this tile's own filters no longer apply to its data".to_owned(),
+        ));
+    }
+    Ok(own.iter().cloned().chain(dashboard).collect())
 }
 
 /// A page size or offset: absent means `default`; text that is not a
@@ -1476,7 +1537,8 @@ async fn records_for_roles(
     .unwrap_or(RECORDS_PAGE_MAX)
     .clamp(1, RECORDS_PAGE_MAX);
     let offset = records_number(q.offset.as_deref(), "offset", 0)?;
-    let filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    let own = chart_own_filters(ch, &q).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -1492,7 +1554,8 @@ async fn records_for_roles(
         }
     };
     let relation = records_relation(ch, &q).await?;
-    let relation = with_calculated_columns(ch, relation, &q, time).await?;
+    let relation = with_calculated_columns(ch, relation, (&q, &own), time).await?;
+    let filters = with_chart_filters(&own, dashboard_filters, &relation.cols, time)?;
     if q.columns.is_some() {
         if drill.is_some() {
             return Err(ApiError::BadRequest(
@@ -1859,17 +1922,18 @@ pub async fn table_export(
         )
         .into());
     }
-    let filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
     let time = crate::routes::settings::time_context(&state).await?;
-    let relation = records_relation(
-        ch,
-        &RecordsQuery {
-            mart: Some(chart.def.mart.clone()),
-            sql_source: chart.def.sql_source.clone(),
-            ..RecordsQuery::default()
-        },
-    )
-    .await?;
+    let relation_query = RecordsQuery {
+        mart: Some(chart.def.mart.clone()),
+        sql_source: chart.def.sql_source.clone(),
+        ..RecordsQuery::default()
+    };
+    let relation = records_relation(ch, &relation_query).await?;
+    // BI-6: the chart's own filters narrow the file as they narrow the tile.
+    let own = chart.def.shape.own_filters();
+    let relation = with_calculated_columns(ch, relation, (&relation_query, own), &time).await?;
+    let filters = with_chart_filters(own, dashboard_filters, &relation.cols, &time)?;
 
     let (shown, labels) = export_columns(chart);
     let (statement, cap) = export_statement(chart, &relation, &q, (&shown, &filters), &time)?;
@@ -2386,6 +2450,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
                 out.push(("target", js_number(target)));
             }
             push_table_fields(def, &mut out);
+            push_shape_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
             }
@@ -2431,6 +2496,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
                 out.push(("grain", json!(grain)));
             }
             push_table_fields(def, &mut out);
+            push_shape_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
             }
@@ -2440,6 +2506,21 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
         }
     }
     out
+}
+
+/// The `BI-6` fields of a definition (the chart's own filters, sort, "Other",
+/// groupings), present only on the charts that carry them. A measure's own
+/// aggregate is part of `measures`, which is always listed.
+fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
+    const NAMES: [&str; 4] = ["filters", "sort", "other", "groupings"];
+    let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
+        return;
+    };
+    for name in NAMES {
+        if let Some(value) = fields.get(name) {
+            out.push((name, value.clone()));
+        }
+    }
 }
 
 /// The `BI-16` part A fields of a definition (raw table, pivot, comparison),
@@ -2693,6 +2774,54 @@ mod tests {
             serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
         assert!(board_edit_allowed(&body));
         assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    /// BI-6: the export lists a chart's own filters, sort, "Other", groupings
+    /// and the measures that carry an aggregate of their own, and a chart that
+    /// has none of them is exported exactly as before.
+    #[test]
+    fn the_yaml_export_lists_the_chart_builder_fields_and_only_when_present() {
+        let def = |extra: Value| -> ChartInput {
+            let mut base = json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+                "measures": ["visitors"], "limit": 5, "order": "desc",
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(base).unwrap()
+        };
+        let keys = |d: &ChartInput| -> Vec<&'static str> {
+            chart_def_fields(d).iter().map(|(k, _)| *k).collect()
+        };
+        let plain = def(json!({}));
+        for key in ["filters", "sort", "other", "groupings"] {
+            assert!(
+                !keys(&plain).contains(&key),
+                "{key} leaked into an older chart"
+            );
+        }
+        let shaped = def(json!({
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+            "filters": [{"column": "category", "values": ["Office"]}],
+            "sort": {"by": "visitors", "dir": "desc"}, "other": true,
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&shaped).into_iter().collect();
+        assert_eq!(
+            fields["measures"],
+            json!(["visitors", {"column": "stay", "aggregate": "avg"}])
+        );
+        assert_eq!(fields["filters"][0]["column"], "category");
+        assert_eq!(fields["sort"], json!({"by": "visitors", "dir": "desc"}));
+        assert_eq!(fields["other"], json!(true));
+        let table = def(json!({
+            "kind": "table", "dimension": "",
+            "groupings": [{"column": "kab"}, {"column": "d", "grain": "month"}],
+        }));
+        let grouped: std::collections::HashMap<_, _> =
+            chart_def_fields(&table).into_iter().collect();
+        assert_eq!(grouped["groupings"][1]["grain"], "month");
     }
 
     #[test]
@@ -4247,6 +4376,130 @@ mod records_pages {
                 .all(|s| !s.contains("ORDER BY ALL"))
         );
     }
+
+    // ── BI-6: the chart's own filters narrow its record list ────────────
+
+    /// A stored bar chart on `mart_x` that filters `region` to `north` and
+    /// `south` itself.
+    fn own_filter_chart(mart: &str, filters: &Value) -> Value {
+        let spec = json!({
+            "id": "u_own", "title": "t", "kind": "bar", "mart": mart,
+            "sql": "SELECT stored", "x": "region", "y": "visitors"
+        });
+        let def = json!({
+            "title": "t", "mart": mart, "kind": "bar", "dimension": "region",
+            "measures": ["visitors"], "filters": filters,
+        });
+        json!({
+            "id": "u_own", "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        })
+    }
+
+    async fn mount_chart(server: &MockServer, chart: Value) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_chart FINAL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "id", "type": "String"}, {"name": "board", "type": "String"},
+                    {"name": "created_by", "type": "String"}, {"name": "created_at", "type": "String"},
+                    {"name": "spec_json", "type": "String"},
+                ],
+                "data": [chart], "rows": 1,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_records_of_a_tile_carry_its_own_filters_ahead_of_the_dashboards() {
+        let server = MockServer::start().await;
+        mount_chart(
+            &server,
+            own_filter_chart(
+                "mart_x",
+                &json!([{"column": "region", "values": ["north", "south"]}]),
+            ),
+        )
+        .await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            chart: Some("u_own".to_owned()),
+            filters: Some(r#"[{"column":"region","values":["south","west"]}]"#.to_owned()),
+            ..mart_query(Some("region"), Some("south"))
+        };
+
+        let body = run(&server, q).await.unwrap();
+
+        assert_eq!(body["total"], 120);
+        let (rows, count) = page_and_count(&server).await;
+        for statement in [&rows, &count] {
+            assert!(
+                statement.contains(
+                    "region = 'south' AND region IN ('north', 'south') AND region IN ('south', 'west')"
+                ),
+                "{statement}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tile_that_reads_other_data_than_the_query_names_is_refused() {
+        let server = MockServer::start().await;
+        mount_chart(
+            &server,
+            own_filter_chart(
+                "mart_other",
+                &json!([{"column": "region", "values": ["north"]}]),
+            ),
+        )
+        .await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            chart: Some("u_own".to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tile_filter_that_no_longer_applies_is_refused_not_dropped() {
+        let server = MockServer::start().await;
+        mount_chart(
+            &server,
+            own_filter_chart("mart_x", &json!([{"column": "gone", "values": ["north"]}])),
+        )
+        .await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            chart: Some("u_own".to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::Unprocessable(_)), "{err:?}");
+        // Nothing was read: no page and no count went to the engine.
+        let all = statements(&server).await;
+        assert!(!all.iter().any(|s| s.contains("ORDER BY ALL")), "{all:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tile_that_does_not_exist_is_a_404() {
+        let server = MockServer::start().await;
+        mount_mart(&server).await;
+        let q = RecordsQuery {
+            chart: Some("u_missing".to_owned()),
+            ..mart_query(None, None)
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
 }
 
 #[cfg(test)]
@@ -4921,3 +5174,10 @@ mod table_tiles {
         assert_eq!(tile["rows"][1]["v"], json!("7"));
     }
 }
+
+// BI-6: the role rewrite on the statement shapes of the chart builder. A test-only
+// module of its own file; declared here, last, because `routes/mod.rs` may have no
+// non-test item after a `#[cfg(test)]` module (`tests/sec11_guard.rs`).
+#[cfg(test)]
+#[path = "chart_shapes_rewrite.rs"]
+mod chart_shapes_rewrite;

@@ -571,7 +571,8 @@ mod tests {
             .and_then(lakehouse_bi::grain::Grain::parse)
         {
             let chart =
-                lakehouse_bi::builder::GrainedChart::from_def(&def, def.kind, grain).unwrap();
+                lakehouse_bi::builder::GrainedChart::from_def(&def, def.kind, grain, &p.from)
+                    .unwrap();
             return lakehouse_bi::builder::grained_sql(
                 &p.from,
                 Vec::new(),

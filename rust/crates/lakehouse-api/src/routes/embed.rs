@@ -702,6 +702,98 @@ mod typed_filters {
         );
     }
 
+    /// BI-6: a chart's own filters apply on an embed or a public link whatever
+    /// the board's saved filters are, and the tile can list them.
+    #[tokio::test]
+    async fn an_embed_applies_a_charts_own_filters_with_the_boards() {
+        let server = MockServer::start().await;
+        let spec = json!({
+            "id": "c1", "title": "T", "kind": "bar", "mart": "mart_a",
+            "sql": "SELECT stored_sql_marker", "x": "kab", "y": "visitors"
+        });
+        let def = json!({
+            "title": "T", "mart": "mart_a", "kind": "bar", "dimension": "kab",
+            "measures": ["visitors"],
+            "filters": [{ "column": "kab", "values": ["a", "b"] }]
+        });
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            vec![json!({
+                "id": "c1", "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })],
+        )
+        .await;
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            vec![
+                json!({ "table": "mart_a", "name": "kab", "type": "String" }),
+                json!({ "table": "mart_a", "name": "visitors", "type": "UInt32" }),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        // No filter is active on the board: the chart's own still rebuild its statement.
+        let board = Board {
+            id: "b1".to_owned(),
+            name: "B".to_owned(),
+            description: None,
+            created_by: None,
+            layout: None,
+            filters: None,
+            refresh_seconds: None,
+            grain: None,
+            created_at: None,
+            updated_at: None,
+            public_token: None,
+            embed_enabled: None,
+            folder_id: None,
+            embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
+        };
+        let locked: Vec<FilterDef> =
+            serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
+
+        let body = render_board_payload(
+            &ch,
+            &PolicyEngineObligations::new(None, &ch),
+            &board,
+            "b1",
+            &locked,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["charts"][0]["def"]["filters"][0]["column"], "kab");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let tile = sent
+            .iter()
+            .find(|s| s.contains("FROM serving.mart_a WHERE"))
+            .unwrap_or_else(|| panic!("tile query not sent: {sent:?}"));
+        assert!(
+            tile.contains("kab IN ('a', 'b') AND kab IN ('b', 'c')"),
+            "{tile}"
+        );
+        assert!(!tile.contains("stored_sql_marker"), "{tile}");
+    }
+
     /// BI-9: an embed or public link has no grain switch; it uses the grain
     /// the board saved, in the deployment's time zone, and a grained chart is
     /// rebuilt rather than served from its stored SQL.

@@ -16,6 +16,8 @@ export type DrillTarget = {
   label?: string;
   /** The grain of `name`, when it is a bucket (BI-9). */
   grain?: string;
+  /** BI-6: the tile, when it has filters of its own, so the rows listed carry them too. */
+  chart?: string;
 };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */

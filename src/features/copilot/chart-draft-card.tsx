@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button";
 import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
 import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
+import type { Grouping, MeasureEntry, SortSpec } from "@/lib/chart-shape";
+import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
@@ -25,8 +27,10 @@ function str(v: unknown): string | undefined {
  * The model sometimes leaves `title` empty and puts the name in `caption`.
  */
 export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
+  // BI-6: a measure is a column name, or a column with its own aggregate.
   const measures = Array.isArray(args.measures)
-    ? args.measures.filter((m): m is string => typeof m === "string")
+    ? args.measures.filter((m): m is MeasureEntry =>
+        typeof m === "string" || (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
   return {
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? "",
@@ -49,6 +53,11 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     caption: str(args.caption),
     target: typeof args.target === "number" ? args.target : undefined,
     limit: typeof args.limit === "number" ? args.limit : undefined,
+    // BI-6: the chart's own filters, sort, "Other" and groupings travel to the builder as the model sent them.
+    filters: Array.isArray(args.filters) ? (args.filters as FilterDef[]) : undefined,
+    sort: typeof args.sort === "object" && args.sort !== null ? (args.sort as SortSpec) : undefined,
+    other: args.other === true ? true : undefined,
+    groupings: Array.isArray(args.groupings) ? (args.groupings as Grouping[]) : undefined,
   };
 }
 

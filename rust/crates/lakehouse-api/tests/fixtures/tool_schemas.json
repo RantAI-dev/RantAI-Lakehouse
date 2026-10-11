@@ -207,8 +207,36 @@
           "measures": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "aggregate"
+                  ],
+                  "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                }
+              ]
+            },
+            "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
             "type": "string"
@@ -354,6 +382,143 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "in",
+                    "not_in",
+                    "between",
+                    "relative",
+                    "contains",
+                    "starts_with",
+                    "ends_with",
+                    "not_contains"
+                  ],
+                  "description": "default in"
+                },
+                "values": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "in / not_in"
+                },
+                "min": {
+                  "type": "string",
+                  "description": "between: a number or a date YYYY-MM-DD"
+                },
+                "max": {
+                  "type": "string"
+                },
+                "minExclusive": {
+                  "type": "boolean"
+                },
+                "maxExclusive": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "contains, starts_with, ends_with, not_contains"
+                },
+                "anchor": {
+                  "type": "string",
+                  "enum": [
+                    "last",
+                    "this",
+                    "previous",
+                    "next"
+                  ],
+                  "description": "relative"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year"
+                  ]
+                },
+                "n": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
+          },
+          "sort": {
+            "type": "object",
+            "properties": {
+              "by": {
+                "type": "string",
+                "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)"
+              },
+              "dir": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            },
+            "required": [
+              "by",
+              "dir"
+            ],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+          },
+          "other": {
+            "type": "boolean",
+            "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain"
+          },
+          "groupings": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "grain": {
+                  "type": "string",
+                  "enum": [
+                    "minute",
+                    "hour",
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year",
+                    "hour_of_day",
+                    "day_of_week",
+                    "day_of_month",
+                    "week_of_year",
+                    "month_of_year",
+                    "quarter_of_year"
+                  ],
+                  "description": "for a date or timestamp column"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension"
           }
         },
         "required": [
@@ -425,8 +590,36 @@
           "measures": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "aggregate"
+                  ],
+                  "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                }
+              ]
+            },
+            "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
             "type": "string"
@@ -578,6 +771,143 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "in",
+                    "not_in",
+                    "between",
+                    "relative",
+                    "contains",
+                    "starts_with",
+                    "ends_with",
+                    "not_contains"
+                  ],
+                  "description": "default in"
+                },
+                "values": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "in / not_in"
+                },
+                "min": {
+                  "type": "string",
+                  "description": "between: a number or a date YYYY-MM-DD"
+                },
+                "max": {
+                  "type": "string"
+                },
+                "minExclusive": {
+                  "type": "boolean"
+                },
+                "maxExclusive": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "contains, starts_with, ends_with, not_contains"
+                },
+                "anchor": {
+                  "type": "string",
+                  "enum": [
+                    "last",
+                    "this",
+                    "previous",
+                    "next"
+                  ],
+                  "description": "relative"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year"
+                  ]
+                },
+                "n": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
+          },
+          "sort": {
+            "type": "object",
+            "properties": {
+              "by": {
+                "type": "string",
+                "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)"
+              },
+              "dir": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            },
+            "required": [
+              "by",
+              "dir"
+            ],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+          },
+          "other": {
+            "type": "boolean",
+            "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain"
+          },
+          "groupings": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "grain": {
+                  "type": "string",
+                  "enum": [
+                    "minute",
+                    "hour",
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year",
+                    "hour_of_day",
+                    "day_of_week",
+                    "day_of_month",
+                    "week_of_year",
+                    "month_of_year",
+                    "quarter_of_year"
+                  ],
+                  "description": "for a date or timestamp column"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension"
           }
         },
         "required": [

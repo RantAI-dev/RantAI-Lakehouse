@@ -34,6 +34,7 @@ import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { GrainMarkers } from "./grain-marker";
+import { OwnFiltersMarker } from "./filters/own-filters-marker";
 import { GrainSwitch } from "./grain-switch";
 import { ReportingProvider } from "./reporting-context";
 import { FilterBar } from "./filters/filter-bar";
@@ -92,6 +93,11 @@ function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
  * definition, but its `x` is a real mart column (`canDrill` leaves out the
  * built-in line and area, whose axis is a derived period).
  */
+/** The tile's id when it has filters of its own, so the records list it opens carries them (BI-6). */
+function ownFilterChart(spec: ChartCard): string | undefined {
+  return spec.source !== "builtin" && spec.def?.filters?.length ? spec.id : undefined;
+}
+
 function clickSpecOf(spec: ChartCard): ClickSpec {
   const own = spec.source !== "builtin";
   return {
@@ -538,7 +544,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       followClick(saved, target.value, target.grain);
       return;
     }
-    setDrill({ name: target.value, label: target.label, grain: target.grain, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
+    setDrill({ name: target.value, label: target.label, grain: target.grain, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec), x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
   };
   const toggleMenuTile = (id: string) => setMenuTiles((prev) => {
     const next = new Set(prev);
@@ -574,7 +580,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : []),
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
       ...(offersTileRecords(spec.kind) && (spec.mart || spec.sqlSource)
-        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource }, spec.source === "builtin") }]
+        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin") }]
         : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
@@ -602,6 +608,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       subtitle: spec.subtitle,
       hint: (
         <>
+          {/* BI-6: the chart's own filters, listed and not removable here. */}
+          {spec.def?.filters?.length ? <OwnFiltersMarker filters={spec.def.filters} /> : null}
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
           {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
           {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
@@ -817,7 +825,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain }, drill.builtin)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, chart: drill.chart }, drill.builtin)}
         />
       ) : null}
       <RecordsDialog request={records} onClose={() => setRecords(null)} />

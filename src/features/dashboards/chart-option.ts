@@ -8,7 +8,10 @@ import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from
 // out, which a plain `(spec, rows, dark) => option` cannot.
 
 /** buildOption only needs how to render (not the SQL) — fits ChartSpec & ChartRenderSpec. */
-type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target">;
+type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target"> & {
+  /** BI-6: a readable name ("avg of stay") for a result column that holds a measure with its own aggregate. */
+  measureLabels?: Record<string, string>;
+};
 
 /** The console's categorical palette (indigo-led). Used consistently across charts. */
 const PALETTE = [
@@ -68,6 +71,9 @@ export function buildOption(
   };
 
   const cat = rows.map((r) => str(r[spec.x]));
+  // BI-6: legend, axis and tooltip name a measure with its own aggregate as
+  // "avg of stay", not by the `avg_stay` it is called in the result.
+  const labelOf = (column: string) => spec.measureLabels?.[column] ?? column;
 
   // Pie / donut.
   if (spec.kind === "pie") {
@@ -185,9 +191,9 @@ export function buildOption(
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
         const o = p as ItemP; const d = o.value;
-        return `${o.name}<br/>${xc}: <b>${fmtInt(d[0])}</b><br/>${yc}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${sc}: <b>${fmtInt(d[2])}</b>` : ""}`;
+        return `${o.name}<br/>${labelOf(xc)}: <b>${fmtInt(d[0])}</b><br/>${labelOf(yc)}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${labelOf(sc)}: <b>${fmtInt(d[2])}</b>` : ""}`;
       } },
-      xAxis: valAxis(xc), yAxis: valAxis(yc),
+      xAxis: valAxis(labelOf(xc)), yAxis: valAxis(labelOf(yc)),
       series: [{ type: "scatter",
         symbolSize: spec.kind === "bubble" && sc ? (d: unknown) => { const a = d as number[]; return 8 + 38 * Math.sqrt((a[2] ?? 0) / maxS); } : 12,
         itemStyle: { opacity: 0.75 },
@@ -203,10 +209,10 @@ export function buildOption(
       grid: { ...base.grid, top: 34 },
       xAxis: catAxis(cat),
       // alignTicks off — the two metrics have different scales (e.g. millions vs thousands).
-      yAxis: [{ ...valAxis(m1), alignTicks: false }, { ...valAxis(m2, true), alignTicks: false }],
+      yAxis: [{ ...valAxis(labelOf(m1)), alignTicks: false }, { ...valAxis(labelOf(m2), true), alignTicks: false }],
       series: [
-        { name: m1, type: "bar", data: rows.map((r) => num(r[m1])), barMaxWidth: 34, itemStyle: { borderRadius: [4, 4, 0, 0] } },
-        { name: m2, type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, lineStyle: { width: 2 }, data: rows.map((r) => num(r[m2])) },
+        { name: labelOf(m1), type: "bar", data: rows.map((r) => num(r[m1])), barMaxWidth: 34, itemStyle: { borderRadius: [4, 4, 0, 0] } },
+        { name: labelOf(m2), type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, lineStyle: { width: 2 }, data: rows.map((r) => num(r[m2])) },
       ],
     } as EChartsOption;
   }
@@ -404,7 +410,7 @@ export function buildOption(
       xAxis: horizontal ? valueAxis : categoryAxis,
       yAxis: horizontal ? categoryAxis : valueAxis,
       series: spec.y.map((col) => ({
-        name: col,
+        name: labelOf(col),
         type: "bar" as const,
         stack: "total",
         emphasis: { focus: "series" as const },
@@ -413,10 +419,36 @@ export function buildOption(
     };
   }
 
-  // Bar / hbar / line / area — a single series.
-  const yCol = Array.isArray(spec.y) ? spec.y[0] : spec.y;
-  const values = (horizontal ? [...rows].reverse() : rows).map((r) => num(r[yCol]));
+  // Bar / hbar / line / area — a single series, or (BI-6) one series per
+  // measure when the chart lists several; they share the value axis.
   const isLine = spec.kind === "line" || spec.kind === "area";
+  const measureCols = Array.isArray(spec.y) ? spec.y : [spec.y];
+  if (measureCols.length > 1) {
+    const ordered = horizontal ? [...rows].reverse() : rows;
+    return {
+      ...base,
+      tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: isLine ? "line" : "shadow" } },
+      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      grid: { ...base.grid, top: 34 },
+      xAxis: horizontal ? valueAxis : categoryAxis,
+      yAxis: horizontal ? categoryAxis : valueAxis,
+      series: measureCols.map((col) => ({
+        name: labelOf(col),
+        type: isLine ? "line" : "bar",
+        data: ordered.map((r) => num(r[col])),
+        barMaxWidth: 26,
+        smooth: isLine,
+        showSymbol: showsPointMarkers(spec.kind, ordered.length),
+        symbolSize: 6,
+        lineStyle: isLine ? { width: 2 } : undefined,
+        areaStyle: spec.kind === "area" ? { opacity: 0.12 } : undefined,
+        emphasis: { focus: "series" },
+        itemStyle: !isLine ? { borderRadius: horizontal ? [0, 3, 3, 0] : [3, 3, 0, 0] } : undefined,
+      })),
+    } as EChartsOption;
+  }
+  const yCol = measureCols[0];
+  const values = (horizontal ? [...rows].reverse() : rows).map((r) => num(r[yCol]));
 
   return {
     ...base,
@@ -425,6 +457,9 @@ export function buildOption(
     yAxis: horizontal ? categoryAxis : valueAxis,
     series: [
       {
+        // Named only when the measure has a readable label of its own (BI-6),
+        // so a chart saved before keeps the tooltip it had.
+        ...(spec.measureLabels?.[yCol] ? { name: spec.measureLabels[yCol] } : {}),
         type: isLine ? "line" : "bar",
         data: values,
         barMaxWidth: 34,

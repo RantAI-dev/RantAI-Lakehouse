@@ -57,6 +57,8 @@ export type ClickContext = {
    */
   grain?: Grain
   labelledRows?: Row[]
+  /** BI-6: the labels of the computed "Other" groups; a click on one names no value. */
+  otherLabels?: ReadonlySet<string>
 }
 
 export type ChartClickHandler = (hit: ChartHit, pos: { x: number; y: number }, ctx: ClickContext) => void
@@ -116,6 +118,8 @@ function sankeyNode(name: string): { side: "a" | "b"; value: string } | null {
  */
 export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = {}): DrillValue | null {
   if (!canDrill(spec)) return null
+  // BI-6: the computed "Other" group is not one stored value, so it has no rows to list.
+  if (ctx.otherLabels?.has(hit.name)) return null
   const column = spec.dimension ?? ""
   const named = (value: string, col = column): DrillValue | null => (value !== "" && col !== "" ? { column: col, value } : null)
 

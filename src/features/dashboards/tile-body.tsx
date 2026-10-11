@@ -17,6 +17,7 @@ import { cellClass, CellValue, columnStyle } from "./table-cell";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
+import { labelOtherRows, OTHER_FLAG, tileMeasureLabels, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
 
 type Cell = Rows | TileFailure;
@@ -52,7 +53,9 @@ export function TileBody({
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
-  const def = spec.def as TableDefFields | undefined;
+  const def = spec.def as (TableDefFields & ShapeDefFields) | undefined;
+  // BI-6: "avg of stay" for a measure with its own aggregate.
+  const measureLabels = tileMeasureLabels(def?.measures, spec.y);
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
@@ -85,7 +88,7 @@ export function TileBody({
     if (def?.tableMode === "rows") {
       return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
-    return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} />;
+    return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} labels={measureLabels} />;
   }
 
   if (spec.kind === "pivot") {
@@ -110,24 +113,28 @@ export function TileBody({
     // maps the label back through `rawRows` (the rows as the server sent them).
     const rawRows = cell.rows;
     const grain = isGrain(cell.grain) ? cell.grain : null;
-    const rows = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
-    const option = buildOption(spec, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) });
+    const bucketed = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
+    // BI-6: the computed "Other" group is drawn last and is never a value to
+    // click; a real value that is also called "Other" stays apart from it.
+    const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
+    const option = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) });
     return (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
-        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined }) : undefined} />
+        onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels }) : undefined} />
     );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
 }
 
-function TableView({ columns, rows, settings = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting> }) {
-  const shown = columns.filter((c) => !settings[c]?.hidden);
+function TableView({ columns, rows, settings = {}, labels = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string> }) {
+  // The flag that marks the computed "Other" group is not a column to read.
+  const shown = columns.filter((c) => !settings[c]?.hidden && c !== OTHER_FLAG);
   return (
     <div className="h-full overflow-auto">
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 bg-card">
           <tr className="border-b border-border">
-            {shown.map((c) => <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{settings[c]?.label ?? c}</th>)}
+            {shown.map((c) => <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{settings[c]?.label ?? labels[c] ?? c}</th>)}
           </tr>
         </thead>
         <tbody>
