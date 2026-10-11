@@ -158,3 +158,11 @@ T1 to T6 are built in the working tree of `feat/bi-phase-2-build` (`/home/hv/lak
 No per-item browser QA and no reviewer re-run of the suites (owner's instruction for phase 2). Planner answers to the handoff: 1 accepted for now (parameter values ride in `TimeContext`; the type is now a read context and should be renamed when someone next touches its signature, not in this phase); 2, 3 and 6 accepted as built; 4 accepted because a chart re-checks its switched column on every read and fails closed; 5 is the standing gap (`AI-15` does not exist).
 
 The reviewer's smoke check on a running API is recorded in the next entry.
+
+### BI-11 — smoke check (reviewer, 2026-10-11)
+
+On the dev API rebuilt from `d94de16`, over HTTP against the real engine: a number and a list parameter were created; a chart with a top-N, a sort and a reference line bound to the number parameter saved; a chart whose measure column is chosen by the list parameter saved (the save path's first run) and returns `sum_hotels` by default and `sum_rooms` with `params={"ukuran_demo":"rooms"}`, each equal to a direct query for the first row; a value outside the list is refused with 400 and the fixed sentence; the demo dashboard's other tiles return no error.
+
+Not looked at by anyone: the controls in the filter row, the parameter dialog, the reference-line editor, a formula with `{name}` typed in the editor, a reference line drawn on a tile.
+
+Housekeeping found here: a 15 GB `rust/target` had appeared inside the build worktree (a cargo command run without the shared `CARGO_TARGET_DIR`); removed. Shell state does not persist between commands, so the variable must be set on every cargo command line.
