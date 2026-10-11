@@ -280,4 +280,71 @@ against `bun run dev`:
 
 ## 8. Handoff (developer)
 
+Branch `claude/gracious-albattani-vw5wsb`, base `main` at `9cff2c2`, plan at `80db022`. One commit per task, in plan order. Nothing pushed, no PR.
+
+### Commits
+
+| Task | Hash | Subject |
+| --- | --- | --- |
+| L1 | `226f37c` | feat(landing): add the /landing page with its static sections (L1) |
+| L2 | `b497f19` | feat(landing): hero 3D lake with the mascot, eye tracking and fallbacks (L2) |
+| L3 | `0b284bb` | feat(landing): scroll-driven dive, underwater look and falling sources (L3) |
+| L4 | `bd0dc3e` | feat(landing): medallion stack with active-layer glow, streams and depth gauge (L4) |
+| L5 | `85c9e9f` | feat(landing): scrubbed assistant chat and the horizontal dashboards rail (L5) |
+| L6 | `ad590f5` | feat(landing): masking table, open cards, final call, footer and top bar (L6) |
+| L7 | `9bfb888` | feat(landing): polish and checks (L7) |
+
+### Commands run, on the final code (commit `9bfb888`, before this handoff commit)
+
+All in the foreground from `/home/user/RantAI-Lakehouse`.
+
+- `bun run typecheck` -> exit 0, no output after the `tsc --noEmit` banner.
+- `bun run lint` -> `6 problems (0 errors, 6 warnings)`. All six are in files this branch does not touch (`alerts-page.tsx`, `open-format-card.test.tsx`, `use-data-table.ts`, `dashboard-specs.ts` and two more); none is under `src/features/landing`, `src/app/landing` or `src/features/auth` (`bun --bun eslint` on those three paths is silent).
+- `bun run test` -> `954 pass, 1 skip, 0 fail, 2352 expect() calls, 955 tests across 105 files` (111.5 s). The known flaky `ConnectorIngestPanel layout` test did not fail in either of the two full runs. New tests: `scroll-timeline.test.ts` (12), `scramble.test.ts` (7), `auth-provider.test.ts` (3).
+- `bun run build` -> exit 0, `Compiled successfully in 26.6s`; `/landing` is listed as `○` (prerendered static).
+- `git status` -> clean after each commit (no `__pycache__`, `.next`, generated files; `bun.lock` and `package.json` carry the two new packages).
+- No cargo, Python or compose command was run: this branch touches none of them.
+
+### Playwright checks (§6), Chromium at `/opt/pw-browsers/chromium`, software GL (SwiftShader), against `bun run dev`
+
+- Screenshots at 1440x900 and 390x844 at scroll 0, 15, 35, 55, 75, 100 %: `final-desktop-*.png`, `final-phone-*.png`. Also `final-reduced-desktop-*.png` (reduced motion) and `final-nowebgl-desktop-*.png` (WebGL off).
+- Folder: `/tmp/claude-0/-home-user-RantAI-Lakehouse/d09405be-e728-58d5-b5e1-7eaf371f0bbf/scratchpad/landing-shots/` (the scripts `shot.js` and `checks.js` are there too). The desktop 15 / 55 / 75 / 100 % frames were taken one tweak before the last commit (the depth stack's anchor moved afterwards); the 35 % frame is from the final code.
+- Console: no errors and no warnings from the page, at 1440 and 390, with WebGL, without WebGL, with WebGL lost mid-session, and with reduced motion. Filtered as environment, not page: the dev server's `/api/auth/me` proxy failure (the root `AuthProvider` asks for a session on every route and no API is running here; the landing page itself calls nothing), the `react-grab` dev tool's version check and the Google Fonts fetch (the sandbox has no trusted TLS for them).
+- Horizontal overflow: `scrollWidth <= innerWidth` is true at 1440 and at 390.
+- Layout shift on load (PerformanceObserver `layout-shift`): 0 at both sizes.
+- No console chrome and no sign-in redirect: no sidebar element, `location.pathname` stays `/landing`.
+- WebGL off (`--disable-3d-apis`): the SVG hero over the CSS lake renders, no canvas element. WebGL lost mid-session (`WEBGL_lose_context`): the canvas is removed and the SVG hero comes back (opacity 1).
+- Reduced motion: no pin, no dive; the hero shows one still frame of the lake, the sections are plain blocks, the depths are three cards.
+- Off screen: 64 draw calls in 3 s while the zone is visible, 0 in 3 s with the page scrolled to the footer.
+- Interaction: the eye follows the pointer (left, up and down checked in screenshots), the masking table flips to Analyst when it scrolls into view and the toggle scrambles and unscrambles it.
+
+### Not done or not verified
+
+- **Real GPU performance.** Everything ran on software GL at 2 to 4 frames per second. The 60 fps goal, the adaptive pixel-ratio step-down and the 1.75 / 1.25 caps are implemented but their effect was not measured on a GPU or a phone.
+- **Browsers and devices other than Chromium.** No Safari, Firefox, iOS or Android run. The phone tilt path (`deviceorientation`) and the idle look-around are untested on a device; iOS is not asked for permission (plan 2.10: "if permission is already granted").
+- **Hidden-tab pause** is implemented (`visibilitychange`) but cannot be exercised in headless Chromium; the off-screen pause was measured.
+- **Unmount disposal** was exercised by React StrictMode's double mount in dev and by the context-lost path, not by a client-side route change (the console CTA is a plain `<a>`, so it reloads). `dispose()` frees the geometries, materials, the environment target and the renderer by reading the code, not by a memory measurement.
+- **Lighthouse** was not run (no Lighthouse in the sandbox); the checks above stand in for "no layout shift, images sized, focus, contrast, phone layout". There are no `<img>` elements; the artwork is SVG and canvas.
+- **Contrast** was computed by hand for the text tokens (smallest: foam at 50 % on abyss, about 5:1), not with a tool; the hero copy sits on a dark scrim over the canvas.
+- `CHANGELOG.md` and the `docs/core/` pages were not touched (the plan lists them for the planner).
+
+### Deviations from the plan, and why
+
+1. **Section lengths.** Hero 150 vh (100 vh stage pinned for 50 vh, then it scrolls away while the dive finishes; plan: pinned +60 vh), sources 230 vh (plan about 150), depths 300 vh (about 250), assistant 260 vh (about 140), dashboards 100 vh plus the measured sideways travel (about 210 to 240 vh; plan about 160). The scrubbed chat and the three slabs need that much scroll to read; shorter versions raced past. Nothing else about the sections changed.
+2. **Scroll progress is `use-section-progress.ts`, not motion's `useScroll`.** motion 13 hands scroll-linked opacity and filter to the native ViewTimeline; with a tall section holding a sticky stage, opacity and blur stayed at their first values while the transform moved (measured, see the L3 commit body). The hook is plain `scrollY` arithmetic and the same numbers the 3D engine uses.
+3. **Copy added around the plan's copy** (none of it claims a capability): the assistant's answer line "Region North had the most visitors last quarter." and four made-up bar values; the five dashboard tile titles and the KPI text ("24.6k", "+8.4% vs last week"); "Illustration · fictional people" above the masking table; a "Three depths" eyebrow, "View as" labels, screen-reader captions and the skip link. All made-up figures sit inside blocks labelled as illustrations.
+4. **The approval card is lake blue, not gold.** Plan 2.3 reserves the three metal accents for the depths. The pulse keyframe changed with it.
+5. **`/landing` carries two `theme-color` tags.** The page's `viewport.themeColor` (`#020514`, as the plan asks) is added to the root layout's static `<meta name="theme-color" content="#050A30">`, which the plan says not to change.
+6. **Top bar on phones** shows the wordmark and the console button only; the four anchors are hidden below 768 px (they do not fit beside the button).
+7. **Hero headline** uses `clamp(4.5rem, 9vw, 7.5rem)`: 72 px minimum, 120 px maximum, as the plan says, so at 390 px it is 72 px.
+8. **Camera hop at the surface.** Within 0.14 units of the water plane the near plane clips it away and the view opens onto the submerged half, so `avoidSurface()` moves the camera across that band in one step. It is covered by a test and happens at the moment the picture changes from sky to ceiling.
+9. **No front fill light on the mascot** (a directional light in front of a clearcoated dome shows as a hot spot on its face); the face is lit by ambient, a hemisphere bounce and the eye's halo.
+
+### For the reviewer
+
+- The sky dome draws the under-water colour itself: three does not tone-map the clear colour, so the water's fog did not match it (L3 commit body).
+- `useReducedMotionSafe()` replaces motion's `useReducedMotion()` in the sections: the latter reads the media query during the first client render and reported a hydration mismatch for reduced-motion visitors.
+- The dashboard tiles' pseudo-random values use integer maths only: the server renders with a different JavaScript engine than the browser hydrates with.
+- `package-lock.json` exists beside `bun.lock` and was not regenerated; only `bun.lock` and `package.json` carry `three` and `@types/three`.
+
 ## 9. Review (planner)
