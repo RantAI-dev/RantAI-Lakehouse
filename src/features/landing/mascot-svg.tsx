@@ -17,6 +17,14 @@ import { motion, type MotionValue } from "motion/react";
 
 /** Dome silhouette; flat base at y = 382, apex at y = 0. */
 export const DOME_PATH = "M6 382 C6 145 101 0 256 0 C411 0 506 145 506 382 Z";
+/**
+ * The dome's curved edge without its base line. WEB-1 review round 1
+ * SHOULD-FIX 3: the rim light used to be the whole dome path stroked 5 units
+ * wide, so half of it fell outside the dome (a bright arc beside the edge on
+ * the right) and a stray line ran along the base. It is now this open arc,
+ * clipped to the dome so it only ever lights the inside of the edge.
+ */
+export const DOME_ARC = "M6 382 C6 145 101 0 256 0 C411 0 506 145 506 382";
 /** Bowl of lake water below the horizon gap. */
 export const BOWL_PATH =
   "M22 424 H490 C470 482 438 512 378 512 H134 C74 512 42 482 22 424 Z";
@@ -63,9 +71,13 @@ export function MascotLogo({ className, eyeX, eyeY }: LogoProps) {
   const rim = `lk-rim-${uid}`;
   const water = `lk-water-${uid}`;
   const glow = `lk-glow-${uid}`;
+  const clip = `lk-clip-${uid}`;
   return (
     <svg viewBox="0 0 512 512" className={className} aria-hidden="true" focusable="false">
       <defs>
+        <clipPath id={clip}>
+          <path d={DOME_PATH} />
+        </clipPath>
         <radialGradient id={body} cx="34%" cy="22%" r="85%">
           <stop offset="0%" stopColor="#16237a" />
           <stop offset="45%" stopColor="#0a1250" />
@@ -86,7 +98,7 @@ export function MascotLogo({ className, eyeX, eyeY }: LogoProps) {
         </radialGradient>
       </defs>
       <path d={DOME_PATH} fill={`url(#${body})`} />
-      <path d={DOME_PATH} fill="none" stroke={`url(#${rim})`} strokeWidth="5" />
+      <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
       <motion.g style={{ x: eyeX, y: eyeY }}>
         <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.1} ry={EYE.ry * 2.1} fill={`url(#${glow})`} />
         <ellipse {...EYE} fill="#ffffff" />
@@ -120,6 +132,7 @@ export function MascotRising({
   const rim = `lk-rrim-${uid}`;
   const glow = `lk-rglow-${uid}`;
   const refl = `lk-rrefl-${uid}`;
+  const clip = `lk-rclip-${uid}`;
   const dx = (760 - 512) / 2;
   const dy = 372 - 382 + 70;
   return (
@@ -136,6 +149,9 @@ export function MascotRising({
         <div className="lk-bob absolute inset-0">
           <svg viewBox="0 0 760 560" className="absolute inset-0 size-full" aria-hidden="true" focusable="false">
             <defs>
+              <clipPath id={clip}>
+                <path d={DOME_PATH} />
+              </clipPath>
               <radialGradient id={body} cx="34%" cy="22%" r="85%">
                 <stop offset="0%" stopColor="#1a2a8c" />
                 <stop offset="45%" stopColor="#0a1250" />
@@ -153,7 +169,7 @@ export function MascotRising({
             </defs>
             <g transform={`translate(${dx} ${dy})`}>
               <path d={DOME_PATH} fill={`url(#${body})`} />
-              <path d={DOME_PATH} fill="none" stroke={`url(#${rim})`} strokeWidth="5" />
+              <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
               <motion.g style={{ x: eyeX, y: eyeY }}>
                 <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.3} ry={EYE.ry * 2.3} fill={`url(#${glow})`} />
                 <ellipse {...EYE} fill="#ffffff" />
