@@ -53,9 +53,13 @@ export function Reveal({
 }
 
 /**
- * A headline whose words rise out of a mask one after another. The whole
- * string is one text node group for assistive tech: the words are plain
- * inline spans and the visible order is the reading order.
+ * A headline whose words rise out of a mask one after another.
+ *
+ * The in-view trigger sits on the outer span, never on the words: a word that
+ * is translated below its clipping mask has no visible area, so an
+ * IntersectionObserver on it would never fire. The words follow the parent
+ * through variants. For assistive tech the text is just the plain words in
+ * reading order.
  */
 export function SplitWords({
   text,
@@ -74,23 +78,28 @@ export function SplitWords({
     <motion.span
       data-reveal
       className={cn("inline", className)}
-      viewport={{ once: true, amount: 0.6 }}
+      initial="hidden"
+      whileInView="shown"
+      viewport={{ once: true, amount: 0.3 }}
     >
       {words.map((word, i) => (
         <React.Fragment key={`${word}-${i}`}>
-          <span className="inline-block overflow-hidden pb-[0.12em] align-bottom">
+          <span className="inline-block overflow-hidden pb-[0.14em] align-bottom">
             <motion.span
               data-reveal
               className="inline-block will-change-transform"
-              initial={{ y: "112%", rotate: 3 }}
-              whileInView={{ y: "0%", rotate: 0 }}
-              viewport={{ once: true, amount: 0.6 }}
-              // Reduced motion: the words are simply there (no rise, no stagger).
-              transition={
-                reduced
-                  ? { duration: 0 }
-                  : { duration: 1.05, delay: delay + i * stagger, ease: EASE_OUT }
-              }
+              custom={i}
+              variants={{
+                hidden: { y: "112%", rotate: 3 },
+                // Reduced motion: the words are simply there (no rise, no stagger).
+                shown: (k: number) => ({
+                  y: "0%",
+                  rotate: 0,
+                  transition: reduced
+                    ? { duration: 0 }
+                    : { duration: 1.05, delay: delay + k * stagger, ease: EASE_OUT },
+                }),
+              }}
             >
               {word}
             </motion.span>
