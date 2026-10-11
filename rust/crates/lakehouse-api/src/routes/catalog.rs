@@ -4468,8 +4468,6 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
-            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y", "serving.old"])
-                .await;
             // A deprecated asset, to be refused as a replacement.
             put_mark(
                 &state,
@@ -4479,6 +4477,11 @@ mod tests {
             )
             .await
             .unwrap();
+            // CI's first run (DATA-12): a successful write drops the search
+            // copy, and with no ClickHouse behind the mock the rebuild fails
+            // (503). Seed it after that write; refusals below keep it.
+            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y", "serving.old"])
+                .await;
             let long_note = format!(r#"{{"status":"deprecated","note":"{}"}}"#, "a".repeat(1001));
             let cases: [(&str, &str); 7] = [
                 (r#"{"status":"trusted"}"#, "status must be"),
@@ -4521,6 +4524,31 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_replacement_is_refused_with_503_when_the_catalog_cannot_be_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            // No search copy seeded and no ClickHouse behind the mock: the
+            // replacement cannot be checked, so nothing is stored.
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let err = put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"deprecated","replacementAssetId":"serving.mart_y"}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                err.1
+                    .contains("the catalog could not be read to check the replacement"),
+                "{}",
+                err.1
+            );
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
         }
 
         #[sqlx::test(migrations = "../../migrations")]
