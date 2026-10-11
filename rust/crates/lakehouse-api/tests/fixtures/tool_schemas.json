@@ -202,7 +202,24 @@
             "type": "number"
           },
           "dimension": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it"
           },
           "measures": {
             "type": "array",
@@ -233,13 +250,61 @@
                     "aggregate"
                   ],
                   "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ],
+                  "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
                 }
               ]
             },
             "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it"
           },
           "map": {
             "type": "string",
@@ -264,7 +329,24 @@
             ]
           },
           "limit": {
-            "type": "number"
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)"
           },
           "span": {
             "type": "number",
@@ -382,6 +464,43 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "referenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
           },
           "filters": {
             "type": "array",
@@ -869,7 +988,24 @@
             "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both"
           },
           "dimension": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it"
           },
           "measures": {
             "type": "array",
@@ -900,13 +1036,61 @@
                     "aggregate"
                   ],
                   "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ],
+                  "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
                 }
               ]
             },
             "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it"
           },
           "caption": {
             "type": "string"
@@ -937,7 +1121,24 @@
             ]
           },
           "limit": {
-            "type": "number"
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)"
           },
           "span": {
             "type": "number",
@@ -1055,6 +1256,43 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "referenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
           },
           "filters": {
             "type": "array",
@@ -1866,6 +2104,206 @@
     "function": {
       "name": "delete_hierarchy",
       "description": "Delete one hierarchy (by id from list_hierarchies). No chart depends on it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_parameters",
+      "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read. Use before create_chart to reuse one.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_parameter",
+      "description": "Define a parameter. Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later"
+          },
+          "label": {
+            "type": "string",
+            "description": "what the control shows"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "number",
+              "text",
+              "date",
+              "list"
+            ],
+            "description": "cannot be changed later"
+          },
+          "default": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values"
+          },
+          "min": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "max": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "maxLength": {
+            "type": "number",
+            "description": "text: at most 200"
+          },
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": [
+                    "number",
+                    "string"
+                  ]
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "default"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_parameter",
+      "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later"
+          },
+          "label": {
+            "type": "string",
+            "description": "what the control shows"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "number",
+              "text",
+              "date",
+              "list"
+            ],
+            "description": "cannot be changed later"
+          },
+          "default": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values"
+          },
+          "min": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "max": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "maxLength": {
+            "type": "number",
+            "description": "text: at most 200"
+          },
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": [
+                    "number",
+                    "string"
+                  ]
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)"
+          },
+          "id": {
+            "type": "string",
+            "description": "from list_parameters"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "default"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_parameter",
+      "description": "Delete one parameter (by id from list_parameters). Refused while a formula, a chart or a dashboard uses it. Needs human approval before it runs.",
       "parameters": {
         "type": "object",
         "properties": {

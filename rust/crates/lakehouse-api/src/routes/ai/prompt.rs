@@ -345,7 +345,7 @@ MODE: ASK (read-only). You can read and analyse anything, but you cannot change 
 pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
-- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one.
+- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one. A parameter (list_parameters, create_parameter) is a value a viewer changes on the dashboard: a formula reads it as {name}, `limit` and a reference line (`referenceLines`) can take {param: name}, and a list parameter can switch the dimension, breakdown or a measure's column; to draw a target line, create a number parameter and pass it in referenceLines. Reuse an existing one.
 - Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
@@ -443,6 +443,9 @@ const DOMAINS: &[Domain] = &[
             "histogram",
             "hierarchy",
             "drill down",
+            "parameter",
+            "reference line",
+            "target line",
         ],
         tools: &[
             "list_charts",
@@ -463,6 +466,10 @@ const DOMAINS: &[Domain] = &[
             "list_hierarchies",
             "create_hierarchy",
             "delete_hierarchy",
+            "list_parameters",
+            "create_parameter",
+            "update_parameter",
+            "delete_parameter",
         ],
     },
     Domain {

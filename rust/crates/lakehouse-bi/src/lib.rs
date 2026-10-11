@@ -16,6 +16,7 @@ pub mod grain;
 pub mod groups;
 pub mod hierarchies;
 pub mod joins;
+pub mod params;
 pub mod shape;
 pub mod sources;
 pub mod specs;

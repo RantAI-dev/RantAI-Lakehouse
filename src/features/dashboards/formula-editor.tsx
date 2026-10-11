@@ -14,6 +14,7 @@ import type {
 } from "@/services/contracts/calc-fields";
 import { applySuggestion, callAtCaret, levelLabel, splitAtProblem, suggest } from "@/lib/formula-assist";
 import { cn } from "@/lib/utils";
+import type { ParamDef } from "@/lib/params";
 
 /** How long the box waits after the last keystroke before asking the server to check. */
 const CHECK_DELAY_MS = 450;
@@ -26,13 +27,15 @@ const CHECK_DELAY_MS = 450;
  * source's columns, and only help typing.
  */
 export function FormulaEditorDialog({
-  open, onOpenChange, source, columns, fields, existing, onSaved, onDeleted,
+  open, onOpenChange, source, columns, fields, params = [], existing, onSaved, onDeleted,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   source: CalcFieldSource;
   /** The source's own column names. */
   columns: string[];
+  /** The parameters a formula may read as `{name}` (BI-11). */
+  params?: ParamDef[];
   /** The source's calculated fields (the one being edited is left out of the suggestions). */
   fields: CalcField[];
   /** The field being changed; absent when making a new one. */
@@ -82,7 +85,8 @@ export function FormulaEditorDialog({
   const names = React.useMemo(() => ({
     columns,
     fields: fields.filter((f) => f.id !== existing?.id).map((f) => ({ name: f.name, formula: f.formula })),
-  }), [columns, fields, existing]);
+    params: params.map((p) => ({ name: p.name, detail: `${p.label || p.name} · ${p.type}` })),
+  }), [columns, fields, params, existing]);
   const hints = suggest(formula, caret, names, functions);
   const call = callAtCaret(formula, caret, functions);
   const nameOk = !!existing || /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name);

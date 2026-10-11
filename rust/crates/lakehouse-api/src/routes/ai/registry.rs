@@ -165,9 +165,20 @@ fn measures_schema() -> Value {
             "column": { "type": "string" },
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
             "required": ["column", "aggregate"],
-            "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" }
+            "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" },
+        { "type": "object", "properties": {
+            "column": param_ref_schema(),
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column"],
+            "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}" }
     ] },
         "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}" })
+}
+
+/// `{ "param": <name> }` (`BI-11`).
+fn param_ref_schema() -> Value {
+    json!({ "type": "object", "properties": { "param": { "type": "string", "description": "the name of a parameter from list_parameters" } },
+        "required": ["param"] })
 }
 
 /// How a number is binned (`BI-10`): the three modes of `lakehouse_bi::bin`.
@@ -185,6 +196,17 @@ fn bin_schema(description: &str) -> Value {
 /// `lakehouse_bi::shape` enforces.
 fn with_shape_properties(mut schema: Value) -> Value {
     let extra = json!({
+        "limit": { "oneOf": [ { "type": "number" }, param_ref_schema() ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)" },
+        "dimension": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it" },
+        "breakdown": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it" },
+        "referenceLines": { "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
+            "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}" },
+            "label": { "type": "string", "description": "at most 60 characters" } },
+            "required": ["value"] },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move" },
         "filters": { "type": "array", "items": { "type": "object", "properties": {
             "column": { "type": "string" },
             "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
@@ -524,6 +546,53 @@ fn create_hierarchy_schema() -> Value {
 fn delete_hierarchy_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_hierarchy",
         "description": "Delete one hierarchy (by id from list_hierarchies). No chart depends on it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── BI-11 parameters ──────────────────────────────────────────────────────
+
+fn list_parameters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_parameters",
+        "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read. Use before create_chart to reuse one.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn parameter_properties() -> Value {
+    json!({
+        "name": { "type": "string", "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later" },
+        "label": { "type": "string", "description": "what the control shows" },
+        "type": { "type": "string", "enum": ["number", "text", "date", "list"], "description": "cannot be changed later" },
+        "default": { "type": ["number", "string"], "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values" },
+        "min": { "type": ["number", "string"], "description": "number or date" },
+        "max": { "type": ["number", "string"], "description": "number or date" },
+        "maxLength": { "type": "number", "description": "text: at most 200" },
+        "values": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "type": "object", "properties": {
+            "value": { "type": ["number", "string"] }, "label": { "type": "string" } },
+            "required": ["value"] },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)" }
+    })
+}
+
+fn create_parameter_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_parameter",
+        "description": "Define a parameter. Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
+        "parameters": { "type": "object", "properties": parameter_properties(),
+            "required": ["name", "type", "default"] } } })
+}
+
+fn update_parameter_schema() -> Value {
+    let mut properties = parameter_properties();
+    properties["id"] = json!({ "type": "string", "description": "from list_parameters" });
+    json!({ "type": "function", "function": { "name": "update_parameter",
+        "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay.",
+        "parameters": { "type": "object", "properties": properties,
+            "required": ["id", "name", "type", "default"] } } })
+}
+
+fn delete_parameter_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_parameter",
+        "description": "Delete one parameter (by id from list_parameters). Refused while a formula, a chart or a dashboard uses it. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -1217,6 +1286,30 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    ToolSpec {
+        name: "list_parameters",
+        schema: list_parameters_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_parameter",
+        schema: create_parameter_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_parameter",
+        schema: update_parameter_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_parameter",
+        schema: delete_parameter_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
     // ── T1.1 Alerts (Tier 1 of the copilot-operations-handover plan) ────
     // Permission strings verified against `policy.rs::POLICY_TABLE`
     // (plan section 3.7 C1): `GET /api/alerts` is `RequiresAuth` (no
@@ -1588,7 +1681,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_seventy_five_entries() {
+    fn tool_schemas_has_seventy_nine_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -1597,8 +1690,9 @@ mod tests {
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
         // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
         // `suggest_join` (`BI-7`) + `create_value_group`, `list_hierarchies`,
-        // `create_hierarchy` and `delete_hierarchy` (`BI-10`).
-        assert_eq!(tool_schemas().len(), 75);
+        // `create_hierarchy` and `delete_hierarchy` (`BI-10`) + `list_parameters`,
+        // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`).
+        assert_eq!(tool_schemas().len(), 79);
     }
 
     #[test]
@@ -1611,6 +1705,42 @@ mod tests {
         ] {
             let spec = find(name).expect("registered tool");
             assert_eq!((spec.risk, spec.permission), (risk, permission), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_bi_11_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("list_parameters", Risk::Read, "dashboard:read"),
+            ("create_parameter", Risk::WriteLow, "dashboard:write"),
+            ("update_parameter", Risk::WriteLow, "dashboard:write"),
+            ("delete_parameter", Risk::WriteHigh, "dashboard:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!((spec.risk, spec.permission), (risk, permission), "{name}");
+        }
+    }
+
+    /// `BI-11` (with `AI-6`): the chart tools take a parameter for the limit
+    /// and the column slots, and reference lines.
+    #[test]
+    fn the_chart_tools_take_parameters_and_reference_lines() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert!(properties.get("referenceLines").is_some(), "{tool}");
+            for slot in ["limit", "dimension", "breakdown"] {
+                assert_eq!(
+                    properties[slot]["oneOf"][1]["required"],
+                    json!(["param"]),
+                    "{tool} {slot}"
+                );
+            }
+            assert_eq!(
+                properties["measures"]["items"]["oneOf"][2]["required"],
+                json!(["column"]),
+                "{tool}"
+            );
         }
     }
 

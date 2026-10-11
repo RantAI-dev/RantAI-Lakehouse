@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { MARKER_LIMIT, buildOption, showsPointMarkers } from "./chart-option"
+import { MARKER_LIMIT, buildOption, showsPointMarkers, withReferenceLines } from "./chart-option"
 
 const rowsOf = (n: number) => Array.from({ length: n }, (_, i) => ({ x: `p${i}`, v: i }))
 const lineSpec = { kind: "line" as const, x: "x", y: "v" }
@@ -94,3 +94,29 @@ test("the decimals of a measure with a fraction apply to every measure on the ch
   // Largest value is over 1,000, so the compact rule keeps whole numbers; the tooltip stays consistent.
   assert.equal(tip.valueFormatter(2.5), "3")
 })
+
+test("BI-11: reference lines are dashed marks on the first series, and the value axis reaches the highest one", () => {
+  const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 100 }, { k: "b", v: 200 }], false);
+  assert.equal(withReferenceLines(base, [], false, false), base, "no lines: the option is returned as it is");
+  assert.equal(withReferenceLines(base, undefined, false, false), base);
+  const option = withReferenceLines(base, [{ value: 20000, label: "Goal" }, { value: 50 }], false, false) as unknown as {
+    series: { markLine?: { data: { yAxis: number; name: string }[] } }[]; yAxis: { max: (r: { max: number }) => number };
+  };
+  assert.deepEqual(option.series[0].markLine?.data, [{ yAxis: 20000, name: "Goal" }, { yAxis: 50, name: "" }]);
+  assert.equal(option.yAxis.max({ max: 200 }), 20000, "a target far above the data is still on the chart");
+  assert.equal(option.yAxis.max({ max: 90000 }), 90000, "and the data is never cut");
+});
+
+test("BI-11: a horizontal bar draws its lines against the horizontal axis", () => {
+  const base = buildOption({ kind: "hbar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 100 }], false);
+  const option = withReferenceLines(base, [{ value: 300 }], true, true) as unknown as {
+    series: { markLine?: { data: { xAxis?: number; yAxis?: number }[] } }[]; xAxis: { max: (r: { max: number }) => number };
+  };
+  assert.deepEqual(option.series[0].markLine?.data, [{ xAxis: 300, name: "" }]);
+  assert.equal(option.xAxis.max({ max: 100 }), 300);
+});
+
+test("BI-11: a line that is not a number is not drawn", () => {
+  const base = buildOption({ kind: "line", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 1 }], false);
+  assert.equal(withReferenceLines(base, [{ value: Number.NaN }], false, false), base);
+});

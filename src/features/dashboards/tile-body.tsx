@@ -8,7 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
-import { buildOption, fmtInt } from "./chart-option";
+import { buildOption, fmtInt, withReferenceLines } from "./chart-option";
 import { GeoChart } from "./geo-chart";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
@@ -122,7 +122,11 @@ export function TileBody({
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
-    const option = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) });
+    // BI-11: the reference lines, at the values this read gave them.
+    const option = withReferenceLines(
+      buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) }),
+      cell.referenceLines, spec.kind === "hbar", dark,
+    );
     return (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />

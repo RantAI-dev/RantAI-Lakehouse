@@ -410,6 +410,36 @@ pub async fn public_dashboard(
     }
 }
 
+/// A chart as an embed or a public link shows it: the render spec of the
+/// chart as this read sees it (`BI-11`: the columns its parameters gave its
+/// slots), the editor's definition, and no click setting. `BI-18`·B: embeds
+/// and public links have no click menu and no destinations, so the editor's
+/// click setting (a board id, a column or a URL) is not sent to someone who
+/// cannot use it.
+fn embed_rendered(original: &StoredChartSpec, effective: &StoredChartSpec) -> Value {
+    let mut rendered = render_stored_spec(&effective.spec, effective.source);
+    rendered["board"] = json!(original.board);
+    rendered["def"] = serde_json::to_value(&original.def).unwrap_or_else(|_| json!({}));
+    if let Some(def) = rendered["def"].as_object_mut() {
+        def.remove("click");
+    }
+    rendered
+}
+
+/// The board's tile layout as the payload carries it.
+fn layout_json(board: &Board) -> Value {
+    board.layout.as_ref().map_or_else(
+        || json!({}),
+        |l| {
+            let mut m = serde_json::Map::new();
+            for (k, b) in l {
+                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
+            }
+            Value::Object(m)
+        },
+    )
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -456,9 +486,11 @@ async fn render_board_payload(
     // Column types are also what decides whether a chart's grain still fits
     // its dimension (BI-9).
     let need_cols = filters.iter().any(FilterDef::is_active)
-        || stored_for_board
-            .iter()
-            .any(|c| c.def.needs_columns() || field_catalog.chart_uses(&c.def));
+        || stored_for_board.iter().any(|c| {
+            c.def.needs_columns()
+                || field_catalog.chart_uses(&c.def)
+                || lakehouse_bi::params::changes_statement(&c.def)
+        });
     let cols = if need_cols {
         mart_columns(ch).await?
     } else {
@@ -470,8 +502,14 @@ async fn render_board_payload(
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     // BI-9: embeds and public links offer no grain switch; they use the one
     // the board saved, and each chart's own where there is none.
+    // BI-11: an embed or a public link offers no control; it uses the values
+    // the board saved, else each parameter's default. A store that cannot be
+    // read leaves the values empty, so only a chart that names a parameter
+    // shows an error (fail closed per tile).
+    let values = crate::routes::params::saved_or_default(ch, board).await;
+    let time_with_params = time.clone().with_params(values.clone());
     let read = lakehouse_bi::builder::ReadContext {
-        time,
+        time: &time_with_params,
         grain: board
             .grain
             .as_deref()
@@ -479,7 +517,16 @@ async fn render_board_payload(
             .filter(|g| g.is_truncation()),
         fields: &field_catalog,
     };
-    for c in &stored_for_board {
+    for original in &stored_for_board {
+        let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
+        let c = match &effective {
+            Ok(e) => &**e,
+            Err(msg) => {
+                results.insert(original.spec.id.clone(), json!({ "error": msg }));
+                charts_out.push(embed_rendered(original, original));
+                continue;
+            }
+        };
         match stored_chart_sql(c, &[], filters, &cols, &sources, &read) {
             Ok(filtered) => {
                 let (id, mut val) = run_spec_sql(
@@ -491,6 +538,7 @@ async fn render_board_payload(
                     obligations,
                 )
                 .await;
+                crate::routes::support::annotate_params(&mut val, c, &values);
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
                 // BI-16 part A: the first page of a raw table, with its
                 // total; an embed and a public link offer no paging.
@@ -508,28 +556,10 @@ async fn render_board_payload(
             }
         }
 
-        let mut rendered = render_stored_spec(&c.spec, c.source);
-        rendered["board"] = json!(c.board);
-        rendered["def"] = serde_json::to_value(&c.def).unwrap_or_else(|_| json!({}));
-        // BI-18·B: embeds and public links have no click menu and no
-        // destinations, so the editor's click setting (a board id, a column
-        // or a URL) is not sent to someone who cannot use it.
-        if let Some(def) = rendered["def"].as_object_mut() {
-            def.remove("click");
-        }
-        charts_out.push(rendered);
+        charts_out.push(embed_rendered(original, c));
     }
 
-    let layout = board.layout.as_ref().map_or_else(
-        || json!({}),
-        |l| {
-            let mut m = serde_json::Map::new();
-            for (k, b) in l {
-                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-            }
-            Value::Object(m)
-        },
-    );
+    let layout = layout_json(board);
 
     Ok(json!({
         "board": { "id": board.id, "name": board.name },
@@ -658,6 +688,7 @@ mod typed_filters {
             filters: Some(filters.clone()),
             refresh_seconds: None,
             grain: None,
+            params: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -754,6 +785,7 @@ mod typed_filters {
             filters: None,
             refresh_seconds: None,
             grain: None,
+            params: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -845,6 +877,7 @@ mod typed_filters {
             filters: None,
             refresh_seconds: None,
             grain: Some("month".to_owned()),
+            params: None,
             created_at: None,
             updated_at: None,
             public_token: None,

@@ -614,7 +614,7 @@ async fn the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_c
         .collect();
     assert!(sent.iter().any(|s| s.contains("LIMIT 2001")), "{sent:?}");
     assert!(
-        stepped.def.limit == Some(100),
+        stepped.def.limit_value() == Some(100),
         "the saved chart's own limit is not changed"
     );
 

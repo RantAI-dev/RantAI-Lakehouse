@@ -468,6 +468,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    // BI-11: parameters are read with the dashboard and defined, changed and
+    // deleted with `dashboard:write`; a viewer's value is a request parameter,
+    // not a write.
+    ("GET",    "/api/dashboard/params",           Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),

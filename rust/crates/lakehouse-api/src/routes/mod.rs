@@ -34,6 +34,7 @@ mod lineage;
 mod notifications;
 mod ops;
 mod overview;
+pub(crate) mod params;
 mod pipelines;
 mod quality;
 mod query;
@@ -828,6 +829,13 @@ pub fn router(state: AppState) -> Router {
                 .post(hierarchies::create)
                 .put(hierarchies::update)
                 .delete(hierarchies::delete),
+        )
+        .route(
+            "/api/dashboard/params",
+            get(params::list)
+                .post(params::create)
+                .put(params::update)
+                .delete(params::delete),
         )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route(

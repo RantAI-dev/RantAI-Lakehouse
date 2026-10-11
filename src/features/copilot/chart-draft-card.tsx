@@ -1,5 +1,6 @@
 "use client";
 
+import { normalizeDef } from "@/lib/params";
 import * as React from "react";
 import { useTheme } from "next-themes";
 import { ChartColumn, PencilRuler } from "lucide-react";
@@ -90,7 +91,8 @@ export function ChartDraftCard({
   // `args` is rebuilt on every render; key the draft on its content so the
   // preview is fetched once per draft, not once per render.
   const argsKey = JSON.stringify(args);
-  const def = React.useMemo(() => chartDefFromArgs(JSON.parse(argsKey)), [argsKey]);
+  // BI-11: a parameter in a column slot arrives as { param } and is held as {name} text, as on the dashboard.
+  const def = React.useMemo(() => normalizeDef(chartDefFromArgs(JSON.parse(argsKey))) ?? {}, [argsKey]);
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);

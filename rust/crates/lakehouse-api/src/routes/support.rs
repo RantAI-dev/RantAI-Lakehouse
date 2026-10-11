@@ -355,6 +355,86 @@ pub(crate) fn stored_chart_sql(
     .ok_or("this chart's definition is invalid")
 }
 
+/// `BI-11`: the chart as this read sees it, with every parameter in its
+/// definition replaced by the read's value ([`lakehouse_bi::params::resolve_chart`]).
+/// A chart that names no parameter slot comes back as it is.
+///
+/// The names a column switch may take are the columns of the chart's relation
+/// (the mart, its joins, or the SQL source's probed columns) and the
+/// calculated fields of that source; the parameter's own list is checked as
+/// well. A SQL source that no longer exists leaves the chart untouched so
+/// [`stored_chart_sql`] reports it with its own sentence.
+///
+/// # Errors
+///
+/// The tile's plain sentence when a parameter is missing, of the wrong kind,
+/// or its value does not fit the slot.
+pub(crate) fn effective_chart<'a>(
+    chart: &'a store::StoredChartSpec,
+    mart_cols: &HashMap<String, RelationColumns>,
+    sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+    read: &lakehouse_bi::builder::ReadContext<'_>,
+) -> Result<std::borrow::Cow<'a, store::StoredChartSpec>, String> {
+    if !lakehouse_bi::params::changes_statement(&chart.def) {
+        return Ok(std::borrow::Cow::Borrowed(chart));
+    }
+    let mut names: std::collections::HashSet<String> = read
+        .fields
+        .for_chart(&chart.def)
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    if let Some(id) = chart.def.sql_source.as_deref() {
+        let Some(source) = sources.get(id) else {
+            return Ok(std::borrow::Cow::Borrowed(chart));
+        };
+        names.extend(source.column_kinds().into_keys());
+    } else {
+        let mart = lakehouse_core::ident::Ident::new(chart.def.mart.clone());
+        match (&mart, chart.def.shape.joins_list().is_empty()) {
+            (Ok(_), true) | (Err(_), _) => {
+                names.extend(
+                    mart_cols
+                        .get(&chart.def.mart)
+                        .map(|c| c.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                );
+            }
+            (Ok(mart), false) => {
+                if let Ok(joined) = lakehouse_bi::joins::chart_relation(
+                    mart,
+                    chart.def.shape.joins_list(),
+                    mart_cols,
+                ) {
+                    names.extend(joined.cols.into_keys());
+                }
+            }
+        }
+    }
+    lakehouse_bi::params::resolve_chart(chart, read.time.params(), &|n| names.contains(n))
+        .map(std::borrow::Cow::Owned)
+}
+
+/// What a tile carries from the chart's parameters (`BI-11`): its reference
+/// lines with the values of this read. A tile that carries an error is left
+/// alone.
+pub(crate) fn annotate_params(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    params: &lakehouse_bi::params::ParamValues,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    let lines = lakehouse_bi::params::reference_lines(&chart.def, params);
+    if !lines.is_empty() {
+        tile.insert("referenceLines".to_owned(), json!(lines));
+    }
+}
+
 /// [`annotate_grain`] for a chart that is not on a dashboard (the builder's
 /// preview): its own grain, no dashboard switch, no filters.
 pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartSpec) {
@@ -374,7 +454,7 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
         grain: Some(grain),
         grain_column: None,
         latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
-            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
+            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit_value())),
         table: None,
         bins: Vec::new(),
     };
@@ -513,7 +593,10 @@ pub(crate) async fn preview_bin_reads(
         grain: None,
         fields: &catalog,
     };
-    stored_chart_sql(chart, &[], &[], &cols, &sources, &read)
+    let Ok(chart) = effective_chart(chart, &cols, &sources, &read) else {
+        return Vec::new();
+    };
+    stored_chart_sql(&chart, &[], &[], &cols, &sources, &read)
         .map(|f| f.bins)
         .unwrap_or_default()
 }
@@ -646,7 +729,7 @@ pub(crate) async fn preview_rows(
     };
     let mut shown = result.clone();
     if chart.def.shape.steps.is_some() {
-        let limit = chart.def.limit.unwrap_or(20);
+        let limit = chart.def.limit_value().unwrap_or(20);
         let sql = lakehouse_bi::builder::steps::with_limit(
             &chart.spec.sql,
             limit,

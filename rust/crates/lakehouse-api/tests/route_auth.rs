@@ -1446,3 +1446,54 @@ async fn hierarchies_are_read_with_dashboard_read_and_defined_with_dashboard_wri
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (neither)");
     }
 }
+
+/// BI-11: parameters are read with `dashboard:read` and defined, changed and
+/// deleted with `dashboard:write`. Asserted both ways for every method: a
+/// reader gets past the gate on `GET` and is refused on the writes, a writer
+/// gets past on all four, and a principal with neither is refused on all four.
+#[tokio::test]
+async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/dashboard/params?id=x";
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    for (method, needs) in [
+        ("GET", "dashboard:read"),
+        ("POST", "dashboard:write"),
+        ("PUT", "dashboard:write"),
+        ("DELETE", "dashboard:write"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/dashboard/params")
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission(needs)),
+            "{method}"
+        );
+        let allowed = if needs == "dashboard:read" {
+            &reader
+        } else {
+            &writer
+        };
+        let refused = if needs == "dashboard:read" {
+            &neither
+        } else {
+            &reader
+        };
+        let resp = request_with_cookie(&router, method, uri, allowed).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method}: the right principal must get past the gate, got {}",
+            resp.status()
+        );
+        let resp = request_with_cookie(&router, method, uri, refused).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+        let resp = request_with_cookie(&router, method, uri, &neither).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (neither)");
+    }
+}

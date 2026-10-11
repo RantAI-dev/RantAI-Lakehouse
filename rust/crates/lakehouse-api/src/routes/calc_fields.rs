@@ -228,6 +228,7 @@ pub async fn validate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
         }));
     }
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     if let Err(too_long) = fields::validate_formula_size(&parsed.formula) {
         return Ok(ApiJson(json!({
             "ok": false,
@@ -273,6 +274,7 @@ pub async fn create(
     let ch = &state.clickhouse;
     let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     let name = parsed.name.trim().to_owned();
     fields::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
     if parsed.group.is_none() {
@@ -387,6 +389,7 @@ pub async fn update(
         SourceKind::SqlSource => resolve(ch, None, Some(&current.source_id)).await?,
     };
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     // BI-10: a value group is replaced by a value group, a formula by a
     // formula; one never turns into the other (a chart may use it as a text
     // column, and its level is the group's, not a formula's).
@@ -484,6 +487,7 @@ pub async fn delete(
         cols: RelationColumns::default(),
     });
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     let siblings = fields::list_fields_for(ch, source.kind, &source.id)
         .await
         .map_err(|failure| classify_ch(&failure))?;

@@ -31,6 +31,8 @@ export type Rows = {
   total?: number;
   limit?: number;
   offset?: number;
+  /** Lines on the value axis, at the values this read gave their parameters (BI-11). */
+  referenceLines?: { value: number; label?: string }[];
 };
 export type Cell = Rows | TileFailure;
 

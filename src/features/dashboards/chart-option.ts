@@ -488,3 +488,41 @@ export function buildOption(
 }
 
 export { fmtInt };
+
+/** A reference line with its value resolved by the server (`BI-11`). */
+export type ReferenceLine = { value: number; label?: string };
+
+/**
+ * Draw `lines` on the value axis of a bar, hbar, line, area, stacked or combo
+ * option: one dashed line each, labelled with its label and value (numbers via
+ * `lib/chart-axis`). The value axis is widened to reach the highest line, since a
+ * target far above the data would otherwise be drawn outside the chart. The
+ * option is returned as it is when there are no lines or no series.
+ */
+export function withReferenceLines(option: EChartsOption, lines: readonly ReferenceLine[] | undefined, horizontal: boolean, dark: boolean): EChartsOption {
+  const drawn = (lines ?? []).filter((l) => Number.isFinite(l.value));
+  const series = Array.isArray(option.series) ? option.series : [];
+  if (!drawn.length || !series.length) return option;
+  const color = dark ? "#fbbf24" : "#d97706";
+  const top = Math.max(...drawn.map((l) => l.value));
+  const markLine = {
+    silent: true,
+    symbol: "none",
+    lineStyle: { type: "dashed" as const, width: 1.5, color },
+    label: {
+      color, fontSize: 11, position: "insideEndTop" as const,
+      formatter: (p: { name?: string; value?: unknown }) => `${p.name ? `${p.name} ` : ""}${formatNumber(Number(p.value ?? 0), decimalsFor([Number(p.value ?? 0)]))}`,
+    },
+    data: drawn.map((l) => (horizontal ? { xAxis: l.value, name: l.label ?? "" } : { yAxis: l.value, name: l.label ?? "" })),
+  };
+  const widen = (axis: unknown) => {
+    if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
+    return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
+  };
+  const widenAll = (axis: unknown) => (Array.isArray(axis) ? axis.map((a, i) => (i === 0 ? widen(a) : a)) : widen(axis));
+  return {
+    ...option,
+    series: series.map((s, i) => (i === 0 ? { ...s, markLine } : s)),
+    ...(horizontal ? { xAxis: widenAll(option.xAxis) } : { yAxis: widenAll(option.yAxis) }),
+  } as EChartsOption;
+}

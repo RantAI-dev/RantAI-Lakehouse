@@ -68,8 +68,12 @@ enum MeasureEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnAggregate {
+    /// A column, or a parameter standing for one (`BI-11`).
+    #[serde(with = "crate::params::slot")]
     column: String,
-    aggregate: String,
+    /// Absent only for a column switch without an aggregate of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aggregate: Option<String>,
 }
 
 /// The measures of a chart: column names, and for some of them an aggregate of
@@ -147,10 +151,14 @@ impl Serialize for MeasureList {
         let mut seq = serializer.serialize_seq(Some(self.columns.len()))?;
         for (column, aggregate) in self.entries() {
             match aggregate {
-                None => seq.serialize_element(column)?,
-                Some(aggregate) => seq.serialize_element(&OwnAggregate {
+                // BI-11: a column switch is written as an object even without
+                // an aggregate of its own.
+                None if crate::params::slot_param(column).is_none() => {
+                    seq.serialize_element(column)?;
+                }
+                _ => seq.serialize_element(&OwnAggregate {
                     column: column.to_owned(),
-                    aggregate: aggregate.to_owned(),
+                    aggregate: aggregate.map(str::to_owned),
                 })?,
             }
         }
@@ -168,7 +176,7 @@ impl<'de> Deserialize<'de> for MeasureList {
                 .into_iter()
                 .map(|e| match e {
                     MeasureEntry::Name(column) => (column, None),
-                    MeasureEntry::Own(own) => (own.column, Some(own.aggregate)),
+                    MeasureEntry::Own(own) => (own.column, own.aggregate),
                 })
                 .collect(),
         ))
@@ -387,6 +395,19 @@ pub struct ShapeFields {
     /// `pointmap`, `geoheat`: group the points by grid cell (`BI-10`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grid: Option<GridSpec>,
+    /// Up to [`crate::params::MAX_REFERENCE_LINES`] lines drawn on the value
+    /// axis, each a number or a number parameter (`BI-11`).
+    #[serde(
+        rename = "referenceLines",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub reference_lines: Option<Vec<crate::params::ReferenceLine>>,
+    /// Set on the copy of a chart whose parameters were replaced by this
+    /// read's values (`BI-11`), so the builder rebuilds its statement instead
+    /// of serving the stored one. Never stored and never sent.
+    #[serde(skip)]
+    pub resolved_params: bool,
 }
 
 impl ShapeFields {
@@ -435,6 +456,7 @@ impl ShapeFields {
             || self.bin.is_some()
             || self.breakdown_bin.is_some()
             || self.grid.is_some()
+            || self.resolved_params
     }
 }
 

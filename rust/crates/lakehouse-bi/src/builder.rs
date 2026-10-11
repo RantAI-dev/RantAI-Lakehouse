@@ -1153,8 +1153,11 @@ fn grained<H: std::hash::BuildHasher>(
     let g = r.effective.zip(column).map(|(grain, column)| {
         let order = def.effective_order();
         let order = order.as_str();
-        let limit =
-            grain::effective_limit(grain, order, grain::clamp_limit(spec.spec.kind, def.limit));
+        let limit = grain::effective_limit(
+            grain,
+            order,
+            grain::clamp_limit(spec.spec.kind, def.limit_value()),
+        );
         Grained {
             grain,
             column,
@@ -2139,7 +2142,7 @@ fn rebuild_chart_over<H: std::hash::BuildHasher>(
             &dimension,
             &measure,
             &where_clauses,
-            def.limit.unwrap_or(20),
+            def.limit_value().unwrap_or(20),
         ));
     }
     let breakdown = def
@@ -2168,7 +2171,7 @@ fn rebuild_chart_over<H: std::hash::BuildHasher>(
         .dimension(dimension)
         .aggregate(agg)
         .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
-        .limit(def.limit.unwrap_or(20))
+        .limit(def.limit_value().unwrap_or(20))
         .breakdown(breakdown)
         .sort(sort)
         .steps(steps)
@@ -2355,7 +2358,7 @@ fn groupings_sql<H: std::hash::BuildHasher>(
         .groupings(idents)
         .aggregate(agg)
         .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
-        .limit(def.limit.unwrap_or(20))
+        .limit(def.limit_value().unwrap_or(20))
         .sort(sort)
         .steps(steps)
         .measure_list(measures.to_vec());
@@ -2402,7 +2405,8 @@ impl GrainedChart {
         let dimension = Ident::new(def.dimension.clone()).ok()?;
         let sort = sort_of(def, &measures, std::slice::from_ref(&dimension), None).ok()?;
         let order = def.effective_order();
-        let limit = grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit));
+        let limit =
+            grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit_value()));
         Some(Self {
             grain,
             dimension,
@@ -3867,7 +3871,7 @@ mod tests {
     fn a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series() {
         let mut spec = grained_spec(ChartKind::Line, "quarter", "none");
         spec.def.breakdown = Some("g".to_owned());
-        spec.def.limit = Some(8);
+        spec.def.limit = Some(8.into());
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert_eq!(
             got.sql,
@@ -3964,7 +3968,7 @@ mod tests {
     #[test]
     fn a_calendar_takes_day_only_and_up_to_a_thousand_buckets() {
         let mut spec = grained_spec(ChartKind::Calendar, "day", "none");
-        spec.def.limit = Some(900);
+        spec.def.limit = Some(900.into());
         let sql = sql_with_filters(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert!(
             sql.contains("toDate32(toTimeZone(d, 'Asia/Jakarta')) AS d"),
@@ -4060,7 +4064,7 @@ mod tests {
         for limit in [1, 5, 20, 1000] {
             for grain in ["hour_of_day", "day_of_month", "week_of_year", "day_of_week"] {
                 let mut spec = grained_spec(ChartKind::Bar, grain, "none");
-                spec.def.limit = Some(limit);
+                spec.def.limit = Some(limit.into());
                 let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
                 assert_eq!(got.latest_limit, None, "{grain} {limit}");
                 assert!(got.sql.contains("LIMIT 64"), "{grain} {limit}: {}", got.sql);
@@ -4077,11 +4081,11 @@ mod tests {
     #[test]
     fn a_part_with_a_value_order_keeps_the_editors_top_n_and_a_truncation_keeps_latest_n() {
         let mut spec = grained_spec(ChartKind::Bar, "hour_of_day", "desc");
-        spec.def.limit = Some(5);
+        spec.def.limit = Some(5.into());
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert!(got.sql.contains("ORDER BY v DESC LIMIT 5"), "{}", got.sql);
         let mut month = grained_spec(ChartKind::Bar, "month", "none");
-        month.def.limit = Some(5);
+        month.def.limit = Some(5.into());
         let got = sql_with_filters_report(&month, &[], &[], &dated(ColumnKind::Date));
         assert_eq!(got.latest_limit, Some(5));
         assert!(got.sql.contains("LIMIT 6"), "{}", got.sql);

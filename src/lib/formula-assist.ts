@@ -8,7 +8,7 @@ import type { FormulaFunction, FormulaProblem } from "@/services/contracts/calc-
  */
 
 export type Suggestion = {
-  kind: "column" | "field" | "function"
+  kind: "column" | "field" | "function" | "param"
   /** What the list shows. */
   label: string
   /** What replaces the typed prefix. */
@@ -21,9 +21,11 @@ export type Names = {
   columns: string[]
   /** Calculated fields of the source, with their formulas for the detail line. */
   fields: { name: string; formula: string }[]
+  /** The parameters a formula may read as `{name}` (BI-11), with a line for the detail. */
+  params?: { name: string; detail: string }[]
 }
 
-type State = "code" | "bracket" | "string"
+type State = "code" | "bracket" | "string" | "param"
 
 /** The lexical state at `caret` and where the open bracket or quote began. */
 function stateAt(text: string, caret: number): { state: State; start: number } {
@@ -36,6 +38,11 @@ function stateAt(text: string, caret: number): { state: State; start: number } {
       if (c === quote) state = "code"
     } else if (state === "bracket") {
       if (c === "]") state = "code"
+    } else if (state === "param") {
+      if (c === "}") state = "code"
+    } else if (c === "{") {
+      state = "param"
+      start = i
     } else if (c === "'" || c === '"') {
       state = "string"
       quote = c
@@ -76,6 +83,14 @@ export function suggest(
     ...names.columns.map((c) => ({ name: c, field: false, formula: "" })),
     ...names.fields.map((f) => ({ name: f.name, field: true, formula: f.formula })),
   ]
+  if (state === "param") {
+    const prefix = text.slice(start + 1, caret)
+    const closes = text[caret] === "}"
+    const items = rank(names.params ?? [], (p) => p.name, prefix)
+      .slice(0, MAX_ITEMS)
+      .map<Suggestion>((p) => ({ kind: "param", label: p.name, insert: closes ? p.name : `${p.name}}`, detail: p.detail }))
+    return { from: start + 1, to: caret, items }
+  }
   if (state === "bracket") {
     const prefix = text.slice(start + 1, caret)
     const closes = text[caret] === "]"

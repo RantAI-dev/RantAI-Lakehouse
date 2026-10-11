@@ -152,10 +152,16 @@ pub struct InvalidTimeZone;
 
 /// The report time zone and the first day of the week: what "today",
 /// "this month" and a bucket mean for the whole deployment.
+///
+/// It also carries the parameter values of the read (`BI-11`): this is the one
+/// context every formula compile and statement build already receives, so the
+/// values reach all of them without a new argument anywhere. They are not time
+/// settings; see [`crate::params`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeContext {
     zone: TimeZoneName,
     week_start: WeekStart,
+    params: crate::params::ParamValues,
 }
 
 impl Default for TimeContext {
@@ -165,6 +171,7 @@ impl Default for TimeContext {
         Self {
             zone: TimeZoneName(DEFAULT_TIME_ZONE.to_owned()),
             week_start: WeekStart::Monday,
+            params: crate::params::ParamValues::default(),
         }
     }
 }
@@ -179,7 +186,21 @@ impl TimeContext {
         Ok(Self {
             zone: TimeZoneName::new(zone).ok_or(InvalidTimeZone)?,
             week_start,
+            params: crate::params::ParamValues::default(),
         })
+    }
+
+    /// This context with the parameter values of a read.
+    #[must_use]
+    pub fn with_params(mut self, params: crate::params::ParamValues) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// The parameter values of this read (none unless a caller set them).
+    #[must_use]
+    pub fn params(&self) -> &crate::params::ParamValues {
+        &self.params
     }
 
     /// The zone name.

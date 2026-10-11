@@ -4,7 +4,7 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import {
   CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, Pencil, Plus, ScatterChart, Search, Table2, Type, type LucideIcon,
+  Map, MapPin, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -29,7 +29,13 @@ import { useAuth } from "@/features/auth/auth-provider";
 import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
-import { dashboardService } from "@/services";
+import { dashboardService, paramService } from "@/services";
+import {
+  columnSwitchParams, limitParam, numberParams, refLinesFromDef, refLinesPayload, slotParam, slotText,
+  type ParamDef, type ParamValue, type RefLineDef, type RefLineDraft,
+} from "@/lib/params";
+import { ParamDialog } from "./param-dialog";
+import { ReferenceLinesEditor } from "./reference-lines-editor";
 import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
@@ -83,7 +89,9 @@ export type ChartDef = {
   dimension?: string; breakdown?: string;
   map?: string; lat?: string; lon?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
-  order?: "desc" | "asc" | "none"; limit?: number; target?: number;
+  order?: "desc" | "asc" | "none"; limit?: number | { param: string }; target?: number;
+  /** Lines on the value axis, each a number or a number parameter (BI-11). */
+  referenceLines?: RefLineDef[];
   /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
   click?: ChartClick;
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
@@ -161,6 +169,7 @@ const KIND_LABELS: Record<string, string> = Object.fromEntries(
   KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
 );
 const NO_BREAKDOWN = "__none__";
+const FIXED_LIMIT = "__fixed_limit__";
 const NO_GRAIN = "__no_grain__";
 const GRAIN_ITEMS: Record<string, string> = { [NO_GRAIN]: "No grouping", ...GRAIN_LABELS };
 /** Column name → kind, from the `{ name, type }` list a fields response or a SQL run returns. */
@@ -267,7 +276,7 @@ const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
  * Writes to the SAME artifact as the chat path (console.bi_chart).
  */
 export function ChartBuilder({
-  onSaved, board = "default", boards = [], initial, editId,
+  onSaved, board = "default", boards = [], initial, editId, paramValues,
   open: openProp, onOpenChange, hideTrigger,
 }: {
   /** Receives the definition that was saved. */
@@ -276,6 +285,8 @@ export function ChartBuilder({
   boards?: BoardOpt[];
   initial?: ChartDef;
   editId?: string;
+  /** The parameter values the dashboard shows now; the preview is drawn with them (BI-11). */
+  paramValues?: Record<string, ParamValue>;
   open?: boolean;
   onOpenChange?: (o: boolean) => void;
   hideTrigger?: boolean;
@@ -300,7 +311,9 @@ export function ChartBuilder({
   const [editingHierarchy, setEditingHierarchy] = React.useState<Hierarchy | undefined>(undefined);
   /** A calculated field is marked "fx" wherever a column is picked. */
   // A joined column (`table__column`, BI-7) reads `table.column`.
-  const fieldLabel = (name: string) => calcNames.has(name)
+  const fieldLabel = (name: string) => slotParam(name)
+    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">param</span></span>
+    : calcNames.has(name)
     ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
     : groupNames.has(name)
       ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">group</span></span>
@@ -355,6 +368,13 @@ export function ChartBuilder({
   const [target, setTarget] = React.useState("");
   const [text, setText] = React.useState("");
   const [limit, setLimit] = React.useState(20);
+  // BI-11: the parameters (for the column slots, the limit and the reference lines), the number
+  // parameter the limit follows ("" = the number above), and the chart's reference lines.
+  const [paramDefs, setParamDefs] = React.useState<ParamDef[]>([]);
+  const [limitParamName, setLimitParamName] = React.useState("");
+  const [refLines, setRefLines] = React.useState<RefLineDraft[]>([]);
+  const [paramsOpen, setParamsOpen] = React.useState(false);
+  const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
   const [click, setClick] = React.useState<ChartClick | undefined>(undefined);
@@ -416,6 +436,7 @@ export function ChartBuilder({
   // A calendar is one cell per day, so up to a year of rows; a grouped chart
   // may show up to a thousand buckets (the server keeps the latest).
   const maxLimit = grain ? 1000 : isCalendar ? 366 : 100;
+  const takesLines = ["bar", "hbar", "line", "area", "stacked", "combo"].includes(kind);
   // Switching to a calendar starts from a full year; leaving it brings the
   // Top-N back inside 1–100.
   React.useEffect(() => {
@@ -464,7 +485,13 @@ export function ChartBuilder({
   const isNumber = (column: string) => fields?.kinds?.[column] === "number";
   function pickDimension(column: string) {
     setDimension(column);
-    setShape((d) => ({ ...d, bin: binKind && isNumber(column) ? d.bin ?? startingBin : null }));
+    // BI-10 review fix (SHOULD-FIX) R1: bins read best in bin order, as dates do; the
+    // editor can still change it. Only the untouched default is replaced.
+    setShape((d) => ({
+      ...d,
+      bin: binKind && isNumber(column) ? d.bin ?? startingBin : null,
+      sortChoice: binKind && isNumber(column) && d.bin === null && d.sortChoice === "order:desc" ? "order:none" : d.sortChoice,
+    }));
   }
   function pickBreakdown(column: string) {
     setBreakdown(column);
@@ -600,6 +627,14 @@ export function ChartBuilder({
       j.calculated ?? [],
     );
     f.hierarchies = j.hierarchies ?? [];
+    // BI-11: a list parameter can stand for a column; it is offered wherever a column is picked,
+    // and the server checks every one of its values as a column of this chart's data when it is saved.
+    const defs = await paramService.list().catch(() => [] as ParamDef[]);
+    setParamDefs(defs);
+    for (const p of columnSwitchParams(defs)) {
+      f.dimensions.push(slotText(p.name));
+      f.measures.push(slotText(p.name));
+    }
     setFields(f);
     return f;
   }
@@ -632,7 +667,9 @@ export function ChartBuilder({
       // check that drops a sort the chart no longer has must see them.
       setDimension(initial.dimension ?? savedShape.groupings[0]?.column ?? "");
       setMeasureRows(rowsFromEntries(initial.measures));
-      setLimit(initial.limit ?? 20);
+      setLimitParamName(limitParam(initial.limit) ?? "");
+      setLimit(typeof initial.limit === "number" ? initial.limit : 20);
+      setRefLines(refLinesFromDef(initial.referenceLines));
       setLimitTouched(true);
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
@@ -657,7 +694,7 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false);
+    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]);
     setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
@@ -767,7 +804,9 @@ export function ChartBuilder({
         map: isMap ? effectiveMap : undefined,
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
-        order: isCalendar ? "none" : isPoints ? undefined : legacyOrder, limit: isPoints ? undefined : Math.min(limit, maxLimit),
+        order: isCalendar ? "none" : isPoints ? undefined : legacyOrder,
+        limit: isPoints ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
+        referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
         // Only a grain the column and kind allow is sent (BI-9); the server checks again.
         grain: grain && grainOptions.includes(grain) ? grain : undefined,
         ...draftPayload(kind, tableDraft, shownColumns),
@@ -781,6 +820,8 @@ export function ChartBuilder({
     if (problem && !forPreview) throw new Error(problem);
     if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
+    // BI-11: the preview is drawn with the values the dashboard shows; they are not part of the chart.
+    if (forPreview && paramValues && Object.keys(paramValues).length) payload.params = paramValues;
     return payload;
   }
 
@@ -793,6 +834,8 @@ export function ChartBuilder({
     shape: JSON.stringify({ measures: measureRows, shape }),
     // BI-8: a changed formula changes the rows a chart over the field returns.
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
+    // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
+    params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
   });
   React.useEffect(() => {
     if (!open) return;
@@ -1228,10 +1271,30 @@ export function ChartBuilder({
               )}
               {limitHasEffect(grain, isCalendar ? "none" : order) ? <div className="grid gap-1.5">
                 <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+                {limitParamName ? null : (
+                  <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+                )}
+                {numberParamDefs.length ? (
+                  <Select value={limitParamName || FIXED_LIMIT} items={{ [FIXED_LIMIT]: "A fixed number", ...Object.fromEntries(numberParamDefs.map((p) => [p.name, p.label || p.name])) }}
+                    onValueChange={(v) => setLimitParamName(v && v !== FIXED_LIMIT ? v : "")}>
+                    <SelectTrigger className="w-full" aria-label="Limit from a parameter"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={FIXED_LIMIT}>A fixed number</SelectItem>
+                      {numberParamDefs.map((p) => <SelectItem key={p.name} value={p.name}>{p.label || p.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                ) : null}
               </div> : null}
             </div>
           )}
+
+          {takesLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} /> : null}
+          <div>
+            <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
+              <SlidersHorizontal className="size-3" aria-hidden /> Parameters
+            </Button>
+          </div>
+          {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
 
           {showOther ? (
             <Label className="gap-2 text-sm font-normal">
@@ -1429,6 +1492,7 @@ export function ChartBuilder({
             onOpenChange={setFormulaOpen}
             source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
             columns={fields.columns}
+            params={paramDefs}
             fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
             existing={editing}
             onSaved={() => { void loadFields(source); }}

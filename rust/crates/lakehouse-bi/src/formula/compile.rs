@@ -232,6 +232,8 @@ pub struct Compiled {
     pub reads: BTreeSet<String>,
     /// The fields it uses, directly or through others, sorted.
     pub fields: BTreeSet<String>,
+    /// The parameters it uses, directly or through fields, sorted (`BI-11`).
+    pub params: BTreeSet<String>,
     /// What the chart must compute around the expression: hidden aggregates,
     /// shifted copies and `Fixed` joins (`BI-8` part 2). Empty for part 1.
     pub staged: Staged,
@@ -307,6 +309,7 @@ pub fn compile(
         produced: 0,
         reads: BTreeSet::new(),
         fields: BTreeSet::new(),
+        params: BTreeSet::new(),
         staged: Staged::default(),
     };
     let typed = cx.node(&tree)?;
@@ -320,8 +323,34 @@ pub fn compile(
         },
         reads: cx.reads,
         fields: cx.fields,
+        params: cx.params,
         staged: cx.staged,
     })
+}
+
+/// The parameters a formula names, by syntax alone (no scope): what the
+/// delete-in-use rule needs. A formula that does not parse names none.
+#[must_use]
+pub fn params_in(formula: &str) -> BTreeSet<String> {
+    fn walk(n: &Node, out: &mut BTreeSet<String>) {
+        match &n.kind {
+            Kind::Param(name) => {
+                out.insert(name.clone());
+            }
+            Kind::Call { args, .. } => args.iter().for_each(|a| walk(a, out)),
+            Kind::Neg(a) | Kind::Not(a) => walk(a, out),
+            Kind::Bin(_, l, r) => {
+                walk(l, out);
+                walk(r, out);
+            }
+            Kind::Num(_) | Kind::Str(_) | Kind::Bool(_) | Kind::Name(_) => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Ok(tree) = parse(formula) {
+        walk(&tree, &mut out);
+    }
+    out
 }
 
 /// A number as SQL, from its parsed value: whole numbers as integers, the rest
@@ -355,6 +384,7 @@ struct Cx<'a> {
     produced: usize,
     reads: BTreeSet<String>,
     fields: BTreeSet<String>,
+    params: BTreeSet<String>,
     staged: Staged,
 }
 
@@ -503,6 +533,7 @@ impl Cx<'_> {
                 level: Level::Constant,
             }),
             Kind::Name(name) => self.name(name, n),
+            Kind::Param(name) => self.param(name, n),
             Kind::Neg(inner) => {
                 let t = self.node(inner)?;
                 want(&t, inner, FType::Number)?;
@@ -522,6 +553,21 @@ impl Cx<'_> {
             Kind::Bin(op, l, r) => self.binary(*op, l, r),
             Kind::Call { name, args } => self.call(name, n, args),
         }
+    }
+
+    /// `{name}`: a literal of the parameter's type, printed from the checked
+    /// value ([`crate::params::ParamValue::sql`]), never from any text of the
+    /// request.
+    fn param(&mut self, name: &str, node: &Node) -> Result<Typed, FormulaError> {
+        let Some(found) = self.scope.time.params().get(name) else {
+            return Err(err(node, format!("'{}' is not a parameter.", clip(name))));
+        };
+        self.params.insert(name.to_owned());
+        Ok(Typed {
+            sql: found.value.sql(),
+            ty: found.value.ftype(),
+            level: Level::Constant,
+        })
     }
 
     fn name(&mut self, name: &str, node: &Node) -> Result<Typed, FormulaError> {
@@ -1578,6 +1624,153 @@ mod tests {
         assert!(
             compiled > 20_000 && refused > 10_000,
             "{compiled} compiled, {refused} refused"
+        );
+    }
+
+    // ── BI-11: parameters ────────────────────────────────────────────────
+
+    use crate::params::{ListEntry, ParamDef, ParamType, ParamValues};
+
+    fn def(name: &str, ty: ParamType, default: serde_json::Value) -> ParamDef {
+        ParamDef {
+            id: String::new(),
+            name: name.to_owned(),
+            label: name.to_owned(),
+            ty,
+            default,
+            min: None,
+            max: None,
+            max_length: None,
+            values: None,
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    fn with_params(defs: &[ParamDef], formula: &str) -> Result<Compiled, FormulaError> {
+        let cols = sample_columns();
+        let time = TimeContext::default().with_params(ParamValues::from_defaults(defs));
+        compile(formula, &Scope::new(&cols, &time), None)
+    }
+
+    #[test]
+    fn a_parameter_compiles_to_a_literal_of_its_type() {
+        let defs = [
+            def("target", ParamType::Number, serde_json::json!(1000)),
+            def("who", ParamType::Text, serde_json::json!("O'Brien")),
+            def("since", ParamType::Date, serde_json::json!("2026-03-05")),
+        ];
+        let c = with_params(&defs, "amount / {target}").unwrap();
+        assert_eq!(c.sql, "(amount / nullIf(1000, 0))");
+        assert_eq!(c.ty, FType::Number);
+        assert!(c.params.contains("target"));
+        let c = with_params(&defs, "Concat({who}, label)").unwrap();
+        assert!(c.sql.contains("'O''Brien'"), "{}", c.sql);
+        let c = with_params(&defs, "day >= {since}").unwrap();
+        assert_eq!(c.sql, "(day >= toDate32('2026-03-05'))");
+        assert_eq!(c.ty, FType::Boolean);
+    }
+
+    #[test]
+    fn an_unknown_parameter_is_a_positioned_error_and_a_type_mismatch_is_refused() {
+        let defs = [def("target", ParamType::Number, serde_json::json!(5))];
+        let e = with_params(&defs, "amount + {nope}").unwrap_err();
+        assert_eq!(e.position, 9, "{e:?}");
+        assert!(e.message.contains("not a parameter"));
+        let e = with_params(&defs, "If({target}, 1, 2)").unwrap_err();
+        assert!(e.message.contains("true or false"), "{e:?}");
+        assert!(run("{target}").is_err(), "no parameters in scope at all");
+        assert!(
+            tokenize_err("{ba d}")
+                && tokenize_err("{}")
+                && tokenize_err("{1a}")
+                && tokenize_err("{a")
+        );
+    }
+
+    fn tokenize_err(src: &str) -> bool {
+        crate::formula::lex::tokenize(src).is_err()
+    }
+
+    #[test]
+    fn a_list_parameter_has_the_type_of_its_values() {
+        let mut numbers = def("n", ParamType::List, serde_json::json!(2));
+        numbers.values = Some(vec![
+            ListEntry {
+                value: serde_json::json!(1),
+                label: "one".into(),
+            },
+            ListEntry {
+                value: serde_json::json!(2),
+                label: "two".into(),
+            },
+        ]);
+        let mut texts = def("t", ParamType::List, serde_json::json!("a"));
+        texts.values = Some(vec![ListEntry {
+            value: serde_json::json!("a"),
+            label: "a".into(),
+        }]);
+        let defs = [numbers, texts];
+        assert_eq!(with_params(&defs, "{n} + 1").unwrap().ty, FType::Number);
+        assert_eq!(
+            with_params(&defs, "Concat({t}, label)").unwrap().ty,
+            FType::Text
+        );
+    }
+
+    #[test]
+    fn params_in_finds_names_by_syntax_alone() {
+        let names = params_in("If({a} > 1, [x] * {b}, {a})");
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+        assert!(params_in("amount +").is_empty());
+    }
+
+    /// BI-11: the property test of the compiler, extended to parameter values.
+    /// Hostile text is a text parameter's value (the definition refuses control
+    /// characters, so those never get as far as a statement); every value that
+    /// passes comes out inside one escaped literal and decodes to itself. A
+    /// number or a date that is not one is refused before any statement is built.
+    #[test]
+    fn generated_hostile_parameter_values_never_reach_sql_outside_an_escaped_literal() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let (mut accepted, mut refused) = (0_u32, 0_u32);
+        let text_def = def("t", ParamType::Text, serde_json::json!("x"));
+        let number_def = def("n", ParamType::Number, serde_json::json!(1));
+        let date_def = def("d", ParamType::Date, serde_json::json!("2026-01-01"));
+        for _ in 0..20_000 {
+            let text = nasty(&mut rng, 40);
+            for (d, source) in [
+                (&text_def, "Concat({t}, label)"),
+                (&number_def, "{n} + 1"),
+                (&date_def, "day >= {d}"),
+            ] {
+                let Ok(value) = crate::params::check_value(d, &serde_json::json!(text)) else {
+                    refused += 1;
+                    continue;
+                };
+                let _ = value;
+                let cols = sample_columns();
+                let defs = [text_def.clone(), number_def.clone(), date_def.clone()];
+                // The request: this parameter takes the hostile value.
+                let request: serde_json::Map<String, serde_json::Value> =
+                    [(d.name.clone(), serde_json::json!(text))]
+                        .into_iter()
+                        .collect();
+                let resolved = ParamValues::resolve(&defs, &[], Some(&request))
+                    .unwrap_or_else(|e| panic!("accepted by check_value, refused by resolve: {e}"));
+                let time = TimeContext::default().with_params(resolved);
+                let c = compile(source, &Scope::new(&cols, &time), None)
+                    .unwrap_or_else(|e| panic!("{source}: {e}"));
+                let literals = audit_sql(&c.sql);
+                if d.ty == ParamType::Text {
+                    assert_eq!(literals[0], text, "{}", c.sql);
+                }
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted > 5_000 && refused > 10_000,
+            "{accepted} accepted, {refused} refused"
         );
     }
 

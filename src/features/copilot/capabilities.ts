@@ -35,7 +35,9 @@ export const CAPABILITIES: Capability[] = [
       // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.
       "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field",
       // BI-10: value groups and hierarchies.
-      "create_value_group", "list_hierarchies", "create_hierarchy", "delete_hierarchy"],
+      "create_value_group", "list_hierarchies", "create_hierarchy", "delete_hierarchy",
+      // BI-11: parameters.
+      "list_parameters", "create_parameter", "update_parameter", "delete_parameter"],
   },
   {
     key: "pipeline",

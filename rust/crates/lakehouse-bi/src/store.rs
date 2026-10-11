@@ -281,14 +281,18 @@ pub struct ChartInput {
     /// How to render the data.
     pub kind: ChartKind,
     /// X-axis / category column.
-    #[serde(default)]
+    #[serde(default, with = "crate::params::slot")]
     pub dimension: String,
     /// Value column(s); more than one only for `stacked`. An entry may be
     /// `{"column": …, "aggregate": …}` to carry its own aggregate (`BI-6`).
     #[serde(default)]
     pub measures: MeasureList,
     /// Optional 2nd dimension: splits into multiple series.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::params::slot_opt"
+    )]
     pub breakdown: Option<String>,
     /// Map id (`geomap`, `pointmap`, `geoheat`); shape-checked only, the
     /// console owns the catalogue.
@@ -304,9 +308,9 @@ pub struct ChartInput {
     /// Aggregate function.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub aggregate: Option<String>,
-    /// Row limit.
+    /// Row limit: a number, or `{ "param": <number parameter> }` (`BI-11`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub limit: Option<u32>,
+    pub limit: Option<crate::params::Limit>,
     /// Sort order.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub order: Option<String>,
@@ -358,6 +362,25 @@ impl ChartInput {
     #[must_use]
     pub fn uses_shaping(&self) -> bool {
         self.measures.has_own_aggregates() || self.shape.is_used()
+    }
+
+    /// The fixed limit, or `None` when the chart has none or takes it from a
+    /// parameter (`BI-11`): a read resolves the parameter into a fixed limit
+    /// first ([`crate::params::resolve_chart`]), so a statement is never built
+    /// from an unresolved one.
+    #[must_use]
+    pub fn limit_value(&self) -> Option<u32> {
+        match &self.limit {
+            Some(crate::params::Limit::Fixed(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Whether the definition names a parameter (a limit, a column, a
+    /// reference line).
+    #[must_use]
+    pub fn uses_params(&self) -> bool {
+        !crate::params::chart_param_names(self).is_empty()
     }
 
     /// `order` in the words it always had (`none`, `asc`, `desc`) once a sort
@@ -428,6 +451,10 @@ pub struct Board {
     /// was saved: each chart then uses its own.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grain: Option<String>,
+    /// The parameters whose controls the board shows, with the value an editor
+    /// saved for each (`BI-11`). `None` when the board shows none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub params: Option<Vec<crate::params::BoardParam>>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -592,6 +619,13 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // BI-11: the parameters a dashboard shows and their saved values, a JSON
+    // list; `[]` is "none", so a board saved before reads as showing none.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS params_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -619,6 +653,17 @@ async fn ensure_field_tables(ch: &ChClient) -> Result<(), ChError> {
            id String, source_kind String, source_id String, name String,\n\
            levels_json String DEFAULT '[]', created_by String DEFAULT '',\n\
            created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-11: parameters (`crate::params`), the same versioned-insert shape; the
+    // whole definition is one JSON document.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_param (\n\
+           id String, name String, def_json String DEFAULT '{}',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
          ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
         None,
     )
@@ -734,7 +779,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -789,6 +834,9 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| *n > 0),
         grain: Some(row_str(row, "grain").to_owned()).filter(|g| !g.is_empty()),
+        params: serde_json::from_str::<Vec<crate::params::BoardParam>>(row_str(row, "params_json"))
+            .ok()
+            .filter(|p| !p.is_empty()),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -878,6 +926,7 @@ pub async fn create_board(
         filters: Some(Vec::new()),
         refresh_seconds: None,
         grain: None,
+        params: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -902,7 +951,7 @@ async fn upsert_board(
     folder_id: &str,
     embed_access: &EmbedAccess,
     refresh_seconds: u32,
-    grain: &str,
+    (grain, params): (&str, &[crate::params::BoardParam]),
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -914,8 +963,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -933,6 +982,8 @@ async fn upsert_board(
         refresh_seconds,
         // Carried on every save like the refresh above (BI-9).
         SqlLiteral::from(grain),
+        // And the shown parameters with their saved values (BI-11).
+        SqlLiteral::from(serde_json::to_string(params).unwrap_or_else(|_| "[]".to_owned())),
     );
     ch.exec(&sql, None).await
 }
@@ -982,6 +1033,7 @@ async fn save_board_patch(
         .refresh_seconds
         .unwrap_or_else(|| board.refresh_seconds.unwrap_or(0));
     let grain = patch.grain.or(board.grain.as_deref()).unwrap_or("");
+    let params = patch.params.or(board.params.as_deref()).unwrap_or_default();
     upsert_board(
         ch,
         &board.id,
@@ -995,7 +1047,7 @@ async fn save_board_patch(
         folder_id,
         embed_access,
         refresh_seconds,
-        grain,
+        (grain, params),
     )
     .await
 }
@@ -1015,6 +1067,7 @@ struct BoardPatch<'a> {
     embed_access: Option<&'a EmbedAccess>,
     refresh_seconds: Option<u32>,
     grain: Option<&'a str>,
+    params: Option<&'a [crate::params::BoardParam]>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -1112,6 +1165,7 @@ pub async fn update_board_layout(
         filters: None,
         refresh_seconds: None,
         grain: None,
+        params: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1151,6 +1205,7 @@ pub async fn update_board_filters(
         filters: None,
         refresh_seconds: None,
         grain: None,
+        params: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1189,6 +1244,7 @@ pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Resu
         filters: None,
         refresh_seconds: None,
         grain: None,
+        params: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1233,6 +1289,7 @@ pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<
         filters: None,
         refresh_seconds: None,
         grain: None,
+        params: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1245,6 +1302,49 @@ pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<
         &board,
         BoardPatch {
             grain: Some(grain),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save the parameters a dashboard shows and their saved values (`BI-11`); an
+/// empty list clears them. Same fallback as [`update_board_layout`] for the
+/// built-in board's row. The caller has checked every name against the
+/// definitions and every value against its definition.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_params(
+    ch: &ChClient,
+    id: &str,
+    params: &[crate::params::BoardParam],
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
+        id: id.to_owned(),
+        name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
+        layout: None,
+        filters: None,
+        refresh_seconds: None,
+        grain: None,
+        params: None,
+        created_at: None,
+        updated_at: None,
+        public_token: None,
+        embed_enabled: None,
+        folder_id: None,
+        embed_access: EmbedAccess::default(),
+    });
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            params: Some(params),
             ..Default::default()
         },
     )
@@ -2303,16 +2403,21 @@ fn limit_and_order(
     // BI-9: a grained chart may ask for up to a thousand buckets and, unless
     // the editor chose a value order, is ordered by bucket.
     let limit = if grained {
-        crate::grain::clamp_limit(kind, input.limit)
+        crate::grain::clamp_limit(kind, input.limit_value())
     } else if kind == ChartKind::Calendar {
-        input.limit.unwrap_or(366).clamp(1, 366)
+        input.limit_value().unwrap_or(366).clamp(1, 366)
     } else if is_point_kind(kind) {
         crate::builder::point_limit(from)
     } else {
-        input.limit.unwrap_or(20).clamp(1, 100)
+        input.limit_value().unwrap_or(20).clamp(1, 100)
     };
+    // BI-10 review fix (SHOULD-FIX) R1: a binned dimension is ordered by bin
+    // unless an explicit `order` (or a `sort`, which wins elsewhere) says
+    // otherwise, as a time grain orders by bucket.
+    let binned = input.shape.bin.is_some();
     let order = input.order.clone().unwrap_or_else(|| {
         if grained
+            || binned
             || matches!(
                 kind,
                 ChartKind::Line | ChartKind::Area | ChartKind::Calendar
@@ -2392,7 +2497,7 @@ fn spec_from_chart_input(
         lat: geo.lat.clone(),
         lon: geo.lon.clone(),
         aggregate: Some(agg.clone()),
-        limit: Some(limit),
+        limit: Some(limit.into()),
         order: Some(order.clone()),
         span: Some(span),
         board: Some(board.clone()),
@@ -2476,6 +2581,7 @@ fn spec_from_chart_input(
 /// Fields common to every branch of `specFromInput`, derived once and
 /// validated up front. Split out to keep `spec_from_input` under clippy's
 /// line-count limit.
+#[derive(Clone)]
 struct CommonFields {
     title: String,
     kind: ChartKind,
@@ -2530,6 +2636,7 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
 /// Where a chart's rows come from, resolved and validated against the real
 /// schema: a `serving` mart's columns from `system.columns`, or a SQL
 /// source's columns as probed when it was saved.
+#[derive(Clone)]
 struct Resolved {
     mart: String,
     sql_source: Option<String>,
@@ -2783,6 +2890,30 @@ pub async fn spec_from_input(
     };
     // ── kpi/table/chart need a mart OR a SQL source ─────────────────
     let resolved = resolve_relation(ch, input).await?;
+    // BI-11: parameters are read only when something here can name one (the
+    // chart itself, or a calculated field of its source), so a chart that
+    // uses none costs no extra read.
+    let needs_params =
+        input.uses_params() || resolved.fields.iter().any(|f| f.formula.contains('{'));
+    if needs_params {
+        let defs = crate::params::list_params(ch).await?;
+        let values = if time.params().is_empty() {
+            crate::params::ParamValues::from_defaults(&defs)
+        } else {
+            time.params().clone()
+        };
+        let with_values = time.clone().with_params(values);
+        return spec_from_param_chart(
+            input,
+            (source, created_by),
+            (common, geo, resolved),
+            GrainCtx {
+                grain,
+                time: &with_values,
+            },
+        )
+        .map(|spec| with_click(spec, click));
+    }
     spec_from_resolved(
         input,
         source,
@@ -2793,6 +2924,110 @@ pub async fn spec_from_input(
         GrainCtx { grain, time },
     )
     .map(|spec| with_click(spec, click))
+}
+
+/// `BI-11`: a chart that names a parameter, saved (or previewed) with the
+/// values in `when.time`. The statement, the render spec and the smoke test
+/// are built for those values by the very code every chart goes through; then
+/// the definition keeps the parameter forms the editor wrote, so a read
+/// resolves them again ([`crate::params::resolve_chart`]).
+///
+/// Every value of a column-switch parameter is checked as a slot of this
+/// chart, not only the current one: a choice that cannot be built (not a
+/// column of the source, a text column as a measure) is refused here, naming
+/// the parameter and the choice, so the viewer never meets it.
+fn spec_from_param_chart(
+    input: &ChartInput,
+    (source, created_by): (ChartSource, &str),
+    (common, geo, resolved): (CommonFields, GeoFields, Resolved),
+    when: GrainCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    use crate::params::{ParamType, Slot, chart_param_names, check_chart_shape, slots, substitute};
+    check_chart_shape(input).map_err(BiError::Validation)?;
+    let params = when.time.params();
+    for name in chart_param_names(input) {
+        let Some(found) = params.get(&name) else {
+            return Err(BiError::Validation(format!(
+                "the parameter '{name}' does not exist."
+            )));
+        };
+        let in_lines = input
+            .shape
+            .reference_lines
+            .iter()
+            .flatten()
+            .any(|l| matches!(&l.value, crate::params::LineValue::Param(p) if p.param == name));
+        let as_limit =
+            matches!(&input.limit, Some(crate::params::Limit::Param(p)) if p.param == name);
+        if (in_lines || as_limit) && found.def.ty != ParamType::Number {
+            return Err(BiError::Validation(format!(
+                "the parameter '{name}' must be a number parameter here."
+            )));
+        }
+    }
+    let effective = substitute(input, params, &|_slot, column| Some(column.to_owned()))
+        .map_err(BiError::Validation)?;
+    // Every choice of every column-switch parameter, in its slot.
+    for (slot, name) in slots(input) {
+        let choices: Vec<String> = params
+            .get(&name)
+            .map(|r| {
+                r.def
+                    .text_choices()
+                    .iter()
+                    .map(|c| (*c).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for choice in choices {
+            let mut probe = effective.clone();
+            match slot {
+                Slot::Dimension => probe.dimension.clone_from(&choice),
+                Slot::Breakdown => probe.breakdown = Some(choice.clone()),
+                Slot::Measure(i) => {
+                    probe.measures = MeasureList::from_pairs(
+                        effective
+                            .measures
+                            .entries()
+                            .enumerate()
+                            .map(|(j, (c, a))| {
+                                (
+                                    if j == i { choice.clone() } else { c.to_owned() },
+                                    a.map(str::to_owned),
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            spec_from_resolved(
+                &probe,
+                source,
+                created_by,
+                common.clone(),
+                geo.clone(),
+                resolved.clone(),
+                when,
+            )
+            .map_err(|failure| match failure {
+                BiError::Validation(why) => BiError::Validation(format!(
+                    "the choice '{choice}' of the parameter '{name}' does not work in this chart: {why}"
+                )),
+                other @ BiError::Clickhouse(_) => other,
+            })?;
+        }
+    }
+    let mut spec = spec_from_resolved(&effective, source, created_by, common, geo, resolved, when)?;
+    // The definition keeps what the editor wrote.
+    spec.def.dimension.clone_from(&input.dimension);
+    spec.def.breakdown.clone_from(&input.breakdown);
+    spec.def.measures = stored_measures(&input.measures);
+    spec.def.limit.clone_from(&input.limit);
+    spec.def
+        .shape
+        .reference_lines
+        .clone_from(&input.shape.reference_lines);
+    Ok(spec)
 }
 
 /// The grain of `input` once its name and its chart kind are checked (`BI-9`).
@@ -3343,7 +3578,7 @@ fn spec_from_groupings_input(
         lat: None,
         lon: None,
         aggregate: Some(ctx.agg.clone()),
-        limit: Some(limit),
+        limit: Some(limit.into()),
         order: Some(order),
         span: Some(ctx.span),
         board: Some(ctx.board.clone()),
@@ -3580,7 +3815,7 @@ impl StoredChartSpec {
                 lat: None,
                 lon: None,
                 aggregate: Some("sum".to_owned()),
-                limit: Some(20),
+                limit: Some(20.into()),
                 order: Some("none".to_owned()),
                 span: Some(1),
                 board: Some("default".to_owned()),
@@ -3641,6 +3876,41 @@ mod tests {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
     }
 
+    /// BI-10 review fix (SHOULD-FIX) R1: a binned dimension with no explicit
+    /// order is ordered by bin; an explicit order wins.
+    #[test]
+    fn a_binned_dimension_defaults_to_bin_order_and_an_explicit_order_wins() {
+        let input = |extra: serde_json::Value| -> ChartInput {
+            let mut v = serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "m", "dimension": "visitors",
+                "measures": ["lat"], "bin": { "mode": "width", "width": 500 },
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let from = Relation::Mart(Ident::new("m").unwrap());
+        let (_, order) =
+            limit_and_order(ChartKind::Bar, &input(serde_json::json!({})), &from, false);
+        assert_eq!(order, "none");
+        let (_, order) = limit_and_order(
+            ChartKind::Bar,
+            &input(serde_json::json!({ "order": "desc" })),
+            &from,
+            false,
+        );
+        assert_eq!(order, "desc");
+        let plain: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "t", "kind": "bar", "mart": "m", "dimension": "visitors", "measures": ["lat"],
+        }))
+        .unwrap();
+        assert_eq!(
+            limit_and_order(ChartKind::Bar, &plain, &from, false).1,
+            "desc"
+        );
+    }
+
     /// Regression test for H1 (`ensure_bi_table` re-issuing all 13 DDL
     /// statements on every call): the first call to any public function
     /// must run the DDL bootstrap, but every call after that — across the
@@ -3671,10 +3941,11 @@ mod tests {
         // the BI-18·B `bi_board.refresh_seconds` column. 18 = those 17 plus
         // the BI-9 `bi_board.grain` column. 19 = those 18 plus the BI-8
         // `console.bi_field` table. 20 = those 19 plus the BI-10
-        // `console.bi_hierarchy` table.
+        // `console.bi_hierarchy` table. 22 = those 20 plus the BI-11
+        // `bi_board.params_json` column and the `console.bi_param` table.
         assert_eq!(
-            first_call_requests, 20,
-            "first call should issue all 20 DDL statements"
+            first_call_requests, 22,
+            "first call should issue all 22 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -4042,6 +4313,7 @@ mod tests {
             filters: None,
             refresh_seconds: None,
             grain: None,
+            params: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -4524,7 +4796,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(spec.def.grain.as_deref(), Some("month"));
-        assert_eq!(spec.def.limit, Some(800));
+        assert_eq!(spec.def.limit_value(), Some(800));
         assert_eq!(spec.def.order.as_deref(), Some("none"));
         assert!(
             spec.spec.sql.contains("date_trunc('month', day) AS day"),
@@ -4536,7 +4808,7 @@ mod tests {
             "kind": "line", "dimension": "day", "limit": 800,
         }))
         .unwrap();
-        assert_eq!(plain.def.limit, Some(100));
+        assert_eq!(plain.def.limit_value(), Some(100));
         assert_eq!(plain.def.grain, None);
         // A bar defaults to the value order, a grained bar to bucket order.
         let bar = grain_build(&serde_json::json!({"kind": "bar", "dimension": "place"})).unwrap();

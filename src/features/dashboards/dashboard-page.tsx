@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
+import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, SlidersHorizontal, Sparkles, Table2, Trash2 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -13,12 +13,15 @@ import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
 import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
 import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBucketFilter } from "@/lib/bucket-click";
+import { ParamControls } from "./param-controls";
+import { ParamDialog } from "./param-dialog";
+import { PARAMS_PARAM, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue } from "@/lib/params";
 import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
+import { summarizeFilters, summarizeParams, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
@@ -53,7 +56,8 @@ import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell }
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
 type BoardOpt = { id: string; name: string; folderId?: string | null };
-type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
+/** `resolved`: the columns a chart's parameter slots took in this response (BI-11). */
+type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef; resolved?: { dimension?: string; breakdown?: string | null } };
 type Payload = {
   board: string; layout: LayoutMap;
   /** The filters in force for this response (the address's, else the default). */
@@ -66,6 +70,8 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
+  params?: ParamControl[]; defaultParams?: Record<string, ParamValue>; appliedParams?: Record<string, ParamValue>;
   filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
@@ -81,6 +87,7 @@ const NO_KPIS: KpiMeta[] = [];
 const NO_RESULTS: Record<string, Cell> = {};
 const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
+const NO_CONTROLS: ParamControl[] = [];
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
 function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
@@ -110,8 +117,8 @@ function clickSpecOf(spec: ChartCard, level?: string): ClickSpec {
     source: spec.source,
     // BI-6 part 2: after steps a row is no longer a set of source rows: no value drill.
     // BI-10: a drilled tile shows the next level of its hierarchy, and clicks on that.
-    dimension: (own ? (spec.def?.steps?.length ? undefined : level ?? spec.def?.dimension) : spec.x) || undefined,
-    breakdown: (own ? spec.def?.breakdown : spec.series) || undefined,
+    dimension: (own ? (spec.def?.steps?.length ? undefined : level ?? spec.resolved?.dimension ?? spec.def?.dimension) : spec.x) || undefined,
+    breakdown: (own ? spec.resolved?.breakdown ?? spec.def?.breakdown : spec.series) || undefined,
     y: spec.y,
   };
 }
@@ -146,6 +153,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const fParam = searchParams.get(FILTER_PARAM);
   // The dashboard's grain switch lives in the address beside the filters.
   const gChoice: GrainChoice = readGrainParam(searchParams.get(GRAIN_PARAM));
+  // BI-11: the parameter values a viewer chose live in the address too (`?p=`).
+  const pParam = searchParams.get(PARAMS_PARAM);
+  const pValues = React.useMemo(() => readParamsParam(pParam), [pParam]);
+  const [paramsOpen, setParamsOpen] = React.useState(false);
   const [savingDefault, setSavingDefault] = React.useState(false);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   // Tile delete is one click away, so it asks first.
@@ -190,18 +201,21 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (fromAddress) q.set("filters", JSON.stringify(fromAddress));
       const grainAsked = grainQuery(gChoice);
       if (grainAsked) q.set("grain", grainAsked);
+      const paramsAsked = paramsQuery(pValues);
+      if (paramsAsked) q.set("params", paramsAsked);
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
-      setData(json);
+      // BI-11: a chart's parameter slots arrive as `{ param }` objects and are held as `{name}` text.
+      setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
     } catch (e) {
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [board, fParam, gChoice]);
+  }, [board, fParam, gChoice, pValues]);
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
@@ -318,11 +332,19 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // differs from the saved default is sent; Reset drops both address parameters
   // in a single navigation.
   const grainDirty = gChoice !== null && differsFromSaved(shownGrainValue, data?.grain);
-  const rowDirty = dirty || grainDirty;
+  // BI-11: the parameters join the same row, the same Save as default and Reset.
+  const paramControls = data?.params ?? NO_CONTROLS;
+  const paramsDirty = pValues !== null && paramsDiffer(paramControls, data?.defaultParams);
+  const rowDirty = dirty || grainDirty || paramsDirty;
+  const changeParam = React.useCallback((name: string, value: ParamValue) => {
+    const qs = withParamsParam(window.location.search, withValue(pValues, data?.defaultParams ?? {}, name, value));
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname, pValues, data?.defaultParams]);
   const resetRow = React.useCallback(() => {
     const q = new URLSearchParams(window.location.search);
     q.delete(FILTER_PARAM);
     q.delete(GRAIN_PARAM);
+    q.delete(PARAMS_PARAM);
     const qs = q.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   }, [router, pathname]);
@@ -332,6 +354,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       const body: Record<string, unknown> = { id: board };
       if (dirty) body.filters = normalizeFilters(filters);
       if (grainDirty) body.grain = savedGrainBody(shownGrainValue);
+      if (paramsDirty) body.params = savedParamsBody(paramControls);
       const res = await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
@@ -347,7 +370,25 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     } finally {
       setSavingDefault(false);
     }
-  }, [board, dirty, grainDirty, filters, shownGrainValue, resetRow]);
+  }, [board, dirty, grainDirty, paramsDirty, paramControls, filters, shownGrainValue, resetRow]);
+  // BI-11: an editor ticks a parameter in the dialog and its control joins (or leaves) this
+  // dashboard's row. Written at once through the board write path; the values already saved stay.
+  const toggleShownParam = React.useCallback(async (name: string, on: boolean) => {
+    const current: BoardParam[] = paramControls.map((c) => ({ name: c.param.name, value: data?.defaultParams?.[c.param.name] }));
+    const next = on ? [...current, { name }] : current.filter((p) => p.name !== name);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, params: next }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not change the parameters shown");
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [board, paramControls, data?.defaultParams, load]);
   // BI-18·B: an editor's choice becomes the dashboard's own default. Written
   // through the board write path (`dashboard:write`); the session choice is
   // dropped once it is the saved one.
@@ -394,8 +435,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // built-in tile ignores dashboard filters, so its rows are not narrowed.
   const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean, extra: FilterDef[] = NO_FILTERS) => {
     setDrill(null);
-    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...filters, ...extra] });
-  }, [filters]);
+    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...filters, ...extra], params: paramsQuery(data?.appliedParams ?? null) ?? undefined });
+  }, [filters, data?.appliedParams]);
 
   // No "jump to the newest user dashboard" from the built-in board here.
   // That effect dated from when `/dashboards` was this page; it now is the
@@ -501,12 +542,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
         `Active filters: ${summarizeFilters(filters)}. ` +
+        `Parameters shown (a formula reads one as {name}; list_parameters has them all): ${summarizeParams(paramControls)}. ` +
         `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, kpis, results, filters, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, paramControls, setPageContext]);
 
   // Carry out a chart's saved click destination (BI-18·B) for the clicked
   // value. The server did not check that the target exists, so the console
@@ -572,7 +614,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const tableSorts = React.useRef<Record<string, { column: string; dir: "asc" | "desc" }>>({});
   async function exportRawTable(id: string) {
     try {
-      const done = await downloadTableExport(id, filters, tableSorts.current[id]);
+      const done = await downloadTableExport(id, filters, tableSorts.current[id], paramsQuery(data?.appliedParams ?? null));
       const note = exportNotice(done);
       if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
     } catch (e) {
@@ -631,7 +673,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
           {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
           {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
-            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={spec.def?.limit} /> : null}
+            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined} /> : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
@@ -728,6 +770,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
+            {hasPermission("dashboard:write") ? (
+              <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
+                <SlidersHorizontal className="size-4" /> Parameters
+              </Button>
+            ) : null}
             <Button size="sm" onClick={() => setNewChartOpen(true)}>
               <ChartColumn className="size-4" /> New chart
             </Button>
@@ -738,7 +785,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {showFilterBar || grainedCharts.length > 0 ? (
+      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
         <div data-print-hide className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/50 px-3 py-2">
           {grainedCharts.length > 0 ? (
             <GrainSwitch
@@ -747,6 +794,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onChange={(next) => writeGrain(next === "" ? "own" : next)}
             />
           ) : null}
+          <ParamControls controls={paramControls} onChange={changeParam} />
           <FilterBar
             board={board}
             fields={filterFields}
@@ -832,14 +880,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         onConfirm={() => { if (removing) void removeChart(removing.id); }}
       />
 
+      {paramsOpen ? (
+        <ParamDialog
+          open
+          onOpenChange={setParamsOpen}
+          canWrite={hasPermission("dashboard:write")}
+          shown={paramControls.map((c) => c.param.name)}
+          onToggleShown={(name, on) => void toggleShownParam(name, on)}
+          onChanged={() => void load()}
+        />
+      ) : null}
       {editing ? (
         <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}
-          editId={editing.id} initial={editing.def} board={board} boards={boards}
+          editId={editing.id} initial={editing.def} board={board} boards={boards} paramValues={data?.appliedParams}
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
       {newChartOpen ? (
         <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
-          board={board} boards={boards}
+          board={board} boards={boards} paramValues={data?.appliedParams}
           onSaved={() => { setNewChartOpen(false); void load(); }} />
       ) : null}
 

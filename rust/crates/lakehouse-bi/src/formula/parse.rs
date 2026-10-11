@@ -9,7 +9,7 @@
 //! sum     = product ( ("+" | "-") product )*
 //! product = unary ( ("*" | "/") unary )*
 //! unary   = "-" unary | primary
-//! primary = number | text | [column] | name | name "(" args ")" | "(" expr ")"
+//! primary = number | text | [column] | {parameter} | name | name "(" args ")" | "(" expr ")"
 //! ```
 //!
 //! A comparison does not chain (`a < b < c` is refused with a hint to use
@@ -61,6 +61,8 @@ pub enum Kind {
     Bool(bool),
     /// A column or another field, by name (bare or in brackets).
     Name(String),
+    /// A parameter, `{name}` (`BI-11`).
+    Param(String),
     /// A function call; `name` as written.
     Call {
         /// The function name as the person wrote it.
@@ -133,6 +135,7 @@ fn describe(tok: &Tok) -> String {
         Tok::Str(_) => "text".to_owned(),
         Tok::Name(n) => format!("'{}'", clip(n)),
         Tok::Bracket(n) => format!("[{}]", clip(n)),
+        Tok::Param(n) => format!("{{{}}}", clip(n)),
         Tok::LParen => "'('".to_owned(),
         Tok::RParen => "')'".to_owned(),
         Tok::Comma => "','".to_owned(),
@@ -333,6 +336,7 @@ impl Parser {
             Tok::Num(v) => leaf(Kind::Num(v)),
             Tok::Str(s) => leaf(Kind::Str(s)),
             Tok::Bracket(name) => leaf(Kind::Name(name)),
+            Tok::Param(name) => leaf(Kind::Param(name)),
             Tok::Name(name) => {
                 if self.peek().is_some_and(|t| t.tok == Tok::LParen) {
                     return self.call(name, token.pos);
@@ -423,6 +427,7 @@ mod tests {
             Kind::Str(s) => format!("'{s}'"),
             Kind::Bool(b) => format!("{b}"),
             Kind::Name(n) => format!("<{n}>"),
+            Kind::Param(n) => format!("{{{n}}}"),
             Kind::Call { name, args } => format!(
                 "{name}({})",
                 args.iter().map(shape).collect::<Vec<_>>().join(",")

@@ -6,7 +6,7 @@ import { previewKey, type PreviewInputs } from "./preview-key"
 const base: PreviewInputs = {
   title: "t", source: "mart:m", kind: "line", dimension: "d", measure: "v", measure2: "", measure3: "",
   breakdown: "", mapId: "", lat: "", lon: "", aggregate: "sum", span: 1, caption: "", target: "",
-  text: "", order: "none", limit: 20, targetBoard: "default", grain: "", tables: "", calc: "", shape: "",
+  text: "", order: "none", limit: 20, targetBoard: "default", grain: "", tables: "", calc: "", shape: "", params: "",
 }
 
 test("the preview is requested again when Group by changes", () => {
@@ -48,4 +48,16 @@ test("each join input changes the key through the shape input (BI-7)", () => {
     draft({ mart: "a", type: "left", on: [...on, { left: "d", op: ">", right: "e" }] }),
   ])
   assert.equal(keys.size, 7)
+})
+
+test("BI-11: the parameter values, the limit's parameter and the reference lines each change the key", () => {
+  const withParams = (p: unknown) => previewKey({ ...base, params: JSON.stringify(p) })
+  const zero = { values: { target: 1000 }, limit: "", lines: [] }
+  const keys = new Set([
+    withParams(zero),
+    withParams({ ...zero, values: { target: 500 } }),
+    withParams({ ...zero, limit: "top" }),
+    withParams({ ...zero, lines: [{ value: "", param: "target", label: "" }] }),
+  ])
+  assert.equal(keys.size, 4)
 })

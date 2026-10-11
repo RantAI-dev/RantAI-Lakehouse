@@ -103,6 +103,16 @@ export function summarizeFilters(filters: FilterLike[]): string {
   return parts.length ? parts.join("; ") : "none"
 }
 
+/**
+ * "target = 1000 (number); pick = rooms (list)" — or "none". The parameters the
+ * dashboard shows with the value in force (BI-11), so the assistant reuses them
+ * (`list_parameters` has the rest) instead of defining a second one.
+ */
+export function summarizeParams(controls: { param: { name: string; type: string }; value: string | number }[]): string {
+  const parts = controls.map((c) => `${c.param.name} = ${fmt(c.value)} (${c.param.type})`)
+  return parts.length ? parts.join("; ") : "none"
+}
+
 /** The SQL in the editor plus the first rows of its last result. */
 export function summarizeQuery(
   sql: string,

@@ -37,6 +37,8 @@ export type RecordsRequest = {
   columns?: readonly string[];
   sortColumn?: string;
   sortDir?: "asc" | "desc";
+  /** BI-11: the parameter values the tile was drawn with (JSON), so a calculated column reads the value that was clicked. */
+  params?: string;
 };
 
 export type RecordsPage = {
@@ -67,6 +69,7 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
     }
   }
   if (req.chart) q.set("chart", req.chart);
+  if (req.params) q.set("params", req.params);
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));
   const active = normalizeFilters(req.filters);

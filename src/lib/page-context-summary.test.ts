@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { summarizeFilters, summarizeQuery, summarizeRows, summarizeTiles } from "./page-context-summary"
+import { summarizeFilters, summarizeParams, summarizeQuery, summarizeRows, summarizeTiles } from "./page-context-summary"
 
 test("summarizeRows shows category=value pairs and counts the rest", () => {
   const rows = [1, 2, 3, 4, 5, 6, 7].map((i) => ({ region: `r${i}`, total: i * 10 }))
@@ -89,4 +89,15 @@ test("a tile with bins says what its numbers stand for", () => {
     { c1: { columns: ["visitors", "n"], rows: [{ visitors: 500, n: 4 }], bins: { visitors: { mode: "auto", width: 500, min: 44, max: 2377 } } } },
   )
   assert.match(out, /binned: visitors in bins of 500 \(a value is the bin's lower edge\)/)
+})
+
+test("BI-11: summarizeParams lists each shown parameter with its value and type, or says none", () => {
+  assert.equal(summarizeParams([]), "none")
+  assert.equal(
+    summarizeParams([
+      { param: { name: "target", type: "number" }, value: 1000 },
+      { param: { name: "pick", type: "list" }, value: "rooms" },
+    ]),
+    "target = 1000 (number); pick = rooms (list)",
+  )
 })

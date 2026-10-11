@@ -20,6 +20,8 @@ export type PreviewInputs = {
    * groupings as they would be sent. Each reaches the SQL, so each must request a new preview.
    */
   shape: string
+  /** BI-11: the parameter values the preview is drawn with, the limit's parameter and the reference lines. */
+  params: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {
