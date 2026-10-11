@@ -193,6 +193,42 @@ describe("the meaning view", () => {
     expect(tracks).toHaveLength(shownBelowLg.length)
   })
 
+  it("shows the same cells in the header and the first row at every width, with one track per shown cell", () => {
+    // Header order: Column, Role, Meaning, Also called, Status, Confirm. Status sheds after Also called, at @2xl.
+    const widths: Array<{ prefix: string; shown: boolean[] }> = [
+      { prefix: "", shown: [true, true, true, false, false, true] },
+      { prefix: "@lg:", shown: [true, true, true, false, false, true] },
+      { prefix: "@2xl:", shown: [true, true, true, false, true, true] },
+      { prefix: "@3xl:", shown: [true, true, true, true, true, true] },
+    ]
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const table = meaningTable()
+    const header = within(table).getAllByRole("row")[0] as HTMLElement
+    const firstRow = within(table).getAllByRole("row")[1] as HTMLElement
+    // A cell is shown at a width when it is not `hidden`, or carries the `block` class of that width or a narrower one.
+    const shownAt = (el: HTMLElement, prefix: string) => {
+      const bases = ["", "@lg:", "@2xl:", "@3xl:"]
+      const reached = bases.slice(0, bases.indexOf(prefix) + 1)
+      return Array.from(el.children).map((cell) => {
+        const tokens = (cell as HTMLElement).className.split(/\s+/)
+        return !tokens.includes("hidden") || reached.some((p) => tokens.includes(`${p}block`))
+      })
+    }
+    const trackCount = (el: HTMLElement, prefix: string) => {
+      const token = el.className.split(/\s+/).find((c) => c.startsWith(`${prefix}grid-cols-[`))
+      return token ? token.slice(`${prefix}grid-cols-[`.length, -1).split("_").length : -1
+    }
+
+    for (const { prefix, shown } of widths) {
+      expect(shownAt(header, prefix)).toEqual(shown)
+      expect(shownAt(firstRow, prefix)).toEqual(shown)
+      expect(trackCount(header, prefix)).toBe(shown.filter(Boolean).length)
+    }
+  })
+
   it("lists the same rows as the statistics view, so the filter applies to both", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)

@@ -170,18 +170,20 @@ function TableMeaningReady({ state }: { state: Ready }) {
 //
 // Header and rows share one grid string, as the Columns card does: fixed
 // tracks in `rem`, flexible ones `minmax(0, …fr)`, so a row truncates and
-// never widens the list. Cells shed by container query: the synonyms go
-// first, below `@2xl`; the status goes second, below `@3xl`. The column name,
-// the role, the meaning and the confirm control never shed. Every breakpoint
-// lists the cells that are shown, in order, so the header and the rows agree.
-// Below `@lg` the four shown cells take one track each, so a row is one line (plan 10 review 2):
-// the meaning gets the widest track (2fr) of the three text cells, since it is
-// what the row is for, and the confirm control keeps its fixed 1.75rem.
+// never widens the list. Cells shed by container query, in this order
+// (PR #109 review, finding 4): the synonyms go first, below `@3xl`; the status
+// goes second, below `@2xl`, so a reader who cannot write still sees whether
+// an entry is a draft. The column name, the role, the meaning and the confirm
+// control never shed. Every breakpoint lists the cells that are shown, in
+// order, so the header and the rows agree. Below `@lg` the four shown cells
+// take one track each, so a row is one line (plan 10 review 2): the meaning
+// gets the widest track (2fr) of the three text cells, since it is what the
+// row is for, and the confirm control keeps its fixed 1.75rem.
 const MEANING_ROW = "grid items-center gap-x-3 px-3"
 const MEANING_TRACKS = [
   "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,2fr)_1.75rem]",
   "@lg:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_1.75rem]",
-  "@2xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_1.75rem]",
+  "@2xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_5rem_1.75rem]",
   "@3xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_5rem_1.75rem]",
 ].join(" ")
 
@@ -304,12 +306,12 @@ function MeaningRow({
           <span className="block truncate text-xs text-muted-foreground">No meaning written</span>
         )}
       </div>
-      <div role="cell" className="hidden min-w-0 @2xl:block">
+      <div role="cell" className="hidden min-w-0 @3xl:block">
         <span className="block truncate text-xs text-muted-foreground" title={entry?.synonyms.join(", ")}>
           {entry?.synonyms.join(", ") ?? ""}
         </span>
       </div>
-      <div role="cell" className="hidden @3xl:block">
+      <div role="cell" className="hidden @2xl:block">
         {entry ? <Pill tone={draft ? "warning" : "neutral"}>{entry.status}</Pill> : null}
       </div>
       <div role="cell" className="flex justify-end">
@@ -340,10 +342,10 @@ function MeaningHeader() {
       <div role="columnheader">Column</div>
       <div role="columnheader">Role</div>
       <div role="columnheader">Meaning</div>
-      <div role="columnheader" className="hidden @2xl:block">
+      <div role="columnheader" className="hidden @3xl:block">
         Also called
       </div>
-      <div role="columnheader" className="hidden @3xl:block">
+      <div role="columnheader" className="hidden @2xl:block">
         Status
       </div>
       <div role="columnheader">
