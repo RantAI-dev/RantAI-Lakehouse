@@ -309,3 +309,24 @@ The product owner tried part 1 on the separate instance (build `8cf85fe`)
 and reported it as expected. `SHOULD-FIX 1` is fixed now, before the pull
 request.
 
+### `SHOULD-FIX 1`, reviewed 2026-10-11 at `a0c32be`, and `main` merged in
+
+Fixed as written (`264ecbe`): rows and the detail body carry
+`replacementName` when the replacement is still in the catalog; the notice
+is three sentences and names the replacement, with the id as the link's
+title. Live on the separate instance the deprecated table's detail and its
+search row both carry the replacement's name.
+
+`main` at `9cff2c2` (the record-model backlog and spec format) is merged in:
+`BACKLOG.md` taken from `main` with this item's rows rewritten in its
+columns, the spec's header and acceptance ids in the new form, the feature
+page on the new template.
+
+**Verification, by the planner, on the merged branch.** After `touch` of the
+crate sources: `cargo fmt --check` exit 0; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean in 2m38s. `bun run
+typecheck` exit 0; `bun run lint` 0 errors, 6 warnings; `bun run test` 955
+pass, 1 skip, 0 fail.
+
+**Not verified.** No Rust test has run; CI runs them first.
+
