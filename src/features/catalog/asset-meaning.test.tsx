@@ -193,6 +193,42 @@ describe("the meaning view", () => {
     expect(tracks).toHaveLength(shownBelowLg.length)
   })
 
+  it("shows the same cells in the header and the first row at every width, with one track per shown cell", () => {
+    // Header order: Column, Role, Meaning, Also called, Status, Confirm. Status sheds after Also called, at @2xl.
+    const widths: Array<{ prefix: string; shown: boolean[] }> = [
+      { prefix: "", shown: [true, true, true, false, false, true] },
+      { prefix: "@lg:", shown: [true, true, true, false, false, true] },
+      { prefix: "@2xl:", shown: [true, true, true, false, true, true] },
+      { prefix: "@3xl:", shown: [true, true, true, true, true, true] },
+    ]
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const table = meaningTable()
+    const header = within(table).getAllByRole("row")[0] as HTMLElement
+    const firstRow = within(table).getAllByRole("row")[1] as HTMLElement
+    // A cell is shown at a width when it is not `hidden`, or carries the `block` class of that width or a narrower one.
+    const shownAt = (el: HTMLElement, prefix: string) => {
+      const bases = ["", "@lg:", "@2xl:", "@3xl:"]
+      const reached = bases.slice(0, bases.indexOf(prefix) + 1)
+      return Array.from(el.children).map((cell) => {
+        const tokens = (cell as HTMLElement).className.split(/\s+/)
+        return !tokens.includes("hidden") || reached.some((p) => tokens.includes(`${p}block`))
+      })
+    }
+    const trackCount = (el: HTMLElement, prefix: string) => {
+      const token = el.className.split(/\s+/).find((c) => c.startsWith(`${prefix}grid-cols-[`))
+      return token ? token.slice(`${prefix}grid-cols-[`.length, -1).split("_").length : -1
+    }
+
+    for (const { prefix, shown } of widths) {
+      expect(shownAt(header, prefix)).toEqual(shown)
+      expect(shownAt(firstRow, prefix)).toEqual(shown)
+      expect(trackCount(header, prefix)).toBe(shown.filter(Boolean).length)
+    }
+  })
+
   it("lists the same rows as the statistics view, so the filter applies to both", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
@@ -214,8 +250,9 @@ describe("Drafts only", () => {
     expect(within(meaningTable()).queryByText("customer_count")).toBeNull()
   })
 
-  it("says no draft is left when the rows that remain are all confirmed", () => {
-    // Eleven columns, so the filter box is shown; "customer" then leaves only the confirmed one.
+  it("says no draft matches the filter when the drafts left do not match it", () => {
+    // Eleven columns, so the filter box is shown; "customer" matches the confirmed column only, and the draft
+    // elsewhere in the table is still in the drafts-only pool, so the view names the filter, not an empty review.
     const eleven = [...ROWS, ...Array.from({ length: 8 }, (_, i) => schemaRow(column(`col_${i}`)))]
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(eleven, state)
@@ -223,7 +260,53 @@ describe("Drafts only", () => {
 
     fireEvent.change(screen.getByLabelText("Filter columns"), { target: { value: "customer" } })
     fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(screen.getByText('No draft matches "customer"')).toBeTruthy()
+  })
+
+  it("lists a draft beyond the first page and says it is the one draft shown", () => {
+    // Thirty columns is paged at 25 by default; the only draft is the 28th, so it is on no first page.
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const { state } = readyMeanings([entry({ column: "col_28", description: "A draft past the first page", status: "draft" })])
+    renderCard(thirty, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(within(meaningTable()).getByText("col_28")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(2)
+    expect(screen.getByText("1 draft, in table order.")).toBeTruthy()
+  })
+
+  it("pages the drafts, not the columns, and says how many drafts there are", () => {
+    // Thirty columns, drafts on columns 4 to 30 (twenty-seven), so columns 1 to 3 hold no draft. The first page
+    // of 25 then holds 22 drafts, and a filter applied after the page cut would show 22 and say so. The
+    // summary must count the 27 and show the first 25 of them (PR #109 review, finding 1).
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const drafts = thirty.slice(3).map((r) => entry({ column: r.column.name, description: "A draft", status: "draft" }))
+    const { state } = readyMeanings(drafts)
+    renderCard(thirty, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+    expect(screen.getByText("Showing the first 25 of 27 drafts, in table order.")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
+  })
+
+  it("keeps the drafts-only box and says no draft is left once the last draft is confirmed, and unticking lists every column", () => {
+    const thirty = Array.from({ length: 30 }, (_, i) => schemaRow(column(`col_${String(i + 1).padStart(2, "0")}`)))
+    const draft = readyMeanings([entry({ column: "col_28", description: "A draft", status: "draft" })]).state
+    const confirmed = readyMeanings([entry({ column: "col_28", description: "A draft", status: "confirmed" })]).state
+    const { rerender } = render(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={draft} />)
+    fireEvent.click(meaningTab())
+    fireEvent.click(screen.getByRole("checkbox", { name: "Drafts only" }))
+
+    rerender(<ColumnsCard rows={thirty} profile={PROFILE} sortingKey={null} meanings={confirmed} />)
     expect(screen.getByText("No draft left to review.")).toBeTruthy()
+    const box = screen.getByRole("checkbox", { name: "Drafts only" })
+    expect(box.getAttribute("data-state")).toBe("checked")
+
+    fireEvent.click(box)
+    expect(screen.getByText("Showing the first 25 of 30 columns, in table order.")).toBeTruthy()
+    expect(within(meaningTable()).getAllByRole("row")).toHaveLength(26)
   })
 })
 
@@ -494,6 +577,29 @@ describe("a person edits a meaning in the dialog", () => {
       description: "Gross order value",
       synonyms: ["omzet", "penjualan"],
       role: "measure",
+    })
+  })
+
+  it("shows Not set on the dialog's role trigger and saves a null role for it", () => {
+    const { state, save } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    fireEvent.click(within(meaningTable()).getByRole("button", { name: "Edit the meaning of orders_total" }))
+    choose(within(dialog()).getByRole("combobox", { name: "Role" }), "Not set")
+
+    // The trigger's text also holds the chevron glyph, so the words are checked, not an exact match.
+    const trigger = within(dialog()).getByRole("combobox", { name: "Role" }).textContent ?? ""
+    expect(trigger).toContain("Not set")
+    expect(trigger).not.toContain("none")
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0][0]).toEqual({
+      column: "orders_total",
+      description: "Total order value in rupiah",
+      synonyms: ["omzet", "penjualan"],
+      role: null,
     })
   })
 
