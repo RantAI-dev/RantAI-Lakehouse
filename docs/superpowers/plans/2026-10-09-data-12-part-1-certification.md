@@ -286,3 +286,10 @@ sources: `cargo fmt --check` exit 0; `cargo clippy --workspace --all-targets
 - The Certification dialog was not operated in a browser (only its unit
   tests); the product owner's check covers it.
 - `tests/route_auth.rs` against the seeded multi-tenant app.
+
+### The product owner's check, 2026-10-11
+
+The product owner tried part 1 on the separate instance (build `8cf85fe`)
+and reported it as expected. `SHOULD-FIX 1` is fixed now, before the pull
+request.
+
