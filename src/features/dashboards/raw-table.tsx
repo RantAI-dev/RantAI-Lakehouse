@@ -31,11 +31,13 @@ function effectiveSort(chosen: Sort | null, def: TableDefFields | undefined): So
  * no `paging`: it shows the first page and says how many rows there are.
  */
 export function RawTable({
-  spec, cell, paging,
+  spec, cell, paging, onSortChange,
 }: {
   readonly spec: RawTableSpec;
   readonly cell: Rows;
   readonly paging?: { readonly filters: FilterDef[] };
+  /** Tells the page the sort the viewer chose, so the CSV export follows the tile (BI-16A T8). */
+  readonly onSortChange?: (sort: { column: string; dir: "asc" | "desc" }) => void;
 }) {
   const def = spec.def;
   const settings: Record<string, ColumnSetting> = def?.columnSettings ?? {};
@@ -70,7 +72,9 @@ export function RawTable({
   function sortBy(column: string) {
     const current = effectiveSort(chosen, def);
     setOffset(0);
-    setChosen({ column, dir: current?.column === column && current.dir === "asc" ? "desc" : "asc" });
+    const next: Sort = { column, dir: current?.column === column && current.dir === "asc" ? "desc" : "asc" };
+    setChosen(next);
+    onSortChange?.(next);
   }
 
   return (

@@ -26,7 +26,7 @@ function hasRows(c: Cell | undefined): c is Rows {
 
 /** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging,
+  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
@@ -46,6 +46,8 @@ export function TileBody({
    * page only (BI-16 part A).
    */
   paging?: { filters: FilterDef[] };
+  /** A raw table reports the sort the viewer chose (for the whole-result export). */
+  onTableSort?: (sort: { column: string; dir: "asc" | "desc" }) => void;
 }) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
@@ -81,7 +83,7 @@ export function TileBody({
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
     if (def?.tableMode === "rows") {
-      return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def }} cell={cell} paging={paging} />;
+      return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
     return <TableView columns={cell.columns} rows={cell.rows} settings={def?.columnSettings} />;
   }

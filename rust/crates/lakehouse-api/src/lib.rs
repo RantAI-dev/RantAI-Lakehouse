@@ -32,6 +32,7 @@ pub mod connector_deprovision;
 pub mod connector_discover;
 pub mod connector_probe;
 pub mod connector_secret_store;
+pub mod csv_export;
 pub mod error;
 pub mod gold_export;
 pub mod gold_export_history;

@@ -153,6 +153,49 @@ Rust not touched. Cited as "BI-16A review fix".
 
 Counts: `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings (as before); `bun test src/features/dashboards src/lib`: 684 pass, 0 fail; full `bun run test`: see the final message.
 
+### Handoff — T8, T9 (developer, 2026-10-11, uncommitted)
+
+**T8, whole-result CSV export.** `GET /api/dashboard/table-export?chart=&filters=&sortColumn=&sortDir=` (`routes/dashboard.rs`, `src/csv_export.rs`, `POLICY_TABLE`, `routes/mod.rs`). The server reads the tile's stored definition (the caller names only the tile), takes its visible columns in order, builds the statement with `rows_page_sql` (filters, saved or chosen sort) with `LIMIT 100001`, rewrites it with `rewrite_sql_for_roles` for the caller's roles (the tile's path, not `raw_bytes` on stored text), runs it, writes at most 100,000 rows (1,999 over a SQL source, the engine's own 2,000 cap minus the probe row). Headers are labels; values raw; UTF-8 BOM, CRLF, RFC 4180; text cells starting `= + - @ TAB CR` get a leading `'` (the only place the export does this; `lib/csv.ts`/`table-csv.ts`, used by every other tile's CSV, escape quoting but not formulas and add no BOM: unchanged, reported). Permission `dashboard:read`. Audit `dashboard.table_export` (principal, board, tile, rows, cut, cap) is written before the file is returned; an unwritable audit store refuses the export (503), deviating from the best-effort audit of other routes because this one hands data over. Response headers follow Query Studio (`Content-Type`, `Content-Disposition: attachment`) plus `X-Export-Rows/Cut/Cap`; the body is buffered, bounded by the cap (Query Studio buffers too). Console: `table-export.ts`; the raw-table tile's menu item is **Download CSV (all rows)** (stored tiles only), following the sort the viewer chose (`RawTable.onSortChange`); a cut is announced with its row count. Not on embeds or public links (no route there).
+
+Real engine (`serving.mart_demo_map_points`, 237 rows): `SELECT place, provinsi, visitors FROM ... WHERE provinsi IN ('Jawa Barat','Bali') ORDER BY visitors DESC, place, provinsi, visitors LIMIT 100001 OFFSET 0` returned 17 rows (first Bandung #4 / Jawa Barat / 2224, last Bandung #2 / 299), the same 17 the paging count gave.
+
+**T9, download applies the run's rewrite.** `routes/query.rs` `download` now calls `rewrite_sql_for_principal` (the run route's function, the caller's current roles) before wrapping and capping; a refusal is the run's 422 with its fixed message and nothing is sent. Tests in `tests/query_download.rs` (3 new, 6 existing untouched and passing): a role with a mask gets the rewritten statement; a role the policy does not govern gets the unchanged statement; a table function is refused with 422, no statement text in the body, and no data statement reaches the engine. I did not assert a row filter: the policy `conditions` JSON in these fixtures only carries `mask`.
+
+**Other routes that run SQL without the rewrite (report, not fixed).** (1) `POST /api/query/estimate` runs `EXPLAIN ESTIMATE` on the caller's SQL unrewritten: it returns planner estimates and the table names, no rows. (2) The assistant's `dry_run_sql` tool runs `EXPLAIN AST` on the model's SQL unrewritten: no rows. (3) Fixed-text statements over `system.*` and the quality checks run aggregate checks on sources, not caller SQL. Everything that returns rows from stored or caller SQL goes through `rewrite_sql_for_roles` / `rewrite_sql_for_principal` (run, dashboards and embeds, records, values, sources preview, catalog sample and profile, alerts, gold export) after this change. Whether (1) and (2) should refuse what the rewrite refuses is a decision.
+
+**PR #104 CI fix.** Cause: BI-8's embed path reads the calculated-field catalog (`console.bi_field`); the failing test's mock engine answers that read with the planted 404, and `render_board_payload` propagated the error, so the whole signed embed became a 500. The dashboard route already degrades the same read (empty catalog, failure reported). Verdict: (b), a real regression, not a missing mock. Fix in `routes/embed.rs`: a failed catalog read logs under a reference and uses an empty catalog, so a chart naming a calculated field fails on its own statement with the tile's fixed message and a reference (never a wrong number), and the rest of the embed renders. The test is unchanged. Fail-closed is kept where it matters: nothing is shown that a catalog should have changed, because an unknown field makes the statement fail.
+
+**Counts.** `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -D warnings` clean. `cargo test -p lakehouse-api --lib`: 1583 pass, 1 ignored. Integration files, each run alone: query_author_exception 6, embed_tokens 21, ai_tool 9, ai_chat_stream 1, ai_citations 1, ai_terms 6, agents_approval 10, agents_run 13, query_download 9, security_regressions 10, semantic_api 17, tier1_saved_query_guard 3, tier1_writehigh_approval 4, tier2_governance_drafts 3, tier2_writehigh_approval 2, parity 0 (2 ignored), upstream_errors 6, route_auth 33, sec11_guard 4, reporting_settings_route 6, dashboard_export 4 (new). All pass. `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings; touched bun tests pass; full `bun run test`: 1231 pass, 1 skip, 0 fail.
+
+**Not verified:** the export in a browser; a cut at exactly 100,000 against the real engine (covered with a mock of 100,001 rows); a real masked mart through the export; the audit row via the UI; the workspace-wide clippy/test and CI.
+
+**Browser checklist**
+1. A raw table of 237 rows: menu > **Download CSV (all rows)**. The file has 237 data rows (not 50), opens in a spreadsheet with correct accents, headers are the labels, hidden columns are absent.
+2. Set a dashboard filter and a header sort, export again: the file has the filtered rows in that order.
+3. A text cell that begins with `=` shows as text in the spreadsheet (leading `'`); a number column stays numeric.
+4. A grouped table and a chart keep the old Download CSV.
+5. A viewer with only `dashboard:read` can export; a user without it gets a refusal with a plain message.
+6. With a mask or row policy for the viewer's role, the file is masked like the tile.
+7. A table over a SQL source: the notice says the export was cut at 1,999 rows when the source returns 2,000.
+8. Admin > audit trail shows a `dashboard.table_export` entry per export with board, tile, rows and cut.
+9. Query Studio: download a past run as a role that has a mask: the file is masked.
+
+### Handoff — T10 (developer, 2026-10-11, uncommitted)
+
+**What changed.** `POST /api/query/estimate` (`routes/query.rs`) now takes the principal and runs `rewrite_sql_for_principal` (the run route's function, engine `clickhouse`) before `EXPLAIN ESTIMATE`, so the estimate explains the rewritten statement; a refusal is the run's 422 with its fixed message and nothing is sent. The assistant's `run_sql` (`routes/ai/tools/data.rs`) rewrites the statement the same way and gives the rewritten text to `dry_run_sql`.
+
+**How it fits SEC-9.** SEC-9's `classify_statement` step (a synchronous refusal of a table function or refused system table before the engine is asked anything) is untouched and still first. Order is now: `is_read_only_sql`, `classify_statement`, the role rewrite, the engine dry run (`EXPLAIN AST` of the rewritten statement, still refusing anything the engine does not call a SELECT), then `routes::query::run`, which rewrites once from the original text (the rewritten text is not rewritten twice). `dry_run_sql` itself is unchanged. The rewrite does read column metadata from the engine for the referenced tables before the dry run; it does not send the statement text.
+
+**Side effect checked.** The estimate lists the tables the planner reports. On the real engine `EXPLAIN ESTIMATE` of a rewritten-shaped statement (a masked subquery over `serving.mart_demo_map_points`) returned the same single row (`serving`, `mart_demo_map_points`, 237 rows) as the plain statement: no subquery alias and no policy expression appears. A test asserts the response carries the table names and nothing of the mask.
+
+**Behaviour change to know.** A statement the rewrite cannot read now gets the run's 422 from the estimate, where it used to get a 200 with an `error` field; the estimate panel in the console handles non-200 as it does for other failures (not checked in a browser).
+
+**Tests** (`tests/explain_rewrite.rs`, 6, new): for each route a masked role gets the rewritten statement explained, an ungoverned role gets it unchanged, and a refused statement (a table function) is never explained. For the assistant the refusal shown is SEC-9's own classification, which comes first; a refusal that only the full rewrite makes (for example a view over a governed table) is covered by the rewrite's own tests, not here. No existing test changed.
+
+**Counts.** fmt clean; `clippy -p lakehouse-api --all-targets -D warnings` clean; `--lib` 1583 pass, 1 ignored; ai_tool 9, agents_run 13, agents_approval 10, security_regressions 10, query_download 9, route_auth 33 (the first run had 15 failures at `common/mod.rs:127`, the per-test database set-up, none in an assertion; rerun alone: 33 pass), sec11_guard 4, upstream_errors 6, query_author_exception 6, ai_chat_stream 1, ai_citations 1, tier1_saved_query_guard 3, explain_rewrite 6. No bun file touched.
+
+**Not verified:** the console's estimate panel on a 422; a view over a governed table through the assistant; workspace-wide clippy/test and CI.
+
 ## 7. Review (planner appends)
 
 ### BI-16 part A — findings from the product owner's QA (reviewer, 2026-10-11)
@@ -195,3 +238,13 @@ Verify, not assume: how Query Studio's download streams and caps, and reuse it; 
 
 - Who may export: anyone who can see the tile (`dashboard:read`). Every export writes an audit entry: who, which dashboard and tile, how many rows, whether it was cut. Query Studio's download is not the pattern to copy for the permission (it is owner-scoped on `query:read`) or for the statement path.
 - T9, same slice: Query Studio's download route re-runs the stored statement without the role rewrite that the run route applies. It must apply the same rewrite as the run route, for the calling principal's current roles, and refuse when the rewrite refuses. The owner asked for this fix in this PR.
+
+- T10 (owner, 2026-10-11: "make them the same"): the two routes that run an `EXPLAIN` on caller or model SQL without the role rewrite (`POST /api/query/estimate`, the assistant's `dry_run_sql`) refuse what the rewrite refuses for the calling principal, and explain the rewritten statement, as the run route would run it.
+
+### BI-16 part A — T8 to T10 and the CI fix (reviewer, 2026-10-11)
+
+- T8 (CSV export of a raw table): the product owner's browser QA passed (all rows, visible columns, raw values, filter and sort followed, opens in a spreadsheet).
+- T9 (Query Studio download applies the run route's policy rewrite) and T10 (the estimate route and the assistant's dry run do the same): covered by the developer's tests only (`tests/query_download.rs`, `tests/explain_rewrite.rs`); the owner checked that an ordinary download still works. Nobody has run them as a masked or row-filtered role against the real engine.
+- PR #104 CI fix (`37739f6`): CI on that commit is green, 23 checks, except `gitleaks (full git history)`, red on `main` too (`SEC-1`).
+- The reviewer did not re-run the suites (owner's instruction); the developer ran the `lakehouse-api` unit tests and the integration files for the routes touched, each alone (counts in section 6). One file (`route_auth`) failed at database set-up on a first run and passed alone: watch it in CI.
+- Owed, each needs a backlog item: the older per-tile CSV export (`lib/csv.ts`, `table-csv.ts`) does not neutralise spreadsheet formulas and writes no byte-order mark; the estimate route now answers 422 where it answered 200 with an `error` field, and the console's estimate panel has not been looked at for that case; a refusal that only the full rewrite makes is not tested through the assistant.

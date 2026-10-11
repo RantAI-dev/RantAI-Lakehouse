@@ -88,7 +88,26 @@ pub(super) async fn run_sql(
     // by `EXPLAIN AST` itself) and refuses whenever the engine's own
     // answer is not a `SELECT`, closing the gap where a model-composed
     // SQL string could smuggle a non-`SELECT` construct past the regex.
-    let dry_run = dry_run_sql(&state.clickhouse, args).await;
+    // The role rewrite comes next, still before the engine sees the statement:
+    // the dry run then asks the engine about the statement the run will really
+    // send (rewritten for the caller's current roles, with the run route's own
+    // function), and a statement the rewrite refuses is refused here with the
+    // run's status and fixed message and never sent. `routes::query::run`
+    // rewrites once more from the original text, so the two never rewrite an
+    // already-rewritten statement.
+    let rewritten =
+        match crate::routes::query::rewrite_sql_for_principal(state, &sql, "clickhouse", principal)
+            .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(refusal) => {
+                let refused: ApiResult<ApiJson<Value>> = Err(refusal.into());
+                return api_result_to_value(refused).await;
+            }
+        };
+    let mut dry_args = args.clone();
+    dry_args.insert("sql".to_owned(), Value::String(rewritten));
+    let dry_run = dry_run_sql(&state.clickhouse, &dry_args).await;
     if dry_run.get("error").is_some() {
         return dry_run;
     }

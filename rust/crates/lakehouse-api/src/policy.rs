@@ -465,6 +465,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),
+    // BI-16 part A (T8): the whole result of a raw table as CSV. Same
+    // permission as seeing the tile; every export is audited.
+    ("GET",    "/api/dashboard/table-export", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.

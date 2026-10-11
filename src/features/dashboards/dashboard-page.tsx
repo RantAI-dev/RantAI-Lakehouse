@@ -16,7 +16,7 @@ import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBo
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
-import { notifyFailure, notifyInfo } from "@/lib/notify";
+import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
 import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
@@ -45,6 +45,7 @@ import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
+import { downloadTableExport, exportNotice } from "./table-export";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -545,6 +546,18 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     return next;
   });
 
+  // The sort a viewer chose on a raw table, by tile, so its export follows the tile.
+  const tableSorts = React.useRef<Record<string, { column: string; dir: "asc" | "desc" }>>({});
+  async function exportRawTable(id: string) {
+    try {
+      const done = await downloadTableExport(id, filters, tableSorts.current[id]);
+      const note = exportNotice(done);
+      if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
+    } catch (e) {
+      notifyFailure("The export failed", e instanceof Error ? e.message : undefined);
+    }
+  }
+
   // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
@@ -568,9 +581,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
         ? [{ label: "Why clicking does nothing", icon: <MousePointerClick />, onSelect: () => notifyInfo("Nothing to open from this value", PART_NO_CLICK_REASON) }]
         : []),
-      ...(hasRows(cell) && cell.rows.length
-        ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
-        : []),
+      // BI-16A T8: a raw table exports its whole result (every row, the tile's
+      // filters and sort), from the server; other tiles keep the rows on screen.
+      ...(hasRows(cell) && cell.rows.length && own && spec.kind === "table" && spec.def?.tableMode === "rows"
+        ? [{ label: "Download CSV (all rows)", icon: <Download />, onSelect: () => void exportRawTable(spec.id) }]
+        : hasRows(cell) && cell.rows.length
+          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
+          : []),
       ...(own && spec.def
         ? [{ label: "Edit chart", icon: <Pencil />, separatorBefore: true, onSelect: () => setEditing({ id: spec.id, def: spec.def as ChartDef }) }]
         : []),
@@ -619,7 +636,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
       body: (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }}
+        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };
