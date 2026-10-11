@@ -79,10 +79,8 @@ describe("assetSnapshotQueryHref", () => {
     expect(href).toContain("engine=clickhouse")
   })
 
-  it("pins a Trino read with FOR VERSION AS OF", () => {
-    expect(sqlOf(assetSnapshotQueryHref(iceberg, "42"))).toContain(
-      "FROM iceberg.bronze.demo_orders_param FOR VERSION AS OF 42\nLIMIT 100"
-    )
+  it("offers no link for a Trino target, whose time travel the API refuses (DATA-16 F6)", () => {
+    expect(assetSnapshotQueryHref(iceberg, "42")).toBeNull()
   })
 
   it("offers nothing when the asset is read from Silver, or is not Iceberg", () => {
