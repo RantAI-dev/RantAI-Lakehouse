@@ -29,7 +29,10 @@ export function SourcesSection() {
       <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         <Container className="text-center">
           <motion.div
-            className="relative z-10"
+            // WEB-1 review round 1 SHOULD-FIX 5: on a phone the copy sits over the
+            // glow of the mascot's eye seen through the water, so it gets a dark
+            // backing there (body text stays above 4.5:1 on it).
+            className="relative z-10 max-md:rounded-3xl max-md:bg-[#020b2a]/70 max-md:p-4"
             style={reduced ? { opacity: 1, y: 0 } : { opacity: headOpacity, y: headY }}
           >
             <DisplayHeading>{SOURCES.headline}</DisplayHeading>

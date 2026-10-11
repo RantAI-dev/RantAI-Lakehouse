@@ -291,7 +291,7 @@ export function createMascot(opts: MascotOptions): Mascot {
       ghostMat.opacity = 0.85 * k;
       ghostBody.visible = ghostEye.visible;
       ghostBodyMat.opacity = 0.22 * k;
-      ghostGlowMat.uniforms.uIntensity.value = 1.1 * k;
+      ghostGlowMat.uniforms.uIntensity.value = 0.75 * k;
     },
     dip(t) {
       if (t - dipStart < 1.6) return;
@@ -334,7 +334,7 @@ export function createMascot(opts: MascotOptions): Mascot {
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
       eyeMesh.scale.y = EYE_LOGO.ry * MASCOT_R * blink;
       ghostEye.scale.copy(eyeMesh.scale);
-      ghostGlow.scale.set(EYE_LOGO.rx * MASCOT_R * 9, EYE_LOGO.ry * MASCOT_R * 9 * (0.35 + 0.65 * blink), 1);
+      ghostGlow.scale.set(EYE_LOGO.rx * MASCOT_R * 7, EYE_LOGO.ry * MASCOT_R * 7 * (0.35 + 0.65 * blink), 1);
       glow.scale.y = EYE_LOGO.ry * MASCOT_R * 6.5 * (0.35 + 0.65 * blink);
       glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
 
