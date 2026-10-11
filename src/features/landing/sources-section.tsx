@@ -35,12 +35,12 @@ export function SourcesSection() {
             <DisplayHeading>{SOURCES.headline}</DisplayHeading>
             <LeadText className="mx-auto mt-5 max-w-[36rem]">{SOURCES.sub}</LeadText>
           </motion.div>
-          <ul className="relative z-0 mx-auto mt-12 flex max-w-[860px] flex-wrap justify-center gap-2.5 md:gap-3">
+          <ul className="relative z-0 mx-auto mt-12 flex max-w-[760px] flex-wrap justify-center gap-2.5 md:gap-3">
             {SOURCES.items.map((item, i) => (
               <SourcePill key={item} label={item} index={i} progress={scrollYProgress} animate={!reduced} />
             ))}
           </ul>
-          <Reveal className="mx-auto mt-9 max-w-[36rem]">
+          <Reveal className="mx-auto mt-10 max-w-[36rem]">
             <p className="lk-mono text-[12px] leading-5 tracking-wide text-[#E8F4FF]/65">{SOURCES.caption}</p>
           </Reveal>
         </Container>
@@ -49,12 +49,14 @@ export function SourcesSection() {
   );
 }
 
-/** Ease-out with a small overshoot: the droplet sinks a hair past its slot and settles back. */
-const settle = (t: number): number => {
-  const c1 = 1.15;
-  const c3 = c1 + 1;
-  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
-};
+/**
+ * Ease-out cubic: the droplet decelerates into its slot and stops there.
+ * WEB-1 review round 1 SHOULD-FIX 1: this used to overshoot by about 10 % of
+ * the fall (around 100 px on a desktop), which pushed the last pills down over
+ * the caption. Transforms never change layout, so the grid itself already
+ * holds its settled height; the pills just must not travel past it.
+ */
+const settle = (t: number): number => 1 - Math.pow(1 - t, 3);
 
 const PILL_CLASS =
   "lk-mono rounded-full border px-3.5 py-1.5 text-[12px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
