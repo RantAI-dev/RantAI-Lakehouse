@@ -348,6 +348,25 @@ All in the foreground from `/home/user/RantAI-Lakehouse`.
 - The dashboard tiles' pseudo-random values use integer maths only: the server renders with a different JavaScript engine than the browser hydrates with.
 - `package-lock.json` exists beside `bun.lock` and was not regenerated; only `bun.lock` and `package.json` carry `three` and `@types/three`.
 
+### Round 1 fixes
+
+One commit per finding, each citing it at the fix site and in the body.
+
+| Finding | Hash | What changed |
+| --- | --- | --- |
+| BLOCKER 1 | `2f9b1c8` | `landing-copy.ts`: SFTP and S3-compatible storage removed (nine pills, laid out 6 + 3); governance sub, the Lineage fact and the Audit fact reworded as the review gave them. The assistant's screen-reader caption does not repeat any of those lines, so nothing else changed. |
+| SHOULD-FIX 1 | `4c76316` | Pills ease out with no overshoot (the old one overshot about 100 px onto the caption); grid narrowed to 760 px, caption margin up. |
+| SHOULD-FIX 2 | `d6c35cb` | Engine sets canvas opacity to `1 - smoothstep(0.82, 1, depthProgress)`; the assistant stage opens with an abyss gradient drawn above its glow blobs (they were clipped to a visible edge at the stage top). |
+| SHOULD-FIX 3 | `3e6d8f4` | Rim light is the open dome arc (`DOME_ARC`), clipped to the dome, in both SVG mascots. |
+| SHOULD-FIX 4 | `08b17ca` | Phone hero eyebrow: lighter blue with a dark text halo; darker, taller bottom scrim. |
+| SHOULD-FIX 5 | `510075b` | Phone sources copy on a 70 % dark backing; underwater eye glow dimmer and smaller. |
+| SHOULD-FIX 6 | `493af14`, reverted by `1486c7b` | Withdrawn by the reviewer: `package-lock.json` was already stale before this work, so regenerating it pulled about 1,500 unrelated lines into a landing-page PR. It is handled in its own backlog item; CI and the Dockerfile install from `bun.lock`. `package-lock.json`, `package.json` and `bun.lock` are byte-identical to `96e3c93`. |
+| (my screenshots) | `53b0f24` | Depth stack anchor 0.36 to 0.42 and footprint capped at 0.86 on wide screens, so Silver and Gold no longer run under the last lines of the copy. |
+
+**Verification** on the fixed code (`53b0f24`; the revert after it touches only `package-lock.json`, which bun does not read), foreground: `bun run typecheck` exit 0; `bun run lint` 0 errors, 6 warnings (same six, none in files this work touches); `bun run test` 954 pass, 1 skip, 0 fail, 2353 expect() calls, 955 tests across 105 files; `bun run build` exit 0, `/landing` static. Phone re-check (`checks.js phone`): no console errors, no horizontal overflow, layout shift 0.
+
+**Screenshots** (same folder, prefix `r1-`, taken with `scroll-behavior: auto`): `r1-d-sources-*` and `r1-m-sources-*` (pills above the caption, phone copy on its backing), `r1-d-depthsend-5.5vh/6.4vh` and `r1-m-depthsend-*` (canvas fades, no seam into S4), `r1-m-hero-0` (eyebrow), `r1-d-nowebgl-0` and `r1-m-nowebgl-0` (rim), `r1b-d-final-0.96` and `r1-m-final-1` (final section). Not re-shot after the last commit: nothing but the depth-end frames, which were taken on it.
+
 ## 9. Review (planner)
 
 ### Round 1 (reviewed at `96e3c93`)
