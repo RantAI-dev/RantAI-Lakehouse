@@ -75,7 +75,13 @@ function SceneZone() {
         <div
           aria-hidden="true"
           className={cn(
-            "pointer-events-none absolute inset-x-0 top-0 z-0 h-[100svh] transition-opacity duration-700",
+            "pointer-events-none z-0 transition-opacity duration-700",
+            // Full: pinned behind the hero, sources and depths for as long as
+            // the zone lasts (the negative margin gives its flow height back).
+            // Still: one frame, in the hero only.
+            mode === "full"
+              ? "sticky top-0 -mb-[100lvh] h-[100lvh]"
+              : "absolute inset-x-0 top-0 h-[100svh]",
             sceneReady ? "opacity-100" : "opacity-0",
           )}
         >

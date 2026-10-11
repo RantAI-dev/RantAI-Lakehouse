@@ -15,6 +15,10 @@ export type SkyUniforms = {
   uMoonDir: THREE.IUniform<THREE.Vector3>;
   uMoonColor: THREE.IUniform<THREE.Color>;
   uMoonBoost: THREE.IUniform<number>;
+  /** The engine's shared fog colour object; the dome shows it when under water. */
+  uFogColor: THREE.IUniform<THREE.Color>;
+  /** 0 above the surface, 1 below it. */
+  uUnder: THREE.IUniform<number>;
 };
 
 export function createSkyUniforms(): SkyUniforms {
@@ -27,6 +31,8 @@ export function createSkyUniforms(): SkyUniforms {
     uMoonDir: { value: new THREE.Vector3(...MOON_DIR) },
     uMoonColor: { value: new THREE.Color("#cfe6ff") },
     uMoonBoost: { value: 7 },
+    uFogColor: { value: new THREE.Color("#0b2257") },
+    uUnder: { value: 0 },
   };
 }
 

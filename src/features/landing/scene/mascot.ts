@@ -25,8 +25,12 @@ export type Mascot = {
   dome: THREE.Mesh;
   /** Foam collar and splash, which live in world space at the waterline. */
   extras: THREE.Group;
+  /** The foam collar alone, hidden when the camera is below the surface. */
+  foam: THREE.Mesh;
   update: (dt: number, t: number, aim: Aim, look: number) => void;
   dip: (t: number) => void;
+  /** 0 above the surface, 1 below: lifts the body's glow and fades in the eye seen through the water. */
+  setUnderwater: (uw: number) => void;
   /** Freeze the idle motion (reduced motion). */
   still: boolean;
   dispose: () => void;
@@ -40,21 +44,23 @@ function profile(t: number): { r: number; y: number } {
   return { r: MASCOT_R * Math.pow(Math.cos(t), EXP), y: MASCOT_H * Math.pow(Math.sin(t), EXP) };
 }
 
-function buildBodyGeometry(): THREE.LatheGeometry {
+function buildBodyGeometry(upperOnly = false): THREE.LatheGeometry {
   const pts: THREE.Vector2[] = [];
   // Submerged half: a plain ellipse, reached only when the camera is below.
   const below = 0.9 * MASCOT_R;
-  for (let i = 0; i <= 24; i++) {
-    const s = (i / 24) * (Math.PI / 2);
-    pts.push(new THREE.Vector2(MASCOT_R * Math.sin(s), -below * Math.cos(s)));
-  }
+  if (upperOnly) pts.push(new THREE.Vector2(0, 0), new THREE.Vector2(MASCOT_R, 0));
+  else
+    for (let i = 0; i <= 24; i++) {
+      const s = (i / 24) * (Math.PI / 2);
+      pts.push(new THREE.Vector2(MASCOT_R * Math.sin(s), -below * Math.cos(s)));
+    }
   // Visible dome: dense near the base where the sides turn.
   for (let i = 1; i <= 72; i++) {
     const t = Math.pow(i / 72, 0.8) * (Math.PI / 2);
     const p = profile(t);
     pts.push(new THREE.Vector2(p.r, p.y));
   }
-  return new THREE.LatheGeometry(pts, 112);
+  return new THREE.LatheGeometry(pts, upperOnly ? 64 : 112);
 }
 
 /** Point and outward normal on the dome for azimuth `phi` and height fraction `rho` of the dome. */
@@ -97,6 +103,24 @@ export function createMascot(opts: MascotOptions): Mascot {
   group.add(dome);
   disposables.push(bodyGeo, bodyMat);
 
+  // Seen from below, the part of the creature above the water shows through
+  // the surface as a faint blue shape: the dome's upper half drawn without
+  // depth testing, only while the camera is under water.
+  const ghostBodyGeo = buildBodyGeometry(true);
+  const ghostBodyMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color("#2f6fd6"),
+    transparent: true,
+    opacity: 0,
+    depthTest: false,
+    depthWrite: false,
+    toneMapped: false,
+  });
+  const ghostBody = new THREE.Mesh(ghostBodyGeo, ghostBodyMat);
+  ghostBody.renderOrder = 6;
+  ghostBody.visible = false;
+  group.add(ghostBody);
+  disposables.push(ghostBodyGeo, ghostBodyMat);
+
   // ---- Eye ---------------------------------------------------------------
   const eye = new THREE.Group();
   const eyeGeo = new THREE.SphereGeometry(1, 40, 28);
@@ -120,8 +144,37 @@ export function createMascot(opts: MascotOptions): Mascot {
   glow.position.z = 0.12 * MASCOT_R;
   glow.renderOrder = 3;
   eye.add(glow);
+  // Seen from below, the creature's eye still looks down at you: a faint copy
+  // of the eye and its halo, drawn without depth testing so the water ceiling
+  // does not hide it. Hidden above the surface.
+  const ghostMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthTest: false,
+    depthWrite: false,
+    toneMapped: false,
+  });
+  const ghostEye = new THREE.Mesh(eyeGeo, ghostMat);
+  ghostEye.renderOrder = 8;
+  ghostEye.visible = false;
+  eye.add(ghostEye);
+  const ghostGlowMat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color("#9fd0ff") }, uIntensity: { value: 0 } },
+    vertexShader: GLOW_VERT,
+    fragmentShader: GLOW_FRAG,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const ghostGlow = new THREE.Mesh(glowGeo, ghostGlowMat);
+  ghostGlow.renderOrder = 7;
+  ghostGlow.visible = false;
+  ghostGlow.position.z = 0.12 * MASCOT_R;
+  eye.add(ghostGlow);
   group.add(eye);
-  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat);
+  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat, ghostMat, ghostGlowMat);
 
   // ---- Lights that belong to the creature --------------------------------
   // Water bounce from below-front, so the lower dome is not a black cut-out.
@@ -227,7 +280,19 @@ export function createMascot(opts: MascotOptions): Mascot {
     group,
     dome,
     extras,
+    foam,
     still: false,
+    setUnderwater(uw) {
+      bodyMat.emissiveIntensity = THREE.MathUtils.lerp(0.55, 1.5, uw);
+      bounce.intensity = THREE.MathUtils.lerp(0.9, 2.6, uw);
+      const k = THREE.MathUtils.smoothstep(uw, 0.1, 0.9);
+      ghostEye.visible = k > 0.01;
+      ghostGlow.visible = ghostEye.visible;
+      ghostMat.opacity = 0.85 * k;
+      ghostBody.visible = ghostEye.visible;
+      ghostBodyMat.opacity = 0.22 * k;
+      ghostGlowMat.uniforms.uIntensity.value = 1.1 * k;
+    },
     dip(t) {
       if (t - dipStart < 1.6) return;
       dipStart = t;
@@ -268,6 +333,8 @@ export function createMascot(opts: MascotOptions): Mascot {
       const bp = (t - blinkStart) / 0.14;
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
       eyeMesh.scale.y = EYE_LOGO.ry * MASCOT_R * blink;
+      ghostEye.scale.copy(eyeMesh.scale);
+      ghostGlow.scale.set(EYE_LOGO.rx * MASCOT_R * 9, EYE_LOGO.ry * MASCOT_R * 9 * (0.35 + 0.65 * blink), 1);
       glow.scale.y = EYE_LOGO.ry * MASCOT_R * 6.5 * (0.35 + 0.65 * blink);
       glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
 

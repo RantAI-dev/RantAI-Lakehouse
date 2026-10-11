@@ -1,42 +1,67 @@
 "use client";
 
 import * as React from "react";
-import { CTA, HERO, LINKS } from "./landing-copy";
-import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "./landing-ui";
-import { useLandingMode } from "./landing-mode";
-import { MascotLogo } from "./mascot-svg";
+import { motion, useTransform } from "motion/react";
 import { cn } from "@/lib/utils";
+import { CTA, HERO, LINKS } from "./landing-copy";
+import { useLandingMode } from "./landing-mode";
+import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "./landing-ui";
+import { MascotLogo } from "./mascot-svg";
+import { useSectionProgress } from "./use-section-progress";
 
 /**
  * S1 — hero. The DOM hero paints first: a CSS night lake with the logo as
  * inline SVG. It is also the permanent fallback when WebGL is missing or the
  * context is lost (plan §2.8), so the copy never depends on the canvas.
+ *
+ * The section is 150 vh tall with a 100 vh sticky stage: the first 50 vh of
+ * scroll pin the hero while its copy lifts and fades and the camera starts
+ * to dive; the rest of the dive happens as the stage scrolls away. With
+ * `prefers-reduced-motion` the section is a plain 100 vh screen (the CSS
+ * `motion-reduce:` variants), so no pinned scroll remains.
  */
 export function HeroSection() {
+  const ref = React.useRef<HTMLElement>(null);
+  const { mode } = useLandingMode();
+  // Over the whole section (150 vh), the copy is gone by 0.28 (about 42 vh).
+  const scrollYProgress = useSectionProgress(ref, ["start start", "end start"]);
+  const live = mode === "full";
+  const copyOpacity = useTransform(scrollYProgress, [0, 0.2, 0.3], live ? [1, 0.7, 0] : [1, 1, 1]);
+  const copyY = useTransform(scrollYProgress, [0, 0.3], live ? [0, -72] : [0, 0]);
+  const copyBlur = useTransform(scrollYProgress, [0.08, 0.3], live ? ["blur(0px)", "blur(8px)"] : ["blur(0px)", "blur(0px)"]);
+  const cueOpacity = useTransform(scrollYProgress, [0, 0.07], [1, 0]);
+
   return (
-    <section id="hero" className="relative isolate min-h-[100svh] overflow-hidden">
-      <HeroBackdrop />
-      {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.85)_0%,rgba(2,5,20,0.6)_40%,transparent_70%)]"
-      />
-      <Container className="relative z-10 flex min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
-        <div className="max-w-[660px]">
-          <Eyebrow>{HERO.eyebrow}</Eyebrow>
-          <DisplayHeading as="h1" size="xl" className="mt-5">
-            {HERO.headline}
-          </DisplayHeading>
-          <LeadText className="mx-auto mt-6 max-w-[34rem] md:mx-0">{HERO.sub}</LeadText>
-          <div className="mt-9 flex flex-wrap items-center justify-center gap-3 md:justify-start">
-            <CtaLink href={LINKS.console}>{CTA.console}</CtaLink>
-            <CtaLink href={LINKS.talk} variant="ghost">
-              {CTA.talk}
-            </CtaLink>
-          </div>
-        </div>
-      </Container>
-      <ScrollCue />
+    <section ref={ref} id="hero" className="relative h-[150vh] motion-reduce:h-auto">
+      <div className="sticky top-0 isolate h-[100svh] overflow-hidden motion-reduce:relative motion-reduce:min-h-[100svh]">
+        <HeroBackdrop />
+        {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.85)_0%,rgba(2,5,20,0.6)_40%,transparent_70%)]"
+        />
+        <Container className="relative z-10 flex h-full min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
+          <motion.div
+            className="max-w-[660px]"
+            style={{ opacity: copyOpacity, y: copyY, filter: copyBlur }}
+          >
+            <Eyebrow>{HERO.eyebrow}</Eyebrow>
+            <DisplayHeading as="h1" size="xl" className="mt-5">
+              {HERO.headline}
+            </DisplayHeading>
+            <LeadText className="mx-auto mt-6 max-w-[34rem] md:mx-0">{HERO.sub}</LeadText>
+            <div className="mt-9 flex flex-wrap items-center justify-center gap-3 md:justify-start">
+              <CtaLink href={LINKS.console}>{CTA.console}</CtaLink>
+              <CtaLink href={LINKS.talk} variant="ghost">
+                {CTA.talk}
+              </CtaLink>
+            </div>
+          </motion.div>
+        </Container>
+        <motion.div style={{ opacity: cueOpacity }}>
+          <ScrollCue />
+        </motion.div>
+      </div>
     </section>
   );
 }

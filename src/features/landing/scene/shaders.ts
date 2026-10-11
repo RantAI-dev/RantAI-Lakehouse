@@ -72,6 +72,8 @@ export const SKY_FRAG = /* glsl */ `
 uniform vec3 uMoonDir;
 uniform vec3 uMoonColor;
 uniform float uMoonBoost;
+uniform vec3 uFogColor;
+uniform float uUnder;
 varying vec3 vDir;
 ${SKY_GRADIENT_GLSL}
 void main(){
@@ -81,6 +83,10 @@ void main(){
   float disc = smoothstep(0.99978, 0.99988, m);
   float halo = pow(max(m, 0.0), 900.0) * 0.5 + pow(max(m, 0.0), 60.0) * 0.12 + pow(max(m, 0.0), 8.0) * 0.03;
   col += uMoonColor * (disc * uMoonBoost + halo);
+  // Under the surface the "sky" is just the water's fog colour. It has to be
+  // drawn here, through the same tone mapping as the water, rather than as the
+  // scene's clear colour, which three does not tone-map and so never matches.
+  col = mix(col, uFogColor, uUnder);
   gl_FragColor = vec4(col, 1.0);
   ${OUTPUT_GLSL}
 }
@@ -294,6 +300,68 @@ varying float vAlpha;
 void main(){
   float d = length(gl_PointCoord - 0.5);
   float a = (1.0 - smoothstep(0.1, 0.5, d)) * vAlpha;
+  gl_FragColor = vec4(uColor * a, a);
+  ${OUTPUT_GLSL}
+}
+`;
+
+/** Marine snow: specks drifting down through the water around the camera. */
+export const SNOW_VERT = /* glsl */ `
+attribute vec4 aSeed;
+uniform float uTime;
+uniform vec3 uCam;
+uniform float uPx;
+uniform float uAlpha;
+varying float vA;
+void main(){
+  vec3 box = vec3(36.0, 30.0, 36.0);
+  vec3 p = aSeed.xyz * box;
+  p.y -= uTime * (0.22 + aSeed.w * 0.32);
+  p.x += sin(uTime * 0.3 + aSeed.z * 20.0) * 0.6;
+  p = mod(p - uCam + box * 0.5, box) - box * 0.5;
+  vec3 world = p + uCam;
+  vec4 mv = viewMatrix * vec4(world, 1.0);
+  gl_Position = projectionMatrix * mv;
+  float d = length(mv.xyz);
+  // Only below the surface, and fading with distance.
+  float below = 1.0 - smoothstep(-1.2, -0.2, world.y);
+  vA = uAlpha * (1.0 - smoothstep(7.0, 17.0, d)) * below * (0.35 + 0.65 * aSeed.w);
+  gl_PointSize = clamp((1.4 + aSeed.w * 2.6) * uPx * (9.0 / max(d, 1.0)), 1.0, 7.0 * uPx);
+}
+`;
+
+export const SNOW_FRAG = /* glsl */ `
+uniform vec3 uColor;
+varying float vA;
+void main(){
+  float d = length(gl_PointCoord - 0.5);
+  float a = (1.0 - smoothstep(0.0, 0.5, d)) * vA;
+  gl_FragColor = vec4(uColor * a, a);
+  ${OUTPUT_GLSL}
+}
+`;
+
+/** One light shaft: a tall billboard, bright at the surface, fading with depth. */
+export const SHAFT_VERT = /* glsl */ `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+export const SHAFT_FRAG = /* glsl */ `
+uniform float uTime;
+uniform float uIntensity;
+uniform float uSeed;
+uniform vec3 uColor;
+varying vec2 vUv;
+${NOISE_GLSL}
+void main(){
+  float across = pow(1.0 - abs(vUv.x * 2.0 - 1.0), 1.7);
+  float along = pow(vUv.y, 3.0);
+  float flick = 0.6 + 0.4 * snoise(vec2(vUv.x * 2.5 + uSeed * 9.0, uTime * 0.12 + uSeed * 5.0 + vUv.y * 1.5));
+  float a = across * along * flick * uIntensity;
   gl_FragColor = vec4(uColor * a, a);
   ${OUTPUT_GLSL}
 }

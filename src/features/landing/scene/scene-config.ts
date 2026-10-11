@@ -27,3 +27,6 @@ export const RIPPLES = 6;
 export const STILL_TIME = 7.3;
 
 export const CAMERA_FOV = 42;
+
+/** World y of the three slabs' centres (Bronze, Silver, Gold). */
+export const SLAB_Y = [-12, -18.5, -25] as const;

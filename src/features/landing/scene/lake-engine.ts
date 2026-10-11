@@ -1,16 +1,23 @@
 import * as THREE from "three";
+import { sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "../scroll-timeline";
 import { createMascot, type Aim } from "./mascot";
 import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
 import { buildEnvironment, createSkyDome, createSkyUniforms, createStars } from "./sky";
+import { createShafts, createSnow } from "./underwater";
 import { createWater } from "./water";
 
 /**
- * Owns the renderer, the scene graph and the loop for the hero lake.
+ * Owns the renderer, the scene graph and the loop for the lake.
  *
  * Why plain three.js and not React Three Fiber: one canvas, one scene, and a
  * loop that must stop when it cannot be seen. The engine is created in a
  * `useEffect` by `lake-scene.tsx` and torn down by `dispose()`, which releases
  * every geometry, material, texture and the renderer itself (plan §2.9).
+ *
+ * The canvas is a sticky layer behind the hero, sources and depths sections;
+ * each frame the engine reads `scrollY`, smooths it, and asks
+ * `sceneStateAt` where the camera should be. Scroll drives everything; the
+ * only clock is for ambient motion (waves, bob, twinkle).
  *
  * Budgets (plan §2.9): pixel ratio capped at 1.75, 1.25 on phones; the loop
  * runs only while the page zone is on screen and the tab is visible;
@@ -32,10 +39,16 @@ export type EngineOptions = {
 export type LakeEngine = { dispose: () => void };
 
 const clamp = THREE.MathUtils.clamp;
+const lerp = THREE.MathUtils.lerp;
+
+/** Fog and background by depth: lake-blue near the surface, abyss at the bottom. */
+const UNDER_NEAR = new THREE.Color("#0b3a74");
+const UNDER_MID = new THREE.Color("#071f52");
+const UNDER_DEEP = new THREE.Color("#020b2a");
 
 export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const { canvas, mode, observe } = opts;
-  const host = canvas.parentElement ?? canvas;  // the host div sized by the page layer
+  const host = canvas.parentElement ?? canvas; // the layer div the page sizes
   const still = mode === "still";
   let phone = window.innerWidth < 768;
 
@@ -52,7 +65,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   renderer.toneMappingExposure = 1.0;
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 600);
+  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
 
   // ---- Sky, stars, environment ------------------------------------------
   const skyUniforms = createSkyUniforms();
@@ -63,10 +76,17 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const envTarget = buildEnvironment(renderer, skyUniforms);
   scene.environment = envTarget.texture;
   scene.environmentIntensity = 0.95;
-  scene.background = skyUniforms.uSkyHorizon.value;
+
+  // One fog colour object shared by the background, three's fog (for the
+  // mascot) and the water shader, so they can never disagree at the horizon.
+  const fogColor = new THREE.Color().copy(skyUniforms.uSkyHorizon.value);
+  scene.background = fogColor;
+  scene.fog = new THREE.FogExp2(fogColor, 0.003);
+  skyUniforms.uFogColor.value = fogColor;
 
   // ---- Water -------------------------------------------------------------
   const water = createWater(skyUniforms, phone);
+  water.uniforms.uFogColor.value = fogColor;
   scene.add(water.mesh);
 
   // ---- Mascot ------------------------------------------------------------
@@ -77,6 +97,12 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   mascot.still = still;
   scene.add(mascot.group);
   scene.add(mascot.extras);
+
+  // ---- Underwater --------------------------------------------------------
+  const shafts = createShafts(phone ? 5 : 9);
+  scene.add(shafts.group);
+  const snow = createSnow(phone ? 700 : 1500);
+  scene.add(snow.points);
 
   // ---- Lights ------------------------------------------------------------
   // Moonlight from behind the creature rims its dome. There is deliberately no
@@ -106,8 +132,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     el instanceof Element && el.closest("a,button,input,select,textarea,summary,[role='button']") !== null;
   const onPointerDown = (e: PointerEvent) => {
     setPointer(e);
-    if (still || isInteractive(e.target)) return;
     // Only the hero's own screen area counts as "the dome".
+    if (still || window.scrollY > layout.vh * 0.5 || isInteractive(e.target)) return;
     ndc.set(pointer.x, pointer.y);
     raycaster.setFromCamera(ndc, camera);
     if (raycaster.intersectObject(mascot.dome, false).length > 0) mascot.dip(clock.t);
@@ -129,52 +155,105 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   }
 
   // ---- Layout ------------------------------------------------------------
-  const anchor = { x: 0, y: 0 };
-  let distScale = 1;
+  const layout: SceneLayout = {
+    vh: window.innerHeight,
+    viewportH: window.innerHeight,
+    depthsTop: Number.MAX_SAFE_INTEGER / 4,
+    depthsHeight: window.innerHeight * 3,
+  };
+  const measure = () => {
+    layout.vh = host.clientHeight || window.innerHeight;
+    layout.viewportH = window.innerHeight;
+    const depths = document.getElementById("depths");
+    if (depths) {
+      layout.depthsTop = depths.getBoundingClientRect().top + window.scrollY;
+      layout.depthsHeight = depths.offsetHeight;
+    }
+  };
+
+  const anchorHero = { x: 0, y: 0 };
+  const anchorDepths = { x: 0, y: 0 };
+  let distScaleHero = 1;
+  let distScaleDepths = 1;
+  let viewKey = "";
+  let width = 1;
+  let height = 1;
   const resize = () => {
-    const w = Math.max(1, host.clientWidth);
-    const h = Math.max(1, host.clientHeight);
+    width = Math.max(1, host.clientWidth);
+    height = Math.max(1, host.clientHeight);
     phone = window.innerWidth < 768;
-    renderer.setSize(w, h, false);
-    const aspect = w / h;
+    renderer.setSize(width, height, false);
+    const aspect = width / height;
     camera.aspect = aspect;
     // Desktop: the creature sits right of centre so the copy has the left.
     // Portrait: it sits in the upper part, above the centred copy.
     const wide = aspect > 1.1;
-    anchor.x = wide ? 0.42 : 0;
-    anchor.y = wide ? 0 : 0.42;
+    anchorHero.x = wide ? 0.42 : 0;
+    anchorHero.y = wide ? 0 : 0.42;
+    anchorDepths.x = wide ? 0.4 : 0;
+    anchorDepths.y = wide ? 0 : -0.3;
     const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
-    distScale = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
-    if (anchor.x !== 0 || anchor.y !== 0) {
-      camera.setViewOffset(w, h, (-anchor.x * w) / 2, (anchor.y * h) / 2, w, h);
-    } else {
-      camera.clearViewOffset();
-    }
+    distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
+    distScaleDepths = distScaleHero;
+    viewKey = "";
+    measure();
     camera.updateProjectionMatrix();
     renderOnceIfStill();
   };
   const ro = new ResizeObserver(resize);
   ro.observe(host);
+  // The zone's own height changes when fonts load or sections reflow.
+  const roZone = new ResizeObserver(measure);
+  roZone.observe(observe);
 
   // ---- Frame -------------------------------------------------------------
   const aim: Aim = { x: 0, y: 0 };
   const mascotNdc = new THREE.Vector3();
-  const camBase = new THREE.Vector3(0, 1.15, 7.2);
-  const camLook = new THREE.Vector3(0, 0.75, 0);
+  const look = new THREE.Vector3();
+  const underColor = new THREE.Color();
+  let smoothY = still ? 0 : window.scrollY;
   let lastBob = -1;
   let ema = 1 / 60;
   let slow = 0;
+  let state: SceneState = sceneStateAt(0, layout);
+
+  function applyView(wHero: number, wDepths: number): void {
+    const ax = wHero * anchorHero.x + wDepths * anchorDepths.x;
+    const ay = wHero * anchorHero.y + wDepths * anchorDepths.y;
+    // Only rebuild the projection when the offset really moved.
+    const key = `${Math.round(ax * 1000)}:${Math.round(ay * 1000)}`;
+    if (key === viewKey) return;
+    viewKey = key;
+    if (ax !== 0 || ay !== 0) camera.setViewOffset(width, height, (-ax * width) / 2, (ay * height) / 2, width, height);
+    else camera.clearViewOffset();
+    camera.updateProjectionMatrix();
+  }
 
   function update(dt: number): void {
     const t = clock.t;
+    const scrollY = still ? 0 : window.scrollY;
+    // Critically damped follow: wheel notches glide instead of stepping.
+    smoothY += (scrollY - smoothY) * (1 - Math.exp(-dt * 7));
+    if (Math.abs(scrollY - smoothY) < 0.05) smoothY = scrollY;
+    state = sceneStateAt(smoothY, layout);
+    const uw = state.underwater;
 
-    // Camera: the hero frame, nudged by the pointer.
+    // Camera: the scroll path, plus a small pointer parallax while above the water.
+    const heroPointer = 1 - state.dive;
     const px = pointer.seen ? pointer.x : 0;
     const py = pointer.seen ? pointer.y : 0;
-    camera.position.set(camBase.x + px * 0.35, camBase.y + py * 0.12, camBase.z);
-    camera.position.sub(camLook).multiplyScalar(distScale).add(camLook);
-    camera.lookAt(camLook);
+    look.set(state.look[0], state.look[1], state.look[2]);
+    camera.position.set(
+      state.position[0] + px * 0.35 * heroPointer,
+      state.position[1] + py * 0.12 * heroPointer,
+      state.position[2],
+    );
+    // On a narrow screen the camera stays pulled back so the creature, and later
+    // the slabs, fit the width.
+    camera.position.sub(look).multiplyScalar(lerp(distScaleHero, distScaleDepths, state.depthsWeight)).add(look);
+    camera.lookAt(look);
+    applyView(state.heroWeight, state.depthsWeight);
 
     // Where the creature is on screen decides what "looking at the pointer" means.
     // The camera must be placed first: projecting through the default camera at
@@ -202,9 +281,11 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       rawY = wanderY;
     }
     const w = still ? 0 : idle;
-    aim.x = rawX + (wanderX - rawX) * w;
-    aim.y = rawY + (wanderY - rawY) * w;
-    mascot.update(dt, t, aim, 1);
+    // Under the surface the eye looks down at the visitor sinking past it.
+    aim.x = lerp(rawX + (wanderX - rawX) * w, clamp(camera.position.x * 0.3, -0.5, 0.5), uw);
+    aim.y = lerp(rawY + (wanderY - rawY) * w, -0.8, uw);
+    mascot.update(dt, t, aim, 1 - uw * 0.5);
+    mascot.foam.visible = uw < 0.95;
 
     // One ring per bob, from the waterline at the trough.
     const bobIndex = Math.floor((t - 3) / 4);
@@ -213,10 +294,29 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       lastBob = bobIndex;
     }
 
+    // Fog, background and the underwater colour ramp by depth.
+    const depthK = clamp((-camera.position.y - 0.5) / 26, 0, 1);
+    if (depthK < 0.35) underColor.copy(UNDER_NEAR).lerp(UNDER_MID, depthK / 0.35);
+    else underColor.copy(UNDER_MID).lerp(UNDER_DEEP, (depthK - 0.35) / 0.65);
+    fogColor.copy(skyUniforms.uSkyHorizon.value).lerp(underColor, smoothstep(0, 1, uw));
+    const density = lerp(0.021, 0.05, uw);
+    (scene.fog as THREE.FogExp2).density = lerp(0.003, 0.05, uw);
+    (scene.fog as THREE.FogExp2).color.copy(fogColor);
+    water.uniforms.uFogDensity.value = density;
+    skyUniforms.uUnder.value = smoothstep(0, 1, uw);
+    mascot.setUnderwater(uw);
+    stars.points.visible = uw < 0.98;
+    stars.uniforms.uAlpha.value = 1 - uw;
+
     sky.position.copy(camera.position);
     stars.points.position.copy(camera.position);
     stars.uniforms.uTime.value = t;
     water.uniforms.uTime.value = t;
+
+    // Light shafts fade out with depth; snow is a constant presence below.
+    const below = Math.max(0, -camera.position.y);
+    shafts.update(t, uw * 0.55 * Math.exp(-below / 14), camera);
+    snow.update(t, uw * 0.85, camera, dpr);
   }
 
   function renderFrame(): void {
@@ -253,7 +353,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       dpr = Math.max(1, dpr - 0.25);
       renderer.setPixelRatio(dpr);
       stars.uniforms.uPx.value = dpr;
-      renderer.setSize(host.clientWidth, host.clientHeight, false);
+      renderer.setSize(width, height, false);
       slow = 0;
       ema = 1 / 60;
     }
@@ -261,6 +361,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const start = () => {
     if (raf || !running()) return;
     clock.last = performance.now();
+    // After a pause the scroll may have moved far; do not glide across it.
+    smoothY = window.scrollY;
     raf = requestAnimationFrame(loop);
   };
 
@@ -284,7 +386,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   canvas.addEventListener("webglcontextlost", onLost);
 
   // Still frame: a ring already out on the water, then a single render.
-  (window as unknown as Record<string, unknown>).__lk = { scene, camera, mascot, water, renderer };
+  (window as unknown as Record<string, unknown>).__lk = { scene, camera, mascot, water, renderer, getState: () => state, snap: () => { smoothY = window.scrollY; } };
   if (still) water.spawnRipple(STILL_TIME - 2.2, 0.55);
   resize();
   if (!still) start();
@@ -294,6 +396,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
       ro.disconnect();
+      roZone.disconnect();
       io.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pointermove", setPointer);
@@ -302,6 +405,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       canvas.removeEventListener("webglcontextlost", onLost);
       mascot.dispose();
       water.dispose();
+      shafts.dispose();
+      snow.dispose();
       sky.geometry.dispose();
       (sky.material as THREE.Material).dispose();
       stars.points.geometry.dispose();
