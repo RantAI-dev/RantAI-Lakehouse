@@ -93,6 +93,23 @@ its state, because a merge is idempotent on a key (`SRC-10` measurement 5,
 slices. A mode that needs ALL its rows or none (`history`, not built) cannot use
 this.
 
+# What a failed load leaves behind (`SRC-10` measurement 4)
+
+A load that fails leaves its package pending in the pipeline's working
+directory. `dlt` then makes the next `run` load that package and NOT extract the
+data it was given, so every later load of the table fails or reports the dead
+run's rows until the package is dropped. Every run here re-reads its rows from
+the source, so a pending package of a failed run is never the thing to retry:
+`load_via_sink` aborts the pipeline's pending packages (`Pipeline.abort_packages`;
+`drop_pending_packages` is deprecated in 1.30.0 and only calls it) when a load
+raises or ends with failed jobs, for every mode. Aborting also restores the
+pipeline state to before the package, so the incremental cursor does not move
+past rows that were never loaded. Measured for replace, append, incremental,
+merge and a failure at normalize (`test_load_modes_dedup_measurement.py`,
+`test_sink_pending_packages.py`). Not covered: a package left by a PROCESS that
+died mid-load is not seen until the next run, which would then finish it instead
+of reading (reported, not changed here).
+
 Because `replace` forgets the cursor and an `append` run is made to
 (`_forget_cursors`), switching a table between modes never leaves a stale
 cursor behind that would skip or re-add rows.
@@ -394,7 +411,9 @@ def _extract_rows(trace, bronze_table_name: str) -> int | None:
     `bronze_table_name` did not appear in this run's normalize row
     counts (a load that wrote zero new rows and a load that never ran
     are both, honestly, "unknown" from this dict alone)."""
-    if trace is None:
+    if trace is None or trace.last_normalize_info is None:
+        # No normalize step ran in this run: `dlt` only finished a package an
+        # earlier run left pending (SRC-10 measurement 4).
         return None
     return trace.last_normalize_info.row_counts.get(bronze_table_name)
 
@@ -510,6 +529,18 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
         resource.apply_hints(incremental=dlt.sources.incremental(cursor))
 
 
+def _abort_pending(pipeline: Any) -> None:
+    """Abort the pipeline's pending packages and restore its state to before
+    them (`Pipeline.abort_packages`; `SRC-10` measurement 4). Must never mask
+    the failure that got us here, so a problem aborting is logged by type and
+    left."""
+    try:
+        if pipeline.has_pending_data:
+            pipeline.abort_packages()
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        logger.warning("could not abort the pending packages of %r (%s)", pipeline.pipeline_name, type(exc).__name__)
+
+
 def _refusal_in(exc: BaseException) -> dedup.DedupRefused | None:
     """The `DedupRefused` a deduplication step raised, or `None`. `dlt` wraps an
     exception of a pipe step twice -- `ResourceExtractionError` or
@@ -545,7 +576,8 @@ def load_via_sink(
     incremental plan over plain rows, and `dedup.DedupRefused` (a `ValueError`
     with a fixed message) when a deduplicating plan cannot be applied: a row
     with no key value, more distinct keys than `INGEST_DEDUP_MAX_ROWS`, cursor
-    values that cannot be ordered.
+    values that cannot be ordered. On any failure the pipeline's pending
+    packages are aborted first (see "What a failed load leaves behind").
     """
     _install_catalog_env(config)
 
@@ -655,6 +687,10 @@ def load_via_sink(
         )
         dedup.assert_flushed(dedup_steps, table=bronze_table_name)
     except Exception as exc:
+        # SRC-10 measurement 4: a failed load leaves its package pending and the
+        # next run would finish THAT instead of reading; this run's rows are
+        # re-read from the source anyway, so drop it, for every mode.
+        _abort_pending(pipeline)
         refused = _refusal_in(exc)
         if refused is not None:
             raise refused from exc
@@ -678,6 +714,7 @@ def load_via_sink(
         # `str(load_info)` can contain a file path -- log only, never
         # surfaced to a caller/response (see this module's docstring).
         logger.warning("dlt load had failed jobs: %s", str(load_info))
+        _abort_pending(pipeline)
 
     return SinkResult(
         rows=rows,

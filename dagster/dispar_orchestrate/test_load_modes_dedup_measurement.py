@@ -30,6 +30,7 @@ from dlt.common.destination.exceptions import DestinationTerminalException
 from dlt.pipeline.exceptions import PipelineStepFailed
 from pyiceberg.table import Table
 
+from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.test_load_modes_measurement import (  # noqa: F401 -- `lab` and `items_db` are fixtures
     Lab,
     _dedup,
@@ -215,7 +216,12 @@ def test_4_without_the_abort_the_next_run_only_finishes_the_failed_package_and_d
     extracted": the next run reports success for the PREVIOUS run's read, and
     `pipeline.last_trace.last_normalize_info` is `None` (so `sink._extract_rows`
     cannot count it; see `test_sink_pending_packages.py`). Nothing is doubled here
-    because both reads were the same rows."""
+    because both reads were the same rows.
+
+    Changed with task D (it ran before it through `load_via_sink`, which now aborts
+    the package itself): the abort is switched off here so the test still measures
+    what `dlt` does without it."""
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda _pipeline: None)
     _load(lab, [{"id": 1, "v": "a"}], "ap", "append")
     failure = _Failure(monkeypatch, Table, "append")
     with pytest.raises(PipelineStepFailed):
@@ -254,7 +260,11 @@ def test_4_without_the_abort_the_next_incremental_run_finishes_the_failed_packag
     to 40 in the failed package's state, so once that package is finished a
     fresh read is filtered to nothing: no row is lost, but the table is complete
     only because a package a dead run left was finished, not because of this
-    run's read."""
+    run's read.
+
+    Changed with task D, as the case above: `load_via_sink`'s own abort is switched
+    off so the test still measures `dlt` without it."""
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda _pipeline: None)
     _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
     items_db.execute("INSERT INTO items VALUES (4,'d',40)")
     items_db.commit()
