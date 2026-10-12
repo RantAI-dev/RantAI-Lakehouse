@@ -42,6 +42,9 @@
 # test-only shortcut.
 volumes:
   g6_secrets:
+  # SRC-9 task 4: the SFTP fixture's host key, minted once by
+  # `sftp-g6-hostkey-init`; read-only in `sftp-g6` and in `g6-test-runner`.
+  sftp_g6_hostkey:
 
 services:
   dagster-code-location:
@@ -115,6 +118,61 @@ services:
       timeout: 5s
       retries: 20
 
+  # SRC-9 task 4: the SFTP fixture. The connector's `hostKeyFingerprint` must
+  # be the fixture's OWN key, never one read off the first connection
+  # (`ssrf_guard_sftp.PinnedHostKeyPolicy` exists to refuse exactly that
+  # trust-on-first-use). So the key is minted by an init step into a named
+  # volume before the server starts, the server installs that key, and the
+  # gate computes the fingerprint from the public half in the same volume.
+  # Idempotent: `docker compose run --rm g6-test-runner` re-walks this
+  # dependency graph, and a second unconditional `ssh-keygen` would replace
+  # the key under an already-running server (the failure
+  # `mssql-g6-cert-init` documents). `apk add` is retried for the same
+  # one-off mirror errors that comment names.
+  sftp-g6-hostkey-init:
+    image: alpine:3.20
+    profiles: ["g6"]
+    restart: "no"
+    volumes:
+      - sftp_g6_hostkey:/out
+    entrypoint: ["/bin/sh", "-c"]
+    # The last file written is the install script, so its presence means the
+    # whole set is complete. `atmoz/sftp` runs every executable file in
+    # /etc/sftp.d before starting sshd; the script copies the key into the
+    # place sshd reads (the key file itself, not executable, is skipped).
+    command:
+      - >
+        test -f /out/00-install-hostkey.sh ||
+        { for i in 1 2 3 4 5; do apk add --no-cache openssh-keygen >/dev/null && break; sleep 3; done;
+        command -v ssh-keygen >/dev/null &&
+        ssh-keygen -q -t ed25519 -N "" -C "g6-fixture" -f /out/ssh_host_ed25519_key &&
+        chmod 600 /out/ssh_host_ed25519_key && chmod 644 /out/ssh_host_ed25519_key.pub &&
+        printf '#!/bin/sh\ncp /etc/sftp.d/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key\nchmod 600 /etc/ssh/ssh_host_ed25519_key\n' > /out/00-install-hostkey.sh &&
+        chmod 755 /out/00-install-hostkey.sh; }
+
+  # `atmoz/sftp:alpine`, pinned by digest (the image publishes only moving
+  # tags besides 2018 ones): the widely used small OpenSSH-based SFTP server,
+  # about 9 MB. One user, chrooted, with a writable `upload` directory; the
+  # gate puts the CSV there as that user. The password comes from the
+  # environment as the image requires (`user:password:uid:gid:dir`), so it
+  # must not contain a colon. Healthcheck on the TCP port: the image starts
+  # sshd only after its setup scripts have run, with no temporary server.
+  sftp-g6:
+    image: atmoz/sftp:alpine@sha256:7e439fabeae536fa254340724c042e11999924d906417dbb5c73602ad518813f
+    profiles: ["g6"]
+    restart: "no"
+    depends_on:
+      sftp-g6-hostkey-init:
+        condition: service_completed_successfully
+    command: ["g6_sftp:${SFTP_G6_PASSWORD:?}:1001:100:upload"]
+    volumes:
+      - sftp_g6_hostkey:/etc/sftp.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   mssql-g6:
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
@@ -137,12 +195,16 @@ services:
     depends_on:
       mariadb-g6:
         condition: service_healthy
+      sftp-g6:
+        condition: service_healthy
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
       # SRC-9 task 3: root (seeding) and the connector's reader password for
       # mariadb-g6, provisioned by its own block above.
       MARIADB_G6_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
       CONNECTOR_MARIADB_PASSWORD: ${CONNECTOR_MARIADB_PASSWORD:?}
+      # SRC-9 task 4: the SFTP user's password, the same value sftp-g6 gets.
+      SFTP_G6_PASSWORD: ${SFTP_G6_PASSWORD:?}
       # The mysql-g6/mssql-g6 dial CONNECTOR credentials (not root/sa) --
       # g6-test-runner needs the real values to write into each
       # connector's derived `file:` credential (ADR 0002 Addendum 3), the
@@ -164,6 +226,12 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./ops/gates:/opt/gates:ro
+      # SRC-9 task 4: the SFTP fixture's public host key, to compute the
+      # connector's pinned fingerprint from the fixture itself.
+      - type: volume
+        source: sftp_g6_hostkey
+        target: /sftp-hostkey
+        read_only: true
       - type: volume
         source: g6_secrets
         target: /gate-secrets

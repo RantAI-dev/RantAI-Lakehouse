@@ -96,6 +96,9 @@ MYSQL_ROOT_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "")
 CONNECTOR_MYSQL_PASSWORD = os.environ.get("CONNECTOR_MYSQL_PASSWORD", "")
 MARIADB_G6_ROOT_PASSWORD = os.environ.get("MARIADB_G6_ROOT_PASSWORD", "")
 CONNECTOR_MARIADB_PASSWORD = os.environ.get("CONNECTOR_MARIADB_PASSWORD", "")
+SFTP_G6_PASSWORD = os.environ.get("SFTP_G6_PASSWORD", "")
+SFTP_G6_USER = "g6_sftp"
+SFTP_HOSTKEY_PUB = "/sftp-hostkey/ssh_host_ed25519_key.pub"
 MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MONGO_G6_ROOT_USER = os.environ.get("MONGO_G6_ROOT_USER", "")
 MONGO_G6_ROOT_PASSWORD = os.environ.get("MONGO_G6_ROOT_PASSWORD", "")
@@ -268,6 +271,53 @@ def _seed_mariadb_fixture() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_sftp_fixture() -> str:
+    """SRC-9 task 4: puts `orders.csv` (3 rows) into `sftp-g6`'s `upload`
+    directory as the fixture's user and returns the connector's pinned
+    `hostKeyFingerprint`.
+
+    The fingerprint is computed from the fixture's own public host key
+    (`sftp-g6-hostkey-init` writes it to a volume this runner mounts), never
+    taken from a connection: that would be the trust-on-first-use
+    `PinnedHostKeyPolicy` refuses. The upload itself checks the same key
+    (`RejectPolicy`), so a server presenting another key fails the gate here.
+    Format: `SHA256:` + unpadded base64 of the SHA-256 of the key blob, as
+    `ssrf_guard_sftp._sha256_fingerprint` and `ssh-keygen -l` print it."""
+    import base64
+    import hashlib
+    import io
+
+    import paramiko
+
+    with open(SFTP_HOSTKEY_PUB, encoding="utf-8") as fh:
+        fields = fh.read().split()
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise G6Failure(f"{SFTP_HOSTKEY_PUB} is not an ssh-ed25519 public key")
+    blob = base64.b64decode(fields[1])
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+    csv_bytes = b"id,name,amount\n1,alpha,10.5\n2,beta,20.25\n3,gamma,30.0\n"
+
+    def upload() -> bool:
+        client = paramiko.SSHClient()
+        client.get_host_keys().add("sftp-g6", "ssh-ed25519", paramiko.Ed25519Key(data=blob))
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        try:
+            client.connect(
+                "sftp-g6", 22, username=SFTP_G6_USER, password=SFTP_G6_PASSWORD,
+                allow_agent=False, look_for_keys=False, timeout=10,
+            )
+            sftp = client.open_sftp()
+            sftp.putfo(io.BytesIO(csv_bytes), "/upload/orders.csv")
+            sftp.close()
+        finally:
+            client.close()
+        return True
+
+    _wait_for("sftp-g6 accepts the fixture upload", upload, 60, interval_s=3.0)
+    return fingerprint
 
 
 def _seed_mssql_fixture() -> None:
@@ -625,6 +675,7 @@ def _bronze_ingested_at_null_count(bronze_table: str) -> int:
 TYPE_OF = {
     "g6-mysql": "MySQL",
     "g6-mariadb": "MariaDB",
+    "g6-sftp": "SFTP",
     "g6-mssql": "SQL Server",
     "conn-pg-lakehouse": "PostgreSQL",
     "g6-files": "Object storage",
@@ -633,7 +684,7 @@ TYPE_OF = {
     "g6-rest": "REST API",
 }
 BRONZE_OF = {
-    "g6-mysql": "g6_mysql_orders", "g6-mariadb": "g6_mariadb_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
+    "g6-mysql": "g6_mysql_orders", "g6-mariadb": "g6_mariadb_orders", "g6-sftp": "g6_sftp_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
     "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders", "g6-kafka": "g6_kafka_events",
     "g6-rest": "g6_rest_items",
 }
@@ -904,6 +955,7 @@ def _step_reload(connector_ids: dict[str, str], first_counts: dict[str, int]) ->
 def step_ingest_matrix() -> None:
     _seed_mysql_fixture()
     _seed_mariadb_fixture()
+    sftp_fingerprint = _seed_sftp_fixture()
     _seed_mssql_fixture()
     mongo_reader_password = _seed_mongo_fixture()
     _seed_files_fixture()
@@ -926,6 +978,16 @@ def step_ingest_matrix() -> None:
          {"source": "file", "primary": "password"}, {"primary": CONNECTOR_MARIADB_PASSWORD},
          "sql", {"driver": "mysql", "host": "mariadb-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
          [{"name": "orders", "target": "g6_mariadb_orders"}]),
+        # SRC-9 task 4: password auth; `hostKeyFingerprint` is the
+        # fixture's own key (see `_seed_sftp_fixture`). The product answers
+        # honestly for connect and discover (SRC-5, SRC-13); load and reload
+        # are real.
+        ("g6-sftp", "SFTP", "sftp-g6:22",
+         {"source": "file", "primary": "password"}, {"primary": SFTP_G6_PASSWORD},
+         "sftp",
+         {"host": "sftp-g6", "port": 22, "user": SFTP_G6_USER, "hostKeyFingerprint": sftp_fingerprint,
+          "path": "/upload", "fileFormat": "csv", "auth": {"type": "password"}},
+         [{"name": "orders.csv", "target": "g6_sftp_orders"}]),
         ("g6-mssql", "SQL Server", "mssql-g6:1433",
          {"source": "file", "primary": "password"}, {"primary": MSSQL_SA_PASSWORD},
          "sql", {"driver": "mssql", "host": "mssql-g6", "port": 1433, "database": "g6_ingest", "user": "sa"},
@@ -1026,7 +1088,7 @@ def step_ingest_matrix() -> None:
     # SRC-9 task 2: `connect` and `discover` for the other connectors, while
     # their first runs are in flight. Both are quick, read-only calls (a
     # supported test stamps this connector's `health`; see `_check_connect`).
-    for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
+    for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-sftp", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
         if name in connector_ids:
             if name != "g6-files":
                 _check_connect(name, connector_ids[name])
@@ -1071,7 +1133,7 @@ def step_ingest_matrix() -> None:
 
     first_counts: dict[str, int] = {}
     for name, bronze_table in [
-        ("g6-mysql", "g6_mysql_orders"), ("g6-mariadb", "g6_mariadb_orders"), ("g6-mssql", "g6_mssql_orders"),
+        ("g6-mysql", "g6_mysql_orders"), ("g6-mariadb", "g6_mariadb_orders"), ("g6-sftp", "g6_sftp_orders"), ("g6-mssql", "g6_mssql_orders"),
         ("conn-pg-lakehouse", "orders"), ("g6-files", "g6_files_orders"),
         ("g6-mongo", "g6_mongo_orders"), ("g6-kafka", "g6_kafka_events"),
         # g6-rest was missing from this list entirely -- verification

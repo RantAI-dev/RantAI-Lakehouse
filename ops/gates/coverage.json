@@ -145,16 +145,16 @@
       }
     },
     "SFTP": {
-      "gate": null,
+      "gate": "g6",
       "steps": {
-        "connect": "missing",
-        "discover": "missing",
-        "load": "missing",
-        "reload": "missing"
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
       },
       "notes": {
-        "all": "SRC-9 plan task 4.",
-        "connect": "Product refuses today with supported:false (SRC-5).",
+        "all": "SRC-9 plan task 4: atmoz/sftp in the g6 override, with a host key minted by the fixture so the pinned fingerprint is its own.",
+        "connect": "SRC-5: an SFTP connector cannot be tested from the console.",
         "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
       }
     }
