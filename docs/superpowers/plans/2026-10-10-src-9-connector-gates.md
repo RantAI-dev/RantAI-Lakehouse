@@ -488,3 +488,47 @@ for Parquet, `bronze.<table>` under `ICEBERG_QUERY_DB`): nothing else stale.
 SEC-16 (per-tenant upload namespace) is not built yet, so the table is still
 `bronze.<table>`; when it lands, the gate's query must change.
 Not verified: any of g9 beyond the tenant step (no stack run).
+
+### Fifth pass (developer): G9 stops at the registry check (product defect, finding G4)
+
+**Failure.** `POST .../ingest (replace)` answered 503 "Could not check whether
+that table already exists"; the API logged ClickHouse `Code: 81 ... Database
+lake does not exist (UNKNOWN_DATABASE)`.
+
+**Mechanism.** `ensure_table_free` -> `table_exists` -> `registered_slug`
+(`routes/catalog.rs`) selects from `lake.bronze_meta.dataset_catalog` and
+`lake.bronze_meta_sec.dataset_catalog`. `table_exists` treated only
+`UNKNOWN_TABLE` (code 60) as "nothing registered"; every other error fails
+closed (503). Nothing in `docker-compose.yml` creates the `lake` database or
+the registry: `demo/clickhouse/04_registry.sql` no longer exists in the repo,
+and the only creator is the orchestrator (`bronze_catalog._assert_or_create_all`
+= `CREATE DATABASE IF NOT EXISTS lake` + `EXPECTED_SCHEMAS`, run by
+`register_bronze_table` and `record_ingest_run`). So on a fresh install, before
+any ingest, an upload as the first action gets this 503: a PRODUCT defect, not
+a gate-stack hole. Adding services to the g9 up list would not have helped (no
+service creates it).
+
+**Fix (option a).** `table_exists` now uses `is_unknown_table_or_database_error`
+(60 or 81). Sound because an absent registry holds no name; the Iceberg half
+still runs (new test proves an existing Iceberg table still gives 409); the
+claim-table (Postgres) half is unchanged; every other ClickHouse error still
+gives 503 (existing test `a_registry_that_cannot_be_read_is_503...`, code 999,
+is unchanged). The API does not create the table: `EXPECTED_SCHEMAS` stays the
+single owner, and the upload's job (`file_ingest` -> `register_loaded_table` ->
+`register_bronze_table`, and `record_ingest_run`) creates the database and both
+registry tables before its first write.
+
+**Rest of G9 read against a never-ingested stack.** `ingest-runs`: the job's
+`record_ingest_run` creates `bronze_meta.ingest_run` before the gate reads it,
+and `governance.rs` already maps 81/60 to an empty list. The `bronze` namespace:
+created by the dlt Iceberg sink on first load, as in g6 (no pre-step).
+`icecat_api`: created by `clickhouse-iceberg-init`, which is in the g9 up list
+and the runner's `depends_on`. No other gap found by reading. Gate and compose
+unchanged.
+
+Tests added (`tests/upload_routes.rs`): code 81 on the registry -> load
+proceeds (200, one launch); code 81 plus an existing Iceberg table -> 409,
+nothing launched.
+
+Not verified: the tests were not run (no `cargo test` on this machine); the
+next CI run of G9 is the proof past this step.
