@@ -720,6 +720,62 @@ jobs:
         if: always()
         run: docker compose -p g6ci-linklocal down -v
 
+  # ── DATA-9 (G9) acceptance, in CI since SRC-9 plan task 7: the upload gate
+  # (ops/g9/upload_test.py) uploads a delimited file, a workbook and a
+  # Parquet file, previews and loads each through file_ingest_job into a raw
+  # table, loads again with append, deletes the upload, and reads the rows
+  # back through ClickHouse. Same condition as g6-ingest: the scope gate, so
+  # a documentation-only change skips it and anything under rust/, dagster/,
+  # ops/, scripts/ or compose runs it (scripts/ci/detect_change_scope.sh). ──
+  g9-upload:
+    name: Rust · G9 file upload
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # lakehouse-api has no default upload credential (unset, every
+          # upload answers 503 "Upload storage is not configured"). RustFS
+          # 1.0.0-rc.4 has no non-root S3 identity (docker-compose.yml, the
+          # CONNECTOR_S3_* note), so the gate hands the API RustFS's own root
+          # key, which this stack takes from the compose default
+          # (RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY unset here), the same
+          # value the Dagster services already default to. A throwaway CI
+          # stack, never a deployment value.
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          EOF
+
+      - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
+        # Explicit service list, as g6-ingest explains: a bare `up` on the
+        # dagster profile would also start debezium-server. clickhouse-
+        # iceberg-init is named because nothing but the gate depends on it.
+        run: >
+          docker compose -p g9ci --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          clickhouse-iceberg-init
+
+      - name: Run the G9 upload test inside the compose network
+        run: docker compose -p g9ci --profile dagster run --rm g9-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g9ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g9ci down -v
+
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
   # ClickHouse and appends it to the `gold` Iceberg namespace through
@@ -826,6 +882,7 @@ jobs:
       - g3-maintenance
       - g4-cdc
       - g6-ingest
+      - g9-upload
       - gold-export
       - g8-governance
     timeout-minutes: 5
@@ -860,6 +917,7 @@ jobs:
           G3_MAINTENANCE_RESULT: ${{ needs.g3-maintenance.result }}
           G4_CDC_RESULT: ${{ needs.g4-cdc.result }}
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
+          G9_UPLOAD_RESULT: ${{ needs.g9-upload.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
         run: ./scripts/ci/required_gate.sh

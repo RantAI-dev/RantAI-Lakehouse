@@ -29,6 +29,7 @@
 #   G3_MAINTENANCE_RESULT result of `g3-maintenance` job
 #   G4_CDC_RESULT         result of `g4-cdc` job
 #   G6_INGEST_RESULT      result of `g6-ingest` job
+#   G9_UPLOAD_RESULT      result of `g9-upload` job
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
 set -euo pipefail
@@ -131,6 +132,7 @@ run_gate() {
   check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
+  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
 

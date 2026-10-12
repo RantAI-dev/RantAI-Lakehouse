@@ -2115,6 +2115,58 @@ services:
       - "pip install -q requests && python g3a_test.py"
     restart: "no"
 
+  # DATA-9 (G9) — the file-upload acceptance test (`ops/g9/upload_test.py`):
+  # upload, preview, load with `replace` and `append`, delete, an Excel
+  # workbook and a Parquet file, end to end through the API, `file_ingest_job`
+  # and ClickHouse. SRC-9 plan task 7 puts it in CI (`g9-upload` job); until
+  # then nothing ran it. `dagster` profile, for the reason `g3a-source-init`'s
+  # comment gives (it depends on `dagster-webserver`).
+  #
+  # The stack it needs beyond the g3a set: `clickhouse-iceberg-init`, which
+  # creates the API's own `DataLakeCatalog` database (`ICEBERG_QUERY_DB`) that
+  # the gate reads the loaded table through (the API does not depend on it),
+  # and an upload credential for `lakehouse-api` (`UPLOAD_S3_ACCESS_KEY` /
+  # `UPLOAD_S3_SECRET_KEY`, which have no default: unset, every upload answers
+  # 503 "Upload storage is not configured."). The CI job writes both into its
+  # `.env`; see `.github/workflows/ci.yml`'s `g9-upload`.
+  #
+  # The gate reads its fixtures from `ops/fixtures/` beside `ops/g9/`, so the
+  # two directories are mounted side by side under /work, read-only: the
+  # runner writes nothing into the checkout, and a read-only mount also keeps
+  # root-owned `__pycache__/` out of it (the failure `g3a-test-runner`'s
+  # PYTHONDONTWRITEBYTECODE note describes).
+  #
+  # Usage (from a clean stack, `.env` as the CI job writes it):
+  #   docker compose -p <project> --profile dagster up -d --build
+  #     lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+  #     clickhouse-iceberg-init
+  #   docker compose -p <project> --profile dagster run --rm g9-test-runner
+  g9-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g9:/work/g9:ro
+      - ./ops/fixtures:/work/fixtures:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g9/upload_test.py"
+    restart: "no"
+
   # P4 (G3) — functional acceptance test for the maintenance job + the
   # `dry_run` metrics console surface (`GET /api/governance/maintenance`).
   # `docs/plans/G3-RESULT.md` has the one-time synthetic-load performance
