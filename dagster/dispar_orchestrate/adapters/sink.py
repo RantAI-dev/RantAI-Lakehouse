@@ -49,8 +49,14 @@ was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
   new rows by construction).
 - `replace` overwrites the table with what the source returns now
   (pyiceberg `overwrite`; the previous snapshot stays reachable until it
-  is expired). An empty source empties the table. dlt also forgets the
-  resource's incremental cursor on a replace.
+  is expired). dlt also forgets the resource's incremental cursor on a
+  replace. Do NOT rely on an empty source to empty the table. Measured
+  (`test_sink_empty_table.py`, dlt 1.30.0): `load_via_sink([], ...)` over a table
+  a `sql_database` source created left all three rows in place, and an empty
+  `dlt` resource leaves a table untouched in any case (no data reaches the
+  destination). So a SQL source table that becomes empty at the source is NOT
+  emptied by a `replace` run; it keeps its old rows. `clear_table` empties a
+  table by running the pipeline on an empty list itself.
 - `incremental` adds only rows whose cursor column is beyond the highest
   value the previous incremental run saw (`dlt.sources.incremental`,
   pushed into the query). Only a `sql_database` source is accepted; see
