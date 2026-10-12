@@ -244,7 +244,18 @@ describe("ConnectorDetailPage", () => {
       }
     )
     render(<ConnectorDetailPage connectorId="conn-a" />)
-    expect(await screen.findAllByText("Waiting for a decision")).toHaveLength(1)
+    // SRC-10 R4: "Waiting for a decision" is also the title of the Schema changes
+    // card, which is on the page before the list has loaded, so waiting for that
+    // text waited for nothing and the count on the tab (set by an effect of the
+    // schema panel, after the list arrives) was read before it was there. Wait for
+    // the mark itself: the pill on the table row, found by its own title.
+    const marks = await screen.findAllByTitle("A change at the source waits for approval; see Schema changes")
+    expect(marks).toHaveLength(1)
+    expect(within(marks[0].closest("li") as HTMLElement).getByText("public.orders")).toBeDefined()
+    expect(within(screen.getByText("public.items").closest("li") as HTMLElement).queryByText("Waiting for a decision")).toBeNull()
+    // The tab's count is set by the same update as the mark, but read it after
+    // waiting for it all the same, and by its own text apart from the tab's name.
+    await waitFor(() => expect(within(tab("Schema changes")).getByText("1")).toBeDefined())
     expect(tab("Schema changes").textContent).toBe("Schema changes1")
     expect(count("GET /api/connectors/conn-a/schema-changes")).toBe(1)
   })
