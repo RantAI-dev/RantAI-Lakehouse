@@ -66,11 +66,13 @@ async fn seed_sql_connector(pool: &sqlx::PgPool, id: &str) {
          name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
          ($1, '11111111-1111-4111-8111-000000000001', \
-         'sql ingest test', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
+         $2, 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
     .bind(id)
+    // `connector_name_unique`: a test that seeds two connectors needs two names.
+    .bind(format!("sql ingest test {id}"))
     .execute(pool)
     .await
     .expect("seed a sql-adapter connector");
@@ -82,12 +84,13 @@ async fn seed_cdc_connector(pool: &sqlx::PgPool, id: &str) {
          name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
          ($1, '11111111-1111-4111-8111-000000000001', \
-         'cdc ingest test', 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
+         $2, 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
          'production', 'meridian', 'cdc', 'cdc', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\",\
          \"slotName\":\"orders_slot\",\"publicationName\":\"orders_pub\"}'::jsonb)",
     )
     .bind(id)
+    .bind(format!("cdc ingest test {id}"))
     .execute(pool)
     .await
     .expect("seed a cdc-adapter connector");
