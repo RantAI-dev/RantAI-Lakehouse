@@ -168,6 +168,18 @@ describe("the meaning view", () => {
     expect(within(table).getByText("confirmed")).toBeTruthy()
   })
 
+  it("tones a confirmed row's status pill success and a draft row's warning", () => {
+    const { state } = readyMeanings([DRAFT, CONFIRMED])
+    renderCard(ROWS, state)
+    fireEvent.click(meaningTab())
+
+    const table = meaningTable()
+    const confirmedRow = within(table).getByText("Number of distinct customers").closest("[role=row]") as HTMLElement
+    const draftRow = within(table).getByText("Total order value in rupiah").closest("[role=row]") as HTMLElement
+    expect(within(confirmedRow).getByText("confirmed").className).toContain("bg-emerald-500/12")
+    expect(within(draftRow).getByText("draft").className).toContain("bg-amber-500/12")
+  })
+
   it("shows a column with no entry as not set, with no meaning written", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
@@ -476,6 +488,21 @@ describe("the table's meaning card", () => {
     expect(screen.getByText("Orders placed by customers")).toBeTruthy()
     expect(screen.getByText("pesanan")).toBeTruthy()
     expect(screen.getByText("AI draft")).toBeTruthy()
+  })
+
+  it("shows a Confirmed pill in the success tone for a confirmed table, and no AI draft", () => {
+    const { state } = readyMeanings([], { table: entry({ description: "A", status: "confirmed" }) })
+    render(<TableMeaningCard state={state} />)
+    const pill = screen.getByText("Confirmed")
+    expect(pill.className).toContain("bg-emerald-500/12")
+    expect(screen.queryByText("AI draft")).toBeNull()
+  })
+
+  it("shows AI draft for a draft table, and no Confirmed pill", () => {
+    const { state } = readyMeanings([], { table: entry({ description: "A", status: "draft", model: "MiniMax-M3" }) })
+    render(<TableMeaningCard state={state} />)
+    expect(screen.getByText("AI draft")).toBeTruthy()
+    expect(screen.queryByText("Confirmed")).toBeNull()
   })
 
   it("names the model that drafted it, and says so when no model is recorded", () => {

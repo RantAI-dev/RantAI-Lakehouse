@@ -194,6 +194,7 @@ function TableMeaningReady({ state }: { state: Ready }) {
           ) : null}
           <div className="flex flex-wrap items-center gap-2">
             {draft ? <Pill tone="warning">AI draft</Pill> : null}
+            {table?.status === "confirmed" ? <Pill tone="success">Confirmed</Pill> : null}
             <ProvenanceLine entry={table} />
           </div>
         </div>
@@ -216,7 +217,7 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // Cells shed by container query, in this order
 // (PR #109 review, finding 4): the synonyms go first, below `@3xl`; the status
 // goes second, below `@2xl`, so a reader who cannot write still sees whether
-// an entry is a draft. The column name, the role, the meaning and the confirm
+// an entry is a draft or confirmed. The column name, the role, the meaning and the confirm
 // control never shed. Every breakpoint lists the cells that are shown, in
 // order, so the header and the rows agree.
 //
@@ -374,7 +375,9 @@ function MeaningRow({
         </span>
       </div>
       <div role="cell" className="hidden @2xl:block">
-        {entry ? <Pill tone={draft ? "warning" : "neutral"}>{entry.status}</Pill> : null}
+        {entry ? (
+          <Pill tone={entry.status === "confirmed" ? "success" : draft ? "warning" : "neutral"}>{entry.status}</Pill>
+        ) : null}
       </div>
       <div role="cell" className="col-start-3 row-span-2 row-start-1 flex justify-end @lg:col-start-auto @lg:row-span-1 @lg:row-start-auto">
         {canEdit && draft ? (
