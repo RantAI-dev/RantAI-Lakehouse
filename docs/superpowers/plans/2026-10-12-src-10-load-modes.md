@@ -177,6 +177,32 @@ the AI team reviews the diff.
 - Any change to `replace`, `append` or `incremental` for tables that keep
   those modes.
 
+## 3b. History, as decided after the measurement (product owner, 2026-10-12)
+
+Feature-page decisions 9 and 10 are signed. Task 3a is built this way:
+
+- **One transaction, written by our module, not by the loader's load step.**
+  The first pass's prototype (case o) is the model: the rows to write are
+  computed, then one pyiceberg transaction on the table writes the closed
+  versions and the new versions together. A failure leaves nothing.
+- **The whole source every run.** A history table takes no cursor in this
+  version. `validate_load_modes` refuses `history` with an `incrementalKey`.
+- **What must still be true of a load done this way**, each with a test:
+  the rows carry `_ingested_at` and the loader's own bookkeeping columns so
+  the table reads like any other Bronze table; the table is created with the
+  day partition and format version 2 when it does not exist; `SRC-8`'s
+  schema observation and `SRC-7`'s run facts see the run as any other; an
+  `ingest_run` row is recorded; the schema grows when the source gains a
+  column (a new column in a history table is a new version only for rows
+  whose value is not null); a table that does not have the history columns
+  is refused, never converted.
+- **Memory.** The current rows of every key in the load are read from the
+  table and the whole source is held to compare. The bound of the dedup
+  step (`INGEST_DEDUP_MAX_ROWS`) applies; above it the load fails with the
+  fixed message.
+- **Mode value** `history`, with a key; offered in the console for every
+  batch source that can name a key.
+
 ## Handoff
 
 ### Task 1 only (developer, stopped on a plan stop condition)
