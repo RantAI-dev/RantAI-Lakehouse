@@ -548,23 +548,42 @@ jobs:
           EOF
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
         run: >
-          docker compose -p g4ci --profile dagster up -d --build
+          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml
+          --profile dagster up -d --build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
           g4-source-init debezium-server
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the G4 acceptance test inside the compose network
-        run: docker compose -p g4ci --profile dagster run --rm g4-test-runner
+        # `tee` and `-T`: the gate prints its connector table between two
+        # marker lines and the next step copies it to the job summary (same
+        # as g6-ingest). `shell: bash` for pipefail.
+        shell: bash
+        run: |
+          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+            --profile dagster run --rm -T g4-test-runner 2>&1 | tee "$RUNNER_TEMP/g4-run.log"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Compose logs (on failure)
         if: failure()
-        run: docker compose -p g4ci logs
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster logs
 
       - name: Tear down
         if: always()
-        run: docker compose -p g4ci down -v
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster down -v
 
   # ── WS3 (G6) acceptance — the Tier 1 ingestion matrix: one connector
   # per adapter (sql×mysql, sql×mssql, sql×postgres, files×csv, rest) is

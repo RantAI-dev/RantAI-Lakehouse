@@ -13,15 +13,16 @@
     "PostgreSQL CDC": {
       "gate": "g4",
       "steps": {
-        "connect": "missing",
-        "discover": "missing",
+        "connect": "real",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
-        "connect": "The product tests a CDC connector like its SQL twin (real); no gate calls it yet.",
-        "discover": "The product lists tables for a cdc connector (real); no gate calls it yet.",
-        "load": "ops/g4: first copy into Bronze.",
+        "all": "SRC-9 plan task 6: ops/g4/g4_test.py records all four steps through gate_summary.",
+        "connect": "ops/g4 registers the demo source as a 'PostgreSQL CDC' connector (adapter cdc) and POST .../test must answer supported:true, ok:true, like its SQL twin.",
+        "discover": "ops/g4: POST .../discover?schema=p5_cdc must list p5_cdc.orders with its columns.",
+        "load": "ops/g4: the initial snapshot reaches Bronze and holds the seeded rows (first copy).",
         "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
       }
     },
@@ -43,7 +44,7 @@
         "reload": "missing"
       },
       "notes": {
-        "all": "SRC-9 plan task 6."
+        "all": "SRC-9 plan task 6, FINDING, no gate built: GET /api/connectors/{id}/debezium-properties renders the PostgreSQL template with the MySQL class name (rust/crates/lakehouse-store/src/cdc.rs:664-673). Debezium 3.6.3 (the pinned debezium-server-iceberg 1.1.1.Final) requires 'database.server.id' for the MySQL connector (BinlogConnectorConfig.SERVER_ID is .required()); the template never renders it although the dial carries serverId (ingest_spec.rs CdcDial.server_id; cdc.rs reads it nowhere). It also emits PostgreSQL-only plugin.name=pgoutput, slot.name, publication.name and publication.autocreate.mode, and a 'database.dbname' the MySQL connector does not have. A Debezium Server started from it fails configuration validation. Product owner decision needed: build a MySQL template, or supported=false with a reason (as SRC-6 did for Google Sheets). Waived until SRC-4."
       }
     },
     "MariaDB": {
@@ -76,7 +77,7 @@
         "reload": "missing"
       },
       "notes": {
-        "all": "SRC-9 plan task 6."
+        "all": "SRC-9 plan task 6, FINDING, no gate built: GET /api/connectors/{id}/debezium-properties renders the PostgreSQL template with the SQL Server class name (rust/crates/lakehouse-store/src/cdc.rs:664-673). Debezium 3.6.3 requires 'database.names' for the SQL Server connector (SqlServerConnectorConfig.DATABASE_NAMES, validated 'Cannot be empty'); the template renders 'database.dbname' instead, which that connector does not define, so validation fails. It also emits PostgreSQL-only plugin.name=pgoutput, slot.name, publication.name and publication.autocreate.mode. A Debezium Server started from it fails configuration validation. Product owner decision needed: build a SQL Server template, or supported=false with a reason. Waived until SRC-4."
       }
     },
     "Object storage": {

@@ -2733,6 +2733,12 @@ services:
       # verification) — mounting it at `/opt/...` instead avoids leaving
       # that stray artifact in the repo tree.
       - ./ops/debezium/deprovision_connector.sh:/opt/deprovision_connector.sh:ro
+      # SRC-9 plan task 6: `ops/gates/gate_summary.py` and `coverage.json`, the
+      # registry and result table every connector gate records into. At
+      # /opt/gates for the reason the deprovision script is at /opt: a bind
+      # mount nested under the bind-mounted /work would make Docker create
+      # the mount point on the host. Read-only, no secrets in it.
+      - ./ops/gates:/opt/gates:ro
     depends_on:
       debezium-server:
         condition: service_started
@@ -2758,6 +2764,12 @@ services:
         condition: service_healthy
     environment:
       DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
+      # SRC-9 plan task 6: where `import gate_summary` finds the module
+      # mounted above; no bytecode, because /work is a read-write bind of
+      # `ops/g4` and a root-owned `__pycache__` there breaks the next
+      # checkout's `git clean` (see `g3a-test-runner`'s note).
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
       CH_URL: http://clickhouse:8123
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
