@@ -85,6 +85,8 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 | 9 | As a user without `connector:manage`, try steps 1 and 5 | Refused | |
 | 10 | Point an object-storage connector at an endpoint that is down; test | A plain failure message with no address or server text in it | |
 
+Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f` (own database; the shared orchestrator, so no run could be started): the screens were reported as conforming ("QA sudah sesuai"). The instance afterwards held one object-storage connector made in the wizard with an endpoint, tested and healthy (rows 1, 7, 8). It held no Oracle connector, so rows 5 and 6 left no trace there. Rows 3, 9 and 10 were not in the check. This is not the acceptance run: the table above is filled on a real deployment.
+
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
 Exceptions, each with an owner and a date:

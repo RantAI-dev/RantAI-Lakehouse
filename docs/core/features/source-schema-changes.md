@@ -97,6 +97,8 @@ Target row works as written" checkable and cover the decisions above.
 | 11 | Set "apply all" on a PostgreSQL connector; create a table in a schema it loads from; run | The table is added to the connector and loaded; the notice lists it | |
 | 12 | While one table waits (row 3), look at the connector's other tables and its health | They loaded; no failure alert; the failure count did not rise | |
 
+Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f`: the Schema changes tab and the policy choice were reported as conforming ("QA sudah sesuai"). No policy change was left saved on that instance. No run could be started there, so rows 2 to 12 were not exercised in a browser; the g6 gate proved rows 2, 3, 8 and 12 against MySQL on PR #101. This is not the acceptance run.
+
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
 Exceptions, each with an owner and a date:
