@@ -428,6 +428,44 @@ Commands: `cargo fmt --check` OK; clippy workspace (detached, after touch) Finis
 
 *(developer)*
 
+### Sixth pass: history (developer)
+
+Scope: the `history` mode (section 3b; feature-page decisions 9 and 10). Commits after `62f72e9`:
+
+| Commit | Item |
+| --- | --- |
+| `36b8a20` | CI of PR #115: `ingest_run.rs` seeded every connector under one fixed name |
+| `2d796ce` | H1 measurement (`test_history_write_measurement.py`, 13 tests) |
+| `4c45058` | H2 store, validation, contract |
+| `94b8003` | H3 `adapters/history.py`, the sink routing, tests |
+| `f154f8f` | H4 console |
+
+**No stop condition was hit.** H1 (dlt 1.30.0, pyiceberg 0.12.0, local catalog):
+
+- One transaction, one commit: 3,000 changed keys (6,000 rows) are one new metadata-log entry (three snapshots: the upsert's overwrite and its two parts, then the append); 2,500 composite keys, one commit.
+- A row violating the schema, and an exception between the staged closed rows and the append: rows, commits and snapshots as before; the next load succeeds in one commit. An identical load writes nothing and adds no commit.
+- Creation and growth, option (a): dlt creates the table and adds columns by running on a ZERO-ROW typed Arrow table (an empty `dlt.resource` with hints does nothing). Metadata commits: 1 to create, 2 to add a column, 1 for a run with nothing to add (so the module runs the step only when a column is missing). The data is always one commit of ours.
+- dlt's schema lists every column of the table, a fresh working directory restores the same, `clear_table` empties a table this mode made and keeps its columns, the next load works.
+- The four history columns are NULLABLE: required ones make a load in another mode fail even after `clear_table` ("declared non-nullable but contains nulls"), measured. `_dlt_id`/`_dlt_load_id` stay required (declared on the Arrow schema).
+
+Decisions the plan left open, taken here: closed rows keep their `_dlt_id`, `_ingested_at` and `_row_hash` (only `_valid_to` and `_is_current` change); new rows have `_ingested_at` = `_valid_from` = the time the load started; keys are matched by the hash's own encoding (`key_token`); an EMPTY table of another mode is accepted and gets the columns (that is what "Refresh, removing rows" leaves), a non-empty one is refused; "has the columns but was loaded in another mode" is detected by a row with no `_row_hash`; `HistoryRefused` subclasses `DedupRefused` (one except arm, status `rejected`).
+
+`SinkResult.rows` = NEW versions written (closed rows not counted). Memory: the winners of the load plus the current row of each of their keys (about twice the source), bound `INGEST_DEDUP_MAX_ROWS` (distinct keys) checked before the table is read. Not measured: wall time and memory at the bound.
+
+Commands: `cd rust && cargo fmt --check` OK; clippy (`--workspace --all-targets --all-features --locked -D warnings`, detached, after touch, 16 GB free): Finished in 2m22s, no warning. Dagster whole suite, detached: after H1 921 passed (911 + 10 of the first H1 version; H1 then grew to 13 and was re-run alone, 13 passed in 165 s); at H3 967 passed, 1 xfailed, 1 failed (`test_sink_dedup_modes.py` pins `LOAD_MODES`; fixed, re-run alone, passes; the full suite was NOT re-run after that one-word fix). `check_intra_package_imports.py`, `check_bare_iceberg_count.py`: OK. `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings; `bun run test` 1104 pass, 1 skip, 0 fail; `src/features/connectors` 10 runs, 233 pass 0 fail each.
+
+Assertions changed: `ingest_run.rs` (unknown-mode message gains `history`; third pass pinned it); `test_sink_dedup_modes.py` (`LOAD_MODES` gains `history`); `connector-ingest-panel.test.tsx` (three option lists gain `history`; one test renamed). Nothing weakened.
+
+**Found, not fixed:** `sink.clear_table` (fourth pass) does NOT empty a table `load_via_sink` made from PLAIN rows (files, REST, MongoDB, SFTP): pyiceberg logs "Delete operation did not match any records" and the rows stay (`test_clear_table_empties_a_table_made_from_plain_rows`, `xfail(strict)`). It empties a table a `sql_database` source made, or this mode. So `clear` and `refresh_remove` do not empty such tables in ANY mode, and for history the next load is then refused with the "Refresh, removing rows" message. Needs a backlog item and the planner's decision (cause not pursued).
+
+Limits to know: a load in another mode into a table that holds history is not refused (columns are nullable): it adds rows with no history values, and the next history load refuses the table. The console note covers the boundary. A column null in every row of a load is not created until a row has a value. A column's type is fixed by the table; a value that does not fit is refused naming the column. Two loads at the same moment on one table: pyiceberg commits optimistically (conflict fails the load, table intact); not measured.
+
+Not verified: `cargo test` (CI); a Lakekeeper REST catalog (`open_table` relies on `sync_destination` and the destination client as the sink installs them); ClickHouse/Trino reading a history table (gate, task 8); a real Postgres/MySQL source through the history mode (SQLite stands in); the console in a browser; the assistant tool schema (it lists no load mode, so unchanged).
+
+Plan/code mismatches: (a) the plan's 3b says "a table that does not have the history columns is refused"; an empty one is accepted (needed for "Refresh, removing rows"). (b) the `clear_table` defect above.
+
+*(developer)*
+
 ## Review
 
 *(planner)*
