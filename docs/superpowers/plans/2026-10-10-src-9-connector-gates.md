@@ -334,6 +334,126 @@ discover `refused-as-expected` (discover's reason today reads "unknown adapter
 \"sftp\"", not a statement that discovery is unsupported; reason text is not
 asserted), load and reload pass. Oracle stays `missing`.
 
+### Third pass (developer): tasks 7, 5, 6, 8
+
+Commits after `9c1846f`: `350266a` (task 7), `5ccaab8` (task 5), `46139f4`
+(task 6), `ee359cc` (task 8).
+
+**Task 6 finding (no MySQL CDC or SQL Server CDC gate built).** In g4 one
+static `debezium-server` (`docker-compose.yml`, heredoc of
+`application.properties`, PostgreSQL only) captures `p5_cdc.orders`; nothing
+renders it from the API. `GET /api/connectors/{id}/debezium-properties`
+(`routes/connectors.rs`, `debezium_properties`; it is a GET, not a POST)
+calls `render_debezium_properties_template`, whose non-Mongo branch
+(`lakehouse-store/src/cdc.rs:664-673`) is the PostgreSQL shape with only
+`connector.class` swapped (`connectors.rs:1888`, `debezium_connector_class`).
+Read from the Debezium 3.6.3.Final sources (the version of the pinned
+`debezium-server-iceberg:1.1.1.Final`, from its release notes): MySQL's
+`database.server.id` is `.required()` (`BinlogConnectorConfig.SERVER_ID`) and
+is never rendered (`CdcDial.server_id`, `ingest_spec.rs:117`, is read nowhere
+in `cdc.rs` or `connectors.rs`); SQL Server's `database.names` is validated
+non-empty (`SqlServerConnectorConfig.DATABASE_NAMES`) and the template renders
+`database.dbname`, which that connector does not define. Both also receive
+the PostgreSQL-only `plugin.name=pgoutput`, `slot.name={slug}_slot` (derived
+from the connector id, not from `dial.slotName`), `publication.name`,
+`publication.autocreate.mode`. A Debezium Server started from either fails
+configuration validation. Also: `DELETE /api/connectors/{id}` and
+`ops/debezium/deprovision_connector.sh` clean up PostgreSQL slots only, so
+"deletion leaves nothing behind" has no MySQL or SQL Server counterpart.
+Decision for the product owner: build the templates (a separate item), or
+`supported = false` with a reason as `SRC-6` did for Google Sheets. Both
+types stay `missing` in `coverage.json` with the gaps in their notes, waived
+until `SRC-4` (the item that already lists "live change capture ... each
+gate-tested"), which the planner may re-point. Not verified: `database.encrypt`
+for SQL Server (JDBC encryption defaults) and the MySQL schema-history
+storage choice, since the first blocker comes before them.
+
+**Task 7.** `g9-test-runner` (profile `dagster`, `ops/g9` and `ops/fixtures`
+read-only under `/work`) and job `g9-upload`, 25 minutes, the scope-gate
+`if:` of `g6-ingest`, CI-only `.env`, teardown. Two things the gate needs
+that no other job gives: `UPLOAD_S3_ACCESS_KEY`/`UPLOAD_S3_SECRET_KEY` for
+`lakehouse-api` (no default; unset, uploads answer 503), set in the CI `.env`
+to RustFS's own default root key (`rustfsadmin`, RustFS has no other
+identity, see the `CONNECTOR_S3_*` note), and `clickhouse-iceberg-init` in the
+`up` list (the API's `ICEBERG_QUERY_DB`; nothing depends on it).
+`ci-required`: `needs`, `G9_UPLOAD_RESULT`, `required_gate.sh`, its self-test
+(27 -> 28 cases), `docs/CI.md`. `ops/g9/**` is `stack` in
+`detect_change_scope.sh` (confirmed; test case added, 33 pass).
+
+**Task 5.** `ops/g6/docker-compose.g6-oracle.override.yml` (own profile
+`g6-oracle`, own runner `g6-oracle-test-runner`, does not combine with the g6
+override), `ops/g6/g6_oracle_test.py` (imports the matrix gate's helpers),
+job `g6-oracle`. Image `gvenzl/oracle-free:23.26.2-slim-faststart@sha256:5e340d72c5cd93b5ce8bab6c128b8f37a5ec485d5d9d98dc2cdc5353fe640f96`
+(index digest, from the Docker Hub registry API today). Healthcheck
+`/opt/oracle/healthcheck.sh`, verified by reading it out of the image's layer:
+exit 0 only when `FREEPDB1` and the container database are `READ WRITE` and
+the init flag files are gone. The gate also waits for a real thin-mode login.
+Licence: the database is under Oracle's Free Use Terms and Conditions, no
+interactive acceptance variable exists; that is decision 5's licence question
+for the product owner. `oracledb==2.5.1` is already in the dagster image the
+runner is built from. `coverage.json`: Oracle -> `g6-oracle`, connect and
+discover `refused`, load and reload `real`; `test_gate_summary` removed
+Oracle's gate inside the test instead of relying on it being gate-less (same
+assertion).
+
+*Probable defect, not proven:* `adapters/oracle.py` passes the dial's
+`database` (labelled "Database (service name)" in the console) to SQLAlchemy as
+the URL path, which `cx_oracle.py:1347-1349` hands to `makedsn(sid=...)`, so
+`FREEPDB1` is sent as a SID, not a service name. Expect `ORA-12505` on load.
+The fix would be a `service_name` query argument in the adapter (Python, not
+done here). The gate was not bent around it.
+
+**Task 6 (g4).** `g4_test.py` records `PostgreSQL CDC` through `gate_summary`:
+connect and discover (the demo source registered as a `PostgreSQL CDC`
+connector with its real slot and publication, `POST .../test`,
+`POST .../discover?schema=p5_cdc`), load (new: the snapshot holds the 5 seeded
+rows) and reload (the three existing assertions, only wrapped to record).
+Needs `ops/g4/docker-compose.g4.override.yml` (a `file:` credential volume and
+`CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`, gate-only) on every compose call of the
+`g4-cdc` job, and the `ops/gates` mount in `g4-test-runner`. The job copies
+the table to its summary.
+
+**Task 8.** `ops/lint/check_connector_gate_coverage.py` and 23 unit tests;
+`Registry` validates and returns a `waiver`. A step in `repo-lints` runs it
+and the unit tests of `ops/lint` and `ops/gates`. On the real tree: 13
+supported types, 11 covered, 2 waived (MySQL CDC, SQL Server CDC, until
+`SRC-4`), exit 0.
+
+**g6 time.** Nothing here touches the `g6-ingest` job (the diff of `ci.yml`
+has no hunk inside it).
+
+**Commands run, with results.** `py_compile` on `ops/g4/g4_test.py`,
+`ops/g6/g6_oracle_test.py`, `ops/g6/g6_ingest_matrix_test.py`,
+`ops/g9/upload_test.py`, the lint and its test, `ops/gates/gate_summary.py`:
+ok. `python3 -m unittest discover -s ops/gates -p 'test_*.py'`: 29 tests OK.
+`python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK.
+`check_intra_package_imports.py`, `check_bare_iceberg_count.py`,
+`check_compose_init_readiness.py`, `check_connector_gate_coverage.py`: pass.
+`bash scripts/ci/tests/test_required_gate.sh`: 28 passed;
+`test_detect_change_scope.sh`: 33 passed. `yaml.safe_load` of `ci.yml` and every
+compose file touched: ok. `docker compose -p check [-f override] --profile ...
+config --quiet` with a dummy env file for: base + `dagster` (g9), g6 + `g6` +
+`dagster`, g6-oracle + `g6-oracle` + `dagster`, g4 + `dagster`, and
+`--profile '*'` on the base file: all ok; the Oracle file fails closed naming
+`ORACLE_G6_PASSWORD` when the env lacks it. No cargo, no bun, nothing started.
+
+**Not verified (all of it needs CI).** That any container starts: `g9-upload`
+(upload credential accepted by RustFS, fixtures at `/work/fixtures`, the
+table readable through `icecat_api`); `g6-oracle` (image pulls and opens in
+time on a runner, the healthcheck, the adapter dial, the SID defect above, the
+job's duration); g4 (connect and discover answer for real for a `cdc`
+connector, the file credential resolves, the snapshot holds exactly 5 rows when
+first visible, the `-f` pair and `-T`/`tee` in the g4 job); the `awk` summary
+steps. The Debezium findings are from sources, not from running a server.
+
+**Expect from CI.** `g9-upload`: pass, if the upload credential works; most
+likely failures are the 503 "Upload storage" (credential) or the table not
+visible through `icecat_api`. `g6-oracle`: load fails with an Oracle
+connection error if the SID defect is real; connect and discover show
+`refused-as-expected`. `g4-cdc`: connect and discover are the new risk; a
+failure there is recorded, the Debezium steps still run, and the verdict names
+the cell. `repo-lints`: pass.
+
 ## Review
 
 *(planner)*
