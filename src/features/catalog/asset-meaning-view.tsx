@@ -1,15 +1,17 @@
 "use client"
 
 /**
- * The meaning of a table and of its columns on the Schema tab: the table's
- * card above the Columns card, and the Meaning view that the Columns card
- * switches to. The pure rules (which keys have an entry, how entries split,
- * how a save body is built) are in `asset-meaning.ts`.
+ * The meaning of a table and of its columns: the table's card above the
+ * Columns card on the Schema tab, the Meaning view that the Columns card
+ * switches to, and the page header's `MeaningBadge` pill. The pure rules
+ * (which keys have an entry, how entries split, how a save body is built)
+ * are in `asset-meaning.ts`.
  *
  * A person writes here only through the state's `save`, with a body built by
  * `inputOf`, so no save drops a field the API replaces.
  */
 import * as React from "react"
+import Link from "next/link"
 import { Check } from "lucide-react"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
@@ -34,9 +36,50 @@ import { formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { SemanticEntry, SemanticEntryInput } from "@/services/contracts/semantic"
 import type { SchemaRow } from "./asset-columns"
-import { inputOf, parseSynonyms, ROLE_OPTIONS, roleLabel, type MeaningState } from "./asset-meaning"
+import {
+  inputOf,
+  meaningSummary,
+  parseSynonyms,
+  ROLE_OPTIONS,
+  roleLabel,
+  type MeaningState,
+} from "./asset-meaning"
 
 type Ready = Extract<MeaningState, { kind: "ready" }>
+
+/**
+ * The page header's pill: how much of the table's meaning a person has
+ * confirmed. It renders outside the Schema tab, so it lives beside the
+ * view's other exports; a press opens the Schema tab, where the meanings are.
+ */
+export function MeaningBadge({ state, columns }: { state: MeaningState; columns: readonly string[] }) {
+  if (state.kind !== "ready") return null
+  const summary = meaningSummary(columns, state.table, state.byColumn)
+  if (summary.kind === "none") return null
+  const { tone, text, title } =
+    summary.kind === "draft"
+      ? {
+          tone: "warning" as const,
+          text: "Meaning: AI draft",
+          title: "The assistant drafted this table's meanings. Nobody has confirmed them yet.",
+        }
+      : summary.kind === "partial"
+        ? {
+            tone: "info" as const,
+            text: `Meaning: ${summary.confirmed} of ${summary.total} confirmed`,
+            title: `A person has confirmed ${summary.confirmed} of this table's ${summary.total} meanings.`,
+          }
+        : {
+            tone: "success" as const,
+            text: "Meaning: confirmed",
+            title: "A person has confirmed every meaning of this table.",
+          }
+  return (
+    <Link href="?tab=schema" title={title} className="rounded-full">
+      <Pill tone={tone}>{text}</Pill>
+    </Link>
+  )
+}
 
 /** The API's limits on a description (`semantic_api.rs` `TABLE_TEXT_CHARS`, `COLUMN_TEXT_CHARS`). */
 const TABLE_TEXT_MAX = 400
@@ -152,6 +195,7 @@ function TableMeaningReady({ state }: { state: Ready }) {
           ) : null}
           <div className="flex flex-wrap items-center gap-2">
             {draft ? <Pill tone="warning">AI draft</Pill> : null}
+            {table?.status === "confirmed" ? <Pill tone="success">Confirmed</Pill> : null}
             <ProvenanceLine entry={table} />
           </div>
         </div>
@@ -174,7 +218,7 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // Cells shed by container query, in this order
 // (PR #109 review, finding 4): the synonyms go first, below `@3xl`; the status
 // goes second, below `@2xl`, so a reader who cannot write still sees whether
-// an entry is a draft. The column name, the role, the meaning and the confirm
+// an entry is a draft or confirmed. The column name, the role, the meaning and the confirm
 // control never shed. Every breakpoint lists the cells that are shown, in
 // order, so the header and the rows agree.
 //
@@ -332,7 +376,9 @@ function MeaningRow({
         </span>
       </div>
       <div role="cell" className="hidden @2xl:block">
-        {entry ? <Pill tone={draft ? "warning" : "neutral"}>{entry.status}</Pill> : null}
+        {entry ? (
+          <Pill tone={entry.status === "confirmed" ? "success" : draft ? "warning" : "neutral"}>{entry.status}</Pill>
+        ) : null}
       </div>
       <div role="cell" className="col-start-3 row-span-2 row-start-1 flex justify-end @lg:col-start-auto @lg:row-span-1 @lg:row-start-auto">
         {canEdit && draft ? (

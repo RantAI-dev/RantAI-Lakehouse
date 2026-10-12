@@ -27,6 +27,8 @@ import { formatDate } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
+import type { MeaningState } from "./asset-meaning"
+import type { SemanticEntry } from "@/services/contracts/semantic"
 import { relatedTables } from "./asset-lineage"
 
 afterEach(() => {
@@ -223,10 +225,10 @@ function stubApi({
   }) as unknown as typeof fetch)
 }
 
-function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}) {
+function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}, meanings?: MeaningState) {
   return render(
     <AuthProvider>
-      <AssetDetailTabs asset={asset} onAssetChanged={onAssetChanged} />
+      <AssetDetailTabs asset={asset} onAssetChanged={onAssetChanged} meanings={meanings} />
     </AuthProvider>
   )
 }
@@ -2106,5 +2108,35 @@ describe("Schema versions of a Silver or Gold table", () => {
 
     expect(await screen.findByText("No schema history available")).toBeTruthy()
     expect(screen.queryByText("No schema version recorded yet")).toBeNull()
+  })
+})
+
+describe("Schema tab: the meaning the page passes in", () => {
+  it("shows the Meaning card of the state the page holds, without a request of its own", () => {
+    const fetchSpy = stubApi()
+    const table: SemanticEntry = {
+      asset: "bronze.demo_orders",
+      column: null,
+      description: "Orders as confirmed by a person",
+      synonyms: [],
+      role: null,
+      status: "confirmed",
+      writtenBy: null,
+      model: null,
+      updatedAt: new Date().toISOString(),
+    }
+    const meanings: MeaningState = {
+      kind: "ready",
+      table,
+      byColumn: new Map(),
+      canEdit: false,
+      save: async () => {},
+      reload: () => {},
+    }
+    renderTabs(BRONZE, () => {}, meanings)
+    fireEvent.click(screen.getByRole("tab", { name: /Schema/ }))
+
+    expect(screen.getByText("Orders as confirmed by a person")).toBeTruthy()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/semantic/"))).toBe(false)
   })
 })

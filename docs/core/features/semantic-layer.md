@@ -16,7 +16,7 @@ A `serving` or `silver` table built by a pipeline, or from any source that gives
 1. Ask the copilot a question about a table using a column's synonym and get an answer.
 2. Wait for a drafting pass and see a `silver` or `serving` table's automatic descriptions within that pass.
 3. See the table's automatic descriptions through `GET /api/semantic/{table}`.
-4. Read a table's meaning and every column's meaning, names, role and status in Data Explorer, a table's Schema tab, view Meaning.
+4. Read a table's meaning and every column's meaning, names, role and status in Data Explorer, a table's Schema tab, view Meaning, and see in the table page's header how much of the table's meaning a person has confirmed.
 5. With `catalog:write`, change a role in its row, edit a meaning and its names in a dialog, and confirm a draft with one press, or do the same through `PUT /api/semantic/{asset}`, replacing any draft.
 6. The chat uses a confirmed text or a draft when it writes SQL; a person's text wins over a draft, and a draft never overwrites a person's text.
 
@@ -46,6 +46,7 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 | 4 | The draft's language is the deployment's `AI_DEFAULT_REPLY_LANGUAGE` | English | Owner, 2026-10-07 |
 | 5 | The switch is `AI_SEMANTIC_LAYER` | on | Owner, 2026-10-07 |
 | 6 | The page is the Schema tab of a table in Data Explorer: a Meaning card for the table and a Meaning view of the Columns card. No "confirm all" | none | Owner, 2026-10-09 |
+| 7 | An entry is marked "AI draft" or "Confirmed"; the page header sums up the table as AI draft, partly confirmed or confirmed | none | Owner, 2026-10-12 |
 
 ## Limits to tell a customer
 
@@ -63,7 +64,7 @@ Yes. The user asks the copilot about a table by name or by using a synonym the c
 
 ## Acceptance checklist
 
-Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass. In rows 1 to 20, `<asset>` is a qualified table name, such as `silver.orders` or `serving.dashboard_users`, picked in row 1.
+Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A step not performed is never Pass. In rows 1 to 21, `<asset>` is a qualified table name, such as `silver.orders` or `serving.dashboard_users`, picked in row 1.
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -87,6 +88,7 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 | 18 | Press a meaning, change the text, save. | The new text shows and the row is `confirmed`. | |
 | 19 | Tick `Drafts only` on a table with more columns than the page size, and confirm every draft listed. | Every draft of the table was listed, not only those on the first page; at the end the view says `No draft left to review.` and unticking the box lists every column. | |
 | 20 | Sign in with `catalog:read` only and open the same tab. | The meanings show; there is no role choice, no edit and no confirm control. | |
+| 21 | Open a `serving` or `silver` table whose meanings are all drafts. Confirm one column, then every other meaning. | The header pill reads `Meaning: AI draft`, then `Meaning: 1 of N confirmed`, then `Meaning: confirmed`, changing without a reload; the confirmed entries are marked `Confirmed` in green. | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
