@@ -77,14 +77,15 @@ export function useProfile(assetId: string): ProfileState {
 }
 
 /**
- * The meanings a person reads and corrects on the Schema tab. A table the
- * semantic route never serves gets `none` and no request. Otherwise the
+ * The meanings a person reads and corrects on the Schema tab and in the page
+ * header. A table the semantic route never serves gets `none` and no request,
+ * and so does `null`, the asset while it is still loading. Otherwise the
  * entries are read through `useService` with `keepDataOnReload`, so the list
  * stays on screen while it reloads after a save.
  */
-export function useMeanings(a: AssetDetail): MeaningState {
+export function useMeanings(a: AssetDetail | null): MeaningState {
   const { hasPermission } = useAuth()
-  const asset = semanticAsset(lineageKey(a))
+  const asset = a === null ? null : semanticAsset(lineageKey(a))
   const canEdit = hasPermission("catalog:write")
   // The fetcher is the same for `none` and for a served table: a `null` asset
   // resolves without a request, so the hook's call order never changes.

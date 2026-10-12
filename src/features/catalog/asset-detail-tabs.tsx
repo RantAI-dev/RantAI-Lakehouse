@@ -20,6 +20,7 @@ import {
 } from "@/components/patterns/line-tabs"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import type { AssetDetail } from "@/services/contracts/assets"
+import type { MeaningState } from "./asset-meaning"
 import { AssetAccess } from "./asset-access"
 import { AssetActivity } from "./asset-activity"
 import {
@@ -87,10 +88,13 @@ function tabCount(
 export function AssetDetailTabs({
   asset: a,
   onAssetChanged,
+  meanings,
 }: {
   asset: AssetDetail
   /** Reloads the asset after something on a tab changed it. */
   onAssetChanged: () => void
+  /** The page's meanings, read once by the page for its header and this tab. */
+  meanings?: MeaningState
 }) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -141,7 +145,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="schema">
-          <AssetSchema asset={a} iceberg={iceberg} />
+          <AssetSchema asset={a} iceberg={iceberg} meanings={meanings} />
         </TabsContent>
 
         <TabsContent value="sample">
