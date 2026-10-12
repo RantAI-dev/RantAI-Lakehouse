@@ -358,6 +358,36 @@ Not verified: `cargo test` (not run on this machine; CI), so `ingest_run.rs` pas
 
 *(developer)*
 
+### Fourth pass: schema changes and the key, refresh and clear, the console (developer)
+
+Scope: plan tasks 4 to 7. `history` (task 3a) is still waiting for the product owner: no `history` value, no option for it.
+Commits on `feat/src-10-load-modes` after `d03ee44`:
+
+| Commit | Task |
+| --- | --- |
+| `13e713a` | 4 schema changes meet the key (decision 6) |
+| `33a4715` | 5 one table, with an action (decision 5), API and orchestrator |
+| `81d2fad` | 6 console: modes and key (decisions 2, 3, 4), discovery returns the key |
+| `3fd067d` | 7 console: refresh and clear (decision 5) |
+
+**Task 4.** The table's mode and key are read from the STORED spec (`ingest_spec::dedup_keys`) by the observation route and again by `list_pending`, by `record` and by `approve_object`, so a row becomes approvable the moment the key or the mode stops naming its column. `schema_diff::decide_for_key` / `evaluate_for_key` (`decide` and `evaluate` are the same with no key). The removal of a key column waits under every policy, `canApprove` is false for the table's waiting changes, approval is a 409 with a fixed text, and the connector is NOT paused by it (SRC-8 review BLOCKER 3a: a pause nobody can lift by approving sticks). A changed source primary key stays approvable: the declared key is still loadable; a removed key column is not. Wire change: the store's `ApproveOutcome` has a fourth variant, `KeyStillNamed`.
+
+**Task 5.** Measured first (`test_sink_empty_table.py`): `load_via_sink([], ..., replace)` empties a table that plain rows created (earlier measurement) but leaves all rows of a table a `sql_database` source created. `sink.clear_table` therefore runs `pipeline.run([], table_format="iceberg", write_disposition="replace")` straight on the table's pipeline: the table is emptied and keeps its columns, the day partition on `_ingested_at` and format-version 2; an empty `dlt` resource leaves the table untouched; a never-loaded table stays absent; idempotent. `LoadPlan.refresh` (`keep` | `remove`) forgets the table's cursor AND dedup marker (`_forget_table_state`); `remove` empties first, inside `load_via_sink`, after the adapter's schema check. For a deduplicating mode "keeping" already replaces with the deduplicated source (the first-run rule), so keep and remove end in the same rows; only `append` differs ("keeping" = a second full copy, like Airbyte's refresh-retain). `ingest_run.status` is a free `String` in `EXPECTED_SCHEMAS`: `cleared` is stored with rows 0. A `clear` resolves no secret, dials no source and makes no schema observation, so `connector_source_schema` is untouched.
+
+**Task 6.** Discovery now returns `primaryKey` (see report); three const queries, one bind each, MySQL names cast to `CHAR`.
+
+**Task 7.** The Runs card state moved into `useIngestRunState`, owned by the editor.
+
+Commands and results: `cd rust && cargo fmt --check`: OK. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (detached, polled, after `touch`): Finished, no warning, after each of the tasks 4, 5 and 6 (2m12s, 2m25s, 1m45s). Dagster whole suite, detached: 911 passed in 576 s (880 + 31 new). `check_intra_package_imports.py` and `check_bare_iceberg_count.py`: OK. `bun run typecheck`, `bun run lint` (0 errors, 6 warnings, none in files touched), `bun run test`: 1096 pass, 1 skip, 0 fail.
+
+Assertions changed (all in `connector-ingest-panel.test.tsx`): the two `loadModeProblem` lines that expected `null` for `incremental_dedup` with a cursor and for `replace_dedup` now give a key, because a deduplicating mode without a key no longer saves (decision 3); the two option-list assertions grew by the new modes. Test literals of `IngestJobRun` get `object: null, action: null`. Nothing else changed.
+
+Not verified: every Rust test (`cargo test`, the new `#[sqlx::test]`s in `schema_changes.rs`, `connector_discover.rs`, `load_alerts.rs`, `tests/ingest_run.rs`; CI); the MySQL and SQL Server primary-key queries on a real server (no fixture; SRC-9's gate); a Lakekeeper REST catalog for `clear_table`; ClickHouse and Trino reading a cleared or refreshed table; the console in a browser.
+
+Plan/code mismatches: (a) plan task 5 says "empty ... through the sink": the `load_via_sink([])` form does not empty a table a SQL source created (above), so `clear_table` bypasses `iceberg_adapter`. (b) `routes/load_alerts.rs` skips BOTH a successful and a failed `clear` run (decision: a clear is neither a success nor a failure of a load); a failed clear is therefore visible in the run list and the `ingest_run` row, not as an alert; the planner may want a failed clear to alert. (c) A refresh that fails after `remove` emptied the table leaves it empty until the next successful run (stated in the confirmation text).
+
+*(developer)*
+
 ## Review
 
 *(planner)*
