@@ -115,6 +115,24 @@ only by CI (decision 7).
 - Row-filter tests (`VER-1`). Google Sheets.
 - Load, soak or version-matrix testing of a source system.
 
+## 3b. Added after the gates ran (product owner, 2026-10-12)
+
+- **MySQL CDC and SQL Server CDC become not supported (feature-page D8).**
+  A migration with the next free number sets `supported = false` and an
+  `unsupported_reason` for both, guarded on the current values as `0062`
+  is; the picker needs no change (it shows the reason for any unsupported
+  type). The Debezium settings route refuses both drivers with a fixed
+  message, as it refuses Oracle. Their two entries and waivers leave
+  `ops/gates/coverage.json`; the coverage check then reports eleven
+  supported types, all covered, none waived.
+- **The batch gate is split in two (feature-page D9).** `g6-ingest` keeps
+  the SQL sources (PostgreSQL, MySQL, MariaDB, SQL Server) and the `SRC-7`
+  and `SRC-8` steps, which use the MySQL fixture; a new job takes object
+  storage, REST, MongoDB, Kafka and SFTP. Each brings up only what it
+  needs, records its own table and is in `ci-required`. No step is removed.
+- **Measure (task 9).** Three CI runs of the final commit; every connector
+  gate job's duration; the slowest against 20 minutes.
+
 ## Handoff
 
 ### Tasks 0-2 (developer, first pass)
