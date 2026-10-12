@@ -343,6 +343,11 @@ pub async fn discover_sql_mssql(
     Ok(group_columns_by_table(schema, rows))
 }
 
+/// The fixed reason for Oracle, which the console cannot discover (`SRC-9`
+/// finding G2, `SRC-13`).
+pub(crate) const ORACLE_DISCOVER_REASON: &str = "Oracle tables are listed by the orchestrator, not \
+    the console; console discovery for Oracle is tracked as SRC-13";
+
 /// Open a bounded, SSRF-checked discovery connection for `target` and list
 /// `schema`, dispatching on `target.driver` — the SAME
 /// `resolve_checked`-before-`secret_ref`-before-dial ordering
@@ -428,16 +433,14 @@ async fn discover_dial(
                 // Oracle schema discovery runs through the Dagster sql
                 // adapter (`dagster/dispar_orchestrate/adapters/oracle.py`
                 // over `oracledb` thin mode), not through this Rust-side
-                // probe. The match arm exists solely to keep
-                // `SqlDriver` exhaustive for the `sql`/`cdc` route shape;
-                // an Oracle connector never reaches this code because
-                // the dialect (`oracledb`) is not supported by sqlx,
-                // tiberius, or any other driver this module imports.
-                Err(DiscoverError::Blocked(
-                    "Oracle schema discovery runs through the Dagster sql adapter, not \
-                     through the Rust-side probe; this endpoint is unsupported for Oracle"
-                        .to_owned(),
-                ))
+                // probe: `sqlx` and `tiberius` cannot speak to it. The arm
+                // keeps `SqlDriver` exhaustive and is never dialed.
+                // `SRC-9` finding G2: this used to answer `Blocked` (HTTP
+                // 422) while every other type the API cannot discover
+                // answers `supported: false`; `discover` now intercepts
+                // Oracle before this function, so this arm is unreachable
+                // from it and refuses defensively if it is ever reached.
+                Err(DiscoverError::Blocked(ORACLE_DISCOVER_REASON.to_owned()))
             }
         }
     })
@@ -488,6 +491,17 @@ pub async fn discover(
                     )));
                 }
             };
+            // `SRC-9` finding G2: an honest `supported: false`, like every
+            // other type the API cannot discover, and before any SSRF check
+            // or credential resolution because nothing will be dialed.
+            let is_oracle = match &parsed {
+                Dial::Sql(dial) => dial.driver == SqlDriver::Oracle,
+                Dial::Cdc(dial) => dial.driver == SqlDriver::Oracle,
+                _ => false,
+            };
+            if is_oracle {
+                return Ok(DiscoverResult::unsupported(ORACLE_DISCOVER_REASON));
+            }
             let objects = discover_dial(
                 &target,
                 &dial_info.secret_ref,
@@ -517,7 +531,56 @@ pub async fn discover(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only module")]
 mod tests {
-    use super::{MSSQL_DISCOVER_QUERY, MYSQL_DISCOVER_QUERY, POSTGRES_DISCOVER_QUERY};
+    use super::{
+        MSSQL_DISCOVER_QUERY, MYSQL_DISCOVER_QUERY, ORACLE_DISCOVER_REASON, POSTGRES_DISCOVER_QUERY,
+    };
+    use crate::internal_hosts::InternalHosts;
+    use lakehouse_core::secret::{DynSecretResolver, SecretError, SecretValue};
+    use lakehouse_store::connectors::ConnectorDialInfo;
+
+    /// Fails the test if discovery touches the credential: an Oracle answer
+    /// must come before any dial or secret resolution.
+    #[derive(Debug)]
+    struct PanicIfCalledResolver;
+
+    #[async_trait::async_trait]
+    impl DynSecretResolver for PanicIfCalledResolver {
+        async fn resolve_dyn(&self, _secret_ref: &str) -> Result<SecretValue, SecretError> {
+            panic!("Oracle discovery must not resolve a secret");
+        }
+    }
+
+    /// `SRC-9` finding G2: Oracle answers `supported: false` with a fixed
+    /// reason, like every other type the API cannot discover, not a 422.
+    /// No earlier test asserted the 422.
+    #[tokio::test]
+    async fn oracle_discovery_is_an_honest_unsupported_answer() {
+        let info = ConnectorDialInfo {
+            kind: "Oracle".to_owned(),
+            host: "oracle.example".to_owned(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("sql".to_owned()),
+            dial: serde_json::json!({
+                "driver": "oracle",
+                "host": "oracle.example",
+                "port": 1521,
+                "database": "FREEPDB1",
+                "user": "u",
+            }),
+        };
+        let result = super::discover(
+            &info,
+            Some("APP"),
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await
+        .expect("an unsupported answer, not an error");
+        assert!(!result.supported);
+        assert!(result.objects.is_empty());
+        assert_eq!(result.reason.as_deref(), Some(ORACLE_DISCOVER_REASON));
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn discover_sql_postgres_lists_columns_from_information_schema(pool: sqlx::PgPool) {

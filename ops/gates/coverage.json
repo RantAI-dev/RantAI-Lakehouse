@@ -114,7 +114,7 @@
       "notes": {
         "all": "SRC-9 plan task 5.",
         "connect": "Product refuses today with supported:false (SRC-5).",
-        "discover": "Product answers HTTP 422, not supported:false, for an Oracle sql connector (connector_discover.rs, SqlDriver::Oracle arm); SRC-13."
+        "discover": "Expected 'refused' (SRC-13: Oracle tables are listed by the orchestrator, not the console). The product answers supported:false since SRC-9 finding G2 (it was HTTP 422). Stays 'missing' until the Oracle gate exists: the registry refuses a non-'missing' step for a type with no gate."
       }
     },
     "MongoDB": {
