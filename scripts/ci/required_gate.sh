@@ -33,6 +33,7 @@
 #   G9_UPLOAD_RESULT      result of `g9-upload` job
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
+#   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
 set -euo pipefail
 
 run_gate() {
@@ -137,6 +138,7 @@ run_gate() {
   check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."

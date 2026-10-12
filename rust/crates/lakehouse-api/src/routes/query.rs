@@ -141,8 +141,57 @@ async fn rewrite_sql_for_principal_inner(
         .await
     }
     .map_err(|err| {
+        // DATA-16 F3: on Trino a past-version clause makes the parse fail
+        // (`GenericDialect` reads no table version), and the generic
+        // answer talks about policies. Say what is actually wrong. This
+        // runs only after a parse failure, so a query that parses is
+        // never affected, and it is a message, not a gate: the query was
+        // already refused.
+        if is_trino_engine(engine)
+            && matches!(
+                err,
+                crate::policy_engine::EnforcementError::Engine(
+                    crate::policy_engine::PolicyEngineError::Unparseable
+                )
+            )
+            && uses_past_version_clause(sql)
+        {
+            return ApiError::Unprocessable(PAST_VERSION_TRINO_MESSAGE.to_owned());
+        }
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })
+}
+
+/// Fixed text for `DATA-16` F3: past versions are queried on `ClickHouse`
+/// only (the `Trino` side is `DATA-21`).
+const PAST_VERSION_TRINO_MESSAGE: &str =
+    "Querying a past version of a table is available on the ClickHouse engine only.";
+
+/// Whether `sql`'s tokens contain the keyword run `VERSION AS OF` or
+/// `TIMESTAMP AS OF`. Reads tokens (not the raw text) so the same words in
+/// a string literal, a quoted identifier or a comment are not mistaken for
+/// the clause. A tokenizer failure answers `false`: the caller then keeps
+/// today's message.
+fn uses_past_version_clause(sql: &str) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+        return false;
+    };
+    // Whitespace and comments carry no meaning between the three words.
+    let words: Vec<String> = tokens
+        .into_iter()
+        .filter_map(|t| match t {
+            Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+            Token::Whitespace(_) => None,
+            // Any other token breaks a run of keywords.
+            _ => Some(String::new()),
+        })
+        .collect();
+    words
+        .windows(3)
+        .any(|w| (w[0] == "VERSION" || w[0] == "TIMESTAMP") && w[1] == "AS" && w[2] == "OF")
 }
 
 /// Runs the already-rewritten `sql` against whichever engine `engine`
@@ -1250,6 +1299,38 @@ mod tests {
         // An unterminated quote swallows the rest, which is the safe way
         // round: the guard then sees less, never more.
         assert_eq!(strip_sql_noise("SELECT 'unterminated"), "SELECT  ");
+    }
+
+    #[test]
+    fn a_past_version_clause_is_found_in_the_tokens() {
+        // DATA-16 F3.
+        assert!(uses_past_version_clause(
+            "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 1"
+        ));
+        assert!(uses_past_version_clause(
+            "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'"
+        ));
+        assert!(uses_past_version_clause(
+            "select * from t version\n/* c */ as of 1"
+        ));
+        assert!(uses_past_version_clause("SELECT * FROM t VERSION AS OF 1"));
+    }
+
+    #[test]
+    fn the_same_words_in_a_string_or_comment_are_not_a_clause() {
+        assert!(!uses_past_version_clause(
+            "SELECT 'FOR VERSION AS OF 1' FROM t WHERE ("
+        ));
+        assert!(!uses_past_version_clause(
+            "SELECT 1 -- VERSION AS OF 1\nWHERE ("
+        ));
+        assert!(!uses_past_version_clause(
+            "SELECT \"version\" AS of_x FROM t"
+        ));
+        assert!(!uses_past_version_clause("SELECT version, x AS of FROM t"));
+        assert!(!uses_past_version_clause("SELECT FROM WHERE ("));
+        // An unterminated literal fails to tokenize: today's message stays.
+        assert!(!uses_past_version_clause("SELECT 'VERSION AS OF"));
     }
 
     #[test]

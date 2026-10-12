@@ -153,7 +153,7 @@ hands-on testing.
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
-| Catalog and search | **Partial.** Search matches table names only; no certification | Yes: columns, tags, certification | `DATA-11`, `DATA-12` |
+| Catalog and search | **Partial.** Search finds tables by name, columns, tags and descriptions and forgives a typo (`DATA-11`, In Acceptance; speed not measured); no certification; no per-user table visibility | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
