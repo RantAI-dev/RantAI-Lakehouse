@@ -388,6 +388,20 @@ Plan/code mismatches: (a) plan task 5 says "empty ... through the sink": the `lo
 
 *(developer)*
 
+### Fifth pass: small fixes after CI of the fourth pass (developer)
+
+Commits after `acc6589`: F2 `sink.py` docstring, F1 `load_alerts.rs` test, F3 menu test (see `git log`).
+
+**F1.** `record_run_result`: failure gives streak + 1 and `degraded` below `REPEATED_FAILURE_STREAK` (3), `unhealthy` from it; success gives `healthy`, 0. In `a_clear_run_leaves_the_connectors_run_facts_alone_and_a_refresh_counts_as_a_run`: after the first failure `degraded`,1 (was written `unhealthy`,1); after the SUCCESS clear unchanged `degraded`,1; after the FAILED clear unchanged `degraded`,1; after the refresh `healthy`,0 (already right). Three expectations changed, no others. The tests after the API library (`tests/ingest_run.rs`, store unit tests of `ingest_spec.rs`/`schema_diff.rs`) were re-read against the handler and the decision code: no expected value from memory found; mocks live to the end of each test; run-list indexing is of Dagster's response order, not seeded rows.
+
+**F2.** Docstring corrected. Lead, not verified: `load_via_sink` hands dlt a generator (`_stamp_rows`), not a materialized empty list, and dlt writes the empty items file that truncates a replace only for a materialized empty list (`extract/extract.py` `tables_with_empty`, `extractors.py`); `clear_table` passes a real `[]`. Why plain rows seemed to empty a table through the sink is not shown: the dedup test asserts only equality with replace.
+
+**F3.** A press on the enabled trigger still failed ~1 run in 3; `await act(async () => {})` before one press: 20/20 runs of `src/features/connectors` clean. Update not identified.
+
+Commands: `cargo fmt --check` OK; clippy workspace (detached, after touch) Finished, no warning; `py_compile` and `check_intra_package_imports.py` OK; `bun run typecheck` OK; `bun run lint` 0 errors, 6 warnings; `bun run test` 1096 pass, 1 skip, 0 fail. Not verified: any `cargo test` (CI).
+
+*(developer)*
+
 ## Review
 
 *(planner)*
