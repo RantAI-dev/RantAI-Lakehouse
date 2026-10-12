@@ -2995,7 +2995,7 @@ services:
   # still fails closed without real values.
   mysql-g6:
     image: mysql:8
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     environment:
       MYSQL_DATABASE: g6_ingest
@@ -3019,7 +3019,7 @@ services:
   # path is what gets exercised end-to-end, not a weakened one.
   mssql-g6-cert-init:
     image: alpine:3.20
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     volumes:
       - mssql_g6_tls:/out
@@ -3049,7 +3049,7 @@ services:
 
   mssql-g6:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     depends_on:
       mssql-g6-cert-init:
@@ -3079,7 +3079,7 @@ services:
     build:
       context: ./ops/g6
       dockerfile: Dockerfile.rest_stub
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
 
   # Tier 2 (G6) — the mongodb-adapter fixture
@@ -3097,7 +3097,7 @@ services:
   # network regardless.
   mongo-g6:
     image: mongo:7
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
       MONGO_INITDB_DATABASE: g6_ingest
@@ -3122,7 +3122,7 @@ services:
   # expected to survive a restart with existing data.
   kafka-g6:
     image: apache/kafka:3.8.0
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
       KAFKA_NODE_ID: "1"
@@ -3188,26 +3188,37 @@ services:
   # unixodbc runtime `pyodbc` needs at import time (`dagster/Dockerfile`),
   # so this test runner needs no separate driver install of its own.
   g6-test-runner:
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql", "g6-other"]
     build:
       context: ./dagster
       dockerfile: Dockerfile
     working_dir: /work
     volumes:
       - ./ops/g6:/work
+    # SRC-9 decision 9: the gate runs as two CI jobs, each with its own
+    # fixtures (`G6_GROUP`, see g6_ingest_matrix_test.py). `required: false`
+    # makes compose skip a fixture whose profile is not active, so
+    # `--profile g6-sql` starts the SQL fixtures only, `--profile g6-other`
+    # the others, and `--profile g6` (a developer's local run) all of them.
+    # A fixture whose profile IS active is still waited for until healthy.
     depends_on:
       dagster-code-location:
         condition: service_started
       mysql-g6:
         condition: service_healthy
+        required: false
       mssql-g6:
         condition: service_healthy
+        required: false
       rest-stub-g6:
         condition: service_started
+        required: false
       mongo-g6:
         condition: service_healthy
+        required: false
       kafka-g6:
         condition: service_healthy
+        required: false
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       DAGSTER_URL: http://dagster-webserver:3000/graphql

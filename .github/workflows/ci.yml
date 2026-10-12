@@ -601,34 +601,45 @@ jobs:
         run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster down -v
 
   # ── WS3 (G6) acceptance — the Tier 1 ingestion matrix: one connector
-  # per adapter (sql×mysql, sql×mssql, sql×postgres, files×csv, rest) is
-  # registered, given an ingest-spec, run, and its rows verified in Bronze
-  # through ClickHouse; plus the column gate, CDC's honest supported:false,
-  # and Sheets' honest supported:false. Same g1-rustfs/g3a-dagster/g4-cdc
-  # shape. A second, SEPARATE, override-free compose project proves the
-  # DEFAULT stack (INGEST_ALLOW_INTERNAL_HOSTS unset) still refuses a
-  # link-local target -- ops/g6/docker-compose.g6.override.yml's own
-  # comment explains why that variable is gate-only and never belongs in
-  # docker-compose.yml itself. See ops/g6/g6_ingest_matrix_test.py and
-  # ops/g6/g6_linklocal_test.py. ──
+  # per adapter is registered, given an ingest-spec, run, and its rows
+  # verified in Bronze through ClickHouse; plus the column gate, CDC's honest
+  # supported:false, and Sheets' honest supported:false. Same
+  # g1-rustfs/g3a-dagster/g4-cdc shape.
+  #
+  # SRC-9 decision 9: the gate is ONE script (ops/g6/g6_ingest_matrix_test.py)
+  # run by TWO jobs, selected by G6_GROUP, so each stays under 20 minutes.
+  # This job is G6_GROUP=sql: PostgreSQL, MySQL, MariaDB and SQL Server, the
+  # SRC-7 (wrong-password MySQL connector) and SRC-8 (schema drift on MySQL)
+  # steps, which use the MySQL fixture, and the column gate, the CDC refusal
+  # and the Sheets refusal, which need only the API and Dagster. Object
+  # storage, REST, MongoDB, Kafka and SFTP, and the link-local half (it
+  # needs a Kafka fixture), are in `g6-ingest-other`. Each job's table shows
+  # the other's types as `skipped`, "covered by job <name>". ──
   g6-ingest:
-    name: Rust · G6 ingest matrix
+    name: Rust · G6 ingest matrix (SQL sources)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    # 25, not 20 (PR #101, product owner 2026-10-10). Measured: bringing the
-    # stack up takes 11m38s to 13m47s of this job, and eight runs on `main`
-    # took 13m02s to 18m37s before SRC-7 and SRC-8 added about two minutes of
-    # steps. On PR #101 every step passed and the job was cut off at 20m02s
-    # during the final `down`. 25 is what G3 and G3a already use. SRC-9
-    # splits the connector gates into parallel jobs and measures its
-    # 20-minute target again.
+    # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
+    # is the cut-off, not the target. Before the split this one job took
+    # 21m56s to 22m48s, 13 of them bringing the stack up (the API image build
+    # dominates). SRC-9 decision 9 split it so each half's TARGET is under 20
+    # minutes; the CI runs of the final commit are the measurement
+    # (docs/plans/SRC-9-RESULT.md).
     timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Write CI-only .env
+        # The same nine fixture secrets as `g6-ingest-other`, though this half
+        # starts only the SQL fixtures: ops/g6/docker-compose.g6.override.yml
+        # makes each fixture's password `${VAR:?}`, and compose interpolates
+        # that for every service in the files it loads, whatever the
+        # profile, so a smaller .env fails at `up` ("required variable ... is
+        # missing a value", checked with `docker compose config`). They are
+        # obviously fake values of a throwaway stack, not defaults in a
+        # compose file.
         run: |
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
@@ -647,7 +658,7 @@ jobs:
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
-      - name: Bring up the g6 matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+      - name: Bring up the g6 SQL matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, not a bare `up` on the activated
         # profiles: this project also activates "dagster" (for
         # dagster-webserver/-daemon, which g6_ingest_matrix_test.py polls
@@ -657,16 +668,16 @@ jobs:
         # unrepinned gap — a human decision, out of this job's scope). A
         # bare `up` with no service names starts every service in an
         # active profile, including that one, and fails the whole step;
-        # naming exactly what `ops/g6/g6_ingest_matrix_test.py` and
-        # `g6-test-runner`'s own depends_on chain need (docker-compose.yml)
-        # starts only those services' own dependency closures, which does
-        # not reach `debezium-server`.
+        # naming exactly what the SQL half of
+        # `ops/g6/g6_ingest_matrix_test.py` needs starts only those
+        # services' own dependency closures, which does not reach
+        # `debezium-server`. `--profile g6-sql`, not `g6`: the runner's
+        # `depends_on` then skips the fixtures of the other half.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6 --profile dagster up -d --build
+          --profile g6-sql --profile dagster up -d --build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
-          g3a-source-init mysql-g6 mariadb-g6 sftp-g6 sftp-g6-hostkey-init mssql-g6 mssql-g6-cert-init rest-stub-g6
-          mongo-g6 kafka-g6 kafka-g6-spoofed
+          g3a-source-init mysql-g6 mariadb-g6 mssql-g6 mssql-g6-cert-init
 
       - name: Run the G6 ingest matrix test inside the compose network
         # Same `-f` pair as the "up" step above -- `g6-test-runner`'s OWN
@@ -695,7 +706,7 @@ jobs:
         shell: bash
         run: |
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
-            --profile g6 --profile dagster run --rm -T g6-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-run.log"
+            --profile g6-sql --profile dagster run --rm -T -e G6_GROUP=sql g6-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-run.log"
 
       - name: Add the connector gate table to the job summary
         # `always()`: a failed gate prints its table too, and that table is
@@ -716,6 +727,82 @@ jobs:
       - name: Tear down the g6 matrix project
         if: always()
         run: docker compose -p g6ci down -v
+
+  # ── SRC-9 decision 9: the second half of the G6 gate (G6_GROUP=other),
+  # in a job of its own so each half stays under 20 minutes: object storage,
+  # REST, MongoDB, Kafka and SFTP, the MongoDB Debezium-template check, and
+  # the SEPARATE, override-free link-local project (it needs a Kafka
+  # fixture). It brings up only the fixtures these need (profile `g6-other`,
+  # no MySQL, MariaDB, SQL Server or `g3a-source-init`). Same script, same
+  # override and same scope gate as `g6-ingest`. ──
+  g6-ingest-other:
+    name: Rust · G6 ingest matrix (files, APIs, streams)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Write CI-only .env
+        # All nine fixture secrets although only the REST, MongoDB, Kafka and
+        # SFTP fixtures start here: see `g6-ingest`'s .env step for why a
+        # smaller file fails at `up`. Obviously fake, throwaway.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          EOF
+
+      - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as `g6-ingest` explains (the dagster profile
+        # also holds debezium-server). `--profile g6-other`: the runner's
+        # `depends_on` skips the SQL fixtures.
+        run: >
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-other --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          sftp-g6 sftp-g6-hostkey-init rest-stub-g6 mongo-g6 kafka-g6
+
+      - name: Run the G6 ingest matrix test (files, APIs, streams) inside the compose network
+        # Same `-f` pair and profiles as the "up" step, and the same reasons
+        # for `tee`, `-T` and `shell: bash` as `g6-ingest`'s run step.
+        # `-e G6_GROUP=other` selects this half of the one gate script.
+        shell: bash
+        run: |
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-other --profile dagster run --rm -T -e G6_GROUP=other g6-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-other-run.log"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-other-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g6-other-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6otherci logs
+
+      - name: Tear down the g6 files, APIs and streams project
+        if: always()
+        run: docker compose -p g6otherci down -v
 
       - name: Bring up a SEPARATE, override-free (for INGEST_ALLOW_INTERNAL_HOSTS) project for the link-local assertion
         # "Override-free" means no `ops/g6/docker-compose.g6.override.yml`
@@ -1032,6 +1119,7 @@ jobs:
       - g3-maintenance
       - g4-cdc
       - g6-ingest
+      - g6-ingest-other
       - g6-oracle
       - g9-upload
       - gold-export
@@ -1069,6 +1157,7 @@ jobs:
           G3_MAINTENANCE_RESULT: ${{ needs.g3-maintenance.result }}
           G4_CDC_RESULT: ${{ needs.g4-cdc.result }}
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
+          G6_INGEST_OTHER_RESULT: ${{ needs.g6-ingest-other.result }}
           G6_ORACLE_RESULT: ${{ needs.g6-oracle.result }}
           G9_UPLOAD_RESULT: ${{ needs.g9-upload.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}

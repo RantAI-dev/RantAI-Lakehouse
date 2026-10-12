@@ -17,6 +17,14 @@ docs/superpowers/plans/2026-09-11-ws5-platform-signals.md's plan for
 extending ops/g4/g4_test.py duplicates the SAME g3a_test.py login block
 into g4_test.py for the identical reason.
 
+# Two halves (SRC-9 decision 9)
+
+`G6_GROUP=sql|other|all` (default `all`) selects which connectors and which
+later steps this process runs; see `GROUP_MEMBERS` below. CI runs `sql` and
+`other` as two jobs so each stays under 20 minutes; a developer running the
+whole gate locally gets `all`, as before. The types of the half that did not
+run are recorded `skipped`, "covered by job <name>".
+
 # Credential shape (ADR 0002 Addendum 3)
 
 `POST /api/connectors` no longer accepts a client-chosen `secretRef` --
@@ -698,6 +706,34 @@ DISCOVER_FIXTURES = {
     "MariaDB": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
     "SQL Server": ("dbo", "dbo.orders", {"id", "amount"}),
 }
+# SRC-9 decision 9: the gate runs as two CI jobs, because one job took 22 to
+# 23 minutes (13 of them bringing the stack up). `G6_GROUP` selects the half:
+# `sql` is the SQL sources (PostgreSQL, MySQL, MariaDB, SQL Server) and the
+# steps that need the MySQL fixture or only the API; `other` is object
+# storage, REST, MongoDB, Kafka and SFTP. `all` (the default) is the whole
+# gate, as a developer runs it locally. Each job brings up only the fixtures
+# of its half (`.github/workflows/ci.yml`; fixture profiles `g6-sql` and
+# `g6-other` in docker-compose.yml). The names are the registry's `g6`
+# gate in both halves; the registry names gates, not CI jobs.
+GROUP = os.environ.get("G6_GROUP", "all")
+GROUP_MEMBERS = {
+    "sql": ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-mssql"),
+    "other": ("g6-files", "g6-rest", "g6-mongo", "g6-kafka", "g6-sftp"),
+}
+JOB_OF_GROUP = {"sql": "g6-ingest", "other": "g6-ingest-other"}
+
+
+def _active(name: str) -> bool:
+    """Whether the connector `name` (a key of `TYPE_OF`) belongs to the half
+    this process runs."""
+    return GROUP == "all" or name in GROUP_MEMBERS[GROUP]
+
+
+def _group_runs(group: str) -> bool:
+    """Whether the steps that belong to `group` run in this process."""
+    return GROUP in ("all", group)
+
+
 # Kafka "reload" (SRC-9 task 2): this many new messages are produced between
 # the two runs, after the first run's offsets are committed.
 KAFKA_RELOAD_MESSAGES = 5
@@ -740,6 +776,28 @@ def _expectation(type_name: str, step: str) -> str | None:
         )
         return None
     return expected
+
+
+def _check_group() -> None:
+    if GROUP != "all" and GROUP not in GROUP_MEMBERS:
+        raise G6Failure(f"G6_GROUP={GROUP!r} is not one of sql, other, all")
+    covered = {name for names in GROUP_MEMBERS.values() for name in names}
+    if covered != set(TYPE_OF):
+        raise G6Failure(f"GROUP_MEMBERS and TYPE_OF disagree: {sorted(covered ^ set(TYPE_OF))}")
+
+
+def _record_other_half_skipped() -> None:
+    """The half this process does not run is shown `skipped`, naming the job
+    that covers it, never blank and never green (the table of each job lists
+    every type)."""
+    for group, names in GROUP_MEMBERS.items():
+        if _group_runs(group):
+            continue
+        for name in names:
+            for step in gate_summary.STEPS:
+                _recorder().record(TYPE_OF[name], step, "skipped", f"covered by job {JOB_OF_GROUP[group]}")
+    if GROUP != "all":
+        print(f"[g6] G6_GROUP={GROUP}: the other half of the matrix is covered by its own job")
 
 
 def _check_registry_covers_this_gate() -> None:
@@ -899,6 +957,8 @@ def _step_reload(connector_ids: dict[str, str], first_counts: dict[str, int]) ->
     run_ids: dict[str, str] = {}
     expected: dict[str, int] = {}
     for name, type_name in TYPE_OF.items():
+        if not _active(name):
+            continue
         if name not in first_counts:
             _record(type_name, "reload", "skipped", "the first load did not complete, so there is nothing to load again")
             continue
@@ -953,12 +1013,17 @@ def _step_reload(connector_ids: dict[str, str], first_counts: dict[str, int]) ->
 
 
 def step_ingest_matrix() -> None:
-    _seed_mysql_fixture()
-    _seed_mariadb_fixture()
-    sftp_fingerprint = _seed_sftp_fixture()
-    _seed_mssql_fixture()
-    mongo_reader_password = _seed_mongo_fixture()
-    _seed_files_fixture()
+    # Only the fixtures of this process's half exist (SRC-9 decision 9).
+    if _active("g6-mysql"):
+        _seed_mysql_fixture()
+    if _active("g6-mariadb"):
+        _seed_mariadb_fixture()
+    sftp_fingerprint = _seed_sftp_fixture() if _active("g6-sftp") else ""
+    if _active("g6-mssql"):
+        _seed_mssql_fixture()
+    mongo_reader_password = _seed_mongo_fixture() if _active("g6-mongo") else ""
+    if _active("g6-files"):
+        _seed_files_fixture()
 
     rest_api_key = secrets.token_hex(8)
     # Filled by every `_register_and_run` below (SRC-9 task 2 needs the id of
@@ -1034,6 +1099,8 @@ def step_ingest_matrix() -> None:
     ]
     run_ids: dict[str, str] = {}
     for name, kind, host, credential, credential_values, adapter, dial, objs in connectors:
+        if not _active(name):
+            continue
         run_id = _register_and_run(
             name=name, kind=kind, host=host, credential=credential, credential_values=credential_values,
             adapter=adapter, dial=dial, source_objects=objs, connector_ids=connector_ids,
@@ -1043,47 +1110,51 @@ def step_ingest_matrix() -> None:
 
     # Postgres batch: the existing seeded conn-pg-lakehouse (0033),
     # already adapter=sql -- run it directly, no new connector needed.
-    pg_run = _post_ingest_run("conn-pg-lakehouse")
-    run_ids["conn-pg-lakehouse"] = pg_run.json()["runId"]
-    connector_ids["conn-pg-lakehouse"] = "conn-pg-lakehouse"
+    if _active("conn-pg-lakehouse"):
+        pg_run = _post_ingest_run("conn-pg-lakehouse")
+        run_ids["conn-pg-lakehouse"] = pg_run.json()["runId"]
+        connector_ids["conn-pg-lakehouse"] = "conn-pg-lakehouse"
 
     # files: the fixture ops/g6/seed_files_fixture.py wrote to
     # landing/orders.csv, registered against a NEW test connector -- never
     # conn-s3-warehouse, which rust/migrations/0033_connector_ingest_spec.sql
     # deliberately seeds with an empty source_objects.
-    files_run_id = _register_and_run(
-        connector_ids=connector_ids,
-        name="g6-files", kind="Object storage", host="rustfs:9000",
-        credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
-        credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
-        adapter="files",
-        # "endpoint" set explicitly -- a real, `FilesDial`-validated
-        # optional field (`rust/crates/lakehouse-store/src/ingest_spec.rs`)
-        # this gate had simply left out, producing a bogus-credential 403
-        # against real AWS S3 (`_default_get_object` has no RustFS
-        # fallback when `endpoint` is unset; `adapters/files.py`'s
-        # docstring was corrected to say so in `ec25a5d`, not "an absent
-        # endpoint dials RustFS", which was never true).
-        dial={"protocol": "s3", "endpoint": "http://rustfs:9000", "bucket": "lakehouse-warehouse", "format": "csv"},
-        source_objects=[{"name": "landing/orders.csv", "target": "g6_files_orders"}],
-    )
-    if files_run_id:
-        run_ids["g6-files"] = files_run_id
-    # SRC-6 B3: after the ingest spec is saved (inside _register_and_run).
-    # Read-only against the connector, so the run just launched is unaffected.
-    #
-    # SRC-9 task 2 (`connect` for object storage): the check above IS the
-    # step, with its assertions unchanged; it is recorded, not run again.
-    # The check runs whatever the registry says (never skipped to match it);
-    # `_expectation` records a failure if the registry calls the step missing.
-    registered = _expectation("Object storage", "connect") is not None
-    try:
-        _check_object_storage_test_and_key_change(connector_ids["g6-files"])
-    except G6Failure as exc:
-        _record_fail("Object storage", "connect", str(exc))
-        raise
-    if registered:
-        _record("Object storage", "connect", "pass", "tested at the dial endpoint; a wrong secret key is refused")
+    files_run_id = None
+    if _active("g6-files"):
+        files_run_id = _register_and_run(
+            connector_ids=connector_ids,
+            name="g6-files", kind="Object storage", host="rustfs:9000",
+            credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
+            credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
+            adapter="files",
+            # "endpoint" set explicitly -- a real, `FilesDial`-validated
+            # optional field (`rust/crates/lakehouse-store/src/ingest_spec.rs`)
+            # this gate had simply left out, producing a bogus-credential 403
+            # against real AWS S3 (`_default_get_object` has no RustFS
+            # fallback when `endpoint` is unset; `adapters/files.py`'s
+            # docstring was corrected to say so in `ec25a5d`, not "an absent
+            # endpoint dials RustFS", which was never true).
+            dial={"protocol": "s3", "endpoint": "http://rustfs:9000", "bucket": "lakehouse-warehouse", "format": "csv"},
+            source_objects=[{"name": "landing/orders.csv", "target": "g6_files_orders"}],
+        )
+        if files_run_id:
+            run_ids["g6-files"] = files_run_id
+        # SRC-6 B3: after the ingest spec is saved (inside _register_and_run).
+        # Read-only against the connector, so the run just launched is unaffected.
+        #
+        # SRC-9 task 2 (`connect` for object storage): the check above IS the
+        # step, with its assertions unchanged; it is recorded, not run again.
+        # The check runs whatever the registry says (never skipped to match it);
+        # `_expectation` records a failure if the registry calls the step missing.
+        registered = _expectation("Object storage", "connect") is not None
+        try:
+            _check_object_storage_test_and_key_change(connector_ids["g6-files"])
+        except G6Failure as exc:
+            _record_fail("Object storage", "connect", str(exc))
+            raise
+        if registered:
+            _record("Object storage", "connect", "pass", "tested at the dial endpoint; a wrong secret key is refused")
+
 
     # SRC-9 task 2: `connect` and `discover` for the other connectors, while
     # their first runs are in flight. Both are quick, read-only calls (a
@@ -1104,7 +1175,7 @@ def step_ingest_matrix() -> None:
     # create) but no value is ever written for it; see this module's
     # docstring.
     kafka_topic = KAFKA_TOPIC
-    kafka_run_id = _register_and_run(
+    kafka_run_id = None if not _active("g6-kafka") else _register_and_run(
         name="g6-kafka", kind="Kafka", host="kafka-g6:9092",
         credential={"source": "file", "primary": "token"}, credential_values=None,
         adapter="kafka",
@@ -1142,6 +1213,8 @@ def step_ingest_matrix() -> None:
         # rows were indistinguishable to this gate.
         ("g6-rest", "g6_rest_items"),
     ]:
+        if not _active(name):
+            continue
         # Polled, not a single immediate check: a freshly-created Iceberg
         # table can take a beat to become visible through ClickHouse's
         # DataLakeCatalog engine after the writing run itself already
@@ -1711,17 +1784,27 @@ def main() -> int:
     global RECORDER
     try:
         RECORDER = gate_summary.Recorder(gate_summary.Registry.load(), "g6")
+        _check_group()
         _check_registry_covers_this_gate()
+        _record_other_half_skipped()
         step_wait_for_services()
         step_login()
         step_ensure_tenant()
         step_ingest_matrix()
-        step_failed_run_updates_connector_health()
-        step_source_schema_changes()
-        step_column_gate_rejects_an_unsupported_column()
-        step_cdc_reports_unsupported_not_a_launch()
-        step_cdc_mongo_debezium_properties()
-        step_sheets_reports_unsupported()
+        # SRC-9 decision 9: the steps follow the fixture they use. SRC-7 and
+        # SRC-8 use the MySQL fixture; the column gate, the CDC refusal and
+        # Sheets need no fixture but the API and Dagster, and ride with `sql`,
+        # whose job has the shorter matrix (the `other` job carries the
+        # link-local half and the Kafka wait). The MongoDB template check
+        # reads no fixture either and names the type of the `other` half.
+        if _group_runs("sql"):
+            step_failed_run_updates_connector_health()
+            step_source_schema_changes()
+            step_column_gate_rejects_an_unsupported_column()
+            step_cdc_reports_unsupported_not_a_launch()
+            step_sheets_reports_unsupported()
+        if _group_runs("other"):
+            step_cdc_mongo_debezium_properties()
         # SRC-9 task 2: connect, discover and reload record their failures and
         # let the gate run on; the verdict comes here, once, naming each.
         failed = _recorder().failures()

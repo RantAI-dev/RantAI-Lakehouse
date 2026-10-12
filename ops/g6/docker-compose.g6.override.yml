@@ -40,6 +40,13 @@
 # gap); it is "gate-only" here only in the sense that no OTHER compose
 # profile references `g6_secrets`, not because the mechanism itself is a
 # test-only shortcut.
+# SRC-9 decision 9: the gate runs as two CI jobs. Fixtures carry the profile
+# `g6-sql` (mysql-g6, mariadb-g6, mssql-g6) or `g6-other` (sftp-g6, rest-stub-g6,
+# mongo-g6, kafka-g6) next to `g6`; a job activates its half's profile and the
+# runner's `depends_on` (`required: false`) skips the other half. `--profile g6`
+# starts everything, as before. Every fixture password stays `${VAR:?}`, which
+# compose interpolates for all services, so both jobs write the full set of
+# fake values into their `.env`.
 volumes:
   g6_secrets:
   # SRC-9 task 4: the SFTP fixture's host key, minted once by
@@ -105,7 +112,7 @@ services:
   # report healthy during it (the same restart-after-ready trap as Postgres).
   mariadb-g6:
     image: mariadb:11.4
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
@@ -131,7 +138,7 @@ services:
   # one-off mirror errors that comment names.
   sftp-g6-hostkey-init:
     image: alpine:3.20
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     volumes:
       - sftp_g6_hostkey:/out
@@ -159,7 +166,7 @@ services:
   # sshd only after its setup scripts have run, with no temporary server.
   sftp-g6:
     image: atmoz/sftp:alpine@sha256:7e439fabeae536fa254340724c042e11999924d906417dbb5c73602ad518813f
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     depends_on:
       sftp-g6-hostkey-init:
@@ -192,11 +199,15 @@ services:
 
   g6-test-runner:
     # SRC-9 task 3: the runner seeds and dials mariadb-g6, so it waits for it.
+    # `required: false`: see g6-test-runner in docker-compose.yml (SRC-9
+    # decision 9, one fixture set per CI job).
     depends_on:
       mariadb-g6:
         condition: service_healthy
+        required: false
       sftp-g6:
         condition: service_healthy
+        required: false
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
       # SRC-9 task 3: root (seeding) and the connector's reader password for
