@@ -403,7 +403,9 @@ def _load_plan(adapter_name: str, obj: dict, refresh: str | None = None) -> Load
 
     `incremental` and `incremental_dedup` are offered for the `sql` adapter
     only; `replace_dedup` runs on every batch adapter, through the same
-    deduplication on plain rows (SRC-10; `adapters/dedup.py`). A Kafka
+    deduplication on plain rows (SRC-10; `adapters/dedup.py`), and so does `history`
+    (`adapters/history.py`: it reads the whole source every run, so it needs no cursor
+    and no adapter that can filter by one). A Kafka
     micro-batch never goes through here: it has no source-object load mode
     and `load_via_sink` appends it, which suits new rows by construction. dlt can filter any
     resource by a cursor, but only the `sql_database` source's path (the

@@ -35,7 +35,7 @@ from dispar_orchestrate.test_load_modes_measurement import Lab, lab  # noqa: F40
 
 
 def test_the_load_modes_include_the_two_deduplicating_ones() -> None:
-    assert sink_module.LOAD_MODES == ("replace", "append", "incremental", "replace_dedup", "incremental_dedup")
+    assert sink_module.LOAD_MODES == ("replace", "append", "incremental", "replace_dedup", "incremental_dedup", "history")
 
 
 def test_a_plan_reads_the_primary_key_of_a_deduplicating_source_object() -> None:

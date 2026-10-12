@@ -95,6 +95,15 @@ was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
   deduplicating mode to `incremental` therefore costs the next switch to
   `incremental_dedup` one full replace, never a silent duplicate.
 
+- `history` (`SRC-10`, decisions 1, 9, 10) keeps every version of a row: each run
+  reads the whole source, deduplicates it on `LoadPlan.key`, and writes the closed
+  and the new versions in ONE `pyiceberg` transaction of its own
+  (`adapters/history.py`, which states the properties, the limits and the
+  refusals). No cursor, so no incremental state; `refresh="keep"` is an ordinary
+  history load and `refresh="remove"` and `clear` empty the table as for any mode.
+  `SinkResult.rows` is the number of NEW versions written (closed rows are not
+  counted).
+
 A merge above 1000 rows is SEVERAL commits: `dlt`'s `merge_iceberg_table`
 upserts the batch in slices of 1000 rows, each its own transaction
 (`dlt/common/libs/pyiceberg.py`; `SRC-10` first pass, case l). For the
@@ -104,8 +113,8 @@ at most one row per key; a run that fails part-way leaves the committed slices
 and not the rest; and the next run re-reads the source and brings the table to
 its state, because a merge is idempotent on a key (`SRC-10` measurement 5,
 `test_5_a_failure_in_a_later_slice_...`). Readers can see a table between two
-slices. A mode that needs ALL its rows or none (`history`, not built) cannot use
-this.
+slices. A mode that needs ALL its rows or none (`history`) cannot use this, which
+is why it does not go through `dlt`'s merge at all.
 
 # What a failed load leaves behind (`SRC-10` measurement 4)
 
@@ -157,11 +166,11 @@ from dlt.extract.source import DltSource
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.helpers import pipeline_drop
 
-from dispar_orchestrate.adapters import dedup
+from dispar_orchestrate.adapters import dedup, history
 
 logger = logging.getLogger(__name__)
 
-LOAD_MODES = ("replace", "append", "incremental", "replace_dedup", "incremental_dedup")
+LOAD_MODES = ("replace", "append", "incremental", "replace_dedup", "incremental_dedup", "history")
 # SRC-10 decision 5: what a refresh of one table does with the rows already there
 # ("keep" them, or "remove" them first). `clear` is `clear_table`, not a plan.
 REFRESHES = ("keep", "remove")
@@ -169,6 +178,9 @@ REFRESHES = ("keep", "remove")
 # beyond a cursor (the cursor is pushed into the query, so only `sql_database`).
 DEDUP_MODES = ("replace_dedup", "incremental_dedup")
 INCREMENTAL_MODES = ("incremental", "incremental_dedup")
+# SRC-10 sixth pass: `history` also needs a key, but is written by `adapters/history.py`
+# and takes no cursor (decision 10).
+KEY_MODES = (*DEDUP_MODES, "history")
 
 # The most columns and the longest column name a key may have: the same bounds
 # as `validate_load_modes` in `rust/crates/lakehouse-store/src/ingest_spec.rs`,
@@ -236,8 +248,17 @@ class LoadPlan:
             raise UnsupportedLoadMode(
                 f"load mode {self.mode!r} needs incrementalKey, the column that marks new rows"
             )
-        if self.mode in DEDUP_MODES:
+        if self.mode in KEY_MODES:
             _check_key(self.mode, self.key)
+        if self.mode == "history":
+            # SRC-10 decision 10: this version reads the whole source on every run.
+            if self.cursor:
+                raise UnsupportedLoadMode("load mode 'history' reads the whole source and takes no incrementalKey")
+            if set(self.key) & set(history.HISTORY_COLUMNS):
+                raise UnsupportedLoadMode(
+                    f"load mode 'history' has a primaryKey that names one of {', '.join(history.HISTORY_COLUMNS)}, "
+                    "the columns the mode adds"
+                )
         if self.refresh is not None and self.refresh not in REFRESHES:
             raise UnsupportedLoadMode(f"refresh {self.refresh!r} is not one of {', '.join(REFRESHES)}")
 
@@ -259,7 +280,7 @@ class LoadPlan:
         """
         mode = obj.get("loadMode") or "replace"
         cursor = (obj.get("incrementalKey") or "").strip() or None
-        raw_key = obj.get("primaryKey") if mode in DEDUP_MODES else None
+        raw_key = obj.get("primaryKey") if mode in KEY_MODES else None
         if raw_key is not None and not isinstance(raw_key, (list, tuple)):
             raise UnsupportedLoadMode(f"load mode {mode!r} has a primaryKey that is not a list of column names")
         return cls(
@@ -472,13 +493,18 @@ def _extract_rows(trace, bronze_table_name: str) -> int | None:
     return trace.last_normalize_info.row_counts.get(bronze_table_name)
 
 
-def _loaded_columns(pipeline: Any, bronze_table_name: str) -> tuple[LoadedColumn, ...]:
+def _loaded_columns(
+    pipeline: Any, bronze_table_name: str, hidden: tuple[str, ...] = ()
+) -> tuple[LoadedColumn, ...]:
     """The columns `dlt`'s schema holds for `bronze_table_name` after a load,
     for the after-load schema observation (SRC-8, decision D4).
 
     Left OUT, on purpose: `dlt`'s own bookkeeping (`_dlt_id`, `_dlt_load_id`,
-    every `_dlt_*` name) and `_ingested_at`, the system column this module
-    stamps itself (ADR 0004). None of them is a column of the SOURCE, so
+    every `_dlt_*` name), `_ingested_at`, the system column this module
+    stamps itself (ADR 0004), and `hidden`: for a `history` table the four columns
+    the mode adds (`SRC-10`), which are not columns of the source and must not
+    show up in SRC-8's observation as a change of it. `hidden` is only that, never
+    applied to another mode, whose source may really have a column of such a name. None of them is a column of the SOURCE, so
     reporting them would make every first observation of a table carry them
     and a source that really has a column of that name could not be told
     apart. A `<column>__v_<type>` variant column, which `dlt` adds when a
@@ -503,7 +529,10 @@ def _loaded_columns(pipeline: Any, bronze_table_name: str) -> tuple[LoadedColumn
                     nullable=column.get("nullable", True),
                 )
                 for name, column in table.get("columns", {}).items()
-                if "data_type" in column and not name.startswith("_dlt_") and name != "_ingested_at"
+                if "data_type" in column
+                and not name.startswith("_dlt_")
+                and name != "_ingested_at"
+                and name not in hidden
             )
     except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
         logger.warning("could not read the loaded columns of %r (%s)", bronze_table_name, type(exc).__name__)
@@ -697,6 +726,66 @@ def _refusal_in(exc: BaseException) -> dedup.DedupRefused | None:
     return None
 
 
+def _apply_iceberg_hints(source: Any) -> Any:
+    """The table hints every Bronze table carries: the day partition on `_ingested_at`
+    and `format-version` 2. The ONE definition, used by `load_via_sink` and by the
+    history mode's table creation (`history.ensure_columns`), so a table is the same
+    whichever mode made it. Returns what `iceberg_adapter` returns (see its use)."""
+    return iceberg_adapter(
+        source,
+        partition=[iceberg_partition.day("_ingested_at")],
+        # PR #29 review: format-version 2 was claimed "confirmed" without
+        # ever being set or asserted. dlt's iceberg destination does not
+        # default this itself (pyiceberg's own table-creation default is
+        # already v2, but that is pyiceberg's default, not a guarantee this
+        # pipeline makes) -- set it explicitly, at table-creation time, so
+        # the guarantee is this module's own rather than inherited
+        # incidentally from whatever pyiceberg happens to default to.
+        # `ops/g3a/g3a_test.py::step_verify_format_version_2` asserts this
+        # against the catalog's own REST metadata, not against what dlt
+        # reports back.
+        table_properties={"format-version": "2"},
+    )
+
+
+def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan: LoadPlan) -> SinkResult:
+    """The `history` mode (`SRC-10` decisions 1, 9, 10; `adapters/history.py`). The rows
+    are written by one `pyiceberg` transaction of ours, so nothing here is a `dlt` load
+    except the creation of the table and its new columns. Same start as every mode: a
+    package a dead run left is dropped first, with the state restored.
+
+    `SinkResult.rows` is the number of NEW versions written; the closed rows are the
+    same rows as before with two columns changed and are not counted, so a run that
+    changed two rows reports 2, not 4, and one that changed nothing reports 0.
+    `columns` are the table's SOURCE columns, without the four the mode adds.
+
+    # Errors
+
+    `history.HistoryRefused` (and `dedup.DedupRefused`) with a fixed message; whatever
+    the source, the catalog or the bucket raise. A failure aborts the pending packages."""
+    pipeline = _bronze_pipeline(bronze_table_name, config)
+    _abort_pending(pipeline, strict=True)
+    if plan.refresh is not None:
+        # `refresh_keep` of a history table is an ordinary history load: there is no
+        # cursor to forget, and the whole source is read every run anyway. The state
+        # is still forgotten so a table that was once loaded in an incremental mode
+        # does not keep a cursor `incremental` would continue from if switched back.
+        _forget_table_state(pipeline)
+    try:
+        outcome = history.load_history(
+            pipeline, source, bronze_table_name, plan.key, _apply_iceberg_hints
+        )
+    except Exception:
+        _abort_pending(pipeline)
+        raise
+    return SinkResult(
+        rows=outcome.new_versions,
+        has_failed_jobs=False,
+        load_info_str=f"history: {outcome.new_versions} new version(s), {outcome.closed} closed",
+        columns=_loaded_columns(pipeline, bronze_table_name, history.HISTORY_COLUMNS),
+    )
+
+
 def load_via_sink(
     source, bronze_table_name: str, config: SinkConfig, plan: LoadPlan = LoadPlan()
 ) -> SinkResult:
@@ -726,6 +815,9 @@ def load_via_sink(
         # after this leaves the table empty until the next successful run; the
         # console says the rows are removed.
         clear_table(bronze_table_name, config)
+
+    if plan.mode == "history":
+        return _load_history(source, bronze_table_name, config, plan)
 
     # ADR 0004: every Bronze row carries `_ingested_at`, stamped here --
     # the ONE owner of the column, regardless of what shape a caller
@@ -767,21 +859,7 @@ def load_via_sink(
     # does not rename that key, so this sink cannot look the resource up
     # by `bronze_table_name` the way the pre-extraction code -- which
     # built the source itself -- could).
-    adapted = iceberg_adapter(
-        source,
-        partition=[iceberg_partition.day("_ingested_at")],
-        # PR #29 review: format-version 2 was claimed "confirmed" without
-        # ever being set or asserted. dlt's iceberg destination does not
-        # default this itself (pyiceberg's own table-creation default is
-        # already v2, but that is pyiceberg's default, not a guarantee this
-        # pipeline makes) -- set it explicitly, at table-creation time, so
-        # the guarantee is this module's own rather than inherited
-        # incidentally from whatever pyiceberg happens to default to.
-        # `ops/g3a/g3a_test.py::step_verify_format_version_2` asserts this
-        # against the catalog's own REST metadata, not against what dlt
-        # reports back.
-        table_properties={"format-version": "2"},
-    )
+    adapted = _apply_iceberg_hints(source)
     # For a `DltSource`/`DltResource`, `iceberg_adapter` applies the hints
     # in place to the resource `source` already carries. For plain rows
     # (the Kafka micro-batch) it wraps them in a NEW resource and applies
