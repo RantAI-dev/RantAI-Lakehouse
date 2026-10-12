@@ -764,7 +764,7 @@ mod tests {
         .await;
         h.knows_run("run-fail", Some(CONNECTOR), "FAILURE").await;
         h.failed("run-fail").await;
-        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
         let config = |action: &str| {
             json!({ "ops": { "run_ingest": { "config": {
                 "connector_id": CONNECTOR, "object": "public.orders", "action": action
@@ -783,14 +783,14 @@ mod tests {
         .expect("accepted")
         .0;
         assert_eq!(resp["matched"], 0);
-        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
         assert!(h.posts_to("al-s").await.is_empty());
 
         // A FAILED clear is not counted against the load either.
         h.knows_run_config("run-clear-fail", config("clear"), "FAILURE")
             .await;
         h.failed("run-clear-fail").await;
-        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
         assert_eq!(
             h.posts_to("al-f").await.len(),
             1,
