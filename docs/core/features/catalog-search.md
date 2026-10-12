@@ -5,7 +5,7 @@
 | Module | Data (Catalog) |
 | Backlog | `DATA-11` |
 | Spec | `docs/core/specs/data-11.md` (one *(proposed)* number, signed under Decisions 1) |
-| Status | Decisions signed 2026-10-09. In build |
+| Status | Decisions signed 2026-10-09. In Acceptance: merged in #98 on 2026-10-09; rows 10, 11, 13 and 14 not run (`DATA-24`) |
 | Plan | `docs/superpowers/plans/2026-10-09-data-11-catalog-search.md` |
 
 ## Problem

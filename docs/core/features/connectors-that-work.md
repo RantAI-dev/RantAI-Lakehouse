@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-6` |
 | Spec | `docs/core/specs/src-6.md` (no *(proposed)* numbers; the decisions below are about behaviour) |
-| Status | Decisions signed 2026-10-08. Built, not verified by CI, not accepted |
+| Status | Decisions signed 2026-10-08. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run |
 | Plan | `docs/superpowers/plans/2026-10-08-src-6-broken-connectors.md` |
 
 ## Problem
