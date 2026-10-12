@@ -988,6 +988,11 @@ pub enum LoadMode {
     /// Merge the rows beyond the cursor column's last seen value into the
     /// table on [`SourceObject::primary_key`] (`SRC-10`).
     IncrementalDedup,
+    /// Keep every version of a row: a changed row is closed and a new
+    /// version added, each with the time of the load that saw it
+    /// (`SRC-10` decisions 1, 9 and 10). Reads the whole source on every
+    /// run, so it takes a key and no cursor.
+    History,
 }
 
 impl LoadMode {
@@ -995,6 +1000,14 @@ impl LoadMode {
     #[must_use]
     pub const fn is_dedup(self) -> bool {
         matches!(self, Self::ReplaceDedup | Self::IncrementalDedup)
+    }
+
+    /// Whether the mode identifies rows by [`SourceObject::primary_key`]: the
+    /// deduplicating modes and `history`. A column of that key removed at the
+    /// source breaks the table under every one of them (`SRC-10` decision 6).
+    #[must_use]
+    pub const fn needs_key(self) -> bool {
+        self.is_dedup() || matches!(self, Self::History)
     }
 
     /// Whether the mode reads only rows beyond a cursor, and so needs a
@@ -1037,13 +1050,17 @@ const MAX_PRIMARY_KEY_COLUMNS: usize = 16;
 /// The longest column name in a `primaryKey`, as for the cursor column.
 const MAX_PRIMARY_KEY_COLUMN_LEN: usize = 128;
 
+/// The columns a `history` table adds (`SRC-10` decision 1). Mirrors
+/// `HISTORY_COLUMNS` in `dagster/dispar_orchestrate/adapters/history.py`.
+const HISTORY_COLUMNS: [&str; 4] = ["_valid_from", "_valid_to", "_is_current", "_row_hash"];
+
 /// Why a spec's `sourceObjects` cannot be ingested as written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidLoadMode {
     /// `loadMode` is not a [`LoadMode`].
     #[error(
         "source object {name:?} has loadMode {mode:?}; use replace, append, incremental, \
-         replace_dedup or incremental_dedup"
+         replace_dedup, incremental_dedup or history"
     )]
     Unknown {
         /// The source object's name.
@@ -1075,6 +1092,26 @@ pub enum InvalidLoadMode {
          columns that identify one row"
     )]
     NoKey {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with an `incrementalKey` (`SRC-10` decision 10): this version
+    /// reads the whole source on every run.
+    #[error(
+        "source object {name:?} asks for loadMode history, which reads the whole source on every \
+         run and takes no incrementalKey"
+    )]
+    HistoryHasCursor {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with a key column named like one of the columns the mode adds
+    /// to the table (`SRC-10` decision 1).
+    #[error(
+        "source object {name:?} asks for loadMode history, whose primaryKey cannot name _valid_from, \
+         _valid_to, _is_current or _row_hash: the mode adds those columns"
+    )]
+    ReservedKeyColumn {
         /// The source object's name.
         name: String,
     },
@@ -1159,8 +1196,30 @@ pub fn validate_load_modes(
                 }
             },
         };
-        if mode.is_dedup() && !has_key {
+        if mode.needs_key() && !has_key {
             return Err(InvalidLoadMode::NoKey { name });
+        }
+        if mode == LoadMode::History {
+            // `SRC-10` decision 10: no cursor in this version. A blank cursor
+            // is what the console sends when the field is empty, so only a
+            // value is refused.
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .map_or("", str::trim);
+            if !cursor.is_empty() {
+                return Err(InvalidLoadMode::HistoryHasCursor { name });
+            }
+            let names_reserved = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|column| HISTORY_COLUMNS.contains(&column));
+            if names_reserved {
+                return Err(InvalidLoadMode::ReservedKeyColumn { name });
+            }
         }
         if !mode.is_incremental() {
             continue;
@@ -1182,7 +1241,8 @@ pub fn validate_load_modes(
     Ok(())
 }
 
-/// The key columns of every object whose stored load mode deduplicates, by
+/// The key columns of every object whose stored load mode has a key (the
+/// deduplicating modes and `history`, [`LoadMode::needs_key`]), by
 /// object name (`SRC-10` decision 6). Read by the schema-change code from the
 /// STORED spec, never from what the orchestrator reports, so a request cannot
 /// claim a table has no key. Lenient: an object [`validate_load_modes`] would
@@ -1200,7 +1260,7 @@ pub fn dedup_keys(
         let is_dedup = object
             .get("loadMode")
             .and_then(|value| LoadMode::deserialize(value).ok())
-            .is_some_and(LoadMode::is_dedup);
+            .is_some_and(LoadMode::needs_key);
         if !is_dedup {
             continue;
         }
@@ -1876,6 +1936,99 @@ mod tests {
             ),
             Err(InvalidLoadMode::NoCursor { .. })
         ));
+    }
+
+    /// `SRC-10` sixth pass, decisions 1 and 10: `history` needs a key, runs on every
+    /// batch adapter, takes no cursor and cannot key on a column it adds.
+    #[test]
+    fn validate_load_modes_for_history_needs_a_key_takes_no_cursor_and_keeps_its_own_columns_free()
+    {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        let history = |extra: serde_json::Value| {
+            let mut object =
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" });
+            for (field, value) in extra.as_object().into_iter().flatten() {
+                object[field] = value.clone();
+            }
+            object
+        };
+        for adapter in ["sql", "files", "rest", "mongodb", "sftp"] {
+            assert_eq!(
+                check(
+                    adapter,
+                    history(serde_json::json!({ "primaryKey": ["id", "line"] }))
+                ),
+                Ok(()),
+                "history on {adapter}"
+            );
+        }
+        // A blank cursor is what an empty console field sends: not a cursor.
+        assert_eq!(
+            check(
+                "sql",
+                history(serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "  " }))
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            check("sql", history(serde_json::json!({}))),
+            Err(InvalidLoadMode::NoKey { .. })
+        ));
+        assert!(matches!(
+            check("sql", history(serde_json::json!({ "primaryKey": [] }))),
+            Err(InvalidLoadMode::BadKey { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                history(
+                    serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "updated_at" })
+                )
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        for reserved in ["_valid_from", "_valid_to", "_is_current", "_row_hash"] {
+            assert!(
+                matches!(
+                    check(
+                        "sql",
+                        history(serde_json::json!({ "primaryKey": ["id", reserved] }))
+                    ),
+                    Err(InvalidLoadMode::ReservedKeyColumn { .. })
+                ),
+                "{reserved} in the key"
+            );
+        }
+        // Another mode may keep such a name in its key: only `history` adds the columns.
+        assert_eq!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "replace_dedup",
+                    "primaryKey": ["_valid_from"] })
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-10` decision 6 for `history`: its key is read like a dedup table's, so a
+    /// removed key column waits and cannot be approved (the same code path).
+    #[test]
+    fn dedup_keys_lists_a_history_object_with_its_key() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]},
+            {"name": "r", "target": "r", "loadMode": "replace", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get("h"), Some(&vec!["id".to_owned()]));
+        let object = SourceObject::deserialize(&serde_json::json!({
+            "name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]
+        }))
+        .expect("valid");
+        assert_eq!(object.load_mode, Some(LoadMode::History));
+        assert!(LoadMode::History.needs_key() && !LoadMode::History.is_dedup());
+        assert!(!LoadMode::History.is_incremental());
     }
 
     #[test]

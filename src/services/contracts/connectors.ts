@@ -544,8 +544,8 @@ export type SourceObject = {
   /** How a run's rows meet the Bronze table. Absent on an object saved
    * before load modes existed, which the ingest job runs as `replace`. */
   loadMode?: LoadMode
-  /** The columns that identify one row, for the deduplicating modes
-   * (`SRC-10`). Kept on the object whatever the mode, so a key the console
+  /** The columns that identify one row, for the deduplicating modes and
+   * `history` (`SRC-10`). Kept on the object whatever the mode, so a key the console
    * detected survives a switch of mode; the API ignores it for a mode that
    * does not use it. */
   primaryKey?: string[]
@@ -559,10 +559,19 @@ export type SourceObject = {
  * `append` adds every row again, `incremental` adds only rows beyond the
  * cursor column's last seen value (SQL connectors only), `replace_dedup`
  * is `replace` keeping one row per `primaryKey`, and `incremental_dedup` is
- * `incremental` merging into the table on `primaryKey` (SQL connectors only).
- * Both deduplicating modes need a `primaryKey` (`SRC-10`).
+ * `incremental` merging into the table on `primaryKey` (SQL connectors only),
+ * and `history` keeps every version of a row, closing the old one and adding a
+ * new one when a run sees it changed. The deduplicating modes and `history` need
+ * a `primaryKey`; `history` reads the whole source every run and takes no
+ * `incrementalKey` (`SRC-10`, decision 10).
  */
-export type LoadMode = "replace" | "append" | "incremental" | "replace_dedup" | "incremental_dedup"
+export type LoadMode =
+  | "replace"
+  | "append"
+  | "incremental"
+  | "replace_dedup"
+  | "incremental_dedup"
+  | "history"
 
 /**
  * Credential reference NAMES only (`env:FOO`, `file:/…`), never a

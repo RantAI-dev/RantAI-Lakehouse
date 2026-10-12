@@ -403,7 +403,7 @@ async fn ingest_spec_put_refuses_a_load_mode_the_job_cannot_run() {
         ),
         (
             json!({ "name": "public.orders", "target": "orders", "loadMode": "merge" }),
-            "replace, append, incremental, replace_dedup or incremental_dedup",
+            "replace, append, incremental, replace_dedup, incremental_dedup or history",
         ),
     ] {
         let body = json!({

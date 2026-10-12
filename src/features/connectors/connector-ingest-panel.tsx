@@ -136,6 +136,7 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   append: "Add all rows again",
   replace_dedup: "Replace all rows, one per key",
   incremental_dedup: "Add only new rows, one per key",
+  history: "Keep history",
 }
 
 /** What a mode does on each run, in one line under the choice, including what happens to the rows already there. */
@@ -155,6 +156,8 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
       return `The first run replaces the table's rows with a copy of the source, one row per key; later runs merge rows whose ${
         cursor || "column"
       } is higher than the last one seen into the rows already there, updating the row of a key it already holds.`
+    case "history":
+      return "Every version of a row is kept, with the time a load first saw it (_valid_from), the time it was replaced (_valid_to) and a mark on the current one (_is_current). Each run reads the whole table."
   }
 }
 
