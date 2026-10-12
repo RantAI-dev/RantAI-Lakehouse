@@ -550,3 +550,75 @@ nothing launched.
 
 Not verified: the tests were not run (no `cargo test` on this machine); the
 next CI run of G9 is the proof past this step.
+
+### Sixth pass (developer): section 3b, decisions 8 and 9
+
+Two commits on `feat/src-9-connector-gates` after `6d568e7`: T-A (decision 8)
+and T-B (decision 9). Nothing pushed, the PR untouched.
+
+**T-A, MySQL CDC and SQL Server CDC are not supported.**
+- Migration `0066_connector_type_cdc_unsupported.sql`: two targeted
+  `UPDATE`s (`supported = true AND adapter = 'cdc'`), the shape of `0062`. They
+  keep `adapter = 'cdc'` so existing connectors still open. Reasons: "Change
+  capture for MySQL is not built yet: this build can only prepare it for
+  PostgreSQL." and the same for SQL Server.
+- `GET /api/connectors/{id}/debezium-properties` refuses a `mysql` or `mssql`
+  driver with `409` and `supported:false` (`unbuilt_cdc_template_refusal`,
+  beside `oracle_cdc_refusal`, called right after it). The Oracle reason said
+  the template was shaped for "Postgres, MySQL and SQL Server"; it now says
+  Postgres, which is what is true. PostgreSQL and MongoDB are unchanged.
+- Expectations that followed decision 8, not loosened: the store tests
+  `unsupported_rows_have_no_adapter` (the exception list is now the three named
+  types), `only_google_sheets_has_an_unsupported_reason` became
+  `only_the_three_named_types_have_an_unsupported_reason`, and a new test pins
+  both reason texts and the `cdc` adapter; the API route test
+  `debezium_properties_route_names_the_mysql_connector_class_and_leaks_no_secret`
+  asserted the old behaviour and is now `..._refuses_a_mysql_cdc_connector`
+  (409, no `properties`); the unit test `the_oracle_gate_never_touches_...` is
+  renamed only. `ops/gates/test_gate_summary.py` built its waiver cases on
+  `MySQL CDC`, which the registry no longer has, so they use `MariaDB` with
+  unchanged assertions; the two "thirteen types" counts (gate_summary tests,
+  `ops/lint/test_check_connector_gate_coverage.py`) are now eleven and the lint
+  test also asserts neither CDC type is listed.
+- `ops/gates/coverage.json`: both entries and both waivers removed. The coverage
+  check reports 11 supported types, all covered, none waived; its migration
+  parser understood `0066` unchanged.
+- Console: the picker already shows `unsupportedReason` for any unsupported
+  type (`connector-type-picker.tsx`); a test with a CDC type that carries a
+  reason and an adapter was added. The other picker/brand-mark fixtures that
+  list a CDC type as `supported: true` test marks only, not the server's list.
+
+**T-B, the batch gate in two jobs.**
+- `G6_GROUP=sql|other|all` (default `all`) in `ops/g6/g6_ingest_matrix_test.py`.
+  `sql`: PostgreSQL, MySQL, MariaDB, SQL Server, SRC-7, SRC-8, column gate, CDC
+  refusal, Sheets. `other`: object storage, REST, MongoDB, Kafka, SFTP, the
+  MongoDB template check. The other half is recorded `skipped`, "covered by job
+  g6-ingest" / "g6-ingest-other". The registry still says `g6` for all of them
+  (it names gates, not jobs).
+- Compose: fixtures carry `g6-sql` or `g6-other` next to `g6`; the runner's
+  `depends_on` on fixtures has `required: false`, so a job's profile starts only
+  its half and `--profile g6` still starts all. Checked with `docker compose
+  config` for the three profile sets; the resolved `depends_on` lists only the
+  active half.
+- `.env`: both jobs write all nine fixture secrets. The override makes them
+  `${VAR:?}`, compose interpolates every service of the loaded files, and a
+  smaller file fails `config` (tried: without the MySQL/MSSQL/MariaDB values the
+  `other` set fails on `MSSQL_SA_PASSWORD`; without the SFTP/Mongo values the
+  `sql` set fails on `SFTP_G6_PASSWORD`). No default added.
+- `ci.yml`: `g6-ingest-other` (same `if:`, 25-minute cut-off, own `.env`, own
+  summary, teardown, project `g6otherci`), added to `ci-required` `needs`, the
+  `*_RESULT` env, `required_gate.sh`, its test (a failing second half blocks) and
+  `docs/CI.md`. The link-local half moved to the new job (its fixture is a
+  Kafka broker). `kafka-g6-spoofed` left the matrix `up` list: the matrix script
+  never uses it, the link-local project starts it itself.
+- Estimate, from the measured phases (13 min bring-up, 4.5 min matrix, 5 min
+  for SRC-7/8, the small steps, the link-local half and teardown): `g6-ingest`
+  about 17 to 19 min (bring-up 12 to 13, matrix 2.5, SRC-7/8 and small steps
+  2.5, teardown); `g6-ingest-other` about 18 to 20 min (bring-up 12.5, matrix
+  3, link-local 2.5, teardown). The second is the tighter one. Not measured:
+  only a CI run can say.
+- No step removed or shortened; no assertion changed.
+
+**Checks run:** `cargo fmt --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` clean (2m13s, shared target); `bun run typecheck`, `bun run lint` (0 errors, 6 warnings), `bun run test` (1077 pass, 1 skip, 0 fail); ops/gates unittest 29 OK; ops/lint unittest 23 OK; four ops/lint checks rc 0; test_required_gate.sh 30 passed; test_detect_change_scope.sh 33 passed; `yaml.safe_load` of ci.yml and both compose files; `docker compose config --quiet` for profiles g6-sql, g6-other, g6, g6-linklocal and `--profile "*"`.
+Not verified: any compose `up`, the gate in either group, the migration against
+a database, the Rust tests (no `cargo test`), the CI timings.
