@@ -290,6 +290,8 @@ function MeaningRow({
       <div role="cell" className="min-w-0">
         {entry ? (
           canEdit ? (
+            // PR #111 review, finding 1: `block` beside `line-clamp-*` keeps display block and
+            // defeats the clamp, and the Button's own white-space nowrap needs whitespace-normal.
             <Button
               variant="ghost"
               size="sm"
@@ -297,12 +299,12 @@ function MeaningRow({
               title={entry.description}
               disabled={busy}
               onClick={onEdit}
-              className="h-auto w-full min-w-0 justify-start px-1 py-0.5 text-left text-xs font-normal"
+              className="h-auto w-full min-w-0 justify-start px-1 py-0.5 text-left text-xs font-normal whitespace-normal"
             >
-              <span className="block min-w-0 line-clamp-2">{entry.description}</span>
+              <span className="min-w-0 whitespace-normal line-clamp-3 @lg:line-clamp-2">{entry.description}</span>
             </Button>
           ) : (
-            <span className="block line-clamp-2 text-xs" title={entry.description}>
+            <span className="whitespace-normal line-clamp-3 text-xs @lg:line-clamp-2" title={entry.description}>
               {entry.description}
             </span>
           )
