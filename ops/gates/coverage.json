@@ -104,17 +104,17 @@
       }
     },
     "Oracle": {
-      "gate": null,
+      "gate": "g6-oracle",
       "steps": {
-        "connect": "missing",
-        "discover": "missing",
-        "load": "missing",
-        "reload": "missing"
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
       },
       "notes": {
-        "all": "SRC-9 plan task 5.",
-        "connect": "Product refuses today with supported:false (SRC-5).",
-        "discover": "Expected 'refused' (SRC-13: Oracle tables are listed by the orchestrator, not the console). The product answers supported:false since SRC-9 finding G2 (it was HTTP 422). Stays 'missing' until the Oracle gate exists: the registry refuses a non-'missing' step for a type with no gate."
+        "all": "SRC-9 plan task 5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. Plaintext dial: the adapter refuses TLS without an operator-typed sslServerCertDn, so TLS to Oracle is not exercised.",
+        "connect": "SRC-5: an Oracle connector cannot be tested from the console (the API has no Oracle client).",
+        "discover": "SRC-13: Oracle tables are listed by the orchestrator, not the console. The product answers supported:false (SRC-9 finding G2; it was HTTP 422)."
       }
     },
     "MongoDB": {

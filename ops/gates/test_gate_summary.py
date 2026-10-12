@@ -63,7 +63,10 @@ class RegistryFileTests(unittest.TestCase):
 
     def test_a_type_with_no_gate_cannot_claim_a_real_step(self) -> None:
         raw = json.loads(REAL_REGISTRY.read_text())
-        raw["types"]["Oracle"]["steps"]["load"] = "real"
+        # SRC-9 task 5: Oracle has its gate now, so this takes it away again
+        # (its steps are not 'missing') instead of relying on a type that
+        # happens to have none today.
+        raw["types"]["Oracle"]["gate"] = None
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps(raw))
