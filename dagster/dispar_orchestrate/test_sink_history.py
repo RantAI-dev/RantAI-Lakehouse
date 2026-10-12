@@ -172,6 +172,9 @@ def test_a_table_loaded_in_another_mode_is_refused_not_converted(lab: Lab) -> No
 
 def test_a_history_table_that_was_then_loaded_in_another_mode_is_refused(lab: Lab) -> None:
     _load(lab, [{"id": 1, "v": "a"}], "back")
+    # SRC-10 review BLOCKER 5: a load in another mode into a table that holds history is
+    # now refused (`test_sink_history_guard.py`), so the setup empties it first.
+    clear_table("back", lab.config)
     load_via_sink([{"id": 5, "v": "z"}], "back", lab.config, LoadPlan(mode="replace"))
     assert [r["_row_hash"] for r in lab.rows("back")] == [None], "the setup: a row with no history values"
     with pytest.raises(HistoryRefused, match='"Refresh, removing rows"'):

@@ -111,10 +111,11 @@ The four columns are NULLABLE in the table. `clear_table` keeps a table's column
 and a column required by `dlt` would make every later load in another mode fail,
 even after "Refresh, removing rows" (measured by
 `test_required_history_columns_would_make_clear_and_a_load_in_another_mode_fail`).
-Our write fills them on every row. Not refused here: a load in another mode into
-a table that holds history (it would add rows with no history values; the next
-history load then refuses the table). The console says a table cannot change
-across this boundary without a refresh.
+Our write fills them on every row. So that nullable columns do not let a table be
+broken silently (`SRC-10 review BLOCKER 5`), a load in ANOTHER mode into a table that
+holds history rows is refused too (`refuse_history_rows`, called by `sink.load_via_sink`
+before anything is written); an empty table is accepted, and the history columns then
+stay in it as nullable columns that other modes leave null.
 """
 
 from __future__ import annotations
@@ -133,7 +134,7 @@ from dlt.common.destination.exceptions import DestinationUndefinedEntity
 from dlt.common.utils import uniq_id_base64
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
-from pyiceberg.expressions import And, EqualTo, In, IsNull
+from pyiceberg.expressions import And, EqualTo, In, IsNull, NotNull
 
 from dispar_orchestrate.adapters import dedup
 
@@ -157,6 +158,11 @@ UTC_US = pa.timestamp("us", tz="UTC")
 ANOTHER_MODE = (
     'table {table!r} holds rows that were not loaded in the history mode; use "Refresh, removing rows" '
     "on it to load it with history"
+)
+
+
+HISTORY_HELD = (
+    'table {table!r} holds history rows; use "Refresh, removing rows" on it to load it in another mode'
 )
 
 
@@ -390,12 +396,14 @@ def to_arrow(rows: list[dict[str, Any]], schema: pa.Schema, *, table: str) -> pa
 # ---------------------------------------------------------------------------
 
 
-def open_table(pipeline: Any, table: str) -> Any | None:
+def open_table(pipeline: Any, table: str, *, sync: bool = True) -> Any | None:
     """The `pyiceberg` table through the destination client of the pipeline that
     owns it (in production Lakekeeper's REST catalog, as the sink installs it), or
     `None` when `dlt` does not know the table. Syncs the pipeline from the bucket
-    first: a recreated container has no local copy of its schema."""
-    pipeline.sync_destination()
+    first: a recreated container has no local copy of its schema (`sync=False` when
+    the caller already did)."""
+    if sync:
+        pipeline.sync_destination()
     try:
         with pipeline.destination_client() as client:
             return client.load_open_table("iceberg", table)
@@ -418,6 +426,44 @@ def check_table(iceberg_table: Any, *, table: str) -> None:
         raise HistoryRefused(ANOTHER_MODE.format(table=table))
     if iceberg_table.scan(row_filter=IsNull("_row_hash"), limit=1).to_arrow().num_rows:
         raise HistoryRefused(ANOTHER_MODE.format(table=table))
+
+
+def refuse_history_rows(pipeline: Any, table: str, *, synced: bool = False) -> bool:
+    """Called before a load in a mode OTHER than `history`: refuse a table that holds
+    history rows, because the load would add rows with no history values (the columns
+    are nullable) and the next history load would refuse the table.
+
+    Cost: one `sync_destination` (reads of the pipeline's schema and state in the bucket,
+    none when `synced`) and a look at the schemas `dlt` holds for the table; no catalog
+    round trip unless the table has all four history columns there. Only then the
+    table is opened and ONE row is looked for whose `_row_hash` is set (a filtered
+    `limit 1` scan, pruned by the null counts of the files' statistics, so a table whose
+    files hold no hash costs manifests only). "Holds history" is a row WITH a hash: a
+    table that was history, was emptied by "Refresh, removing rows" or "Clear" and
+    then loaded in another mode has the columns and rows without a hash, and is accepted.
+
+    Returns True when the table carries the history columns (empty, or holding rows
+    without a hash): the caller hides them from the schema observation, since they are
+    not columns of the source.
+
+    # Errors
+
+    `HistoryRefused` with the fixed `HISTORY_HELD` text."""
+    if not synced:
+        pipeline.sync_destination()
+    names = set(HISTORY_COLUMNS)
+    if not any(
+        names <= set(known.tables[table].get("columns", {}))
+        for known in pipeline.schemas.values()
+        if table in known.tables
+    ):
+        return False
+    iceberg_table = open_table(pipeline, table, sync=False)
+    if iceberg_table is None or not names <= {field.name for field in iceberg_table.schema().fields}:
+        return False
+    if iceberg_table.scan(row_filter=NotNull("_row_hash"), limit=1).to_arrow().num_rows:
+        raise HistoryRefused(HISTORY_HELD.format(table=table))
+    return True
 
 
 def read_current(

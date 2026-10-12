@@ -859,6 +859,8 @@ class _FakePipeline:
         self.state: dict = {}
         # The real pipeline's flag; `load_via_sink` asks it before every run (SRC-10 R3).
         self.has_pending_data = False
+        # SRC-10 review BLOCKER 5: the history check looks at the schemas dlt holds (none here).
+        self.schemas: dict = {}
         self.run_source = None
         self.table_name = None
         self.write_disposition = None

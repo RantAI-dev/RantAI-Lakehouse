@@ -501,10 +501,11 @@ def _loaded_columns(
 
     Left OUT, on purpose: `dlt`'s own bookkeeping (`_dlt_id`, `_dlt_load_id`,
     every `_dlt_*` name), `_ingested_at`, the system column this module
-    stamps itself (ADR 0004), and `hidden`: for a `history` table the four columns
-    the mode adds (`SRC-10`), which are not columns of the source and must not
-    show up in SRC-8's observation as a change of it. `hidden` is only that, never
-    applied to another mode, whose source may really have a column of such a name. None of them is a column of the SOURCE, so
+    stamps itself (ADR 0004), and `hidden`: the four columns the history mode adds
+    (`SRC-10`), which are not columns of the source and must not show up in SRC-8's
+    observation as a change of it: for a `history` table, and for a table that was
+    one and now takes another mode (it keeps them as nullable columns; the source
+    of a history table cannot have had a column of such a name, it is refused). None of them is a column of the SOURCE, so
     reporting them would make every first observation of a table carry them
     and a source that really has a column of that name could not be told
     apart. A `<column>__v_<type>` variant column, which `dlt` adds when a
@@ -912,12 +913,19 @@ def load_via_sink(
     _abort_pending(pipeline, strict=True)
     if plan.refresh is not None:
         _forget_table_state(pipeline)
+    # SRC-10 review BLOCKER 5: a table that holds history rows takes no load in another
+    # mode (`history.refuse_history_rows`), before anything is written. After a refresh
+    # that removes rows it holds none; the history columns it keeps are then hidden from
+    # the schema observation (they are not the source's). The pipeline is synced from the
+    # bucket here, once, for the check and for the incremental modes below.
+    synced = plan.refresh is not None
+    leftover_history = history.refuse_history_rows(pipeline, bronze_table_name, synced=synced)
     # What the pipeline state says about earlier runs, read from the bucket first
     # (a recreated container has no local copy). Only the modes that continue from
     # a cursor consult it; the others cost no extra read.
     key_marked = False
     if plan.mode in INCREMENTAL_MODES:
-        pipeline.sync_destination()
+        # (Synced above, by the history check or the refresh.)
         markers = dedup.markers(pipeline.state)
         key_marked = bool(markers) and all(marker == list(plan.key) for marker in markers)
     run_options: dict[str, Any] = {}
@@ -994,5 +1002,7 @@ def load_via_sink(
         rows=rows,
         has_failed_jobs=load_info.has_failed_jobs,
         load_info_str=str(load_info),
-        columns=() if load_info.has_failed_jobs else _loaded_columns(pipeline, bronze_table_name),
+        columns=()
+        if load_info.has_failed_jobs
+        else _loaded_columns(pipeline, bronze_table_name, history.HISTORY_COLUMNS if leftover_history else ()),
     )
