@@ -457,3 +457,34 @@ the cell. `repo-lints`: pass.
 ## Review
 
 *(planner)*
+
+### Fourth pass (developer): the two new jobs' first-run failures
+
+Commits after `d717b2d`: Oracle service name (`SRC-9` finding G3), g9 tenant.
+
+**G6 Oracle (product defect, G3).** `adapters/oracle.py` sent the dial's
+`database` as the SQLAlchemy URL path, which `oracle+oracledb` turns into a
+SID (`makedsn(sid=...)`); against the pluggable database `FREEPDB1` the
+listener answered `DPY-6003: SID "FREEPDB1" is not registered` (ORA-12505).
+The console labels the field "Database (service name)", so it is now sent as
+`query={"service_name": ...}` (the dialect refuses path and `service_name`
+together, so `database` is unset). Host stays the checked IP literal, the call
+stays in `checking_resolver()`, the `sslServerCertDn` rule is untouched. No
+other code builds an Oracle connection: SRC-8's observer reuses
+`build_source`, and no Oracle CDC template exists. Limit: a database reachable
+only by SID is not supported; a `sid` dial field would be needed. The gate
+printed `Oracle load: fail`, `reload: skipped` with its reason, connect and
+discover `refused-as-expected`. Timings of the job (16m53s): image pull
+06:14:17-06:15:02; dagster image builds to 06:16:51; the `lakehouse-api` Rust
+build 06:16:51-06:27:25 (about 10.5 minutes, the dominant cost); the Oracle
+container started 06:27:26; stack up 06:27:48; gate 06:27:48-06:30:45.
+
+**G9.** `ops/g9/upload_test.py` had no tenant step; the bootstrap admin is in
+no tenant, so `POST /api/uploads` answered 400. Added g9's own
+`step_ensure_tenant` (twin of g6's), `X-Tenant` set from it. The rest of the
+gate was read against `routes/uploads.rs`, `upload_parse.rs`, the store's
+`Upload` and `governance.rs` (statuses, fields, `bronzeTable` and `mode` only
+for Parquet, `bronze.<table>` under `ICEBERG_QUERY_DB`): nothing else stale.
+SEC-16 (per-tenant upload namespace) is not built yet, so the table is still
+`bronze.<table>`; when it lands, the gate's query must change.
+Not verified: any of g9 beyond the tenant step (no stack run).
