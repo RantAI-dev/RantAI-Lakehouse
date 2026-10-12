@@ -179,8 +179,8 @@ function TableMeaningReady({ state }: { state: Ready }) {
 // order, so the header and the rows agree.
 //
 // Below `@lg` the name and the role share the first track, the role on the
-// row's second grid line under the name, so the name is not cut at a phone's
-// width. PR #111 review, finding 2: a fixed 7.5rem role track left about 60 px
+// row's second grid line under the name, so the name gets the whole track.
+// PR #111 review, finding 2: a fixed 7.5rem role track left about 60 px
 // for the name and cut most of them. The meaning spans the second track across
 // both lines, and the confirm control keeps the third. From `@lg` up the role
 // takes its own track on the first line, and the status and synonyms join as
