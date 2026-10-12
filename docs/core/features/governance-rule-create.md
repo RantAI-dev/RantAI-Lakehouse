@@ -6,7 +6,7 @@
 | Backlog | `SEC-23` |
 | Spec | `docs/core/specs/sec-23.md` (no *(proposed)* numbers) |
 | Kind | Task (it has an acceptance checklist because it changes what a user sees) |
-| Status | In Progress (the pull request is open; `BACKLOG.md` holds the status) |
+| Status | Done: merged in #97 on 2026-10-12, CI green (`BACKLOG.md` holds the status) |
 | Priority | P1 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
