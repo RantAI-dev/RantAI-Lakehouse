@@ -43,6 +43,23 @@ fails with `TooManyKeys` naming the setting. The bound is checked as keys
 arrive, so the process stops growing at the bound instead of being killed for
 memory.
 
+# The marker (`SRC-10` third pass, finding R2)
+
+A merge never repairs a table that already holds a key twice (measurement 3), so
+the first run of a deduplicating mode must REPLACE the table with the winners.
+"First" cannot be read from the incremental cursor alone: a table loaded with
+`incremental` on the same cursor has cursor state and several versions of a key.
+So a run of either mode leaves a marker, the key columns it deduplicated on, in
+the resource state of the pipeline state (`dlt.current.resource_state`, beside the
+incremental cursor `sink._incremental_cursors` reads), written while the rows are
+extracted and so part of the same package: it is stored with the data in the
+bucket, survives a recreated container, and is rolled back to its value before
+the run by `Pipeline.abort_packages` if the load fails. `sink.load_via_sink` reads
+it (`markers`) and treats a run as the first one unless the marker equals its key.
+A run under any other mode that writes rows removes the marker (`clear_marker_on`).
+It is written only when the run emitted rows: an empty read leaves the table as it
+was, so it cannot make it clean.
+
 # How it attaches
 
 - A plain iterable of dicts (files, REST, `MongoDB`, SFTP): `dedup_rows`, a
@@ -71,11 +88,15 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
+import dlt
 from dlt.extract.incremental import IncrementalResourceWrapper
 from dlt.extract.items_transform import ItemTransform, MapItem
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 
+# The marker `sink.load_via_sink` keeps in the pipeline state (see
+# "The marker" in this module's docstring).
+MARKER_KEY = "_dedup_key"
 MAX_KEYS_ENV = "INGEST_DEDUP_MAX_ROWS"
 DEFAULT_MAX_KEYS = 2_000_000
 
@@ -160,6 +181,10 @@ class Winners:
         self._best: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._rows_without_key = 0
         self._key_columns_without_value: set[str] = set()
+
+    @property
+    def key(self) -> tuple[str, ...]:
+        return self._key
 
     def add(self, row: dict[str, Any]) -> None:
         """Offer one row.
@@ -255,7 +280,38 @@ def dedup_rows(
 ) -> Iterator[dict[str, Any]]:
     """`deduplicate` as a generator, for a plain iterable of dicts. Nothing is
     yielded until `rows` is exhausted (and its refusals are raised then)."""
-    yield from deduplicate(rows, key=key, cursor=cursor, table=table, limits=limits)
+    winners = deduplicate(rows, key=key, cursor=cursor, table=table, limits=limits)
+    if winners:
+        write_marker(key)
+    yield from winners
+
+
+def write_marker(key: tuple[str, ...], resource_name: str | None = None) -> None:
+    """Record `key` as the columns this resource's rows were deduplicated on. Must
+    run while `dlt` extracts (inside the resource), where the resource state is
+    writable and travels with the package."""
+    dlt.current.resource_state(resource_name)[MARKER_KEY] = list(key)
+
+
+def markers(state: dict[str, Any]) -> list[list[str]]:
+    """Every marker a pipeline state holds, across all source schemas and
+    resources (the same walk as `sink._incremental_cursors`)."""
+    found: list[list[str]] = []
+    for source_state in (state.get("sources") or {}).values():
+        for resource_state in (source_state.get("resources") or {}).values():
+            marker = resource_state.get(MARKER_KEY)
+            if isinstance(marker, list):
+                found.append([str(column) for column in marker])
+    return found
+
+
+def clear_marker(resource_name: str | None = None) -> None:
+    """Remove the marker: a load that is NOT a deduplicating one wrote rows that
+    may repeat a key, so the table is no longer known to hold one row per key.
+    `sink._stamp_for_load` calls it from the stamp of every such load, inside the
+    extract like `write_marker`. A no-op, changing no state, when there is no
+    marker, so such a load costs no extra package."""
+    dlt.current.resource_state(resource_name).pop(MARKER_KEY, None)
 
 
 class _EndOfRows(list):
@@ -280,10 +336,12 @@ class DedupStep(ItemTransform[Any, dict]):
         self.winners = winners
         self.flushed = False
         self._marked_gen: Any = None
+        self._pipe_name: str | None = None
 
     def bind(self, pipe: Any) -> "DedupStep":
         # `dlt` calls `bind` each time it evaluates the pipe; wrap the data
         # generator once per generator.
+        self._pipe_name = pipe.name
         if pipe.gen is not self._marked_gen:
             self._marked_gen = _marked(pipe.gen)
             pipe.replace_gen(self._marked_gen)
@@ -293,6 +351,8 @@ class DedupStep(ItemTransform[Any, dict]):
         if isinstance(item, _EndOfRows):
             rows = self.winners.result()
             self.flushed = True
+            if rows:
+                write_marker(self.winners.key, self._pipe_name)
             return rows or None
         if isinstance(item, list):
             for row in item:

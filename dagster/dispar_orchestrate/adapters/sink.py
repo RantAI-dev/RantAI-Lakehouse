@@ -68,18 +68,26 @@ was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
   runs first, the rows it lets through are deduplicated, and they are merged
   into the table on the key (`dlt` write disposition `merge`, strategy
   `upsert`; pyiceberg `Table.upsert`). Only a `sql_database` source, as for
-  `incremental`. Its FIRST run for a cursor has no cursor state, so it loads
-  everything and REPLACES the table with the winners, as `incremental` does:
-  a table an earlier `append` run left with a key in two data files is
-  rewritten clean, so later merges meet no duplicate (`SRC-10` measurement 3,
-  `test_3_a_replace_with_the_deduplicated_rows_cleans_an_append_table_...`).
-  Measured: a merge does NOT notice such a duplicate (copies in different data
-  files are both updated and both stay), so the first-run replace is what
-  makes the table sound, not the merge. The one case it does not cover is a
-  table switched from `incremental` to `incremental_dedup`: the cursor is the
-  same one, so the first run merges into a table that holds two versions of a
-  key and updates both (`test_3_a_table_with_two_versions_...`); a refresh that
-  forgets the cursor (`SRC-10` plan task 5) is the way out.
+  `incremental`. Its FIRST run loads everything and REPLACES the table with the
+  winners, so a merge only ever meets a table that holds one row per key. A
+  merge does NOT repair a duplicate (copies in different data files are both
+  updated and both stay: `SRC-10` measurement 3), so "first" must be decided
+  exactly. The rule (`SRC-10` third pass, R2): every run of a deduplicating mode
+  leaves a MARKER, the key columns it deduplicated on, in the pipeline state beside
+  the incremental cursor (`dedup.write_marker`, in the resource state, written while
+  the rows are extracted; see `adapters/dedup.py`, "The marker"). A run of
+  `incremental_dedup` is the first one, and replaces, when the marker is absent OR
+  names other key columns than the plan's OR no cursor exists. When a cursor exists
+  but the marker does not match (the table was loaded with `incremental`, or with
+  another key), the cursors are forgotten first so that the run reads everything. A
+  run of any other mode that writes rows (`replace`, `append`, `incremental`)
+  removes the marker (`dedup.clear_marker`, from the stamp), because its rows may
+  repeat a key. The marker is stored with the data in the bucket like the cursor,
+  so it survives a recreated container, and `Pipeline.abort_packages` restores it
+  with the rest of the state when a load fails, so a failed first run is still the
+  first run next time (`test_sink_dedup_marker.py`). Switching back from a
+  deduplicating mode to `incremental` therefore costs the next switch to
+  `incremental_dedup` one full replace, never a silent duplicate.
 
 A merge above 1000 rows is SEVERAL commits: `dlt`'s `merge_iceberg_table`
 upserts the batch in slices of 1000 rows, each its own transaction
@@ -245,7 +253,7 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def _stamp_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+def _stamp_rows(rows: Iterable[dict[str, Any]], clear_marker: bool = False) -> Iterable[dict[str, Any]]:
     """Lazily stamp a plain iterable of dicts (the Kafka micro-batch shape,
     `ingest_factory.py::run_kafka_stream_batch`'s `batch.rows`) without
     mutating the caller's own dicts -- `batch.rows` is read again by that
@@ -253,33 +261,49 @@ def _stamp_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
     nothing here should assume that stays true forever), so each row is
     copied before the stamp is written rather than stamped in place."""
     for row in rows:
+        if clear_marker:
+            dedup.clear_marker()
         yield _stamp_ingested_at(dict(row))
 
 
-def _stamp_for_load(source: Any) -> Any:
+def _stamp_for_load(source: Any, clear_marker: bool = False) -> Any:
     """Make `_ingested_at` land on every row `load_via_sink` writes,
     whatever shape `source` is -- a `dlt` `DltSource` (every resource it
     carries), a bare `DltResource`, or a plain iterable of dicts (the
     Kafka micro-batch). This is the ADR 0004 stamp's ONE call site now:
     `dlt_pipeline.py::run_bronze_ingest` used to call `resource.add_map`
     itself, and `ingest_factory.py`'s other adapters never stamped at
-    all -- see this module's own docstring for why that was a bug."""
+    all -- see this module's own docstring for why that was a bug.
+
+    `clear_marker` (SRC-10 R2): the same stamp also removes the deduplication
+    marker, because a load that is not a deduplicating one writes rows that may
+    repeat a key (`dedup.clear_marker`). It rides on the stamp instead of being a
+    step of its own so the pipe keeps the steps it had."""
     if isinstance(source, DltSource):
         for resource in source.resources.values():
-            _stamp_last(resource)
+            _stamp_last(resource, clear_marker)
         return source
     if isinstance(source, DltResource):
-        _stamp_last(source)
+        _stamp_last(source, clear_marker)
         return source
-    return _stamp_rows(source)
+    return _stamp_rows(source, clear_marker)
 
 
-def _stamp_last(resource: DltResource) -> None:
+def _stamp_last(resource: DltResource, clear_marker: bool = False) -> None:
     """Add the stamp as the resource's LAST step. A plain `add_map` lands
     ahead of the resource's incremental cursor step, where the stamp would
     change the hash dlt uses to recognise an already-loaded row -- see
     `_apply_cursor`."""
-    resource.add_map(_stamp_ingested_at, insert_at=len(resource._pipe))
+    if not clear_marker:
+        resource.add_map(_stamp_ingested_at, insert_at=len(resource._pipe))
+        return
+    name = resource.name
+
+    def stamp_and_clear(record: dict[str, Any]) -> dict[str, Any]:
+        dedup.clear_marker(name)
+        return _stamp_ingested_at(record)
+
+    resource.add_map(stamp_and_clear, insert_at=len(resource._pipe))
 
 
 class BronzeIngestConfigLike(Protocol):
@@ -470,11 +494,13 @@ def _incremental_cursors(pipeline: Any) -> dict[str, dict[str, set[str]]]:
     return cursors
 
 
-def _has_cursor(pipeline: Any, cursor: str) -> bool:
+def _has_cursor(pipeline: Any, cursor: str, *, sync: bool = True) -> bool:
     """Whether an earlier incremental run left a value for `cursor` to
     continue from. Reads the state stored with the data first, since a
-    recreated container starts with no local copy of it."""
-    pipeline.sync_destination()
+    recreated container starts with no local copy of it (`sync=False` when the
+    caller already did)."""
+    if sync:
+        pipeline.sync_destination()
     return any(
         cursor in paths for resources in _incremental_cursors(pipeline).values() for paths in resources.values()
     )
@@ -612,7 +638,12 @@ def load_via_sink(
         source, dedup_steps = dedup.attach(
             source, key=plan.key, cursor=plan.cursor, table=bronze_table_name
         )
-    source = _stamp_for_load(source)
+    # SRC-10 R2: unconditional for every mode that does not deduplicate (a no-op
+    # when no marker is there, and it changes no state then), so a replace or append
+    # run costs no read of the pipeline state in the bucket. A plain-rows `append` is
+    # the Kafka micro-batch, which no deduplicating mode shares a table with.
+    plain_append = plan.mode == "append" and not isinstance(source, (DltSource, DltResource))
+    source = _stamp_for_load(source, clear_marker=plan.mode not in DEDUP_MODES and not plain_append)
 
     # Adapters still apply their own `apply_hints` (table name, primary
     # key, etc.) to their resource(s) before calling this function;
@@ -656,6 +687,14 @@ def load_via_sink(
         # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
         dataset_name="bronze",
     )
+    # What the pipeline state says about earlier runs, read from the bucket first
+    # (a recreated container has no local copy). Only the modes that continue from
+    # a cursor consult it; the others cost no extra read.
+    key_marked = False
+    if plan.mode in INCREMENTAL_MODES:
+        pipeline.sync_destination()
+        markers = dedup.markers(pipeline.state)
+        key_marked = bool(markers) and all(marker == list(plan.key) for marker in markers)
     run_options: dict[str, Any] = {}
     if plan.mode == "incremental":
         write_disposition: Any = "append"
@@ -667,7 +706,17 @@ def load_via_sink(
         run_options["primary_key"] = list(plan.key)
     else:
         write_disposition = plan.mode
-    if plan.mode in INCREMENTAL_MODES and not _has_cursor(pipeline, plan.cursor or ""):
+    if plan.mode == "incremental_dedup" and not key_marked and _has_cursor(pipeline, plan.cursor or "", sync=False):
+        # SRC-10 R2: a cursor exists (the table was loaded with `incremental`, or
+        # with another key) but no run has left the table deduplicated on THIS key.
+        # The run must read everything and replace, so the cursor goes first. Done
+        # before the run and failing safe: with no cursor, a failed run is "first"
+        # again next time.
+        _forget_cursors(pipeline)
+    if plan.mode in INCREMENTAL_MODES and (
+        not _has_cursor(pipeline, plan.cursor or "", sync=False)
+        or (plan.mode == "incremental_dedup" and not key_marked)
+    ):
         # Nothing to continue from: load everything, and replace rather
         # than stack it onto what an earlier mode left there. For
         # `incremental_dedup` the replace also rewrites a table an earlier
