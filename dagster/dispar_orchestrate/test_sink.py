@@ -197,6 +197,8 @@ class _FakePipeline:
         # What an earlier incremental run would have left behind.
         self.state: dict = {}
         self.synced = False
+        # The real pipeline's flag; `load_via_sink` asks it before every run (SRC-10 R3).
+        self.has_pending_data = False
 
     def sync_destination(self) -> None:
         self.synced = True

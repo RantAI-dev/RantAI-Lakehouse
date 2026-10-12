@@ -114,9 +114,18 @@ raises or ends with failed jobs, for every mode. Aborting also restores the
 pipeline state to before the package, so the incremental cursor does not move
 past rows that were never loaded. Measured for replace, append, incremental,
 merge and a failure at normalize (`test_load_modes_dedup_measurement.py`,
-`test_sink_pending_packages.py`). Not covered: a package left by a PROCESS that
-died mid-load is not seen until the next run, which would then finish it instead
-of reading (reported, not changed here).
+`test_sink_pending_packages.py`).
+
+A package left by a PROCESS that died mid-load (no `except` ran) is dropped the
+same way, at the START of every run (`SRC-10` measurement 6, third pass). Measured
+before the change: with a state already in the bucket, the next `pipeline.run`
+finished the dead package and did not extract its own read, and returned success
+with no count (or with the dead run's); the table held the dead batch's rows and
+not this one's, for a Kafka micro-batch whose offsets are committed when the call
+returns. (With no state in the bucket yet `dlt` wipes the working folder itself.)
+`_abort_pending(strict=True)` raises when the abort fails: loading on top of a
+package that could not be dropped is the thing being prevented
+(`test_sink_killed_run.py`, one test per mode family).
 
 Because `replace` forgets the cursor and an `append` run is made to
 (`_forget_cursors`), switching a table between modes never leaves a stale
@@ -555,16 +564,24 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
         resource.apply_hints(incremental=dlt.sources.incremental(cursor))
 
 
-def _abort_pending(pipeline: Any) -> None:
+def _abort_pending(pipeline: Any, *, strict: bool = False) -> None:
     """Abort the pipeline's pending packages and restore its state to before
-    them (`Pipeline.abort_packages`; `SRC-10` measurement 4). Must never mask
-    the failure that got us here, so a problem aborting is logged by type and
-    left."""
+    them (`Pipeline.abort_packages`; `SRC-10` measurement 4). After a failure it
+    must never mask the failure that got us here, so a problem aborting is logged
+    by type and left. At the START of a run (`strict=True`) there is nothing to
+    mask, and a package left in place would be loaded instead of this run's read,
+    so the problem is raised.
+
+    # Errors
+
+    Only with `strict=True`: whatever `abort_packages` raises."""
     try:
         if pipeline.has_pending_data:
             pipeline.abort_packages()
-    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+    except Exception as exc:  # noqa: BLE001 -- logged, re-raised only when strict
         logger.warning("could not abort the pending packages of %r (%s)", pipeline.pipeline_name, type(exc).__name__)
+        if strict:
+            raise
 
 
 def _refusal_in(exc: BaseException) -> dedup.DedupRefused | None:
@@ -687,6 +704,14 @@ def load_via_sink(
         # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
         dataset_name="bronze",
     )
+    # SRC-10 measurement 6: a package left by a PROCESS that died mid-load would
+    # be finished by this run's `pipeline.run` INSTEAD of reading (dlt: "the data
+    # you passed to the run function will not be extracted"), and the run would
+    # report success for the dead run's read -- for a Kafka micro-batch that means
+    # offsets committed for rows never loaded. Every run here re-reads its rows from
+    # the source, so whatever a dead run left is dropped first, with the state
+    # (cursor, marker) restored to before it.
+    _abort_pending(pipeline, strict=True)
     # What the pipeline state says about earlier runs, read from the bucket first
     # (a recreated container has no local copy). Only the modes that continue from
     # a cursor consult it; the others cost no extra read.

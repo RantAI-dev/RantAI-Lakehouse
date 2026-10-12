@@ -16,6 +16,10 @@ Cases, cited by the loader's comments as `SRC-10 measurement 3/4/5`:
   and to the incremental cursor.
 - 5: a merge above 1000 rows is several commits; a failure part-way leaves one
   row per key, and the next clean run completes it.
+- 6 (third pass, finding R3): what the next run does with a package left by a
+  PROCESS that died mid-load, which no `except` ran for. Simulated by raising a
+  `BaseException` out of `Pipeline.load` (or `normalize`): `load_via_sink` only
+  catches `Exception`, exactly as a kill gives it no chance to abort anything.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import dlt
 import pytest
 from dlt.common.destination.exceptions import DestinationTerminalException
 from dlt.pipeline.exceptions import PipelineStepFailed
+from dlt.pipeline.pipeline import Pipeline
 from pyiceberg.table import Table
 
 from dispar_orchestrate.adapters import sink as sink_module
@@ -63,6 +68,18 @@ class _Failure:
 
     def heal(self) -> None:
         self.active = False
+
+
+class Killed(BaseException):
+    """The process died here. A `BaseException`, so no `except Exception` of the
+    loader runs, as for a SIGKILL; `at` is the `Pipeline` step it dies in front of."""
+
+
+def kill_before(monkeypatch: pytest.MonkeyPatch, at: str) -> None:
+    def die(*_args: Any, **_kwargs: Any) -> Any:
+        raise Killed(at)
+
+    monkeypatch.setattr(Pipeline, at, die)
 
 
 def _v(lab: Lab, table: str) -> dict[Any, str]:
@@ -133,8 +150,10 @@ def test_3_a_table_with_two_versions_of_a_key_from_incremental_keeps_both_throug
     """The case the first-run rule does NOT cover: switching `incremental` to
     `incremental_dedup` keeps the cursor (it is the same cursor), so run 1 merges
     instead of replacing, into a table that holds an old and a new version of
-    key 2, and (previous case) the merge updates both. Reported to the planner;
-    refresh (plan task 5) forgets the cursor and is the way out."""
+    key 2, and (previous case) the merge updates both. This is the raw merge, which
+    stays as measured; `load_via_sink` closes the gap with the marker it keeps in the
+    pipeline state (`test_sink_dedup_marker.py`, planner finding R2 of the second
+    pass): the first run under a deduplicating mode replaces, so it never gets here."""
     _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
     items_db.execute("UPDATE items SET v='B', updated_at=40 WHERE id=2")
     items_db.commit()
@@ -221,7 +240,7 @@ def test_4_without_the_abort_the_next_run_only_finishes_the_failed_package_and_d
     Changed with task D (it ran before it through `load_via_sink`, which now aborts
     the package itself): the abort is switched off here so the test still measures
     what `dlt` does without it."""
-    monkeypatch.setattr(sink_module, "_abort_pending", lambda _pipeline: None)
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *_a, **_k: None)
     _load(lab, [{"id": 1, "v": "a"}], "ap", "append")
     failure = _Failure(monkeypatch, Table, "append")
     with pytest.raises(PipelineStepFailed):
@@ -264,7 +283,7 @@ def test_4_without_the_abort_the_next_incremental_run_finishes_the_failed_packag
 
     Changed with task D, as the case above: `load_via_sink`'s own abort is switched
     off so the test still measures `dlt` without it."""
-    monkeypatch.setattr(sink_module, "_abort_pending", lambda _pipeline: None)
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *_a, **_k: None)
     _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
     items_db.execute("INSERT INTO items VALUES (4,'d',40)")
     items_db.commit()
@@ -320,3 +339,74 @@ def test_5_a_failure_in_a_later_slice_of_a_merge_that_inserts_new_keys_also_leav
     lab.pipeline("ins").abort_packages()
     _merge_load(lab, source, "ins", ["id"])
     assert len(lab.rows("ins")) == 2500 and {r["v"] for r in lab.rows("ins")} == {"new"}
+
+
+# ---------------------------------------------------------------------------
+# Measurement 6: a package a killed process left
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("killed_before", ["normalize", "load"])
+def test_6_without_an_abort_at_the_start_the_run_after_a_kill_finishes_the_dead_package_and_loads_none_of_its_own_rows(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch, killed_before: str
+) -> None:
+    """What the next `load_via_sink` does TODAY (the abort at the start of a run is
+    switched off here, as in the cases of 4): a Kafka-shaped micro-batch [1, 2, 3] dies
+    between extract and load; the next micro-batch [4, 5] is reported as a success
+    with the DEAD batch's row count (3, or none; never 2) while the
+    table holds the dead batch's rows and not its own. A consumer that commits offsets
+    after the call returns has then committed 4 and 5 for rows that are not in the table."""
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *_a, **_k: None)
+    _load(lab, [{"id": 0, "v": "first"}], "k", "append")  # the table exists: the bucket holds a state
+    with monkeypatch.context() as dies:
+        kill_before(dies, killed_before)
+        with pytest.raises(Killed):
+            _load(lab, [{"id": n, "v": "dead"} for n in (1, 2, 3)], "k", "append")
+    assert lab.pipeline("k").has_pending_data, "the dead run left its package behind"
+    result = _load(lab, [{"id": 4, "v": "live"}, {"id": 5, "v": "live"}], "k", "append")
+    assert not result.has_failed_jobs, "reported as a success"
+    # Killed before normalize, the run normalized the DEAD package and counts its 3 rows;
+    # killed after it, no normalize ran in this run at all and there is no count. Never 2.
+    assert result.rows == {"normalize": 3, "load": None}[killed_before], "no count of this batch's own 2 rows"
+    assert sorted(_v(lab, "k")) == [0, 1, 2, 3], "the dead batch's rows are in; this batch's rows are not"
+    # The batch after that one finds nothing pending and loads its own rows.
+    _load(lab, [{"id": 6, "v": "next"}], "k", "append")
+    assert sorted(_v(lab, "k")) == [0, 1, 2, 3, 6]
+
+
+def test_6_a_run_killed_before_the_table_ever_had_a_state_is_dropped_by_the_next_run_not_finished(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one case that needs no abort: with no state in the bucket yet, `dlt`'s
+    restore at the start of `run` wipes the working folder, package included, so the
+    next run reads its own rows. (Why the cases above load a row first.)"""
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *_a, **_k: None)
+    with monkeypatch.context() as dies:
+        kill_before(dies, "load")
+        with pytest.raises(Killed):
+            _load(lab, [{"id": n, "v": "dead"} for n in (1, 2, 3)], "k", "append")
+    result = _load(lab, [{"id": 4, "v": "live"}], "k", "append")
+    assert result.rows == 1 and sorted(_v(lab, "k")) == [4]
+
+
+def test_6_the_incremental_cursor_moved_by_a_killed_run_is_kept_and_the_dead_package_is_finished_by_the_next_run(
+    lab: Lab, items_db: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For a cursor the dead package carries the cursor's move (`dlt` saves the
+    state at extract), so finishing the package keeps rows and cursor consistent; what
+    is lost is only the next run's own read, which waits for the run after it."""
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *_a, **_k: None)
+    _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
+    items_db.execute("INSERT INTO items VALUES (4,'d',40)")
+    items_db.commit()
+    with monkeypatch.context() as dies:
+        kill_before(dies, "load")
+        with pytest.raises(Killed):
+            _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
+    items_db.execute("INSERT INTO items VALUES (5,'e',50)")
+    items_db.commit()
+    result = _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
+    assert result.rows == 0, "reported as 'nothing new' although the dead package's row 4 was loaded"
+    assert sorted(_v(lab, "items")) == [1, 2, 3, 4], "row 4 from the dead package; row 5 is not read yet"
+    _load(lab, _items_source(tmp_path), "items", "incremental", "updated_at")
+    assert sorted(r["id"] for r in lab.rows("items")) == [1, 2, 3, 4, 5]

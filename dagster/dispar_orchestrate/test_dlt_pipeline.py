@@ -184,6 +184,8 @@ class _FakePipeline:
         self.materialized_rows: list[dict] = []
         self.last_trace = None
         self.state: dict = {}
+        # The real pipeline's flag; `load_via_sink` asks it before every run (SRC-10 R3).
+        self.has_pending_data = False
 
     def run(self, source, table_name, table_format, write_disposition):
         self.materialized_rows = list(source)
