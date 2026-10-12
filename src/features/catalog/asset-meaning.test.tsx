@@ -178,26 +178,33 @@ describe("the meaning view", () => {
     expect(within(row).getByText("No meaning written")).toBeTruthy()
   })
 
-  it("gives the narrow layout one track per cell that is shown below @lg", () => {
+  it("shows three header cells below @lg, the role being under the name, and a first track for each", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
 
-    // Below @lg the Also called and Status cells are `hidden`; Column, Role, Meaning and Confirm are shown.
+    // Below @lg the Role, Also called and Status headers are `hidden`: the role sits under the name in the row.
     const header = within(meaningTable()).getAllByRole("row")[0] as HTMLElement
     const shownBelowLg = within(header)
       .getAllByRole("columnheader")
       .filter((h) => !/(^|\s)hidden(\s|$)/.test(h.className))
+      .map((h) => h.textContent)
+    expect(shownBelowLg).toEqual(["Column", "Meaning", "Confirm"])
     const base = header.className.split(/\s+/).find((c) => c.startsWith("grid-cols-["))
-    expect(base).toBeTruthy()
+    expect(base).toBe("grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_1.75rem]")
     const tracks = base?.slice("grid-cols-[".length, -1).split("_") ?? []
     expect(tracks).toHaveLength(shownBelowLg.length)
   })
 
-  it("shows the same cells in the header and the first row at every width, with one track per shown cell", () => {
+  it("shows the same cells in the header and the first row from @lg up, and the header without the role below it", () => {
     // Header order: Column, Role, Meaning, Also called, Status, Confirm. Status sheds after Also called, at @2xl.
-    const widths: Array<{ prefix: string; shown: boolean[] }> = [
-      { prefix: "", shown: [true, true, true, false, false, true] },
+    // Below @lg the role sits under the name in the row, so the header has one cell less than the row.
+    const widths: Array<{ prefix: string; shown: boolean[]; headerShown?: boolean[] }> = [
+      {
+        prefix: "",
+        shown: [true, true, true, false, false, true],
+        headerShown: [true, false, true, false, false, true],
+      },
       { prefix: "@lg:", shown: [true, true, true, false, false, true] },
       { prefix: "@2xl:", shown: [true, true, true, false, true, true] },
       { prefix: "@3xl:", shown: [true, true, true, true, true, true] },
@@ -223,10 +230,10 @@ describe("the meaning view", () => {
       return token ? token.slice(`${prefix}grid-cols-[`.length, -1).split("_").length : -1
     }
 
-    for (const { prefix, shown } of widths) {
-      expect(shownAt(header, prefix)).toEqual(shown)
+    for (const { prefix, shown, headerShown = shown } of widths) {
+      expect(shownAt(header, prefix)).toEqual(headerShown)
       expect(shownAt(firstRow, prefix)).toEqual(shown)
-      expect(trackCount(header, prefix)).toBe(shown.filter(Boolean).length)
+      expect(trackCount(header, prefix)).toBe(headerShown.filter(Boolean).length)
     }
   })
 
@@ -237,24 +244,30 @@ describe("the meaning view", () => {
     expect(within(meaningTable()).getAllByRole("row")).toHaveLength(4)
   })
 
-  it("clamps a meaning to two lines, not one, for a reader who can write", () => {
+  it("wraps a meaning to three lines below @lg and two from @lg, with normal white space, for a reader who can write", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: true })
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
 
     const classes = within(meaningTable()).getByText("Total order value in rupiah").className.split(/\s+/)
-    expect(classes).toContain("line-clamp-2")
+    expect(classes).toContain("line-clamp-3")
+    expect(classes).toContain("@lg:line-clamp-2")
+    expect(classes).toContain("whitespace-normal")
     expect(classes).not.toContain("truncate")
+    expect(classes).not.toContain("block")
   })
 
-  it("clamps a meaning to two lines, not one, for a reader who cannot write", () => {
+  it("wraps a meaning to three lines below @lg and two from @lg, with normal white space, for a reader who cannot write", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED], { canEdit: false })
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
 
     const classes = within(meaningTable()).getByText("Number of distinct customers").className.split(/\s+/)
-    expect(classes).toContain("line-clamp-2")
+    expect(classes).toContain("line-clamp-3")
+    expect(classes).toContain("@lg:line-clamp-2")
+    expect(classes).toContain("whitespace-normal")
     expect(classes).not.toContain("truncate")
+    expect(classes).not.toContain("block")
   })
 })
 
@@ -365,13 +378,16 @@ describe("the role in the row", () => {
     )
   })
 
-  it("gives the Meaning view's header a 7.5rem role track below @lg", () => {
+  it("puts the role below the name on the row's second grid line in the first track, below @lg", () => {
     const { state } = readyMeanings([DRAFT, CONFIRMED])
     renderCard(ROWS, state)
     fireEvent.click(meaningTab())
 
     const header = within(meaningTable()).getAllByRole("row")[0]
-    expect(header.className).toContain("grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]")
+    expect(header.className).toContain("grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_1.75rem]")
+    const roleCell = Array.from(rowOf("orders_total").children)[1] as HTMLElement
+    expect(roleCell.className).toContain("row-start-2")
+    expect(roleCell.className).toContain("@lg:row-start-auto")
   })
 })
 
