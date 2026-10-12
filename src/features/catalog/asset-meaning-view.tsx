@@ -170,22 +170,26 @@ function TableMeaningReady({ state }: { state: Ready }) {
 //
 // Header and rows share one grid string, as the Columns card does: fixed
 // tracks in `rem`, flexible ones `minmax(0, …fr)`, so a cell never widens the
-// list. The meaning takes up to two lines; the other cells truncate to one.
+// list. The meaning clamps to three lines below `@lg` and two from `@lg`; the other cells truncate to one.
 // Cells shed by container query, in this order
 // (PR #109 review, finding 4): the synonyms go first, below `@3xl`; the status
 // goes second, below `@2xl`, so a reader who cannot write still sees whether
 // an entry is a draft. The column name, the role, the meaning and the confirm
 // control never shed. Every breakpoint lists the cells that are shown, in
-// order, so the header and the rows agree. Below `@lg` the four shown cells
-// take one track each: the role gets a fixed 7.5rem, wide enough for its short
-// label, so it is read whole (staging run 2026-10-11, item 1), and the meaning
-// gets `minmax(0, 1.6fr)`, the widest of the flexible tracks, since it is what
-// the row is for. The confirm control keeps its fixed 1.75rem. The row shows
-// the role's short label with the full one as its title. A meaning clamps to
-// two lines, so a long one is read in full (staging run 2026-10-11, item 2).
-const MEANING_ROW = "grid items-center gap-x-3 px-3"
+// order, so the header and the rows agree.
+//
+// Below `@lg` the name and the role share the first track, the role on the
+// row's second grid line under the name, so the name is not cut at a phone's
+// width. PR #111 review, finding 2: a fixed 7.5rem role track left about 60 px
+// for the name and cut most of them. The meaning spans the second track across
+// both lines, and the confirm control keeps the third. From `@lg` up the role
+// takes its own track on the first line, and the status and synonyms join as
+// the container widens. The row shows the role's short label with the full one
+// as its title. A meaning clamps to three lines below `@lg` and two from `@lg`,
+// so a long one is read in full (staging run 2026-10-11, item 2).
+const MEANING_ROW = "grid items-center gap-x-3 gap-y-1 px-3"
 const MEANING_TRACKS = [
-  "grid-cols-[minmax(0,1fr)_7.5rem_minmax(0,1.6fr)_1.75rem]",
+  "grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_1.75rem]",
   "@lg:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_1.75rem]",
   "@2xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_5rem_1.75rem]",
   "@3xl:grid-cols-[minmax(0,1fr)_9rem_minmax(0,2fr)_minmax(0,1fr)_5rem_1.75rem]",
@@ -272,7 +276,7 @@ function MeaningRow({
           {name}
         </span>
       </div>
-      <div role="cell" className="min-w-0">
+      <div role="cell" className="col-start-1 row-start-2 min-w-0 @lg:col-start-auto @lg:row-start-auto">
         {canEdit ? (
           <RoleSelect
             value={role}
@@ -287,7 +291,7 @@ function MeaningRow({
           </span>
         )}
       </div>
-      <div role="cell" className="min-w-0">
+      <div role="cell" className="col-start-2 row-span-2 row-start-1 min-w-0 @lg:col-start-auto @lg:row-span-1 @lg:row-start-auto">
         {entry ? (
           canEdit ? (
             // PR #111 review, finding 1: `block` beside `line-clamp-*` keeps display block and
@@ -330,7 +334,7 @@ function MeaningRow({
       <div role="cell" className="hidden @2xl:block">
         {entry ? <Pill tone={draft ? "warning" : "neutral"}>{entry.status}</Pill> : null}
       </div>
-      <div role="cell" className="flex justify-end">
+      <div role="cell" className="col-start-3 row-span-2 row-start-1 flex justify-end @lg:col-start-auto @lg:row-span-1 @lg:row-start-auto">
         {canEdit && draft ? (
           <Button
             variant="ghost"
@@ -356,7 +360,7 @@ function MeaningHeader() {
       className={cn(MEANING_ROW, MEANING_TRACKS, "border-b bg-muted/30 py-2 text-xs font-medium text-muted-foreground")}
     >
       <div role="columnheader">Column</div>
-      <div role="columnheader">Role</div>
+      <div role="columnheader" className="hidden @lg:block">Role</div>
       <div role="columnheader">Meaning</div>
       <div role="columnheader" className="hidden @3xl:block">
         Also called
