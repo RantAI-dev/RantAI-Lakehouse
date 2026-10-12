@@ -35,7 +35,9 @@ type Call = { url: string; method: string; body: unknown }
 
 function stubFetch(
   spec: typeof SPEC = SPEC,
-  history: { runs: unknown[]; results: unknown[] } = { runs: [], results: [] }
+  history: { runs: unknown[]; results: unknown[] } = { runs: [], results: [] },
+  // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
+  options: { discovered?: unknown[]; onRun?: (body: unknown) => Response } = {}
 ): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -56,13 +58,13 @@ function stubFetch(
     if (url.includes("/discover")) {
       return json({
         supported: true,
-        objects: [
+        objects: options.discovered ?? [
           { name: "public.orders", columns: [{ name: "order_id", typeName: "smallint" }] },
           { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }] },
         ],
       })
     }
-    if (url.includes("/ingest/run")) return json({ runId: "0123456789abcdef" })
+    if (url.includes("/ingest/run")) return options.onRun ? options.onRun(body) : json({ runId: "0123456789abcdef" })
     throw new Error(`unexpected fetch: ${method} ${url}`)
   }) as unknown as typeof fetch
   return calls
@@ -77,8 +79,9 @@ describe("ingest panel helpers", () => {
     expect(loadModeProblem({ loadMode: "incremental" })).toMatch(/Pick the column/)
     // SRC-10: the merging mode needs the same cursor column; the replacing one needs none.
     expect(loadModeProblem({ loadMode: "incremental_dedup" })).toMatch(/Pick the column/)
-    expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at" })).toBeNull()
-    expect(loadModeProblem({ loadMode: "replace_dedup" })).toBeNull()
+    // ... and a key (the two lines below named no key before the key field existed).
+    expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
+    expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
   })
 
   it("names a Bronze table after the connector and the source table", () => {
@@ -205,7 +208,13 @@ describe("ConnectorIngestPanel", () => {
     const sql = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
     expect(mode.value).toBe("replace")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "incremental", "append"])
+    expect([...mode.options].map((o) => o.value)).toEqual([
+      "replace",
+      "incremental",
+      "append",
+      "replace_dedup",
+      "incremental_dedup",
+    ])
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
     sql.unmount()
 
@@ -217,7 +226,7 @@ describe("ConnectorIngestPanel", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
-    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append"])
+    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup"])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {
@@ -466,5 +475,171 @@ describe("groupResultsByRun", () => {
     )
     expect(groups).toHaveLength(1)
     expect(groups[0]!.results).toEqual([])
+  })
+})
+
+/**
+ * SRC-10 decisions 2, 3 and 4: the modes a source offers, the key of a
+ * deduplicating table (filled from discovery, typed otherwise), and the problems
+ * the API would refuse shown before saving.
+ */
+describe("ConnectorIngestPanel load modes and keys", () => {
+  const saved = (extra: Record<string, unknown> = {}) => ({
+    ...SPEC,
+    sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
+  })
+  const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
+  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+
+  it("offers five modes to a SQL source, labelled in plain words", async () => {
+    stubFetch(saved())
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+    expect([...mode.options].map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add only new rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+    ])
+    // Nothing is missing, so there is no line about a missing mode.
+    expect(screen.queryByText(/offered for SQL sources only/)).toBeNull()
+  })
+
+  it("offers three modes to any other batch source and says why the incremental ones are missing", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "rest",
+      dial: { baseUrl: "https://api.example.com" } as unknown as typeof SPEC.dial,
+      sourceObjects: [{ name: "orders", target: "api_orders" }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    const mode = await modeOf("orders")
+    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup"])
+    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources only/)).toBeDefined()
+  })
+
+  it("says in each hint what happens to the rows already in the table", async () => {
+    stubFetch(saved())
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+    const hints: Record<string, RegExp> = {
+      replace: /replaces the rows already in the table/,
+      append: /below the rows already in the table/,
+      replace_dedup: /replaces the rows already in the table with a fresh copy of the source, one row per key/,
+      incremental: /keep the rows already there/,
+      incremental_dedup: /merge .* into the rows already there/,
+    }
+    for (const [value, hint] of Object.entries(hints)) {
+      fireEvent.change(mode, { target: { value } })
+      if (value.startsWith("incremental")) {
+        fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
+      }
+      if (value.endsWith("_dedup")) {
+        fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
+      }
+      expect(screen.getByText(hint)).toBeDefined()
+    }
+  })
+
+  it("blocks Save for a deduplicating mode with no key, and for incremental and deduplicate with no cursor", async () => {
+    stubFetch(saved())
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+
+    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
+    expect(saveButton().disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
+    expect(screen.queryByText(/cannot be saved without a key/)).toBeNull()
+    expect(saveButton().disabled).toBe(false)
+
+    fireEvent.change(mode, { target: { value: "incremental_dedup" } })
+    expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
+    expect(saveButton().disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
+    expect(saveButton().disabled).toBe(false)
+
+    // Clearing the key again blocks Save again.
+    fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "" } })
+    expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
+    expect(saveButton().disabled).toBe(true)
+  })
+
+  it("saves a typed key as a list of columns, with the cursor, for a table typed by hand", async () => {
+    const calls = stubFetch({ ...SPEC, adapter: "rest", dial: {} as unknown as typeof SPEC.dial, sourceObjects: [] })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "orders" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    fireEvent.change(await modeOf("orders"), { target: { value: "replace_dedup" } })
+    fireEvent.change(screen.getByLabelText("Key columns for orders"), { target: { value: "id, region" } })
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "orders", target: "api_orders", loadMode: "replace_dedup", primaryKey: ["id", "region"] },
+    ])
+  })
+
+  const FOUND = [
+    {
+      name: "public.orders",
+      columns: [
+        { name: "order_id", typeName: "integer" },
+        { name: "region", typeName: "text" },
+        { name: "updated_at", typeName: "timestamp" },
+      ],
+      primaryKey: ["order_id", "region"],
+    },
+    { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }], primaryKey: [] },
+  ]
+
+  it("fills the key from the source's own when a found table is ticked, and lets the user change it", async () => {
+    const calls = stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
+    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
+
+    const ticked = (name: string) =>
+      (screen.getByLabelText(`${name} is part of the key of public.orders`) as HTMLInputElement).checked
+    expect([ticked("order_id"), ticked("region"), ticked("updated_at")]).toEqual([true, true, false])
+    expect(screen.getByText("Filled in from the source, which declares order_id, region as this table's key.")).toBeDefined()
+
+    // Change it: untick region.
+    fireEvent.click(screen.getByLabelText("region is part of the key of public.orders"))
+    expect(screen.getByText(/The source declares order_id, region as this table's key; this table uses another\./)).toBeDefined()
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      {
+        name: "public.orders",
+        target: "northwind_orders",
+        loadMode: "incremental_dedup",
+        incrementalKey: "updated_at",
+        primaryKey: ["order_id"],
+      },
+    ])
+  })
+
+  it("asks for a key when the source declares none, and fills it when a table already picked is switched to a mode that needs one", async () => {
+    stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.customers/))
+    fireEvent.change(await modeOf("public.customers"), { target: { value: "replace_dedup" } })
+    // Declares no key: nothing is ticked, and Save says why it is off.
+    expect((screen.getByLabelText("customer_id is part of the key of public.customers") as HTMLInputElement).checked).toBe(false)
+    expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
+    expect(saveButton().disabled).toBe(true)
+  })
+
+  it("keeps a saved key and mode as they are", async () => {
+    stubFetch(saved({ loadMode: "replace_dedup", primaryKey: ["id"] }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+    expect(mode.value).toBe("replace_dedup")
+    expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
+    expect(saveButton().disabled).toBe(true)
   })
 })

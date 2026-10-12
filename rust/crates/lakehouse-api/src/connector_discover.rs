@@ -74,6 +74,12 @@ pub struct DiscoveredObject {
     pub name: String,
     /// This table's columns, in the source database's own ordinal order.
     pub columns: Vec<DiscoveredColumn>,
+    /// The columns of the table's primary key, in key order, as the source's own
+    /// catalog declares it (`SRC-10` decision 3); empty when the source declares
+    /// none. Read by a second bound query per driver
+    /// ([`POSTGRES_PRIMARY_KEY_QUERY`] and its siblings), never guessed from
+    /// column names.
+    pub primary_key: Vec<String>,
 }
 
 /// The response body for `POST /api/connectors/{id}/discover`. `reason`
@@ -203,10 +209,28 @@ fn group_columns_by_table(
                     name: column_name,
                     type_name: data_type,
                 }],
+                primary_key: Vec::new(),
             }),
         }
     }
     objects
+}
+
+/// Put each `(table_name, column_name)` row of a primary-key query — already
+/// ordered by `(table_name, ordinal_position)` — on the table it names, in key
+/// order. A row for a table `objects` does not list (a view's key cannot exist,
+/// so only a race with a dropped table could do it) is ignored.
+fn attach_primary_keys(
+    schema: &str,
+    objects: &mut [DiscoveredObject],
+    rows: Vec<(String, String)>,
+) {
+    for (table_name, column_name) in rows {
+        let full_name = format!("{schema}.{table_name}");
+        if let Some(object) = objects.iter_mut().find(|o| o.name == full_name) {
+            object.primary_key.push(column_name);
+        }
+    }
 }
 
 /// `$1`: `sqlx`'s Postgres positional-parameter placeholder syntax.
@@ -229,8 +253,29 @@ pub async fn discover_sql_postgres(
         .fetch_all(pool)
         .await
         .map_err(DiscoverError::from)?;
-    Ok(group_columns_by_table(schema, rows))
+    let mut objects = group_columns_by_table(schema, rows);
+    let keys: Vec<(String, String)> = sqlx::query_as(POSTGRES_PRIMARY_KEY_QUERY)
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+        .map_err(DiscoverError::from)?;
+    attach_primary_keys(schema, &mut objects, keys);
+    Ok(objects)
 }
+
+/// The primary-key columns of every table in a schema, in key order, from the
+/// standard `information_schema` views (`SRC-10` decision 3). One bind placeholder
+/// (`$1`), no interpolation site, like [`POSTGRES_DISCOVER_QUERY`]; the pair
+/// `(constraint_name, table_name)` is what ties a key column to its table in
+/// `PostgreSQL`, where constraint names are unique only per table.
+pub(crate) const POSTGRES_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.column_name \
+    FROM information_schema.table_constraints tc \
+    JOIN information_schema.key_column_usage kcu \
+      ON kcu.constraint_schema = tc.constraint_schema \
+     AND kcu.constraint_name = tc.constraint_name \
+     AND kcu.table_name = tc.table_name \
+    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 \
+    ORDER BY kcu.table_name, kcu.ordinal_position";
 
 // `information_schema.columns` is the SAME standard SQL view `MySQL`
 // exposes (`MySQL` 8's own `information_schema.columns`) — the query
@@ -254,8 +299,32 @@ pub async fn discover_sql_mysql(
         .fetch_all(pool)
         .await
         .map_err(DiscoverError::from)?;
-    Ok(group_columns_by_table(schema, rows))
+    let mut objects = group_columns_by_table(schema, rows);
+    let keys: Vec<(String, String)> = sqlx::query_as(MYSQL_PRIMARY_KEY_QUERY)
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+        .map_err(DiscoverError::from)?;
+    attach_primary_keys(schema, &mut objects, keys);
+    Ok(objects)
 }
+
+/// The primary-key columns of every table in a schema, in key order
+/// (`SRC-10` decision 3). One bind placeholder (`?`). The two selected names are
+/// `CAST` to `CHAR`: `MySQL` 8 reports `information_schema` text as `VARBINARY`/
+/// `BLOB` to the wire protocol, which `sqlx` will not decode as `String` (the
+/// lesson of `SRC-9`'s gate on a real server). The join names `table_schema` and
+/// `table_name` too, because every `MySQL` primary key is called `PRIMARY`.
+pub(crate) const MYSQL_PRIMARY_KEY_QUERY: &str = "SELECT CAST(kcu.table_name AS CHAR), \
+    CAST(kcu.column_name AS CHAR) \
+    FROM information_schema.table_constraints tc \
+    JOIN information_schema.key_column_usage kcu \
+      ON kcu.constraint_schema = tc.constraint_schema \
+     AND kcu.constraint_name = tc.constraint_name \
+     AND kcu.table_schema = tc.table_schema \
+     AND kcu.table_name = tc.table_name \
+    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ? \
+    ORDER BY kcu.table_name, kcu.ordinal_position";
 
 // SQL Server's own `INFORMATION_SCHEMA.COLUMNS` (T-SQL is
 // case-insensitive for identifiers by default) — `tiberius` (not `sqlx`)
@@ -289,8 +358,37 @@ pub async fn discover_sql_mssql(
             row.get::<&str, _>(2).unwrap_or_default().to_owned(),
         ));
     }
-    Ok(group_columns_by_table(schema, rows))
+    let mut objects = group_columns_by_table(schema, rows);
+    let stream = client
+        .query(MSSQL_PRIMARY_KEY_QUERY, &[&schema])
+        .await
+        .map_err(DiscoverError::from)?;
+    let mut keys = Vec::new();
+    for row in stream
+        .into_first_result()
+        .await
+        .map_err(DiscoverError::from)?
+    {
+        keys.push((
+            row.get::<&str, _>(0).unwrap_or_default().to_owned(),
+            row.get::<&str, _>(1).unwrap_or_default().to_owned(),
+        ));
+    }
+    attach_primary_keys(schema, &mut objects, keys);
+    Ok(objects)
 }
+
+/// The primary-key columns of every table in a schema, in key order, from SQL
+/// Server's `INFORMATION_SCHEMA` (`SRC-10` decision 3). One bind placeholder
+/// (`@P1`), like [`MSSQL_DISCOVER_QUERY`].
+pub(crate) const MSSQL_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.column_name \
+    FROM information_schema.table_constraints tc \
+    JOIN information_schema.key_column_usage kcu \
+      ON kcu.constraint_schema = tc.constraint_schema \
+     AND kcu.constraint_name = tc.constraint_name \
+     AND kcu.table_name = tc.table_name \
+    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = @P1 \
+    ORDER BY kcu.table_name, kcu.ordinal_position";
 
 /// Open a bounded, SSRF-checked discovery connection for `target` and list
 /// `schema`, dispatching on `target.driver` — the SAME
@@ -466,7 +564,10 @@ pub async fn discover(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only module")]
 mod tests {
-    use super::{MSSQL_DISCOVER_QUERY, MYSQL_DISCOVER_QUERY, POSTGRES_DISCOVER_QUERY};
+    use super::{
+        MSSQL_DISCOVER_QUERY, MSSQL_PRIMARY_KEY_QUERY, MYSQL_DISCOVER_QUERY,
+        MYSQL_PRIMARY_KEY_QUERY, POSTGRES_DISCOVER_QUERY, POSTGRES_PRIMARY_KEY_QUERY,
+    };
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn discover_sql_postgres_lists_columns_from_information_schema(pool: sqlx::PgPool) {
@@ -509,5 +610,77 @@ mod tests {
         assert!(!MYSQL_DISCOVER_QUERY.contains("{schema}"));
         assert!(MSSQL_DISCOVER_QUERY.contains("@P1"));
         assert!(!MSSQL_DISCOVER_QUERY.contains("{schema}"));
+    }
+
+    /// `SRC-10`: the three primary-key queries are held to the same rule as the
+    /// column queries: exactly ONE bind placeholder of the driver's own syntax,
+    /// no interpolation site, and the `MySQL` text columns cast to `CHAR`.
+    #[test]
+    fn primary_key_queries_bind_the_schema_never_interpolate_it() {
+        for (query, placeholder, others) in [
+            (POSTGRES_PRIMARY_KEY_QUERY, "$1", ["?", "@P1"]),
+            (MYSQL_PRIMARY_KEY_QUERY, "?", ["$1", "@P1"]),
+            (MSSQL_PRIMARY_KEY_QUERY, "@P1", ["$1", "?"]),
+        ] {
+            assert_eq!(query.matches(placeholder).count(), 1, "{query}");
+            for other in others {
+                assert!(!query.contains(other), "{query}");
+            }
+            assert!(!query.contains('{') && !query.contains('}'), "{query}");
+            assert!(query.contains("'PRIMARY KEY'"), "{query}");
+            assert!(query.contains("ORDER BY"), "{query}");
+        }
+        assert!(MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.table_name AS CHAR)"));
+        assert!(MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.column_name AS CHAR)"));
+    }
+
+    /// A composite key keeps its column order; a table with no key keeps `[]`;
+    /// a row for a table that is not listed is ignored.
+    #[test]
+    fn keys_land_on_their_tables_in_key_order() {
+        let mut objects = super::group_columns_by_table(
+            "public",
+            vec![
+                ("a".to_owned(), "x".to_owned(), "integer".to_owned()),
+                ("a".to_owned(), "y".to_owned(), "integer".to_owned()),
+                ("b".to_owned(), "z".to_owned(), "integer".to_owned()),
+            ],
+        );
+        super::attach_primary_keys(
+            "public",
+            &mut objects,
+            vec![
+                ("a".to_owned(), "y".to_owned()),
+                ("a".to_owned(), "x".to_owned()),
+                ("gone".to_owned(), "q".to_owned()),
+            ],
+        );
+        assert_eq!(objects[0].primary_key, ["y", "x"]);
+        assert!(objects[1].primary_key.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn discover_sql_postgres_reads_the_declared_primary_key_in_key_order(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE keyed (region TEXT, id INT, note TEXT, PRIMARY KEY (id, region))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create keyed table");
+        sqlx::query("CREATE TABLE unkeyed (id INT)")
+            .execute(&pool)
+            .await
+            .expect("create unkeyed table");
+        let objects = super::discover_sql_postgres(&pool, "public")
+            .await
+            .expect("discovery query succeeds");
+        let keyed = objects.iter().find(|o| o.name == "public.keyed").unwrap();
+        assert_eq!(
+            keyed.primary_key,
+            ["id", "region"],
+            "key order, not column order"
+        );
+        let unkeyed = objects.iter().find(|o| o.name == "public.unkeyed").unwrap();
+        assert!(unkeyed.primary_key.is_empty());
     }
 }

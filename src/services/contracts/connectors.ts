@@ -689,6 +689,12 @@ export type DiscoveredColumn = {
 export type DiscoveredObject = {
   name: string
   columns: DiscoveredColumn[]
+  /**
+   * `SRC-10`: the columns of the table's primary key as the source declares it,
+   * in key order; `[]` when the source declares none. SQL drivers only; read from
+   * the source's own catalog views, so it is the source's word, not a guess.
+   */
+  primaryKey: string[]
 }
 
 /**
