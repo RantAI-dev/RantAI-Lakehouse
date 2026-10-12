@@ -7,11 +7,11 @@ import { brandMarkForTypeName } from "@/lib/connectors/brand-marks"
 afterEach(cleanup)
 
 const TYPES: ConnectorType[] = [
-  { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null },
-  { name: "Oracle", adapter: "sql", supported: true, docsUrl: null },
-  { name: "PostgreSQL CDC", adapter: "cdc", supported: true, docsUrl: null },
-  { name: "SQL Server CDC", adapter: "cdc", supported: true, docsUrl: null },
-  { name: "SAP / ERP", adapter: null, supported: false, docsUrl: null },
+  { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "Oracle", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "PostgreSQL CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "SQL Server CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "SAP / ERP", adapter: null, supported: false, docsUrl: null, unsupportedReason: null },
 ]
 
 function tile(name: string) {
@@ -64,7 +64,7 @@ describe("ConnectorTypePicker marks", () => {
   })
 
   it("draws a mark whose brand colour is too dark for the dark theme in the foreground there", () => {
-    render(<ConnectorTypePicker types={[{ name: "MariaDB", adapter: "sql", supported: true, docsUrl: null }]} value={null} onChange={() => {}} />)
+    render(<ConnectorTypePicker types={[{ name: "MariaDB", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null }]} value={null} onChange={() => {}} />)
     const svg = tile("MariaDB").querySelector("svg[data-brand-mark]")!
     expect(svg.getAttribute("class")).toContain("dark:text-foreground")
     cleanup()
@@ -84,7 +84,7 @@ describe("ConnectorTypePicker marks", () => {
 
 describe("MySQL mark", () => {
   it("draws both paths of the dolphin on its own non-square view box, in the brand colour and the foreground in dark", () => {
-    render(<ConnectorTypePicker types={[{ name: "MySQL CDC", adapter: "cdc", supported: true, docsUrl: null }]} value={null} onChange={() => {}} />)
+    render(<ConnectorTypePicker types={[{ name: "MySQL CDC", adapter: "cdc", supported: true, docsUrl: null, unsupportedReason: null }]} value={null} onChange={() => {}} />)
     const svg = tile("MySQL CDC").querySelector("svg[data-brand-mark]")!
     expect(svg.getAttribute("viewBox")).toBe("0 0 256 252")
     expect(svg.querySelectorAll("path")).toHaveLength(2)
@@ -107,5 +107,37 @@ describe("SelectedTypeSummary marks", () => {
     render(<SelectedTypeSummary type={TYPES[1]} />)
     expect(document.querySelector("svg[data-brand-mark]")).toBeNull()
     expect(document.querySelector("svg.lucide-database")).not.toBeNull()
+  })
+})
+
+describe("unavailable tiles (SRC-6 F5)", () => {
+  const SHEETS: ConnectorType = {
+    name: "Google Sheets",
+    adapter: "sheets",
+    supported: false,
+    docsUrl: null,
+    unsupportedReason: "No verified Google sign-in exists in this build, so a Google Sheets connector cannot be tested or loaded.",
+  }
+
+  it("disables the Google Sheets tile and shows its reason as text and title", () => {
+    render(<ConnectorTypePicker types={[SHEETS]} value={null} onChange={() => {}} />)
+    const el = tile("Google Sheets") as HTMLButtonElement
+    expect(el.disabled).toBe(true)
+    expect(el.textContent).toContain(SHEETS.unsupportedReason!)
+    expect(el.getAttribute("title")).toBe(SHEETS.unsupportedReason!)
+  })
+
+  it("shows Not available yet on an unavailable type that has no reason", () => {
+    render(<ConnectorTypePicker types={TYPES} value={null} onChange={() => {}} />)
+    const el = tile("SAP / ERP") as HTMLButtonElement
+    expect(el.disabled).toBe(true)
+    expect(el.textContent).toContain("Not available yet")
+    expect(el.getAttribute("title")).toBe("Not available yet")
+  })
+
+  it("no longer tells the user that Google Sheets can be configured and tested", () => {
+    render(<ConnectorTypePicker types={[SHEETS]} value="Google Sheets" onChange={() => {}} />)
+    expect(screen.queryByText(/can be configured and tested/)).toBeNull()
+    expect(screen.queryByText("Test only")).toBeNull()
   })
 })

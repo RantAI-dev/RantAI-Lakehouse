@@ -35,11 +35,17 @@ import type { QueryKeys } from "@/types/data-table"
 // out of scope for WS1 task 1.15) — so these two lookups stay page-local
 // instead of going through `@/services`.
 import { apiFetch } from "@/services/http"
-import { getRuleColumns, type Rule } from "@/features/alerts/rules-columns"
+import { useAuth } from "@/features/auth/auth-provider"
+import { getRuleColumns, isLoadAlertKind, ruleKindLabel, type Rule } from "@/features/alerts/rules-columns"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { alertRuleService } from "@/services"
-import type { AlertRule, SaveAlertRuleInput, AlertRunResult } from "@/services/contracts/alerts"
+import { alertRuleService, connectorService } from "@/services"
+import {
+  LOAD_ALERT_KINDS,
+  type AlertRule,
+  type SaveAlertRuleInput,
+  type AlertRunResult,
+} from "@/services/contracts/alerts"
 
 const OPS = [">", ">=", "<", "<=", "=="]
 const AGGS = ["sum", "avg", "max", "min", "count"]
@@ -91,21 +97,104 @@ const EMPTY_FORM: AlertRule = {
   id: "", name: "", type: "alert", agg: "sum", op: ">", threshold: 0, channel: "webhook", target: "", enabled: true,
 };
 
+/** D5: shown under the two kinds that nothing raises yet. */
+const NOT_RAISED_YET: Record<string, string> = {
+  connector_disabled:
+    "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed.",
+  connector_schema_change:
+    "Nothing raises this yet. It starts working when schema change detection (SRC-8) is installed.",
+}
+
+/**
+ * Whether the signed-in user sees every tenant: the one grant the API's
+ * `is_unrestricted` checks, the literal `*:*` token (a Platform Admin's set).
+ * Only such a user may save a rule for all connectors or for uploads (`SRC-7`
+ * D7); the API enforces it, this only decides what the form offers.
+ */
+export function seesEveryTenant(permissions: readonly string[] | undefined): boolean {
+  return permissions?.includes("*:*") ?? false
+}
+
 /**
  * Which rule-editor fields apply to a given `AlertRule.type`. A
  * `freshness` rule reuses `mart` as its `<namespace>.<table>` target and
  * sends no `board` — the backend clears `measure`/`agg`/`threshold`/`board`
- * for that kind (`lakehouse-alerts::normalize_input`). Kept pure and
- * DOM-free so it is unit-testable (WS5 item E3).
+ * for that kind (`lakehouse-alerts::normalize_input`). The six `SRC-7` kinds
+ * have none of mart, measure, aggregate, operator, threshold or board: the
+ * five `connector_*` kinds pick a connector (`connector`), offering "All
+ * connectors" (`allConnectors`) only when `canSeeAllTenants` and never for
+ * `connector_success` (D4); `upload_failure` picks nothing. `note` is the
+ * line under the kinds nothing raises yet (D5). Kept pure and DOM-free so it
+ * is unit-testable (WS5 item E3).
  */
-export function alertRuleFormFields(type: string): {
+export function alertRuleFormFields(
+  type: string,
+  canSeeAllTenants = false
+): {
   martMeasure: boolean;
   board: boolean;
   freshnessTarget: boolean;
+  connector: boolean;
+  allConnectors: boolean;
+  note: string | null;
 } {
-  if (type === "freshness") return { martMeasure: false, board: false, freshnessTarget: true };
-  if (type === "alert") return { martMeasure: true, board: false, freshnessTarget: false };
-  return { martMeasure: false, board: true, freshnessTarget: false };
+  const none = { connector: false, allConnectors: false, note: null }
+  if (type === "freshness") return { martMeasure: false, board: false, freshnessTarget: true, ...none };
+  if (type === "alert") return { martMeasure: true, board: false, freshnessTarget: false, ...none };
+  if (isLoadAlertKind(type)) {
+    const picksConnector = type !== "upload_failure"
+    return {
+      martMeasure: false,
+      board: false,
+      freshnessTarget: false,
+      connector: picksConnector,
+      allConnectors: picksConnector && type !== "connector_success" && canSeeAllTenants,
+      note: NOT_RAISED_YET[type] ?? null,
+    }
+  }
+  return { martMeasure: false, board: true, freshnessTarget: false, ...none };
+}
+
+/**
+ * The body to save for the form `f`. The `SRC-7` kinds send exactly the fields
+ * that apply (no mart, measure, aggregate, operator, threshold, board or
+ * pipeline) and only a connector for the five connector kinds; every other
+ * kind sends the form as it always did.
+ */
+export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
+  if (!isLoadAlertKind(f.type)) return f
+  return {
+    name: f.name.trim(),
+    type: f.type,
+    channel: f.channel,
+    target: f.target.trim(),
+    enabled: f.enabled,
+    ...(f.severity ? { severity: f.severity } : {}),
+    ...(f.type === "upload_failure" ? {} : { connector: f.connector ?? "" }),
+  }
+}
+
+/** The connector to keep when the kind changes: "All connectors" does not survive a kind that cannot take it. */
+export function connectorForKind(type: string, current: string | undefined, canSeeAllTenants: boolean): string | undefined {
+  if (!alertRuleFormFields(type, canSeeAllTenants).connector) return undefined
+  if (current === "*" && !alertRuleFormFields(type, canSeeAllTenants).allConnectors) return undefined
+  return current
+}
+
+/** The run-alerts notice (D9), or `null` when the API says reports can arrive or could not say. */
+export const RUN_ALERTS_OFF =
+  "Run alerts are not being reported: PIPELINE_RUN_TOKEN is not set on the API."
+
+export function RunAlertsNotice({ runEventsConfigured }: { readonly runEventsConfigured: boolean | null }) {
+  if (runEventsConfigured !== false) return null
+  return (
+    <div
+      role="status"
+      className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
+    >
+      {RUN_ALERTS_OFF}
+    </div>
+  )
 }
 
 type AlertConditionProps = {
@@ -275,6 +364,9 @@ type RuleDialogProps = {
   readonly onSave: () => Promise<void>
   readonly busy: boolean
   readonly err: string | null
+  readonly connectors: { id: string; name: string }[]
+  readonly connectorsError: string | null
+  readonly canSeeAllTenants: boolean
 }
 
 function RuleEditDialog({
@@ -293,13 +385,16 @@ function RuleEditDialog({
   onSave,
   busy,
   err,
+  connectors,
+  connectorsError,
+  canSeeAllTenants,
 }: RuleDialogProps) {
   const dialogTitle = edit ? "Edit rule" : "New rule"
   const targetPlaceholder =
     f.channel === "email"
       ? "boss@company.com"
       : "https://hooks.slack.com/services/…"
-  const formFields = alertRuleFormFields(f.type)
+  const formFields = alertRuleFormFields(f.type, canSeeAllTenants)
 
   let saveLabel = "Create"
   if (edit) {
@@ -316,7 +411,8 @@ function RuleEditDialog({
           <DialogTitle>{dialogTitle}</DialogTitle>
           <DialogDescription>
             Alerts fire when a Gold metric crosses a threshold. Digests summarise a
-            dashboard on a schedule.
+            dashboard on a schedule. Connector and upload rules tell you when a load
+            fails or succeeds.
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
@@ -334,16 +430,24 @@ function RuleEditDialog({
               <Select
                 value={f.type}
                 onValueChange={(v) =>
-                  setF((prev) => ({ ...prev, type: v ?? "alert" }))
+                  setF((prev) => {
+                    const type = v ?? "alert"
+                    return { ...prev, type, connector: connectorForKind(type, prev.connector, canSeeAllTenants) }
+                  })
                 }
               >
                 <SelectTrigger>
-                  <SelectValue />
+                  <SelectValue>{ruleKindLabel(f.type)}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="alert">Threshold alert</SelectItem>
                   <SelectItem value="digest">Dashboard digest</SelectItem>
                   <SelectItem value="freshness">Dataset freshness</SelectItem>
+                  {LOAD_ALERT_KINDS.map((kind) => (
+                    <SelectItem key={kind} value={kind}>
+                      {ruleKindLabel(kind)}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -390,6 +494,34 @@ function RuleEditDialog({
             </Select>
           </div>
 
+          {formFields.connector ? (
+            <div className="grid gap-1.5">
+              <Label>Connector</Label>
+              <Select
+                value={f.connector ?? ""}
+                onValueChange={(v) => setF((prev) => ({ ...prev, connector: v ?? "" }))}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="pick a connector">
+                    {f.connector === "*"
+                      ? "All connectors"
+                      : (connectors.find((c) => c.id === f.connector)?.name ?? f.connector)}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {formFields.allConnectors ? <SelectItem value="*">All connectors</SelectItem> : null}
+                  {connectors.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {connectorsError ? <p className="mt-1 text-xs text-destructive">{connectorsError}</p> : null}
+            </div>
+          ) : null}
+          {formFields.note ? <p className="text-xs text-muted-foreground">{formFields.note}</p> : null}
+
           {formFields.freshnessTarget ? (
             <div className="grid gap-1.5">
               <Label>Table (namespace.table)</Label>
@@ -409,9 +541,9 @@ function RuleEditDialog({
               fieldsError={fieldsError}
               loadFields={loadFields}
             />
-          ) : (
+          ) : formFields.board ? (
             <DigestConditionFields f={f} setF={setF} boards={boards} boardsError={boardsError} />
-          )}
+          ) : null}
 
           <div className="grid gap-1.5">
             <Label>
@@ -441,6 +573,16 @@ function RuleEditDialog({
 
 export function AlertsPage() {
   const state = useService((s) => alertRuleService.listRules(s), []);
+  // D9: says whether run reports can arrive at all. If it cannot be read, no
+  // notice is shown (the rules list reports its own failure).
+  const runStatus = useService((s) => alertRuleService.getStatus(s), []);
+  const connectorList = useService((s) => connectorService.listConnectors(s), []);
+  const { user } = useAuth();
+  const canSeeAllTenants = seesEveryTenant(user?.permissions);
+  const connectors = React.useMemo(
+    () => (connectorList.status === "success" ? connectorList.data.map((c) => ({ id: c.id, name: c.name })) : []),
+    [connectorList]
+  );
 
   const [marts, setMarts] = React.useState<string[]>([]);
   const [martsError, setMartsError] = React.useState<string | null>(null);
@@ -460,7 +602,8 @@ export function AlertsPage() {
   );
   const removeAction = useServiceAction((signal, id: string) => alertRuleService.deleteRule(id, signal));
   const toggleAction = useServiceAction((signal, rule: AlertRule) =>
-    alertRuleService.updateRule({ ...rule, enabled: !rule.enabled }, signal)
+    // A load rule goes back with only the fields that apply to it, as a save does.
+    alertRuleService.updateRule({ ...alertRuleSaveInput(rule), id: rule.id, enabled: !rule.enabled }, signal)
   );
   const runAction = useServiceAction((signal, id: string | undefined) => alertRuleService.runRules(id, signal));
 
@@ -516,7 +659,11 @@ export function AlertsPage() {
     setFormErr(null);
     if (!f.name.trim()) { setFormErr("Name required."); return; }
     if (!f.target.trim()) { setFormErr("Webhook URL / email required."); return; }
-    const saved = await saveAction.run(f, edit ? edit.id : null);
+    if (alertRuleFormFields(f.type, canSeeAllTenants).connector && !f.connector) {
+      setFormErr("Choose a connector.");
+      return;
+    }
+    const saved = await saveAction.run(alertRuleSaveInput(f), edit ? edit.id : null);
     if (saved) { setOpen(false); state.reload(); }
   }
 
@@ -547,9 +694,10 @@ export function AlertsPage() {
         onDelete: (id) => void remove(id),
         busy: toggleAction.status === "pending" || runAction.status === "pending",
         boards,
+        connectors,
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [toggleAction.status, runAction.status, boards]
+    [toggleAction.status, runAction.status, boards, connectors]
   )
 
   const tableUrlState = useTableUrlState(RULE_QUERY_KEYS)
@@ -608,6 +756,10 @@ export function AlertsPage() {
           </Button>
         </div>
       </div>
+
+      <RunAlertsNotice
+        runEventsConfigured={runStatus.status === "success" ? runStatus.data.runEventsConfigured : null}
+      />
 
       {mutationError ? (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -670,6 +822,9 @@ export function AlertsPage() {
         onSave={save}
         busy={busy}
         err={formErr ?? saveAction.error?.message ?? null}
+        connectors={connectors}
+        connectorsError={connectorList.status === "error" ? connectorList.error.message : null}
+        canSeeAllTenants={canSeeAllTenants}
       />
     </div>
   )

@@ -16,8 +16,9 @@ import { snapshotRelativeTime } from "@/lib/lakehouse-view"
 import { schemaHistory } from "@/lib/schema-history"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
-import { schemaRows, useProfile } from "./asset-column-data"
+import { schemaRows, useMeanings, useProfile } from "./asset-column-data"
 import { ColumnsCard, type SchemaRow } from "./asset-columns"
+import { TableMeaningCard } from "./asset-meaning-view"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { StandInNotice } from "./asset-stand-in"
 
@@ -129,6 +130,7 @@ function SchemaVersions({ asset: a, table }: { asset: AssetDetail; table: Lakeho
  */
 export function AssetSchema({ asset: a, iceberg }: { asset: AssetDetail; iceberg: IcebergTableState }) {
   const profile = useProfile(a.id)
+  const meanings = useMeanings(a)
   const table = icebergTableOf(iceberg)
   // A `silver.*`/`serving.*` asset's types are ClickHouse's own, where a
   // column that is not `Nullable(...)` cannot be null.
@@ -138,7 +140,8 @@ export function AssetSchema({ asset: a, iceberg }: { asset: AssetDetail; iceberg
   return (
     <div className="flex flex-col gap-2">
       <StandInNotice asset={a} />
-      <ColumnsCard rows={rows} profile={profile} sortingKey={a.storage?.sortingKey} />
+      {meanings.kind === "none" ? null : <TableMeaningCard state={meanings} />}
+      <ColumnsCard rows={rows} profile={profile} sortingKey={a.storage?.sortingKey} meanings={meanings} />
 
       {system.length > 0 ? (
         <SectionCard

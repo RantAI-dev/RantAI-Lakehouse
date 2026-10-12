@@ -217,6 +217,7 @@ function stubApi({
     if (path.includes("/api/governance/lineage")) return json(lineage)
     if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
+    if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)

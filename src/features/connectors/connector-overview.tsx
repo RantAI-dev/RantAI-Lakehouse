@@ -25,6 +25,7 @@ import {
   scheduleLabel,
 } from "./connector-ingest-panel"
 import { connectionReviewItems } from "./connector-review"
+import { failureStreakLabel } from "./connectors-columns"
 
 /** Something about the connector that needs a look, newest source first. */
 export type Problem = { key: string; message: string; at: string | null }
@@ -238,6 +239,25 @@ export function ConnectorOverview({
               }))}
             />
           )}
+        </SectionCard>
+
+        <SectionCard size="sm" title="Run health">
+          <MetadataList
+            items={[
+              {
+                label: "Last success",
+                value: detail.lastRunSuccessAt ? formatRelativeTime(detail.lastRunSuccessAt) : "No successful run yet",
+              },
+              {
+                label: "Last failure",
+                value: detail.lastRunFailureAt ? formatRelativeTime(detail.lastRunFailureAt) : "No failed run yet",
+              },
+              {
+                label: "Failed in a row",
+                value: failureStreakLabel(detail.failureStreak) ?? "None",
+              },
+            ]}
+          />
         </SectionCard>
 
         <SectionCard size="sm" title="Used by">

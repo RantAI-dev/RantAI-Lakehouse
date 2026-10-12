@@ -127,3 +127,23 @@ def test_build_source_never_interpolates_the_password_into_a_dsn_string(monkeypa
         resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
     )
     assert captured["credentials"]["password"] == "p@ss/word:with?special&chars"
+
+
+def test_the_table_adapter_callback_reaches_sql_database_and_is_left_out_when_absent(monkeypatch):
+    captured = []
+    monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.append(kwargs) or "src")
+    spec = {"driver": "oracle", "host": "ora.invalid", "port": 1521, "database": "ORCLPDB1", "user": "reader"}
+
+    def callback(table):
+        return None
+
+    for cb in (callback, None):
+        build_source(
+            spec,
+            secrets={"password": "s3cret"},
+            source_objects=[{"name": "orders", "target": "orders"}],
+            resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
+            table_adapter_callback=cb,
+        )
+    assert captured[0]["table_adapter_callback"] is callback
+    assert "table_adapter_callback" not in captured[1]

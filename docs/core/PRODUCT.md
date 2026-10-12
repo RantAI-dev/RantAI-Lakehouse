@@ -142,7 +142,7 @@ hands-on testing.
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
 | SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
-| Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct. | Yes, inside the user's permissions | `AI-16` |
+| Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
