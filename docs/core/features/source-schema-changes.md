@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-8` |
 | Spec | `docs/core/specs/src-8.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". The spec has no *(proposed)* numbers |
-| Status | Decisions signed 2026-10-09 and 2026-10-10. Built, not verified by CI, not accepted |
+| Status | Decisions signed 2026-10-09 and 2026-10-10. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run. A connector loaded after the fact cannot leave a pause until `SRC-16` |
 | Plan | `docs/superpowers/plans/2026-10-09-src-8-source-schema-changes.md` |
 
 ## Problem

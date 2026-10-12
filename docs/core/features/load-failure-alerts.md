@@ -5,7 +5,7 @@
 | Module | Data (Sources) |
 | Backlog | `SRC-7` |
 | Spec | `docs/core/specs/src-7.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec" |
-| Status | Decisions signed 2026-10-09. Built, not verified by CI, not accepted |
+| Status | Decisions signed 2026-10-09. In Acceptance: merged in #101 on 2026-10-12, CI green; checklist not run. Row 5 (a failed delivery shown honestly) cannot pass until `SRC-17` |
 | Plan | `docs/superpowers/plans/2026-10-08-src-7-load-failure-alerts.md` |
 
 ## Problem
