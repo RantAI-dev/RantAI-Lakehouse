@@ -263,12 +263,6 @@ def test_refresh_remove_turns_a_table_of_another_mode_into_a_history_table(lab: 
     assert load_via_sink(source(), "items", lab.config, _plan()).rows == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SRC-10 sixth pass, found while testing: clear_table (fourth pass) leaves the rows of a table that "
-    "`load_via_sink` made from PLAIN rows (files, REST, MongoDB, SFTP): 'Delete operation did not match any "
-    "records'. It empties a table a sql_database source or the history mode made. Reported, not fixed here.",
-)
 def test_clear_table_empties_a_table_made_from_plain_rows(lab: Lab) -> None:
     load_via_sink([{"id": 1, "v": "a"}], "plain", lab.config, LoadPlan(mode="replace"))
     clear_table("plain", lab.config)

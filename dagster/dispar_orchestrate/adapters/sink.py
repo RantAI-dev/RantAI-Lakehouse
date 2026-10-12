@@ -50,13 +50,11 @@ was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
 - `replace` overwrites the table with what the source returns now
   (pyiceberg `overwrite`; the previous snapshot stays reachable until it
   is expired). dlt also forgets the resource's incremental cursor on a
-  replace. Do NOT rely on an empty source to empty the table. Measured
-  (`test_sink_empty_table.py`, dlt 1.30.0): `load_via_sink([], ...)` over a table
-  a `sql_database` source created left all three rows in place, and an empty
-  `dlt` resource leaves a table untouched in any case (no data reaches the
-  destination). So a SQL source table that becomes empty at the source is NOT
-  emptied by a `replace` run; it keeps its old rows. `clear_table` empties a
-  table by running the pipeline on an empty list itself.
+  replace. A source that returns no rows empties the table (measured,
+  `test_sink_empty_table.py`) only while its resource keeps the name the stored
+  schema records for the table: `dlt` truncates a replace table that received
+  no data for that resource alone (`empty_table`'s docstring). `clear_table` does
+  not rely on it: it empties a table with a `pyiceberg` delete, for every origin.
 - `incremental` adds only rows whose cursor column is beyond the highest
   value the previous incremental run saw (`dlt.sources.incremental`,
   pushed into the query). Only a `sql_database` source is accepted; see
@@ -152,6 +150,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -165,6 +164,7 @@ from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.helpers import pipeline_drop
+from pyiceberg.expressions import AlwaysTrue
 
 from dispar_orchestrate.adapters import dedup, history
 
@@ -622,35 +622,68 @@ def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
     )
 
 
-def clear_table(bronze_table_name: str, config: SinkConfig) -> SinkResult:
-    """Empty a Bronze table and forget its cursor and deduplication marker, loading
-    nothing (`SRC-10` decision 5: "clear", and the first half of "refresh,
-    removing old rows").
+def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
+    """Delete every row of a Bronze table in ONE `pyiceberg` transaction, keeping the
+    table: its columns, its day partition on `_ingested_at`, `format-version` 2 and its
+    snapshot history. The ONE way a Bronze table is emptied (`clear_table`, a refresh
+    that removes rows, the history mode's refresh); returns False, touching nothing,
+    for a table `dlt` does not know (never loaded).
 
-    The way is a `replace` run of an empty LIST of rows straight on the table's
-    pipeline. Measured (`test_sink_empty_table.py`): it empties the table and keeps
-    its columns, its day partition on `_ingested_at` and `format-version` 2, so the
-    next load meets the same table. It does NOT go through `load_via_sink`'s
-    `iceberg_adapter` wrapper: there, over a table a `sql_database` source created,
-    the same empty list left every row in place (measured, same file; the cause was
-    not pursued); and an empty `dlt` RESOURCE leaves a table as it is in any case. The previous snapshot stays reachable until it is expired, as for
-    any replace. A table that was never loaded stays absent. Idempotent.
+    Why not a `dlt` `replace` run of no rows (`SRC-10 review BLOCKER 4`; measured in
+    `test_sink_empty_table.py`, `dlt` 1.30.0, `pyiceberg` 0.12.0): `dlt` truncates a
+    replace table that received no data only through `Extract._handle_empty_tables`
+    (`dlt/extract/extract.py`), which writes the empty items file for a replace
+    RESOURCE whose name is the resource the stored schema records for that table
+    (`group_tables_by_resource`). `pipeline.run([], table_name=T)` names its resource
+    `T`; plain rows loaded by `load_via_sink` are recorded under the generator's name
+    `_stamp_rows`, so the run extracts nothing ("No data found to normalize") and the
+    rows stay, while a `sql_database` table, whose resource IS named `T`, was emptied.
+    `load_via_sink([], ...)` is the mirror image. The empty items file the other way,
+    `dlt.mark.materialize_table_schema()`, empties every origin but creates a table
+    with no partition for one never loaded, so it cannot be the way.
+
+    The table comes from the destination client of the pipeline that owns it, as in
+    the history mode (`history.open_table`), so it is the table `dlt` loads into.
+    `dlt` keeps no row count or table content in its schema or state (measured by the
+    history pass: it tolerates a write of ours), so its view stays consistent; the
+    cursor and marker are forgotten by the caller.
 
     # Errors
 
-    Whatever `pipeline.run` or the abort of a left-over package raises; a failed run
-    aborts its own package first, as `load_via_sink` does.
-    """
+    Whatever the catalog raises; `RuntimeError` (fixed text) if a row remains after
+    the commit."""
+    iceberg_table = history.open_table(pipeline, bronze_table_name)
+    if iceberg_table is None:
+        return False
+    with warnings.catch_warnings():
+        # pyiceberg warns when a delete matches nothing: an already empty table.
+        warnings.filterwarnings("ignore", message="Delete operation did not match any records")
+        iceberg_table.delete(delete_filter=AlwaysTrue())
+    if iceberg_table.scan(limit=1).to_arrow().num_rows:
+        raise RuntimeError(f"table {bronze_table_name!r}: rows remained after the delete")
+    return True
+
+
+def clear_table(bronze_table_name: str, config: SinkConfig) -> SinkResult:
+    """Empty a Bronze table and forget its cursor and deduplication marker, loading
+    nothing (`SRC-10` decision 5: "clear", and the first half of "refresh,
+    removing old rows"). The emptying is `empty_table`, whose docstring says why it
+    is a `pyiceberg` delete and not a `dlt` run. A table that was never loaded stays
+    absent. Idempotent.
+
+    # Errors
+
+    Whatever `empty_table`, the catalog or the abort of a left-over package raises."""
     _install_catalog_env(config)
     pipeline = _bronze_pipeline(bronze_table_name, config)
     _abort_pending(pipeline, strict=True)
     _forget_table_state(pipeline)
-    try:
-        load_info = pipeline.run([], table_name=bronze_table_name, table_format="iceberg", write_disposition="replace")
-    except Exception:
-        _abort_pending(pipeline)
-        raise
-    return SinkResult(rows=0, has_failed_jobs=load_info.has_failed_jobs, load_info_str=str(load_info))
+    emptied = empty_table(pipeline, bronze_table_name)
+    return SinkResult(
+        rows=0,
+        has_failed_jobs=False,
+        load_info_str="table emptied" if emptied else "table not loaded; nothing to empty",
+    )
 
 
 def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:

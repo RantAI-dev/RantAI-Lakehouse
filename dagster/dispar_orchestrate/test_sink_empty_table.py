@@ -1,14 +1,18 @@
-"""Measurement for `SRC-10` decision 5 (refresh and clear): how a Bronze Iceberg
-table is emptied through the loader's own path.
+"""Measurement and tests for `SRC-10` decision 5 (refresh and clear): how a Bronze
+Iceberg table is emptied, for EVERY origin of the table.
 
-The question, asked before anything was built (plan task 5): does
-`load_via_sink` over an empty list of rows, under `replace`, empty the table and
-KEEP its columns, its day partition on `_ingested_at` and `format-version` 2, so
-that the next load meets the same table? `sink.py`'s docstring says "An empty
-source empties the table", and the second pass saw it for a bare table; this file
-asserts it on a table a `sql_database` source created, which is what a clear meets.
-Also measured: an empty `dlt` RESOURCE does NOT empty it (so it is the wrong form),
-and a table that was never loaded survives being emptied.
+The question (plan task 5): which way empties the table and KEEPS its columns, its day
+partition on `_ingested_at` and `format-version` 2, so that the next load meets the same
+table? Fourth pass: a `dlt` run of no rows. Seventh pass (`SRC-10 review BLOCKER 4`): that
+way empties a table by accident of a NAME. `dlt` writes the empty items file that
+truncates a replace table only for a replace resource named as the stored schema records
+it for the table (`dlt/extract/extract.py::_handle_empty_tables`); `sql_database` names its
+resource like the table, plain rows are recorded under the generator's name `_stamp_rows`.
+So `pipeline.run([], table_name=T)` emptied a SQL table and not a plain-rows one, and
+`load_via_sink([], ...)` did the opposite. `sink.empty_table` is a `pyiceberg` delete and
+does not depend on the name; the tests below run it for each origin (plain rows, a
+`sql_database` source, the history mode) and for each caller (`clear_table`, a refresh
+that removes rows in every load mode).
 
 The tests drive `sink.load_via_sink` itself on a local catalog (the harness of
 `test_load_modes_measurement.py`; same limits: not Lakekeeper, no query engine).
@@ -57,7 +61,7 @@ def _shape(lab: Lab, name: str) -> tuple[list[tuple[str, str]], list[str], str]:
     )
 
 
-def test_a_replace_of_an_empty_list_empties_the_table_and_keeps_its_shape(
+def test_clear_table_empties_a_sql_source_table_and_keeps_its_shape(
     lab: Lab, items_db: sqlite3.Connection, tmp_path: Path
 ) -> None:
     load_via_sink(_source(tmp_path), "items", lab.config, LoadPlan(mode="replace"))
@@ -85,10 +89,9 @@ def test_the_emptied_table_takes_the_next_load_as_any_other(
 def test_an_empty_list_through_load_via_sink_does_not_empty_a_table_a_sql_source_created(
     lab: Lab, items_db: sqlite3.Connection, tmp_path: Path
 ) -> None:
-    """Why `clear_table` runs the pipeline itself: the form the docstring of
-    `sink.py` suggests ("an empty source empties the table") left all three rows in
-    place over a table `sql_database` created. (Over a table plain rows created it
-    did empty it: `test_sink_dedup_modes.py`.)"""
+    """The cause, half one: the empty-source form `sink.py` once suggested left all
+    three rows in place over a table `sql_database` created, because the empty
+    resource is named `_stamp_rows` and the stored schema says `items`."""
     load_via_sink(_source(tmp_path), "items", lab.config, LoadPlan(mode="replace"))
     load_via_sink([], "items", lab.config, LoadPlan(mode="replace"))
     assert len(lab.rows("items")) == 3
@@ -131,3 +134,125 @@ def test_clear_table_empties_the_table_and_forgets_the_cursor_and_the_marker(
     again = load_via_sink(_source(tmp_path), "items", lab.config, plan)
     assert again.rows == 3
     assert sorted(r["id"] for r in lab.rows("items")) == [1, 2, 3]
+
+
+# --- the cause, and the one way, for every origin (seventh pass, SRC-10 review BLOCKER 4) ----
+
+
+def test_a_dlt_run_of_no_rows_does_not_empty_a_table_made_from_plain_rows(lab: Lab) -> None:
+    """The cause, half two: `pipeline.run([], table_name=T)` names its resource `T`, the
+    stored schema records `_stamp_rows` for the table, so `dlt` extracts nothing ("No data
+    found to normalize") and writes no empty items file. This is what `clear_table` was
+    until the seventh pass."""
+    load_via_sink([{"id": 1, "v": "a"}], "plain", lab.config, LoadPlan(mode="replace"))
+    pipeline = lab.pipeline("plain")
+    pipeline.sync_destination()
+    assert pipeline.default_schema.tables["plain"]["resource"] == "_stamp_rows"
+    pipeline.run([], table_name="plain", table_format="iceberg", write_disposition="replace")
+    assert len(lab.rows("plain")) == 1
+
+
+ORIGINS = ("plain", "sql", "history")
+
+
+def _write_source(tmp_path: Path, rows: list[tuple[int, str, int]]) -> None:
+    db = sqlite3.connect(tmp_path / "source.db")
+    db.execute("DROP TABLE IF EXISTS items")
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, v TEXT, updated_at INTEGER)")
+    db.executemany("INSERT INTO items VALUES (?,?,?)", rows)
+    db.commit()
+    db.close()
+
+
+def _rows_source(origin: str, tmp_path: Path, rows: list[tuple[int, str, int]]) -> Any:
+    """What the connector would hand the sink for `rows`: a list of dicts (files, REST,
+    MongoDB, SFTP) or a `sql_database` source."""
+    if origin == "sql":
+        _write_source(tmp_path, rows)
+        return _source(tmp_path)
+    return [{"id": i, "v": v, "updated_at": u} for i, v, u in rows]
+
+
+def _origin_plan(origin: str, refresh: str | None = None) -> LoadPlan:
+    return LoadPlan(mode="history", key=("id",), refresh=refresh) if origin == "history" else LoadPlan(
+        mode="replace", refresh=refresh
+    )
+
+
+FIRST = [(1, "a", 10), (2, "b", 20), (3, "c", 30)]
+SECOND = [(2, "B", 25), (3, "c", 30), (4, "d", 40)]
+
+
+@pytest.mark.parametrize("origin", ORIGINS)
+def test_clear_table_empties_a_table_of_every_origin_and_the_next_load_works(
+    lab: Lab, tmp_path: Path, origin: str
+) -> None:
+    load_via_sink(_rows_source(origin, tmp_path, FIRST), "t", lab.config, _origin_plan(origin))
+    assert len(lab.rows("t")) == 3
+    before = _shape(lab, "t")
+    assert before[1] == ["_ingested_at_day"]
+
+    clear_table("t", lab.config)
+
+    assert lab.rows("t") == []
+    assert _shape(lab, "t") == before, "same columns, same partition spec, same format version"
+    assert lab.table("t").metadata.format_version == 2
+    clear_table("t", lab.config)  # twice is fine
+    assert lab.rows("t") == []
+
+    again = load_via_sink(_rows_source(origin, tmp_path, SECOND), "t", lab.config, _origin_plan(origin))
+    assert again.rows == 3
+    assert sorted(r["id"] for r in lab.rows("t")) == [2, 3, 4]
+    assert _shape(lab, "t") == before
+
+
+# Every mode family, with the origins it accepts (an incremental mode takes a `sql_database` source only).
+_FAMILIES = [
+    ("plain", "replace"),
+    ("plain", "append"),
+    ("plain", "replace_dedup"),
+    ("plain", "history"),
+    ("sql", "replace"),
+    ("sql", "append"),
+    ("sql", "incremental"),
+    ("sql", "incremental_dedup"),
+    ("sql", "replace_dedup"),
+    ("sql", "history"),
+]
+
+
+def _family_plan(mode: str, refresh: str | None = None) -> LoadPlan:
+    return LoadPlan(
+        mode=mode,
+        cursor="updated_at" if mode.startswith("incremental") else None,
+        key=("id",) if mode in ("incremental_dedup", "replace_dedup", "history") else (),
+        refresh=refresh,
+    )
+
+
+@pytest.mark.parametrize(("origin", "mode"), _FAMILIES)
+def test_refresh_remove_leaves_exactly_the_sources_rows_in_every_mode_and_origin(
+    lab: Lab, tmp_path: Path, origin: str, mode: str
+) -> None:
+    load_via_sink(_rows_source(origin, tmp_path, FIRST), "t", lab.config, _family_plan(mode))
+    assert len(lab.rows("t")) >= 3
+    before = _shape(lab, "t")
+
+    result = load_via_sink(_rows_source(origin, tmp_path, SECOND), "t", lab.config, _family_plan(mode, "remove"))
+
+    # The source's rows and nothing of the first load: id 1 is gone, id 2 has its new value
+    # once, whatever the mode would have done with a plain run (append would stack them).
+    assert sorted((r["id"], r["v"]) for r in lab.rows("t")) == [(2, "B"), (3, "c"), (4, "d")]
+    assert result.rows == 3
+    assert _shape(lab, "t") == before
+    if mode == "history":
+        assert all(r["_is_current"] and r["_valid_to"] is None for r in lab.rows("t"))
+
+
+def test_clearing_a_table_that_was_never_loaded_creates_nothing(lab: Lab) -> None:
+    clear_table("never_loaded", lab.config)
+    clear_table("never_loaded", lab.config)
+    assert list(lab.bucket.glob("**/never_loaded")) == [], "no table, no directory"
+    assert load_via_sink(
+        [{"id": 1, "v": "a"}], "never_loaded", lab.config, LoadPlan(mode="replace", refresh="remove")
+    ).rows == 1, "and a refresh that removes rows loads a table that was not there"
