@@ -17,18 +17,20 @@
 //! interpolation site at all — `discover_sql_queries_bind_the_schema_never_interpolate_it`
 //! (below) asserts this on the query TEXT itself, for all three drivers.
 //!
-//! # How MySQL/SQL Server discovery is tested today: it is not (Z14, `SRC-6` F9)
+//! # How MySQL/SQL Server discovery is tested today (`SRC-9`, finding G1)
 //!
 //! This workspace's `#[sqlx::test]` macro and its `testcontainers` fixture
 //! (`lakehouse-test-support`, `postgres` module only) stand up a scratch
 //! Postgres database; there is no `MySQL` or SQL Server live-database
 //! fixture inside `cargo test`. [`discover_sql_postgres`] therefore has a
-//! real, live `#[sqlx::test]` proof; [`discover_sql_mysql`] and
-//! [`discover_sql_mssql`] have no live test at all. An earlier version of
-//! this comment said the `ops/g6` gate exercised them against its
-//! `mysql`/`mssql` compose services; it does not (`grep -i discover ops/g6/`
-//! finds only an unrelated comment in the compose override). `SRC-9` owns
-//! adding that test.
+//! real, live `#[sqlx::test]` proof. [`discover_sql_mysql`] and
+//! [`discover_sql_mssql`] are exercised live by the `ops/g6` gate
+//! (`_check_discover`, `SRC-9`), against its `mysql`/`mssql` compose services.
+//! That gate's first CI run found that `MySQL` discovery answered `422`
+//! ("connection failed") while the same connector's connection test passed:
+//! the connect options are the same function, so the failure was in the
+//! query's row decoding (see [`MYSQL_DISCOVER_QUERY`]). Whether that fix is
+//! enough is decided by the next g6 run.
 //!
 //! # Scope: `sql`/`cdc` only in this task
 //!
@@ -156,6 +158,19 @@ pub enum DiscoverError {
 /// `ApiError::Internal(err.to_string())`).
 impl From<DiscoverError> for ApiError {
     fn from(err: DiscoverError) -> Self {
+        // `SRC-9` finding G1: the handler used to log nothing about why a
+        // discovery failed, so a decode error and a refused connection were
+        // indistinguishable ("connection failed" in the response, nothing in
+        // the log). Log the variant and, for `sqlx`, its error kind only.
+        // Never `err`'s text: a `sqlx` database error echoes the server's
+        // message, which can name the user and host.
+        if let DiscoverError::Sql(source) = &err {
+            tracing::warn!(
+                sqlx_kind = sqlx_error_kind(source),
+                class = connector_probe::classify_sqlx_error(source),
+                "connector discovery failed"
+            );
+        }
         match err {
             DiscoverError::Sql(source) => ApiError::Unprocessable(format!(
                 "could not discover the connector's schema: {}",
@@ -177,6 +192,28 @@ impl From<DiscoverError> for ApiError {
                 DIAL_TIMEOUT.as_secs()
             )),
         }
+    }
+}
+
+/// The variant name of a `sqlx::Error`, for the server log only. A fixed
+/// string per variant: no upstream text, so it cannot carry a credential.
+fn sqlx_error_kind(err: &sqlx::Error) -> &'static str {
+    match err {
+        sqlx::Error::Configuration(_) => "Configuration",
+        sqlx::Error::Database(_) => "Database",
+        sqlx::Error::Io(_) => "Io",
+        sqlx::Error::Tls(_) => "Tls",
+        sqlx::Error::Protocol(_) => "Protocol",
+        sqlx::Error::RowNotFound => "RowNotFound",
+        sqlx::Error::TypeNotFound { .. } => "TypeNotFound",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "ColumnIndexOutOfBounds",
+        sqlx::Error::ColumnNotFound(_) => "ColumnNotFound",
+        sqlx::Error::ColumnDecode { .. } => "ColumnDecode",
+        sqlx::Error::Decode(_) => "Decode",
+        sqlx::Error::PoolTimedOut => "PoolTimedOut",
+        sqlx::Error::PoolClosed => "PoolClosed",
+        sqlx::Error::WorkerCrashed => "WorkerCrashed",
+        _ => "Other",
     }
 }
 
@@ -236,8 +273,22 @@ pub async fn discover_sql_postgres(
 // exposes (`MySQL` 8's own `information_schema.columns`) — the query
 // shape is identical to Postgres's, only the placeholder syntax (`?`,
 // `MySQL`'s positional-parameter convention) differs.
-pub(crate) const MYSQL_DISCOVER_QUERY: &str = "SELECT table_name, column_name, data_type FROM \
-    information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position";
+//
+// `SRC-9` finding G1: the g6 gate showed `MySQL` discovery failing with the
+// generic "connection failed" class while the connection test (same
+// `mysql_connect_options`) passed. `MySQL` 8 reports some
+// `information_schema` columns with a binary collation / `VARBINARY`-like
+// type, which `sqlx` refuses to decode as `String` (`ColumnDecode`, which
+// `classify_sqlx_error` folds into "connection failed"). Casting every
+// selected column to `CHAR` with an explicit charset makes the decode
+// independent of the server's column type. Still `const`, with exactly one
+// bind placeholder. Not proven by a live test here; the g6 gate decides.
+pub(crate) const MYSQL_DISCOVER_QUERY: &str = "SELECT \
+    CAST(table_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(column_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(data_type AS CHAR CHARACTER SET utf8mb4) \
+    FROM information_schema.columns WHERE table_schema = ? \
+    ORDER BY table_name, ordinal_position";
 
 /// List every table and column in `schema` on a live `MySQL` connection.
 /// `schema` is bound as `?` — see the module doc comment.
