@@ -1182,6 +1182,40 @@ pub fn validate_load_modes(
     Ok(())
 }
 
+/// The key columns of every object whose stored load mode deduplicates, by
+/// object name (`SRC-10` decision 6). Read by the schema-change code from the
+/// STORED spec, never from what the orchestrator reports, so a request cannot
+/// claim a table has no key. Lenient: an object [`validate_load_modes`] would
+/// refuse cannot be in a stored spec, and a malformed one simply has no entry
+/// (treated as non-deduplicating, as before `SRC-10`).
+#[must_use]
+pub fn dedup_keys(
+    source_objects: &serde_json::Value,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut keys = std::collections::HashMap::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let is_dedup = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(LoadMode::is_dedup);
+        if !is_dedup {
+            continue;
+        }
+        let key: Vec<String> = object
+            .get("primaryKey")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|column| column.as_str().map(str::to_owned))
+            .collect();
+        keys.insert(name.to_owned(), key);
+    }
+    keys
+}
+
 /// `text` as a lower-case SQL-safe slug: every run of characters outside
 /// `[a-z0-9]` becomes one `_`, and leading and trailing `_` are dropped.
 fn bronze_slug(text: &str) -> String {
@@ -1729,6 +1763,24 @@ mod tests {
             ),
             Err(InvalidLoadMode::NotForAdapter { .. })
         ));
+    }
+
+    /// `SRC-10` decision 6: only objects in a deduplicating mode have a key
+    /// entry; a key kept on a table in another mode is not one.
+    #[test]
+    fn dedup_keys_lists_only_the_deduplicating_objects() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+            {"name": "b", "target": "b", "loadMode": "incremental_dedup", "primaryKey": ["x", "y"],
+             "incrementalKey": "u"},
+            {"name": "c", "target": "c", "loadMode": "replace", "primaryKey": ["id"]},
+            {"name": "d", "target": "d", "primaryKey": ["id"]},
+            {"target": "e", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["a"], vec!["id".to_owned()]);
+        assert_eq!(keys["b"], vec!["x".to_owned(), "y".to_owned()]);
+        assert!(dedup_keys(&serde_json::json!({})).is_empty());
     }
 
     #[test]

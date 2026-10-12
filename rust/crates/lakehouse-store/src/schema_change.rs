@@ -267,6 +267,19 @@ impl SchemaChange {
             )
     }
 
+    /// Whether this is the removal of a column the table's deduplicating key
+    /// names (`SRC-10` decision 6): approving it would accept a shape every
+    /// later load fails on. `keys` is [`DedupKeys`], read from the stored
+    /// spec by the caller. The row is approvable again once the key (or the
+    /// mode) no longer names the column.
+    #[must_use]
+    pub fn names_a_key_column(&self, keys: &DedupKeys) -> bool {
+        self.kind == ChangeKind::ColumnRemoved.as_str()
+            && keys
+                .get(&self.object_name)
+                .is_some_and(|key| key.contains(&self.column_name))
+    }
+
     /// Fill [`Self::can_approve`] from the row's own fields. A table-wide
     /// block is applied by [`mark_approvable`].
     #[must_use]
@@ -277,23 +290,58 @@ impl SchemaChange {
     }
 }
 
+/// The key columns of the connector's deduplicating tables, by table name
+/// ([`crate::ingest_spec::dedup_keys`]).
+pub type DedupKeys = std::collections::HashMap<String, Vec<String>>;
+
 /// Set [`SchemaChange::can_approve`] on a list of changes: each row's own
 /// rule, then `false` for every waiting column-level change of a table that
 /// has a change the column cannot hold, because approval takes a table's
 /// waiting changes as a whole and the route refuses it (decision 10).
 /// Every place that returns changes goes through this or `with_can_approve`.
 pub fn mark_approvable(changes: &mut [SchemaChange]) {
+    mark_approvable_with_keys(changes, &DedupKeys::new());
+}
+
+/// [`mark_approvable`] for a connector with deduplicating tables: a waiting
+/// removal of a key column is not approvable either, and blocks the rest of
+/// its table for the same reason as an unloadable type change (`SRC-10`
+/// decision 6).
+pub fn mark_approvable_with_keys(changes: &mut [SchemaChange], keys: &DedupKeys) {
+    let blocked_row = |c: &SchemaChange| {
+        c.status == ChangeStatus::Pending.as_str()
+            && (c.cannot_be_loaded() || c.names_a_key_column(keys))
+    };
     let blocked: std::collections::HashSet<String> = changes
         .iter()
-        .filter(|c| c.status == ChangeStatus::Pending.as_str() && c.cannot_be_loaded())
+        .filter(|c| blocked_row(c))
         .map(|c| c.object_name.clone())
         .collect();
     for change in changes {
-        let own = change.status == ChangeStatus::Pending.as_str() && !change.cannot_be_loaded();
+        let own = change.status == ChangeStatus::Pending.as_str() && !blocked_row(change);
         change.can_approve = own
             && (change.kind == ChangeKind::TableAdded.as_str()
                 || !blocked.contains(&change.object_name));
     }
+}
+
+/// The deduplicating keys in the connector's STORED spec, read on `conn`.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+async fn dedup_keys_of(
+    conn: &mut sqlx::PgConnection,
+    connector_id: &str,
+) -> Result<DedupKeys, StoreError> {
+    let objects: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT source_objects FROM connector WHERE id = $1")
+            .bind(connector_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(objects.map_or_else(DedupKeys::new, |(objects,)| {
+        crate::ingest_spec::dedup_keys(&objects)
+    }))
 }
 
 /// A time that serializes as ISO 8601 with milliseconds, like every other
@@ -465,8 +513,9 @@ impl<'p> ObservationTx<'p> {
         }
         // All of the table's changes are in `recorded`, so the table-wide
         // block of decision 10 can be decided here.
+        let keys = dedup_keys_of(&mut self.tx, &self.connector_id).await?;
         let mut rows: Vec<SchemaChange> = recorded.iter().map(|r| r.change.clone()).collect();
-        mark_approvable(&mut rows);
+        mark_approvable_with_keys(&mut rows, &keys);
         for (r, row) in recorded.iter_mut().zip(rows) {
             r.change.can_approve = row.can_approve;
         }
@@ -878,7 +927,11 @@ pub async fn list_pending(
         .bind(PENDING_LIST_LIMIT)
         .fetch_all(pool)
         .await?;
-    mark_approvable(&mut rows);
+    // SRC-10 decision 6: the stored spec's keys, read now, so a row becomes
+    // approvable the moment the key or the mode stops naming its column.
+    let mut conn = pool.acquire().await?;
+    let keys = dedup_keys_of(&mut conn, connector_id).await?;
+    mark_approvable_with_keys(&mut rows, &keys);
     Ok(rows)
 }
 
@@ -1017,6 +1070,9 @@ pub enum ApproveOutcome {
     /// (decision 10, `SRC-8 review BLOCKER 2`): approving it would resume a
     /// table whose next load fails the same way. Nothing was written.
     CannotBeLoaded,
+    /// What waits includes the removal of a column the table's deduplicating
+    /// key still names (`SRC-10` decision 6). Nothing was written.
+    KeyStillNamed,
 }
 
 impl ApproveOutcome {
@@ -1025,7 +1081,7 @@ impl ApproveOutcome {
     pub fn into_approval(self) -> Option<Approval> {
         match self {
             Self::Approved(approval) => Some(approval),
-            Self::NothingWaits | Self::CannotBeLoaded => None,
+            Self::NothingWaits | Self::CannotBeLoaded | Self::KeyStillNamed => None,
         }
     }
 }
@@ -1219,6 +1275,11 @@ pub async fn approve_object(
     // Decision 10: refuse the table as a whole; nothing is written.
     if pending.iter().any(SchemaChange::cannot_be_loaded) {
         return Ok(ApproveOutcome::CannotBeLoaded);
+    }
+    // `SRC-10` decision 6: read under the same lock, from the stored spec.
+    let keys = dedup_keys_of(&mut tx, connector_id).await?;
+    if pending.iter().any(|c| c.names_a_key_column(&keys)) {
+        return Ok(ApproveOutcome::KeyStillNamed);
     }
     let table_waits = pending
         .iter()
