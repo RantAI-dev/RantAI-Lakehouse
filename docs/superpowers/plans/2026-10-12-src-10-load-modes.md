@@ -179,6 +179,36 @@ the AI team reviews the diff.
 
 ## Handoff
 
+### Task 1 only (developer, stopped on a plan stop condition)
+
+Commit `4532efc` adds `dagster/dispar_orchestrate/test_load_modes_measurement.py`
+(27 tests). Tasks 2, 3 and 3a were NOT started: the history load is more than
+one commit above 1000 rows and can leave a closed row without its successor
+(the plan's own stop condition). Observations are in the test names and
+docstrings; dlt 1.30.0, pyiceberg 0.12.0, local ephemeral catalog (not
+Lakekeeper), no query engine.
+
+Key facts: `dlt/common/libs/pyiceberg.py::merge_iceberg_table` calls
+`table.upsert` per 1000 rows, each its own commit. Up to 1000 rows per load
+(closed rows plus new versions) a history load is one commit and a failure
+between "read" and "write" or inside the upsert commits nothing. At 1500
+changed keys (3000 rows) it is three commits, and failing the second leaves
+1000 keys with a closed row and no current row. One pyiceberg
+`Table.upsert` on the whole batch is one commit at 3000 rows and rolls back
+whole, but bypasses dlt's load step (prototype in the test).
+Merge itself: day partition and format-version 2 kept; one commit; updated
+row gets the new `_ingested_at`, untouched row keeps its own; a repeated key
+in a batch, a null key and a table that holds duplicates all fail the load
+loudly, and the failed package stays pending so later loads of that table
+fail too.
+
+Commands: `(cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest
+dispar_orchestrate -q)`: 739 passed before, 766 passed after (27 new);
+`python3 ops/lint/check_intra_package_imports.py` and
+`check_bare_iceberg_count.py`: OK. No Rust, TypeScript or compose touched.
+Not verified: a REST catalog (Lakekeeper), ClickHouse and Trino reading a
+merged table, large-table cost.
+
 *(developer)*
 
 ## Review
