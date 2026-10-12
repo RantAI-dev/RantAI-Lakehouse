@@ -11,7 +11,7 @@ import type { SemanticEntry, SemanticEntryInput } from "@/services/contracts/sem
 import { ServiceError } from "@/services/errors"
 import { ColumnsCard, type ProfileState, type SchemaRow } from "./asset-columns"
 import type { MeaningState } from "./asset-meaning"
-import { TableMeaningCard } from "./asset-meaning-view"
+import { MeaningBadge, TableMeaningCard } from "./asset-meaning-view"
 
 const column = (name: string, dataType = "String", over: Partial<AssetColumn> = {}): AssetColumn => ({
   name,
@@ -759,5 +759,76 @@ describe("the table's card confirms and edits the table", () => {
 
     expect(save).toHaveBeenCalledTimes(1)
     expect(save.mock.calls[0][0]).toEqual({ column: null, description: "Orders placed", synonyms: ["pesanan"], role: null })
+  })
+})
+
+describe("the header's meaning pill", () => {
+  const pillText = (text: RegExp) => screen.getByText(text)
+  const link = () => pillText(/^Meaning:/).closest("a") as HTMLAnchorElement
+
+  it("shows AI draft in the warning tone when no meaning is confirmed", () => {
+    const { state } = readyMeanings(
+      [entry({ column: "a", status: "draft" }), entry({ column: "b", status: "draft" })],
+      { table: entry({ status: "draft" }) }
+    )
+    render(<MeaningBadge state={state} columns={["a", "b"]} />)
+
+    const pill = pillText(/^Meaning: AI draft$/)
+    expect(pill.className).toContain("bg-amber-500/12")
+    expect(link().getAttribute("title")).toBe("The assistant drafted this table's meanings. Nobody has confirmed them yet.")
+  })
+
+  it("shows the count of confirmed meanings in the info tone when some are confirmed", () => {
+    const { state } = readyMeanings(
+      [entry({ column: "a", status: "confirmed" }), entry({ column: "b", status: "draft" })],
+      { table: entry({ status: "confirmed" }) }
+    )
+    render(<MeaningBadge state={state} columns={["a", "b"]} />)
+
+    const pill = pillText(/^Meaning: 2 of 3 confirmed$/)
+    expect(pill.className).toContain("bg-primary/10")
+    expect(link().getAttribute("title")).toBe("A person has confirmed 2 of this table's 3 meanings.")
+  })
+
+  it("shows confirmed in the success tone when every meaning is confirmed", () => {
+    const { state } = readyMeanings(
+      [entry({ column: "a", status: "confirmed" }), entry({ column: "b", status: "confirmed" })],
+      { table: entry({ status: "confirmed" }) }
+    )
+    render(<MeaningBadge state={state} columns={["a", "b"]} />)
+
+    const pill = pillText(/^Meaning: confirmed$/)
+    expect(pill.className).toContain("bg-emerald-500/12")
+    expect(link().getAttribute("title")).toBe("A person has confirmed every meaning of this table.")
+  })
+
+  it("links the pill to the Schema tab", () => {
+    const { state } = readyMeanings([], { table: entry({ status: "draft" }) })
+    render(<MeaningBadge state={state} columns={["a", "b"]} />)
+
+    expect(link().getAttribute("href")).toBe("?tab=schema")
+  })
+
+  it("renders nothing for a ready state with no entry", () => {
+    const { state } = readyMeanings([])
+    const { container } = render(<MeaningBadge state={state} columns={["a", "b"]} />)
+
+    expect(container.innerHTML).toBe("")
+    expect(screen.queryByText(/Meaning:/)).toBeNull()
+  })
+
+  it("renders nothing for the states that are not ready", () => {
+    const error: MeaningState = { kind: "error", message: "down", retry: () => {} }
+    const states: MeaningState[] = [
+      { kind: "none" },
+      { kind: "loading" },
+      error,
+      { kind: "unsupported", reason: "not served" },
+    ]
+    for (const state of states) {
+      const { container, unmount } = render(<MeaningBadge state={state} columns={["a", "b"]} />)
+      expect(container.innerHTML).toBe("")
+      unmount()
+    }
   })
 })

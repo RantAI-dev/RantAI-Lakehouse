@@ -16,9 +16,10 @@ import { snapshotRelativeTime } from "@/lib/lakehouse-view"
 import { schemaHistory } from "@/lib/schema-history"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
-import { schemaRows, useMeanings, useProfile } from "./asset-column-data"
+import { schemaRows, useProfile } from "./asset-column-data"
 import { ColumnsCard, type SchemaRow } from "./asset-columns"
 import { TableMeaningCard } from "./asset-meaning-view"
+import type { MeaningState } from "./asset-meaning"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { StandInNotice } from "./asset-stand-in"
 
@@ -128,9 +129,17 @@ function SchemaVersions({ asset: a, table }: { asset: AssetDetail; table: Lakeho
  * `asset-columns.tsx`), then the table's own bookkeeping columns and its
  * schema history.
  */
-export function AssetSchema({ asset: a, iceberg }: { asset: AssetDetail; iceberg: IcebergTableState }) {
+export function AssetSchema({
+  asset: a,
+  iceberg,
+  meanings = { kind: "none" },
+}: {
+  asset: AssetDetail
+  iceberg: IcebergTableState
+  /** Read by the page, so the header and this tab share one request. Absent means no meaning to show. */
+  meanings?: MeaningState
+}) {
   const profile = useProfile(a.id)
-  const meanings = useMeanings(a)
   const table = icebergTableOf(iceberg)
   // A `silver.*`/`serving.*` asset's types are ClickHouse's own, where a
   // column that is not `Nullable(...)` cannot be null.

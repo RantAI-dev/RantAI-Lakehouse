@@ -10,6 +10,7 @@
  * `inputOf`, so no save drops a field the API replaces.
  */
 import * as React from "react"
+import Link from "next/link"
 import { Check } from "lucide-react"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
@@ -34,9 +35,50 @@ import { formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { SemanticEntry, SemanticEntryInput } from "@/services/contracts/semantic"
 import type { SchemaRow } from "./asset-columns"
-import { inputOf, parseSynonyms, ROLE_OPTIONS, roleLabel, type MeaningState } from "./asset-meaning"
+import {
+  inputOf,
+  meaningSummary,
+  parseSynonyms,
+  ROLE_OPTIONS,
+  roleLabel,
+  type MeaningState,
+} from "./asset-meaning"
 
 type Ready = Extract<MeaningState, { kind: "ready" }>
+
+/**
+ * The page header's pill: how much of the table's meaning a person has
+ * confirmed. It renders outside the Schema tab, so it lives beside the
+ * view's other exports; a press opens the Schema tab, where the meanings are.
+ */
+export function MeaningBadge({ state, columns }: { state: MeaningState; columns: readonly string[] }) {
+  if (state.kind !== "ready") return null
+  const summary = meaningSummary(columns, state.table, state.byColumn)
+  if (summary.kind === "none") return null
+  const { tone, text, title } =
+    summary.kind === "draft"
+      ? {
+          tone: "warning" as const,
+          text: "Meaning: AI draft",
+          title: "The assistant drafted this table's meanings. Nobody has confirmed them yet.",
+        }
+      : summary.kind === "partial"
+        ? {
+            tone: "info" as const,
+            text: `Meaning: ${summary.confirmed} of ${summary.total} confirmed`,
+            title: `A person has confirmed ${summary.confirmed} of this table's ${summary.total} meanings.`,
+          }
+        : {
+            tone: "success" as const,
+            text: "Meaning: confirmed",
+            title: "A person has confirmed every meaning of this table.",
+          }
+  return (
+    <Link href="?tab=schema" title={title} className="rounded-full">
+      <Pill tone={tone}>{text}</Pill>
+    </Link>
+  )
+}
 
 /** The API's limits on a description (`semantic_api.rs` `TABLE_TEXT_CHARS`, `COLUMN_TEXT_CHARS`). */
 const TABLE_TEXT_MAX = 400
