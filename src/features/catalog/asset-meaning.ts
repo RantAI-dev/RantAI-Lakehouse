@@ -1,9 +1,9 @@
 /**
  * Pure helpers for the meaning of a table and its columns: which catalog
  * keys have an entry, how the entries split into the table's own and one per
- * column, how many columns still await a person's confirmation, and how a
- * save body is built so no save drops a field. No React here, so each rule
- * is tested without a DOM.
+ * column, how many columns still await a person's confirmation, how much of
+ * a table's meaning a person has confirmed, and how a save body is built so
+ * no save drops a field. No React here, so each rule is tested without a DOM.
  */
 import type { SemanticEntry, SemanticEntryInput, SemanticRole } from "@/services/contracts/semantic"
 

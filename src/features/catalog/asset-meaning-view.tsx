@@ -1,10 +1,11 @@
 "use client"
 
 /**
- * The meaning of a table and of its columns on the Schema tab: the table's
- * card above the Columns card, and the Meaning view that the Columns card
- * switches to. The pure rules (which keys have an entry, how entries split,
- * how a save body is built) are in `asset-meaning.ts`.
+ * The meaning of a table and of its columns: the table's card above the
+ * Columns card on the Schema tab, the Meaning view that the Columns card
+ * switches to, and the page header's `MeaningBadge` pill. The pure rules
+ * (which keys have an entry, how entries split, how a save body is built)
+ * are in `asset-meaning.ts`.
  *
  * A person writes here only through the state's `save`, with a body built by
  * `inputOf`, so no save drops a field the API replaces.
