@@ -60,6 +60,38 @@ was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
   has nothing to continue from, so it loads everything and replaces the
   table: appending the full table onto rows an earlier mode left there
   would double them. A changed row shows up again as a new version.
+- `replace_dedup` is `replace` keeping ONE row per key (`LoadPlan.key`): the
+  rows are deduplicated (`adapters/dedup.py`: the highest cursor value wins,
+  else the last row read) and the table is replaced with the winners on every
+  run. It never merges. Any batch adapter can run it, SQL or not.
+- `incremental_dedup` is `incremental` followed by a merge: the cursor filter
+  runs first, the rows it lets through are deduplicated, and they are merged
+  into the table on the key (`dlt` write disposition `merge`, strategy
+  `upsert`; pyiceberg `Table.upsert`). Only a `sql_database` source, as for
+  `incremental`. Its FIRST run for a cursor has no cursor state, so it loads
+  everything and REPLACES the table with the winners, as `incremental` does:
+  a table an earlier `append` run left with a key in two data files is
+  rewritten clean, so later merges meet no duplicate (`SRC-10` measurement 3,
+  `test_3_a_replace_with_the_deduplicated_rows_cleans_an_append_table_...`).
+  Measured: a merge does NOT notice such a duplicate (copies in different data
+  files are both updated and both stay), so the first-run replace is what
+  makes the table sound, not the merge. The one case it does not cover is a
+  table switched from `incremental` to `incremental_dedup`: the cursor is the
+  same one, so the first run merges into a table that holds two versions of a
+  key and updates both (`test_3_a_table_with_two_versions_...`); a refresh that
+  forgets the cursor (`SRC-10` plan task 5) is the way out.
+
+A merge above 1000 rows is SEVERAL commits: `dlt`'s `merge_iceberg_table`
+upserts the batch in slices of 1000 rows, each its own transaction
+(`dlt/common/libs/pyiceberg.py`; `SRC-10` first pass, case l). For the
+deduplicating modes that is acceptable and is stated here rather than hidden:
+the batch has one row per key, so every slice, and therefore every commit, leaves
+at most one row per key; a run that fails part-way leaves the committed slices
+and not the rest; and the next run re-reads the source and brings the table to
+its state, because a merge is idempotent on a key (`SRC-10` measurement 5,
+`test_5_a_failure_in_a_later_slice_...`). Readers can see a table between two
+slices. A mode that needs ALL its rows or none (`history`, not built) cannot use
+this.
 
 Because `replace` forgets the cursor and an `append` run is made to
 (`_forget_cursors`), switching a table between modes never leaves a stale
@@ -82,32 +114,78 @@ from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
 from dlt.extract.incremental import IncrementalResourceWrapper
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
+from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.helpers import pipeline_drop
+
+from dispar_orchestrate.adapters import dedup
 
 logger = logging.getLogger(__name__)
 
-LOAD_MODES = ("replace", "append", "incremental")
+LOAD_MODES = ("replace", "append", "incremental", "replace_dedup", "incremental_dedup")
+# SRC-10: the modes that keep one row per key, and the modes that read only rows
+# beyond a cursor (the cursor is pushed into the query, so only `sql_database`).
+DEDUP_MODES = ("replace_dedup", "incremental_dedup")
+INCREMENTAL_MODES = ("incremental", "incremental_dedup")
+
+# The most columns and the longest column name a key may have: the same bounds
+# as `validate_load_modes` in `rust/crates/lakehouse-store/src/ingest_spec.rs`,
+# which refuses a key at save time; a spec that got here another way is refused
+# again at run time.
+MAX_KEY_COLUMNS = 16
+MAX_KEY_COLUMN_LENGTH = 128
 
 
 class UnsupportedLoadMode(ValueError):
     """A source object asks for a load mode this build cannot run as
-    written: an unknown mode, or `incremental` without a cursor column."""
+    written: an unknown mode, `incremental` without a cursor column, or a
+    deduplicating mode without a usable key."""
+
+
+def _check_key(mode: str, key: tuple[str, ...]) -> None:
+    if not key:
+        raise UnsupportedLoadMode(
+            f"load mode {mode!r} needs primaryKey, the columns that identify one row"
+        )
+    problem = (
+        len(key) > MAX_KEY_COLUMNS
+        or len(set(key)) != len(key)
+        or any(
+            not isinstance(column, str)
+            or not column.strip()
+            or len(column) > MAX_KEY_COLUMN_LENGTH
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in column)
+            for column in key
+        )
+    )
+    if problem:
+        raise UnsupportedLoadMode(
+            f"load mode {mode!r} has a primaryKey that is not a list of at most {MAX_KEY_COLUMNS} distinct, "
+            f"non-blank column names of at most {MAX_KEY_COLUMN_LENGTH} characters without control characters"
+        )
 
 
 @dataclass(frozen=True)
 class LoadPlan:
     """How one load's rows meet its Bronze table -- see this module's
-    "Load modes" section. `cursor` is the incremental cursor column and is
-    set exactly when `mode` is `incremental`."""
+    "Load modes" section. `cursor` is the incremental cursor column: required
+    for `incremental` and `incremental_dedup`, optional for `replace_dedup`
+    (where it only decides which of two rows with one key wins), unused
+    otherwise. `key` is the columns that identify one row, required for the
+    deduplicating modes and empty for the others (SRC-10)."""
 
     mode: str = "append"
     cursor: str | None = None
+    key: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in LOAD_MODES:
             raise UnsupportedLoadMode(f"load mode {self.mode!r} is not one of {', '.join(LOAD_MODES)}")
-        if self.mode == "incremental" and not self.cursor:
-            raise UnsupportedLoadMode("load mode 'incremental' needs incrementalKey, the column that marks new rows")
+        if self.mode in INCREMENTAL_MODES and not self.cursor:
+            raise UnsupportedLoadMode(
+                f"load mode {self.mode!r} needs incrementalKey, the column that marks new rows"
+            )
+        if self.mode in DEDUP_MODES:
+            _check_key(self.mode, self.key)
 
     @classmethod
     def from_source_object(cls, obj: dict[str, Any]) -> "LoadPlan":
@@ -115,14 +193,26 @@ class LoadPlan:
         load modes existed has no `loadMode`; it gets `replace`, so its
         next run leaves one copy of the source instead of adding another.
 
+        `primaryKey` is read only for a deduplicating mode: the console keeps
+        a detected key on the object while the user switches modes, and a key
+        on another mode is ignored, as the API ignores it (SRC-10).
+
         # Errors
 
-        Raises `UnsupportedLoadMode` for an unknown mode, or `incremental`
-        with no `incrementalKey`.
+        Raises `UnsupportedLoadMode` for an unknown mode, an incremental mode
+        with no `incrementalKey`, or a deduplicating mode with no usable
+        `primaryKey`.
         """
         mode = obj.get("loadMode") or "replace"
         cursor = (obj.get("incrementalKey") or "").strip() or None
-        return cls(mode=mode, cursor=cursor if mode == "incremental" else None)
+        raw_key = obj.get("primaryKey") if mode in DEDUP_MODES else None
+        if raw_key is not None and not isinstance(raw_key, (list, tuple)):
+            raise UnsupportedLoadMode(f"load mode {mode!r} has a primaryKey that is not a list of column names")
+        return cls(
+            mode=mode,
+            cursor=cursor if mode in INCREMENTAL_MODES or mode == "replace_dedup" else None,
+            key=tuple(raw_key or ()),
+        )
 
 
 def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
@@ -385,7 +475,7 @@ def _forget_cursors(pipeline: Any) -> None:
         pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
 
 
-def _apply_cursor(source: Any, cursor: str) -> None:
+def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
     """Attach the incremental cursor to what `source` loads.
 
     Only a resource that takes the cursor itself is accepted, which is what
@@ -410,14 +500,32 @@ def _apply_cursor(source: Any, cursor: str) -> None:
     elif isinstance(source, DltResource):
         resources = [source]
     else:
-        raise UnsupportedLoadMode("load mode 'incremental' needs a dlt source or resource, not plain rows")
+        raise UnsupportedLoadMode(f"load mode {mode!r} needs a dlt source or resource, not plain rows")
     for resource in resources:
         if not isinstance(resource.incremental, IncrementalResourceWrapper):
             raise UnsupportedLoadMode(
-                f"load mode 'incremental' is not available for {resource.name!r}: its source cannot filter by a "
+                f"load mode {mode!r} is not available for {resource.name!r}: its source cannot filter by a "
                 "cursor before the rows are stamped, so reruns would add the last row again"
             )
         resource.apply_hints(incremental=dlt.sources.incremental(cursor))
+
+
+def _refusal_in(exc: BaseException) -> dedup.DedupRefused | None:
+    """The `DedupRefused` a deduplication step raised, or `None`. `dlt` wraps an
+    exception of a pipe step twice -- `ResourceExtractionError` or
+    `PipeItemProcessingError` inside `PipelineStepFailed` (measured) -- so the
+    chain is walked (bounded, as `ingest_factory._classify_exception` does).
+    Unwrapped so the caller sees the fixed-message refusal and the ingest op can
+    report it as a config-shaped failure."""
+    current: BaseException | None = exc
+    for _ in range(8):
+        if current is None:
+            return None
+        if isinstance(current, dedup.DedupRefused):
+            return current
+        inner = current.exception if isinstance(current, PipelineStepFailed) else None
+        current = inner if isinstance(inner, BaseException) else (current.__cause__ or current.__context__)
+    return None
 
 
 def load_via_sink(
@@ -434,7 +542,10 @@ def load_via_sink(
     Raises whatever `pipeline.run` raises (`PipelineStepFailed`, etc.) --
     this stays a thin, unit-testable wrapper around dlt's own run, not a
     place that swallows load failures. Raises `UnsupportedLoadMode` for an
-    incremental plan over plain rows.
+    incremental plan over plain rows, and `dedup.DedupRefused` (a `ValueError`
+    with a fixed message) when a deduplicating plan cannot be applied: a row
+    with no key value, more distinct keys than `INGEST_DEDUP_MAX_ROWS`, cursor
+    values that cannot be ordered.
     """
     _install_catalog_env(config)
 
@@ -459,8 +570,16 @@ def load_via_sink(
     # and silently under-partitions everything else. Stamping unconditionally
     # here, before `iceberg_adapter` fixes the partition spec to that
     # column, closes that gap for every caller at once.
-    if plan.mode == "incremental":
-        _apply_cursor(source, plan.cursor or "")
+    if plan.mode in INCREMENTAL_MODES:
+        _apply_cursor(source, plan.cursor or "", plan.mode)
+    # SRC-10 (planner decision 6): deduplicate AFTER the cursor filter and BEFORE
+    # the stamp. The filter has then already dropped the rows beyond reach, and the
+    # stamp is written on the winner only, so it can never decide which row wins.
+    dedup_steps: list[Any] = []
+    if plan.mode in DEDUP_MODES:
+        source, dedup_steps = dedup.attach(
+            source, key=plan.key, cursor=plan.cursor, table=bronze_table_name
+        )
     source = _stamp_for_load(source)
 
     # Adapters still apply their own `apply_hints` (table name, primary
@@ -505,20 +624,47 @@ def load_via_sink(
         # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
         dataset_name="bronze",
     )
-    write_disposition = "append" if plan.mode == "incremental" else plan.mode
-    if plan.mode == "incremental" and not _has_cursor(pipeline, plan.cursor or ""):
-        # Nothing to continue from: load everything, and replace rather
-        # than stack it onto what an earlier mode left there.
+    run_options: dict[str, Any] = {}
+    if plan.mode == "incremental":
+        write_disposition: Any = "append"
+    elif plan.mode == "replace_dedup":
+        # Never a merge: the winners replace the table on every run.
         write_disposition = "replace"
-    load_info = pipeline.run(
-        source, table_name=bronze_table_name, table_format="iceberg", write_disposition=write_disposition
-    )
+    elif plan.mode == "incremental_dedup":
+        write_disposition = {"disposition": "merge", "strategy": "upsert"}
+        run_options["primary_key"] = list(plan.key)
+    else:
+        write_disposition = plan.mode
+    if plan.mode in INCREMENTAL_MODES and not _has_cursor(pipeline, plan.cursor or ""):
+        # Nothing to continue from: load everything, and replace rather
+        # than stack it onto what an earlier mode left there. For
+        # `incremental_dedup` the replace also rewrites a table an earlier
+        # `append` run left with duplicate keys (SRC-10 measurement 3). The key
+        # stays on this run too: dlt recognises the rows at the cursor boundary
+        # by a hash of the key (else of the whole row), so the run that stores
+        # the hash and the runs that compare it must agree, or every later run
+        # re-reads and re-merges the last row.
+        write_disposition = "replace"
+    try:
+        load_info = pipeline.run(
+            source,
+            table_name=bronze_table_name,
+            table_format="iceberg",
+            write_disposition=write_disposition,
+            **run_options,
+        )
+        dedup.assert_flushed(dedup_steps, table=bronze_table_name)
+    except Exception as exc:
+        refused = _refusal_in(exc)
+        if refused is not None:
+            raise refused from exc
+        raise
 
     # A load with failed jobs never produced a trustworthy normalize count
     # for this run -- `rows` is `None` here even if `row_counts` happens to
     # carry a stale/partial number (WS3 plan review Z9, case 2 of 3).
     rows = None if load_info.has_failed_jobs else _extract_rows(pipeline.last_trace, bronze_table_name)
-    if rows is None and plan.mode == "incremental" and not load_info.has_failed_jobs and pipeline.last_trace:
+    if rows is None and plan.mode in INCREMENTAL_MODES and not load_info.has_failed_jobs and pipeline.last_trace:
         # The one case an absent count IS a measurement: the cursor filter
         # ran and let nothing through, so this run added zero rows.
         rows = 0

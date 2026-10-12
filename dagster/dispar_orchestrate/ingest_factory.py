@@ -154,6 +154,7 @@ from kafka.structs import OffsetAndMetadata
 from dispar_orchestrate import connector_catalog, dlt_pipeline, schema_observer, secret_resolver, ssrf_guard
 from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
 from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
+from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
@@ -400,7 +401,11 @@ def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
     (`adapters/sink.py`'s "Load modes"). A source object saved before load
     modes existed replaces: every run used to add the whole source again.
 
-    `incremental` is offered for the `sql` adapter only. dlt can filter any
+    `incremental` and `incremental_dedup` are offered for the `sql` adapter
+    only; `replace_dedup` runs on every batch adapter, through the same
+    deduplication on plain rows (SRC-10; `adapters/dedup.py`). A Kafka
+    micro-batch never goes through here: it has no source-object load mode
+    and `load_via_sink` appends it, which suits new rows by construction. dlt can filter any
     resource by a cursor, but only the `sql_database` source's path (the
     filter pushed into the query, the cursor kept across runs) has been
     exercised; the others are refused rather than assumed to work.
@@ -411,9 +416,9 @@ def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
     rejection.
     """
     plan = LoadPlan.from_source_object(obj)
-    if plan.mode == "incremental" and adapter_name != "sql":
+    if plan.mode in sink_adapter.INCREMENTAL_MODES and adapter_name != "sql":
         raise UnsupportedLoadMode(
-            f"load mode 'incremental' is only available for SQL connectors, not adapter {adapter_name!r}"
+            f"load mode {plan.mode!r} is only available for SQL connectors, not adapter {adapter_name!r}"
         )
     return plan
 
@@ -751,6 +756,9 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
         ssrf_guard.SsrfBlocked,
         UnsupportedColumnType,
         UnsupportedLoadMode,
+        # SRC-10: a deduplicating load that cannot be done as asked (a row with
+        # no key value, too many keys). Fixed message: counts and names only.
+        dedup_adapter.DedupRefused,
         schema_observer.ObservationRefused,
     ) as exc:
         _record(rows=None, status="rejected", error=str(exc))
