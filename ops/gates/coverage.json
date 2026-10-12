@@ -1,5 +1,5 @@
 {
-  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest supported:false today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing.",
+  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest supported:false today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'.",
   "types": {
     "PostgreSQL": {
       "gate": "g6",
@@ -35,22 +35,6 @@
         "reload": "real"
       }
     },
-    "MySQL CDC": {
-      "gate": null,
-      "steps": {
-        "connect": "missing",
-        "discover": "missing",
-        "load": "missing",
-        "reload": "missing"
-      },
-      "notes": {
-        "all": "SRC-9 plan task 6, FINDING, no gate built: GET /api/connectors/{id}/debezium-properties renders the PostgreSQL template with the MySQL class name (rust/crates/lakehouse-store/src/cdc.rs:664-673). Debezium 3.6.3 (the pinned debezium-server-iceberg 1.1.1.Final) requires 'database.server.id' for the MySQL connector (BinlogConnectorConfig.SERVER_ID is .required()); the template never renders it although the dial carries serverId (ingest_spec.rs CdcDial.server_id; cdc.rs reads it nowhere). It also emits PostgreSQL-only plugin.name=pgoutput, slot.name, publication.name and publication.autocreate.mode, and a 'database.dbname' the MySQL connector does not have. A Debezium Server started from it fails configuration validation. Product owner decision needed: build a MySQL template, or supported=false with a reason (as SRC-6 did for Google Sheets). Waived until SRC-4."
-      },
-      "waiver": {
-        "until": "SRC-4",
-        "reason": "The API renders no usable Debezium template for MySQL (no database.server.id, PostgreSQL-only properties); see the notes. Reported by SRC-9 task 6 for a product owner decision."
-      }
-    },
     "MariaDB": {
       "gate": "g6",
       "steps": {
@@ -70,22 +54,6 @@
         "discover": "real",
         "load": "real",
         "reload": "real"
-      }
-    },
-    "SQL Server CDC": {
-      "gate": null,
-      "steps": {
-        "connect": "missing",
-        "discover": "missing",
-        "load": "missing",
-        "reload": "missing"
-      },
-      "notes": {
-        "all": "SRC-9 plan task 6, FINDING, no gate built: GET /api/connectors/{id}/debezium-properties renders the PostgreSQL template with the SQL Server class name (rust/crates/lakehouse-store/src/cdc.rs:664-673). Debezium 3.6.3 requires 'database.names' for the SQL Server connector (SqlServerConnectorConfig.DATABASE_NAMES, validated 'Cannot be empty'); the template renders 'database.dbname' instead, which that connector does not define, so validation fails. It also emits PostgreSQL-only plugin.name=pgoutput, slot.name, publication.name and publication.autocreate.mode. A Debezium Server started from it fails configuration validation. Product owner decision needed: build a SQL Server template, or supported=false with a reason. Waived until SRC-4."
-      },
-      "waiver": {
-        "until": "SRC-4",
-        "reason": "The API renders no usable Debezium template for SQL Server (no database.names, PostgreSQL-only properties); see the notes. Reported by SRC-9 task 6 for a product owner decision."
       }
     },
     "Object storage": {

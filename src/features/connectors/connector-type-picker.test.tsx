@@ -135,6 +135,21 @@ describe("unavailable tiles (SRC-6 F5)", () => {
     expect(el.getAttribute("title")).toBe("Not available yet")
   })
 
+  it("disables a change-capture tile that keeps its cdc adapter and shows the API's reason (SRC-9 decision 8)", () => {
+    const mysqlCdc: ConnectorType = {
+      name: "MySQL CDC",
+      adapter: "cdc",
+      supported: false,
+      docsUrl: null,
+      unsupportedReason: "Change capture for MySQL is not built yet: this build can only prepare it for PostgreSQL.",
+    }
+    render(<ConnectorTypePicker types={[mysqlCdc]} value={null} onChange={() => {}} />)
+    const el = tile("MySQL CDC") as HTMLButtonElement
+    expect(el.disabled).toBe(true)
+    expect(el.textContent).toContain(mysqlCdc.unsupportedReason!)
+    expect(el.getAttribute("title")).toBe(mysqlCdc.unsupportedReason!)
+  })
+
   it("no longer tells the user that Google Sheets can be configured and tested", () => {
     render(<ConnectorTypePicker types={[SHEETS]} value="Google Sheets" onChange={() => {}} />)
     expect(screen.queryByText(/can be configured and tested/)).toBeNull()

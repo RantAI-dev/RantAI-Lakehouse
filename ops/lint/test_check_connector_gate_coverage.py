@@ -55,9 +55,11 @@ def entry(gate="g6", steps=None, waiver=None) -> dict:
 
 
 class SupportedTypesTests(unittest.TestCase):
-    def test_the_real_migrations_list_thirteen_supported_types_and_not_google_sheets(self) -> None:
+    def test_the_real_migrations_list_eleven_supported_types_and_not_google_sheets(self) -> None:
         names = check.supported_types(REPO_ROOT / "rust" / "migrations")
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 11)  # 13 before SRC-9 decision 8 (0066)
+        self.assertNotIn("MySQL CDC", names)
+        self.assertNotIn("SQL Server CDC", names)
         self.assertNotIn("Google Sheets", names)
         self.assertIn("Oracle", names)
 

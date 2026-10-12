@@ -35,9 +35,9 @@ def small_registry() -> gs.Registry:
 
 
 class RegistryFileTests(unittest.TestCase):
-    def test_the_checked_in_registry_loads_and_lists_thirteen_types(self) -> None:
+    def test_the_checked_in_registry_loads_and_lists_eleven_types(self) -> None:
         registry = gs.Registry.load(REAL_REGISTRY)
-        self.assertEqual(len(registry.type_names()), 13)
+        self.assertEqual(len(registry.type_names()), 11)
 
     def test_the_checked_in_registry_does_not_list_google_sheets(self) -> None:
         # 0062 flipped it to unsupported; a gate for it would claim coverage of nothing.
@@ -73,10 +73,13 @@ class RegistryFileTests(unittest.TestCase):
             with self.assertRaises(gs.RegistryError):
                 gs.Registry.load(path)
 
+    # SRC-9 decision 8 removed the two types these waiver tests used to take
+    # (MySQL CDC); the registry no longer carries a waiver, so they build one
+    # on MariaDB. The assertions are unchanged.
     def test_a_waiver_needs_both_a_backlog_id_and_a_reason(self) -> None:
         raw = json.loads(REAL_REGISTRY.read_text())
         for bad in ({"until": "SRC-4"}, {"until": "", "reason": "x"}, {"until": "SRC-4", "reason": "x", "extra": 1}, "later"):
-            raw["types"]["MySQL CDC"]["waiver"] = bad
+            raw["types"]["MariaDB"]["waiver"] = bad
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "c.json"
                 path.write_text(json.dumps(raw))
@@ -85,12 +88,12 @@ class RegistryFileTests(unittest.TestCase):
 
     def test_a_waiver_is_read_back_and_a_type_without_one_has_none(self) -> None:
         raw = json.loads(REAL_REGISTRY.read_text())
-        raw["types"]["MySQL CDC"]["waiver"] = {"until": "SRC-4", "reason": "no template"}
+        raw["types"]["MariaDB"]["waiver"] = {"until": "SRC-4", "reason": "no template"}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps(raw))
             registry = gs.Registry.load(path)
-        self.assertEqual(registry.waiver("MySQL CDC"), {"until": "SRC-4", "reason": "no template"})
+        self.assertEqual(registry.waiver("MariaDB"), {"until": "SRC-4", "reason": "no template"})
         self.assertIsNone(registry.waiver("MySQL"))
 
     def test_a_missing_registry_file_is_an_error_not_an_empty_registry(self) -> None:
@@ -110,7 +113,7 @@ class RegistryFileTests(unittest.TestCase):
             old = os.environ.get("GATE_COVERAGE_PATH")
             os.environ["GATE_COVERAGE_PATH"] = str(path)
             try:
-                self.assertEqual(len(gs.Registry.load().type_names()), 13)
+                self.assertEqual(len(gs.Registry.load().type_names()), 11)
             finally:
                 if old is None:
                     del os.environ["GATE_COVERAGE_PATH"]
