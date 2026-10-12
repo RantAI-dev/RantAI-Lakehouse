@@ -544,6 +544,11 @@ export type SourceObject = {
   /** How a run's rows meet the Bronze table. Absent on an object saved
    * before load modes existed, which the ingest job runs as `replace`. */
   loadMode?: LoadMode
+  /** The columns that identify one row, for the deduplicating modes
+   * (`SRC-10`). Kept on the object whatever the mode, so a key the console
+   * detected survives a switch of mode; the API ignores it for a mode that
+   * does not use it. */
+  primaryKey?: string[]
   target: string
 }
 
@@ -552,9 +557,12 @@ export type SourceObject = {
  * `dagster/dispar_orchestrate/adapters/sink.py`, which acts on it:
  * `replace` overwrites the table with what the source returns now,
  * `append` adds every row again, `incremental` adds only rows beyond the
- * cursor column's last seen value (SQL connectors only).
+ * cursor column's last seen value (SQL connectors only), `replace_dedup`
+ * is `replace` keeping one row per `primaryKey`, and `incremental_dedup` is
+ * `incremental` merging into the table on `primaryKey` (SQL connectors only).
+ * Both deduplicating modes need a `primaryKey` (`SRC-10`).
  */
-export type LoadMode = "replace" | "append" | "incremental"
+export type LoadMode = "replace" | "append" | "incremental" | "replace_dedup" | "incremental_dedup"
 
 /**
  * Credential reference NAMES only (`env:FOO`, `file:/…`), never a

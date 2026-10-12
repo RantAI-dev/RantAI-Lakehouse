@@ -75,6 +75,10 @@ describe("ingest panel helpers", () => {
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at" })).toBeNull()
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "  " })).toMatch(/Pick the column/)
     expect(loadModeProblem({ loadMode: "incremental" })).toMatch(/Pick the column/)
+    // SRC-10: the merging mode needs the same cursor column; the replacing one needs none.
+    expect(loadModeProblem({ loadMode: "incremental_dedup" })).toMatch(/Pick the column/)
+    expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "replace_dedup" })).toBeNull()
   })
 
   it("names a Bronze table after the connector and the source table", () => {

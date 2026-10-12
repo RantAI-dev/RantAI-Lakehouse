@@ -113,7 +113,15 @@ const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"
   unsupported: "neutral",
 }
 
-type Selected = { name: string; target: string; loadMode: LoadMode; incrementalKey?: string }
+type Selected = {
+  name: string
+  target: string
+  loadMode: LoadMode
+  incrementalKey?: string
+  /** SRC-10: set through the assistant or the API for now; the panel has no field for it, so it is only carried
+   * through a save (dropping it would silently undo a deduplicating table). */
+  primaryKey?: string[]
+}
 type Selection = Selected[]
 
 /** What a table gets when it is ticked: one copy of the source per run. */
@@ -123,6 +131,10 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace: "Replace all rows",
   incremental: "Add only new rows",
   append: "Add all rows again",
+  // SRC-10: not offered by `loadModesFor` yet (no key field); labelled so a table the assistant set to one of them
+  // shows its mode instead of a blank choice.
+  replace_dedup: "Replace all rows, one per key",
+  incremental_dedup: "Add only new rows, one per key",
 }
 
 /** What a mode does on each run, in one line under the choice. */
@@ -136,6 +148,12 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
       } is higher than the last one seen. A changed row is added again as a new version.`
     case "append":
       return "Every run adds the whole source on top of earlier loads, so the table grows by a full copy each time."
+    case "replace_dedup":
+      return "The table always holds one copy of the source, with one row per key: the one with the highest value of the cursor column, or the last one read."
+    case "incremental_dedup":
+      return `The first run copies everything; later runs merge rows whose ${
+        cursor || "column"
+      } is higher than the last one seen into the table, one row per key.`
   }
 }
 
@@ -146,7 +164,10 @@ function loadModesFor(adapter: string): LoadMode[] {
 
 /** Why a table's load mode cannot be saved, or `null`. */
 export function loadModeProblem(selected: { loadMode: LoadMode; incrementalKey?: string }): string | null {
-  if (selected.loadMode === "incremental" && !(selected.incrementalKey ?? "").trim()) {
+  if (
+    (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
+    !(selected.incrementalKey ?? "").trim()
+  ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
   }
   return null
@@ -159,6 +180,7 @@ function fromSpec(spec: IngestSpec): Selection {
     // Saved before load modes existed: the ingest job replaces.
     loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
     incrementalKey: o.incrementalKey,
+    primaryKey: o.primaryKey,
   }))
 }
 
@@ -168,9 +190,10 @@ function toSourceObjects(selection: Selection, withModes: boolean): SourceObject
     name: s.name,
     target: s.target,
     ...(withModes ? { loadMode: s.loadMode } : {}),
-    ...(withModes && s.loadMode === "incremental" && s.incrementalKey?.trim()
+    ...(withModes && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
+    ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
   }))
 }
 
@@ -739,7 +762,7 @@ function LoadModeFields({
             </option>
           ))}
         </select>
-        {selected.loadMode === "incremental" ? (
+        {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
           <>
             <span className="shrink-0 text-xs text-muted-foreground">by</span>
             {columns && columns.length > 0 ? (
