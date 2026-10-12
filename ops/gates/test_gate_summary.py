@@ -73,6 +73,26 @@ class RegistryFileTests(unittest.TestCase):
             with self.assertRaises(gs.RegistryError):
                 gs.Registry.load(path)
 
+    def test_a_waiver_needs_both_a_backlog_id_and_a_reason(self) -> None:
+        raw = json.loads(REAL_REGISTRY.read_text())
+        for bad in ({"until": "SRC-4"}, {"until": "", "reason": "x"}, {"until": "SRC-4", "reason": "x", "extra": 1}, "later"):
+            raw["types"]["MySQL CDC"]["waiver"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps(raw))
+                with self.assertRaises(gs.RegistryError, msg=repr(bad)):
+                    gs.Registry.load(path)
+
+    def test_a_waiver_is_read_back_and_a_type_without_one_has_none(self) -> None:
+        raw = json.loads(REAL_REGISTRY.read_text())
+        raw["types"]["MySQL CDC"]["waiver"] = {"until": "SRC-4", "reason": "no template"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(raw))
+            registry = gs.Registry.load(path)
+        self.assertEqual(registry.waiver("MySQL CDC"), {"until": "SRC-4", "reason": "no template"})
+        self.assertIsNone(registry.waiver("MySQL"))
+
     def test_a_missing_registry_file_is_an_error_not_an_empty_registry(self) -> None:
         with self.assertRaises(gs.RegistryError):
             gs.Registry.load("/nonexistent/coverage.json")

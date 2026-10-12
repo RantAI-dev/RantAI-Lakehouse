@@ -36,7 +36,7 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 On a `push` to `main`, all jobs run unconditionally.
 
 Downstream jobs execute according to scope:
-- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the four static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports) into one fast job.
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.

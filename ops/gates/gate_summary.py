@@ -98,6 +98,15 @@ class Registry:
                     raise RegistryError(f"{name}.{step}: a 'refused' step needs a note naming the backlog item")
             if gate is None and any(v != "missing" for v in steps.values()):
                 raise RegistryError(f"{name}: a type with no gate cannot have a step other than 'missing'")
+            waiver = entry.get("waiver")
+            if waiver is not None:
+                # SRC-9 task 8: a waiver is the one way a supported type may
+                # stay uncovered; the coverage check lists it, never skips it.
+                if (
+                    not isinstance(waiver, dict) or set(waiver) != {"until", "reason"}
+                    or not all(isinstance(waiver[k], str) and waiver[k].strip() for k in waiver)
+                ):
+                    raise RegistryError(f"{name}: 'waiver' must be {{\"until\": <backlog id>, \"reason\": <text>}}, both non-empty")
         return cls(types)
 
     def type_names(self) -> list[str]:
@@ -110,6 +119,11 @@ class Registry:
         """`real`, `refused` or `missing` for one step of one type."""
         _check_step(step)
         return self._entry(type_name)["steps"][step]
+
+    def waiver(self, type_name: str) -> dict | None:
+        """`{"until": <backlog id>, "reason": <text>}` if the type carries an
+        explicit waiver of its gate coverage (SRC-9 task 8), else None."""
+        return self._entry(type_name).get("waiver")
 
     def note(self, type_name: str, step: str) -> str:
         """The note for a step, falling back to the type's `all` note; empty if none."""

@@ -98,6 +98,21 @@ jobs:
       - name: Check intra-package imports (Dagster)
         run: python3 ops/lint/check_intra_package_imports.py
 
+      # SRC-9 task 8 (decision 6): every connector type the migrations list as
+      # supported has a gate in ops/gates/coverage.json, with all four steps
+      # covered or an explicit, printed waiver. Fails on a migration that
+      # touches connector_type in a shape it cannot read, so a new supported
+      # type cannot slip in unnoticed. See ops/lint/check_connector_gate_coverage.py.
+      - name: Check connector gate coverage (SRC-9)
+        run: python3 ops/lint/check_connector_gate_coverage.py
+
+      # The unit tests of that check and of the gates' registry and result
+      # table module (no network, no containers; seconds).
+      - name: Unit-test the connector gate coverage tooling (SRC-9)
+        run: |
+          python3 -m unittest discover -s ops/lint -p 'test_*.py'
+          python3 -m unittest discover -s ops/gates -p 'test_*.py'
+
   # ── Frontend ────────────────────────────────────────────────────────
   verify:
     name: Frontend · Lint · Typecheck · Test · Build
