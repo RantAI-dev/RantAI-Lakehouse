@@ -184,8 +184,8 @@ None of them were added by the reviewed PRs.
 | --- | --- | --- | --- |
 | #113 | SRC-6/7/8 status | Correct | **Merged** |
 | #77 | flaky tests | Already on `main` as c1c9906 | Closed as superseded, with a comment |
-| #97 | `SEC-23` | Ready; one docs conflict | Main merged in by the planner (docs only); merge when CI is green |
-| #100 | `DATA-16` | Ready; two docs conflicts | Main merged in by the planner (docs only); merge when CI and `g8-time-travel` are green |
+| #97 | `SEC-23` | Ready; docs conflicts only | Main merged in by the planner (docs only); **merged** with CI green; `SEC-23` Done |
+| #100 | `DATA-16` | Ready; two docs conflicts | Main merged in by the planner (docs only); **merged** with CI and `g8-time-travel` green; `DATA-16` Done, follow-ups in `DATA-25` |
 | #106 | `DATA-12` part 1 | BLOCKER: migration `0062` collides with main's | Commented |
 | #105 | `SEC-10`–`SEC-13` | Two BLOCKERs: the merge with main does not compile and main's load alerts skip the webhook check; the code was written by the planner model | Commented |
 | #104 | `BI-18` phase 1 (draft) | Waits for #105; the assistant filter tool (`AI-2`) is missing | Commented |

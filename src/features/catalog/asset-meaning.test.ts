@@ -1,6 +1,14 @@
 import { describe, expect, it } from "bun:test"
 import type { SemanticEntry, SemanticEntryInput } from "@/services/contracts/semantic"
-import { draftCount, inputOf, parseSynonyms, roleLabel, semanticAsset, splitEntries } from "./asset-meaning"
+import {
+  draftCount,
+  inputOf,
+  meaningSummary,
+  parseSynonyms,
+  roleLabel,
+  semanticAsset,
+  splitEntries,
+} from "./asset-meaning"
 import { visibleColumns } from "./asset-columns"
 
 const entry = (over: Partial<SemanticEntry> = {}): SemanticEntry => ({
@@ -57,6 +65,61 @@ describe("draftCount", () => {
       ["gone", entry({ column: "gone", status: "draft" })],
     ])
     expect(draftCount(rows, byColumn)).toBe(1)
+  })
+})
+
+describe("meaningSummary", () => {
+  const columns = ["a", "b"]
+
+  it("returns none when neither the table nor any listed column has an entry", () => {
+    expect(meaningSummary(columns, null, new Map())).toEqual({ kind: "none" })
+  })
+
+  it("returns draft with the total when the table and every listed column are drafts", () => {
+    const table = entry({ column: null, status: "draft" })
+    const byColumn = new Map<string, SemanticEntry>([
+      ["a", entry({ column: "a", status: "draft" })],
+      ["b", entry({ column: "b", status: "draft" })],
+    ])
+    expect(meaningSummary(columns, table, byColumn)).toEqual({ kind: "draft", total: 3 })
+  })
+
+  it("returns partial with the confirmed count and the total when some entries are still drafts", () => {
+    const table = entry({ column: null, status: "confirmed" })
+    const byColumn = new Map<string, SemanticEntry>([
+      ["a", entry({ column: "a", status: "confirmed" })],
+      ["b", entry({ column: "b", status: "draft" })],
+    ])
+    expect(meaningSummary(columns, table, byColumn)).toEqual({ kind: "partial", confirmed: 2, total: 3 })
+  })
+
+  it("returns confirmed with the total when the table and every listed column are confirmed", () => {
+    const table = entry({ column: null, status: "confirmed" })
+    const byColumn = new Map<string, SemanticEntry>([
+      ["a", entry({ column: "a", status: "confirmed" })],
+      ["b", entry({ column: "b", status: "confirmed" })],
+    ])
+    expect(meaningSummary(columns, table, byColumn)).toEqual({ kind: "confirmed", total: 3 })
+  })
+
+  it("returns confirmed with a total of one when only one column has a confirmed entry", () => {
+    const byColumn = new Map<string, SemanticEntry>([["a", entry({ column: "a", status: "confirmed" })]])
+    expect(meaningSummary(columns, null, byColumn)).toEqual({ kind: "confirmed", total: 1 })
+  })
+
+  it("leaves out an entry whose column is not among the listed columns", () => {
+    const table = entry({ column: null, status: "draft" })
+    const byColumn = new Map<string, SemanticEntry>([
+      ["a", entry({ column: "a", status: "draft" })],
+      ["gone", entry({ column: "gone", status: "confirmed" })],
+    ])
+    expect(meaningSummary(columns, table, byColumn)).toEqual({ kind: "draft", total: 2 })
+  })
+
+  it("counts a status the console does not know as an entry but not as confirmed", () => {
+    const byColumn = new Map<string, SemanticEntry>([["a", entry({ column: "a", status: "confirmed" })]])
+    const table = entry({ column: null, status: "unknown" })
+    expect(meaningSummary(columns, table, byColumn)).toEqual({ kind: "partial", confirmed: 1, total: 2 })
   })
 })
 
