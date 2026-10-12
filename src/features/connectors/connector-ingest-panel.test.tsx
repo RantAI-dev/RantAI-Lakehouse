@@ -214,6 +214,7 @@ describe("ConnectorIngestPanel", () => {
       "append",
       "replace_dedup",
       "incremental_dedup",
+      "history",
     ])
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
     sql.unmount()
@@ -226,7 +227,7 @@ describe("ConnectorIngestPanel", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
-    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup"])
+    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {
@@ -491,7 +492,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
   const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
 
-  it("offers five modes to a SQL source, labelled in plain words", async () => {
+  it("offers six modes to a SQL source, labelled in plain words", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
@@ -501,12 +502,13 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       "Add all rows again",
       "Replace all rows, one per key",
       "Add only new rows, one per key",
+      "Keep history",
     ])
     // Nothing is missing, so there is no line about a missing mode.
     expect(screen.queryByText(/offered for SQL sources only/)).toBeNull()
   })
 
-  it("offers three modes to any other batch source and says why the incremental ones are missing", async () => {
+  it("offers four modes to any other batch source and says why the incremental ones are missing", async () => {
     stubFetch({
       ...SPEC,
       adapter: "rest",
@@ -515,7 +517,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup"])
+    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
     expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources only/)).toBeDefined()
   })
 
@@ -641,6 +643,130 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     expect(mode.value).toBe("replace_dedup")
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
+  })
+})
+
+/**
+ * SRC-10 sixth pass, decisions 1, 9 and 10: the history mode. It reads the whole table, so it takes a key and
+ * no cursor, and a table cannot cross to or from it without "Refresh, removing rows".
+ */
+describe("ConnectorIngestPanel history mode", () => {
+  const saved = (extra: Record<string, unknown> = {}) => ({
+    ...SPEC,
+    sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
+  })
+  const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
+  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const BOUNDARY = "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
+
+  it("says in one line what is kept and that each run reads the whole table", async () => {
+    stubFetch(saved())
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
+    expect(
+      screen.getByText(
+        "Every version of a row is kept, with the time a load first saw it (_valid_from), the time it was replaced (_valid_to) and a mark on the current one (_is_current). Each run reads the whole table."
+      )
+    ).toBeDefined()
+  })
+
+  it("asks for a key like the deduplicating modes, and shows no cursor field", async () => {
+    stubFetch(saved())
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
+    expect(saveButton().disabled).toBe(true)
+    expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
+    fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
+    expect(screen.queryByText(/cannot be saved without a key/)).toBeNull()
+    expect(saveButton().disabled).toBe(false)
+  })
+
+  it("saves the key and no cursor, even if the table had a cursor before", async () => {
+    const calls = stubFetch(saved({ loadMode: "incremental", incrementalKey: "updated_at" }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id, region" } })
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "history", primaryKey: ["order_id", "region"] },
+    ])
+  })
+
+  it("fills the key from the source's own when a found table is switched to history", async () => {
+    stubFetch(SPEC, undefined, {
+      discovered: [
+        {
+          name: "public.orders",
+          columns: [{ name: "order_id", typeName: "integer" }],
+          primaryKey: ["order_id"],
+        },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    expect((screen.getByLabelText("order_id is part of the key of public.orders") as HTMLInputElement).checked).toBe(true)
+    expect(saveButton().disabled).toBe(false)
+  })
+
+  it("says to use Refresh, removing rows when a saved table is switched to history, and not before", async () => {
+    stubFetch(saved({ loadMode: "replace" }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+    expect(screen.queryByText(BOUNDARY)).toBeNull()
+    fireEvent.change(mode, { target: { value: "append" } })
+    expect(screen.queryByText(BOUNDARY)).toBeNull()
+    fireEvent.change(mode, { target: { value: "history" } })
+    expect(screen.getByText(BOUNDARY)).toBeDefined()
+    fireEvent.change(mode, { target: { value: "replace" } })
+    expect(screen.queryByText(BOUNDARY)).toBeNull()
+  })
+
+  it("says it too when a saved history table is switched to another mode", async () => {
+    stubFetch(saved({ loadMode: "history", primaryKey: ["id"] }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = await modeOf("public.orders")
+    expect(mode.value).toBe("history")
+    expect(screen.queryByText(BOUNDARY)).toBeNull()
+    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    expect(screen.getByText(BOUNDARY)).toBeDefined()
+  })
+
+  it("says nothing for a table that is not saved yet", async () => {
+    stubFetch(SPEC, undefined, {
+      discovered: [{ name: "public.orders", columns: [{ name: "order_id", typeName: "integer" }], primaryKey: ["order_id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    expect(screen.queryByText(BOUNDARY)).toBeNull()
+  })
+
+  it("shows the refusal of a run as the API answered it, and keeps the dialog open", async () => {
+    const refusal =
+      'table \'orders\' holds rows that were not loaded in the history mode; use "Refresh, removing rows" on it to load it with history'
+    stubFetch(saved({ loadMode: "history", primaryKey: ["id"] }), undefined, { onRun: () => json({ error: refusal }, 422) })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Refresh or clear public.orders" }) as HTMLButtonElement).disabled).toBe(false)
+    )
+    await act(async () => {})
+    const trigger = screen.getByRole("button", { name: "Refresh or clear public.orders" })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" })
+    fireEvent.mouseDown(trigger, { button: 0 })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: "mouse" })
+    fireEvent.mouseUp(trigger, { button: 0 })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByText("Refresh, keeping rows"))
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh" }))
+    expect(await screen.findByText(refusal)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
   })
 })
 

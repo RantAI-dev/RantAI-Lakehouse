@@ -162,14 +162,14 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
 }
 
 /**
- * The modes a source offers. Replace, append and replace-and-deduplicate run on
- * every batch source; the two incremental ones are pushed into a SQL query, so
+ * The modes a source offers. Replace, append, replace-and-deduplicate and history run on
+ * every batch source (history reads the whole table, so it needs no cursor); the two incremental ones are pushed into a SQL query, so
  * no other adapter runs them (SRC-10 decision 2).
  */
 function loadModesFor(adapter: string): LoadMode[] {
   return adapter === "sql"
-    ? ["replace", "incremental", "append", "replace_dedup", "incremental_dedup"]
-    : ["replace", "append", "replace_dedup"]
+    ? ["replace", "incremental", "append", "replace_dedup", "incremental_dedup", "history"]
+    : ["replace", "append", "replace_dedup", "history"]
 }
 
 /** Why a source cannot offer the incremental modes, or `null` when it can. */
@@ -180,6 +180,18 @@ function missingModesNote(modes: LoadMode[]): string | null {
 }
 
 const isDedup = (mode: LoadMode) => mode === "replace_dedup" || mode === "incremental_dedup"
+/** The modes that identify a row by its key: the deduplicating ones, and history (SRC-10 decisions 1 and 3). */
+const needsKey = (mode: LoadMode) => isDedup(mode) || mode === "history"
+
+/**
+ * Said under the mode when the chosen mode and the saved one are on different sides of the history boundary
+ * (SRC-10 decision 1). The console cannot know whether the table has rows, so it says what to do either way: a
+ * history table's rows cannot be kept as another mode's, nor the reverse.
+ */
+const HISTORY_BOUNDARY_NOTE =
+  "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
+const crossesHistoryBoundary = (saved: LoadMode | null, chosen: LoadMode) =>
+  saved !== null && (saved === "history") !== (chosen === "history")
 
 /** Why a table's load mode cannot be saved, or `null`. */
 export function loadModeProblem(selected: {
@@ -195,7 +207,7 @@ export function loadModeProblem(selected: {
   ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
   }
-  if (isDedup(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
+  if (needsKey(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
     return "Name the column, or the columns together, that identify one row. A mode with one row per key cannot be saved without a key."
   }
   return null
@@ -405,7 +417,7 @@ function IngestEditor({
         // Switching to a mode with one row per key fills the key from the source's own, when it has one and
         // none is set (SRC-10 decision 3). The user's own choice is never overwritten.
         const detected = keysOf.get(name)
-        if (patch.loadMode && isDedup(patch.loadMode) && (next.primaryKey ?? []).length === 0 && detected) {
+        if (patch.loadMode && needsKey(patch.loadMode) && (next.primaryKey ?? []).length === 0 && detected) {
           next.primaryKey = detected
         }
         return next
@@ -515,6 +527,7 @@ function IngestEditor({
                   <LoadModeFields
                     selected={s}
                     modes={loadModesFor(adapter)}
+                    savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
                     columns={columnsOf.get(s.name) ?? null}
                     detectedKey={keysOf.get(s.name) ?? null}
                     problem={modeProblems[i]}
@@ -806,6 +819,7 @@ function IngestEditor({
 function LoadModeFields({
   selected,
   modes,
+  savedMode,
   columns,
   detectedKey,
   problem,
@@ -813,6 +827,8 @@ function LoadModeFields({
 }: {
   selected: Selected
   modes: LoadMode[]
+  /** The mode this table is saved with, or null for a table not saved yet. */
+  savedMode: LoadMode | null
   columns: string[] | null
   /** The key the source declares for this table, when it was found and declares one. */
   detectedKey: string[] | null
@@ -874,7 +890,7 @@ function LoadModeFields({
         ) : null}
       </div>
       {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
-      {isDedup(selected.loadMode) ? (
+      {needsKey(selected.loadMode) ? (
         <KeyFields
           name={selected.name}
           value={selected.primaryKey ?? []}
@@ -887,6 +903,9 @@ function LoadModeFields({
       <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
         {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
       </p>
+      {crossesHistoryBoundary(savedMode, selected.loadMode) ? (
+        <p className="text-xs text-muted-foreground">{HISTORY_BOUNDARY_NOTE}</p>
+      ) : null}
     </div>
   )
 }
