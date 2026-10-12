@@ -118,7 +118,18 @@ services:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
       MONGO_G6_ROOT_USER: ${MONGO_G6_ROOT_USER:?}
       MONGO_G6_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
+      # SRC-9 task 1: `ops/gates/gate_summary.py` and `coverage.json` are
+      # shared by the connector gates but live outside `ops/g6` (the only
+      # directory this runner mounts at /work). They are mounted at
+      # /opt/gates, not under /work: a bind mount nested inside another one
+      # makes Docker create the mount point on the host (see the comment on
+      # `g4-test-runner`'s deprovision script). Read-only and
+      # PYTHONDONTWRITEBYTECODE, so the root-owned runner leaves no
+      # `__pycache__` in the checkout for the next `git clean`.
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
+      - ./ops/gates:/opt/gates:ro
       - type: volume
         source: g6_secrets
         target: /gate-secrets

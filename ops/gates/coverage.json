@@ -1,0 +1,162 @@
+{
+  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest supported:false today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving.",
+  "types": {
+    "PostgreSQL": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "PostgreSQL CDC": {
+      "gate": "g4",
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "connect": "The product tests a CDC connector like its SQL twin (real); no gate calls it yet.",
+        "discover": "The product lists tables for a cdc connector (real); no gate calls it yet.",
+        "load": "ops/g4: first copy into Bronze.",
+        "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
+      }
+    },
+    "MySQL": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "MySQL CDC": {
+      "gate": null,
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "missing",
+        "reload": "missing"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 6."
+      }
+    },
+    "MariaDB": {
+      "gate": null,
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "missing",
+        "reload": "missing"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 3. MariaDB uses the MySQL driver, so connect and discover are real."
+      }
+    },
+    "SQL Server": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "SQL Server CDC": {
+      "gate": null,
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "missing",
+        "reload": "missing"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 6."
+      }
+    },
+    "Object storage": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "REST API": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "Oracle": {
+      "gate": null,
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "missing",
+        "reload": "missing"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 5.",
+        "connect": "Product refuses today with supported:false (SRC-5).",
+        "discover": "Product answers HTTP 422, not supported:false, for an Oracle sql connector (connector_discover.rs, SqlDriver::Oracle arm); SRC-13."
+      }
+    },
+    "MongoDB": {
+      "gate": "g6",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "connect": "SRC-5: a MongoDB connector cannot be tested from the console.",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "Kafka": {
+      "gate": "g6",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "connect": "SRC-5: a Kafka connector cannot be tested from the console.",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server.",
+        "reload": "A micro-batch: the gate produces a known number of new messages before the second run and expects the table to grow by exactly the messages the consumer group had not yet committed."
+      }
+    },
+    "SFTP": {
+      "gate": null,
+      "steps": {
+        "connect": "missing",
+        "discover": "missing",
+        "load": "missing",
+        "reload": "missing"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 4.",
+        "connect": "Product refuses today with supported:false (SRC-5).",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    }
+  }
+}
