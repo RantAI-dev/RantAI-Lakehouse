@@ -51,10 +51,13 @@ import {
   type ValueShares,
 } from "@/lib/column-profile"
 import { typeFamily, type TypeFamily } from "@/lib/column-type"
-import { formatCompactNumber, formatNumber } from "@/lib/format"
+import { formatCompactNumber, formatDate, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetProfile, ColumnProfile } from "@/services/contracts/assets"
 import { ALL, CountToggle } from "./count-toggle"
+import { draftCount, type MeaningState } from "./asset-meaning"
+import { MeaningView } from "./asset-meaning-view"
+import { Checkbox } from "@/components/ui/checkbox"
 
 /** One row of the table: a catalog column with what the Iceberg table says about it. */
 export type SchemaRow = {
@@ -85,13 +88,15 @@ const NOT_PROFILED = "Not profiled (type not supported)"
 const NO_VALUE_LISTED = "No value is listed: the profile states a value's count only where it is exact."
 
 /**
- * The columns to list: those whose name or description contains `query`,
- * cut to `limit`. `matched` is how many there are before the cut.
+ * The columns to list: those whose name or description contains `query`, or
+ * whose `extra` text does (the meaning written for the column, for the Schema
+ * tab), cut to `limit`. `matched` is how many there are before the cut.
  */
 export function visibleColumns<T extends { column: AssetColumn }>(
   rows: T[],
   query: string,
-  limit: number
+  limit: number,
+  extra?: (row: T) => string
 ): { shown: T[]; matched: number } {
   const needle = query.trim().toLowerCase()
   const matching =
@@ -100,7 +105,8 @@ export function visibleColumns<T extends { column: AssetColumn }>(
       : rows.filter(
           (r) =>
             r.column.name.toLowerCase().includes(needle) ||
-            (r.column.description ?? "").toLowerCase().includes(needle)
+            (r.column.description ?? "").toLowerCase().includes(needle) ||
+            (extra?.(r) ?? "").toLowerCase().includes(needle)
         )
   return { shown: matching.slice(0, limit), matched: matching.length }
 }
@@ -535,7 +541,8 @@ export function ColumnDetail({
 }
 
 /**
- * What a column is marked as: masked, its classification, partition, sort key.
+ * What a column is marked as: inactive at the source (`SRC-8`), masked, its
+ * classification, partition, sort key.
  * A row renders these twice and CSS shows one: beside the name from `@lg` up,
  * and below it on the type's line otherwise. Below `@lg` the name's track is
  * a third of a phone's card, so marks beside it (they never shrink) left a
@@ -544,9 +551,14 @@ export function ColumnDetail({
  */
 function Marks({ row, sortKey, className }: { row: SchemaRow; sortKey: boolean; className: string }) {
   const c = row.column
-  if (!c.masked && !c.classification && !row.partition && !sortKey) return null
+  if (!c.masked && !c.classification && !row.partition && !sortKey && !c.inactiveSince) return null
   return (
     <span className={cn("shrink-0 items-center gap-1.5", className)}>
+      {c.inactiveSince ? (
+        <Pill tone="neutral" title="The source no longer has this column. Its old values are kept.">
+          inactive since {formatDate(c.inactiveSince, { month: "short" })}
+        </Pill>
+      ) : null}
       {c.masked ? <Pill tone="warning">masked</Pill> : null}
       {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
       {row.partition ? (
@@ -694,23 +706,40 @@ function ColumnHeader({ showStats }: { showStats: boolean }) {
   )
 }
 
+/** The two views of the card: the statistics of each column, or what each column means. */
+type ColumnsView = "statistics" | "meaning"
+const VIEWS: readonly { value: ColumnsView; label: string }[] = [
+  { value: "statistics", label: "Statistics" },
+  { value: "meaning", label: "Meaning" },
+]
+
 /**
  * The "Columns" card: the filter and page size for a wide table, the list,
- * and the note saying what the statistics were computed over.
+ * and the note saying what the statistics were computed over. With
+ * `meanings`, a second view lists what each column means and the drafts to
+ * review.
  */
 export function ColumnsCard({
   rows,
   profile,
   sortingKey,
+  meanings,
 }: {
   rows: SchemaRow[]
   profile: ProfileState
   /** `AssetDetail.storage.sortingKey`: the engine's key, which may name columns or hold expressions. */
   sortingKey?: string | null
+  /** The meanings of the table's columns; absent or `none` leaves the card as it was. */
+  meanings?: MeaningState
 }) {
   const showStats = profile.kind === "ready" || profile.kind === "loading"
   const [limit, setLimit] = React.useState<number>(COLUMN_PAGE_SIZES[0])
   const [query, setQuery] = React.useState("")
+  const [view, setView] = React.useState<ColumnsView>("statistics")
+  const [draftsOnly, setDraftsOnly] = React.useState(false)
+  const draftsId = React.useId()
+  const ready = meanings?.kind === "ready" ? meanings : null
+  const byColumn = ready?.byColumn ?? new Map()
   // Held here, not in each row, so a column stays open while the filter narrows the list and widens it again.
   const [open, setOpen] = React.useState<ReadonlySet<string>>(() => new Set())
   const toggle = (name: string) =>
@@ -725,35 +754,110 @@ export function ColumnsCard({
   const filterable = rows.length > FILTER_ABOVE
   // Only the sizes that would cut this table short, then all of it.
   const sizes = [...COLUMN_PAGE_SIZES.filter((n) => n < rows.length), ALL]
-  const { shown, matched } = visibleColumns(rows, query, paged ? limit : ALL)
+  // The drafts line counts over every row, so it says what is left to review whatever the filter hides.
+  const drafts = ready ? draftCount(rows, byColumn) : 0
+  // The filter also reaches the meaning written for each column (its description and synonyms, the
+  // Meaning cell and "Also called"), so "revenue" or a word of the meaning finds its column in both views (plan 10 review 1).
+  const extra = ready
+    ? (r: SchemaRow) => {
+        const entry = byColumn.get(r.column.name)
+        return [entry?.description ?? "", (entry?.synonyms ?? []).join(", ")].join(" ")
+      }
+    : undefined
+  // The statistics view is the card as it was; the meaning view replaces its table, not its filter.
+  const meaningView = ready !== null && view === "meaning"
+  // Drafts only narrows the rows before the filter and the page cut, so the page holds drafts and the count
+  // says how many drafts there are (PR #109 review, finding 1). A filter applied after the cut showed "No draft
+  // left to review." for a table whose drafts sat past the first page.
+  const draftsShown = meaningView && draftsOnly
+  const pool = draftsShown ? rows.filter((r) => byColumn.get(r.column.name)?.status === "draft") : rows
+  const { shown, matched } = visibleColumns(pool, query, paged ? limit : ALL, extra)
   const sortKeys = sortKeyColumns(
     sortingKey,
     rows.map((r) => r.column.name)
   )
-  const total = `${rows.length} column${rows.length === 1 ? "" : "s"}`
+  const noun = draftsShown ? "draft" : "column"
+  const total = `${pool.length} ${noun}${pool.length === 1 ? "" : "s"}`
+  // No draft left: a search over zero drafts matches nothing, so this wins over the query text (staging run 2026-10-11, item 3).
   const summary =
-    query.trim() !== ""
-      ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
-      : shown.length < rows.length
-        ? `Showing the first ${shown.length} of ${total}, in table order.`
-        : `${total}, in table order.`
+    draftsShown && pool.length === 0
+      ? `No drafts among ${rows.length} column${rows.length === 1 ? "" : "s"}.`
+      : query.trim() !== ""
+        ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
+        : shown.length < pool.length
+          ? `Showing the first ${shown.length} of ${total}, in table order.`
+          : `${total}, in table order.`
+
+  const hasControls = filterable || ready !== null
 
   return (
     <SectionCard size="sm" title="Columns" description={summary}>
       <div className="flex flex-col gap-2">
         {/* In the body, not the card's header action: that slot cannot shrink, so a filter beside a
             page-size toggle pushed past the card at phone width. */}
-        {filterable ? (
+        {/* Without meanings the row is exactly the filter and the page size, as it was before the meanings. */}
+        {hasControls ? (
           <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-            <Input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Filter columns…"
-              aria-label="Filter columns"
-              className="h-8 w-full sm:w-56"
-            />
-            {paged ? (
+            {filterable ? (
+              <Input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter columns…"
+                aria-label="Filter columns"
+                className="h-8 w-full sm:w-56"
+              />
+            ) : null}
+            {ready !== null ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                <div className="flex items-center gap-1" role="group" aria-label="Columns view">
+                  {VIEWS.map((v) => (
+                    <Button
+                      key={v.value}
+                      type="button"
+                      size="sm"
+                      variant={view === v.value ? "secondary" : "ghost"}
+                      aria-pressed={view === v.value}
+                      onClick={() => setView(v.value)}
+                      className={cn(view === v.value && "font-semibold")}
+                    >
+                      {v.label}
+                    </Button>
+                  ))}
+                </div>
+                {drafts > 0 && !meaningView ? (
+                  <Button type="button" size="sm" variant="link" onClick={() => setView("meaning")}>
+                    {drafts === 1 ? "1 draft to review" : `${drafts} drafts to review`}
+                  </Button>
+                ) : null}
+                {(drafts > 0 || draftsOnly) && meaningView ? (
+                  // PR #109 review, finding 2: the box stays while Drafts only is on, so confirming the last draft
+                  // leaves a way back to every column instead of an empty view with no control.
+                  <span className="flex items-center gap-2 text-xs">
+                    {drafts > 0 ? (
+                      <span className="text-muted-foreground">
+                        {drafts === 1 ? "1 draft to review" : `${drafts} drafts to review`}
+                      </span>
+                    ) : null}
+                    <Checkbox
+                      id={draftsId}
+                      checked={draftsOnly}
+                      onCheckedChange={(checked) => setDraftsOnly(checked === true)}
+                    />
+                    <label htmlFor={draftsId}>Drafts only</label>
+                  </span>
+                ) : null}
+                {paged ? (
+                  <CountToggle
+                    label="Show"
+                    ariaLabel="Columns to show"
+                    options={sizes}
+                    value={limit}
+                    onChange={setLimit}
+                  />
+                ) : null}
+              </div>
+            ) : paged ? (
               <CountToggle
                 label="Show"
                 ariaLabel="Columns to show"
@@ -766,8 +870,14 @@ export function ColumnsCard({
         ) : null}
         {rows.length === 0 ? (
           <EmptyState title="No columns registered" className="py-4" />
+        ) : shown.length === 0 && draftsShown && pool.length === 0 ? (
+          <EmptyState title="No draft left to review." className="py-4" />
+        ) : shown.length === 0 && draftsShown ? (
+          <EmptyState title={`No draft matches "${query.trim()}"`} className="py-4" />
         ) : shown.length === 0 ? (
           <EmptyState title={`No column matches "${query.trim()}"`} className="py-4" />
+        ) : meaningView && ready ? (
+          <MeaningView rows={shown} state={ready} />
         ) : (
           <>
             <div className="@container overflow-hidden rounded-lg border border-border">

@@ -20,7 +20,7 @@ use lakehouse_iceberg::IcebergClient;
 use lakehouse_notify::{EmailSender, SmtpConfig};
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, FiredRule};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -29,7 +29,15 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
 
-/// `GET /api/alerts` — list every alert & digest rule.
+/// `GET /api/alerts` — list the alert & digest rules the caller may see.
+///
+/// The body is `{"rules": [...]}`, as the `TypeScript` handler's. Rules of
+/// the pre-`SRC-7` kinds are returned exactly as before; rules of the six
+/// `SRC-7` kinds are filtered by [`visible_rules`] (`SRC-7` review BLOCKER 1:
+/// the list is one for the installation, and such a rule names a connector
+/// and carries a webhook target). Whether run reports can arrive is a
+/// separate route, [`status`], so this body stays what the parity corpus
+/// recorded (`SRC-7` review SHOULD-FIX 3).
 ///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
@@ -39,12 +47,105 @@ use crate::state::AppState;
 ///
 /// # Errors
 ///
-/// Returns a 500 [`ApiError::Internal`] on a `ClickHouse` failure.
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+/// Returns a 500 [`ApiError::Internal`] on a `ClickHouse` failure; for the
+/// `SRC-7` kinds, whatever [`visible_rules`] returns.
+pub async fn list(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_alerts::list_rules(&state.clickhouse)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
     Ok(ApiJson(json!({ "rules": rules })))
+}
+
+/// Body of `GET /api/alerts/status`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertsStatus {
+    /// True when this API has `PIPELINE_RUN_TOKEN` set (non-empty), the
+    /// condition under which the orchestrator's run sensors can post failed
+    /// and finished runs.
+    run_events_configured: bool,
+}
+
+/// `GET /api/alerts/status` — whether connector and upload alerts can fire
+/// at all (`SRC-7` D9): unset, no run report is accepted, and the console
+/// says so instead of showing a silent "no alerts". It cannot see the
+/// orchestrator's own copy of the token.
+///
+/// # Errors
+///
+/// None; the signature is the handlers' shared shape.
+#[allow(
+    clippy::unused_async,
+    reason = "axum handlers are async fns; the body reads config only"
+)]
+pub async fn status(State(state): State<AppState>) -> ApiResult<ApiJson<AlertsStatus>> {
+    Ok(ApiJson(AlertsStatus {
+        run_events_configured: state.config.pipeline_run_token.is_some(),
+    }))
+}
+
+/// The rules of `rules` that `principal` may see (`SRC-7` review BLOCKER 1).
+///
+/// Rules of the pre-`SRC-7` kinds pass untouched. For the six new kinds an
+/// unrestricted caller ([`crate::routes::catalog::is_unrestricted`]) sees
+/// all; anyone else sees only the rules scoped to a connector of their
+/// tenants. A `*` rule, an `upload_failure` rule and a rule whose connector
+/// no longer exists (or has no tenant) are hidden from them, as the save
+/// check refuses the same scopes. Membership is decided for all connectors
+/// in one query, not one per rule.
+///
+/// # Errors
+///
+/// 401 with no principal when a rule of the new kinds exists; 503 if no
+/// pool is configured; 500 on a database failure.
+pub(crate) async fn visible_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+    rules: Vec<AlertRule>,
+) -> Result<Vec<AlertRule>, ApiError> {
+    if !rules.iter().any(|rule| rule.kind.is_connector_scoped()) {
+        return Ok(rules);
+    }
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    if crate::routes::catalog::is_unrestricted(principal) {
+        return Ok(rules);
+    }
+    let mut ids: Vec<String> = rules
+        .iter()
+        .filter(|rule| rule.kind.is_connector_scoped())
+        .filter_map(|rule| rule.connector.clone())
+        .filter(|connector| connector != "*")
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let own: std::collections::HashSet<String> = if ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let pool = state
+            .pg
+            .as_deref()
+            .ok_or_else(|| ApiError::Unavailable("connector store unavailable".to_owned()))?;
+        lakehouse_store::connectors::connector_ids_in_tenants(pool, &ids, &principal.tenant_ids)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    Ok(rules
+        .into_iter()
+        .filter(|rule| {
+            !rule.kind.is_connector_scoped()
+                || rule
+                    .connector
+                    .as_deref()
+                    .is_some_and(|connector| own.contains(connector))
+        })
+        .collect())
 }
 
 /// Parse the raw request body as JSON into an [`AlertRuleInput`].
@@ -66,15 +167,163 @@ fn parse_body(body: &Bytes) -> Result<AlertRuleInput, ApiError> {
         .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))
 }
 
+/// The refusal for a rule scoped to every connector or to uploads, by
+/// someone who does not see every tenant (`SRC-7` D7).
+const ALL_SCOPE_DENIED: &str =
+    "only an administrator who sees every tenant can save a rule for all connectors or for uploads";
+
+/// Who may save a rule of the `SRC-7` kinds (decision D7, finding F7). Rules
+/// are one list for the installation, so a rule for all connectors, or for
+/// uploads, would carry every tenant's connector and file names:
+///
+/// - scope `"*"` (and every `upload_failure`, which is always `"*"`) needs
+///   [`crate::routes::catalog::is_unrestricted`];
+/// - a connector id must pass
+///   [`crate::routes::connectors::ensure_connector_in_tenants`], which
+///   answers a connector outside the caller's tenants exactly as an unknown
+///   one (404), so the answer is no oracle for which ids exist. An
+///   unrestricted caller needs only the connector to exist.
+///
+/// Any other kind is not checked here (unchanged behaviour). A missing
+/// connector is left to `save_rule`'s own validation (400). With no
+/// principal the `SRC-7` kinds fail closed (401); the HTTP routes always
+/// have one, and the copilot's alert tools pass theirs.
+///
+/// # Errors
+///
+/// 401, 403 or 404 as above; 503 if no pool is configured; 500 on a
+/// database failure.
+pub(crate) async fn authorise_rule_scope(
+    state: &AppState,
+    principal: Option<&Principal>,
+    kind: Option<&str>,
+    connector: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(kind) = kind.and_then(AlertKind::parse_connector_kind) else {
+        return Ok(());
+    };
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    let scope = if kind == AlertKind::UploadFailure {
+        "*"
+    } else {
+        connector.map_or("", str::trim)
+    };
+    if scope.is_empty() {
+        return Ok(());
+    }
+    if scope == "*" {
+        return if crate::routes::catalog::is_unrestricted(principal) {
+            Ok(())
+        } else {
+            Err(ApiError::PermissionDenied(ALL_SCOPE_DENIED.to_owned()))
+        };
+    }
+    if crate::routes::catalog::is_unrestricted(principal) {
+        // PR #101 CI (`an_administrator_may_save_a_rule_for_all_connectors_and_for_uploads`):
+        // an administrator who sees every tenant is a member of none in
+        // particular, so the tenant-membership test below refused a real
+        // connector of another tenant. Existence is all that is left to
+        // check, and an unknown id gets the same 404 as everywhere else.
+        let pool = crate::routes::connectors::pool(state)?;
+        return if lakehouse_store::connectors::get_connector(pool, scope)
+            .await?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(ApiError::NotFound(format!("Connector {scope} not found")))
+        };
+    }
+    crate::routes::connectors::ensure_connector_in_tenants(state, Some(principal), scope).await
+}
+
+/// [`authorise_rule_scope`] for `input`, and for the rule `id` it replaces:
+/// an update must not let a caller take over, or move, a rule they could not
+/// have created (`SRC-7` D7). An unrestricted caller may do both, so the
+/// stored rule is not even read for them.
+///
+/// # Errors
+///
+/// As [`authorise_rule_scope`]; 503 with a fixed message when the stored
+/// rule cannot be read.
+pub(crate) async fn authorise_rule_update(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+    input: &AlertRuleInput,
+) -> Result<(), ApiError> {
+    authorise_rule_scope(
+        state,
+        principal,
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await?;
+    authorise_existing_rule(state, principal, id).await
+}
+
+/// The check on a stored rule that an update or a delete acts on (`SRC-7`
+/// D7; review BLOCKER 2 for delete): a rule of the six kinds must be one the
+/// caller could have created, [`authorise_rule_scope`] on what is stored. An
+/// unrestricted caller may touch any, so the rule is not even read for them;
+/// an unknown id passes (the write is then a no-op or a validation error, as
+/// before).
+///
+/// # Errors
+///
+/// As [`authorise_rule_scope`]; 503 with a fixed message when the stored
+/// rule cannot be read.
+pub(crate) async fn authorise_existing_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
+    if principal.is_some_and(crate::routes::catalog::is_unrestricted) {
+        return Ok(());
+    }
+    let existing = lakehouse_alerts::get_rule(&state.clickhouse, id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, "an alert rule could not be read before a change");
+            ApiError::Unavailable("the alert rules could not be read".to_owned())
+        })?;
+    match existing {
+        Some(rule) => {
+            authorise_rule_scope(
+                state,
+                principal,
+                Some(rule.kind.as_str()),
+                rule.connector.as_deref(),
+            )
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
 /// `POST /api/alerts` — create a rule.
 ///
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] on an unparseable body or a
 /// validation failure (see `lakehouse_alerts::save_rule`) — matching the
-/// `TypeScript`'s single `catch` around both.
-pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+/// `TypeScript`'s single `catch` around both. For the `SRC-7` rule kinds, a
+/// 401, 403 or 404 from [`authorise_rule_scope`].
+pub async fn create(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
+    authorise_rule_scope(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        input.kind.as_deref(),
+        input.connector.as_deref(),
+    )
+    .await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, None)
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -86,12 +335,24 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<Api
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] on an unparseable body, a missing
-/// `id`, or a validation failure — matching the `TypeScript`.
-pub async fn update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+/// `id`, or a validation failure — matching the `TypeScript`. For the
+/// `SRC-7` rule kinds, a 401, 403 or 404 from [`authorise_rule_update`].
+pub async fn update(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
     let Some(id) = input.id.clone() else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
+    authorise_rule_update(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &id,
+        &input,
+    )
+    .await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id))
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -106,18 +367,26 @@ pub struct DeleteQuery {
 
 /// `DELETE /api/alerts?id=` — soft-delete a rule.
 ///
+/// A rule of the `SRC-7` kinds is deleted only by a caller who could have
+/// saved it ([`authorise_existing_rule`]); otherwise any `alert:write`
+/// holder could silence another tenant's failure alerts (`SRC-7` review
+/// BLOCKER 2). Other kinds, and an unknown id, behave as before.
+///
 /// # Errors
 ///
 /// Returns a 400 [`ApiError::BadRequest`] when `id` is missing, or a 500
 /// [`ApiError::Internal`] on a `ClickHouse` failure — matching the
-/// `TypeScript`'s pre-`try` `id` check (400) vs. its `catch` (500).
+/// `TypeScript`'s pre-`try` `id` check (400) vs. its `catch` (500). For the
+/// `SRC-7` kinds, a 401, 403 or 404 from [`authorise_existing_rule`].
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<DeleteQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = query.id else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
+    authorise_existing_rule(&state, principal.as_ref().map(|Extension(p)| p), &id).await?;
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -345,6 +614,16 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::PipelineSlow => "Pipeline SLA: duration",
         AlertKind::PipelineLate => "Pipeline SLA: late",
         AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
+        // `SRC-7`: connector and upload rules fire from the run event
+        // routes (`routes::pipelines`), which persist their own instance
+        // with the source label; `run_rules` skips them, so these labels
+        // are only a fallback for an exhaustive match.
+        AlertKind::ConnectorFailure
+        | AlertKind::ConnectorRepeatedFailure
+        | AlertKind::ConnectorDisabled
+        | AlertKind::ConnectorSchemaChange
+        | AlertKind::ConnectorSuccess => "Connector runs",
+        AlertKind::UploadFailure => "File uploads",
     }
 }
 
@@ -377,6 +656,14 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         AlertKind::PipelineVolumeDrop => {
             "pipeline run processed fewer than half the median rows of prior runs".to_owned()
         }
+        // `SRC-7`: never reached from `run_rules` (it skips these kinds);
+        // the event routes write their own detail.
+        AlertKind::ConnectorFailure
+        | AlertKind::ConnectorRepeatedFailure
+        | AlertKind::ConnectorDisabled
+        | AlertKind::ConnectorSchemaChange
+        | AlertKind::ConnectorSuccess
+        | AlertKind::UploadFailure => "connector or upload event".to_owned(),
     }
 }
 
@@ -1508,5 +1795,443 @@ mod sql_gate_enforcement {
         assert!(!err.contains("example.com"), "{err}");
         assert!(server.received_requests().await.unwrap().is_empty());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rule_scope_authorisation {
+    //! `SRC-7` D7/F7: who may save a rule of the connector and upload kinds.
+    //! A real ephemeral Postgres (connector tenants) and a wiremock
+    //! `ClickHouse` that answers every rule read with one configured row.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::http::StatusCode;
+    use lakehouse_auth::PermissionSet;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    const OWN_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+    const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+    const OWN_CONNECTOR: &str = "conn-pg-lakehouse";
+    const OTHER_CONNECTOR: &str = "conn-s3-warehouse";
+
+    /// A Data Engineer: `alert:write`, member of [`OWN_TENANT`] only.
+    fn engineer() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(7)),
+            tenant_ids: vec![OWN_TENANT.parse().unwrap()],
+            display_name: "Data Engineer".to_owned(),
+            permissions: PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// An administrator who sees every tenant (`*:*`).
+    fn admin() -> Principal {
+        Principal {
+            permissions: PermissionSet::parse("*:*"),
+            ..engineer()
+        }
+    }
+
+    /// `existing` is the `(type, connector)` of the one rule the rule store
+    /// answers every read with.
+    async fn setup(pool: &sqlx::PgPool, existing: (&str, &str)) -> (AppState, MockServer) {
+        for (id, tenant) in [(OWN_CONNECTOR, OWN_TENANT), (OTHER_CONNECTOR, OTHER_TENANT)] {
+            sqlx::query("UPDATE connector SET tenant_id = $2 WHERE id = $1")
+                .bind(id)
+                .bind(Uuid::parse_str(tenant).unwrap())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let ch = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "rows": 1,
+                "data": [{
+                    "id": "al_x", "name": "Rule", "type": existing.0,
+                    "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "0",
+                    "board": "", "channel": "webhook", "target": "https://hooks.example.com/x",
+                    "enabled": "1", "created_at": "", "severity": "", "pipeline": "",
+                    "connector": existing.1,
+                }]
+            })))
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ch)
+            .await;
+        let options = pool.connect_options();
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch.uri());
+        (
+            AppState::new(Config::from_map(&env).expect("a valid test Config")),
+            ch,
+        )
+    }
+
+    fn rule_body(kind: &str, connector: Option<&str>, id: Option<&str>) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": id, "name": "Load failed", "type": kind, "connector": connector,
+                "channel": "webhook", "target": "https://hooks.example.com/x",
+                "pipeline": "pl-x",
+            }))
+            .unwrap(),
+        )
+    }
+
+    async fn create_as(
+        state: &AppState,
+        principal: Option<Principal>,
+        kind: &str,
+        connector: Option<&str>,
+    ) -> Result<(), ApiError> {
+        create(
+            State(state.clone()),
+            principal.map(Extension),
+            rule_body(kind, connector, None),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    async fn update_as(
+        state: &AppState,
+        principal: Principal,
+        kind: &str,
+        connector: Option<&str>,
+    ) -> Result<(), ApiError> {
+        update(
+            State(state.clone()),
+            Some(Extension(principal)),
+            rule_body(kind, connector, Some("al_x")),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_may_save_a_rule_for_a_connector_of_their_own_tenant(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        for kind in [
+            "connector_failure",
+            "connector_repeated_failure",
+            "connector_success",
+        ] {
+            create_as(&state, Some(engineer()), kind, Some(OWN_CONNECTOR))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_who_does_not_see_every_tenant_cannot_save_a_rule_for_all_or_for_uploads(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        for (kind, connector) in [
+            ("connector_failure", Some("*")),
+            ("connector_disabled", Some("*")),
+            ("upload_failure", None),
+            ("upload_failure", Some(OWN_CONNECTOR)),
+        ] {
+            let err = create_as(&state, Some(engineer()), kind, connector)
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), 403, "{kind} {connector:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("permission_denied: {ALL_SCOPE_DENIED}")
+            );
+        }
+    }
+
+    /// A connector of another tenant is answered exactly as an unknown one
+    /// (same status, same text but for the id the caller sent): no oracle.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn another_tenants_connector_is_refused_like_an_unknown_one(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let other = create_as(
+            &state,
+            Some(engineer()),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap_err();
+        let unknown = create_as(
+            &state,
+            Some(engineer()),
+            "connector_failure",
+            Some("conn-ghost"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(other.status(), StatusCode::NOT_FOUND.as_u16());
+        assert_eq!(other.status(), unknown.status());
+        assert_eq!(
+            other.to_string().replace(OTHER_CONNECTOR, "ID"),
+            unknown.to_string().replace("conn-ghost", "ID")
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_administrator_may_save_a_rule_for_all_connectors_and_for_uploads(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", "*")).await;
+        create_as(&state, Some(admin()), "connector_failure", Some("*"))
+            .await
+            .unwrap();
+        create_as(&state, Some(admin()), "upload_failure", None)
+            .await
+            .unwrap();
+        create_as(
+            &state,
+            Some(admin()),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap();
+        // Still an existing connector only: an unknown id is the same 404.
+        let err = create_as(
+            &state,
+            Some(admin()),
+            "connector_failure",
+            Some("conn-ghost"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND.as_u16());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_new_kinds_fail_closed_with_no_principal_and_other_kinds_are_unchanged(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let err = create_as(&state, None, "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 401);
+        // A pipeline kind is not checked: the engineer saves it as before.
+        create_as(&state, Some(engineer()), "pipeline_failure", None)
+            .await
+            .unwrap();
+    }
+
+    /// An update may not take over or move a rule the caller could not have
+    /// created: not to `*`, not off a `*` rule, not onto another tenant's
+    /// connector.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_update_cannot_move_a_rule_the_caller_could_not_have_created(pool: sqlx::PgPool) {
+        // The stored rule is for all connectors.
+        let (state, _ch) = setup(&pool, ("connector_failure", "*")).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403, "taking over an all-connectors rule");
+        // The stored rule is for another tenant's connector.
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some(OWN_CONNECTOR))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 404, "taking over another tenant's rule");
+        // The stored rule is the caller's own; moving it to `*` or to another
+        // tenant's connector is refused, moving it within their tenant is not.
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let err = update_as(&state, engineer(), "connector_failure", Some("*"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403);
+        let err = update_as(
+            &state,
+            engineer(),
+            "connector_failure",
+            Some(OTHER_CONNECTOR),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), 404);
+        update_as(
+            &state,
+            engineer(),
+            "connector_repeated_failure",
+            Some(OWN_CONNECTOR),
+        )
+        .await
+        .unwrap();
+        // Turning a connector rule into a pipeline kind does not escape the
+        // check on what it was.
+        let (state, _ch) = setup(&pool, ("upload_failure", "*")).await;
+        let err = update_as(&state, engineer(), "pipeline_failure", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 403);
+        // An administrator may do all of it.
+        update_as(&state, admin(), "connector_failure", Some("*"))
+            .await
+            .unwrap();
+    }
+
+    async fn listed_as(state: &AppState, principal: Option<Principal>) -> Result<Value, ApiError> {
+        list(State(state.clone()), principal.map(Extension))
+            .await
+            .map(|json| json.0)
+            .map_err(|rejection| rejection.0)
+    }
+
+    async fn deleted_as(state: &AppState, principal: Option<Principal>) -> Result<(), ApiError> {
+        delete(
+            State(state.clone()),
+            principal.map(Extension),
+            Query(DeleteQuery {
+                id: Some("al_x".to_owned()),
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    /// `SRC-7` review BLOCKER 1: the list shows a non-administrator only the
+    /// connector rules of their tenants.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_shows_a_caller_only_the_connector_rules_of_their_tenants(pool: sqlx::PgPool) {
+        // The rule store answers every read with this one rule.
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(body["rules"][0]["connector"], OWN_CONNECTOR);
+
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"], serde_json::json!([]));
+
+        // A connector that no longer exists is hidden from a non-admin.
+        let (state, _ch) = setup(&pool, ("connector_failure", "conn-gone")).await;
+        let body = listed_as(&state, Some(engineer())).await.unwrap();
+        assert_eq!(body["rules"], serde_json::json!([]));
+
+        // `*` and upload rules are an unrestricted caller's alone.
+        for existing in [("connector_failure", "*"), ("upload_failure", "*")] {
+            let (state, _ch) = setup(&pool, existing).await;
+            let body = listed_as(&state, Some(engineer())).await.unwrap();
+            assert_eq!(body["rules"], serde_json::json!([]));
+            let body = listed_as(&state, Some(admin())).await.unwrap();
+            assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    /// Other kinds are returned as before, to anyone and with no principal;
+    /// the new kinds with no principal are a 401.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_returns_other_kinds_untouched_and_refuses_new_kinds_without_a_principal(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("pipeline_failure", "")).await;
+        for principal in [None, Some(engineer())] {
+            let body = listed_as(&state, principal).await.unwrap();
+            assert_eq!(body["rules"].as_array().unwrap().len(), 1);
+        }
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        assert_eq!(listed_as(&state, None).await.unwrap_err().status(), 401);
+    }
+
+    /// `SRC-7` review BLOCKER 2: a delete needs the check an update applies to
+    /// the stored rule, with the same answer for another tenant's connector
+    /// as for an unknown one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_applies_the_scope_check_to_the_stored_rule(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("connector_failure", OWN_CONNECTOR)).await;
+        deleted_as(&state, Some(engineer())).await.unwrap();
+
+        let (state, _ch) = setup(&pool, ("connector_failure", OTHER_CONNECTOR)).await;
+        let other = deleted_as(&state, Some(engineer())).await.unwrap_err();
+        let (state, _ch) = setup(&pool, ("connector_failure", "conn-gone")).await;
+        let unknown = deleted_as(&state, Some(engineer())).await.unwrap_err();
+        assert_eq!(other.status(), 404);
+        assert_eq!(unknown.status(), 404);
+        assert_eq!(
+            other.to_string().replace(OTHER_CONNECTOR, "X"),
+            unknown.to_string().replace("conn-gone", "X")
+        );
+
+        for existing in [("connector_failure", "*"), ("upload_failure", "*")] {
+            let (state, _ch) = setup(&pool, existing).await;
+            assert_eq!(
+                deleted_as(&state, Some(engineer()))
+                    .await
+                    .unwrap_err()
+                    .status(),
+                403
+            );
+            deleted_as(&state, Some(admin())).await.unwrap();
+        }
+        // Other kinds delete as before.
+        let (state, _ch) = setup(&pool, ("pipeline_failure", "")).await;
+        deleted_as(&state, Some(engineer())).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_events_configured {
+    //! `SRC-7` D9 (review SHOULD-FIX 3): `GET /api/alerts/status` says whether
+    //! run reports can arrive.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use super::*;
+
+    async fn reported(token: Option<&str>) -> Value {
+        let mut env = HashMap::new();
+        if let Some(token) = token {
+            env.insert("PIPELINE_RUN_TOKEN".to_owned(), token.to_owned());
+        }
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        serde_json::to_value(status(State(state)).await.expect("status").0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_flag_is_true_with_a_token_and_false_without_or_with_an_empty_one() {
+        assert_eq!(
+            reported(Some("a-token")).await,
+            json!({ "runEventsConfigured": true })
+        );
+        assert_eq!(
+            reported(None).await,
+            json!({ "runEventsConfigured": false })
+        );
+        assert_eq!(
+            reported(Some("")).await,
+            json!({ "runEventsConfigured": false })
+        );
     }
 }

@@ -163,9 +163,70 @@ pub enum AlertKind {
     /// Evaluated by [`evaluate_pipeline_volume_drop`] from the
     /// `run-finished` event route. Plan 1f.
     PipelineVolumeDrop,
+    /// Fires when a connector's run fails, scoped to one connector id or
+    /// `"*"` for every connector. Evaluated by
+    /// [`evaluate_connector_event`] from `routes::pipelines::run_failed_event`
+    /// (`SRC-7`). The explicit `serde(rename)` gives the `snake_case` wire
+    /// string the `rename_all = "lowercase"` above would not.
+    #[serde(rename = "connector_failure")]
+    ConnectorFailure,
+    /// Fires once per episode, when a connector's failure streak becomes
+    /// exactly `REPEATED_FAILURE_STREAK` (3, decision D2). Same scope and
+    /// caller as [`AlertKind::ConnectorFailure`] (`SRC-7`).
+    #[serde(rename = "connector_repeated_failure")]
+    ConnectorRepeatedFailure,
+    /// Fires when a connector is disabled. Nothing raises it in `SRC-7`
+    /// (decision D5): `SRC-11`'s auto-disable calls
+    /// [`evaluate_connector_event`] with this kind.
+    #[serde(rename = "connector_disabled")]
+    ConnectorDisabled,
+    /// Fires when a connector's source schema changes. Nothing raises it in
+    /// `SRC-7` (decision D5): `SRC-8`'s detection calls
+    /// [`evaluate_connector_event`] with this kind.
+    #[serde(rename = "connector_schema_change")]
+    ConnectorSchemaChange,
+    /// Fires when a connector's run succeeds. Optional per connector
+    /// (decision D4): the rule must name one connector, never `"*"`, so
+    /// with no such rule no success alert is ever sent.
+    #[serde(rename = "connector_success")]
+    ConnectorSuccess,
+    /// Fires when a file upload's load fails. Always stored with the
+    /// connector scope `"*"`: an upload belongs to no connector (`SRC-7`).
+    #[serde(rename = "upload_failure")]
+    UploadFailure,
 }
 
 impl AlertKind {
+    /// Whether the kind is scoped by the `connector` column (`SRC-7`): the
+    /// five `connector_*` kinds and `upload_failure`.
+    #[must_use]
+    pub const fn is_connector_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectorFailure
+                | Self::ConnectorRepeatedFailure
+                | Self::ConnectorDisabled
+                | Self::ConnectorSchemaChange
+                | Self::ConnectorSuccess
+                | Self::UploadFailure
+        )
+    }
+
+    /// Parse a literal kind string (the inverse of [`AlertKind::as_str`])
+    /// for the `SRC-7` kinds only; `None` for any other string.
+    #[must_use]
+    pub fn parse_connector_kind(s: &str) -> Option<Self> {
+        match s {
+            "connector_failure" => Some(Self::ConnectorFailure),
+            "connector_repeated_failure" => Some(Self::ConnectorRepeatedFailure),
+            "connector_disabled" => Some(Self::ConnectorDisabled),
+            "connector_schema_change" => Some(Self::ConnectorSchemaChange),
+            "connector_success" => Some(Self::ConnectorSuccess),
+            "upload_failure" => Some(Self::UploadFailure),
+            _ => None,
+        }
+    }
+
     /// The literal kind string, as stored in `console.alert_rule.type`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -177,6 +238,12 @@ impl AlertKind {
             Self::PipelineSlow => "pipeline_slow",
             Self::PipelineLate => "pipeline_late",
             Self::PipelineVolumeDrop => "pipeline_volume_drop",
+            Self::ConnectorFailure => "connector_failure",
+            Self::ConnectorRepeatedFailure => "connector_repeated_failure",
+            Self::ConnectorDisabled => "connector_disabled",
+            Self::ConnectorSchemaChange => "connector_schema_change",
+            Self::ConnectorSuccess => "connector_success",
+            Self::UploadFailure => "upload_failure",
         }
     }
 }
@@ -267,6 +334,11 @@ pub struct AlertRule {
     /// back into `None` on read).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pipeline: Option<String>,
+    /// Connector id (or `"*"`) for the `connector_*` kinds, and `"*"` for
+    /// `upload_failure` (`SRC-7`). `None` for every other kind; the column
+    /// stores the empty string then, like `pipeline`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub connector: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -332,6 +404,10 @@ pub struct AlertRuleInput {
     /// [`AlertKind::PipelineFailure`] rules. Required for that kind, not
     /// read for any other.
     pub pipeline: Option<String>,
+    /// Connector id (or `"*"`) for the `connector_*` kinds (`SRC-7`).
+    /// Required for them, ignored for `upload_failure` (always stored as
+    /// `"*"`) and for every other kind.
+    pub connector: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -354,6 +430,9 @@ struct NormalizedRule {
     /// string for every other kind (matches the `mart`/`board`/
     /// `severity` "empty means absent" convention on this table).
     pipeline: String,
+    /// Connector id or `"*"` for the `SRC-7` kinds; empty for every other
+    /// kind.
+    connector: String,
 }
 
 /// Validate and normalize `input`, exactly reproducing `saveRule`'s
@@ -376,7 +455,8 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         Some("pipeline_slow") => AlertKind::PipelineSlow,
         Some("pipeline_late") => AlertKind::PipelineLate,
         Some("pipeline_volume_drop") => AlertKind::PipelineVolumeDrop,
-        _ => AlertKind::Alert,
+        Some(other) => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
+        None => AlertKind::Alert,
     };
     let channel = if input.channel.as_deref() == Some("email") {
         AlertChannel::Email
@@ -431,6 +511,8 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_pipeline_scoped(input, common, "pipeline_late")
     } else if kind == AlertKind::PipelineVolumeDrop {
         normalize_pipeline_scoped(input, common, "pipeline_volume_drop")
+    } else if kind.is_connector_scoped() {
+        normalize_connector_scoped(input, common)
     } else {
         normalize_digest(input, common)
     }
@@ -488,6 +570,7 @@ fn normalize_alert(
         board: String::new(),
         severity: common.severity,
         pipeline: String::new(),
+        connector: String::new(),
     })
 }
 
@@ -535,6 +618,7 @@ fn normalize_freshness(
         board: String::new(),
         severity: common.severity,
         pipeline: String::new(),
+        connector: String::new(),
     })
 }
 
@@ -563,6 +647,7 @@ fn normalize_pipeline_failure(
         board: String::new(),
         severity: common.severity,
         pipeline: raw,
+        connector: String::new(),
     })
 }
 
@@ -589,6 +674,7 @@ fn normalize_pipeline_scoped(
         board: String::new(),
         severity: common.severity,
         pipeline: raw,
+        connector: String::new(),
     })
 }
 
@@ -608,6 +694,80 @@ fn validate_pipeline_scoped(
         )));
     }
     Ok(raw)
+}
+
+/// The most characters a connector id may have in a rule (`SRC-7`). The
+/// store mints ids as `conn-<slug>-<base36>` (at most about 50 characters);
+/// the bound only stops an absurd value from reaching `ClickHouse`.
+const MAX_CONNECTOR_ID_LEN: usize = 128;
+
+/// Shape check for a connector id in a rule's scope (`SRC-7`): ASCII letters,
+/// digits and `-`, bounded length. The store has no validator of its own
+/// (`connectors::slug_id` only ever mints `[a-z0-9-]`), so this is the one
+/// place the shape is written down; whether the connector exists, and
+/// whether the caller may see it, is the API's check (`routes::alerts`).
+fn is_connector_id_shape(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CONNECTOR_ID_LEN
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Validate the scope of the `SRC-7` kinds. `upload_failure` takes no input
+/// and stores `"*"`; the five `connector_*` kinds need a connector id or
+/// `"*"`, and `connector_success` refuses `"*"` (decision D4). Messages are
+/// fixed text, never an echo of the input.
+fn validate_connector_scoped(
+    input: &AlertRuleInput,
+    kind: AlertKind,
+) -> Result<String, AlertError> {
+    if kind == AlertKind::UploadFailure {
+        return Ok("*".to_owned());
+    }
+    let label = kind.as_str();
+    let raw = input.connector.as_deref().unwrap_or("").trim().to_owned();
+    if raw.is_empty() {
+        return Err(AlertError::Validation(format!(
+            "{label} requires a connector id or \"*\"."
+        )));
+    }
+    if raw == "*" {
+        if kind == AlertKind::ConnectorSuccess {
+            return Err(AlertError::Validation(
+                "connector_success must name one connector, not \"*\".".to_owned(),
+            ));
+        }
+        return Ok(raw);
+    }
+    if !is_connector_id_shape(&raw) {
+        return Err(AlertError::Validation(format!(
+            "{label} connector is not a valid connector id."
+        )));
+    }
+    Ok(raw)
+}
+
+/// `SRC-7`: the `connector_*` kinds and `upload_failure`. No mart, measure,
+/// board or pipeline: only the connector scope.
+fn normalize_connector_scoped(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let connector = validate_connector_scoped(input, common.kind)?;
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board: String::new(),
+        severity: common.severity,
+        pipeline: String::new(),
+        connector,
+    })
 }
 
 /// Unchanged from today's behavior.
@@ -634,6 +794,7 @@ fn normalize_digest(
         board,
         severity: common.severity,
         pipeline: String::new(),
+        connector: String::new(),
     })
 }
 
@@ -703,10 +864,18 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // `SRC-7`: the `connector` column carries a connector id or "*" for the
+    // `connector_*` kinds and "*" for `upload_failure`. Additive, like
+    // `pipeline` above; existing rows read back as `None`.
+    ch.exec(
+        "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS connector String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,connector";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -750,7 +919,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         "pipeline_slow" => AlertKind::PipelineSlow,
         "pipeline_late" => AlertKind::PipelineLate,
         "pipeline_volume_drop" => AlertKind::PipelineVolumeDrop,
-        _ => AlertKind::Alert,
+        other => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
     };
     let channel = if row_str(row, "channel") == "email" {
         AlertChannel::Email
@@ -775,6 +944,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         created_at: non_empty(row_str(row, "created_at")),
         severity: non_empty(row_str(row, "severity")),
         pipeline: non_empty(row_str(row, "pipeline")),
+        connector: non_empty(row_str(row, "connector")),
     }
 }
 
@@ -836,7 +1006,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,connector) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -849,6 +1019,7 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.target.as_str()),
         SqlLiteral::from(normalized.severity.as_deref().unwrap_or("")),
         SqlLiteral::from(normalized.pipeline.as_str()),
+        SqlLiteral::from(normalized.connector.as_str()),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -1455,27 +1626,116 @@ async fn deliver_one_kind(
     title_prefix: &str,
     text: &str,
 ) -> Result<usize, ChError> {
+    deliver_matching(
+        ch,
+        http,
+        email,
+        silence,
+        kind,
+        RuleScope::Pipeline(pipeline_id),
+        title_prefix,
+        text,
+    )
+    .await
+    .map(|delivered| delivered.len())
+}
+
+/// Which `console.alert_rule` scope column a delivery matches against: the
+/// `pipeline` column (the pipeline kinds) or the `connector` column
+/// (`SRC-7`). In either, a stored `"*"` matches every id.
+#[derive(Clone, Copy)]
+enum RuleScope<'a> {
+    Pipeline(&'a str),
+    Connector(&'a str),
+}
+
+impl RuleScope<'_> {
+    fn matches(self, rule: &AlertRule) -> bool {
+        let (wanted, stored) = match self {
+            Self::Pipeline(id) => (id, rule.pipeline.as_deref()),
+            Self::Connector(id) => (id, rule.connector.as_deref()),
+        };
+        stored.is_some_and(|s| s == wanted || s == "*")
+    }
+}
+
+/// The shared filter-and-deliver of [`deliver_one_kind`] (`SRC-7`, AGENTS.md
+/// rule 4: generalised rather than copied): list the enabled rules of
+/// `kind` whose scope matches, deliver `text` to each unless silenced, and
+/// return the rules a delivery was attempted for (so the caller can record
+/// an `alert_instance` for each).
+async fn deliver_matching(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
+    kind: AlertKind,
+    scope: RuleScope<'_>,
+    title_prefix: &str,
+    text: &str,
+) -> Result<Vec<AlertRule>, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
         .into_iter()
-        .filter(|r| {
-            r.enabled
-                && r.kind == kind
-                && r.pipeline
-                    .as_deref()
-                    .is_some_and(|p| p == pipeline_id || p == "*")
-        })
+        .filter(|r| r.enabled && r.kind == kind && scope.matches(r))
         .collect();
-    let mut delivered = 0_usize;
-    for rule in &rules {
+    let mut delivered = Vec::new();
+    for rule in rules {
         let title = format!("{title_prefix}: {}", rule.name);
         if let Some(DeliverResult { .. }) =
-            deliver_unless_silenced(http, email, silence, rule, &title, text).await
+            deliver_unless_silenced(http, email, silence, &rule, &title, text).await
         {
-            delivered += 1;
+            delivered.push(rule);
         }
     }
     Ok(delivered)
+}
+
+/// Deliver every enabled rule of the `SRC-7` `kind` whose connector scope
+/// matches `connector_id` (or is `"*"`), and return the rules a delivery was
+/// attempted for. This is the one public entry point for all six kinds:
+/// `run_failed_event` and `run_finished_event` call it for
+/// `connector_failure`, `connector_repeated_failure`, `connector_success`
+/// and `upload_failure`; `SRC-11` (auto-disable) will call it for
+/// `connector_disabled` and `SRC-8` (schema detection) for
+/// `connector_schema_change`, which nothing raises yet (decision D5).
+///
+/// `title_prefix` is joined to each rule's name (`"{title_prefix}: {name}"`),
+/// like the pipeline kinds. `text` is the caller's message and must hold
+/// only ids, names and a relative console link, never upstream error text
+/// (decision D8). For `upload_failure`, whose rules are always scoped `"*"`,
+/// pass the upload id as `connector_id`: it is not matched, only the kind is.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
+/// `ClickHouse` unreachable). Per-rule delivery failures are reported via
+/// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
+pub async fn evaluate_connector_event(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    kind: AlertKind,
+    connector_id: &str,
+    title_prefix: &str,
+    text: &str,
+    silence: Option<&dyn SilenceSource>,
+) -> Result<Vec<AlertRule>, ChError> {
+    if !kind.is_connector_scoped() {
+        // Not a `SRC-7` kind: nothing to match on the `connector` column.
+        return Ok(Vec::new());
+    }
+    deliver_matching(
+        ch,
+        http,
+        email,
+        silence,
+        kind,
+        RuleScope::Connector(connector_id),
+        title_prefix,
+        text,
+    )
+    .await
 }
 
 /// Plan 1e entry point: deliver every enabled [`AlertKind::PipelineFailure`]
@@ -1633,6 +1893,17 @@ async fn run_one(
             rule,
             "pipeline_late rules are evaluated by /api/alerts/run after run_rules returns"
                 .to_owned(),
+        ),
+        // `SRC-7`: connector and upload rules fire on an event, never on the
+        // periodic pass (`evaluate_connector_event`).
+        AlertKind::ConnectorFailure
+        | AlertKind::ConnectorRepeatedFailure
+        | AlertKind::ConnectorDisabled
+        | AlertKind::ConnectorSchemaChange
+        | AlertKind::ConnectorSuccess
+        | AlertKind::UploadFailure => skipped(
+            rule,
+            "connector and upload rules are evaluated by their event, not run_rules".to_owned(),
         ),
     }
 }
@@ -3109,6 +3380,7 @@ mod tests {
             created_at: None,
             severity: None,
             pipeline: None,
+            connector: None,
         }
     }
 
@@ -3308,5 +3580,434 @@ mod tests {
         let email = no_smtp_email_sender();
         let delivered = deliver_unless_silenced(&http, &email, None, &rule, "title", "text").await;
         assert!(delivered.is_some());
+    }
+
+    // ── SRC-7: connector and upload kinds ───────────────────────────────
+
+    fn connector_input(kind: &str, connector: Option<&str>) -> AlertRuleInput {
+        AlertRuleInput {
+            name: Some("Load failed".to_owned()),
+            kind: Some(kind.to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            connector: connector.map(str::to_owned),
+            ..AlertRuleInput::default()
+        }
+    }
+
+    #[test]
+    fn src7_kinds_have_snake_case_strings_in_as_str_and_on_the_wire() {
+        for (kind, wire) in [
+            (AlertKind::ConnectorFailure, "connector_failure"),
+            (
+                AlertKind::ConnectorRepeatedFailure,
+                "connector_repeated_failure",
+            ),
+            (AlertKind::ConnectorDisabled, "connector_disabled"),
+            (AlertKind::ConnectorSchemaChange, "connector_schema_change"),
+            (AlertKind::ConnectorSuccess, "connector_success"),
+            (AlertKind::UploadFailure, "upload_failure"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(wire));
+            assert_eq!(AlertKind::parse_connector_kind(wire), Some(kind));
+            assert!(kind.is_connector_scoped());
+        }
+        assert!(!AlertKind::PipelineFailure.is_connector_scoped());
+    }
+
+    #[test]
+    fn normalize_input_accepts_connector_kinds_with_an_id_or_star() {
+        for kind in [
+            "connector_failure",
+            "connector_repeated_failure",
+            "connector_disabled",
+            "connector_schema_change",
+        ] {
+            let one = normalize_input(&connector_input(kind, Some("conn-pg-oms"))).unwrap();
+            assert_eq!(one.connector, "conn-pg-oms");
+            assert_eq!(one.pipeline, "");
+            let all = normalize_input(&connector_input(kind, Some("*"))).unwrap();
+            assert_eq!(all.connector, "*");
+        }
+        let success =
+            normalize_input(&connector_input("connector_success", Some("conn-a"))).unwrap();
+        assert_eq!(success.kind, AlertKind::ConnectorSuccess);
+    }
+
+    #[test]
+    fn normalize_input_refuses_a_connector_rule_without_a_valid_connector() {
+        let missing = normalize_input(&connector_input("connector_failure", None)).unwrap_err();
+        assert!(
+            missing.to_string().contains("requires a connector id"),
+            "{missing}"
+        );
+        let blank = normalize_input(&connector_input("connector_failure", Some("  "))).unwrap_err();
+        assert!(
+            blank.to_string().contains("requires a connector id"),
+            "{blank}"
+        );
+        for bad in ["conn a", "conn;drop", "conn\n1", "con'n", "é"] {
+            let err =
+                normalize_input(&connector_input("connector_failure", Some(bad))).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connector_failure connector is not a valid connector id."
+            );
+        }
+        let long = "a".repeat(MAX_CONNECTOR_ID_LEN + 1);
+        assert!(normalize_input(&connector_input("connector_failure", Some(&long))).is_err());
+    }
+
+    /// Decision D4: a success rule names one connector, never `"*"`.
+    #[test]
+    fn normalize_input_refuses_a_connector_success_rule_for_star_with_a_fixed_message() {
+        let err = normalize_input(&connector_input("connector_success", Some("*"))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "connector_success must name one connector, not \"*\"."
+        );
+    }
+
+    #[test]
+    fn normalize_input_stores_star_for_an_upload_failure_rule_whatever_was_sent() {
+        let a = normalize_input(&connector_input("upload_failure", None)).unwrap();
+        assert_eq!(
+            (a.kind, a.connector.as_str()),
+            (AlertKind::UploadFailure, "*")
+        );
+        let b = normalize_input(&connector_input("upload_failure", Some("conn-x"))).unwrap();
+        assert_eq!(b.connector, "*");
+    }
+
+    #[test]
+    fn row_to_rule_maps_the_connector_column() {
+        let mut row = Map::new();
+        row.insert(
+            "type".to_owned(),
+            Value::String("connector_failure".to_owned()),
+        );
+        row.insert("connector".to_owned(), Value::String("conn-a".to_owned()));
+        let rule = row_to_rule(&row);
+        assert_eq!(rule.kind, AlertKind::ConnectorFailure);
+        assert_eq!(rule.connector.as_deref(), Some("conn-a"));
+        row.insert("connector".to_owned(), Value::String(String::new()));
+        assert_eq!(row_to_rule(&row).connector, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_sends_an_additive_connector_column_statement() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ADD COLUMN IF NOT EXISTS connector"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        ensure(&ch).await.unwrap();
+    }
+
+    /// The connector scope reaches `ClickHouse` as an escaped literal, never
+    /// as raw interpolation: a quote in an (invalid) id is refused before
+    /// SQL is built, and a valid id is sent quoted.
+    #[tokio::test]
+    async fn save_rule_sends_the_connector_scope_as_a_quoted_literal() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("INSERT INTO console.alert_rule"))
+            .and(body_string_contains("'connector_failure'"))
+            .and(body_string_contains("'conn-pg-oms'"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(connector_rules_json(&[(
+                    "al_c1",
+                    "connector_failure",
+                    "conn-pg-oms",
+                    "https://hooks.example.com/x",
+                    true,
+                )])),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let saved = save_rule(
+            &ch,
+            &connector_input("connector_failure", Some("conn-pg-oms")),
+            Some("al_c1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.connector.as_deref(), Some("conn-pg-oms"));
+
+        let err = save_rule(
+            &ch,
+            &connector_input("connector_failure", Some("x' OR 1=1 --")),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AlertError::Validation(_)));
+    }
+
+    /// `(id, kind, connector, target, enabled)` rows, every field
+    /// `row_to_rule` reads populated.
+    fn connector_rules_json(rows: &[(&str, &str, &str, &str, bool)]) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, kind, connector, target, enabled)| {
+                serde_json::json!({
+                    "id": id, "name": format!("Rule {id}"), "type": kind,
+                    "mart": "", "measure": "", "agg": "", "op": "", "threshold": "0",
+                    "board": "", "channel": "webhook", "target": target,
+                    "enabled": if *enabled { "1" } else { "0" },
+                    "created_at": "", "severity": "", "pipeline": "",
+                    "connector": connector,
+                })
+            })
+            .collect();
+        serde_json::json!({ "meta": [], "data": data, "rows": data.len() })
+    }
+
+    /// Starts a mock where `ClickHouse` answers every call with `rows` and
+    /// each rule's webhook path `/hooks/<id>` is expected `expect` times.
+    async fn connector_event_server(
+        rows: &[(&str, &str, &str, bool)],
+        expectations: &[(&str, u64)],
+    ) -> (wiremock::MockServer, ChClient) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (id, times) in expectations {
+            Mock::given(method("POST"))
+                .and(path(format!("/hooks/{id}")))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(*times)
+                .mount(&server)
+                .await;
+        }
+        let full: Vec<(&str, &str, &str, String, bool)> = rows
+            .iter()
+            .map(|(id, kind, connector, enabled)| {
+                (
+                    *id,
+                    *kind,
+                    *connector,
+                    format!("{}/hooks/{id}", server.uri()),
+                    *enabled,
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str, &str, bool)> = full
+            .iter()
+            .map(|(id, kind, connector, target, enabled)| {
+                (*id, *kind, *connector, target.as_str(), *enabled)
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(connector_rules_json(&refs)))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        (server, ch)
+    }
+
+    /// A rule scoped to one connector delivers for that connector only; a
+    /// `*` rule delivers for every connector; a disabled rule and a rule of
+    /// another kind never deliver. The message names the connector and run
+    /// and links to the console (decision D8).
+    #[tokio::test]
+    async fn evaluate_connector_event_matches_its_connector_star_and_kind_only() {
+        let (_server, ch) = connector_event_server(
+            &[
+                ("one", "connector_failure", "conn-a", true),
+                ("other", "connector_failure", "conn-b", true),
+                ("all", "connector_failure", "*", true),
+                ("off", "connector_failure", "*", false),
+                ("kind", "connector_success", "conn-a", true),
+            ],
+            &[
+                ("one", 1),
+                ("other", 0),
+                ("all", 1),
+                ("off", 0),
+                ("kind", 0),
+            ],
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::ConnectorFailure,
+            "conn-a",
+            "Connector failure",
+            "Connector Orders (conn-a) run run-1 failed. View: /connectors/conn-a",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<&str> = delivered.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["all", "one"]);
+    }
+
+    #[tokio::test]
+    async fn evaluate_connector_event_delivers_the_message_text_unchanged() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/msg", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/msg"))
+            .and(body_string_contains("conn-a"))
+            .and(body_string_contains("run-1"))
+            .and(body_string_contains("/connectors/conn-a"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(connector_rules_json(&[(
+                    "al_m",
+                    "connector_failure",
+                    "conn-a",
+                    &webhook,
+                    true,
+                )])),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::ConnectorFailure,
+            "conn-a",
+            "Connector failure",
+            "Connector Orders (conn-a) run run-1 failed. View: /connectors/conn-a",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evaluate_connector_event_does_not_deliver_a_silenced_rule() {
+        let (_server, ch) = connector_event_server(
+            &[("quiet", "connector_failure", "conn-a", true)],
+            &[("quiet", 0)],
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::ConnectorFailure,
+            "conn-a",
+            "Connector failure",
+            "text",
+            Some(&AlwaysSilenced),
+        )
+        .await
+        .unwrap();
+        assert!(delivered.is_empty());
+    }
+
+    /// `SRC-11` and `SRC-8` have no caller yet (decision D5); the entry
+    /// point must already deliver their two kinds when it is called.
+    #[tokio::test]
+    async fn evaluate_connector_event_delivers_connector_disabled_and_schema_change_rules() {
+        let (_server, ch) = connector_event_server(
+            &[
+                ("dis", "connector_disabled", "conn-a", true),
+                ("sch", "connector_schema_change", "*", true),
+            ],
+            &[("dis", 1), ("sch", 1)],
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        for (kind, expected) in [
+            (AlertKind::ConnectorDisabled, "dis"),
+            (AlertKind::ConnectorSchemaChange, "sch"),
+        ] {
+            let delivered =
+                evaluate_connector_event(&ch, &http, &email, kind, "conn-a", "Event", "text", None)
+                    .await
+                    .unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].id, expected);
+        }
+    }
+
+    /// `upload_failure` rules are stored `"*"`, so they match whatever id
+    /// the caller passes (the upload id).
+    #[tokio::test]
+    async fn evaluate_connector_event_delivers_an_upload_failure_rule_for_any_upload() {
+        let (_server, ch) =
+            connector_event_server(&[("up", "upload_failure", "*", true)], &[("up", 1)]).await;
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::UploadFailure,
+            "upl-1",
+            "Upload failure",
+            "text",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered.len(), 1);
+    }
+
+    /// A pipeline kind passed here is not a `SRC-7` kind: nothing is
+    /// listed, nothing is delivered.
+    #[tokio::test]
+    async fn evaluate_connector_event_ignores_a_non_connector_kind() {
+        let (_server, ch) = connector_event_server(&[], &[]).await;
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::PipelineFailure,
+            "pl-x",
+            "x",
+            "text",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(delivered.is_empty());
     }
 }

@@ -235,3 +235,99 @@ def test_run_bronze_ingest_still_produces_stamped_rows_now_via_the_shared_sink(m
     for row in materialized:
         assert "_ingested_at" in row
         assert row["_ingested_at"].tzinfo == timezone.utc
+
+
+# --- SRC-8 task 6: the gate between reflecting and loading -------------------
+
+
+class _GateTable:
+    """What `sql_database` hands `table_adapter_callback`."""
+
+    def __init__(self) -> None:
+        columns = [("id", "INTEGER", False), ("note", "VARCHAR(40)", True)]
+        self._columns = [_GateColumn(n, t, nullable) for n, t, nullable in columns]
+        self.columns = self._columns
+        self.primary_key = type("PK", (), {"columns": [self._columns[0]]})()
+
+
+class _GateColumn:
+    def __init__(self, name: str, type_text: str, nullable: bool) -> None:
+        self.name, self.nullable = name, nullable
+        self.type = type_text  # `str(column.type)` is the database's spelling
+
+
+def _gate_env(monkeypatch):
+    builds: list = []
+    loads: list = []
+
+    def fake_sql_database(**kwargs):
+        table = _GateTable()
+        callback = kwargs.get("table_adapter_callback")
+        if callback is not None:
+            callback(table)
+        builds.append({"hostaddr": kwargs["engine_kwargs"]["connect_args"]["hostaddr"], "columns": [c.name for c in table._columns]})
+        return _FakeSource("orders")
+
+    monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.sql_database", fake_sql_database)
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.ssrf_guard.resolve_checked",
+        lambda host, port: ssrf_guard.ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.load_via_sink",
+        lambda source, table_name, sink_config, plan: loads.append(table_name) or _FakeLoadResult(),
+    )
+    return builds, loads
+
+
+def test_the_gate_sees_the_reflected_table_before_anything_is_loaded(monkeypatch) -> None:
+    from dispar_orchestrate import schema_observer
+
+    builds, loads = _gate_env(monkeypatch)
+    seen = []
+
+    def gate(table):
+        seen.append((table, list(loads)))  # nothing loaded when the gate runs
+        return schema_observer.Decision(action="load", columns=None, changes=[])
+
+    outcome = run_bronze_ingest(_base_config(), gate=gate)
+
+    [(table, loads_at_gate)] = seen
+    assert [(c.name, c.type_name, c.nullable) for c in table.columns] == [
+        ("id", "INTEGER", False),
+        ("note", "VARCHAR(40)", True),
+    ]
+    assert table.primary_key == ("id",)
+    assert loads_at_gate == []
+    assert loads == ["orders"] and outcome["rows"] == 3
+    assert len(builds) == 1
+
+
+def test_a_wait_from_the_gate_loads_nothing_and_returns_a_waiting_summary(monkeypatch) -> None:
+    from dispar_orchestrate import schema_observer
+
+    builds, loads = _gate_env(monkeypatch)
+    outcome = run_bronze_ingest(
+        _base_config(), gate=lambda table: schema_observer.Decision(action="wait", columns=None, changes=[])
+    )
+    assert loads == []
+    assert outcome["waiting"] is True and outcome["rows"] is None
+
+
+def test_a_column_list_from_the_gate_rebuilds_the_source_under_the_same_hostaddr_pin(monkeypatch) -> None:
+    from dispar_orchestrate import schema_observer
+
+    builds, loads = _gate_env(monkeypatch)
+    run_bronze_ingest(
+        _base_config(), gate=lambda table: schema_observer.Decision(action="load", columns=["id"], changes=[])
+    )
+    # Both builds (the reflection and the one that loads) dial the checked address.
+    assert [b["hostaddr"] for b in builds] == ["10.0.0.9", "10.0.0.9"]
+    assert [b["columns"] for b in builds] == [["id", "note"], ["id"]]
+    assert loads == ["orders"]
+
+
+def test_without_a_gate_the_source_is_built_once_and_without_a_callback(monkeypatch) -> None:
+    builds, loads = _gate_env(monkeypatch)
+    run_bronze_ingest(_base_config())
+    assert len(builds) == 1 and loads == ["orders"]

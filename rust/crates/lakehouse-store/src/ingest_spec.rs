@@ -1091,6 +1091,59 @@ pub fn validate_load_modes(
     Ok(())
 }
 
+/// `text` as a lower-case SQL-safe slug: every run of characters outside
+/// `[a-z0-9]` becomes one `_`, and leading and trailing `_` are dropped.
+fn bronze_slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut separator_pending = false;
+    for c in text.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if separator_pending && !out.is_empty() {
+                out.push('_');
+            }
+            separator_pending = false;
+            out.push(c);
+        } else {
+            separator_pending = true;
+        }
+    }
+    out
+}
+
+/// The Bronze table a source object lands in unless a person renames it:
+/// `<connector>_<table>` (`SRC-8` task 8, decision D2).
+///
+/// Every connector writes into the same flat `bronze` namespace, so two
+/// connectors that both have an `orders` table would otherwise append into
+/// one `bronze.orders`. `object_name` is `schema.table`; only its last
+/// dot-separated part is used.
+///
+/// THE SAME RULE AS THE CONSOLE'S TABLE PICKER: this is a port of
+/// `defaultTarget` in `src/features/connectors/connector-ingest-panel.tsx`.
+/// Keep both in step; each has a test that pins the same three examples
+/// (`northwind`/`public.orders`, `Northwind DB!`/`public.Order Details`,
+/// `2024 sales`/`t`).
+#[must_use]
+pub fn default_bronze_target(connector_name: &str, object_name: &str) -> String {
+    let table = bronze_slug(object_name.rsplit('.').next().unwrap_or(object_name));
+    let prefix = bronze_slug(connector_name);
+    let joined = [prefix, table]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let joined = if joined.is_empty() {
+        "table".to_owned()
+    } else {
+        joined
+    };
+    if joined.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("t_{joined}")
+    } else {
+        joined
+    }
+}
+
 /// This [`SourceObject`] failed application-level validation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("source object {name:?} has an empty target")]
@@ -1345,6 +1398,35 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The same examples `connector-ingest-panel.test.tsx` pins for
+    /// `defaultTarget` (the console's table picker): the two must agree.
+    #[test]
+    fn the_default_bronze_target_matches_the_console_pickers_examples() {
+        assert_eq!(
+            default_bronze_target("northwind", "public.orders"),
+            "northwind_orders"
+        );
+        assert_eq!(
+            default_bronze_target("Northwind DB!", "public.Order Details"),
+            "northwind_db_order_details"
+        );
+        assert_eq!(default_bronze_target("2024 sales", "t"), "t_2024_sales_t");
+    }
+
+    #[test]
+    fn the_default_bronze_target_falls_back_the_way_the_picker_does() {
+        // No usable connector name: the table alone.
+        assert_eq!(default_bronze_target("!!!", "dbo.Orders"), "orders");
+        // No usable table part: the connector alone.
+        assert_eq!(default_bronze_target("shop", "public."), "shop");
+        // Nothing usable at all.
+        assert_eq!(default_bronze_target("", "..."), "table");
+        // A name without a schema is its own table part.
+        assert_eq!(default_bronze_target("shop", "orders"), "shop_orders");
+        // Runs of separators collapse and edges are trimmed.
+        assert_eq!(default_bronze_target("  a--b  ", "s.__x__y__"), "a_b_x_y");
+    }
 
     #[test]
     fn sql_dial_parses_the_documented_shape() {
