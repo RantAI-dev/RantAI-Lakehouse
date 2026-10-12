@@ -324,6 +324,40 @@ Plan/code mismatches: (a) section 4 says the assistant's tool schema lists the l
 
 *(developer)*
 
+### Third pass: review findings of the second pass (developer)
+
+Scope: the planner's three findings and the CI flake. `history` is still waiting for the product owner: no `history` value, no task 3a.
+Commits on `feat/src-10-load-modes` after `d9df91e`:
+
+| Commit | Item |
+| --- | --- |
+| `01c710f` | R1 the failing Rust test (CI, PR #115) |
+| `a83ce0e` | R4 the frontend test that failed twice and then passed |
+| `fb6ab82` | R2 `incremental` -> `incremental_dedup` leaves duplicates |
+| `90a6976` | R3 a run killed mid-load |
+
+**R1.** `ingest_run.rs:432` expected `"replace, append or incremental"`; the list grew, so the expectation is CORRECTED to `"replace, append, incremental, replace_dedup or incremental_dedup"` (the whole list, in order, `contains` as before: not loosened). `cargo test` stopped at that binary (`grep -a "Running "` of the CI log: it ran 22 binaries and stopped inside `tests/ingest_run.rs`; the remaining `lakehouse-api` tests and the other crates never ran). Searched for pinned mode lists or messages in `rust/**`, `src/**/*.test.*`, `dagster/**`, `ops/**` (g6, g9): the other places that name modes are the uploads' own `LoadMode` (`replace|append`, a different enum in `uploads.rs`, `upload_routes.rs`, `tests/uploads.rs`), `"loadMode": "replace"` fixtures (`store/tests/connectors.rs`, `schema_change.rs`, `ops/g6`) and the `ingest_spec.rs` unit tests, which match error VARIANTS, not text. No other test pins the old list or the old "an incremental loadMode" wording. `cargo fmt --check` clean; clippy (workspace, all targets, all features, locked, `-D warnings`) Finished in 2m 21s, no warning.
+
+**R2.** The marker is `_dedup_key`, a list of the key columns, in the RESOURCE state of the pipeline state (`pipeline.state["sources"][schema]["resources"][resource]`), the dict that also holds the incremental cursor `_incremental_cursors` reads. It is written by `dlt.current.resource_state()` while the rows are extracted (`DedupStep` at its flush, `dedup_rows` for plain rows; only when rows were emitted), so it is part of the extract package: stored with the data in the bucket and restored by `abort_packages` with the rest of the state. `incremental_dedup` is a first run (replace) when the marker is not exactly the plan's key or no cursor exists; if a cursor exists but the marker does not match, `_forget_cursors` runs first (so the run reads everything). `replace`, `append`, `incremental` clear it from the `_ingested_at` stamp (`_stamp_for_load(..., clear_marker=True)`), which adds no pipe step and no read of the state for `replace`/`append`. Not cleared: a plain-rows `append` (the Kafka micro-batch; no dedup mode shares a table with it). `test_sink_dedup_marker.py`, 9 tests through `load_via_sink`; measured: a failed first run leaves no marker and is a first run next time; a pre-existing marker `["id"]` is back to `["id"]` after a failed run that had written `["id","v"]`; the marker is read back by a new `DLT_DATA_DIR` and the next run merges (1 commit, untouched rows keep `_ingested_at`). With the comparison bypassed, 4 of the 9 fail. The `sink.py` docstring states the rule. Known limit: a stale marker in ANOTHER source schema of the same pipeline name is also read (the walk is across all schemas, as for cursors).
+
+**R3.** Measured first (`test_load_modes_dedup_measurement.py`, case 6, abort switched off): with a state already in the bucket, the run after a kill (simulated by a `BaseException` out of `Pipeline.normalize` or `.load`) finishes the dead package and does not extract its own read; Kafka-shaped append: table holds the dead batch's rows (0..3), not the live ones (4, 5), `rows` is 3 (killed before normalize) or `None` (before load), never 2, `has_failed_jobs` false; an incremental run reports `rows == 0` while it loaded the dead package's row 4 and its own row 5 waits one run. With NO state in the bucket yet `dlt` wipes the working folder at its restore, package included (measured; no abort needed). Now `load_via_sink` calls `_abort_pending(pipeline, strict=True)` right after creating the pipeline (strict: a failed abort raises). `test_sink_killed_run.py`: 13 tests, replace, Kafka-shaped append, incremental (cursor not past rows never loaded; a following run reads 0), replace_dedup, incremental_dedup (+ marker), a killed first dedup run, a failed abort, no abort call when nothing is pending; with the abort removed the first fails.
+Kafka: `run_kafka_stream_batch` commits (`consumer.commit`, then `record_ingest_offset`) only after `load_via_sink` returns, and a returned call now always means THIS batch's rows were extracted and loaded (the dead package is gone). Offsets can no longer run ahead of loaded rows through a killed run. Two paths remain, NOT changed here: (a) a process killed after the load and before `consumer.commit` re-delivers the batch, so its rows are loaded twice (at-least-once; duplicates, not loss); (b) `ingest_factory.py` does not look at `outcome.has_failed_jobs` before committing, so a sink that returned with failed jobs would still commit offsets; dlt raises on failed jobs by default, so it was not reached in any test, and it is a one-line check for the planner to decide.
+
+**R4.** Cause: the test awaited `findAllByText("Waiting for a decision")`, but that is also the title of the Schema changes card, which is on the page before the list has loaded, so it waited for nothing; the tab's count is set by an effect of the schema panel after the list arrives. Reproduced deterministically by delaying `GET .../schema-changes` 150 ms: the old assertion fails ("Schema changes" received), the new one passes. Fix (test only, the component is right): wait for the mark itself (`findAllByTitle` of the pill's own title), assert exactly one, on `public.orders` and not on `public.items`, then `waitFor` the tab's count and assert `"Schema changes1"`; nothing it checked is weakened. Loops: the file 20 times, 20 pass 0 fail; `src/features/connectors` 5 times, 5 pass 0 fail.
+
+Commands and results (foreground unless noted):
+
+- `cd rust && cargo fmt --check`: OK. `df -h /`: 17 GB free. After `touch`: `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (detached, polled): Finished in 2m 21s, no warning.
+- Dagster, whole suite, detached and polled: after R2 (marker, without R3) 867 passed; after R3 a first run 875 passed, 5 failed (three `FakePipeline` stand-ins without `has_pending_data`, two lambdas without the new keyword; fixed); at `90a6976` **880 passed** (854 + 9 + 4 + 13). 880 passed in 526.69 s.
+- `python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py`: OK, OK.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings (none in files touched). `bun run test`: 1068 pass, 1 skip, 0 fail.
+
+Assertions and helpers changed: `ingest_run.rs` (R1, above); `connector-detail-page.test.tsx` (R4, above); the three `_FakePipeline` classes (`test_sink.py`, `test_dlt_pipeline.py`, `test_file_ingest.py`) gain `has_pending_data = False`; in the measurement file two `monkeypatch.setattr(sink_module, "_abort_pending", lambda _pipeline: None)` take `*_a, **_k`, and the docstring of `test_3_a_table_with_two_versions...` now says the gap is closed by the marker. No assertion was removed or loosened.
+
+Not verified: `cargo test` (not run on this machine; CI), so `ingest_run.rs` passing with the corrected text is verified by reading the message in `ingest_spec.rs`, not by running it; a Lakekeeper REST catalog, ClickHouse, Trino (gate); a real SIGKILL (a `BaseException` out of `Pipeline.normalize`/`.load` stands for it); a recreated container with a real second process (a new `DLT_DATA_DIR` stands for it); wall time and memory at 2,000,000 keys; the compose/CI path. Nothing was pushed and the PR was not touched.
+
+*(developer)*
+
 ## Review
 
 *(planner)*
