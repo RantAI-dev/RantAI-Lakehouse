@@ -256,3 +256,28 @@ def test_clearing_a_table_that_was_never_loaded_creates_nothing(lab: Lab) -> Non
     assert load_via_sink(
         [{"id": 1, "v": "a"}], "never_loaded", lab.config, LoadPlan(mode="replace", refresh="remove")
     ).rows == 1, "and a refresh that removes rows loads a table that was not there"
+
+
+# --- an ordinary replace of a source that now returns nothing (seventh pass, item 4) ----------
+
+
+@pytest.mark.parametrize("mode", ["replace", "replace_dedup"])
+@pytest.mark.parametrize("origin", ["plain", "sql"])
+def test_a_replace_of_a_source_that_now_returns_no_rows_leaves_the_table_empty(
+    lab: Lab, tmp_path: Path, origin: str, mode: str
+) -> None:
+    """What "replace" promises, measured to hold already (the fifth pass's note that a
+    SQL table empty at the source kept its rows could not be reproduced: that was
+    `load_via_sink([])`, whose resource name differs). The resource of each run keeps
+    the name the stored schema records, so `dlt` truncates. The trade-off is the one
+    every `replace` has: a read that is wrongly empty empties the table."""
+    plan = LoadPlan(mode=mode, key=("id",) if mode == "replace_dedup" else ())
+    load_via_sink(_rows_source(origin, tmp_path, FIRST), "t", lab.config, plan)
+    assert len(lab.rows("t")) == 3
+    before = _shape(lab, "t")
+
+    load_via_sink(_rows_source(origin, tmp_path, []), "t", lab.config, plan)
+
+    assert lab.rows("t") == []
+    assert _shape(lab, "t") == before
+    assert load_via_sink(_rows_source(origin, tmp_path, SECOND), "t", lab.config, plan).rows == 3
