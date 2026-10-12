@@ -117,7 +117,149 @@ only by CI (decision 7).
 
 ## Handoff
 
-*(developer)*
+### Tasks 0-2 (developer, first pass)
+
+Commits on `feat/src-9-connector-gates`: `bd5b679` (task 0), `c708ae2`
+(task 1), `c1f09c7` (task 2).
+
+**Commands run here, with results.** `python3 -m py_compile` on
+`ops/g3/g3_test.py`, `ops/g6/g6_ingest_matrix_test.py`,
+`ops/g6/rest_stub.py`, `ops/gates/gate_summary.py` and
+`ops/gates/test_gate_summary.py`: no output (ok).
+`python3 -m unittest discover -s ops/gates -p 'test_*.py'`: `Ran 27 tests ... OK`.
+`python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`,
+`check_compose_init_readiness.py`: all pass. `yaml.safe_load` of
+`.github/workflows/ci.yml` and `ops/g6/docker-compose.g6.override.yml`: ok.
+`docker compose -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+--profile g6 --profile dagster config` (dummy values for the `:?` variables):
+resolves, and shows the bind mount of `ops/gates` at `/opt/gates` read-only and
+`PYTHONPATH=/opt/gates`. A throwaway script (not committed) drove
+`_check_connect` / `_check_discover` against a fake session to catch typos.
+No cargo, no bun.
+
+**Task 0.** g3 now waits for `bronze_ingest_job` to be listed after the
+webserver is up (`step_wait_for_services`) and retries the trigger once on
+`422 PipelineNotFoundError` (`_post_trigger`). Sharing: not possible without a
+compose change. Each runner mounts only its own `ops/gN` as `/work` (g3 also
+mounts one extra file, `bronze_catalog.py`, by an explicit volume line), so g3
+cannot import g6's helper, and a shared module needs a mount in
+`g3-maintenance-test-runner` in `docker-compose.yml`. g3 therefore carries a
+twin of g6's `_ingest_job_is_loaded` / `_post_ingest_run`, with a comment
+naming g6's functions. Other gates with the same exposure: g3a
+(`step_trigger_run_via_lakehouse_api` triggers `bronze_ingest_job` after only
+listing it, no wait and no retry) and g7 (`step_trigger_and_wait_for_real_row_
+materializations`, a plain trigger); g4 already waits for
+`replication_slot_check_job` before its launch (no retry). Not fixed, as asked.
+The backlog item for the race (plan task 0, "next free ID") is not added: the
+backlog is the planner's file.
+
+**Task 1.** `ops/gates/coverage.json` (13 types), `ops/gates/gate_summary.py`
+(`Registry`, `Recorder`, `extract_summary`), tests in
+`ops/gates/test_gate_summary.py`; run them with
+`python3 -m unittest discover -s ops/gates -p 'test_*.py'` from the repository
+root (there is no test home under `ops/lint`). Sharing for g6: a read-only
+mount `./ops/gates:/opt/gates:ro`, `PYTHONPATH=/opt/gates` and
+`PYTHONDONTWRITEBYTECODE=1`, added in `ops/g6/docker-compose.g6.override.yml`
+only (not `docker-compose.yml`). This is a compose-file change the brief did
+not list; the module cannot reach the container otherwise. Job summary: the
+container cannot write the host `GITHUB_STEP_SUMMARY`, so the gate prints the
+Markdown between the lines `GATE-SUMMARY-BEGIN` / `GATE-SUMMARY-END` (plain
+text, not `::x::`, which GitHub reads as workflow commands), and `ci.yml`'s
+g6 job now runs the gate as `... run --rm -T g6-test-runner 2>&1 | tee
+$RUNNER_TEMP/g6-run.log` (`shell: bash` for `pipefail`) and a new
+`if: always()` step copies the marked lines into `$GITHUB_STEP_SUMMARY` with
+`awk`. `emit()` also appends to `GITHUB_STEP_SUMMARY` when that variable is
+set in the process (a host run).
+
+Supported types derived from `0035` (ten `supported = true`: PostgreSQL,
+PostgreSQL CDC, MySQL, MySQL CDC, MariaDB, SQL Server, SQL Server CDC, Object
+storage, REST API, Google Sheets), `0043` (+ Kafka, MongoDB, SFTP, Oracle) and
+`0062` (- Google Sheets): thirteen, matching the plan. No other migration
+touches `connector_type` (`0036` only mentions the number 0035 in a comment).
+
+Registry values (connect / discover / load / reload):
+
+| Type | Gate | Values |
+| --- | --- | --- |
+| PostgreSQL | g6 | real / real / real / real |
+| PostgreSQL CDC | g4 | missing / missing / real / real |
+| MySQL | g6 | real / real / real / real |
+| MySQL CDC | null | missing x4 |
+| MariaDB | null | missing x4 |
+| SQL Server | g6 | real / real / real / real |
+| SQL Server CDC | null | missing x4 |
+| Object storage | g6 | real / refused (SRC-13) / real / real |
+| REST API | g6 | real / refused (SRC-13) / real / real |
+| Oracle | null | missing x4 |
+| MongoDB | g6 | refused (SRC-5) / refused (SRC-13) / real / real |
+| Kafka | g6 | refused (SRC-5) / refused (SRC-13) / real / real |
+| SFTP | null | missing x4 |
+
+The decisions are read from `connector_probe::probe` and
+`connector_discover::discover`. `notes` in the file record where the product
+behaviour for a `missing` cell is already known (Oracle and SFTP connect:
+`supported: false`, SRC-5).
+
+**Task 2.** `ops/g6/g6_ingest_matrix_test.py`: `_check_connect`,
+`_check_discover`, `_step_reload`, `_produce_kafka_reload_batch`, and the
+recording of the existing load checks. A failed new step is recorded and the
+gate goes on (one CI run shows every broken cell); `main` raises one
+`G6Failure` at the end whose `[g6] FAILED:` line lists `<type> <step>: <detail>`
+for each, and the table prints in a `finally` on every path. Existing
+assertions: none weakened or removed. Changed by wrapping only: the run-wait
+loop and the Bronze verification loop (same asserts, now inside a `try` that
+records the load cell as `fail` and re-raises), the object-storage test call
+(same call, recorded as the `connect` cell), `connector_ids` now filled for
+every connector. `reload` for a default-mode connector: `loadMode` absent means
+`replace` (`LoadPlan.from_source_object`), so the second run must leave the same
+count; the count is read until it matches, then again 6 s later, because an
+older snapshot has the same count a `replace` should keep. Kafka (append):
+the gate produces 5 new messages after the first run's offsets are committed,
+then computes, at the broker, (end offset - the group's committed offset) summed
+over partitions, which includes any message the first run's producer sent after
+the consumer's last poll; the second run must add exactly that many. If the
+group has no committed offset the cell is `skipped` with the reason. The
+second runs are all started, then all waited for.
+
+`ops/g6/rest_stub.py` now answers `GET /` with 200: `connector_probe::
+probe_rest` sends one GET to the connector's `baseUrl` itself and the stub
+answered 404, so a "real" REST connect could never pass.
+
+**Time estimate (not measured).** connect and discover: 14 short calls, made
+while the first runs are in flight, about 0 to 30 s. reload: the seven second
+runs start together; the slowest is Kafka, whose consumer polls for its whole
+60 s window, so about 70 to 80 s from launch, plus the count wait and one 6 s
+stability pause, plus Kafka offset/produce setup of a few seconds. Estimate
+1.5 to 2 minutes added, inside the 3-minute line; the 25-minute timeout is
+untouched.
+
+**Plan/code mismatches found.**
+1. The REST stub returned 404 for `/` (fixed above).
+2. Oracle discovery answers HTTP 422 (`DiscoverError::Blocked` for
+   `SqlDriver::Oracle`), not `supported: false`. The registry marks Oracle
+   discover `missing` with a note; task 5 must either assert the 422 or the
+   planner changes the product to a `supported: false` answer.
+3. Plan task 0 and task 1 say a shared module; without a compose change that
+   is only possible for g6, by the override mount above. g3 stays a twin.
+4. Plan section 2 says "the gates read it and the coverage check reads it":
+   g4 does not use the module yet; its registry cells (`load`/`reload` real)
+   are not recorded by any run today, so the PostgreSQL CDC row shows
+   `skipped` ("covered by gate g4, which did not run here") in g6's table.
+
+**Not verified.** Everything about the gates: no gate, docker run or CI ran. In
+particular: (a) the `up`/`run` of the g6 profile with the new mount and `-T`/
+`tee`; (b) that MySQL, SQL Server and PostgreSQL discovery return the fixture
+tables with those exact names and column names (MySQL 8's
+`information_schema` columns may decode differently through sqlx; if
+discover fails for MySQL, that is a product finding); (c) that the connection
+test passes for the seeded `conn-pg-lakehouse` (credential
+`env:CONNECTOR_PG_PASSWORD` resolved by the API); (d) that a second `replace`
+run leaves the same count for every adapter and that Kafka's broker-side
+arithmetic gives the number the table grows by (`KafkaConsumer.committed` and
+`end_offsets` with only a `group_id`); (e) the `awk` extraction in the new CI
+step. Expected risks in CI, most likely first: Kafka reload arithmetic, MySQL
+discover decoding, REST connect, the pg connect.
+
 
 ## Review
 
