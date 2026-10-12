@@ -156,6 +156,9 @@ from dispar_orchestrate.adapters import dedup
 logger = logging.getLogger(__name__)
 
 LOAD_MODES = ("replace", "append", "incremental", "replace_dedup", "incremental_dedup")
+# SRC-10 decision 5: what a refresh of one table does with the rows already there
+# ("keep" them, or "remove" them first). `clear` is `clear_table`, not a plan.
+REFRESHES = ("keep", "remove")
 # SRC-10: the modes that keep one row per key, and the modes that read only rows
 # beyond a cursor (the cursor is pushed into the query, so only `sql_database`).
 DEDUP_MODES = ("replace_dedup", "incremental_dedup")
@@ -205,11 +208,20 @@ class LoadPlan:
     for `incremental` and `incremental_dedup`, optional for `replace_dedup`
     (where it only decides which of two rows with one key wins), unused
     otherwise. `key` is the columns that identify one row, required for the
-    deduplicating modes and empty for the others (SRC-10)."""
+    deduplicating modes and empty for the others (SRC-10).
+
+    `refresh` (SRC-10 decision 5) is set only by a run of ONE table started with
+    an action: `"keep"` forgets the table's incremental cursor and deduplication
+    marker and then loads by `mode` (an incremental mode therefore reads
+    everything, and a deduplicating one replaces with the deduplicated rows;
+    for `append` "keeping" means the whole source is added ON TOP of what is there,
+    duplicates of it included, which is what Airbyte's "refresh, retain" does);
+    `"remove"` empties the table first (`clear_table`) and then does the same."""
 
     mode: str = "append"
     cursor: str | None = None
     key: tuple[str, ...] = ()
+    refresh: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in LOAD_MODES:
@@ -220,9 +232,11 @@ class LoadPlan:
             )
         if self.mode in DEDUP_MODES:
             _check_key(self.mode, self.key)
+        if self.refresh is not None and self.refresh not in REFRESHES:
+            raise UnsupportedLoadMode(f"refresh {self.refresh!r} is not one of {', '.join(REFRESHES)}")
 
     @classmethod
-    def from_source_object(cls, obj: dict[str, Any]) -> "LoadPlan":
+    def from_source_object(cls, obj: dict[str, Any], refresh: str | None = None) -> "LoadPlan":
         """The plan a connector's source object asks for. One saved before
         load modes existed has no `loadMode`; it gets `replace`, so its
         next run leaves one copy of the source instead of adding another.
@@ -246,6 +260,7 @@ class LoadPlan:
             mode=mode,
             cursor=cursor if mode in INCREMENTAL_MODES or mode == "replace_dedup" else None,
             key=tuple(raw_key or ()),
+            refresh=refresh,
         )
 
 
@@ -529,6 +544,80 @@ def _forget_cursors(pipeline: Any) -> None:
         pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
 
 
+def _forget_table_state(pipeline: Any) -> None:
+    """Drop everything the pipeline remembers about how far the table got: every
+    incremental cursor AND every deduplication marker (`SRC-10` decision 5, a
+    refresh or a clear). Without a cursor an incremental mode reads everything;
+    without the marker `incremental_dedup` treats its next run as the first and
+    replaces. Reads the state stored with the data first (a recreated container
+    has no local copy). `pipeline_drop(state_only=True)` removes a resource's
+    whole state, so a resource that only holds a marker (`replace_dedup` has no
+    cursor) is named too.
+
+    Schema by schema, for the reason `_forget_cursors` gives."""
+    pipeline.sync_destination()
+    remembered: dict[str, list[str]] = {}
+    for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
+        for resource_name, resource_state in (source_state.get("resources") or {}).items():
+            if resource_state.get("incremental") or dedup.MARKER_KEY in resource_state:
+                remembered.setdefault(schema_name, []).append(resource_name)
+    for schema_name, resources in sorted(remembered.items()):
+        pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
+
+
+def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
+    """The `dlt` pipeline that owns one Bronze table: its S3 destination and, via
+    its name, its state (cursor, marker). Shared by `load_via_sink` and `clear_table`
+    so both address the same table the same way."""
+    destination = filesystem(
+        bucket_url=f"s3://{config.warehouse_bucket}/bronze",
+        credentials={
+            "aws_access_key_id": config.rustfs_access_key,
+            "aws_secret_access_key": config.rustfs_secret_key,
+            "endpoint_url": config.rustfs_endpoint,
+        },
+    )
+    return dlt.pipeline(
+        pipeline_name=f"bronze_ingest_{bronze_table_name}",
+        destination=destination,
+        # Flat `bronze` dataset (ADR 0004's flat `bronze` namespace) -- every
+        # Bronze table this pipeline ever writes lands in the same
+        # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
+        dataset_name="bronze",
+    )
+
+
+def clear_table(bronze_table_name: str, config: SinkConfig) -> SinkResult:
+    """Empty a Bronze table and forget its cursor and deduplication marker, loading
+    nothing (`SRC-10` decision 5: "clear", and the first half of "refresh,
+    removing old rows").
+
+    The way is a `replace` run of an empty LIST of rows straight on the table's
+    pipeline. Measured (`test_sink_empty_table.py`): it empties the table and keeps
+    its columns, its day partition on `_ingested_at` and `format-version` 2, so the
+    next load meets the same table. It does NOT go through `load_via_sink`'s
+    `iceberg_adapter` wrapper: there, over a table a `sql_database` source created,
+    the same empty list left every row in place (measured, same file; the cause was
+    not pursued); and an empty `dlt` RESOURCE leaves a table as it is in any case. The previous snapshot stays reachable until it is expired, as for
+    any replace. A table that was never loaded stays absent. Idempotent.
+
+    # Errors
+
+    Whatever `pipeline.run` or the abort of a left-over package raises; a failed run
+    aborts its own package first, as `load_via_sink` does.
+    """
+    _install_catalog_env(config)
+    pipeline = _bronze_pipeline(bronze_table_name, config)
+    _abort_pending(pipeline, strict=True)
+    _forget_table_state(pipeline)
+    try:
+        load_info = pipeline.run([], table_name=bronze_table_name, table_format="iceberg", write_disposition="replace")
+    except Exception:
+        _abort_pending(pipeline)
+        raise
+    return SinkResult(rows=0, has_failed_jobs=load_info.has_failed_jobs, load_info_str=str(load_info))
+
+
 def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
     """Attach the incremental cursor to what `source` loads.
 
@@ -623,15 +712,14 @@ def load_via_sink(
     packages are aborted first (see "What a failed load leaves behind").
     """
     _install_catalog_env(config)
-
-    destination = filesystem(
-        bucket_url=f"s3://{config.warehouse_bucket}/bronze",
-        credentials={
-            "aws_access_key_id": config.rustfs_access_key,
-            "aws_secret_access_key": config.rustfs_secret_key,
-            "endpoint_url": config.rustfs_endpoint,
-        },
-    )
+    if plan.refresh == "remove":
+        # SRC-10 decision 5: refresh, removing old rows. Emptied here, at the point
+        # of loading, after the adapter's schema check let the table through (the
+        # gate runs before this function), and BEFORE the pipeline below exists, so
+        # the two never hold the same working directory at once. A load that fails
+        # after this leaves the table empty until the next successful run; the
+        # console says the rows are removed.
+        clear_table(bronze_table_name, config)
 
     # ADR 0004: every Bronze row carries `_ingested_at`, stamped here --
     # the ONE owner of the column, regardless of what shape a caller
@@ -696,14 +784,7 @@ def load_via_sink(
     if not isinstance(source, (DltSource, DltResource)):
         source = adapted
 
-    pipeline = dlt.pipeline(
-        pipeline_name=f"bronze_ingest_{bronze_table_name}",
-        destination=destination,
-        # Flat `bronze` dataset (ADR 0004's flat `bronze` namespace) -- every
-        # Bronze table this pipeline ever writes lands in the same
-        # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
-        dataset_name="bronze",
-    )
+    pipeline = _bronze_pipeline(bronze_table_name, config)
     # SRC-10 measurement 6: a package left by a PROCESS that died mid-load would
     # be finished by this run's `pipeline.run` INSTEAD of reading (dlt: "the data
     # you passed to the run function will not be extracted"), and the run would
@@ -712,6 +793,8 @@ def load_via_sink(
     # the source, so whatever a dead run left is dropped first, with the state
     # (cursor, marker) restored to before it.
     _abort_pending(pipeline, strict=True)
+    if plan.refresh is not None:
+        _forget_table_state(pipeline)
     # What the pipeline state says about earlier runs, read from the bucket first
     # (a recreated container has no local copy). Only the modes that continue from
     # a cursor consult it; the others cost no extra read.

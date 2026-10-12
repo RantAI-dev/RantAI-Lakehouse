@@ -961,6 +961,31 @@ pub async fn list_recent(
     Ok(rows)
 }
 
+/// Whether a schema change waits for a decision about `object_name` (a table
+/// that could not be added does not count: it is a notice, not a table held
+/// back). A refresh or a clear of such a table would load past the decision, so
+/// the run route refuses it (`SRC-10` decision 5, `SRC-8`).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn object_waits(
+    pool: &PgPool,
+    connector_id: &str,
+    object_name: &str,
+) -> Result<bool, StoreError> {
+    let (waits,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
+         WHERE connector_id = $1 AND object_name = $2 AND status = 'pending' \
+           AND kind <> 'table_added')",
+    )
+    .bind(connector_id)
+    .bind(object_name)
+    .fetch_one(pool)
+    .await?;
+    Ok(waits)
+}
+
 /// Every column of a connector marked inactive, by table then name.
 ///
 /// # Errors

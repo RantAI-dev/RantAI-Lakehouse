@@ -159,6 +159,19 @@ async fn find_connector(
     else {
         return Ok(Found::Skip("run config names no connector"));
     };
+    // `SRC-10` decision 5: a clear empties one table and loads nothing, so it is
+    // neither a success nor a failure of a LOAD. Counting it would reset the
+    // connector's failure streak (and send a "succeeded" alert) for a run that
+    // read nothing from the source. The run stays visible in the run list and as
+    // a `cleared` row of `ingest_run`; a clear that fails is seen there and in the
+    // orchestrator, not counted against the connector's load health.
+    if config
+        .pointer("/ops/run_ingest/config/action")
+        .and_then(Value::as_str)
+        == Some("clear")
+    {
+        return Ok(Found::Skip("a clear loads nothing"));
+    }
     match connectors::get_connector(pool, id).await? {
         Some(detail) => Ok(Found::This(ConnectorRef {
             id: detail.connector.id,
@@ -559,6 +572,12 @@ mod tests {
                 || json!({}),
                 |c| json!({ "ops": { "run_ingest": { "config": { "connector_id": c } } } }),
             );
+            self.knows_run_config(run_id, config, status).await;
+        }
+
+        /// As [`Self::knows_run`], with the whole run config given (a run of
+        /// one table carries `object` and `action` beside the connector id).
+        async fn knows_run_config(&self, run_id: &str, config: Value, status: &str) {
             Mock::given(method("POST"))
                 .and(body_string_contains("runOrError"))
                 .and(body_string_contains(run_id))
@@ -724,6 +743,81 @@ mod tests {
         assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
         assert_eq!(h.posts_to("al-s").await.len(), 1);
         assert!(h.posts_to("al-other").await.is_empty());
+    }
+
+    /// `SRC-10` decision 5: a clear loads nothing, so its run is neither a
+    /// success nor a failure of a load. Whatever the orchestrator says about it,
+    /// the connector's health and failure streak are left alone, no alert is
+    /// sent, and no run event is written; a refresh, which does load, counts as
+    /// any run does.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_clear_run_leaves_the_connectors_run_facts_alone_and_a_refresh_counts_as_a_run(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-f", "connector_failure", CONNECTOR),
+                ("al-s", "connector_success", CONNECTOR),
+            ],
+        )
+        .await;
+        h.knows_run("run-fail", Some(CONNECTOR), "FAILURE").await;
+        h.failed("run-fail").await;
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        let config = |action: &str| {
+            json!({ "ops": { "run_ingest": { "config": {
+                "connector_id": CONNECTOR, "object": "public.orders", "action": action
+            } } } })
+        };
+
+        // A SUCCESS clear does not reset the streak and sends no success alert.
+        h.knows_run_config("run-clear", config("clear"), "SUCCESS")
+            .await;
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-clear", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 0);
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        assert!(h.posts_to("al-s").await.is_empty());
+
+        // A FAILED clear is not counted against the load either.
+        h.knows_run_config("run-clear-fail", config("clear"), "FAILURE")
+            .await;
+        h.failed("run-clear-fail").await;
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 1));
+        assert_eq!(
+            h.posts_to("al-f").await.len(),
+            1,
+            "only the first, real failure"
+        );
+        let (events,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pipeline_run_event WHERE run_id IN ('run-clear', 'run-clear-fail')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
+
+        // A refresh loads: an ordinary run for health and alerts.
+        h.knows_run_config("run-refresh", config("refresh_remove"), "SUCCESS")
+            .await;
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-refresh", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 1);
+        assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
+        assert_eq!(h.posts_to("al-s").await.len(), 1);
     }
 
     /// `SRC-8` decision D7: a table that waits for a schema-change decision

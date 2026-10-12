@@ -497,7 +497,7 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/connectors/{id}/ingest/run",
-            axum::routing::post(connectors::ingest_run),
+            axum::routing::post(connectors::ingest_run_request),
         )
         .route(
             "/api/connectors/{id}/ingest/runs",
