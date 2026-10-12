@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import {
   ConnectorIngestPanel,
@@ -656,23 +656,20 @@ describe("ConnectorIngestPanel refresh and clear", () => {
   const menu = () => screen.getByRole("button", { name: "Refresh or clear public.orders" }) as HTMLButtonElement
 
   async function pick(item: string) {
-    const trigger = await screen.findByRole("button", { name: "Refresh or clear public.orders" })
-    // Press until the menu is open. Base UI opens it on the press, and in happy-dom the first press is sometimes
-    // lost when the previous test closed a dialog a moment ago (one run in ten failed with a single click);
-    // a press while it is open would close it again, so it is repeated only while it is closed.
-    await waitFor(
-      () => {
-        if (trigger.getAttribute("aria-expanded") !== "true") {
-          fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" })
-          fireEvent.mouseDown(trigger, { button: 0 })
-          fireEvent.pointerUp(trigger, { button: 0, pointerType: "mouse" })
-          fireEvent.mouseUp(trigger, { button: 0 })
-          fireEvent.click(trigger)
-        }
-        expect(screen.getByText(item)).toBeDefined()
-      },
-      { timeout: 5000, interval: 250 }
-    )
+    // Until the run list and the schema changes have loaded the row shows a disabled placeholder, so wait for
+    // the enabled trigger. That alone is not enough (measured: a single press still failed about one run in
+    // three of this folder): the state updates that follow the enabling were still pending, and a press
+    // before they were flushed did not open the menu. Flushing them with `act` makes ONE press open it
+    // (20 runs of this folder, 0 failures). Which update it is was not identified.
+    await waitFor(() => expect(menu().disabled).toBe(false))
+    await act(async () => {})
+    const trigger = menu()
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" })
+    fireEvent.mouseDown(trigger, { button: 0 })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: "mouse" })
+    fireEvent.mouseUp(trigger, { button: 0 })
+    fireEvent.click(trigger)
+    await screen.findByText(item)
     fireEvent.click(screen.getByText(item))
   }
 
