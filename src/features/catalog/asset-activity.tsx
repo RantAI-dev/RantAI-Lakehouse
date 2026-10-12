@@ -30,6 +30,7 @@ import {
 import { useAuth } from "@/features/auth/auth-provider"
 import { useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
+import { snapshotRetentionText } from "@/lib/snapshot-picker"
 import {
   formatCompactNumber,
   formatDateTime,
@@ -404,6 +405,11 @@ export function AssetActivity({
   const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
   const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])
   const snapshotCount = iceberg.status === "success" ? (iceberg.data?.snapshots.length ?? 0) : 0
+  // DATA-16 D2: how far back versions go is what the list shows, never a promise.
+  const retention =
+    iceberg.status === "success" && iceberg.data && iceberg.data.snapshots.length > 0
+      ? snapshotRetentionText(iceberg.data.snapshots)
+      : null
   // Reads by dashboards are not in the query history the usage is counted from.
   const dashboards = a.dependents.filter((d) => d.kind.toLowerCase().includes("dashboard")).length
   const uncounted =
@@ -420,8 +426,8 @@ export function AssetActivity({
         size="sm"
         title="Snapshots"
         description={`One per load of an Iceberg table, newest first. Any of them can be queried as the table stood then.${
-          snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""
-        }`}
+          retention ? ` ${retention}.` : ""
+        }${snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""}`}
         action={
           snapshotCount > PAGE_SIZES[0] ? (
             <CountToggle

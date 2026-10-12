@@ -1,4 +1,5 @@
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
+import { pinSnapshot } from "./snapshot-picker"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { QueryEngine } from "@/services/contracts/queries"
 
@@ -73,26 +74,21 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema">) {
  * read from its Iceberg table (a `silver.*` read has no snapshots to go
  * back to), or when the id is not the plain number Iceberg issues.
  *
- * ClickHouse pins a snapshot with a query-level setting; Trino with the
- * same `FOR VERSION AS OF` clause Query Studio's own time-travel control
- * writes (`@/lib/snapshot-picker`).
+ * Only ClickHouse can be pinned (`pinSnapshot`, the one function that
+ * writes the pin). A Trino target gives `null` until Trino time travel is
+ * supported: the API cannot parse the clause it would need, so offering a
+ * link would offer a query that is refused (`DATA-16` F6, `DATA-21`).
  */
 export function assetSnapshotQueryHref(
   a: Target & Pick<AssetDetail, "schema">,
   snapshotId: string
 ): string | null {
-  if (!isIcebergCandidate(a) || !/^\d+$/.test(snapshotId)) return null
+  if (!isIcebergCandidate(a)) return null
   const target = assetQueryTarget(a)
-  const base = assetStarterSql(a)
-  let sql: string
-  if (target.engine === "trino") {
-    sql = base.replace(`FROM ${target.table}`, `FROM ${target.table} FOR VERSION AS OF ${snapshotId}`)
-  } else if (target.table.includes("`bronze.")) {
-    // The `DataLakeCatalog` name, e.g. icecat_api.`bronze.orders`.
-    sql = `${base}\nSETTINGS iceberg_snapshot_id = ${snapshotId}`
-  } else {
-    return null
-  }
+  // The `DataLakeCatalog` name, e.g. icecat_api.`bronze.orders`.
+  if (!target.table.includes("`bronze.")) return null
+  const sql = pinSnapshot(assetStarterSql(a), target.engine, snapshotId)
+  if (sql === null) return null
   const params = new URLSearchParams({ sql, engine: target.engine })
   return `/query-studio?${params.toString()}`
 }

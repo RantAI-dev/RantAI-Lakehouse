@@ -4,16 +4,12 @@ import * as React from "react"
 
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState } from "@/components/patterns/page-states"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Button } from "@/components/ui/button"
-import { useService } from "@/hooks/use-service"
-import { insertAsOfClause } from "@/lib/snapshot-picker"
-import { lakehouseService } from "@/services"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { IcebergTimeTravelControls } from "./time-travel-controls"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { SaveQuerySheet } from "./save-query-sheet"
 import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
@@ -22,107 +18,6 @@ import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
-
-/**
- * Iceberg time-travel controls: the user picks a namespace, then a table
- * (from `lakehouseService.listTables`), and that table's own snapshots
- * (from `getTableDetail`) feed the picker — the table is never inferred
- * from the SQL text itself. Only rendered when the engine is `trino`,
- * since `FOR VERSION AS OF` is meaningless against ClickHouse.
- */
-function IcebergTimeTravelControls({
-  sql,
-  onApply,
-}: {
-  sql: string
-  onApply: (nextSql: string) => void
-}) {
-  const [namespace, setNamespace] = React.useState<string | null>(null)
-  const [table, setTable] = React.useState<string | null>(null)
-  const [snapshotId, setSnapshotId] = React.useState<string | null>(null)
-
-  const namespacesState = useService((s) => lakehouseService.listNamespaces(undefined, s), [])
-  const tablesState = useService(
-    (s) => (namespace ? lakehouseService.listTables(namespace, undefined, s) : Promise.resolve([])),
-    [namespace]
-  )
-  const detailState = useService(
-    (s) =>
-      namespace && table
-        ? lakehouseService.getTableDetail(namespace, table, s)
-        : Promise.resolve(null),
-    [namespace, table]
-  )
-  const snapshots = detailState.status === "success" && detailState.data ? detailState.data.snapshots : []
-
-  function handleApply() {
-    if (!namespace || !table || !snapshotId) return
-    onApply(insertAsOfClause(sql, `${namespace}.${table}`, snapshotId))
-  }
-
-  return (
-    <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-border p-2 text-xs">
-      <span className="font-medium text-muted-foreground">Time travel</span>
-      <Select
-        value={namespace ?? ""}
-        onValueChange={(v) => {
-          setNamespace(v || null)
-          setTable(null)
-          setSnapshotId(null)
-        }}
-      >
-        <SelectTrigger size="sm">
-          <SelectValue placeholder="Namespace" />
-        </SelectTrigger>
-        <SelectContent>
-          {namespacesState.status === "success"
-            ? namespacesState.data.map((n) => (
-                <SelectItem key={n.name} value={n.name}>
-                  {n.name}
-                </SelectItem>
-              ))
-            : null}
-        </SelectContent>
-      </Select>
-      <Select
-        value={table ?? ""}
-        onValueChange={(v) => {
-          setTable(v || null)
-          setSnapshotId(null)
-        }}
-        disabled={!namespace}
-      >
-        <SelectTrigger size="sm">
-          <SelectValue placeholder="Table" />
-        </SelectTrigger>
-        <SelectContent>
-          {tablesState.status === "success"
-            ? tablesState.data.map((t) => (
-                <SelectItem key={t.name} value={t.name}>
-                  {t.name}
-                </SelectItem>
-              ))
-            : null}
-        </SelectContent>
-      </Select>
-      <Select value={snapshotId ?? ""} onValueChange={(v) => setSnapshotId(v || null)} disabled={snapshots.length === 0}>
-        <SelectTrigger size="sm">
-          <SelectValue placeholder="Snapshot" />
-        </SelectTrigger>
-        <SelectContent>
-          {snapshots.map((snap) => (
-            <SelectItem key={snap.id} value={snap.id}>
-              {snap.id} · {snap.operation}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <Button size="sm" variant="outline" onClick={handleApply} disabled={!namespace || !table || !snapshotId}>
-        Insert AS OF
-      </Button>
-    </div>
-  )
-}
 
 /** Query Studio: natural-language ↔ SQL workspace with execution transparency. */
 export function QueryStudioPage() {
@@ -182,14 +77,16 @@ export function QueryStudioPage() {
                 onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
               />
               {/*
-               * Iceberg time-travel: inserts a `FOR VERSION AS OF` clause
-               * into the SQL text. Kept unconditional even when the
-               * engine picker (`SqlPanel`) is set to ClickHouse — the
-               * clause is meaningless there, so running it is on the
-               * author, the same way writing any Trino-only syntax into
-               * the editor is.
+               * Iceberg time travel: pins one version of the raw tables
+               * through a query setting. Shown whatever the engine, and
+               * disabled with a note on Trino, so the reason is on screen
+               * (DATA-16 F5).
                */}
-              <IcebergTimeTravelControls sql={studio.sql} onApply={studio.setSql} />
+              <IcebergTimeTravelControls
+                sql={studio.sql}
+                engine={studio.engine}
+                onApply={studio.setSql}
+              />
             </TabsContent>
           </Tabs>
           {studio.runAct.status === "error" ? (
