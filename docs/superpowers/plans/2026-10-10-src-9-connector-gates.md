@@ -261,6 +261,79 @@ step. Expected risks in CI, most likely first: Kafka reload arithmetic, MySQL
 discover decoding, REST connect, the pg connect.
 
 
+### Second pass (developer): F-a, F-b, F-c, tasks 3 and 4
+
+Commits after `f5cef8a`: `fe76d3d` (F-a), `a0fbc77` (F-b), `1c5b79d` (F-c),
+`08adff1` (task 3), `987dd65` (task 4).
+
+**F-a, finding G1 (MySQL discovery 422 "connection failed").** Found by
+reading, not proven: `connector_probe::probe_mysql` and
+`connector_discover::discover_dial` build their options with the same
+`mysql_connect_options` (pinned address, `Preferred` TLS, port, database,
+user, password), so the connection is not the difference. The difference is
+the query: discovery decodes `information_schema.columns` rows into `String`,
+and `MySQL` 8 reports those columns with a binary collation, which `sqlx`
+refuses (`ColumnDecode`); `classify_sqlx_error` has no arm for it and answers
+"connection failed". `MYSQL_DISCOVER_QUERY` now casts the three columns to
+`CHAR CHARACTER SET utf8mb4` (a `const`, one `?`). `From<DiscoverError>` now
+logs `sqlx_kind` (the variant name, a fixed string) and the class; never the
+error text, which for a database error carries the server's message. The
+module comment that said MySQL/SQL Server discovery has no live test is
+corrected. Confidence: moderate; CI (g6) decides, and the new log line names
+the cause if it is another.
+
+**F-b, finding G2.** `discover` answers `supported: false` with a fixed reason
+(`ORACLE_DISCOVER_REASON`, names `SRC-13`) before any SSRF check or secret
+resolution. No existing test asserted the 422 (searched `rust/crates/*/tests`
+and `src`); a new unit test, `oracle_discovery_is_an_honest_unsupported_answer`,
+asserts the new answer. Mismatch: the brief asked for Oracle's `discover` cell
+to be `refused`; `Registry.load` rejects any non-`missing` step for a type with
+no gate (`ops/gates/gate_summary.py`), and weakening that is not mine to do, so
+the cell stays `missing` with a note saying `refused` is expected once the
+Oracle gate exists (task 5).
+
+**F-c.** `ops/g3a/g3a_test.py` and `ops/g7/g7_pipeline_test.py` carry twins of
+g3's `_dagster_job_is_loaded` / `_post_trigger`; g3a also waits for its job in
+`step_wait_for_services`. No assertion changed. g7 is not run by any CI job or
+compose service today.
+
+**Task 3.** `mariadb-g6` (`mariadb:11.4`, the LTS series) in the override,
+`MARIADB_G6_ROOT_PASSWORD` and `CONNECTOR_MARIADB_PASSWORD` (`:?`), TCP
+healthcheck, wire driver `mysql`. **Task 4.** `sftp-g6`
+(`atmoz/sftp:alpine@sha256:7e43...813f`), `sftp-g6-hostkey-init`,
+`SFTP_G6_PASSWORD`; the gate derives the pinned fingerprint from the fixture's
+public key and uploads a 3-row CSV as the user.
+
+**Time estimate (not measured).** g6 was 19m51s. Added: two image pulls
+(about 110 MB MariaDB, 9 MB SFTP) inside the parallel `up`, 20 to 40 s; two
+more connectors whose first and second runs are launched with the others,
+about 30 to 60 s each stage. Estimate +1 to 2.5 minutes, so 21 to 22.5 minutes,
+under the 23-minute line; the timeout is untouched.
+
+**Commands run, with results.** `cargo fmt --check`: ok. `cargo clippy
+--workspace --all-targets --all-features --locked -- -D warnings` (shared
+cache dir, 2 jobs): finished clean, 2m33s. `py_compile` on `ops/g3a`, `ops/g7`
+and `ops/g6` files: ok. `python3 -m unittest discover -s ops/gates -p
+'test_*.py'`: 27 tests OK. `check_intra_package_imports.py`,
+`check_bare_iceberg_count.py`, `check_compose_init_readiness.py`: pass.
+`yaml.safe_load` of `ci.yml` and the override: ok. `docker compose -p check
+-f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6
+--profile dagster config --quiet` with a dummy env file: ok, and it fails
+closed (names the missing variable) without the env file.
+
+**Not verified.** No cargo test (the new Rust unit test and the existing
+query-text test have not run); nothing about the containers: that `atmoz/sftp`
+runs `/etc/sftp.d` scripts before sshd and accepts the installed key, that
+`mariadb-admin` ping works as the healthcheck, that sqlx and pymysql
+authenticate to MariaDB 11.4, that the `CAST` fixes the MySQL decode, the Kafka
+reload arithmetic from the first pass, the time estimate.
+
+**Expect from CI.** MySQL discover passes if the cast was the cause, otherwise
+the API log now names the sqlx variant. MariaDB: four passes. SFTP: connect and
+discover `refused-as-expected` (discover's reason today reads "unknown adapter
+\"sftp\"", not a statement that discovery is unsupported; reason text is not
+asserted), load and reload pass. Oracle stays `missing`.
+
 ## Review
 
 *(planner)*
