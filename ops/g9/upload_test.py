@@ -10,7 +10,9 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
 
 1. The API answers, and (when `DAGSTER_URL` is set) the code location lists
    `file_ingest_job`. Then it signs in, as `ops/g6/g6_ingest_matrix_test.py`
-   does.
+   does, and makes sure the account belongs to a tenant (an upload belongs to
+   the uploader's active tenant, and the bootstrap admin of a fresh database
+   is in none: `POST /api/uploads` answers 400 for it; SRC-9 fourth pass).
 2. It uploads `ops/fixtures/uploads/sap_report_utf16.xls`: UTF-16 tab-separated
    text with two title lines and two blank lines above its header, named
    `.xls` and sent as an Excel type, the export that motivated the feature.
@@ -67,7 +69,8 @@ Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 - `DAGSTER_URL`: the Dagster GraphQL endpoint. Optional: when set, the gate
   waits for the code location to list `file_ingest_job` before it starts.
 - `G9_TENANT_ID`: a tenant the account belongs to, sent as `X-Tenant`.
-  Optional: without it the API uses the account's first tenant.
+  Optional: without it the gate puts the account into the seeded tenant
+  `meridian-group` (`step_ensure_tenant`) and sends that tenant's id.
 
 It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` and
 `ops/fixtures/parquet/` beside this directory, so a container that runs it needs `ops/` and not only
@@ -144,6 +147,8 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "")
 QUERY_DB = os.environ.get("ICEBERG_QUERY_DB", "icecat_api")
 TENANT_ID = os.environ.get("G9_TENANT_ID", "")
+# The tenant that 0042_tenant_provisioning.sql seeds; the same one the g6 gates join.
+GATE_TENANT_SLUG = "meridian-group"
 
 
 class G9Failure(Exception):
@@ -228,9 +233,52 @@ def step_login(api) -> None:
         relogin = api.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
         if not relogin.ok:
             raise G9Failure(f"re-login after rotation failed: {relogin.status_code} {relogin.text[:300]}")
-    if TENANT_ID:
-        api.headers["X-Tenant"] = TENANT_ID
     print("[g9] logged in")
+
+
+def _me_tenant_ids(api) -> list[str]:
+    me = api.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G9Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def step_ensure_tenant(api) -> None:
+    """Make sure the account belongs to a tenant, and send it as `X-Tenant`.
+
+    Twin of `step_ensure_tenant` in `ops/g6/g6_ingest_matrix_test.py`, copied
+    and not imported because the gates share no module (and g9's runner mounts
+    only `ops/g9` and `ops/fixtures`). The bootstrap admin of a fresh database
+    belongs to no tenant, and `POST /api/uploads` answers 400 ("Your account
+    belongs to no tenant") for such an account: an upload belongs to the
+    active tenant (`tenant_scope::resolve`). So the account joins
+    `GATE_TENANT_SLUG` with `PUT /api/identity/users/{id}/tenants/{tenant_id}`
+    (the unrestricted admin may add itself) and `/api/auth/me` is read again
+    to confirm. With `G9_TENANT_ID` set the operator has chosen the tenant and
+    nothing is changed."""
+    if TENANT_ID:
+        if TENANT_ID not in _me_tenant_ids(api):
+            raise G9Failure(f"G9_TENANT_ID {TENANT_ID!r} is not one of the account's tenants")
+        api.headers["X-Tenant"] = TENANT_ID
+        return
+    me = api.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G9Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    listed = api.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise G9Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
+    tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if tenant is None:
+        raise G9Failure(f"tenant {GATE_TENANT_SLUG!r} does not exist (0042_tenant_provisioning.sql seeds it)")
+    if tenant["id"] not in _me_tenant_ids(api):
+        added = api.put(f"{API_URL}/api/identity/users/{me.json()['id']}/tenants/{tenant['id']}", timeout=10)
+        if not added.ok:
+            raise G9Failure(f"add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}")
+        if tenant["id"] not in _me_tenant_ids(api):
+            raise G9Failure(f"the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it")
+        print(f"[g9] added the account to tenant {GATE_TENANT_SLUG!r}")
+    api.headers["X-Tenant"] = tenant["id"]
+    print(f"[g9] active tenant: {GATE_TENANT_SLUG}")
 
 
 def run_query(api, sql: str) -> dict:
@@ -537,6 +585,7 @@ def main() -> int:
         _require_settings()
         step_wait_for_services(api, requests)
         step_login(api)
+        step_ensure_tenant(api)
         upload_id, using, expected = step_upload_and_preview(api, state)
         file_rows = len(expected["rows"])
         print(f"[g9] table for this run: {table}")
