@@ -622,3 +622,30 @@ and T-B (decision 9). Nothing pushed, the PR untouched.
 **Checks run:** `cargo fmt --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` clean (2m13s, shared target); `bun run typecheck`, `bun run lint` (0 errors, 6 warnings), `bun run test` (1077 pass, 1 skip, 0 fail); ops/gates unittest 29 OK; ops/lint unittest 23 OK; four ops/lint checks rc 0; test_required_gate.sh 30 passed; test_detect_change_scope.sh 33 passed; `yaml.safe_load` of ci.yml and both compose files; `docker compose config --quiet` for profiles g6-sql, g6-other, g6, g6-linklocal and `--profile "*"`.
 Not verified: any compose `up`, the gate in either group, the migration against
 a database, the Rust tests (no `cargo test`), the CI timings.
+
+### Close of the build, 2026-10-12, at `3edde86` (then `main` merged in)
+
+Six developer passes; each was pushed and proven by this pull request's own
+CI, as decision 7 set out. The planner read every pass's report and its
+riskiest diffs (the workflow, the compose overrides, the product fixes), and
+re-ran on the build machine what can run there: the unit tests of
+`ops/gates` and `ops/lint`, the coverage check, YAML and Python syntax, and
+`cargo fmt --check`. No gate and no Rust test was run on the build machine by
+anyone.
+
+CI on `3edde86`, three attempts: every job passed in each (the two
+`gitleaks` jobs of the Security workflow are red on `main` too). Durations
+and coverage are in `docs/plans/SRC-9-RESULT.md`. No open `BLOCKER` or
+`SHOULD-FIX`.
+
+What the reviews changed along the way: the gate was never bent around a
+product defect (G1 to G5 in the result document were each fixed or decided
+by the product owner); two expected values the developer had written from
+memory were corrected by CI rather than by review, which is a limit of
+reviewing Rust tests that cannot be run here.
+
+Follow-ups filed: `SRC-19` (a wrong PostgreSQL password is retried),
+`SRC-20` (`ops/g7` runs in no CI job). Carried by existing items: a live
+connection test for Oracle, MongoDB, Kafka and SFTP (`SRC-5`); discovery for
+the other types, and the wording "unknown adapter" in SFTP's refusal
+(`SRC-13`); the two CDC types (`SRC-4`).
