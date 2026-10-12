@@ -5,7 +5,7 @@ import type { ColumnDef } from "@tanstack/react-table"
 import { MoreHorizontal } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
-import { HealthBadge } from "@/components/patterns/status-badge"
+import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -36,6 +36,31 @@ const HEALTH_OPTIONS = (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
   value: h,
   label: HEALTH_LABEL[h],
 }))
+
+/**
+ * The later of a connector's last successful and last failed run, with which
+ * one it was; `null` when it has neither (no run has reported yet, which the
+ * list says as "No runs yet" rather than showing a blank). The two come from
+ * the run reports (`SRC-7`), not from a manual Test.
+ */
+export function latestRun(
+  c: Pick<Connector, "lastRunSuccessAt" | "lastRunFailureAt">
+): { at: string; succeeded: boolean } | null {
+  const { lastRunSuccessAt: ok, lastRunFailureAt: failed } = c
+  if (!ok && !failed) return null
+  if (!ok) return { at: failed as string, succeeded: false }
+  if (!failed) return { at: ok, succeeded: true }
+  // A timestamp that does not parse loses to one that does; a tie is a failure,
+  // the safer thing to show.
+  return Date.parse(ok) > Date.parse(failed)
+    ? { at: ok, succeeded: true }
+    : { at: failed, succeeded: false }
+}
+
+/** "3 failed in a row" for a streak above zero, `null` otherwise. */
+export function failureStreakLabel(streak: number): string | null {
+  return streak > 0 ? `${streak} failed in a row` : null
+}
 
 /**
  * The Sources list's columns. A connector opens at `/connectors/<id>`: the
@@ -92,7 +117,18 @@ export function getConnectorColumns(): ColumnDef<Connector>[] {
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Health" />
       ),
-      cell: ({ row }) => <HealthBadge health={row.original.health} />,
+      cell: ({ row }) => {
+        const streak = failureStreakLabel(row.original.failureStreak)
+        return (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <HealthBadge health={row.original.health} />
+            {streak ? <span className="text-xs text-destructive">{streak}</span> : null}
+            {row.original.pausedReason ? (
+              <Pill tone="warning">Paused: {row.original.pausedReason}</Pill>
+            ) : null}
+          </div>
+        )
+      },
       enableColumnFilter: true,
       meta: {
         label: "Health",
@@ -138,6 +174,28 @@ export function getConnectorColumns(): ColumnDef<Connector>[] {
       meta: {
         label: "Last test",
         variant: "date",
+      },
+    },
+    {
+      id: "lastRun",
+      accessorFn: (c) => latestRun(c)?.at ?? null,
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Last run" />
+      ),
+      cell: ({ row }) => {
+        const last = latestRun(row.original)
+        if (!last) return <span className="text-muted-foreground">No runs yet</span>
+        return (
+          <span className="text-muted-foreground">
+            <span className={last.succeeded ? "text-foreground" : "text-destructive"}>
+              {last.succeeded ? "Succeeded" : "Failed"}
+            </span>{" "}
+            {formatRelativeTime(last.at)}
+          </span>
+        )
+      },
+      meta: {
+        label: "Last run",
       },
     },
     {

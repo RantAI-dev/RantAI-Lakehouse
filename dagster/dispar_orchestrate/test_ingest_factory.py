@@ -46,6 +46,76 @@ def _no_catalog_registration(monkeypatch):
     monkeypatch.setattr(f.connector_catalog, "register_connector_table", lambda *a, **k: 0)
 
 
+class _FakeColumn:
+    def __init__(self, name: str, type_name: str, nullable: bool = True) -> None:
+        self.name, self.type, self.nullable = name, type_name, nullable
+
+    def __str__(self) -> str:  # `str(column.type)` is the database's spelling
+        return self.type
+
+
+class _FakeTable:
+    """What `sql_database` hands a `table_adapter_callback`: a reflected
+    SQLAlchemy `Table`, reduced to what `schema_observer` reads."""
+
+    def __init__(self, columns=(("id", "INTEGER", False), ("note", "VARCHAR(40)", True)), key=("id",)) -> None:
+        self._columns = [_FakeColumn(n, _FakeType(t), nullable) for n, t, nullable in columns]
+        self.columns = self._columns
+        by_name = {c.name: c for c in self._columns}
+        self.primary_key = type("PK", (), {"columns": [by_name[k] for k in key]})()
+
+
+class _FakeType:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _reflect(callback, table=None) -> None:
+    """What a real `sql_database` build does: reflect, and hand the table to
+    the callback (SRC-8). A fake source builder calls this."""
+    if callback is not None:
+        callback(table or _FakeTable())
+
+
+@pytest.fixture(autouse=True)
+def observations(monkeypatch):
+    """Every test here runs with an API that answers `load` for every
+    schema observation (SRC-8) and records what was asked. A test of the
+    observation itself replaces the answer through `observations.answer`: a
+    decision, an exception to raise, or a function of the object's name."""
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import schema_observer
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.answer = schema_observer.Decision(action="load", columns=None, changes=[])
+
+    recorder = Recorder()
+
+    def fake_post(cfg, connector_id, object_name, columns, primary_key, phase, run_id):
+        recorder.calls.append(
+            {
+                "connector_id": connector_id,
+                "object": object_name,
+                "columns": list(columns),
+                "primary_key": list(primary_key),
+                "phase": phase,
+                "run_id": run_id,
+            }
+        )
+        answer = recorder.answer(object_name) if callable(recorder.answer) else recorder.answer
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(f.schema_observer, "post_observation", fake_post)
+    return recorder
+
+
 UNTIL = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
 
 
@@ -168,7 +238,8 @@ def test_run_one_object_resolves_secrets_via_the_allowlisted_resolver(monkeypatc
                 (),
                 {
                     "build_source": staticmethod(
-                        lambda dial, secrets, objs: calls.append(secrets)
+                        lambda dial, secrets, objs, table_adapter_callback=None: calls.append(secrets)
+                        or _reflect(table_adapter_callback)
                         or type("R", (), {"source": iter(()), "resolved": None})()
                     )
                 },
@@ -228,7 +299,7 @@ def test_run_one_object_records_failed_and_reraises_on_any_other_exception(monke
                 (),
                 {
                     "build_source": staticmethod(
-                        lambda dial, secrets, objs: (_ for _ in ()).throw(
+                        lambda dial, secrets, objs, table_adapter_callback=None: (_ for _ in ()).throw(
                             ConnectionError("db.internal:5432 refused")
                         )
                     )
@@ -278,7 +349,7 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
 
     plans = []
 
-    def fake_run_bronze_ingest(cfg, plan):
+    def fake_run_bronze_ingest(cfg, plan, gate=None):
         assert isinstance(cfg, _StubCfg)
         plans.append(plan)
         return {"rows": 42, "bronze_table_name": "orders", "source_schema": "public", "source_table": "orders"}
@@ -381,8 +452,9 @@ def test_run_one_object_routes_an_oracle_driver_sql_connector_through_the_oracle
     oracle_calls = []
     pinned_calls = []
 
-    def fake_oracle_build_source(dial, secrets, source_objects):
+    def fake_oracle_build_source(dial, secrets, source_objects, table_adapter_callback=None):
         oracle_calls.append((dial, secrets, source_objects))
+        _reflect(table_adapter_callback)
         return type("R", (), {"source": iter(()), "resolved": f.ssrf_guard.ResolvedAddress("10.0.0.9", 1521, 2)})()
 
     monkeypatch.setattr(f.oracle_adapter, "build_source", fake_oracle_build_source)
@@ -618,7 +690,7 @@ def test_run_ingest_never_calls_run_one_object_for_a_stream_mode_connector(monke
     import dispar_orchestrate.ingest_factory as f
     from dagster import build_op_context
 
-    monkeypatch.setattr(f, "_run_stream_connector", lambda connector: None)
+    monkeypatch.setattr(f, "_run_stream_connector", lambda connector, run_id=None: None)
     monkeypatch.setattr(
         f, "_run_one_object", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("a stream-mode connector must never reach the batch per-object loop")
@@ -953,7 +1025,7 @@ def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> 
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
     registered = []
     monkeypatch.setattr(
         f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
@@ -981,7 +1053,7 @@ def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkey
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
 
     def _broken(*a, **k):
         raise RuntimeError("clickhouse is down")
@@ -1016,7 +1088,7 @@ def test_run_ingest_reports_each_objects_measured_rows_as_a_materialization(monk
 
     _stub_env(monkeypatch)
     rows_by_object = {"orders": 42, "sheet": None}
-    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj: rows_by_object[obj["name"]])
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: rows_by_object[obj["name"]])
     connector = {
         "id": "conn-pg",
         "adapter": "sql",
@@ -1078,7 +1150,7 @@ def test_three_objects_yield_three_mapped_steps_with_their_keys(monkeypatch) -> 
     _stub_env(monkeypatch)
     monkeypatch.setattr(
         f, "_run_one_object",
-        lambda connector, obj: {"orders": 7, "customers": 3, "invoices": 1}[obj["name"]],
+        lambda connector, obj, run_id=None: {"orders": 7, "customers": 3, "invoices": 1}[obj["name"]],
     )
     connector = _batch_connector(["orders", "customers", "invoices"])
     monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
@@ -1120,6 +1192,7 @@ def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monk
     class _FakeOutcome:
         def __init__(self, rows: int) -> None:
             self.rows = rows
+            self.columns = ()  # a `SinkResult` always has them (SRC-8)
 
     class _FakeResult:
         def __init__(self, rows: int) -> None:
@@ -1128,7 +1201,8 @@ def test_one_failing_object_fails_only_its_step_and_records_its_failure_row(monk
             self.rows = rows
 
     class _FakeAdapter:
-        def build_source(self, dial, secrets, objs):
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            _reflect(table_adapter_callback)
             if objs[0]["name"] == "customers":
                 raise f.UnknownAdapter("adapter=something-not-real")
             return _FakeResult(rows={"orders": 11, "invoices": 5}[objs[0]["name"]])
@@ -1217,7 +1291,7 @@ def test_oracle_tls_config_error_from_a_mapped_step_is_wrapped_in_a_non_retryabl
 
     import dispar_orchestrate.ingest_factory as f
 
-    def fake_run_one_object(_connector, obj):
+    def fake_run_one_object(_connector, obj, run_id=None):
         raise f.oracle_adapter.OracleTlsConfigError(
             f"oracle tls config rejected for {obj.get('target')!r}"
         )
@@ -1278,7 +1352,7 @@ def test_stream_connector_yields_no_mapped_steps(monkeypatch) -> None:
     called = []
     monkeypatch.setattr(
         f, "_run_stream_connector",
-        lambda connector: called.append(connector["id"]),
+        lambda connector, run_id=None: called.append(connector["id"]),
     )
     result = f.ingest_job.execute_in_process(
         raise_on_error=False,
@@ -1357,3 +1431,821 @@ def test_no_dynamic_output_value_contains_a_resolved_secret(monkeypatch) -> None
         # invariant is closing.
         for field in ("password", "token", "api_key", "secret"):
             assert field not in payload["connector"], f"{field!r} leaked into DynamicOutput payload"
+
+
+# --- SRC-8 task 6: observe a batch SQL table before it loads ------------------
+#
+# Every test drives the real `_run_one_object` with a fake adapter that
+# "reflects" the way `sql_database` does (`_reflect`), a fake sink, and the
+# `observations` fixture standing in for `lakehouse-api`.
+
+
+def _mysql_connector() -> dict:
+    return {
+        "id": "conn-mysql",
+        "adapter": "sql",
+        "dial": {"driver": "mysql", "host": "db.internal", "port": 3306, "database": "shop", "user": "u"},
+        "secretRef": "env:CONNECTOR_MYSQL_PASSWORD",
+        "secretRefSecondary": None,
+    }
+
+
+def _wire_mysql(monkeypatch, *, loads: list, builds: list, table=None):
+    """Fake the generic SQL adapter and the sink; `loads` gets one entry per
+    row load, `builds` the column names each build left selected."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f, "_host_of", lambda dial: None)
+
+    class _Adapter:
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            fake_table = table or _FakeTable()
+            _reflect(table_adapter_callback, fake_table)
+            builds.append([c.name for c in fake_table._columns])
+            return type("R", (), {"source": object(), "resolved": None})()
+
+    monkeypatch.setitem(f._ADAPTERS, "sql", _Adapter())
+
+    def fake_load(source, target, sink_config, plan):
+        loads.append(target)
+        return f.sink_adapter.SinkResult(rows=5, has_failed_jobs=False, load_info_str="")
+
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", fake_load)
+    return recorded
+
+
+def test_the_observation_is_posted_before_any_row_is_loaded(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    seen_at_load: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    original = f.sink_adapter.load_via_sink
+
+    def load_after_checking(*args, **kwargs):
+        seen_at_load.append(len(observations.calls))  # observations made by the time rows move
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", load_after_checking)
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"}, run_id="run-7")
+
+    assert seen_at_load == [1]
+    [call] = observations.calls
+    assert call["phase"] == "before_load"
+    assert call["object"] == "shop.orders"
+    assert call["run_id"] == "run-7"
+    assert [(c.name, c.type_name, c.nullable) for c in call["columns"]] == [
+        ("id", "INTEGER", False),
+        ("note", "VARCHAR(40)", True),
+    ]
+    assert call["primary_key"] == ["id"]
+    assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+def test_a_wait_answer_loads_nothing_records_waiting_and_does_not_raise(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[{"kind": "type_changed"}])
+
+    rows = f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    assert rows is None
+    assert loads == []
+    assert [(r["status"], r["rows"], r["object_name"]) for r in recorded] == [("waiting", None, "shop.orders")]
+    assert "schema change" in recorded[0]["error"]
+    # A waiting table is not registered in the catalog either: it did not load.
+
+
+def test_a_wait_answer_for_a_postgres_table_loads_nothing_and_records_waiting(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    gates: list = []
+
+    def fake_run_bronze_ingest(cfg, plan, gate=None):
+        gates.append(gate(_reflected_table()))
+        return {"rows": None, "waiting": True}
+
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", fake_run_bronze_ingest)
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[])
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "pg.internal", "port": 5432, "database": "d", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+    }
+
+    assert f._run_one_object(connector, {"name": "public.orders", "target": "orders"}, run_id="r") is None
+
+    assert [(r["status"], r["rows"]) for r in recorded] == [("waiting", None)]
+    assert gates[0].action == "wait"
+    assert observations.calls[0]["object"] == "public.orders"
+    assert observations.calls[0]["run_id"] == "r"
+
+
+def _reflected_table():
+    from dispar_orchestrate import schema_observer
+
+    return schema_observer.ReflectedTable(
+        columns=(schema_observer.ReflectedColumn("id", "integer", False),), primary_key=("id",)
+    )
+
+
+def test_a_wait_answer_for_an_oracle_table_loads_nothing_and_records_waiting(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    def fake_oracle(dial, secrets, objs, table_adapter_callback=None):
+        _reflect(table_adapter_callback)
+        return type("R", (), {"source": iter(()), "resolved": None})()
+
+    monkeypatch.setattr(f.oracle_adapter, "build_source", fake_oracle)
+    monkeypatch.setattr(
+        f.sink_adapter, "load_via_sink", lambda *a, **k: pytest.fail("a waiting table must not be loaded")
+    )
+    observations.answer = f.schema_observer.Decision(action="wait", columns=None, changes=[])
+    connector = {
+        "id": "conn-ora",
+        "adapter": "sql",
+        "dial": {"driver": "oracle", "host": "ora.internal", "port": 1521, "database": "O", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+    }
+    assert f._run_one_object(connector, {"name": "S.ORDERS", "target": "orders"}) is None
+    assert [r["status"] for r in recorded] == ["waiting"]
+
+
+def test_a_column_list_in_the_answer_rebuilds_the_source_with_only_those_columns(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    builds: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=builds)
+    observations.answer = f.schema_observer.Decision(action="load", columns=["id"], changes=[])
+
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    # First build reflects and keeps everything (nothing is removed yet); the
+    # second, after the answer, was built keeping `id` only.
+    assert builds == [["id", "note"], ["id"]]
+    assert loads == ["orders"]
+    assert [r["status"] for r in recorded] == ["succeeded"]
+    assert len(observations.calls) == 1  # observed once, not once per build
+
+
+def test_no_column_list_loads_with_a_single_build(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    builds: list = []
+    _wire_mysql(monkeypatch, loads=[], builds=builds)
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert builds == [["id", "note"]]
+
+
+def test_an_api_that_cannot_be_reached_fails_the_object_and_loads_nothing(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    observations.answer = f.schema_observer.ObservationUnreachable("the API could not be reached (ConnectionError)")
+
+    with pytest.raises(f.schema_observer.ObservationUnreachable):
+        f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+
+    assert loads == []
+    assert [r["status"] for r in recorded] == ["failed"]
+
+
+def test_a_source_build_that_reflects_no_table_is_refused_rather_than_loaded_unchecked(
+    monkeypatch, observations
+) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+
+    class _SilentAdapter:
+        def build_source(self, dial, secrets, objs, table_adapter_callback=None):
+            return type("R", (), {"source": object(), "resolved": None})()  # never calls the callback
+
+    monkeypatch.setitem(f._ADAPTERS, "sql", _SilentAdapter())
+    with pytest.raises(f.schema_observer.ReflectionMissing):
+        f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert loads == [] and observations.calls == []
+    assert [r["status"] for r in recorded] == ["rejected"]
+
+
+def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> None:
+    from dagster import Failure, build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    payload = {"connector": {"id": "c"}, "obj": {"name": "orders", "target": "orders"}}
+
+    def raises(exc):
+        def fake(_connector, _obj, run_id=None):
+            raise exc
+
+        return fake
+
+    monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationUnreachable("down")))
+    with pytest.raises(Failure) as unreachable:
+        f.ingest_source_object(build_op_context(), payload)
+    assert unreachable.value.allow_retries is True  # DEFAULT_RETRY_POLICY keeps retrying a transient failure
+
+    monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationRefused("HTTP 403")))
+    with pytest.raises(Failure) as refused:
+        f.ingest_source_object(build_op_context(), payload)
+    assert refused.value.allow_retries is False
+
+
+# --- PR #101 CI: a refused credential is not a transient failure ---------
+
+
+def _driver_error(module: str, *args):
+    """An exception of a class that claims `module` as its home, like the
+    real driver's, without importing that driver (`pyodbc` cannot be
+    imported without a system ODBC library)."""
+    return type("OperationalError", (Exception,), {"__module__": module})(*args)
+
+
+def _wrapped_like_sqlalchemy(driver_error: Exception) -> Exception:
+    import sqlalchemy.exc
+
+    return sqlalchemy.exc.OperationalError("SELECT 1", {}, driver_error)
+
+
+def test_a_refused_credential_is_recognised_by_driver_error_code_for_mysql_sql_server_and_oracle() -> None:
+    import oracledb
+    import pymysql.err
+    from oracledb.errors import _Error
+
+    import dispar_orchestrate.ingest_factory as f
+
+    mysql = pymysql.err.OperationalError(1045, "Access denied for user 'u'@'h' (using password: YES)")
+    oracle = oracledb.DatabaseError(_Error(message="ORA-01017: logon denied", code=1017))
+    mssql = _driver_error("pyodbc", "28000", "[28000] Login failed for user 'u'. (18456)")
+
+    assert f._is_authentication_refusal(mysql)
+    assert f._is_authentication_refusal(_wrapped_like_sqlalchemy(mysql))  # SQLAlchemy's `.orig`
+    assert f._is_authentication_refusal(oracle)
+    assert f._is_authentication_refusal(mssql)
+    assert f._is_authentication_refusal(_wrapped_like_sqlalchemy(mssql))
+
+
+def test_a_refusal_wrapped_with_raise_from_is_still_found() -> None:
+    import pymysql.err
+
+    import dispar_orchestrate.ingest_factory as f
+
+    try:
+        try:
+            raise pymysql.err.OperationalError(1045, "x")
+        except Exception as inner:
+            raise RuntimeError("pipeline step failed") from inner
+    except RuntimeError as outer:
+        assert f._is_authentication_refusal(outer)
+
+
+def test_failures_that_are_not_a_refused_credential_are_not_recognised() -> None:
+    import oracledb
+    import pymysql.err
+    from oracledb.errors import _Error
+
+    import dispar_orchestrate.ingest_factory as f
+
+    # The same driver, other codes: unreachable host (2003), lock wait (1205),
+    # SQL Server timeout (HYT00), Oracle "invalid identifier" (ORA-00904).
+    assert not f._is_authentication_refusal(pymysql.err.OperationalError(2003, "Can't connect"))
+    assert not f._is_authentication_refusal(pymysql.err.OperationalError(1205, "Lock wait timeout"))
+    assert not f._is_authentication_refusal(_driver_error("pyodbc", "HYT00", "Login timeout expired"))
+    assert not f._is_authentication_refusal(
+        oracledb.DatabaseError(_Error(message="ORA-00904: invalid identifier", code=904))
+    )
+    # The code alone is not enough: another module's `1045` is not MySQL's.
+    assert not f._is_authentication_refusal(_driver_error("requests", 1045))
+    # The message is never read: text that looks like a refusal does not count.
+    assert not f._is_authentication_refusal(RuntimeError("Access denied for user 'u' (1045)"))
+    assert not f._is_authentication_refusal(ConnectionError("connection reset"))
+    # A cycle in the cause chain ends the walk.
+    cyclic = RuntimeError("a")
+    cyclic.__cause__ = cyclic
+    assert not f._is_authentication_refusal(cyclic)
+
+
+def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driver_errors(monkeypatch) -> None:
+    import pymysql.err
+    from dagster import Failure, build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    payload = {"connector": {"id": "c"}, "obj": {"name": "orders", "target": "orders"}}
+
+    def raises(exc):
+        def fake(_connector, _obj, run_id=None):
+            raise exc
+
+        return fake
+
+    denied = _wrapped_like_sqlalchemy(
+        pymysql.err.OperationalError(1045, "Access denied for user 'g6_reader'@'172.18.0.5'")
+    )
+    monkeypatch.setattr(f, "_run_one_object", raises(denied))
+    with pytest.raises(Failure) as refused:
+        f.ingest_source_object(build_op_context(), payload)
+    assert refused.value.allow_retries is False  # the policy must not retry it
+    assert refused.value.__cause__ is denied
+    # Nothing the driver said (user, client address) reaches the Failure.
+    assert "g6_reader" not in str(refused.value.description) and "172.18" not in str(refused.value.description)
+
+    unreachable = _wrapped_like_sqlalchemy(pymysql.err.OperationalError(2003, "Can't connect to MySQL server"))
+    monkeypatch.setattr(f, "_run_one_object", raises(unreachable))
+    with pytest.raises(type(unreachable)):  # propagates as it did: the retry policy handles it
+        f.ingest_source_object(build_op_context(), payload)
+
+
+def test_the_op_sends_its_dagster_run_id_with_the_observation(monkeypatch) -> None:
+    from dagster import build_op_context
+
+    import dispar_orchestrate.ingest_factory as f
+
+    seen: list = []
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: seen.append(run_id) or None)
+    context = build_op_context()
+    f.ingest_source_object(context, {"connector": {"id": "c"}, "obj": {"name": "o", "target": "o"}})
+    assert seen == [context.run_id]
+
+
+# --- SRC-8 task 7: observe after loading (files, rest, mongodb, sftp, kafka) --
+
+
+def _loaded(*columns: tuple[str, str]):
+    """A `SinkResult` for a load that produced these columns."""
+    from dispar_orchestrate.adapters.sink import LoadedColumn
+
+    return SinkResult(
+        rows=3,
+        has_failed_jobs=False,
+        load_info_str="",
+        columns=tuple(LoadedColumn(name, dtype, True) for name, dtype in columns),
+    )
+
+
+def _wire_files(monkeypatch, result) -> list:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f, "_host_of", lambda dial: None)
+
+    class _Adapter:
+        def build_source(self, dial, secrets, objs):
+            return type("R", (), {"source": object(), "resolved": None})()
+
+    monkeypatch.setitem(f._ADAPTERS, "files", _Adapter())
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: result)
+    return recorded
+
+
+_FILES_CONNECTOR = {
+    "id": "conn-files",
+    "adapter": "files",
+    "dial": {"endpoint": "https://files.internal"},
+    "secretRef": "env:X",
+    "secretRefSecondary": None,
+}
+_FILES_OBJECT = {"name": "exports/orders.csv", "target": "orders"}
+
+
+def test_the_columns_of_a_file_load_are_posted_after_the_load_succeeded(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = _wire_files(monkeypatch, _loaded(("id", "bigint"), ("note", "text")))
+    assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT, run_id="run-9") == 3
+
+    [call] = observations.calls
+    assert (call["phase"], call["object"], call["run_id"]) == ("after_load", "exports/orders.csv", "run-9")
+    assert [(c.name, c.type_name) for c in call["columns"]] == [("id", "bigint"), ("note", "text")]
+    # No key is observed for these sources.
+    assert call["primary_key"] == []
+    assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+def test_the_columns_of_a_file_load_carry_their_own_name_as_the_loaded_name(monkeypatch, observations) -> None:
+    """SRC-8 task 11: after a load the pipeline's names are already the loaded
+    ones, so `loadedName` is the name itself."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded(("order_date", "date"), ("note", "text")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT, run_id="run-9")
+
+    [call] = observations.calls
+    assert [(c.name, c.loaded_name) for c in call["columns"]] == [("order_date", "order_date"), ("note", "note")]
+
+
+def test_the_request_is_just_what_was_loaded_so_a_missing_column_is_not_reported_at_all(
+    monkeypatch, observations
+) -> None:
+    """Run 1 loaded `id` and `note`; run 2 loads a batch with `id` only. This
+    side reports `id` and says nothing about `note`: the API carries the
+    previous columns over for this phase (D4), so no removal can come from
+    here."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded(("id", "bigint"), ("note", "text")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+    _wire_files(monkeypatch, _loaded(("id", "bigint")))
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+
+    assert [c.name for c in observations.calls[1]["columns"]] == ["id"]
+    assert not any(key in observations.calls[1] for key in ("removed", "missing", "absent"))
+
+
+def test_dlts_bookkeeping_and_the_ingested_at_column_are_left_out_of_what_a_load_reports(monkeypatch) -> None:
+    """Tested where the columns are read (`sink._loaded_columns`) against a real
+    `dlt` schema: `_dlt_id`, `_dlt_load_id` and `_ingested_at` belong to the
+    pipeline, not to the source, so a first observation must not carry them."""
+    import dlt
+    from dlt.destinations import filesystem
+
+    from dispar_orchestrate.adapters import sink as sink_module
+
+    for name in (
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_NAME",
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE",
+        "ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pipeline = dlt.pipeline(
+            pipeline_name="after_load_columns",
+            pipelines_dir=f"{tmp}/p",
+            destination=filesystem(bucket_url=f"{tmp}/b"),
+            dataset_name="bronze",
+        )
+        rows = [{"id": 1, "note": "x", "_ingested_at": datetime.now(timezone.utc)}]
+        pipeline.run(rows, table_name="orders", write_disposition="append")
+        columns = sink_module._loaded_columns(pipeline, "orders")
+
+    assert [(c.name, c.data_type) for c in columns] == [("id", "bigint"), ("note", "text")]
+
+
+def test_a_failed_post_never_turns_a_successful_file_load_into_a_failed_run(monkeypatch, observations, caplog) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = _wire_files(monkeypatch, _loaded(("id", "bigint")))
+    observations.answer = f.schema_observer.ObservationUnreachable("the API could not be reached (ConnectionError)")
+    with caplog.at_level(logging.WARNING):
+        assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT) == 3
+    assert [r["status"] for r in recorded] == ["succeeded"]  # recorded once, as a success
+    assert "the data is in Bronze" in caplog.text
+    assert "ConnectionError" in caplog.text
+
+    # Even an exception the observer never raises on purpose is swallowed.
+    observations.answer = RuntimeError("secret-looking detail")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT) == 3
+    assert "RuntimeError" in caplog.text and "secret-looking detail" not in caplog.text
+
+
+def test_a_load_whose_columns_could_not_be_read_posts_nothing(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    _wire_files(monkeypatch, _loaded())
+    f._run_one_object(_FILES_CONNECTOR, _FILES_OBJECT)
+    assert observations.calls == []
+
+
+def test_a_sheets_connector_is_not_observed_at_all(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    unsupported = type("R", (), {"supported": False, "reason": "not available", "source": None})()
+    monkeypatch.setattr(f.sheets_adapter, "build_source", lambda dial, secrets: unsupported)
+    connector = {"id": "c", "adapter": "sheets", "dial": {}, "secretRef": "env:X", "secretRefSecondary": None}
+    assert f._run_one_object(connector, {"name": "A1:B2", "target": "sheet"}) is None
+    assert [r["status"] for r in recorded] == ["unsupported"]
+    assert observations.calls == []
+
+
+def test_a_sql_load_is_observed_once_before_and_not_again_after(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    builds: list = []
+    _wire_mysql(monkeypatch, loads=[], builds=builds)
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: _loaded(("id", "bigint")))
+    f._run_one_object(_mysql_connector(), {"name": "shop.orders", "target": "orders"})
+    assert [c["phase"] for c in observations.calls] == ["before_load"]
+
+
+def test_a_kafka_micro_batch_is_observed_after_it_loaded_and_committed(monkeypatch, observations) -> None:
+    order: list = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: order.append("load") or _loaded(("id", "bigint"), ("note", "text")),
+    )
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_offset", lambda *a, **k: order.append("offset"))
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_run", lambda **kw: order.append(kw["status"]))
+
+    class _Consumer(_FakeStreamConsumer):
+        def commit(self, offsets):
+            order.append("commit")
+
+    run_kafka_stream_batch(
+        connector_id="conn-k",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders", "target": "orders"}],
+        consumer=_Consumer(),
+        run_id="run-k",
+    )
+
+    [call] = observations.calls
+    assert (call["phase"], call["object"], call["run_id"], call["primary_key"]) == (
+        "after_load",
+        "orders",
+        "run-k",
+        [],
+    )
+    assert [c.name for c in call["columns"]] == ["id", "note"]
+    assert order == ["load", "commit", "offset", "succeeded"]
+
+
+def test_a_failing_post_never_fails_a_kafka_micro_batch(monkeypatch, observations) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded: list = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.load_via_sink", lambda *a, **k: _loaded(("id", "bigint")))
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_offset", lambda *a, **k: None)
+    monkeypatch.setattr("dispar_orchestrate.ingest_factory.record_ingest_run", lambda **kw: recorded.append(kw))
+    observations.answer = f.schema_observer.ObservationRefused("HTTP 403")
+
+    run_kafka_stream_batch(
+        connector_id="conn-k",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders", "target": "orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    assert [r["status"] for r in recorded] == ["succeeded"]
+
+
+# --- SRC-8 task 8: new tables under "apply all" (decision D2) -----------------
+
+
+def _apply_all_connector(driver: str = "postgres", policy: str = "apply_all", names=("public.orders", "sales.items")):
+    return {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "schemaChangePolicy": policy,
+        "dial": {"driver": driver, "host": "db.internal", "port": 5432, "database": "shop", "user": "u"},
+        "secretRef": "env:X",
+        "secretRefSecondary": None,
+        "sourceObjects": [{"name": n, "target": n.replace(".", "_")} for n in names],
+    }
+
+
+class _Discovery:
+    def __init__(self) -> None:
+        self.listed: list = []
+        self.posts: list = []
+        self.tables = {"public": ["orders", "customers"], "sales": ["items", "returns"]}
+        self.answer_added = True
+
+
+@pytest.fixture
+def discovery(monkeypatch):
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import schema_observer
+
+    d = _Discovery()
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    def fake_list_tables(spec, secrets, schemas, **kwargs):
+        d.listed.append((spec["driver"], secrets, list(schemas)))
+        return {schema: d.tables[schema] for schema in schemas}
+
+    def fake_post_new_tables(cfg, connector_id, tables, run_id):
+        d.posts.append((connector_id, list(tables), run_id))
+        return schema_observer.NewTablesAnswer(added=list(tables) if d.answer_added else [], not_added=[])
+
+    monkeypatch.setattr(f.sql_adapter, "list_tables", fake_list_tables)
+    monkeypatch.setattr(f.schema_observer, "post_new_tables", fake_post_new_tables)
+    return d
+
+
+def test_the_tables_of_each_schema_already_loaded_are_listed_and_the_new_ones_posted(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    added = f._discover_new_tables(_apply_all_connector(), "run-3")
+
+    assert added is True
+    assert discovery.listed == [("postgres", {"password": "s3cret"}, ["public", "sales"])]
+    # Only tables not already selected, in schema order, with the run id.
+    assert discovery.posts == [("conn-pg", ["public.customers", "sales.returns"], "run-3")]
+
+
+@pytest.mark.parametrize("driver", ["postgres", "mysql", "mariadb", "mssql"])
+def test_apply_all_connectors_of_the_four_listable_drivers_are_looked_at(discovery, driver) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    assert f._discover_new_tables(_apply_all_connector(driver), None) is True
+    assert discovery.listed[0][0] == driver
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        _apply_all_connector(policy="apply_non_breaking"),
+        _apply_all_connector(policy="ask_first"),
+        _apply_all_connector(policy="pause"),
+        _apply_all_connector("oracle"),
+        {**_apply_all_connector(), "adapter": "files"},
+        {k: v for k, v in _apply_all_connector().items() if k != "schemaChangePolicy"},
+        _apply_all_connector(names=("orders",)),  # no schema to list
+    ],
+)
+def test_nothing_is_listed_for_any_other_policy_driver_adapter_or_schemaless_tables(discovery, connector) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    assert f._discover_new_tables(connector, None) is False
+    assert discovery.listed == [] and discovery.posts == []
+
+
+def test_nothing_is_posted_when_every_listed_table_is_already_selected(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.tables = {"public": ["orders"], "sales": ["items"]}
+    assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert discovery.posts == []
+
+
+def test_a_batch_larger_than_the_api_accepts_is_sent_in_chunks(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.tables = {"public": [f"t{i:05d}" for i in range(4500)], "sales": []}
+    f._discover_new_tables(_apply_all_connector(names=("public.orders",)), None)
+    assert [len(tables) for _, tables, _ in discovery.posts] == [2000, 2000, 500]
+
+
+def test_the_api_adding_nothing_means_the_run_goes_on_with_the_tables_it_has(discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    discovery.answer_added = False
+    assert f._discover_new_tables(_apply_all_connector(), None) is False
+
+
+def test_a_failing_listing_or_post_never_stops_the_run_and_logs_only_a_safe_text(
+    monkeypatch, discovery, caplog
+) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(
+        f.sql_adapter, "list_tables", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("db.internal:5432 s3cret"))
+    )
+    with caplog.at_level(logging.WARNING):
+        assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert "ConnectionError" in caplog.text and "the tables it already has still load" in caplog.text
+    assert "s3cret" not in caplog.text and "db.internal" not in caplog.text
+
+
+def test_a_refused_new_table_report_never_stops_the_run_either(monkeypatch, discovery, caplog) -> None:
+    import logging
+
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f.sql_adapter, "list_tables", lambda spec, secrets, schemas, **k: {s: ["new"] for s in schemas})
+
+    def refused(*args, **kwargs):
+        raise f.schema_observer.ObservationRefused("the API refused the new-table report (HTTP 409)")
+
+    monkeypatch.setattr(f.schema_observer, "post_new_tables", refused)
+    with caplog.at_level(logging.WARNING):
+        assert f._discover_new_tables(_apply_all_connector(), None) is False
+    assert "HTTP 409" in caplog.text
+
+
+def test_tables_the_api_added_are_loaded_in_the_same_run(monkeypatch, discovery) -> None:
+    """After the add, `run_ingest` reads the connector again, so the fan-out
+    covers the new tables: three mapped steps, not two."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    before = _apply_all_connector(names=("public.orders",))
+    after = {
+        **before,
+        "sourceObjects": before["sourceObjects"]
+        + [{"name": "public.customers", "target": "bronze_customers", "loadMode": "replace"}],
+    }
+    reads: list = []
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: reads.append(cid) or (before if len(reads) == 1 else after))
+    discovery.tables = {"public": ["orders", "customers"]}
+    ran: list = []
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: ran.append(obj["name"]) or 1)
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+
+    assert result.success
+    assert reads == ["conn-pg", "conn-pg"]
+    assert sorted(ran) == ["public.customers", "public.orders"]
+
+
+def test_a_connector_that_gained_no_tables_is_read_once(monkeypatch, discovery) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    discovery.answer_added = False
+    reads: list = []
+    connector = _apply_all_connector(names=("public.orders",))
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: reads.append(cid) or connector)
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj, run_id=None: 1)
+    discovery.tables = {"public": ["orders", "customers"]}
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-pg"}}}},
+    )
+    assert result.success and reads == ["conn-pg"]
+
+
+# --- SRC-8 task 9: a waiting table is not a failure (decision D7) -------------
+
+
+def test_a_run_where_one_table_waits_and_another_loads_ends_without_raising_from_either_step(
+    monkeypatch, observations
+) -> None:
+    """The real job graph and the real `_run_one_object`: `shop.orders` is
+    told to wait, `shop.items` loads. Both mapped steps SUCCEED, so the run
+    does, which is what keeps the run-success sensor from stamping a failure
+    and the repeated-failure streak from growing (D7). The waiting table is
+    recorded as `waiting`, loads nothing, and is not a materialization."""
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_env(monkeypatch)
+    loads: list = []
+    recorded = _wire_mysql(monkeypatch, loads=loads, builds=[])
+    connector = {
+        **_mysql_connector(),
+        "sourceObjects": [
+            {"name": "shop.orders", "target": "orders"},
+            {"name": "shop.items", "target": "items"},
+        ],
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: connector)
+    observations.answer = lambda name: f.schema_observer.Decision(
+        action="wait" if name == "shop.orders" else "load", columns=None, changes=[]
+    )
+
+    result = f.ingest_job.execute_in_process(
+        raise_on_error=False,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-mysql"}}}},
+    )
+
+    assert result.success
+    failed = {e.step_key for e in result.all_events if e.event_type_value == "STEP_FAILURE"}
+    succeeded = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+    assert failed == set()
+    assert {"ingest_source_object[orders]", "ingest_source_object[items]"} <= succeeded
+    assert {r["object_name"]: r["status"] for r in recorded} == {
+        "shop.orders": "waiting",
+        "shop.items": "succeeded",
+    }
+    assert loads == ["items"]
+    materialized = [
+        e.event_specific_data.materialization.asset_key.to_user_string()
+        for e in result.all_events
+        if e.event_type_value == "ASSET_MATERIALIZATION"
+    ]
+    assert materialized == ["bronze/items"]

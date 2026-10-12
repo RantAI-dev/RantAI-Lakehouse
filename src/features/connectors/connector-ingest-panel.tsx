@@ -49,6 +49,11 @@ function slug(text: string): string {
  * `<connector>_<table>`. Every connector writes into the same flat `bronze`
  * namespace, so two connectors that both have an `orders` table would
  * otherwise append into one `bronze.orders`.
+ *
+ * Rust has the same rule: `default_bronze_target` in
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs` names the target of a table
+ * `lakehouse-api` adds on its own (`SRC-8`, policy "apply all"). Change one,
+ * change the other; both tests pin the same examples.
  */
 export function defaultTarget(connectorName: string, objectName: string): string {
   const table = slug(objectName.split(".").pop() ?? objectName)
@@ -191,11 +196,17 @@ export function ConnectorIngestPanel({
   connectorName,
   layout = "embedded",
   onTableCount,
+  pausedReason = null,
+  waitingTables,
 }: {
   connectorId: string
   connectorName: string
   layout?: "page" | "embedded"
   onTableCount?: (count: number) => void
+  /** Why the connector is paused (`SRC-8`); the API refuses a run meanwhile. */
+  pausedReason?: string | null
+  /** Source tables that wait for a schema decision (`SRC-8`), from the Schema changes tab's one list. */
+  waitingTables?: ReadonlySet<string>
 }) {
   const spec = useService((s) => connectorService.getIngestSpec(connectorId, s), [connectorId])
   // The spec a save returned, so saving does not refetch (and unmount the
@@ -231,6 +242,8 @@ export function ConnectorIngestPanel({
       spec={current}
       layout={layout}
       onSaved={setSavedSpec}
+      pausedReason={pausedReason}
+      waitingTables={waitingTables}
     />
   )
 }
@@ -241,12 +254,16 @@ function IngestEditor({
   spec,
   layout,
   onSaved,
+  pausedReason,
+  waitingTables,
 }: {
   connectorId: string
   connectorName: string
   spec: IngestSpec
   layout: "page" | "embedded"
   onSaved: (spec: IngestSpec) => void
+  pausedReason: string | null
+  waitingTables?: ReadonlySet<string>
 }) {
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
@@ -366,6 +383,14 @@ function IngestEditor({
                   <span className="min-w-0 flex-1 truncate font-mono text-xs" title={s.name}>
                     {s.name}
                   </span>
+                  {waitingTables?.has(s.name) ? (
+                    <Pill
+                      tone="warning"
+                      title="A change at the source waits for approval; see Schema changes"
+                    >
+                      Waiting for a decision
+                    </Pill>
+                  ) : null}
                   <button
                     type="button"
                     aria-label={`Remove ${s.name}`}
@@ -616,11 +641,13 @@ function IngestEditor({
       connectorId={connectorId}
       tableCount={saved.length}
       blockedReason={
-        dirty
-          ? "Save your changes before running."
-          : !isStream && saved.length === 0
-            ? "Save at least one table to run."
-            : null
+        pausedReason
+          ? `Paused: ${pausedReason}`
+          : dirty
+            ? "Save your changes before running."
+            : !isStream && saved.length === 0
+              ? "Save at least one table to run."
+              : null
       }
     />
   )

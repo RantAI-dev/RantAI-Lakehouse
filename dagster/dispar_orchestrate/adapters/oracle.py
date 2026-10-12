@@ -83,7 +83,13 @@ def build_source(
     source_objects: list[dict],
     *,
     resolve_checked=ssrf_guard.resolve_checked,
+    table_adapter_callback=None,
 ) -> AdapterBuildResult:
+    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
+    calls it with each reflected table while the source is built, which is
+    below, inside `checking_resolver()` and over the checked IP literal -- the
+    observation reads the columns from that reflection and opens no
+    connection of its own."""
     resolved = resolve_checked(spec["host"], spec["port"])
     table_names = [obj["name"].split(".")[-1] for obj in source_objects]
 
@@ -117,5 +123,8 @@ def build_source(
         "database": spec["database"],
     }
     with ssrf_guard.checking_resolver():
-        source = sql_database(credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs)
+        extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+        source = sql_database(
+            credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs, **extra
+        )
     return AdapterBuildResult(source=source, resolved=resolved)
