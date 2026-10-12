@@ -39,7 +39,7 @@ expect() {
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
-          G4_CDC_RESULT G6_INGEST_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT
+          G4_CDC_RESULT G6_INGEST_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT G8_TIME_TRAVEL_RESULT
     export "$@"
     bash "$SCRIPT" >/dev/null 2>&1
   ) || got=$?
@@ -61,7 +61,7 @@ base_docs_green=(
   RUST_BUILD_RESULT=skipped RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
   DAGSTER_TESTS_RESULT=skipped G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped
   G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped
-  G6_INGEST_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  G6_INGEST_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 )
 
 base_frontend_green=(
@@ -71,7 +71,7 @@ base_frontend_green=(
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
   G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G6_INGEST_RESULT=skipped
-  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 )
 
 base_rust_green=(
@@ -81,7 +81,7 @@ base_rust_green=(
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_dagster_green=(
@@ -91,7 +91,7 @@ base_dagster_green=(
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_stack_green=(
@@ -101,7 +101,7 @@ base_stack_green=(
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_all_green=(
@@ -111,7 +111,7 @@ base_all_green=(
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_push_green=(
@@ -121,7 +121,7 @@ base_push_green=(
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 # 1. Happy path cases
@@ -146,6 +146,7 @@ expect 1 "Failing clippy blocks rust PR" "${base_rust_green[@]}" RUST_CLIPPY_RES
 expect 1 "Failing fmt blocks rust PR" "${base_rust_green[@]}" RUST_FMT_RESULT=failure
 expect 1 "Failing build blocks rust PR" "${base_rust_green[@]}" RUST_BUILD_RESULT=failure
 expect 1 "Failing acceptance blocks rust PR" "${base_rust_green[@]}" G6_INGEST_RESULT=failure
+expect 1 "Failing time-travel acceptance blocks rust PR" "${base_rust_green[@]}" G8_TIME_TRAVEL_RESULT=failure
 expect 1 "Skipped acceptance blocks rust PR" "${base_rust_green[@]}" G1_RUSTFS_RESULT=skipped
 expect 1 "Failing dagster unit test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_TESTS_RESULT=failure
 expect 1 "Skipped dagster unit test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_TESTS_RESULT=skipped

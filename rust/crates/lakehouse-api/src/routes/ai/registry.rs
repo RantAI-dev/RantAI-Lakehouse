@@ -1085,8 +1085,10 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     // ── T2.5 Governance draft tools ─────────────────────────────────
     // `POST /api/governance/policies` requires `policy:write`
-    // (policy.rs:163); `POST /api/governance/{kind}` (quality,
-    // classification) is `RequiresAuth` only (policy.rs:165, C1).
+    // (policy.rs:163). SEC-23 (F3): `POST /api/governance/{kind}` (quality,
+    // classification) now requires `governance:write` too, so the two rule
+    // tools carry it — [`super::gate::decide`] refuses them without it. Before,
+    // the tools were an unguarded path around the route policy.
     ToolSpec {
         name: "draft_policy",
         schema: draft_policy_schema,
@@ -1097,13 +1099,13 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "draft_classification_rule",
         schema: draft_classification_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "draft_quality_rule",
         schema: draft_quality_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "get_ingest_spec",
@@ -1419,9 +1421,10 @@ mod tests {
         // Tier 2 tools that carry no narrower permission than
         // `RequiresAuth` (C1) — every T2.1 governance read,
         // `run_bronze_maintenance`, `list_workloads`, both gold export
-        // tools, the two rule-level draft tools (`draft_policy` needs
-        // `policy:write`, so it is NOT in this list), and `ask_user`, which
-        // stores and reads nothing.
+        // tools, and `ask_user`, which stores and reads nothing. The three
+        // draft tools are NOT in this list: `draft_policy` needs
+        // `policy:write`, and since SEC-23 the two rule drafts need
+        // `governance:write`.
         assert_eq!(
             offered_names,
             vec![
@@ -1436,8 +1439,6 @@ mod tests {
                 "list_workloads".to_owned(),
                 "export_gold_mart".to_owned(),
                 "get_gold_export".to_owned(),
-                "draft_classification_rule".to_owned(),
-                "draft_quality_rule".to_owned(),
                 "ask_user".to_owned(),
             ]
         );
@@ -1494,8 +1495,12 @@ mod tests {
             ("export_gold_mart", Risk::WriteLow, ""),
             ("get_gold_export", Risk::Read, ""),
             ("draft_policy", Risk::WriteLow, "policy:write"),
-            ("draft_classification_rule", Risk::WriteLow, ""),
-            ("draft_quality_rule", Risk::WriteLow, ""),
+            (
+                "draft_classification_rule",
+                Risk::WriteLow,
+                "governance:write",
+            ),
+            ("draft_quality_rule", Risk::WriteLow, "governance:write"),
         ];
         for (name, risk, permission) in expected {
             let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));

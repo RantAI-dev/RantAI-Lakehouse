@@ -40,7 +40,7 @@ Downstream jobs execute according to scope:
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`, `g8-governance`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 
 At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
