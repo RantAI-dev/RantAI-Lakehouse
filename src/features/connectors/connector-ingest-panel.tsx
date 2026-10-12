@@ -25,6 +25,7 @@ import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, pa
 import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
+import { TableActionsMenu, tableActionLabel } from "./connector-table-actions"
 import type {
   Dial,
   IngestJobRun,
@@ -108,6 +109,8 @@ export function scheduleLabel(cron: string | null): string {
 
 const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"> = {
   succeeded: "success",
+  // SRC-10: a clear loads nothing and says so; it did what it was asked.
+  cleared: "success",
   failed: "destructive",
   rejected: "warning",
   unsupported: "neutral",
@@ -418,6 +421,17 @@ function IngestEditor({
   const shown = needle ? found.filter((o) => o.name.toLowerCase().includes(needle)) : found
   const allShownSelected = shown.length > 0 && shown.every((o) => selectedNames.has(o.name))
 
+  /** Why a table cannot be refreshed or cleared now, or `null` (SRC-10 decision 5). */
+  function tableActionBlock(name: string): string | null {
+    if (!saved.some((t) => t.name === name) || dirty) return "Save your changes before refreshing or clearing a table."
+    if (pausedReason) return `Paused: ${pausedReason}`
+    if (runState.watching) return "A run of this connector is going; wait for it to finish."
+    if (waitingTables?.has(name)) {
+      return "This table waits for a schema decision; approve or resolve the change on the Schema changes tab first."
+    }
+    return null
+  }
+
   const page = layout === "page"
   const tablesIntro = isStream
     ? "A Kafka connector reads its topic; each run takes one micro-batch."
@@ -460,6 +474,18 @@ function IngestEditor({
                     >
                       Waiting for a decision
                     </Pill>
+                  ) : null}
+                  {!isCdc ? (
+                    <TableActionsMenu
+                      connectorId={connectorId}
+                      table={s.name}
+                      target={s.target}
+                      disabledReason={tableActionBlock(s.name)}
+                      onStarted={(runId) => {
+                        runState.launch(runId)
+                        runState.refreshRuns()
+                      }}
+                    />
                   ) : null}
                   <button
                     type="button"
@@ -1188,11 +1214,17 @@ function RunGroupCard({
   const start = toMillis(run?.startedAt ?? null)
   const end = toMillis(run?.endedAt ?? null)
 
+  // SRC-10 decision 5: a run of one table says which table and what it was asked to do.
+  const scope = run?.object ? `${run.action ? `${tableActionLabel(run.action)} · ` : ""}${run.object}` : null
   const summary = !run
     ? `${results.length} older ${results.length === 1 ? "result" : "results"}`
     : isActive(run)
-      ? `${results.length} of ${tableCount} tables so far`
-      : results.length === 0
+      ? run.object
+        ? `${results.length} of 1 table so far`
+        : `${results.length} of ${tableCount} tables so far`
+      : run.action === "clear" && results.length > 0
+        ? "Table emptied · nothing loaded"
+        : results.length === 0
         ? "No table reached"
         : `${loaded.length} of ${results.length} tables · ${rows.toLocaleString()} rows${
             notLoaded > 0 ? ` · ${notLoaded} not loaded` : ""
@@ -1203,7 +1235,16 @@ function RunGroupCard({
   ) : (
     <Pill tone="neutral">Earlier</Pill>
   )
-  const runId = run ? <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span> : null
+  const runId = run ? (
+    <>
+      <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>
+      {scope ? (
+        <span className="max-w-full truncate text-xs font-medium" title={scope}>
+          {scope}
+        </span>
+      ) : null}
+    </>
+  ) : null
   const when = run ? (
     <>
       {formatRelativeTime(run.startedAt)}

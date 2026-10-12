@@ -130,8 +130,8 @@ export const postgresConnectorService: ConnectorService = {
       signal
     );
   },
-  runIngest(id, signal) {
-    return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, undefined, signal);
+  runIngest(id, signal, table) {
+    return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, table, signal);
   },
   listIngestRuns(connectorId, signal) {
     return getJson<IngestRun[]>(

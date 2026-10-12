@@ -731,6 +731,21 @@ export type IngestRunResult = {
 }
 
 /**
+ * What a run of ONE table does (`SRC-10` decision 5), the body of
+ * `POST /api/connectors/{id}/ingest/run`: refresh keeping the rows already
+ * there, refresh after removing them, or clear the table and load nothing.
+ * Mirrors Rust `IngestAction` (`routes/connectors.rs`).
+ */
+export type IngestTableAction = "refresh_keep" | "refresh_remove" | "clear"
+
+/** The optional body of `POST .../ingest/run`: both fields, or no body at all. */
+export type IngestTableRequest = {
+  /** The source object's name, as listed in the ingest spec. */
+  object: string
+  action: IngestTableAction
+}
+
+/**
  * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
  * returned by `GET /api/governance/ingest-runs?connectorId=`.
  */
@@ -762,6 +777,13 @@ export type IngestJobRun = {
   startedAt: string | null
   /** ISO 8601; `null` until the run ends. */
   endedAt: string | null
+  /**
+   * `SRC-10`: the one table a run of a single table named (from the run's
+   * config), `null` for a run of every table.
+   */
+  object: string | null
+  /** `refresh_keep | refresh_remove | clear` for such a run, else `null`. Widened: a newer API may add actions. */
+  action: IngestTableAction | string | null
 }
 
 /**
@@ -820,7 +842,8 @@ export interface ConnectorService {
   /** `schema` is required for a `sql`/`cdc` connector: the server lists
    * only that schema's tables (bound, never interpolated). */
   discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
-  runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
+  /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
+  runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
   listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
   /**

@@ -57,7 +57,7 @@ const SPEC = {
 }
 
 function run(runId: string, status: IngestJobRun["status"], startedAt: string, endedAt: string | null): IngestJobRun {
-  return { runId, status, startedAt, endedAt }
+  return { runId, status, startedAt, endedAt, object: null, action: null }
 }
 
 function result(object: string, status: string, startedAt: string, error = ""): IngestRun {

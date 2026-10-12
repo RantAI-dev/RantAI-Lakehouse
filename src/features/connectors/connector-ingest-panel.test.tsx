@@ -453,8 +453,8 @@ describe("groupResultsByRun", () => {
 
   it("puts each table result under the run it happened in, oldest table first, and older results last", () => {
     const runs = [
-      { runId: "run-2", status: "running" as const, startedAt: "2026-09-29T08:22:39.206Z", endedAt: null },
-      { runId: "run-1", status: "completed" as const, startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z" },
+      { runId: "run-2", status: "running" as const, startedAt: "2026-09-29T08:22:39.206Z", endedAt: null, object: null, action: null },
+      { runId: "run-1", status: "completed" as const, startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z", object: null, action: null },
     ]
     const groups = groupResultsByRun(runs, [
       result("public.orders", "2026-09-29T08:22:59.700710+00:00"),
@@ -470,7 +470,7 @@ describe("groupResultsByRun", () => {
 
   it("keeps a run that reached no table, so a failure before the first table still shows", () => {
     const groups = groupResultsByRun(
-      [{ runId: "run-401", status: "failed", startedAt: "2026-09-29T06:48:06.638Z", endedAt: "2026-09-29T06:48:09.000Z" }],
+      [{ runId: "run-401", status: "failed", startedAt: "2026-09-29T06:48:06.638Z", endedAt: "2026-09-29T06:48:09.000Z", object: null, action: null }],
       []
     )
     expect(groups).toHaveLength(1)
@@ -641,5 +641,164 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     expect(mode.value).toBe("replace_dedup")
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
+  })
+})
+
+/**
+ * SRC-10 decision 5: refresh or clear one table, each behind a confirmation, and
+ * the run view naming the table and the action.
+ */
+describe("ConnectorIngestPanel refresh and clear", () => {
+  const SAVED = {
+    ...SPEC,
+    sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "replace" }],
+  }
+  const menu = () => screen.getByRole("button", { name: "Refresh or clear public.orders" }) as HTMLButtonElement
+
+  async function pick(item: string) {
+    const trigger = await screen.findByRole("button", { name: "Refresh or clear public.orders" })
+    // Press until the menu is open. Base UI opens it on the press, and in happy-dom the first press is sometimes
+    // lost when the previous test closed a dialog a moment ago (one run in ten failed with a single click);
+    // a press while it is open would close it again, so it is repeated only while it is closed.
+    await waitFor(
+      () => {
+        if (trigger.getAttribute("aria-expanded") !== "true") {
+          fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" })
+          fireEvent.mouseDown(trigger, { button: 0 })
+          fireEvent.pointerUp(trigger, { button: 0, pointerType: "mouse" })
+          fireEvent.mouseUp(trigger, { button: 0 })
+          fireEvent.click(trigger)
+        }
+        expect(screen.getByText(item)).toBeDefined()
+      },
+      { timeout: 5000, interval: 250 }
+    )
+    fireEvent.click(screen.getByText(item))
+  }
+
+  it.each([
+    ["Refresh, keeping rows", "refresh_keep", /Rows already in bronze\.northwind_orders are kept/, "Refresh"],
+    ["Refresh, removing rows", "refresh_remove", /Removes every row in bronze\.northwind_orders, then loads the whole table again\. The removed rows cannot be brought back from here\./, "Remove rows and refresh"],
+    ["Clear", "clear", /Removes every row in bronze\.northwind_orders and loads nothing\. The removed rows cannot be brought back from here/, "Clear table"],
+  ])("%s asks first, then sends the table and the action", async (item, action, sentence, confirmLabel) => {
+    const calls = stubFetch(SAVED)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await pick(item)
+
+    // Nothing was sent before the confirmation, and the dialog says what happens to the rows.
+    expect(calls.some((c) => c.url.endsWith("/ingest/run"))).toBe(false)
+    expect(await screen.findByText(sentence)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: confirmLabel }))
+
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest/run") && c.method === "POST")).toBe(true))
+    const post = calls.find((c) => c.url.endsWith("/ingest/run") && c.method === "POST")
+    expect(post?.body).toEqual({ object: "public.orders", action })
+    // The run is being waited for, as for Run now.
+    await screen.findByText(/Starting run 01234567/)
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("sends nothing when the confirmation is cancelled", async () => {
+    const calls = stubFetch(SAVED)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await pick("Clear")
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }))
+    expect(calls.some((c) => c.url.endsWith("/ingest/run"))).toBe(false)
+  })
+
+  it("is disabled, with the reason as its title, while a run of this connector is going", async () => {
+    stubFetch(SAVED, {
+      runs: [{ runId: "run-live-0001", status: "running", startedAt: "2026-10-12T08:00:00Z", endedAt: null, object: null, action: null }],
+      results: [],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await waitFor(() => expect(menu().disabled).toBe(true))
+    expect(menu().title).toBe("A run of this connector is going; wait for it to finish.")
+  })
+
+  it("is disabled while the connector is paused, with the pause as the reason", async () => {
+    stubFetch(SAVED)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" pausedReason="schema changed" />)
+    await waitFor(() => expect(menu().disabled).toBe(true))
+    expect(menu().title).toBe("Paused: schema changed")
+  })
+
+  it("is disabled for a table that waits for a schema decision, and not for the others", async () => {
+    stubFetch({
+      ...SPEC,
+      sourceObjects: [
+        { name: "public.orders", target: "northwind_orders" },
+        { name: "public.items", target: "northwind_items" },
+      ],
+    })
+    render(
+      <ConnectorIngestPanel
+        connectorId="conn-northwind"
+        connectorName="northwind"
+        layout="page"
+        waitingTables={new Set(["public.orders"])}
+      />
+    )
+    await waitFor(() => expect(menu().disabled).toBe(true))
+    expect(menu().title).toMatch(/waits for a schema decision/)
+    expect((screen.getByRole("button", { name: "Refresh or clear public.items" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("is disabled until unsaved changes are saved", async () => {
+    stubFetch(SAVED)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await waitFor(() => expect(menu().disabled).toBe(false))
+    fireEvent.change(await screen.findByLabelText("Bronze table for public.orders"), { target: { value: "orders_two" } })
+    await waitFor(() => expect(menu().disabled).toBe(true))
+    expect(menu().title).toBe("Save your changes before refreshing or clearing a table.")
+  })
+
+  it("shows the API's refusal as it answered and keeps the dialog open", async () => {
+    const refusal = "a run for this connector is already running (run 7bd3a0c4); wait for it to finish before starting another"
+    stubFetch(SAVED, undefined, { onRun: () => json({ error: refusal }, 409) })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await pick("Refresh, removing rows")
+    fireEvent.click(await screen.findByRole("button", { name: "Remove rows and refresh" }))
+    expect(await screen.findByText(refusal)).toBeDefined()
+    expect(screen.getByRole("button", { name: "Remove rows and refresh" })).toBeDefined()
+    // Closed before the test ends: an open modal leaves the page inert for the next test.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
+  })
+
+  it("shows a table that waits as refused too, with the API's own words", async () => {
+    const refusal = "This table is waiting for a schema decision, so it cannot be refreshed or cleared yet. Approve or resolve the change first."
+    stubFetch(SAVED, undefined, { onRun: () => json({ error: refusal }, 409) })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await pick("Clear")
+    fireEvent.click(await screen.findByRole("button", { name: "Clear table" }))
+    expect(await screen.findByText(refusal)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
+  })
+
+  it("names the table and the action in the run list", async () => {
+    stubFetch(SAVED, {
+      runs: [
+        { runId: "run-clear-0001", status: "completed", startedAt: "2026-10-12T08:00:00Z", endedAt: "2026-10-12T08:00:05Z", object: "public.orders", action: "clear" },
+        { runId: "run-all-000001", status: "completed", startedAt: "2026-10-12T07:00:00Z", endedAt: "2026-10-12T07:00:30Z", object: null, action: null },
+      ],
+      results: [
+        { connectorId: "conn-northwind", job: "ingest_job", object: "public.orders", rows: 0, startedAt: "2026-10-12T08:00:01Z", endedAt: "2026-10-12T08:00:02Z", status: "cleared", error: "" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect(await screen.findByText("Clear · public.orders")).toBeDefined()
+    expect(screen.getByText("Table emptied · nothing loaded")).toBeDefined()
+    expect(screen.getByText("cleared")).toBeDefined()
+    // A run of every table names no table.
+    expect(screen.queryByText(/Refresh, keeping rows · /)).toBeNull()
+  })
+
+  it("has no table menu for a CDC connector, whose tables stream", async () => {
+    stubFetch({ ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("public.orders")
+    expect(screen.queryByRole("button", { name: "Refresh or clear public.orders" })).toBeNull()
   })
 })
