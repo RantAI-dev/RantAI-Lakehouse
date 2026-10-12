@@ -6,7 +6,6 @@
 | Backlog | `SRC-9` |
 | Spec | `docs/core/specs/src-9.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 1 |
 | Plan | `docs/superpowers/plans/2026-10-10-src-9-connector-gates.md` |
-| Plan | `docs/superpowers/plans/2026-10-10-src-9-connector-gates.md` |
 
 ## Problem
 
