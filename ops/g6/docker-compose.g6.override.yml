@@ -89,6 +89,32 @@ services:
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:?}"]
 
+  # SRC-9 task 3: the MariaDB fixture, defined here and not in
+  # docker-compose.yml for the reason the header gives (`${VAR:?}` is
+  # interpolated for every service, so a gate-only credential in the default
+  # file breaks `docker compose --profile '*' config --quiet`). Same shape as
+  # `mysql-g6`: one database, a database-scoped reader user the connector
+  # dials, root for the gate's seeding only. `11.4` is MariaDB's current
+  # long-term-support series (supported to 2029), pinned by series tag like
+  # the other fixtures. The healthcheck dials 127.0.0.1 over TCP, never the
+  # socket: the image's entrypoint runs a temporary server with networking
+  # off while it creates the database and users, and a socket ping would
+  # report healthy during it (the same restart-after-ready trap as Postgres).
+  mariadb-g6:
+    image: mariadb:11.4
+    profiles: ["g6"]
+    restart: "no"
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
+      MARIADB_DATABASE: g6_ingest
+      MARIADB_USER: g6_reader
+      MARIADB_PASSWORD: ${CONNECTOR_MARIADB_PASSWORD:?}
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping --protocol=tcp -h 127.0.0.1 -u root -p\"$$MARIADB_ROOT_PASSWORD\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   mssql-g6:
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
@@ -107,8 +133,16 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
 
   g6-test-runner:
+    # SRC-9 task 3: the runner seeds and dials mariadb-g6, so it waits for it.
+    depends_on:
+      mariadb-g6:
+        condition: service_healthy
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      # SRC-9 task 3: root (seeding) and the connector's reader password for
+      # mariadb-g6, provisioned by its own block above.
+      MARIADB_G6_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
+      CONNECTOR_MARIADB_PASSWORD: ${CONNECTOR_MARIADB_PASSWORD:?}
       # The mysql-g6/mssql-g6 dial CONNECTOR credentials (not root/sa) --
       # g6-test-runner needs the real values to write into each
       # connector's derived `file:` credential (ADR 0002 Addendum 3), the

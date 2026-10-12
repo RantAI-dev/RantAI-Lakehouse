@@ -602,6 +602,8 @@ jobs:
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
           MONGO_G6_ROOT_USER=ci-mongo-root-not-real
           MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
@@ -628,7 +630,7 @@ jobs:
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
           --profile g6 --profile dagster up -d --build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
-          g3a-source-init mysql-g6 mssql-g6 mssql-g6-cert-init rest-stub-g6
+          g3a-source-init mysql-g6 mariadb-g6 mssql-g6 mssql-g6-cert-init rest-stub-g6
           mongo-g6 kafka-g6 kafka-g6-spoofed
 
       - name: Run the G6 ingest matrix test inside the compose network

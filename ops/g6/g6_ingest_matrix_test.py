@@ -94,6 +94,8 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 MYSQL_ROOT_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "")
 CONNECTOR_MYSQL_PASSWORD = os.environ.get("CONNECTOR_MYSQL_PASSWORD", "")
+MARIADB_G6_ROOT_PASSWORD = os.environ.get("MARIADB_G6_ROOT_PASSWORD", "")
+CONNECTOR_MARIADB_PASSWORD = os.environ.get("CONNECTOR_MARIADB_PASSWORD", "")
 MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MONGO_G6_ROOT_USER = os.environ.get("MONGO_G6_ROOT_USER", "")
 MONGO_G6_ROOT_PASSWORD = os.environ.get("MONGO_G6_ROOT_PASSWORD", "")
@@ -243,6 +245,21 @@ def step_ensure_tenant() -> None:
 def _seed_mysql_fixture() -> None:
     import pymysql
     conn = pymysql.connect(host="mysql-g6", user="root", password=MYSQL_ROOT_PASSWORD, database="g6_ingest")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY, amount DECIMAL(10,2))")
+            cur.execute("DELETE FROM orders")
+            cur.executemany("INSERT INTO orders (id, amount) VALUES (%s, %s)", [(1, 10.5), (2, 20.25)])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_mariadb_fixture() -> None:
+    """SRC-9 task 3: the same `orders` table as `_seed_mysql_fixture`, in
+    `mariadb-g6`'s `g6_ingest` (pymysql speaks to MariaDB as to MySQL)."""
+    import pymysql
+    conn = pymysql.connect(host="mariadb-g6", user="root", password=MARIADB_G6_ROOT_PASSWORD, database="g6_ingest")
     try:
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY, amount DECIMAL(10,2))")
@@ -607,6 +624,7 @@ def _bronze_ingested_at_null_count(bronze_table: str) -> int:
 # this maps the gate's own connector names to its keys.
 TYPE_OF = {
     "g6-mysql": "MySQL",
+    "g6-mariadb": "MariaDB",
     "g6-mssql": "SQL Server",
     "conn-pg-lakehouse": "PostgreSQL",
     "g6-files": "Object storage",
@@ -615,7 +633,7 @@ TYPE_OF = {
     "g6-rest": "REST API",
 }
 BRONZE_OF = {
-    "g6-mysql": "g6_mysql_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
+    "g6-mysql": "g6_mysql_orders", "g6-mariadb": "g6_mariadb_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
     "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders", "g6-kafka": "g6_kafka_events",
     "g6-rest": "g6_rest_items",
 }
@@ -626,6 +644,7 @@ BRONZE_OF = {
 DISCOVER_FIXTURES = {
     "PostgreSQL": ("ingest_demo", "ingest_demo.orders", {"id", "customer", "amount", "created_at"}),
     "MySQL": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
+    "MariaDB": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
     "SQL Server": ("dbo", "dbo.orders", {"id", "amount"}),
 }
 # Kafka "reload" (SRC-9 task 2): this many new messages are produced between
@@ -884,6 +903,7 @@ def _step_reload(connector_ids: dict[str, str], first_counts: dict[str, int]) ->
 
 def step_ingest_matrix() -> None:
     _seed_mysql_fixture()
+    _seed_mariadb_fixture()
     _seed_mssql_fixture()
     mongo_reader_password = _seed_mongo_fixture()
     _seed_files_fixture()
@@ -898,6 +918,14 @@ def step_ingest_matrix() -> None:
          {"source": "file", "primary": "password"}, {"primary": CONNECTOR_MYSQL_PASSWORD},
          "sql", {"driver": "mysql", "host": "mysql-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
          [{"name": "orders", "target": "g6_mysql_orders"}]),
+        # SRC-9 task 3: registered the way the console registers MariaDB:
+        # type "MariaDB", adapter `sql`, and the wire driver `mysql`
+        # (`driverForType("MariaDB")` in the console; `SqlDriver` has no
+        # `mariadb` value).
+        ("g6-mariadb", "MariaDB", "mariadb-g6:3306",
+         {"source": "file", "primary": "password"}, {"primary": CONNECTOR_MARIADB_PASSWORD},
+         "sql", {"driver": "mysql", "host": "mariadb-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
+         [{"name": "orders", "target": "g6_mariadb_orders"}]),
         ("g6-mssql", "SQL Server", "mssql-g6:1433",
          {"source": "file", "primary": "password"}, {"primary": MSSQL_SA_PASSWORD},
          "sql", {"driver": "mssql", "host": "mssql-g6", "port": 1433, "database": "g6_ingest", "user": "sa"},
@@ -998,7 +1026,7 @@ def step_ingest_matrix() -> None:
     # SRC-9 task 2: `connect` and `discover` for the other connectors, while
     # their first runs are in flight. Both are quick, read-only calls (a
     # supported test stamps this connector's `health`; see `_check_connect`).
-    for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
+    for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
         if name in connector_ids:
             if name != "g6-files":
                 _check_connect(name, connector_ids[name])
@@ -1043,7 +1071,7 @@ def step_ingest_matrix() -> None:
 
     first_counts: dict[str, int] = {}
     for name, bronze_table in [
-        ("g6-mysql", "g6_mysql_orders"), ("g6-mssql", "g6_mssql_orders"),
+        ("g6-mysql", "g6_mysql_orders"), ("g6-mariadb", "g6_mariadb_orders"), ("g6-mssql", "g6_mssql_orders"),
         ("conn-pg-lakehouse", "orders"), ("g6-files", "g6_files_orders"),
         ("g6-mongo", "g6_mongo_orders"), ("g6-kafka", "g6_kafka_events"),
         # g6-rest was missing from this list entirely -- verification

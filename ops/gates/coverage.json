@@ -47,15 +47,15 @@
       }
     },
     "MariaDB": {
-      "gate": null,
+      "gate": "g6",
       "steps": {
-        "connect": "missing",
-        "discover": "missing",
-        "load": "missing",
-        "reload": "missing"
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
       },
       "notes": {
-        "all": "SRC-9 plan task 3. MariaDB uses the MySQL driver, so connect and discover are real."
+        "all": "SRC-9 plan task 3: mariadb:11.4 in the g6 override. MariaDB uses the MySQL driver (wire driver 'mysql'), so connect and discover go through the same code paths as MySQL."
       }
     },
     "SQL Server": {
