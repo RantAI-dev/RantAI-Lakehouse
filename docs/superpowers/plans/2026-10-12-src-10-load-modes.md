@@ -486,6 +486,22 @@ Not verified: Lakekeeper REST catalog (local catalog only); ClickHouse/Trino rea
 
 *(developer)*
 
+### Eighth pass: main merged, the gate step, the Dagster job split (developer)
+
+Commits after `f68a8b5`: `ea2fef2` merge of `main` (`ce9d8ed`, SRC-9); `0e2f352` task 8, `step_load_modes`; `199273d` the loader marker and `dagster-loader-tests`.
+
+**Merge.** One conflict, `connector_discover.rs`, two hunks, both kept: SRC-9's `ORACLE_DISCOVER_REASON`, Oracle refusal, log line and its test; this branch's `MSSQL_PRIMARY_KEY_QUERY` and tests (import list merged). `MYSQL_PRIMARY_KEY_QUERY` now casts with `CHARACTER SET utf8mb4` like SRC-9's column query, and its test follows. Checked without conflict: the only `DiscoveredObject { }` literal carries `primary_key`; no duplicate migration number; TS contracts hold `unsupportedReason` and `primaryKey`; the g6 discover step reads `objects` and column names only, so the extra field does not touch it.
+
+**Gate step** (`ops/g6/g6_ingest_matrix_test.py::step_load_modes`, `sql` group, after the SRC-8 step; own tables `src10_dedup/hist/other`, own connector `g6-mysql-load-modes`). Parts a (key detection from discover), b (dedup, three runs), c (history, same three runs), d (refresh_remove of one table, clear of another), e (replace over history is `rejected`, the run FAILS, spec put back, connector not paused). Parts b and c share runs (a run loads every table): six runs, not eight. Deviation: tables are read through ClickHouse's catalog database like the gate's other steps (`ch_query`, always `WHERE`), not `POST /api/query/run`, because the gate has no `ICEBERG_QUERY_DB`. No existing assertion changed. Time estimate: 6 runs (about 15-25 s; two are single-table) plus ClickHouse polling is about 3 to 4 minutes; `g6-ingest` measured 15m16s to 17m22s, so 18.5 to 21.5 minutes against the 25-minute limit and the 20-minute decision: the top of the range is past 20. Proposal, not done: move this step and the SRC-8 step to a third job.
+
+**Dagster split.** `loader` marker in `dagster/pyproject.toml` (`--strict-markers`), `pytestmark` on 14 files chosen by per-file timing (13 files of 30 s or more, plus `test_schema_loaded_name.py` named by the planner). Collected: loader 258 + not loader 774 = 1032 = no `-m`. Run in `~/.cache/rantai-dagster-venv`: `not loader` 774 passed in 16.3 s; `loader` 258 passed in 959.5 s (the whole suite was 949 s here, which is slower than the CI runner). Fast job is no longer slow.
+
+Commands: `cargo fmt --check` OK; clippy workspace (detached, after touch) Finished 1m57s, no warning; `bun install --frozen-lockfile`, `typecheck` clean, `lint` 0 errors 6 warnings, `test` 1128 pass 1 skip 0 fail; Dagster whole suite 1032 passed (949 s, before the split); `ops/gates` 29 and `ops/lint` 23 unit tests OK; four lints OK; `test_required_gate.sh` 32 passed.
+
+Not verified: everything in the gate step (CI only); `cargo test` (CI); that `_is_current` and `_valid_to` read as the step assumes through ClickHouse (the step prints what it saw); the new CI job (YAML parses, `ci-required` needs print includes it).
+
+*(developer)*
+
 ## Review
 
 *(planner)*
