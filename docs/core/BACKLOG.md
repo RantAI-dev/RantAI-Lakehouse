@@ -124,7 +124,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-6` | Feature | Fix the broken connectors: object-storage test and key change, Oracle credential change, Sheets shown as unsupported, Sources header text | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-7` | Feature | Alerts when a connector run or an upload load fails; health from real runs | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Todo |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | In Progress | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
@@ -164,6 +164,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-26` | Task | About thirty assistant tool results carry raw upstream error text (`err.to_string()`) into the chat response's `toolTrace`. Same rule as `SEC-6` | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 | `SRC-17` | Task | Load-failure alert delivery: a failed delivery is recorded as if sent (feature-page row 5 cannot pass); a rule-store failure loses the alert because the dedupe row is written first; the Alerts page still says nothing raises `connector_schema_change`; a gate step that receives a webhook, and `SRC-7-RESULT.md` with measured seconds | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-7`) |
 | `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
+| `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | Todo |  | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
+| `SRC-20` | Task | The pipeline gate `ops/g7` is run by no CI job | Data | P3 | Todo |  | `plans/SRC-9-RESULT.md` |
 | `DATA-24` | Task | Catalog search follow-ups: measure the 500 ms target on 10,000 tables (`DATA-11-RESULT.md`); keep the Owner and Tags filters reachable on a laptop-width window; read column rows with `FINAL`; run acceptance rows 10, 11 and 13 | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`DATA-11`) |
 | `AI-19` | Task | The AI team's plans for `AI-16` and `AI-17` in `docs/superpowers/plans/` (`AI-16-AC1`, `AGENTS.md` step 1); the feature pages say plans are not kept in the repository | AI Copilot | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 
@@ -218,6 +220,7 @@ set by the product owner and are left empty until they are.
 | `SRC-6` | 2026-10-08 | 2026-10-12 | |
 | `SRC-7` | 2026-10-08 | 2026-10-12 | |
 | `SRC-8` | 2026-10-09 | 2026-10-12 | |
+| `SRC-9` | 2026-10-10 | | |
 
 ## Decide
 

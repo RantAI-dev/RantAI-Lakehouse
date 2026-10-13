@@ -114,7 +114,7 @@ use uuid::Uuid;
 use super::catalog::registered_slug;
 use super::catalog_source::{PresenceUnknown, iceberg_table_presence};
 use super::governance::{IngestRunRow, ingest_runs_or_empty};
-use super::lakehouse::is_unknown_table_error;
+use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -1440,8 +1440,15 @@ async fn table_exists(state: &AppState, table: &str) -> Result<bool, PresenceUnk
     match registered_slug(&state.clickhouse, table).await {
         Ok(Some(_)) => return Ok(true),
         Ok(None) => {}
-        // No registry table yet means nothing has ever been registered.
-        Err(ChError::Server(body)) if is_unknown_table_error(&body) => {}
+        // No registry table yet means nothing has ever been registered. On a
+        // fresh install the whole `lake` database is absent too (`Code: 81`):
+        // the orchestrator's `register_bronze_table` creates the database and
+        // both registry tables (`EXPECTED_SCHEMAS`, their single owner) before
+        // its first write, so an upload may be the first thing a tenant does.
+        // SRC-9 finding G4. An absent registry holds no name, so nothing is
+        // claimed here; the Iceberg half below still runs, and every other
+        // error stays `Unanswered`.
+        Err(ChError::Server(body)) if is_unknown_table_or_database_error(&body) => {}
         Err(err) => {
             tracing::warn!(%err, table, "the catalog registry could not be asked about a table name");
             return Err(PresenceUnknown::Unanswered);

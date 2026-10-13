@@ -17,6 +17,14 @@ docs/superpowers/plans/2026-09-11-ws5-platform-signals.md's plan for
 extending ops/g4/g4_test.py duplicates the SAME g3a_test.py login block
 into g4_test.py for the identical reason.
 
+# Two halves (SRC-9 decision 9)
+
+`G6_GROUP=sql|other|all` (default `all`) selects which connectors and which
+later steps this process runs; see `GROUP_MEMBERS` below. CI runs `sql` and
+`other` as two jobs so each stays under 20 minutes; a developer running the
+whole gate locally gets `all`, as before. The types of the half that did not
+run are recorded `skipped`, "covered by job <name>".
+
 # Credential shape (ADR 0002 Addendum 3)
 
 `POST /api/connectors` no longer accepts a client-chosen `secretRef` --
@@ -57,6 +65,12 @@ import time
 
 import requests
 
+# SRC-9 task 1: the coverage registry and the result table, mounted at
+# /opt/gates by this gate's compose override (PYTHONPATH). Imported, not
+# duplicated, unlike the helpers above: it is the one module the connector
+# gates share (docs/superpowers/plans/2026-10-10-src-9-connector-gates.md).
+import gate_summary
+
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
@@ -88,6 +102,11 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 MYSQL_ROOT_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "")
 CONNECTOR_MYSQL_PASSWORD = os.environ.get("CONNECTOR_MYSQL_PASSWORD", "")
+MARIADB_G6_ROOT_PASSWORD = os.environ.get("MARIADB_G6_ROOT_PASSWORD", "")
+CONNECTOR_MARIADB_PASSWORD = os.environ.get("CONNECTOR_MARIADB_PASSWORD", "")
+SFTP_G6_PASSWORD = os.environ.get("SFTP_G6_PASSWORD", "")
+SFTP_G6_USER = "g6_sftp"
+SFTP_HOSTKEY_PUB = "/sftp-hostkey/ssh_host_ed25519_key.pub"
 MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MONGO_G6_ROOT_USER = os.environ.get("MONGO_G6_ROOT_USER", "")
 MONGO_G6_ROOT_PASSWORD = os.environ.get("MONGO_G6_ROOT_PASSWORD", "")
@@ -245,6 +264,68 @@ def _seed_mysql_fixture() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_mariadb_fixture() -> None:
+    """SRC-9 task 3: the same `orders` table as `_seed_mysql_fixture`, in
+    `mariadb-g6`'s `g6_ingest` (pymysql speaks to MariaDB as to MySQL)."""
+    import pymysql
+    conn = pymysql.connect(host="mariadb-g6", user="root", password=MARIADB_G6_ROOT_PASSWORD, database="g6_ingest")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY, amount DECIMAL(10,2))")
+            cur.execute("DELETE FROM orders")
+            cur.executemany("INSERT INTO orders (id, amount) VALUES (%s, %s)", [(1, 10.5), (2, 20.25)])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_sftp_fixture() -> str:
+    """SRC-9 task 4: puts `orders.csv` (3 rows) into `sftp-g6`'s `upload`
+    directory as the fixture's user and returns the connector's pinned
+    `hostKeyFingerprint`.
+
+    The fingerprint is computed from the fixture's own public host key
+    (`sftp-g6-hostkey-init` writes it to a volume this runner mounts), never
+    taken from a connection: that would be the trust-on-first-use
+    `PinnedHostKeyPolicy` refuses. The upload itself checks the same key
+    (`RejectPolicy`), so a server presenting another key fails the gate here.
+    Format: `SHA256:` + unpadded base64 of the SHA-256 of the key blob, as
+    `ssrf_guard_sftp._sha256_fingerprint` and `ssh-keygen -l` print it."""
+    import base64
+    import hashlib
+    import io
+
+    import paramiko
+
+    with open(SFTP_HOSTKEY_PUB, encoding="utf-8") as fh:
+        fields = fh.read().split()
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise G6Failure(f"{SFTP_HOSTKEY_PUB} is not an ssh-ed25519 public key")
+    blob = base64.b64decode(fields[1])
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+    csv_bytes = b"id,name,amount\n1,alpha,10.5\n2,beta,20.25\n3,gamma,30.0\n"
+
+    def upload() -> bool:
+        client = paramiko.SSHClient()
+        client.get_host_keys().add("sftp-g6", "ssh-ed25519", paramiko.Ed25519Key(data=blob))
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        try:
+            client.connect(
+                "sftp-g6", 22, username=SFTP_G6_USER, password=SFTP_G6_PASSWORD,
+                allow_agent=False, look_for_keys=False, timeout=10,
+            )
+            sftp = client.open_sftp()
+            sftp.putfo(io.BytesIO(csv_bytes), "/upload/orders.csv")
+            sftp.close()
+        finally:
+            client.close()
+        return True
+
+    _wait_for("sftp-g6 accepts the fixture upload", upload, 60, interval_s=3.0)
+    return fingerprint
 
 
 def _seed_mssql_fixture() -> None:
@@ -596,19 +677,382 @@ def _bronze_ingested_at_null_count(bronze_table: str) -> int:
     return int(text.strip())
 
 
+# SRC-9 task 2: the registry type each connector of the matrix stands for.
+# `ops/gates/coverage.json` is the one list of what each type is gated for;
+# this maps the gate's own connector names to its keys.
+TYPE_OF = {
+    "g6-mysql": "MySQL",
+    "g6-mariadb": "MariaDB",
+    "g6-sftp": "SFTP",
+    "g6-mssql": "SQL Server",
+    "conn-pg-lakehouse": "PostgreSQL",
+    "g6-files": "Object storage",
+    "g6-mongo": "MongoDB",
+    "g6-kafka": "Kafka",
+    "g6-rest": "REST API",
+}
+BRONZE_OF = {
+    "g6-mysql": "g6_mysql_orders", "g6-mariadb": "g6_mariadb_orders", "g6-sftp": "g6_sftp_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
+    "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders", "g6-kafka": "g6_kafka_events",
+    "g6-rest": "g6_rest_items",
+}
+# What `POST .../discover` must list for the types the product can discover:
+# `(schema, "<schema>.<table>", columns)`. The fixtures: `ingest_demo.orders`
+# (docker-compose.yml, g3a-source-init), and the `orders` table the seeders
+# above create in `g6_ingest` (MySQL) and in `dbo` of `g6_ingest` (SQL Server).
+DISCOVER_FIXTURES = {
+    "PostgreSQL": ("ingest_demo", "ingest_demo.orders", {"id", "customer", "amount", "created_at"}),
+    "MySQL": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
+    "MariaDB": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
+    "SQL Server": ("dbo", "dbo.orders", {"id", "amount"}),
+}
+# SRC-9 decision 9: the gate runs as two CI jobs, because one job took 22 to
+# 23 minutes (13 of them bringing the stack up). `G6_GROUP` selects the half:
+# `sql` is the SQL sources (PostgreSQL, MySQL, MariaDB, SQL Server) and the
+# steps that need the MySQL fixture or only the API; `other` is object
+# storage, REST, MongoDB, Kafka and SFTP. `all` (the default) is the whole
+# gate, as a developer runs it locally. Each job brings up only the fixtures
+# of its half (`.github/workflows/ci.yml`; fixture profiles `g6-sql` and
+# `g6-other` in docker-compose.yml). The names are the registry's `g6`
+# gate in both halves; the registry names gates, not CI jobs.
+GROUP = os.environ.get("G6_GROUP", "all")
+GROUP_MEMBERS = {
+    "sql": ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-mssql"),
+    "other": ("g6-files", "g6-rest", "g6-mongo", "g6-kafka", "g6-sftp"),
+}
+JOB_OF_GROUP = {"sql": "g6-ingest", "other": "g6-ingest-other"}
+
+
+def _active(name: str) -> bool:
+    """Whether the connector `name` (a key of `TYPE_OF`) belongs to the half
+    this process runs."""
+    return GROUP == "all" or name in GROUP_MEMBERS[GROUP]
+
+
+def _group_runs(group: str) -> bool:
+    """Whether the steps that belong to `group` run in this process."""
+    return GROUP in ("all", group)
+
+
+# Kafka "reload" (SRC-9 task 2): this many new messages are produced between
+# the two runs, after the first run's offsets are committed.
+KAFKA_RELOAD_MESSAGES = 5
+KAFKA_TOPIC = "g6-events"
+KAFKA_GROUP_ID = "g6-gate-kafka"
+
+# Set by `main`. The four steps record into it; `main` prints the table and
+# fails the gate if any cell is `fail`.
+RECORDER: gate_summary.Recorder | None = None
+
+
+def _recorder() -> gate_summary.Recorder:
+    if RECORDER is None:
+        raise G6Failure("internal error: the gate summary recorder was not created")
+    return RECORDER
+
+
+def _record(type_name: str, step: str, outcome: str, detail: str = "") -> None:
+    _recorder().record(type_name, step, outcome, detail)
+    print(f"[g6] {type_name} {step}: {outcome}{' (' + detail + ')' if detail else ''}")
+
+
+def _record_fail(type_name: str, step: str, detail: str) -> None:
+    """A failed connect, discover or reload step is recorded and the gate
+    goes on, so one CI run shows every broken cell instead of the first;
+    `main` fails the gate at the end and the `[g6] FAILED:` line names each
+    type and step."""
+    _record(type_name, step, "fail", detail)
+
+
+def _expectation(type_name: str, step: str) -> str | None:
+    """The registry's value for the step, or None after recording a failure
+    when it says `missing`: a gate that runs a step the registry calls
+    missing means the registry is stale (one list, not two)."""
+    expected = _recorder().registry.expectation(type_name, step)
+    if expected == "missing":
+        _record_fail(
+            type_name, step,
+            "ops/gates/coverage.json says 'missing' but this gate runs the step; update the registry",
+        )
+        return None
+    return expected
+
+
+def _check_group() -> None:
+    if GROUP != "all" and GROUP not in GROUP_MEMBERS:
+        raise G6Failure(f"G6_GROUP={GROUP!r} is not one of sql, other, all")
+    covered = {name for names in GROUP_MEMBERS.values() for name in names}
+    if covered != set(TYPE_OF):
+        raise G6Failure(f"GROUP_MEMBERS and TYPE_OF disagree: {sorted(covered ^ set(TYPE_OF))}")
+
+
+def _record_other_half_skipped() -> None:
+    """The half this process does not run is shown `skipped`, naming the job
+    that covers it, never blank and never green (the table of each job lists
+    every type)."""
+    for group, names in GROUP_MEMBERS.items():
+        if _group_runs(group):
+            continue
+        for name in names:
+            for step in gate_summary.STEPS:
+                _recorder().record(TYPE_OF[name], step, "skipped", f"covered by job {JOB_OF_GROUP[group]}")
+    if GROUP != "all":
+        print(f"[g6] G6_GROUP={GROUP}: the other half of the matrix is covered by its own job")
+
+
+def _check_registry_covers_this_gate() -> None:
+    for type_name in TYPE_OF.values():
+        owner = _recorder().registry.gate_of(type_name)
+        if owner != "g6":
+            raise G6Failure(f"ops/gates/coverage.json gives {type_name!r} to gate {owner!r}, but g6 loads it")
+
+
+def _check_connect(name: str, connector_id: str) -> None:
+    """SRC-9 task 2, step `connect`: `POST .../test`.
+
+    `real`: `supported: true, ok: true`. `refused`: `supported: false`,
+    `ok: false`, no latency and a non-empty message; the message text is not
+    matched, it may be reworded. A supported test stamps `connector.health`
+    (`record_test_result`) on THIS connector only; `step_failed_run_updates_
+    connector_health` uses a connector of its own, so it is not disturbed. A
+    refused one leaves `health` alone."""
+    type_name = TYPE_OF[name]
+    expected = _expectation(type_name, "connect")
+    if expected is None:
+        return
+    try:
+        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/test", timeout=30)
+        if not resp.ok:
+            _record_fail(type_name, "connect", f"POST .../test answered {resp.status_code} {resp.text[:200]}")
+            return
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        _record_fail(type_name, "connect", f"POST .../test did not answer cleanly ({type(exc).__name__})")
+        return
+    if expected == "real":
+        if body.get("supported") is True and body.get("ok") is True:
+            _record(type_name, "connect", "pass", f"{body.get('latencyMs')} ms")
+        else:
+            _record_fail(
+                type_name, "connect",
+                f"expected supported=true ok=true, got supported={body.get('supported')!r} "
+                f"ok={body.get('ok')!r} message={str(body.get('message'))[:200]!r}",
+            )
+        return
+    message = body.get("message")
+    if (
+        body.get("supported") is False and body.get("ok") is False
+        and body.get("latencyMs") is None and isinstance(message, str) and message.strip()
+    ):
+        _record(type_name, "connect", "refused-as-expected", "supported=false, no latency")
+    else:
+        _record_fail(
+            type_name, "connect",
+            f"expected the honest refusal (supported=false, ok=false, no latency, a message), got {body}",
+        )
+
+
+def _check_discover(name: str, connector_id: str) -> None:
+    """SRC-9 task 2, step `discover`: `POST .../discover` (`?schema=` is
+    required for sql/cdc connectors and ignored for the rest).
+
+    `real`: `supported: true` and the fixture's table is listed with its
+    columns. `refused`: `supported: false` and a non-empty `reason`."""
+    type_name = TYPE_OF[name]
+    expected = _expectation(type_name, "discover")
+    if expected is None:
+        return
+    fixture = DISCOVER_FIXTURES.get(type_name)
+    params = {"schema": fixture[0]} if fixture else None
+    try:
+        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params=params, timeout=30)
+        if not resp.ok:
+            _record_fail(type_name, "discover", f"POST .../discover answered {resp.status_code} {resp.text[:200]}")
+            return
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        _record_fail(type_name, "discover", f"POST .../discover did not answer cleanly ({type(exc).__name__})")
+        return
+    if expected == "refused":
+        reason = body.get("reason")
+        if body.get("supported") is False and isinstance(reason, str) and reason.strip():
+            _record(type_name, "discover", "refused-as-expected", "supported=false with a reason")
+        else:
+            _record_fail(type_name, "discover", f"expected supported=false with a reason, got {body}")
+        return
+    if fixture is None:
+        _record_fail(type_name, "discover", "the gate has no discovery fixture for a type the registry calls real")
+        return
+    _, table_name, columns = fixture
+    table = next((o for o in body.get("objects") or [] if o.get("name") == table_name), None)
+    if body.get("supported") is not True or table is None:
+        listed = [o.get("name") for o in body.get("objects") or []]
+        _record_fail(
+            type_name, "discover",
+            f"expected supported=true listing {table_name!r}, got supported={body.get('supported')!r} objects={listed[:20]}",
+        )
+        return
+    found = {c.get("name") for c in table.get("columns") or []}
+    if not columns <= found:
+        _record_fail(type_name, "discover", f"{table_name!r} is missing columns {sorted(columns - found)}, has {sorted(found)}")
+        return
+    _record(type_name, "discover", "pass", f"{table_name} with {len(found)} columns")
+
+
+def _produce_kafka_reload_batch(topic: str, group_id: str) -> int | None:
+    """Produce `KAFKA_RELOAD_MESSAGES` new messages and return how many
+    messages the consumer group has not yet committed, counted at the
+    broker: the sum over partitions of (end offset - the group's committed
+    offset). Returns None if the group has no committed offset on some
+    partition (then the count is not knowable and the caller records
+    `skipped`).
+
+    Why this and not "N": the first run's producer keeps going until the run
+    ends, so messages sent after the consumer's last poll were never
+    committed and the second run reads them too. The broker's own offsets
+    give the exact number the second run must load, with nothing assumed
+    about timing. A consumer with a `group_id` and no subscription only
+    reads offsets; it joins no group and commits nothing."""
+    from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+    consumer = KafkaConsumer(
+        bootstrap_servers=["kafka-g6:9092"], group_id=group_id, enable_auto_commit=False, security_protocol="PLAINTEXT",
+    )
+    try:
+        partitions = consumer.partitions_for_topic(topic)
+        if not partitions:
+            return None
+        tps = [TopicPartition(topic, p) for p in sorted(partitions)]
+        committed = {tp: consumer.committed(tp) for tp in tps}
+        if any(offset is None for offset in committed.values()):
+            return None
+        producer = KafkaProducer(bootstrap_servers=["kafka-g6:9092"], security_protocol="PLAINTEXT")
+        try:
+            for i in range(KAFKA_RELOAD_MESSAGES):
+                producer.send(topic, json.dumps({"id": 1000 + i, "amount": 1000.0 + i}).encode("utf-8"))
+            producer.flush()
+        finally:
+            producer.close()
+        ends = consumer.end_offsets(tps)
+        return sum(ends[tp] - committed[tp] for tp in tps)
+    finally:
+        consumer.close()
+
+
+def _step_reload(connector_ids: dict[str, str], first_counts: dict[str, int]) -> None:
+    """SRC-9 task 2, step `reload`: a SECOND run of every connector the
+    matrix loaded, started together and waited for together, then the
+    table's rows as the load mode promises.
+
+    These connectors have no `loadMode`, so each source object takes the
+    default, `replace` (`LoadPlan.from_source_object`): the second run must
+    leave exactly the rows the first left. Kafka is a micro-batch that
+    appends (`run_kafka_stream_batch`): the second run must add exactly the
+    messages the group had not committed (`_produce_kafka_reload_batch`).
+
+    The row count is read twice, a few seconds apart: a freshly overwritten
+    Iceberg table can show the previous snapshot to ClickHouse for a moment
+    (see the wait in `step_ingest_matrix`), and an earlier snapshot has the
+    same count a `replace` is meant to keep, so one read could pass a run
+    that appended."""
+    run_ids: dict[str, str] = {}
+    expected: dict[str, int] = {}
+    for name, type_name in TYPE_OF.items():
+        if not _active(name):
+            continue
+        if name not in first_counts:
+            _record(type_name, "reload", "skipped", "the first load did not complete, so there is nothing to load again")
+            continue
+        if _expectation(type_name, "reload") is None:
+            continue
+        expected[name] = first_counts[name]
+        if name == "g6-kafka":
+            unconsumed = _produce_kafka_reload_batch(KAFKA_TOPIC, KAFKA_GROUP_ID)
+            if unconsumed is None:
+                _record(type_name, "reload", "skipped", "the consumer group has no committed offset after the first run, so the rows the second run must add cannot be counted")
+                del expected[name]
+                continue
+            expected[name] += unconsumed
+            print(f"[g6] kafka reload: {unconsumed} messages not yet committed (including {KAFKA_RELOAD_MESSAGES} new ones)")
+        try:
+            launched = _post_ingest_run(connector_ids[name]).json().get("runId")
+        except G6Failure as exc:
+            _record_fail(type_name, "reload", f"second run not started: {exc}")
+            expected.pop(name, None)
+            continue
+        if not launched:
+            _record_fail(type_name, "reload", "the second ingest/run returned no runId")
+            expected.pop(name, None)
+            continue
+        run_ids[name] = launched
+        print(f"[g6] launched second run {launched} for {name!r}")
+
+    for name, run_id in run_ids.items():
+        try:
+            step_wait_for_run_success(run_id)
+        except G6Failure as exc:
+            _record_fail(TYPE_OF[name], "reload", f"second run did not succeed: {exc}")
+            expected.pop(name, None)
+
+    matched: dict[str, int] = {}
+    for name, want in expected.items():
+        table = BRONZE_OF[name]
+        try:
+            _wait_for(f"bronze.{table} has {want} rows after the second run", lambda t=table, w=want: _bronze_row_count(t) == w or None, 30, interval_s=3.0)
+            matched[name] = want
+        except G6Failure:
+            _record_fail(TYPE_OF[name], "reload", f"expected {want} rows in bronze.{table} after the second run, got {_bronze_row_count(table)}")
+    time.sleep(6.0)
+    for name, want in matched.items():
+        table = BRONZE_OF[name]
+        got = _bronze_row_count(table)
+        if got != want:
+            _record_fail(TYPE_OF[name], "reload", f"bronze.{table} had {want} rows after the second run and {got} a few seconds later")
+        else:
+            mode = "added exactly the uncommitted messages" if name == "g6-kafka" else "replace left the same rows"
+            _record(TYPE_OF[name], "reload", "pass", f"{want} rows in bronze.{table}: {mode}")
+
+
 def step_ingest_matrix() -> None:
-    _seed_mysql_fixture()
-    _seed_mssql_fixture()
-    mongo_reader_password = _seed_mongo_fixture()
-    _seed_files_fixture()
+    # Only the fixtures of this process's half exist (SRC-9 decision 9).
+    if _active("g6-mysql"):
+        _seed_mysql_fixture()
+    if _active("g6-mariadb"):
+        _seed_mariadb_fixture()
+    sftp_fingerprint = _seed_sftp_fixture() if _active("g6-sftp") else ""
+    if _active("g6-mssql"):
+        _seed_mssql_fixture()
+    mongo_reader_password = _seed_mongo_fixture() if _active("g6-mongo") else ""
+    if _active("g6-files"):
+        _seed_files_fixture()
 
     rest_api_key = secrets.token_hex(8)
+    # Filled by every `_register_and_run` below (SRC-9 task 2 needs the id of
+    # each connector for the connect, discover and reload steps).
+    connector_ids: dict[str, str] = {}
 
     connectors = [
         ("g6-mysql", "MySQL", "mysql-g6:3306",
          {"source": "file", "primary": "password"}, {"primary": CONNECTOR_MYSQL_PASSWORD},
          "sql", {"driver": "mysql", "host": "mysql-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
          [{"name": "orders", "target": "g6_mysql_orders"}]),
+        # SRC-9 task 3: registered the way the console registers MariaDB:
+        # type "MariaDB", adapter `sql`, and the wire driver `mysql`
+        # (`driverForType("MariaDB")` in the console; `SqlDriver` has no
+        # `mariadb` value).
+        ("g6-mariadb", "MariaDB", "mariadb-g6:3306",
+         {"source": "file", "primary": "password"}, {"primary": CONNECTOR_MARIADB_PASSWORD},
+         "sql", {"driver": "mysql", "host": "mariadb-g6", "port": 3306, "database": "g6_ingest", "user": "g6_reader"},
+         [{"name": "orders", "target": "g6_mariadb_orders"}]),
+        # SRC-9 task 4: password auth; `hostKeyFingerprint` is the
+        # fixture's own key (see `_seed_sftp_fixture`). The product answers
+        # honestly for connect and discover (SRC-5, SRC-13); load and reload
+        # are real.
+        ("g6-sftp", "SFTP", "sftp-g6:22",
+         {"source": "file", "primary": "password"}, {"primary": SFTP_G6_PASSWORD},
+         "sftp",
+         {"host": "sftp-g6", "port": 22, "user": SFTP_G6_USER, "hostKeyFingerprint": sftp_fingerprint,
+          "path": "/upload", "fileFormat": "csv", "auth": {"type": "password"}},
+         [{"name": "orders.csv", "target": "g6_sftp_orders"}]),
         ("g6-mssql", "SQL Server", "mssql-g6:1433",
          {"source": "file", "primary": "password"}, {"primary": MSSQL_SA_PASSWORD},
          "sql", {"driver": "mssql", "host": "mssql-g6", "port": 1433, "database": "g6_ingest", "user": "sa"},
@@ -655,44 +1099,71 @@ def step_ingest_matrix() -> None:
     ]
     run_ids: dict[str, str] = {}
     for name, kind, host, credential, credential_values, adapter, dial, objs in connectors:
+        if not _active(name):
+            continue
         run_id = _register_and_run(
             name=name, kind=kind, host=host, credential=credential, credential_values=credential_values,
-            adapter=adapter, dial=dial, source_objects=objs,
+            adapter=adapter, dial=dial, source_objects=objs, connector_ids=connector_ids,
         )
         if run_id:
             run_ids[name] = run_id
 
     # Postgres batch: the existing seeded conn-pg-lakehouse (0033),
     # already adapter=sql -- run it directly, no new connector needed.
-    pg_run = _post_ingest_run("conn-pg-lakehouse")
-    run_ids["conn-pg-lakehouse"] = pg_run.json()["runId"]
+    if _active("conn-pg-lakehouse"):
+        pg_run = _post_ingest_run("conn-pg-lakehouse")
+        run_ids["conn-pg-lakehouse"] = pg_run.json()["runId"]
+        connector_ids["conn-pg-lakehouse"] = "conn-pg-lakehouse"
 
     # files: the fixture ops/g6/seed_files_fixture.py wrote to
     # landing/orders.csv, registered against a NEW test connector -- never
     # conn-s3-warehouse, which rust/migrations/0033_connector_ingest_spec.sql
     # deliberately seeds with an empty source_objects.
-    connector_ids: dict[str, str] = {}
-    files_run_id = _register_and_run(
-        connector_ids=connector_ids,
-        name="g6-files", kind="Object storage", host="rustfs:9000",
-        credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
-        credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
-        adapter="files",
-        # "endpoint" set explicitly -- a real, `FilesDial`-validated
-        # optional field (`rust/crates/lakehouse-store/src/ingest_spec.rs`)
-        # this gate had simply left out, producing a bogus-credential 403
-        # against real AWS S3 (`_default_get_object` has no RustFS
-        # fallback when `endpoint` is unset; `adapters/files.py`'s
-        # docstring was corrected to say so in `ec25a5d`, not "an absent
-        # endpoint dials RustFS", which was never true).
-        dial={"protocol": "s3", "endpoint": "http://rustfs:9000", "bucket": "lakehouse-warehouse", "format": "csv"},
-        source_objects=[{"name": "landing/orders.csv", "target": "g6_files_orders"}],
-    )
-    if files_run_id:
-        run_ids["g6-files"] = files_run_id
-    # SRC-6 B3: after the ingest spec is saved (inside _register_and_run).
-    # Read-only against the connector, so the run just launched is unaffected.
-    _check_object_storage_test_and_key_change(connector_ids["g6-files"])
+    files_run_id = None
+    if _active("g6-files"):
+        files_run_id = _register_and_run(
+            connector_ids=connector_ids,
+            name="g6-files", kind="Object storage", host="rustfs:9000",
+            credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
+            credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
+            adapter="files",
+            # "endpoint" set explicitly -- a real, `FilesDial`-validated
+            # optional field (`rust/crates/lakehouse-store/src/ingest_spec.rs`)
+            # this gate had simply left out, producing a bogus-credential 403
+            # against real AWS S3 (`_default_get_object` has no RustFS
+            # fallback when `endpoint` is unset; `adapters/files.py`'s
+            # docstring was corrected to say so in `ec25a5d`, not "an absent
+            # endpoint dials RustFS", which was never true).
+            dial={"protocol": "s3", "endpoint": "http://rustfs:9000", "bucket": "lakehouse-warehouse", "format": "csv"},
+            source_objects=[{"name": "landing/orders.csv", "target": "g6_files_orders"}],
+        )
+        if files_run_id:
+            run_ids["g6-files"] = files_run_id
+        # SRC-6 B3: after the ingest spec is saved (inside _register_and_run).
+        # Read-only against the connector, so the run just launched is unaffected.
+        #
+        # SRC-9 task 2 (`connect` for object storage): the check above IS the
+        # step, with its assertions unchanged; it is recorded, not run again.
+        # The check runs whatever the registry says (never skipped to match it);
+        # `_expectation` records a failure if the registry calls the step missing.
+        registered = _expectation("Object storage", "connect") is not None
+        try:
+            _check_object_storage_test_and_key_change(connector_ids["g6-files"])
+        except G6Failure as exc:
+            _record_fail("Object storage", "connect", str(exc))
+            raise
+        if registered:
+            _record("Object storage", "connect", "pass", "tested at the dial endpoint; a wrong secret key is refused")
+
+
+    # SRC-9 task 2: `connect` and `discover` for the other connectors, while
+    # their first runs are in flight. Both are quick, read-only calls (a
+    # supported test stamps this connector's `health`; see `_check_connect`).
+    for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-sftp", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
+        if name in connector_ids:
+            if name != "g6-files":
+                _check_connect(name, connector_ids[name])
+            _check_discover(name, connector_ids[name])
 
     # kafka: ingestMode="stream" (widened by 0043_ingest_tier2_adapters.sql
     # -- `ingest_factory.py::run_ingest` dispatches "stream" to
@@ -703,28 +1174,37 @@ def step_ingest_matrix() -> None:
     # ()`) -- credential is still supplied (the field is required on
     # create) but no value is ever written for it; see this module's
     # docstring.
-    kafka_topic = "g6-events"
-    kafka_run_id = _register_and_run(
+    kafka_topic = KAFKA_TOPIC
+    kafka_run_id = None if not _active("g6-kafka") else _register_and_run(
         name="g6-kafka", kind="Kafka", host="kafka-g6:9092",
         credential={"source": "file", "primary": "token"}, credential_values=None,
         adapter="kafka",
         dial={"bootstrapServers": ["kafka-g6:9092"], "topic": kafka_topic, "auth": {"type": "none"},
-              "groupId": "g6-gate-kafka", "microBatchSeconds": 60},
+              "groupId": KAFKA_GROUP_ID, "microBatchSeconds": 60},
         source_objects=[{"name": kafka_topic, "target": "g6_kafka_events"}],
         ingest_mode="stream",
+        connector_ids=connector_ids,
     )
     if kafka_run_id:
         run_ids["g6-kafka"] = kafka_run_id
+        # SRC-9 task 2: before the producer below, which blocks until the run ends.
+        _check_connect("g6-kafka", connector_ids["g6-kafka"])
+        _check_discover("g6-kafka", connector_ids["g6-kafka"])
         # Produced AFTER the run launches (see _produce_kafka_fixture's
         # own docstring for why "before" would race kafka-python's
         # default "latest" auto_offset_reset).
         _produce_kafka_fixture(kafka_topic, run_id=kafka_run_id)
 
     for name, run_id in run_ids.items():
-        step_wait_for_run_success(run_id)
+        try:
+            step_wait_for_run_success(run_id)
+        except G6Failure as exc:
+            _record_fail(TYPE_OF[name], "load", str(exc))
+            raise
 
+    first_counts: dict[str, int] = {}
     for name, bronze_table in [
-        ("g6-mysql", "g6_mysql_orders"), ("g6-mssql", "g6_mssql_orders"),
+        ("g6-mysql", "g6_mysql_orders"), ("g6-mariadb", "g6_mariadb_orders"), ("g6-sftp", "g6_sftp_orders"), ("g6-mssql", "g6_mssql_orders"),
         ("conn-pg-lakehouse", "orders"), ("g6-files", "g6_files_orders"),
         ("g6-mongo", "g6_mongo_orders"), ("g6-kafka", "g6_kafka_events"),
         # g6-rest was missing from this list entirely -- verification
@@ -733,6 +1213,8 @@ def step_ingest_matrix() -> None:
         # rows were indistinguishable to this gate.
         ("g6-rest", "g6_rest_items"),
     ]:
+        if not _active(name):
+            continue
         # Polled, not a single immediate check: a freshly-created Iceberg
         # table can take a beat to become visible through ClickHouse's
         # DataLakeCatalog engine after the writing run itself already
@@ -740,14 +1222,25 @@ def step_ingest_matrix() -> None:
         # LAST-completing run in the matrix specifically) -- this is
         # catalog-visibility latency, not a reason to fail a table that
         # really was written.
-        count = _wait_for(f"bronze.{bronze_table} rows visible", lambda t=bronze_table: _bronze_row_count(t) or None, 30, interval_s=3.0)
-        null_ingested_at = _bronze_ingested_at_null_count(bronze_table)
-        if null_ingested_at != 0:
-            raise G6Failure(
-                f"expected _ingested_at present and non-null on every row of bronze.{bronze_table} "
-                f"for {name!r}, got {null_ingested_at} of {count} rows with a null/missing value"
-            )
+        # SRC-9 task 2: the assertions are unchanged; a failure is recorded
+        # against the connector type's `load` cell and re-raised.
+        try:
+            count = _wait_for(f"bronze.{bronze_table} rows visible", lambda t=bronze_table: _bronze_row_count(t) or None, 30, interval_s=3.0)
+            null_ingested_at = _bronze_ingested_at_null_count(bronze_table)
+            if null_ingested_at != 0:
+                raise G6Failure(
+                    f"expected _ingested_at present and non-null on every row of bronze.{bronze_table} "
+                    f"for {name!r}, got {null_ingested_at} of {count} rows with a null/missing value"
+                )
+        except G6Failure as exc:
+            _record_fail(TYPE_OF[name], "load", str(exc))
+            raise
         print(f"[g6] bronze.{bronze_table}: {count} rows, _ingested_at null count: {null_ingested_at}")
+        first_counts[name] = count
+        _record(TYPE_OF[name], "load", "pass", f"{count} rows in bronze.{bronze_table}")
+
+    # SRC-9 task 2: the second run of every connector, started together.
+    _step_reload(connector_ids, first_counts)
 
 
 def step_wait_for_run_failure(run_id: str) -> float:
@@ -1288,17 +1781,38 @@ def main() -> int:
     # unreadable.
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
+    global RECORDER
     try:
+        RECORDER = gate_summary.Recorder(gate_summary.Registry.load(), "g6")
+        _check_group()
+        _check_registry_covers_this_gate()
+        _record_other_half_skipped()
         step_wait_for_services()
         step_login()
         step_ensure_tenant()
         step_ingest_matrix()
-        step_failed_run_updates_connector_health()
-        step_source_schema_changes()
-        step_column_gate_rejects_an_unsupported_column()
-        step_cdc_reports_unsupported_not_a_launch()
-        step_cdc_mongo_debezium_properties()
-        step_sheets_reports_unsupported()
+        # SRC-9 decision 9: the steps follow the fixture they use. SRC-7 and
+        # SRC-8 use the MySQL fixture; the column gate, the CDC refusal and
+        # Sheets need no fixture but the API and Dagster, and ride with `sql`,
+        # whose job has the shorter matrix (the `other` job carries the
+        # link-local half and the Kafka wait). The MongoDB template check
+        # reads no fixture either and names the type of the `other` half.
+        if _group_runs("sql"):
+            step_failed_run_updates_connector_health()
+            step_source_schema_changes()
+            step_column_gate_rejects_an_unsupported_column()
+            step_cdc_reports_unsupported_not_a_launch()
+            step_sheets_reports_unsupported()
+        if _group_runs("other"):
+            step_cdc_mongo_debezium_properties()
+        # SRC-9 task 2: connect, discover and reload record their failures and
+        # let the gate run on; the verdict comes here, once, naming each.
+        failed = _recorder().failures()
+        if failed:
+            raise G6Failure(
+                "connector gate steps failed: "
+                + "; ".join(f"{type_name} {step}: {detail}" for type_name, step, detail in failed)
+            )
     except G6Failure as exc:
         print(f"[g6] FAILED: {exc}", file=sys.stderr)
         return 1
@@ -1306,6 +1820,11 @@ def main() -> int:
         import traceback
         print(f"[g6] FAILED: unexpected error, not a G6Failure:\n{traceback.format_exc()}", file=sys.stderr)
         return 1
+    finally:
+        # The table is printed on every path, so a failed run still says
+        # which type and step broke and which steps never ran.
+        if RECORDER is not None:
+            RECORDER.emit()
     print("[g6] PASS")
     return 0
 

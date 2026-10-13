@@ -2103,6 +2103,11 @@ pub async fn debezium_properties(
     if let Some(response) = oracle_cdc_refusal(&target, state.config.oracle_cdc_logminer_enabled) {
         return Ok((StatusCode::CONFLICT, ApiJson(response)));
     }
+    // SRC-9 decision 8: MySQL and SQL Server CDC have no usable template.
+    // Same position and status as the Oracle refusal, for the same reason.
+    if let Some(response) = unbuilt_cdc_template_refusal(&target) {
+        return Ok((StatusCode::CONFLICT, ApiJson(response)));
+    }
 
     let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
         return Err(ApiError::BadRequest(format!(
@@ -2179,8 +2184,7 @@ fn oracle_cdc_refusal(
     let reason = if oracle_cdc_logminer_enabled {
         "ORACLE_CDC_LOGMINER_ENABLED is set, but this build ships no Debezium Oracle \
          LogMiner property template: the template it can render is shaped for the \
-         Postgres, MySQL and SQL Server connectors, and Oracle's connector would reject \
-         it. Oracle ingestion runs through the batch sql adapter until LogMiner support \
+         Postgres connector, and Oracle's connector would reject it. Oracle ingestion runs through the batch sql adapter until LogMiner support \
          is built (docs/adr/0008-initial-snapshot-backfill.md)."
     } else {
         "Oracle CDC via Debezium LogMiner is not enabled on this deployment \
@@ -2188,6 +2192,40 @@ fn oracle_cdc_refusal(
          LogMiner property template in any case. LogMiner capture needs ARCHIVELOG mode \
          and supplemental logging on the source database, which the batch sql adapter \
          neither assumes nor configures (docs/adr/0008-initial-snapshot-backfill.md)."
+    };
+    Some(DebeziumPropertiesResponse::Unsupported {
+        supported: false,
+        reason: reason.to_owned(),
+    })
+}
+
+/// `SRC-9` decision 8: refuses a `mysql` or `mssql` driver CDC connector.
+///
+/// [`render_debezium_properties_template`] renders one `PostgreSQL`-shaped
+/// property set and only swaps the connector class. `Debezium` 3.6.3 rejects
+/// that for `MySQL` (no `database.server.id`; `PostgreSQL`-only `pgoutput`,
+/// slot and publication properties) and for `SQL Server` (no
+/// `database.names`), so a `Debezium Server` started from it fails
+/// configuration validation. The two types are listed as not supported
+/// (migration `0066`); this keeps the route honest for connectors created
+/// before that, instead of handing back a config that looks ready and is not.
+fn unbuilt_cdc_template_refusal(
+    target: &DebeziumSourceTarget,
+) -> Option<DebeziumPropertiesResponse> {
+    let reason = match target.driver {
+        SqlDriver::Mysql => {
+            "Change capture for MySQL is not built yet: this build can only prepare it for \
+             PostgreSQL. The Debezium template it can render lacks the MySQL settings \
+             (database.server.id) and carries PostgreSQL-only ones, so a Debezium Server \
+             started from it would fail to start."
+        }
+        SqlDriver::Mssql => {
+            "Change capture for SQL Server is not built yet: this build can only prepare it \
+             for PostgreSQL. The Debezium template it can render lacks the SQL Server \
+             settings (database.names) and carries PostgreSQL-only ones, so a Debezium \
+             Server started from it would fail to start."
+        }
+        _ => return None,
     };
     Some(DebeziumPropertiesResponse::Unsupported {
         supported: false,
@@ -4396,10 +4434,10 @@ mod tests {
         assert!(reason.contains("no Debezium Oracle"), "{reason}");
     }
 
-    /// The gate touches Oracle only: the drivers that have a real template
-    /// render it whatever the flag says.
+    /// The Oracle gate touches Oracle only (`MySQL` and `SQL Server` have their
+    /// own refusal below).
     #[test]
-    fn the_oracle_gate_never_touches_the_drivers_that_have_a_template() {
+    fn the_oracle_gate_never_touches_the_other_drivers() {
         for driver in [SqlDriver::Postgres, SqlDriver::Mysql, SqlDriver::Mssql] {
             for flag in [false, true] {
                 assert!(
@@ -4407,6 +4445,35 @@ mod tests {
                     "{driver:?} with flag={flag} must render"
                 );
             }
+        }
+    }
+
+    /// `SRC-9` decision 8: `MySQL` and `SQL Server` are refused with a fixed
+    /// message that names what is missing; `PostgreSQL` is not touched.
+    #[test]
+    fn mysql_and_sql_server_cdc_connectors_are_refused_with_what_is_missing() {
+        let for_mysql = refusal_reason(unbuilt_cdc_template_refusal(&target_with_driver(
+            SqlDriver::Mysql,
+        )));
+        assert!(for_mysql.contains("MySQL"), "{for_mysql}");
+        assert!(for_mysql.contains("database.server.id"), "{for_mysql}");
+        let for_sql_server = refusal_reason(unbuilt_cdc_template_refusal(&target_with_driver(
+            SqlDriver::Mssql,
+        )));
+        assert!(for_sql_server.contains("SQL Server"), "{for_sql_server}");
+        assert!(
+            for_sql_server.contains("database.names"),
+            "{for_sql_server}"
+        );
+    }
+
+    #[test]
+    fn the_unbuilt_template_refusal_leaves_postgres_and_oracle_alone() {
+        for driver in [SqlDriver::Postgres, SqlDriver::Oracle] {
+            assert!(
+                unbuilt_cdc_template_refusal(&target_with_driver(driver)).is_none(),
+                "{driver:?} must not get this refusal"
+            );
         }
     }
 
