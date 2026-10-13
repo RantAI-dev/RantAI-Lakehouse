@@ -17,18 +17,20 @@
 //! interpolation site at all — `discover_sql_queries_bind_the_schema_never_interpolate_it`
 //! (below) asserts this on the query TEXT itself, for all three drivers.
 //!
-//! # How MySQL/SQL Server discovery is tested today: it is not (Z14, `SRC-6` F9)
+//! # How MySQL/SQL Server discovery is tested today (`SRC-9`, finding G1)
 //!
 //! This workspace's `#[sqlx::test]` macro and its `testcontainers` fixture
 //! (`lakehouse-test-support`, `postgres` module only) stand up a scratch
 //! Postgres database; there is no `MySQL` or SQL Server live-database
 //! fixture inside `cargo test`. [`discover_sql_postgres`] therefore has a
-//! real, live `#[sqlx::test]` proof; [`discover_sql_mysql`] and
-//! [`discover_sql_mssql`] have no live test at all. An earlier version of
-//! this comment said the `ops/g6` gate exercised them against its
-//! `mysql`/`mssql` compose services; it does not (`grep -i discover ops/g6/`
-//! finds only an unrelated comment in the compose override). `SRC-9` owns
-//! adding that test.
+//! real, live `#[sqlx::test]` proof. [`discover_sql_mysql`] and
+//! [`discover_sql_mssql`] are exercised live by the `ops/g6` gate
+//! (`_check_discover`, `SRC-9`), against its `mysql`/`mssql` compose services.
+//! That gate's first CI run found that `MySQL` discovery answered `422`
+//! ("connection failed") while the same connector's connection test passed:
+//! the connect options are the same function, so the failure was in the
+//! query's row decoding (see [`MYSQL_DISCOVER_QUERY`]). Whether that fix is
+//! enough is decided by the next g6 run.
 //!
 //! # Scope: `sql`/`cdc` only in this task
 //!
@@ -162,6 +164,19 @@ pub enum DiscoverError {
 /// `ApiError::Internal(err.to_string())`).
 impl From<DiscoverError> for ApiError {
     fn from(err: DiscoverError) -> Self {
+        // `SRC-9` finding G1: the handler used to log nothing about why a
+        // discovery failed, so a decode error and a refused connection were
+        // indistinguishable ("connection failed" in the response, nothing in
+        // the log). Log the variant and, for `sqlx`, its error kind only.
+        // Never `err`'s text: a `sqlx` database error echoes the server's
+        // message, which can name the user and host.
+        if let DiscoverError::Sql(source) = &err {
+            tracing::warn!(
+                sqlx_kind = sqlx_error_kind(source),
+                class = connector_probe::classify_sqlx_error(source),
+                "connector discovery failed"
+            );
+        }
         match err {
             DiscoverError::Sql(source) => ApiError::Unprocessable(format!(
                 "could not discover the connector's schema: {}",
@@ -183,6 +198,28 @@ impl From<DiscoverError> for ApiError {
                 DIAL_TIMEOUT.as_secs()
             )),
         }
+    }
+}
+
+/// The variant name of a `sqlx::Error`, for the server log only. A fixed
+/// string per variant: no upstream text, so it cannot carry a credential.
+fn sqlx_error_kind(err: &sqlx::Error) -> &'static str {
+    match err {
+        sqlx::Error::Configuration(_) => "Configuration",
+        sqlx::Error::Database(_) => "Database",
+        sqlx::Error::Io(_) => "Io",
+        sqlx::Error::Tls(_) => "Tls",
+        sqlx::Error::Protocol(_) => "Protocol",
+        sqlx::Error::RowNotFound => "RowNotFound",
+        sqlx::Error::TypeNotFound { .. } => "TypeNotFound",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "ColumnIndexOutOfBounds",
+        sqlx::Error::ColumnNotFound(_) => "ColumnNotFound",
+        sqlx::Error::ColumnDecode { .. } => "ColumnDecode",
+        sqlx::Error::Decode(_) => "Decode",
+        sqlx::Error::PoolTimedOut => "PoolTimedOut",
+        sqlx::Error::PoolClosed => "PoolClosed",
+        sqlx::Error::WorkerCrashed => "WorkerCrashed",
+        _ => "Other",
     }
 }
 
@@ -281,8 +318,22 @@ pub(crate) const POSTGRES_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.
 // exposes (`MySQL` 8's own `information_schema.columns`) — the query
 // shape is identical to Postgres's, only the placeholder syntax (`?`,
 // `MySQL`'s positional-parameter convention) differs.
-pub(crate) const MYSQL_DISCOVER_QUERY: &str = "SELECT table_name, column_name, data_type FROM \
-    information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position";
+//
+// `SRC-9` finding G1: the g6 gate showed `MySQL` discovery failing with the
+// generic "connection failed" class while the connection test (same
+// `mysql_connect_options`) passed. `MySQL` 8 reports some
+// `information_schema` columns with a binary collation / `VARBINARY`-like
+// type, which `sqlx` refuses to decode as `String` (`ColumnDecode`, which
+// `classify_sqlx_error` folds into "connection failed"). Casting every
+// selected column to `CHAR` with an explicit charset makes the decode
+// independent of the server's column type. Still `const`, with exactly one
+// bind placeholder. Not proven by a live test here; the g6 gate decides.
+pub(crate) const MYSQL_DISCOVER_QUERY: &str = "SELECT \
+    CAST(table_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(column_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(data_type AS CHAR CHARACTER SET utf8mb4) \
+    FROM information_schema.columns WHERE table_schema = ? \
+    ORDER BY table_name, ordinal_position";
 
 /// List every table and column in `schema` on a live `MySQL` connection.
 /// `schema` is bound as `?` — see the module doc comment.
@@ -315,8 +366,8 @@ pub async fn discover_sql_mysql(
 /// `BLOB` to the wire protocol, which `sqlx` will not decode as `String` (the
 /// lesson of `SRC-9`'s gate on a real server). The join names `table_schema` and
 /// `table_name` too, because every `MySQL` primary key is called `PRIMARY`.
-pub(crate) const MYSQL_PRIMARY_KEY_QUERY: &str = "SELECT CAST(kcu.table_name AS CHAR), \
-    CAST(kcu.column_name AS CHAR) \
+pub(crate) const MYSQL_PRIMARY_KEY_QUERY: &str = "SELECT CAST(kcu.table_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(kcu.column_name AS CHAR CHARACTER SET utf8mb4) \
     FROM information_schema.table_constraints tc \
     JOIN information_schema.key_column_usage kcu \
       ON kcu.constraint_schema = tc.constraint_schema \
@@ -389,6 +440,11 @@ pub(crate) const MSSQL_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.col
      AND kcu.table_name = tc.table_name \
     WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = @P1 \
     ORDER BY kcu.table_name, kcu.ordinal_position";
+
+/// The fixed reason for Oracle, which the console cannot discover (`SRC-9`
+/// finding G2, `SRC-13`).
+pub(crate) const ORACLE_DISCOVER_REASON: &str = "Oracle tables are listed by the orchestrator, not \
+    the console; console discovery for Oracle is tracked as SRC-13";
 
 /// Open a bounded, SSRF-checked discovery connection for `target` and list
 /// `schema`, dispatching on `target.driver` — the SAME
@@ -475,16 +531,14 @@ async fn discover_dial(
                 // Oracle schema discovery runs through the Dagster sql
                 // adapter (`dagster/dispar_orchestrate/adapters/oracle.py`
                 // over `oracledb` thin mode), not through this Rust-side
-                // probe. The match arm exists solely to keep
-                // `SqlDriver` exhaustive for the `sql`/`cdc` route shape;
-                // an Oracle connector never reaches this code because
-                // the dialect (`oracledb`) is not supported by sqlx,
-                // tiberius, or any other driver this module imports.
-                Err(DiscoverError::Blocked(
-                    "Oracle schema discovery runs through the Dagster sql adapter, not \
-                     through the Rust-side probe; this endpoint is unsupported for Oracle"
-                        .to_owned(),
-                ))
+                // probe: `sqlx` and `tiberius` cannot speak to it. The arm
+                // keeps `SqlDriver` exhaustive and is never dialed.
+                // `SRC-9` finding G2: this used to answer `Blocked` (HTTP
+                // 422) while every other type the API cannot discover
+                // answers `supported: false`; `discover` now intercepts
+                // Oracle before this function, so this arm is unreachable
+                // from it and refuses defensively if it is ever reached.
+                Err(DiscoverError::Blocked(ORACLE_DISCOVER_REASON.to_owned()))
             }
         }
     })
@@ -535,6 +589,17 @@ pub async fn discover(
                     )));
                 }
             };
+            // `SRC-9` finding G2: an honest `supported: false`, like every
+            // other type the API cannot discover, and before any SSRF check
+            // or credential resolution because nothing will be dialed.
+            let is_oracle = match &parsed {
+                Dial::Sql(dial) => dial.driver == SqlDriver::Oracle,
+                Dial::Cdc(dial) => dial.driver == SqlDriver::Oracle,
+                _ => false,
+            };
+            if is_oracle {
+                return Ok(DiscoverResult::unsupported(ORACLE_DISCOVER_REASON));
+            }
             let objects = discover_dial(
                 &target,
                 &dial_info.secret_ref,
@@ -566,8 +631,56 @@ pub async fn discover(
 mod tests {
     use super::{
         MSSQL_DISCOVER_QUERY, MSSQL_PRIMARY_KEY_QUERY, MYSQL_DISCOVER_QUERY,
-        MYSQL_PRIMARY_KEY_QUERY, POSTGRES_DISCOVER_QUERY, POSTGRES_PRIMARY_KEY_QUERY,
+        MYSQL_PRIMARY_KEY_QUERY, ORACLE_DISCOVER_REASON, POSTGRES_DISCOVER_QUERY,
+        POSTGRES_PRIMARY_KEY_QUERY,
     };
+    use crate::internal_hosts::InternalHosts;
+    use lakehouse_core::secret::{DynSecretResolver, SecretError, SecretValue};
+    use lakehouse_store::connectors::ConnectorDialInfo;
+
+    /// Fails the test if discovery touches the credential: an Oracle answer
+    /// must come before any dial or secret resolution.
+    #[derive(Debug)]
+    struct PanicIfCalledResolver;
+
+    #[async_trait::async_trait]
+    impl DynSecretResolver for PanicIfCalledResolver {
+        async fn resolve_dyn(&self, _secret_ref: &str) -> Result<SecretValue, SecretError> {
+            panic!("Oracle discovery must not resolve a secret");
+        }
+    }
+
+    /// `SRC-9` finding G2: Oracle answers `supported: false` with a fixed
+    /// reason, like every other type the API cannot discover, not a 422.
+    /// No earlier test asserted the 422.
+    #[tokio::test]
+    async fn oracle_discovery_is_an_honest_unsupported_answer() {
+        let info = ConnectorDialInfo {
+            kind: "Oracle".to_owned(),
+            host: "oracle.example".to_owned(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("sql".to_owned()),
+            dial: serde_json::json!({
+                "driver": "oracle",
+                "host": "oracle.example",
+                "port": 1521,
+                "database": "FREEPDB1",
+                "user": "u",
+            }),
+        };
+        let result = super::discover(
+            &info,
+            Some("APP"),
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await
+        .expect("an unsupported answer, not an error");
+        assert!(!result.supported);
+        assert!(result.objects.is_empty());
+        assert_eq!(result.reason.as_deref(), Some(ORACLE_DISCOVER_REASON));
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn discover_sql_postgres_lists_columns_from_information_schema(pool: sqlx::PgPool) {
@@ -630,8 +743,12 @@ mod tests {
             assert!(query.contains("'PRIMARY KEY'"), "{query}");
             assert!(query.contains("ORDER BY"), "{query}");
         }
-        assert!(MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.table_name AS CHAR)"));
-        assert!(MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.column_name AS CHAR)"));
+        assert!(
+            MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.table_name AS CHAR CHARACTER SET utf8mb4)")
+        );
+        assert!(
+            MYSQL_PRIMARY_KEY_QUERY.contains("CAST(kcu.column_name AS CHAR CHARACTER SET utf8mb4)")
+        );
     }
 
     /// A composite key keeps its column order; a table with no key keeps `[]`;

@@ -1,0 +1,43 @@
+# ops/g4/docker-compose.g4.override.yml -- SRC-9 plan task 6, GATE-ONLY.
+#
+# `ops/g4/g4_test.py` registers the demo CDC source in the connector registry
+# (type `PostgreSQL CDC`) and calls the routes the console calls on it:
+# `POST .../test` and `POST .../discover`. Two things are needed that the
+# default docker-compose.yml deliberately does not give a real deployment, and
+# this file gives them to this gate's stack only, as
+# ops/g6/docker-compose.g6.override.yml does for its fixtures:
+#
+# 1. `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`: the API blocks internal
+#    addresses for the connection test, discovery and the save-time check of
+#    an ingest spec (SEC-15); the demo source IS `postgres` inside the compose
+#    network.
+# 2. A `file:` credential store (ADR 0002 Addendum 3). `POST /api/connectors`
+#    no longer takes a client-chosen secretRef: the server derives
+#    `file:/run/secrets/connector_<id>_<suffix>` from the connector's own new
+#    id, so the secret can only be written after the connector exists. The
+#    volume is mounted read-only at /run/secrets in `lakehouse-api`
+#    (`FileSecretResolver`'s fixed base directory) and read-write at
+#    /gate-secrets in the runner, which writes the Postgres password there.
+#    Nothing else in this stack reads it.
+#
+# Used as
+#   docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+#     --profile dagster up -d --build ...
+volumes:
+  g4_secrets:
+
+services:
+  lakehouse-api:
+    environment:
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
+    volumes:
+      - type: volume
+        source: g4_secrets
+        target: /run/secrets
+        read_only: true
+
+  g4-test-runner:
+    volumes:
+      - type: volume
+        source: g4_secrets
+        target: /gate-secrets
