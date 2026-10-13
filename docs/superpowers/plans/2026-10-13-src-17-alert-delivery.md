@@ -67,6 +67,24 @@ the role split in `AGENTS.md`.
   a plain SMTP sink without changing product behaviour, or if the opt-in of
   `SEC-10` does not exist in a form the gate can use.
 
+### D-d as changed by the planner on 2026-10-13, after the developer stopped on both stop conditions
+
+Found by the developer: `SEC-10` is not built (backlog: Todo), so alert
+webhooks have no internal-address check and no opt-in; and the e-mail sender
+has no mode without verified TLS, so it cannot reach a plain SMTP sink
+without a product change.
+
+- **Webhook: built now.** Steps 1 (webhook only), 2 and 3 of D-d. The
+  gate's receiver is on the gate's own network; a comment at the step and
+  in the job says that `SEC-10` will refuse such an address by default and
+  must give this gate its documented opt-in when it lands. A line is added
+  to `SEC-10`'s backlog row by the planner.
+- **E-mail: not built, not measured.** No test-only plain-SMTP mode is
+  added: a switch that turns off TLS verification for mail is a product
+  and security decision, not a gate detail. `SRC-7-RESULT.md` says e-mail
+  arrival is *not measured* and why. The product owner decides whether a
+  measured e-mail path is wanted and how.
+
 ## 3. Tasks
 
 One task per commit; the Rust tasks sit together. Cite `SRC-17` and the
