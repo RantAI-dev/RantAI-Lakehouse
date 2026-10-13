@@ -246,3 +246,60 @@ services:
       - type: volume
         source: g6_secrets
         target: /gate-secrets
+
+  # SRC-17 task 5 (finding F4, the delivery review of 2026-10-12): the alert
+  # delivery gate, `ops/g6/src17_alert_delivery_test.py`, in a job of its own
+  # (`g6-alerts`). It reuses this file for what a failing MySQL connector
+  # needs (the gate-only `INGEST_ALLOW_INTERNAL_HOSTS` and
+  # `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` above, the `g6_secrets` volume, the
+  # `mysql-g6` fixture), so nothing here is duplicated. Profile `g6-alerts`
+  # only: a job activates it together with `g6-sql` (for `mysql-g6`) and
+  # `dagster`, and names the services it starts, so no other fixture runs.
+  #
+  # The gate starts its own webhook receiver in this container, on a port the
+  # API reaches over the compose network (nothing is published). `SEC-10`
+  # (alert webhooks cannot reach internal addresses) is not built yet; when it
+  # lands it will refuse this receiver's address by default and must give this
+  # gate its documented opt-in.
+  #
+  # `clickhouse-iceberg-init`: an upload load asks ClickHouse whether the
+  # table name is free (`ICEBERG_QUERY_DB`), as `g9-test-runner` does.
+  # `MYSQL_ROOT_PASSWORD` and the other fixture secrets are not read by this
+  # gate; the job's `.env` carries them because this file's `${VAR:?}` is
+  # interpolated for every service it loads.
+  g6-alerts-test-runner:
+    profiles: ["g6-alerts"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+      mysql-g6:
+        condition: service_healthy
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python src17_alert_delivery_test.py"]
