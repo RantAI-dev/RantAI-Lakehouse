@@ -40,6 +40,14 @@ and CI workflows are the proof.
 
 *(developer)*
 
+Task 1, commit `0e4deeb`: `quinn-proto` 0.11.17 -> 0.11.19 in `rust/Cargo.lock`.
+
+- `cd rust && cargo update -p quinn-proto`: locked 1 package; only
+  `quinn-proto` moved. Its `getrandom` dependency reference changed from
+  0.4.3 to the already-locked 0.3.4 (no version of any other crate moved).
+- `find crates -name '*.rs' | xargs touch`, then `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: `EXIT=0`, finished in 2m 30s.
+- *Not verified:* `cargo audit`, `cargo deny`, `cargo test` (machine limits; the pull request's Security and CI workflows are the proof).
+
 ## Review
 
 *(planner)*
