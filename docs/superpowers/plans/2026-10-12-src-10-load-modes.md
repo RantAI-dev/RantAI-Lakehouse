@@ -505,3 +505,29 @@ Not verified: everything in the gate step (CI only); `cargo test` (CI); that `_i
 ## Review
 
 *(planner)*
+
+### Closing review of the eighth pass, 2026-10-13 (planner), at `6449c85`
+
+Read: the merge resolution in `connector_discover.rs`, the gate step, the
+CI job split. Re-run by the reviewer: `cargo fmt --check` clean; workspace
+clippy clean (2m43s, after touching every Rust source: a first run that
+touched only the changed files failed on stale artefacts of another
+worktree in the shared target directory); `bun run typecheck` clean;
+`bun run test` 1128 pass, 1 skip, 0 fail; Dagster `-m "not loader"` 774
+passed, `-m loader` collects 258 of 1032; `test_required_gate.sh` 32 passed.
+The loader group was not re-run locally.
+
+CI on pull request #115 at `6449c85`: 26 checks pass, among them
+"Rust · test (stable)", the three `g6` jobs (SQL sources with the new step
+19m54s), "Dagster · loader tests" (13m26s) and `ci-required`. Red and not
+caused by this branch, which touches no dependency: `cargo audit` and both
+`gitleaks` jobs, red on `main` too (`SEC-27`; pull request #121 for the
+first).
+
+No open `BLOCKER`. One `SHOULD-FIX`, not blocking: the SQL gate job is six
+seconds inside the 20-minute target; the next step added there moves to a
+job of its own (recorded in `docs/plans/SRC-10-RESULT.md`).
+
+Open before merge: the product owner's browser check of the Ingest tab
+(mode choice, key field, the refresh and clear menu, "Keep history").
+
