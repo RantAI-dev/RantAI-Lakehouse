@@ -56,8 +56,11 @@ describe("alertRuleFormFields", () => {
 const NONE = { martMeasure: false, board: false, freshnessTarget: false }
 const NOT_RAISED_SRC11 =
   "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed."
-const NOT_RAISED_SRC8 =
-  "Nothing raises this yet. It starts working when schema change detection (SRC-8) is installed."
+// SRC-17 D-c: this constant used to pin "Nothing raises this yet..." for the
+// schema change kind, which was false once SRC-8 landed (it raises the kind).
+// It now pins the true sentence; the disabled kind's sentence is unchanged.
+const RAISED_BY_SCHEMA_CHANGES =
+  "Raised when a source table's columns change or a new table appears at the source."
 
 describe("alertRuleFormFields for connector and upload rules", () => {
   it("shows a connector select and no mart, measure, board or table for each connector kind", () => {
@@ -83,9 +86,14 @@ describe("alertRuleFormFields for connector and upload rules", () => {
     })
   })
 
-  it("says under the disabled and schema change kinds which later work raises them", () => {
+  it("says the disabled kind is not raised yet, and that schema changes raise the schema change kind", () => {
     expect(alertRuleFormFields("connector_disabled").note).toBe(NOT_RAISED_SRC11)
-    expect(alertRuleFormFields("connector_schema_change").note).toBe(NOT_RAISED_SRC8)
+    expect(alertRuleFormFields("connector_schema_change").note).toBe(
+      RAISED_BY_SCHEMA_CHANGES
+    )
+    expect(alertRuleFormFields("connector_schema_change").note).not.toContain(
+      "Nothing raises"
+    )
   })
 
   it("keeps All connectors only for a kind that can take it when the kind changes", () => {

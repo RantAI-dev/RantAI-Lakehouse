@@ -180,9 +180,12 @@ pub enum AlertKind {
     /// [`evaluate_connector_event`] with this kind.
     #[serde(rename = "connector_disabled")]
     ConnectorDisabled,
-    /// Fires when a connector's source schema changes. Nothing raises it in
-    /// `SRC-7` (decision D5): `SRC-8`'s detection calls
-    /// [`evaluate_connector_event`] with this kind.
+    /// Fires when a connector's source schema changes. Raised by `SRC-8`'s
+    /// schema change detection (`routes::schema_changes`, which calls
+    /// [`evaluate_connector_event`] with this kind) when a source table's
+    /// columns change or a new table appears. `SRC-7` built the kind
+    /// (decision D5) before anything raised it; `SRC-17` D-c corrects this
+    /// doc, which kept saying nothing raises it.
     #[serde(rename = "connector_schema_change")]
     ConnectorSchemaChange,
     /// Fires when a connector's run succeeds. Optional per connector
@@ -1782,12 +1785,13 @@ pub async fn deliver_connector_event_to(
 
 /// Deliver every enabled rule of the `SRC-7` `kind` whose connector scope
 /// matches `connector_id` (or is `"*"`), and return the rules a delivery was
-/// attempted for, each with its outcome ([`RuleDelivery`], `SRC-17` F1). This is the one public entry point for all six kinds:
+/// attempted for, each with its outcome ([`RuleDelivery`], `SRC-17` F1).
+/// This is the one public entry point for all six kinds:
 /// `run_failed_event` and `run_finished_event` call it for
 /// `connector_failure`, `connector_repeated_failure`, `connector_success`
-/// and `upload_failure`; `SRC-11` (auto-disable) will call it for
-/// `connector_disabled` and `SRC-8` (schema detection) for
-/// `connector_schema_change`, which nothing raises yet (decision D5).
+/// and `upload_failure`; `SRC-8` (schema detection) calls it for
+/// `connector_schema_change`; `SRC-11` (auto-disable) will call it for
+/// `connector_disabled`, which nothing raises yet (decision D5).
 ///
 /// `title_prefix` is joined to each rule's name (`"{title_prefix}: {name}"`),
 /// like the pipeline kinds. `text` is the caller's message and must hold
@@ -4028,8 +4032,8 @@ mod tests {
         assert!(delivered.is_empty());
     }
 
-    /// `SRC-11` and `SRC-8` have no caller yet (decision D5); the entry
-    /// point must already deliver their two kinds when it is called.
+    /// `SRC-11` has no caller yet (decision D5) and `SRC-8` calls from
+    /// `routes::schema_changes`; the entry point delivers both kinds.
     #[tokio::test]
     async fn evaluate_connector_event_delivers_connector_disabled_and_schema_change_rules() {
         let (_server, ch) = connector_event_server(

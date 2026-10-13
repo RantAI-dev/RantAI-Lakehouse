@@ -97,12 +97,19 @@ const EMPTY_FORM: AlertRule = {
   id: "", name: "", type: "alert", agg: "sum", op: ">", threshold: 0, channel: "webhook", target: "", enabled: true,
 };
 
-/** D5: shown under the two kinds that nothing raises yet. */
-const NOT_RAISED_YET: Record<string, string> = {
+/**
+ * D5, corrected by `SRC-17` D-c: the line under the two kinds with something
+ * special to say. `connector_disabled` is still raised by nothing (`SRC-11`
+ * has not landed). `connector_schema_change` is raised: schema change
+ * detection (`SRC-8`) sends it when a source table's columns change or a new
+ * table appears, so the page no longer tells the user a working rule does not
+ * work.
+ */
+const KIND_NOTES: Record<string, string> = {
   connector_disabled:
     "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed.",
   connector_schema_change:
-    "Nothing raises this yet. It starts working when schema change detection (SRC-8) is installed.",
+    "Raised when a source table's columns change or a new table appears at the source.",
 }
 
 /**
@@ -124,7 +131,7 @@ export function seesEveryTenant(permissions: readonly string[] | undefined): boo
  * five `connector_*` kinds pick a connector (`connector`), offering "All
  * connectors" (`allConnectors`) only when `canSeeAllTenants` and never for
  * `connector_success` (D4); `upload_failure` picks nothing. `note` is the
- * line under the kinds nothing raises yet (D5). Kept pure and DOM-free so it
+ * line under the kinds in `KIND_NOTES` (D5, `SRC-17` D-c). Kept pure and DOM-free so it
  * is unit-testable (WS5 item E3).
  */
 export function alertRuleFormFields(
@@ -149,7 +156,7 @@ export function alertRuleFormFields(
       freshnessTarget: false,
       connector: picksConnector,
       allConnectors: picksConnector && type !== "connector_success" && canSeeAllTenants,
-      note: NOT_RAISED_YET[type] ?? null,
+      note: KIND_NOTES[type] ?? null,
     }
   }
   return { martMeasure: false, board: true, freshnessTarget: false, ...none };
