@@ -31,7 +31,7 @@ A query that fails in Query Studio shows its error and nothing else. The person 
 - Variables in the statement. **Waits for `QS-5`.**
 - An optimise action. The spec names one against Databricks and Snowflake; it is not built here.
 - Autocomplete by AI (the spec lists it as later).
-- Fix with AI on Trino. It is plan 16, after another stream repairs Trino's catalog access on staging; until then the button is disabled on Trino and says why.
+- Fix with AI on Trino. It is a later backlog item, after another stream repairs Trino's catalog access on staging; until then the button is disabled on Trino and says why.
 
 ## Asking the assistant
 
@@ -43,17 +43,17 @@ This feature is the assistant working inside Query Studio. The user asks with on
 | --- | --- | --- | --- |
 | 1 | The buttons sit in Query Studio's SQL tab, and the explanation and the proposal show on that page | none | Owner, 2026-10-13 |
 | 2 | The fix is a line diff, written in this repository, with no new dependency | none | Owner, 2026-10-13 |
-| 3 | This pull request holds Explain for both engines and Fix with AI for ClickHouse; Fix for Trino is a later plan | none | Owner, 2026-10-13 |
-| 4 | One new read-only tool, `propose_sql`, which validates the statement and echoes it back | none | Planner's choice, plan 15 |
-| 5 | The server checks a proposal without running it: the read-only guard, the policy rewrite as the caller, then `EXPLAIN PLAN` on ClickHouse | none | Planner's choice, plan 15 |
-| 6 | A proposal that fails the check returns to the model as an error, so the model can correct it in the same turn | none | Planner's choice, plan 15 |
-| 7 | One switch, `AI_SQL_HELP`, on when unset or empty | on | Planner's choice, plan 15 |
-| 8 | The diff is computed in the console, line by line, so the server never sees the editor's text in a second form | none | Planner's choice, plan 15 |
+| 3 | This pull request holds Explain for both engines and Fix with AI for ClickHouse; Fix for Trino is a later backlog item | none | Owner, 2026-10-13 |
+| 4 | One new read-only tool, `propose_sql`, which validates the statement and echoes it back | none | Planner's choice, 2026-10-13 |
+| 5 | The server checks a proposal without running it: the read-only guard, the policy rewrite as the caller, then `EXPLAIN PLAN` on ClickHouse | none | Planner's choice, 2026-10-13 |
+| 6 | A proposal that fails the check returns to the model as an error, so the model can correct it in the same turn | none | Planner's choice, 2026-10-13 |
+| 7 | One switch, `AI_SQL_HELP`, on when unset or empty | on | Planner's choice, 2026-10-13 |
+| 8 | The diff is computed in the console, line by line, so the server never sees the editor's text in a second form | none | Planner's choice, 2026-10-13 |
 
 ## Limits to tell a customer
 
 - A proposal is checked for the caller's permissions and for the names the engine resolves, and it is never run. A statement that plans can still return rows other than the ones the person meant.
-- A statement of more than 20,000 characters is not sent; the console says it is too long.
+- The console refuses to send a statement of more than 20,000 characters to be fixed; it says the query is too long for the assistant to fix.
 - The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text.
 - The diff is against the editor as it was when the proposal came back. Typing in the editor closes the proposal, and so does running the query.
 - `AI_SQL_HELP=false` takes the `propose_sql` tool and the rules that tell the model when to use it out of the chat. The Explain and Fix with AI buttons stay in Query Studio's SQL tab: Fix with AI then shows the assistant's answer and "No fix to apply was proposed.", never a diff.

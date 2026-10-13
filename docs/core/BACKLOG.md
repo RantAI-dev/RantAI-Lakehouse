@@ -222,6 +222,7 @@ set by the product owner and are left empty until they are.
 | `SRC-7` | 2026-10-08 | 2026-10-12 | |
 | `SRC-8` | 2026-10-09 | 2026-10-12 | |
 | `SRC-9` | 2026-10-10 | 2026-10-13 | |
+| `AI-12` | 2026-10-13 | | |
 
 ## Decide
 
