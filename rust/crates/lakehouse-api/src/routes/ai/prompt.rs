@@ -82,6 +82,31 @@ UNCLEAR WORDS
 - Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
 - If the question is not about data, answer it as it is. Do not ask.";
 
+/// The two sentences the console sends with the SQL help. `prepare_chat`
+/// matches the Explain one to take the tool out of its turn (plan 17); the
+/// test below holds the rules to the same words.
+pub(super) const EXPLAIN_REQUEST: &str = "Explain what this query does.";
+/// The Fix sentence is named only for the test that holds the rules to it:
+/// no product code matches it, so it is not compiled outside tests.
+#[cfg(test)]
+pub(super) const FIX_REQUEST: &str = "Why does this query fail? Fix it.";
+
+/// Appended after the mode text when `AI_SQL_HELP` is on and `propose_sql` is
+/// in the chat's tool list. It is a separate block, so a chat without the
+/// tool keeps the prompt it had, byte for byte.
+///
+/// The rules name no table, column or value: the statement, the engine and
+/// the error come in the message, and the rules say only what to do with
+/// them.
+pub(super) const SQL_HELP_RULES: &str = "
+
+SQL HELP
+- A message that starts with \"Why does this query fail? Fix it.\" holds an engine, a statement and the error it raised. Find the cause, then call propose_sql once with the whole corrected statement for that engine and one sentence on what was wrong. Change only what the error requires.
+- If propose_sql returns an error, correct the statement and call it again.
+- If the statement cannot be fixed from what is known, say what is missing and call nothing.
+- A message that starts with \"Explain what this query does.\" holds a statement. Say in plain words what it returns, step by step, and call no tool.
+- Never call run_sql for either.";
+
 /// Appended after the mode text (and after [`ASK_BACK_RULES`]) when
 /// `AI_SEMANTIC_LAYER` is on, in both modes. It is a separate block and not
 /// part of [`SYSTEM_BASE`], so a deployment with the switch off keeps the
@@ -654,6 +679,50 @@ mod tests {
     }
 
     #[test]
+    fn the_sql_help_rules_are_six_lines_and_hold_both_sentences_verbatim() {
+        let lines = SQL_HELP_RULES
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines <= 6, "{lines} lines: {SQL_HELP_RULES}");
+        // The console sends these two sentences; the rules must name them
+        // exactly, or the model does not know which branch a message is in.
+        assert!(SQL_HELP_RULES.contains(FIX_REQUEST), "{SQL_HELP_RULES}");
+        assert!(SQL_HELP_RULES.contains(EXPLAIN_REQUEST), "{SQL_HELP_RULES}");
+    }
+
+    #[test]
+    fn the_sql_help_rules_name_no_dataset() {
+        let lower = SQL_HELP_RULES.to_lowercase();
+        for word in [
+            "wisman",
+            "pariwisata",
+            "mart_",
+            "kunjungan",
+            "serving.",
+            "silver.",
+        ] {
+            assert!(!lower.contains(word), "`{word}` in {SQL_HELP_RULES}");
+        }
+    }
+
+    #[test]
+    fn propose_sql_is_offered_only_by_an_allowlist_never_by_default() {
+        // The chat's own list and the eval's plain chat keep today's tools:
+        // the tool is in no domain and not in `ALWAYS`.
+        assert!(!ALWAYS.contains(&super::super::registry::PROPOSE_SQL));
+        for domain in DOMAINS {
+            assert!(!domain.tools.contains(&super::super::registry::PROPOSE_SQL));
+        }
+        for recent in [
+            vec!["Why does this query fail? Fix it."],
+            vec!["Explain what this query does."],
+        ] {
+            assert!(!select_tools(&recent).contains(super::super::registry::PROPOSE_SQL));
+        }
+    }
+
+    #[test]
     fn a_data_question_gets_only_the_data_tools_and_listings() {
         let tools = select_tools(&["How many foreign tourists came in 2024?"]);
         assert_eq!(tools.len(), ALWAYS.len());
@@ -702,6 +771,12 @@ mod tests {
     #[test]
     fn every_registered_tool_is_reachable_from_some_domain() {
         for spec in super::super::registry::TOOLS {
+            // `propose_sql` is offered only when the console's allowlist names
+            // it (plan 15 decision: the eval's plain chat keeps today's tools),
+            // so it is reachable by that path and by no domain.
+            if spec.name == super::super::registry::PROPOSE_SQL {
+                continue;
+            }
             let reachable =
                 ALWAYS.contains(&spec.name) || DOMAINS.iter().any(|d| d.tools.contains(&spec.name));
             assert!(reachable, "{} can never be offered to the model", spec.name);

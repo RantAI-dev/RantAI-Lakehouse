@@ -1,3 +1,5 @@
+-- Renumbered from 0066 to 0070 before it was ever merged: `main` took 0066 to
+-- 0069 meanwhile. It had been applied to a development database only.
 -- Deployment-wide reporting settings (`BI-9`, with `AI-3`): the time zone the
 -- console reports in and the first day of the week.
 --

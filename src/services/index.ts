@@ -22,6 +22,7 @@ import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
+import { semanticService as semanticClientService } from "./clients/semantic"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -100,6 +101,10 @@ export const settingsService = settingsClientService
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
+// The semantic entries of a table and its columns (`/api/semantic/{asset}`):
+// the drafted meaning and role, and the person's confirmed corrections. No
+// mock ever existed.
+export const semanticService = semanticClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

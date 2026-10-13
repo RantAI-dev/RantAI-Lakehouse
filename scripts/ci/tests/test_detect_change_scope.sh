@@ -36,7 +36,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   git config user.email "ci-test@example.com"
   git config user.name "CI Test"
 
-  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/fixtures scripts .github/workflows
+  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/g9 ops/fixtures scripts .github/workflows
 
   : > docs/test.md
   : > GTM/test.md
@@ -59,6 +59,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > dagster/pipeline.py
   : > docker-compose.yml
   : > ops/g6/test.py
+  : > ops/g9/upload_test.py
   : > ops/fixtures/upload_load_failure_reasons.json
   mkdir -p scripts/ci
   : > scripts/ci/detect_change_scope.sh
@@ -168,6 +169,8 @@ assert_case "dagster/pipeline.py is dagster-only" "false" "false" "true" "false"
 # docker-compose.yml sets rust and stack (embedded for demo_connector_compose_properties)
 assert_case "docker-compose.yml sets rust and stack" "true" "false" "false" "true" "false" "false" "docker-compose.yml"
 assert_case "ops/g6/test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g6/test.py"
+# SRC-9 task 7: the upload gate's own files select the acceptance jobs (g9-upload) through stack.
+assert_case "ops/g9/upload_test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g9/upload_test.py"
 assert_case "scripts/compose.sh is stack-only" "false" "false" "false" "true" "false" "false" "scripts/compose.sh"
 assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" "false" ".env.example"
 

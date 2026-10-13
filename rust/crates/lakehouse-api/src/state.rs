@@ -201,6 +201,13 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
+    /// Test seam for the alert webhook sender (merge of `SEC-10` into the
+    /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
+    /// listener on loopback, which the real address policy refuses by
+    /// design and no setting can open. Compiled only for this crate's tests,
+    /// so a service build has no way to swap the policy.
+    #[cfg(test)]
+    pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
 }
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
@@ -599,7 +606,21 @@ impl AppState {
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
+            #[cfg(test)]
+            webhook_sender_override: None,
         }
+    }
+
+    /// The webhook sender for alert deliveries that have no request of their
+    /// own to take a policy from: [`crate::webhook_guard::sender`] over this
+    /// state's config (`SEC-10`), or the test override.
+    #[must_use]
+    pub fn webhook_sender(&self) -> lakehouse_notify::WebhookSender {
+        #[cfg(test)]
+        if let Some(sender) = &self.webhook_sender_override {
+            return sender.clone();
+        }
+        crate::webhook_guard::sender(&self.config)
     }
 }
 

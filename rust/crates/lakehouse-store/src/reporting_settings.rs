@@ -1,4 +1,4 @@
-//! The deployment's reporting settings (migration `0066`): the report time
+//! The deployment's reporting settings (migration `0070`): the report time
 //! zone and the first day of the week.
 //!
 //! At most one row exists (`singleton`). No row is not an error: it means the

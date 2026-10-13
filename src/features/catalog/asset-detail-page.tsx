@@ -41,6 +41,8 @@ import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
 import { AssetDetailTabs } from "./asset-detail-tabs"
+import { useMeanings } from "./asset-column-data"
+import { MeaningBadge } from "./asset-meaning-view"
 
 /**
  * Candidate permissions the "Request access" dialog offers. Not every
@@ -63,6 +65,8 @@ export function AssetDetailPage() {
     [params.assetId]
   )
   const { hasPermission } = useAuth()
+  // Read here, not in the Schema tab, so the header pill and the tab share one request.
+  const meanings = useMeanings(state.status === "success" ? state.data : null)
   const [open, setOpen] = React.useState(false)
   const [permission, setPermission] = React.useState("")
   const [reason, setReason] = React.useState("")
@@ -122,6 +126,7 @@ export function AssetDetailPage() {
               title={classificationTitle(a)}
             />
             <HealthBadge health={a.health} title={healthTitle(a)} />
+            <MeaningBadge state={meanings} columns={a.schema.map((c) => c.name)} />
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
                 Request access
@@ -163,7 +168,7 @@ export function AssetDetailPage() {
           },
         ]}
       />
-      <AssetDetailTabs asset={a} onAssetChanged={state.reload} />
+      <AssetDetailTabs asset={a} onAssetChanged={state.reload} meanings={meanings} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>
         <DialogContent className="sm:max-w-md">

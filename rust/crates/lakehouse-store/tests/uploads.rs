@@ -35,8 +35,8 @@ use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
     LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete, find_by_sha256, get,
-    insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim, table_claimed,
-    upload_in_tenants,
+    get_by_run_id, insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim,
+    table_claimed, upload_in_tenants,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -1688,4 +1688,20 @@ fn load_mode_parses_exactly_the_two_lowercase_names_and_defaults_to_replace() {
     for mode in [LoadMode::Replace, LoadMode::Append] {
         assert_eq!(LoadMode::parse(mode.as_str()), Some(mode));
     }
+}
+
+/// `SRC-7` F6: the orchestrator reports a run, not an upload; the run id
+/// finds the upload that claimed it, and an unknown run finds none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_run_id_finds_the_upload_of_a_run_or_none(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-by-run").await;
+    add(&pool, "up-1", tenant_a, "").await;
+    add(&pool, "up-2", tenant_a, "").await;
+    start(&pool, "up-1", "t1", LoadMode::Replace, Some("run-1")).await;
+    start(&pool, "up-2", "t2", LoadMode::Replace, Some("run-2")).await;
+
+    let found = get_by_run_id(&pool, "run-2").await.unwrap().unwrap();
+    assert_eq!(found.id, "up-2");
+    assert!(get_by_run_id(&pool, "run-none").await.unwrap().is_none());
+    Ok(())
 }
