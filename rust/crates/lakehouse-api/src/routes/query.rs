@@ -267,10 +267,6 @@ async fn execute_query_against_engine(
 ///   the author's to see, the same text `run_sql` already treats as such.
 /// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
 ///   replaces this arm.
-#[allow(
-    dead_code,
-    reason = "plan 15 Step 2 adds its caller, the `propose_sql` tool; remove this allow then"
-)]
 pub(crate) async fn check_statement_would_run(
     state: &AppState,
     principal: &Principal,

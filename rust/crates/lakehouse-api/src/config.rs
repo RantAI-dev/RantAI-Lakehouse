@@ -81,6 +81,13 @@ pub enum ConfigError {
     /// leave the chat asking questions for an operator who meant to stop it.
     #[error("AI_ASK_BACK must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}")]
     UnsupportedAiAskBack(String),
+    /// `AI_SQL_HELP` was set to something other than `"true"` or `"false"`.
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiAskBack`]: a typo such as `"no"` would leave the
+    /// assistant proposing SQL fixes for an operator who meant to stop it.
+    #[error("AI_SQL_HELP must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}")]
+    UnsupportedAiSqlHelp(String),
     /// `AI_RELEVANT_TABLES` was set to something other than `"true"` or
     /// `"false"`.
     ///
@@ -707,6 +714,11 @@ pub struct Config {
     /// prompt. `true` when unset or empty, and for `"true"`; `false` only
     /// for `"false"`. The routes under `/api/ai/terms` answer either way.
     pub ai_ask_back: bool,
+    /// Whether the assistant may explain a Query Studio statement and propose
+    /// a corrected one (`AI_SQL_HELP`): the `propose_sql` tool and the rules
+    /// that tell the model when to call it. `true` when unset or empty, and
+    /// for `"true"`; `false` only for `"false"`.
+    pub ai_sql_help: bool,
     /// Whether the prompt carries only the tables a question names
     /// (`AI_RELEVANT_TABLES`), instead of every table in full. `true` when
     /// unset or empty, and for `"true"`; `false` only for `"false"`.
@@ -922,6 +934,7 @@ impl std::fmt::Debug for Config {
             .field("ai_default_reply_language", &self.ai_default_reply_language)
             .field("ai_semantic_layer", &self.ai_semantic_layer)
             .field("ai_ask_back", &self.ai_ask_back)
+            .field("ai_sql_help", &self.ai_sql_help)
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
@@ -1022,6 +1035,8 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiSemanticLayer`], if `AI_SEMANTIC_LAYER`
     ///   is set and non-empty but is neither `true` nor `false`.
     /// - [`ConfigError::UnsupportedAiAskBack`], if `AI_ASK_BACK` is set and
+    ///   non-empty but is neither `true` nor `false`.
+    /// - [`ConfigError::UnsupportedAiSqlHelp`], if `AI_SQL_HELP` is set and
     ///   non-empty but is neither `true` nor `false`.
     /// - [`ConfigError::UnsupportedAiRelevantTables`], if
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
@@ -1230,6 +1245,7 @@ impl Config {
                 ConfigError::UnsupportedAiSemanticLayer,
             )?,
             ai_ask_back: parse_switch(env, "AI_ASK_BACK", ConfigError::UnsupportedAiAskBack)?,
+            ai_sql_help: parse_switch(env, "AI_SQL_HELP", ConfigError::UnsupportedAiSqlHelp)?,
             ai_relevant_tables: parse_switch(
                 env,
                 "AI_RELEVANT_TABLES",
@@ -2107,6 +2123,37 @@ mod tests {
     fn ask_back_setting_false_means_off() {
         let cfg = Config::from_map(&env_with("AI_ASK_BACK", "false")).unwrap();
         assert!(!cfg.ai_ask_back);
+    }
+
+    #[test]
+    fn sql_help_is_on_when_the_setting_is_absent_or_empty() {
+        assert!(Config::from_map(&HashMap::new()).unwrap().ai_sql_help);
+        assert!(
+            Config::from_map(&env_with("AI_SQL_HELP", ""))
+                .unwrap()
+                .ai_sql_help
+        );
+        assert!(
+            Config::from_map(&env_with("AI_SQL_HELP", "true"))
+                .unwrap()
+                .ai_sql_help
+        );
+    }
+
+    #[test]
+    fn sql_help_setting_false_means_off() {
+        let cfg = Config::from_map(&env_with("AI_SQL_HELP", "false")).unwrap();
+        assert!(!cfg.ai_sql_help);
+    }
+
+    #[test]
+    fn an_unknown_sql_help_setting_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with("AI_SQL_HELP", "maybe"))
+            .expect_err("only true and false are accepted, a typo must not leave the help on");
+        assert_eq!(err, ConfigError::UnsupportedAiSqlHelp("maybe".to_owned()));
+        let message = err.to_string();
+        assert!(message.contains("\"true\""), "{message}");
+        assert!(message.contains("\"false\""), "{message}");
     }
 
     #[test]
