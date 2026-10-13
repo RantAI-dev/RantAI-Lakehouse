@@ -153,9 +153,10 @@ async fn first_model_request(llm: &MockServer) -> (Vec<String>, String) {
     (names, system)
 }
 
-/// The fix sentence, the engine, the statement and the error, as the console
-/// sends them.
-const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT no_such_col FROM silver.orders\n\nERROR:\nUNKNOWN_IDENTIFIER";
+/// The console's Fix message for `SELECT no_such_col FROM silver.orders` on
+/// `clickhouse`, template `proposeFix` in src/services/clients/queries.ts.
+/// The server matches the leading sentence only.
+const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nEngine: clickhouse\nSQL:\nSELECT no_such_col FROM silver.orders\nError:\nUNKNOWN_IDENTIFIER";
 
 const WRONG_PROPOSAL: &str = r#"{"sql":"SELECT no_such_col FROM silver.orders","reason":"Used the wrong column.","engine":"clickhouse"}"#;
 const RIGHT_PROPOSAL: &str = r#"{"sql":"SELECT order_id FROM silver.orders","reason":"The column is order_id, not no_such_col.","engine":"clickhouse"}"#;
@@ -386,4 +387,256 @@ async fn a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt() 
             "switch {switch}: the system prompt's bytes changed"
         );
     }
+}
+
+#[tokio::test]
+async fn a_tool_the_allowlist_did_not_name_is_refused_and_runs_nothing() {
+    // Round 1 calls `run_sql`, which the console's allowlist does not name;
+    // round 2 writes the answer. The refusal must reach the model, and no
+    // statement may reach ClickHouse. The call's statement is clean, so
+    // `run_sql`'s own dry run would pass it: only the allowlist stops it.
+    let llm = mock_model(vec![
+        model_round(
+            None,
+            &[("call_1", "run_sql", r#"{"sql":"SELECT 1 AS probe"}"#)],
+        ),
+        model_round(Some("Answered without the query."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // The DATA MAP's `system.*` reads are sent by the prompt on every turn, so
+    // the check is on the model's own statement only. It comes first: with the
+    // refusal removed, the statement is what must fail this test.
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter().all(|s| !s.contains("AS probe")),
+        "the refused query reached ClickHouse: {sent:?}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one refused call: {trace:?}");
+    assert_eq!(trace[0]["tool"], "run_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+    assert_eq!(
+        trace[0]["result"]["error"], "run_sql is not available in this chat. Answer without it.",
+        "{trace:?}"
+    );
+    assert_eq!(body["answer"], "Answered without the query.", "{body}");
+}
+
+#[tokio::test]
+async fn query_studio_s_question_box_is_held_to_its_four_tools() {
+    // The console's question box sends these four names. `list_charts` is a
+    // read tool the box did not name, so the loop refuses it.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "list_charts", "{}")]),
+        model_round(Some("Answered without the chart list."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+    let allow = json!([
+        "run_sql",
+        "list_datasets",
+        "describe_dataset",
+        "lakehouse_overview"
+    ]);
+
+    let (status, body) = chat(&llm, &ch, "true", Some(allow), "Apa saja grafik yang ada?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "list_charts");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+}
+
+#[tokio::test]
+async fn a_chat_with_no_allowlist_still_runs_a_tool_the_turn_selection_left_out() {
+    // No `tools` in the request: `list_charts` is outside the per-turn offer
+    // for this message, but plain chat dispatches as it did before plan 17.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "list_charts", "{}")]),
+        model_round(Some("Done."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "berapa tamu bulan ini?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "list_charts");
+    assert_eq!(trace[0]["ok"], true, "{trace:?}");
+}
+
+#[tokio::test]
+async fn with_the_switch_off_a_proposal_the_model_makes_anyway_is_refused() {
+    // The switch removes `propose_sql` from the offer, but a model can still
+    // name it. The call must end `ok: false` and reach ClickHouse as nothing.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", RIGHT_PROPOSAL)]),
+        model_round(Some("Explained without a proposal."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "false",
+        Some(json!(["propose_sql"])),
+        FIX_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "propose_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+    assert!(
+        statements(&ch)
+            .await
+            .iter()
+            .all(|s| !s.contains("EXPLAIN PLAN") && !s.contains("order_id")),
+        "the proposal never reached ClickHouse: {:?}",
+        statements(&ch).await
+    );
+}
+
+/// The console's Explain message for `SELECT 1 AS probe` on `clickhouse`,
+/// template `explainSql` in src/services/clients/queries.ts. The server
+/// matches the leading sentence only.
+const EXPLAIN_MESSAGE: &str =
+    "Explain what this query does.\n\nEngine: clickhouse\nSQL:\nSELECT 1 AS probe";
+
+#[tokio::test]
+async fn an_explain_turn_offers_no_tool_and_keeps_the_sql_help_rules() {
+    let llm = mock_model(vec![model_round(Some("It returns one row."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, _) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (names, system) = first_model_request(&llm).await;
+    assert!(
+        names.is_empty(),
+        "an Explain turn offers no tool: {names:?}"
+    );
+    assert!(
+        system.contains("SQL HELP"),
+        "the rules stay for the Explain turn: {system}"
+    );
+}
+
+#[tokio::test]
+async fn a_proposal_in_an_explain_turn_is_refused_and_the_explanation_is_the_answer() {
+    // The staging failure: the model proposes a statement during an Explain.
+    // RIGHT_PROPOSAL would pass the check, so only the offer decides here.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", RIGHT_PROPOSAL)]),
+        model_round(Some("It returns one row."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    // The check first, as in T1: the proposal's SQL must not reach ClickHouse.
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter()
+            .all(|s| !s.contains("EXPLAIN PLAN") && !s.contains("order_id")),
+        "the proposal reached ClickHouse: {sent:?}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "propose_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+    assert_eq!(
+        trace[0]["result"]["error"],
+        "propose_sql is not available in this chat. Answer without it.",
+        "{trace:?}"
+    );
+    assert!(
+        trace
+            .iter()
+            .all(|step| step["result"]["proposed"] != json!(true)),
+        "no step proposes: {trace:?}"
+    );
+    assert_eq!(body["answer"], "It returns one row.", "{body}");
+}
+
+#[tokio::test]
+async fn a_query_in_an_explain_turn_is_refused_and_runs_nothing() {
+    let llm = mock_model(vec![
+        model_round(
+            None,
+            &[("call_1", "run_sql", r#"{"sql":"SELECT 1 AS probe"}"#)],
+        ),
+        model_round(Some("It returns one row."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter().all(|s| !s.contains("AS probe")),
+        "the query reached ClickHouse: {sent:?}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "run_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+}
+
+#[tokio::test]
+async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
+    // The sentence is matched at the start of the message only. A Fix message
+    // whose statement holds the sentence in a comment keeps the tool.
+    let fix_with_comment = "Why does this query fail? Fix it.\n\nEngine: clickhouse\nSQL:\nSELECT 1 /* Explain what this query does. */ AS probe\nError:\nUNKNOWN_IDENTIFIER";
+    let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, _) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        fix_with_comment,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (names, _) = first_model_request(&llm).await;
+    assert!(names.contains(&"propose_sql".to_owned()), "{names:?}");
 }
