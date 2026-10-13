@@ -22,11 +22,67 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Serialize;
 
+/// Why a delivery did not happen, as a fixed set of reasons the product
+/// words itself (`SRC-17` F1, delivery review 2026-10-12; principles 2 and 4).
+///
+/// The text of a failure never comes from the other side: not a webhook's
+/// status line or body, not an `SMTP` reply, not a driver's error (which can
+/// carry a host name or an address). Each upstream failure is classified into
+/// one of these before it is returned, stored on an alert or shown. The
+/// [`Self::message`] strings are what the Alerts page prints; a test pins
+/// every one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailure {
+    /// The webhook URL is not an `http(s)` address.
+    WebhookAddressRefused,
+    /// The webhook server could not be reached (connect, `DNS`, timeout, TLS).
+    WebhookUnreachable,
+    /// The webhook server answered with a non-success status.
+    WebhookServerError,
+    /// The webhook server answered with a redirect, which is never followed
+    /// (`SEC-10`: a redirect is a second target nobody checked).
+    WebhookRedirected,
+    /// `SMTP_HOST` is not set.
+    EmailNotConfigured,
+    /// The e-mail address (or the message built from it) is not valid.
+    EmailAddressRefused,
+    /// The mail server could not be reached.
+    MailServerUnreachable,
+    /// The mail server answered and refused the message.
+    MailServerRefused,
+    /// The rule names a channel this build does not send to.
+    ChannelUnsupported,
+}
+
+impl DeliveryFailure {
+    /// The fixed sentence for this reason; nothing from the failed call is
+    /// ever added to it.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::WebhookAddressRefused => "the webhook address was refused",
+            Self::WebhookUnreachable => "the webhook server could not be reached",
+            Self::WebhookServerError => "the webhook server answered with an error",
+            Self::WebhookRedirected => "the webhook server redirected the request",
+            Self::EmailNotConfigured => "e-mail is not set up on this installation",
+            Self::EmailAddressRefused => "the e-mail address was refused",
+            Self::MailServerUnreachable => "the mail server could not be reached",
+            Self::MailServerRefused => "the mail server refused the message",
+            Self::ChannelUnsupported => "the rule's channel is not supported",
+        }
+    }
+}
+
 /// Outcome of a delivery attempt, matching the TypeScript's
 /// `DeliverResult`. Deliberately not a `Result<(), String>`: the
 /// TypeScript never throws from `sendWebhook`/`sendEmail`/`deliver` — every
 /// failure mode (bad URL, unconfigured `SMTP`, invalid address, network
 /// error) is reported through this struct instead.
+///
+/// `error`, when present, is always the [`DeliveryFailure::message`] of a
+/// fixed reason (`SRC-17` F1): this struct is serialized into the
+/// `/api/alerts/run` response and stored on alert instances, so it must not
+/// carry upstream text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeliverResult {
     /// Whether delivery succeeded.
@@ -44,10 +100,10 @@ impl DeliverResult {
         }
     }
 
-    fn err(message: impl Into<String>) -> Self {
+    fn err(failure: DeliveryFailure) -> Self {
         Self {
             ok: false,
-            error: Some(message.into()),
+            error: Some(failure.message().to_owned()),
         }
     }
 }
@@ -128,12 +184,14 @@ impl EmailSender {
     /// Send an email, matching `sendEmail(to, subject, html)`.
     ///
     /// Validation order, matching the TypeScript exactly:
-    /// 1. `SMTP_HOST` unset → `{ ok: false, error: "SMTP is not
-    ///    configured ..." }`, without attempting anything else.
-    /// 2. `to` empty or missing `@` → `{ ok: false, error: "invalid
-    ///    email address" }`.
-    /// 3. Otherwise, connect and send; a transport-level failure is
-    ///    reported via its `Display` message.
+    /// 1. `SMTP_HOST` unset → `{ ok: false }` with
+    ///    [`DeliveryFailure::EmailNotConfigured`], without attempting
+    ///    anything else.
+    /// 2. `to` empty or missing `@` → [`DeliveryFailure::EmailAddressRefused`].
+    /// 3. Otherwise, connect and send; a failure is classified into
+    ///    [`DeliveryFailure::MailServerUnreachable`] or
+    ///    [`DeliveryFailure::MailServerRefused`] (`SRC-17` F1: the
+    ///    transport's own message is never returned).
     ///
     /// # Errors
     ///
@@ -142,17 +200,14 @@ impl EmailSender {
     /// never throws from `sendEmail`.
     pub async fn send(&self, to: &str, subject: &str, html: &str) -> DeliverResult {
         let Some(host) = &self.config.host else {
-            return DeliverResult::err(
-                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)",
-            );
+            return DeliverResult::err(DeliveryFailure::EmailNotConfigured);
         };
         if to.is_empty() || !to.contains('@') {
-            return DeliverResult::err("invalid email address");
+            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
         }
 
-        let message = match build_message(&self.config.from, to, subject, html) {
-            Ok(m) => m,
-            Err(err) => return DeliverResult::err(err.to_string()),
+        let Ok(message) = build_message(&self.config.from, to, subject, html) else {
+            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
         };
 
         let builder = if self.config.secure {
@@ -160,10 +215,10 @@ impl EmailSender {
         } else {
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
         };
-        let mut builder = match builder {
-            Ok(b) => b.port(self.config.port),
-            Err(err) => return DeliverResult::err(err.to_string()),
+        let Ok(builder) = builder else {
+            return DeliverResult::err(DeliveryFailure::MailServerUnreachable);
         };
+        let mut builder = builder.port(self.config.port);
         if let Some(user) = &self.config.user {
             builder = builder.credentials(Credentials::new(user.clone(), self.config.pass.clone()));
         }
@@ -171,7 +226,13 @@ impl EmailSender {
 
         match transport.send(message).await {
             Ok(_) => DeliverResult::ok(),
-            Err(err) => DeliverResult::err(err.to_string()),
+            // `SRC-17` F1: an `SMTP` reply (transient or permanent) means
+            // the server answered and refused; anything else (connect, TLS,
+            // timeout) means it was not reached. The reply text is dropped.
+            Err(err) if err.is_permanent() || err.is_transient() => {
+                DeliverResult::err(DeliveryFailure::MailServerRefused)
+            }
+            Err(_) => DeliverResult::err(DeliveryFailure::MailServerUnreachable),
         }
     }
 }
@@ -211,7 +272,7 @@ pub async fn deliver(
             // difference left to reproduce.
             email.send(target, title, &html).await
         }
-        other => DeliverResult::err(format!("unknown channel: {other}")),
+        _ => DeliverResult::err(DeliveryFailure::ChannelUnsupported),
     }
 }
 
@@ -229,7 +290,10 @@ mod tests {
     async fn webhook_rejects_non_http_url() {
         let client = MappedResolver::new().into_sender();
         let result = client.send("ftp://example.com", "t", "x").await;
-        assert_eq!(result, DeliverResult::err("invalid webhook URL"));
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::WebhookAddressRefused)
+        );
     }
 
     #[tokio::test]
@@ -263,7 +327,12 @@ mod tests {
 
         let client = MappedResolver::new().into_sender();
         let result = client.send(&server.uri(), "t", "x").await;
-        assert_eq!(result, DeliverResult::err("webhook HTTP 500"));
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::WebhookServerError)
+        );
+        // SRC-17 F1: the status code is not in the text.
+        assert!(!result.error.unwrap().contains("500"));
     }
 
     /// `SEC-10`: the connection goes to the address the resolver approved,
@@ -308,7 +377,10 @@ mod tests {
             .await;
         let sender = MappedResolver::new().into_sender();
         let result = sender.send(&first.uri(), "t", "x").await;
-        assert_eq!(result, DeliverResult::err("webhook redirect not followed"));
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::WebhookRedirected)
+        );
         assert!(
             second.received_requests().await.unwrap().is_empty(),
             "the redirect target must never be requested"
@@ -323,7 +395,7 @@ mod tests {
         let sender = MappedResolver::new().into_sender();
         assert_eq!(
             sender.send("http://nowhere.test/x", "t", "x").await,
-            DeliverResult::err("webhook host could not be resolved")
+            DeliverResult::err(DeliveryFailure::WebhookUnreachable)
         );
         for bad in [
             "http://user:pw@example.test/x",
@@ -334,7 +406,7 @@ mod tests {
         ] {
             assert_eq!(
                 sender.send(bad, "t", "x").await,
-                DeliverResult::err("invalid webhook URL"),
+                DeliverResult::err(DeliveryFailure::WebhookAddressRefused),
                 "{bad}"
             );
         }
@@ -351,7 +423,10 @@ mod tests {
         let sender = MappedResolver::new().into_sender();
         let url = format!("http://127.0.0.1:{port}/secret-marker-token");
         let result = sender.send(&url, "t", "x").await;
-        assert_eq!(result, DeliverResult::err("webhook connection failed"));
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::WebhookUnreachable)
+        );
         let text = result.error.unwrap();
         assert!(!text.contains("secret-marker-token"), "{text}");
         assert!(!text.contains("error sending request"), "{text}");
@@ -388,9 +463,7 @@ mod tests {
         let result = sender.send("someone@example.com", "s", "<p>hi</p>").await;
         assert_eq!(
             result,
-            DeliverResult::err(
-                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)"
-            )
+            DeliverResult::err(DeliveryFailure::EmailNotConfigured)
         );
     }
 
@@ -398,10 +471,16 @@ mod tests {
     async fn email_rejects_invalid_address() {
         let sender = EmailSender::new(cfg(Some("smtp.example.com")));
         let result = sender.send("not-an-email", "s", "<p>hi</p>").await;
-        assert_eq!(result, DeliverResult::err("invalid email address"));
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::EmailAddressRefused)
+        );
 
         let result_empty = sender.send("", "s", "<p>hi</p>").await;
-        assert_eq!(result_empty, DeliverResult::err("invalid email address"));
+        assert_eq!(
+            result_empty,
+            DeliverResult::err(DeliveryFailure::EmailAddressRefused)
+        );
     }
 
     #[test]
@@ -453,9 +532,7 @@ mod tests {
         let result = deliver(&http, &email, "email", "someone@example.com", "t", "x").await;
         assert_eq!(
             result,
-            DeliverResult::err(
-                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)"
-            )
+            DeliverResult::err(DeliveryFailure::EmailNotConfigured)
         );
     }
 
@@ -466,7 +543,97 @@ mod tests {
         let result = deliver(&http, &email, "carrier-pigeon", "target", "t", "x").await;
         assert_eq!(
             result,
-            DeliverResult::err("unknown channel: carrier-pigeon")
+            DeliverResult::err(DeliveryFailure::ChannelUnsupported)
         );
+        // SRC-17 F1: the rule's channel text is not echoed.
+        assert!(!result.error.unwrap().contains("carrier-pigeon"));
+    }
+
+    /// SRC-17 F1 (D-a): a webhook host nothing listens on gives the fixed
+    /// "could not be reached" reason, and nothing from the driver's error
+    /// (which names the address) is in it.
+    #[tokio::test]
+    async fn webhook_to_an_unreachable_host_gives_the_fixed_reason_and_no_driver_text() {
+        // Bind then drop, so the port is free and the connect is refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let client = MappedResolver::new().into_sender();
+        let url = format!("http://127.0.0.1:{port}/hook");
+        let result = client.send(&url, "t", "x").await;
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::WebhookUnreachable)
+        );
+        let text = result.error.unwrap();
+        assert!(!text.contains("127.0.0.1") && !text.contains(&port.to_string()));
+    }
+
+    /// SRC-17 F1 (D-a): a mail server nothing listens on gives the fixed
+    /// "could not be reached" reason whether the transport fails to build or
+    /// fails to connect, and none of the driver's text.
+    #[tokio::test]
+    async fn email_to_an_unreachable_server_gives_the_fixed_reason_and_no_driver_text() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut config = cfg(Some("127.0.0.1"));
+        config.port = port;
+        let sender = EmailSender::new(config);
+        let result = sender.send("someone@example.com", "s", "<p>hi</p>").await;
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::MailServerUnreachable)
+        );
+        assert!(!result.error.unwrap().contains("127.0.0.1"));
+    }
+
+    /// SRC-17 F1: the set of reasons is closed and every sentence is pinned,
+    /// so a new one cannot be added without a test noticing.
+    #[test]
+    fn every_delivery_failure_has_its_fixed_sentence() {
+        let all = [
+            (
+                DeliveryFailure::WebhookAddressRefused,
+                "the webhook address was refused",
+            ),
+            (
+                DeliveryFailure::WebhookUnreachable,
+                "the webhook server could not be reached",
+            ),
+            (
+                DeliveryFailure::WebhookServerError,
+                "the webhook server answered with an error",
+            ),
+            (
+                DeliveryFailure::WebhookRedirected,
+                "the webhook server redirected the request",
+            ),
+            (
+                DeliveryFailure::EmailNotConfigured,
+                "e-mail is not set up on this installation",
+            ),
+            (
+                DeliveryFailure::EmailAddressRefused,
+                "the e-mail address was refused",
+            ),
+            (
+                DeliveryFailure::MailServerUnreachable,
+                "the mail server could not be reached",
+            ),
+            (
+                DeliveryFailure::MailServerRefused,
+                "the mail server refused the message",
+            ),
+            (
+                DeliveryFailure::ChannelUnsupported,
+                "the rule's channel is not supported",
+            ),
+        ];
+        for (failure, sentence) in all {
+            assert_eq!(failure.message(), sentence);
+        }
     }
 }

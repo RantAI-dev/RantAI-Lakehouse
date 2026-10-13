@@ -44,7 +44,7 @@ use std::time::Duration;
 use reqwest::Url;
 use serde_json::json;
 
-use crate::DeliverResult;
+use crate::{DeliverResult, DeliveryFailure};
 
 /// How long a whole delivery may take. Before `SEC-10` the client had no
 /// timeout at all (`reqwest::Client::new()`), so one unresponsive webhook
@@ -117,6 +117,22 @@ impl fmt::Display for WebhookError {
             Self::TimedOut => f.write_str("webhook request timed out"),
             Self::ConnectFailed => f.write_str("webhook connection failed"),
             Self::Failed => f.write_str("webhook request failed"),
+        }
+    }
+}
+
+impl WebhookError {
+    /// The reason a delivery result reports for this error. The save-time
+    /// check keeps using `Display` (its messages are fixed and ours); the
+    /// result stored on an alert uses [`DeliveryFailure`] (`SRC-17` F1).
+    fn failure(&self) -> DeliveryFailure {
+        match self {
+            Self::InvalidUrl | Self::NotAllowed => DeliveryFailure::WebhookAddressRefused,
+            Self::Unresolved | Self::TimedOut | Self::ConnectFailed | Self::Failed => {
+                DeliveryFailure::WebhookUnreachable
+            }
+            Self::Redirect => DeliveryFailure::WebhookRedirected,
+            Self::Status(_) => DeliveryFailure::WebhookServerError,
         }
     }
 }
@@ -208,7 +224,10 @@ impl WebhookSender {
     pub async fn send(&self, raw_url: &str, title: &str, text: &str) -> DeliverResult {
         match self.try_send(raw_url, title, text).await {
             Ok(()) => DeliverResult::ok(),
-            Err(err) => DeliverResult::err(err.to_string()),
+            // `SRC-17` F1 (merged with `SEC-10`): the delivery result carries
+            // one of the product's closed set of reasons, never the status
+            // code or the text of `WebhookError`'s own `Display`.
+            Err(err) => DeliverResult::err(err.failure()),
         }
     }
 

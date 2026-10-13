@@ -169,7 +169,7 @@ mod tests {
                 sender.send(url, "t", "x").await,
                 DeliverResult {
                     ok: false,
-                    error: Some("webhook address is not allowed".to_owned())
+                    error: Some("the webhook address was refused".to_owned())
                 },
                 "{url}"
             );
@@ -262,7 +262,7 @@ mod tests {
             sender.send(&url, "t", "x").await,
             DeliverResult {
                 ok: false,
-                error: Some("webhook redirect not followed".to_owned())
+                error: Some("the webhook server redirected the request".to_owned())
             }
         );
         assert!(inward.received_requests().await.unwrap().is_empty());

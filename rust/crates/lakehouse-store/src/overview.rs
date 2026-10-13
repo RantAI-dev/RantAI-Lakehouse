@@ -76,6 +76,17 @@ pub struct AlertItem {
     /// [`is_rule_silenced`]) is silenced until this time, ISO 8601.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silenced_until: Option<String>,
+    /// Whether the rule's webhook or e-mail arrived (`SRC-17` F1): `Some(true)`
+    /// delivered, `Some(false)` not delivered (see [`Self::delivery_reason`]),
+    /// absent when it is not known (instances written before `0068`, seeded
+    /// rows) -- never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<bool>,
+    /// Why a delivery did not happen: one of the fixed sentences of
+    /// `lakehouse_notify::DeliveryFailure::message`, never text from the
+    /// other side. Present only when [`Self::delivered`] is `Some(false)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_reason: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -94,6 +105,8 @@ struct AlertRow {
     rule_id: Option<String>,
     fired_at: Option<OffsetDateTime>,
     silenced_until: Option<OffsetDateTime>,
+    delivery_status: Option<String>,
+    delivery_reason: Option<String>,
 }
 
 impl From<AlertRow> for AlertItem {
@@ -113,12 +126,38 @@ impl From<AlertRow> for AlertItem {
             rule_id: row.rule_id,
             fired_at: row.fired_at.map(iso_millis),
             silenced_until: row.silenced_until.map(iso_millis),
+            // Anything but the two values the `0068` CHECK admits is
+            // "not known", not a guess.
+            delivered: match row.delivery_status.as_deref() {
+                Some(DELIVERED) => Some(true),
+                Some(NOT_DELIVERED) => Some(false),
+                _ => None,
+            },
+            delivery_reason: row.delivery_reason,
         }
     }
 }
 
 const ALERT_COLUMNS: &str = "id, title, severity, source, affected, status, assignee, at, \
-    detail, resolution_note, href, rule_id, fired_at, silenced_until";
+    detail, resolution_note, href, rule_id, fired_at, silenced_until, delivery_status, \
+    delivery_reason";
+
+/// `alert_instance.delivery_status` of an instance whose delivery arrived.
+const DELIVERED: &str = "delivered";
+/// `alert_instance.delivery_status` of an instance whose delivery failed.
+const NOT_DELIVERED: &str = "not_delivered";
+
+/// How a delivery ended, as [`insert_from_fired_rule_with_delivery`] records
+/// it (`SRC-17` F1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRecord<'a> {
+    /// The webhook or e-mail arrived.
+    Delivered,
+    /// It did not; the reason must be one of the fixed sentences of
+    /// `lakehouse_notify::DeliveryFailure::message` (principle 4: nothing
+    /// the other side said is stored).
+    NotDelivered(&'a str),
+}
 
 /// List every alert instance, most recent first.
 ///
@@ -212,6 +251,31 @@ pub async fn insert_from_fired_rule(
     fired: &FiredRule<'_>,
     now: OffsetDateTime,
 ) -> Result<Option<AlertItem>, StoreError> {
+    insert_from_fired_rule_with_delivery(pool, fired, None, now).await
+}
+
+/// [`insert_from_fired_rule`] that also records how the delivery went
+/// (`SRC-17` F1). `None` leaves the outcome unknown (NULL), which is what
+/// the callers that have no delivery result pass.
+///
+/// The 15-minute dedup is unchanged: when a recent instance of the rule
+/// exists nothing is inserted and `None` is returned, so a later failed
+/// delivery inside that window is not shown on its own row.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure.
+pub async fn insert_from_fired_rule_with_delivery(
+    pool: &PgPool,
+    fired: &FiredRule<'_>,
+    delivery: Option<DeliveryRecord<'_>>,
+    now: OffsetDateTime,
+) -> Result<Option<AlertItem>, StoreError> {
+    let (status, reason) = match delivery {
+        Some(DeliveryRecord::Delivered) => (Some(DELIVERED), None),
+        Some(DeliveryRecord::NotDelivered(reason)) => (Some(NOT_DELIVERED), Some(reason)),
+        None => (None, None),
+    };
     let mut tx = pool.begin().await?;
     // `hashtext()` is Postgres's built-in string hash — stable within one
     // session, which is all an advisory lock scoped to this transaction's
@@ -234,7 +298,8 @@ pub async fn insert_from_fired_rule(
     let id = format!("ai-{}", uuid::Uuid::new_v4());
     let sql = format!(
         "INSERT INTO alert_instance (id, title, severity, source, affected, status, at, \
-         detail, rule_id, fired_at) VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$6) \
+         detail, rule_id, fired_at, delivery_status, delivery_reason) \
+         VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$6,$9,$10) \
          RETURNING {ALERT_COLUMNS}"
     );
     let row: AlertRow = sqlx::query_as(&sql)
@@ -246,6 +311,8 @@ pub async fn insert_from_fired_rule(
         .bind(now)
         .bind(fired.detail)
         .bind(fired.rule_id)
+        .bind(status)
+        .bind(reason)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -323,6 +390,8 @@ mod tests {
             rule_id: None,
             fired_at: None,
             silenced_until: None,
+            delivered: None,
+            delivery_reason: None,
         };
         let value = serde_json::to_value(&alert).unwrap();
         for key in [
@@ -336,6 +405,9 @@ mod tests {
         assert!(value.get("ruleId").is_none());
         assert!(value.get("firedAt").is_none());
         assert!(value.get("silencedUntil").is_none());
+        // SRC-17 F1: an unknown delivery outcome is absent, not `false`.
+        assert!(value.get("delivered").is_none());
+        assert!(value.get("deliveryReason").is_none());
     }
 
     /// `severity` is `Option<String>` — a rule fired with no severity
@@ -359,6 +431,8 @@ mod tests {
             rule_id: Some("rule-1".to_owned()),
             fired_at: Some("2026-01-01T00:00:00.000Z".to_owned()),
             silenced_until: Some("2026-01-01T00:10:00.000Z".to_owned()),
+            delivered: None,
+            delivery_reason: None,
         };
         let value = serde_json::to_value(&alert).unwrap();
         assert!(

@@ -112,6 +112,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "query.rs",
+        ".map_err(|err| err.to_string())?;",
+        "rewrite_sql_for_principal's ApiError: the policy's own non-leaking message, written in this repository",
+    ),
+    (
+        "query.rs",
         "invalid JSON: {err}",
         "serde error over the caller's own request body",
     ),
@@ -240,6 +245,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "inspected for UNKNOWN_TABLE to pick a fixed message; never returned",
     ),
     // The assistant's tools.
+    (
+        "ai/tools/alerts.rs",
+        "json!({ \"error\": err.to_string() })",
+        "an ApiError from routes::alerts' scope checks and visible_rules: fixed texts written in this repository, a store failure is already \"database error\"",
+    ),
     (
         "ai/tools/connectors.rs",
         "Err(err) => return json!({ \"error\": err.to_string() })",

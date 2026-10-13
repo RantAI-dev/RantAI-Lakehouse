@@ -29,8 +29,13 @@
 #   G3_MAINTENANCE_RESULT result of `g3-maintenance` job
 #   G4_CDC_RESULT         result of `g4-cdc` job
 #   G6_INGEST_RESULT      result of `g6-ingest` job
+#   G6_INGEST_OTHER_RESULT result of `g6-ingest-other` job
+#   G6_ORACLE_RESULT      result of `g6-oracle` job
+#   G9_UPLOAD_RESULT      result of `g9-upload` job
+#   G6_ALERTS_RESULT      result of `g6-alerts` job (SRC-17 alert delivery)
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
+#   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
 set -euo pipefail
 
 run_gate() {
@@ -131,8 +136,13 @@ run_gate() {
   check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."

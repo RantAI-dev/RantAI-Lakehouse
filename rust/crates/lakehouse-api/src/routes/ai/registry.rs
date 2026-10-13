@@ -130,6 +130,21 @@ fn ask_user_schema() -> Value {
             "required": ["term", "question", "options"] } } })
 }
 
+/// The tool that proposes a corrected statement for a Query Studio query that
+/// failed. Named once so the chat's switch and its offered list cannot
+/// misspell it; a test pins it to a registered tool.
+pub const PROPOSE_SQL: &str = "propose_sql";
+
+fn propose_sql_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "propose_sql",
+        "description": "Propose the whole corrected statement once, with one sentence saying what was wrong. The server checks that it would run for this user, and the person sees it as a diff and accepts or rejects it. It is never run by you or by the server. Use it only for a query the person asked you to fix.",
+        "parameters": { "type": "object", "properties": {
+            "sql": { "type": "string", "description": "the whole corrected statement, not a fragment (1 to 20000 characters)" },
+            "reason": { "type": "string", "description": "one sentence saying what was wrong (1 to 300 characters)" },
+            "engine": { "type": "string", "enum": ["clickhouse", "trino"], "description": "the engine the statement is for" } },
+            "required": ["sql", "reason", "engine"] } } })
+}
+
 fn list_datasets_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_datasets",
         "description": "List the datasets registered in the lakehouse catalog: slug, title, whether it comes from a primary or secondary source, and the Gold table it is served from. Optional keyword or source filter.",
@@ -1085,8 +1100,10 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     // ── T2.5 Governance draft tools ─────────────────────────────────
     // `POST /api/governance/policies` requires `policy:write`
-    // (policy.rs:163); `POST /api/governance/{kind}` (quality,
-    // classification) is `RequiresAuth` only (policy.rs:165, C1).
+    // (policy.rs:163). SEC-23 (F3): `POST /api/governance/{kind}` (quality,
+    // classification) now requires `governance:write` too, so the two rule
+    // tools carry it — [`super::gate::decide`] refuses them without it. Before,
+    // the tools were an unguarded path around the route policy.
     ToolSpec {
         name: "draft_policy",
         schema: draft_policy_schema,
@@ -1097,13 +1114,13 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "draft_classification_rule",
         schema: draft_classification_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "draft_quality_rule",
         schema: draft_quality_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "get_ingest_spec",
@@ -1198,6 +1215,15 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
+    // Checks a proposed statement as the caller, with the caller's own
+    // permission, and runs nothing. The Query Studio's own permission is
+    // `query:read`, so the same person may propose what they may run.
+    ToolSpec {
+        name: PROPOSE_SQL,
+        schema: propose_sql_schema,
+        risk: Risk::Read,
+        permission: "query:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -1255,8 +1281,8 @@ mod tests {
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
-        // sources) + `ask_user`.
-        assert_eq!(tool_schemas().len(), 64);
+        // sources) + `ask_user` + `propose_sql` (plan 15).
+        assert_eq!(tool_schemas().len(), 65);
     }
 
     #[test]
@@ -1419,9 +1445,10 @@ mod tests {
         // Tier 2 tools that carry no narrower permission than
         // `RequiresAuth` (C1) — every T2.1 governance read,
         // `run_bronze_maintenance`, `list_workloads`, both gold export
-        // tools, the two rule-level draft tools (`draft_policy` needs
-        // `policy:write`, so it is NOT in this list), and `ask_user`, which
-        // stores and reads nothing.
+        // tools, and `ask_user`, which stores and reads nothing. The three
+        // draft tools are NOT in this list: `draft_policy` needs
+        // `policy:write`, and since SEC-23 the two rule drafts need
+        // `governance:write`.
         assert_eq!(
             offered_names,
             vec![
@@ -1436,8 +1463,6 @@ mod tests {
                 "list_workloads".to_owned(),
                 "export_gold_mart".to_owned(),
                 "get_gold_export".to_owned(),
-                "draft_classification_rule".to_owned(),
-                "draft_quality_rule".to_owned(),
                 "ask_user".to_owned(),
             ]
         );
@@ -1494,8 +1519,12 @@ mod tests {
             ("export_gold_mart", Risk::WriteLow, ""),
             ("get_gold_export", Risk::Read, ""),
             ("draft_policy", Risk::WriteLow, "policy:write"),
-            ("draft_classification_rule", Risk::WriteLow, ""),
-            ("draft_quality_rule", Risk::WriteLow, ""),
+            (
+                "draft_classification_rule",
+                Risk::WriteLow,
+                "governance:write",
+            ),
+            ("draft_quality_rule", Risk::WriteLow, "governance:write"),
         ];
         for (name, risk, permission) in expected {
             let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));
