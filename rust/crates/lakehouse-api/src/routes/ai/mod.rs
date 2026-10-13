@@ -316,6 +316,7 @@ async fn system_prompt(
     context: &str,
     user_messages: &[&str],
     asking: bool,
+    sql_help: bool,
 ) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
     let withheld = withheld_by_policy(state).await;
@@ -359,6 +360,9 @@ async fn system_prompt(
     let mut rules = String::new();
     if state.config.ai_ask_back && asking {
         rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
     }
     // Read from the switch alone, in both modes: a count that overlaps
     // between rows is a fact about the data, not about asking back. With
@@ -439,6 +443,10 @@ async fn prepare_chat(
             if name == registry::ASK_USER && !state.config.ai_ask_back {
                 return false;
             }
+            // Same for the SQL help: the switch decides, whatever the list says.
+            if name == registry::PROPOSE_SQL && !state.config.ai_sql_help {
+                return false;
+            }
             if let Some(allow) = &allow {
                 // An explicit allowlist from the console's Tools menu is
                 // the user's own choice and wins over the per-turn
@@ -450,10 +458,14 @@ async fn prepare_chat(
         .collect();
 
     // The rules for asking are written only for a chat that can ask: one
-    // whose tool list holds `ask_user`.
+    // whose tool list holds `ask_user`. The SQL help rules follow the same
+    // rule for `propose_sql`.
     let asking = tools
         .iter()
         .any(|t| t["function"]["name"].as_str() == Some(registry::ASK_USER));
+    let sql_help = tools
+        .iter()
+        .any(|t| t["function"]["name"].as_str() == Some(registry::PROPOSE_SQL));
     let sys = system_prompt(
         state,
         principal,
@@ -462,6 +474,7 @@ async fn prepare_chat(
         parsed.context.as_deref().unwrap_or_default(),
         &recent_user,
         asking,
+        sql_help,
     )
     .await;
 
@@ -842,6 +855,21 @@ async fn run_chat(
                 let question = m.get("question").and_then(Value::as_str).unwrap_or("");
                 return Ok(chat_response_body(
                     question,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
+            // plan 15: an accepted proposal ends the turn the same way. The
+            // reason is the reply; the console shows the proposed statement.
+            if call.function.name == registry::PROPOSE_SQL
+                && let Value::Object(m) = &result
+                && m.get("proposed") == Some(&Value::Bool(true))
+            {
+                let reason = m.get("reason").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    reason,
                     &tool_trace,
                     build_run_id.as_deref(),
                     chart_created,
@@ -1997,8 +2025,17 @@ mod tests {
         let state = state_with_ask_back_and_layer("false", "false");
         let headers = axum::http::HeaderMap::new();
         for asking in [false, true] {
-            let ask =
-                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], asking).await;
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 ask,
                 format!(
@@ -2007,8 +2044,17 @@ mod tests {
                     prompt::SYSTEM_ASK_SUFFIX
                 )
             );
-            let build =
-                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], asking).await;
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 build,
                 format!(
@@ -2024,7 +2070,17 @@ mod tests {
     async fn with_ask_back_on_the_rules_come_after_the_mode_text_and_before_the_data_map() {
         let state = state_with_ask_back_and_layer("true", "false");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert_eq!(
             text,
             format!(
@@ -2049,8 +2105,17 @@ mod tests {
             } else {
                 ""
             };
-            let ask =
-                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
             assert_eq!(
                 ask,
                 format!(
@@ -2059,8 +2124,17 @@ mod tests {
                     prompt::SYSTEM_ASK_SUFFIX
                 )
             );
-            let build =
-                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], true).await;
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
             assert_eq!(
                 build,
                 format!(
@@ -2080,7 +2154,17 @@ mod tests {
             ("AI_ASK_BACK", "false"),
             ("DATABASE_URL", "not a postgres url"),
         ]);
-        let ask = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        let ask = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             ask,
             format!(
@@ -2090,7 +2174,17 @@ mod tests {
                 prompt::DISTINCT_COUNT_RULES
             )
         );
-        let build = system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], false).await;
+        let build = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             build,
             format!(
@@ -2106,7 +2200,17 @@ mod tests {
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert_eq!(
             text,
             format!(
@@ -2125,7 +2229,17 @@ mod tests {
         // Studio's allowlist, for one) must not be told to call it.
         let state = state_with_ask_back("true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert!(!text.contains("ask_user"), "{text}");
     }
 
@@ -2279,6 +2393,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(
@@ -2293,12 +2408,22 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!his.contains("lodging"), "{his}");
         assert!(!his.contains(WORDS_HEADER), "{his}");
-        let nobody =
-            system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let nobody = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert!(!nobody.contains("lodging"), "{nobody}");
     }
 
@@ -2317,6 +2442,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let map = text.find("\n\nDATA MAP\n").expect("a data map section");
@@ -2338,6 +2464,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains("lodging"), "{text}");
@@ -2365,6 +2492,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let words = text.split(WORDS_HEADER).nth(1).expect("a words section");
@@ -2417,6 +2545,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains(WORDS_HEADER), "{text}");

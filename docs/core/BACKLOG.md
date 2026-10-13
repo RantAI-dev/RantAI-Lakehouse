@@ -97,7 +97,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-9` | Feature | **Waits for `BI-18`** (layout part). The assistant adds tabs and uses templates | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-10` | Feature | **Waits for `RPT-1`, `BI-1`**. The assistant schedules reports ("send this to me every Monday as PDF") and produces a PDF or Excel file on request | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-11` | Feature | **Waits for `BI-19`, `BI-26`, `DEC-8`**. The assistant creates share and embed links only with approval, respects dashboard permissions, and never grants permissions | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
-| `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables **Waits for `QS-5`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables **Waits for `QS-5`** | AI Copilot | P2 | Building | #127 | `AGENTS.md` (assistant parity) |
 | `AI-13` | Feature | **Waits for `BI-14`**. The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today) | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-14` | Feature | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | AI Copilot | P2 | Todo |  | `AGENTS.md` (assistant parity) |
@@ -222,6 +222,7 @@ set by the product owner and are left empty until they are.
 | `SRC-7` | 2026-10-08 | 2026-10-12 | |
 | `SRC-8` | 2026-10-09 | 2026-10-12 | |
 | `SRC-9` | 2026-10-10 | 2026-10-13 | |
+| `AI-12` | 2026-10-13 | | |
 
 ## Decide
 
