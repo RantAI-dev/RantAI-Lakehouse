@@ -124,7 +124,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-6` | Feature | Fix the broken connectors: object-storage test and key change, Oracle credential change, Sheets shown as unsupported, Sources header text | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-7` | Feature | Alerts when a connector run or an upload load fails; health from real runs | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | In Progress | #114 | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Done | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
@@ -220,7 +220,7 @@ set by the product owner and are left empty until they are.
 | `SRC-6` | 2026-10-08 | 2026-10-12 | |
 | `SRC-7` | 2026-10-08 | 2026-10-12 | |
 | `SRC-8` | 2026-10-09 | 2026-10-12 | |
-| `SRC-9` | 2026-10-10 | | |
+| `SRC-9` | 2026-10-10 | 2026-10-13 | |
 
 ## Decide
 
