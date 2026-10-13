@@ -153,9 +153,10 @@ async fn first_model_request(llm: &MockServer) -> (Vec<String>, String) {
     (names, system)
 }
 
-/// The fix sentence, the engine, the statement and the error, as the console
-/// sends them.
-const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT no_such_col FROM silver.orders\n\nERROR:\nUNKNOWN_IDENTIFIER";
+/// The console's Fix message for `SELECT no_such_col FROM silver.orders` on
+/// `clickhouse`, template `proposeFix` in src/services/clients/queries.ts.
+/// The server matches the leading sentence only.
+const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nEngine: clickhouse\nSQL:\nSELECT no_such_col FROM silver.orders\nError:\nUNKNOWN_IDENTIFIER";
 
 const WRONG_PROPOSAL: &str = r#"{"sql":"SELECT no_such_col FROM silver.orders","reason":"Used the wrong column.","engine":"clickhouse"}"#;
 const RIGHT_PROPOSAL: &str = r#"{"sql":"SELECT order_id FROM silver.orders","reason":"The column is order_id, not no_such_col.","engine":"clickhouse"}"#;
@@ -507,10 +508,11 @@ async fn with_the_switch_off_a_proposal_the_model_makes_anyway_is_refused() {
     );
 }
 
-/// The explain sentence, the engine and the statement, as the console sends
-/// them for Explain.
+/// The console's Explain message for `SELECT 1 AS probe` on `clickhouse`,
+/// template `explainSql` in src/services/clients/queries.ts. The server
+/// matches the leading sentence only.
 const EXPLAIN_MESSAGE: &str =
-    "Explain what this query does.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT 1 AS probe";
+    "Explain what this query does.\n\nEngine: clickhouse\nSQL:\nSELECT 1 AS probe";
 
 #[tokio::test]
 async fn an_explain_turn_offers_no_tool_and_keeps_the_sql_help_rules() {
@@ -618,25 +620,10 @@ async fn a_query_in_an_explain_turn_is_refused_and_runs_nothing() {
 }
 
 #[tokio::test]
-async fn a_fix_turn_still_offers_the_tool_after_the_explain_change() {
-    // The existing fixture `an_allowlist_naming_propose_sql_offers_it_with_the_rules`
-    // is the pin; this one checks the same offer on the Fix message in the
-    // same file, next to the Explain tests.
-    let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
-    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
-
-    let (status, _) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let (names, _) = first_model_request(&llm).await;
-    assert_eq!(names, ["propose_sql"], "{names:?}");
-}
-
-#[tokio::test]
 async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
     // The sentence is matched at the start of the message only. A Fix message
     // whose statement holds the sentence in a comment keeps the tool.
-    let fix_with_comment = "Why does this query fail? Fix it.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT 1 /* Explain what this query does. */ AS probe\n\nERROR:\nUNKNOWN_IDENTIFIER";
+    let fix_with_comment = "Why does this query fail? Fix it.\n\nEngine: clickhouse\nSQL:\nSELECT 1 /* Explain what this query does. */ AS probe\nError:\nUNKNOWN_IDENTIFIER";
     let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
     let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
 

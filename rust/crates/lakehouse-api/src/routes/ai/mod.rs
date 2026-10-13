@@ -809,8 +809,9 @@ async fn run_chat(
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
-            // list, not the request's strings, so a tool the switch or the
-            // permission removed stays refused here too.
+            // list, not the request's strings, so a tool the switch removed,
+            // or that the Explain filter kept out, stays refused here too; a
+            // tool the permission removed never reaches this arm.
             let not_offered = allowlisted
                 && !tools
                     .iter()
