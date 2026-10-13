@@ -1354,38 +1354,127 @@ mod tests {
         assert!(listed(&resumed));
     }
 
-    /// Changing the policy away from `pause` does not lift a pause; only
-    /// approval does. A policy outside the four is a 400.
+    /// `SRC-16` F1 (delivery review 2026-10-12): a connector whose changes
+    /// are seen after the load, on `pause`, sees a change. It pauses with the
+    /// change pending and approvable; `ingest/run` answers 409 and the due
+    /// list leaves it out; approving the table moves the baseline to the
+    /// loaded shape, lifts the pause and the connector can run again.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn changing_the_policy_does_not_lift_a_pause(pool: sqlx::PgPool) {
+    async fn after_the_load_a_pause_is_lifted_by_approving_the_change(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "files paused", "pause").await;
+        sqlx::query(
+            "UPDATE connector SET adapter = 'files', ingest_mode = 'batch', \
+             schedule_cron = '0 2 * * *' WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let manager = user(&[h.tenant]);
+        let due = "/api/connectors/ingestible?dueAfter=2026-09-30T01:59:00Z&dueUntil=2026-09-30T02:00:00Z";
+        let is_listed = |body: &Value| {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == id.as_str())
+        };
+        observe_as_service(&h, &id, &BASE, "after_load").await;
+        let answer = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+        assert_eq!(answer["action"], "load");
+        assert_eq!(answer["changes"][0]["status"], "pending");
+        assert_eq!(answer["changes"][0]["canApprove"], true);
+        assert!(paused(&pool, &id).await);
+        let waiting = listed(&h, &id).await;
+        assert_eq!(waiting["pending"][0]["canApprove"], true);
+
+        let run = format!("/api/connectors/{id}/ingest/run");
+        let (status, _) = call(&h, &manager, "POST", &run, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (_, while_paused) = call(&h, &service(), "GET", due, None).await;
+        assert!(!is_listed(&while_paused), "{while_paused}");
+
+        let (status, approved) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["approved"][0]["status"], "approved");
+        assert_eq!(approved["pauseLifted"], true);
+        assert!(!paused(&pool, &id).await);
+        assert_eq!(
+            baseline_columns(&pool, &id).await,
+            3,
+            "the loaded shape is the baseline"
+        );
+        assert_eq!(listed(&h, &id).await["pending"], json!([]));
+        let (_, resumed) = call(&h, &service(), "GET", due, None).await;
+        assert!(is_listed(&resumed), "{resumed}");
+        // Past the pause check: Dagster is a bare mock here, so the launch
+        // fails with something other than the pause's 409.
+        let (status, _) = call(&h, &manager, "POST", &run, None).await;
+        assert_ne!(status, StatusCode::CONFLICT);
+
+        // A second run sees the same shape: no new change, nothing pauses.
+        let again = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+        assert_eq!(again["changes"], json!([]));
+        assert!(!paused(&pool, &id).await);
+    }
+
+    /// `SRC-16` F3 (delivery review 2026-10-12; it was "changing the policy
+    /// does not lift a pause", pinned by `SRC-8`): moving the policy from
+    /// `pause` to another lifts the schema-change pause and leaves the waiting
+    /// change listed; a pause with another reason stays; a patch that keeps
+    /// `pause` lifts nothing. A policy outside the four is a 400.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn moving_the_policy_away_from_pause_lifts_the_schema_change_pause(pool: sqlx::PgPool) {
         let h = harness(&pool, &[]).await;
         let id = connector(&h, "policy patch", "pause").await;
         let manager = user(&[h.tenant]);
+        let patch = |body: Value| {
+            let (h, manager, id) = (&h, &manager, &id);
+            async move {
+                call(
+                    h,
+                    manager,
+                    "PATCH",
+                    &format!("/api/connectors/{id}"),
+                    Some(body),
+                )
+                .await
+            }
+        };
         observe_as_service(&h, &id, &BASE, "before_load").await;
         observe_as_service(&h, &id, &WITH_QTY, "before_load").await;
         assert!(paused(&pool, &id).await);
 
-        let (status, patched) = call(
-            &h,
-            &manager,
-            "PATCH",
-            &format!("/api/connectors/{id}"),
-            Some(json!({ "schemaChangePolicy": "ask_first" })),
-        )
-        .await;
+        let (status, kept) =
+            patch(json!({ "schemaChangePolicy": "pause", "name": "renamed" })).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert!(paused(&pool, &id).await, "still on pause: nothing lifted");
+
+        let (status, patched) = patch(json!({ "schemaChangePolicy": "ask_first" })).await;
         assert_eq!(status, StatusCode::OK, "{patched}");
         assert_eq!(patched["schemaChangePolicy"], "ask_first");
-        assert!(patched["pausedAt"].is_string(), "{patched}");
-        assert!(paused(&pool, &id).await, "only an approval lifts the pause");
+        assert!(patched["pausedAt"].is_null(), "{patched}");
+        assert!(!paused(&pool, &id).await, "leaving pause lifts it");
+        assert_eq!(
+            listed(&h, &id).await["pending"].as_array().unwrap().len(),
+            1,
+            "the table still waits on its own"
+        );
 
-        let (status, _) = call(
-            &h,
-            &manager,
-            "PATCH",
-            &format!("/api/connectors/{id}"),
-            Some(json!({ "schemaChangePolicy": "whenever" })),
-        )
-        .await;
+        // Not this module's pause: another reason stays through a policy move.
+        sqlx::query("UPDATE connector SET schema_change_policy = 'pause', paused_reason = 'other', paused_at = now() WHERE id = $1")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _) = patch(json!({ "schemaChangePolicy": "apply_all" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            paused(&pool, &id).await,
+            "a pause with another reason stays"
+        );
+
+        let (status, _) = patch(json!({ "schemaChangePolicy": "whenever" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -1499,10 +1588,14 @@ mod tests {
     const WITHOUT_NOTE_QTY: [(&str, &str); 2] = [("id", "integer"), ("qty", "integer")];
 
     /// Decision D4: after the load nothing is held back. A column missing
-    /// from the batch is not a removal; an added column is applied; `pause`
-    /// still pauses the connector for later runs.
+    /// from the batch is not a removal; an added column is already in the
+    /// table (`action` is `load`); under `pause` it waits for an approval and
+    /// the connector pauses for later runs (`SRC-16` F1, delivery review
+    /// 2026-10-12: it used to be recorded `applied`, which left nothing to
+    /// approve and no way to lift the pause). The baseline stays until the
+    /// approval.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn after_the_load_changes_are_applied_and_a_missing_column_is_not_removed(
+    async fn after_the_load_under_pause_a_change_waits_and_a_missing_column_is_not_removed(
         pool: sqlx::PgPool,
     ) {
         let h = harness(&pool, &[]).await;
@@ -1520,9 +1613,26 @@ mod tests {
             added["action"], "load",
             "the change is already in the table"
         );
-        assert_eq!(added["changes"][0]["status"], "applied");
-        assert_eq!(baseline_columns(&pool, &id).await, 3);
+        assert_eq!(added["changes"][0]["status"], "pending");
+        assert_eq!(added["changes"][0]["canApprove"], true);
+        assert_eq!(baseline_columns(&pool, &id).await, 2, "until approved");
         assert!(paused(&pool, &id).await, "later runs stop");
+    }
+
+    /// Under the three other policies a change seen after the load is
+    /// applied, moves the baseline and pauses nothing (`SRC-16` F1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn after_the_load_under_the_other_policies_a_change_is_applied(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        for policy in ["apply_non_breaking", "apply_all", "ask_first"] {
+            let id = connector(&h, &format!("after load {policy}"), policy).await;
+            observe_as_service(&h, &id, &BASE, "after_load").await;
+            let added = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+            assert_eq!(added["action"], "load", "{policy}");
+            assert_eq!(added["changes"][0]["status"], "applied", "{policy}");
+            assert_eq!(baseline_columns(&pool, &id).await, 3, "{policy}");
+            assert!(!paused(&pool, &id).await, "{policy}");
+        }
     }
 
     /// An unknown connector is a 404 and a malformed or oversize body a 400,

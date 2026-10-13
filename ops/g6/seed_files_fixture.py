@@ -20,3 +20,10 @@ _CSV_BODY = b"id,customer,amount\n1,acme,100.00\n2,globex,250.50\n"
 def seed(*, endpoint: str, bucket: str, access_key: str, secret_key: str) -> None:
     fs = s3fs.S3FileSystem(key=access_key, secret=secret_key, client_kwargs={"endpoint_url": endpoint})
     fs.pipe_file(f"{bucket}/landing/orders.csv", _CSV_BODY)
+
+
+def put(*, endpoint: str, bucket: str, access_key: str, secret_key: str, key: str, body: bytes) -> None:
+    """Write one object under `bucket/key` (SRC-16: the pause step of the gate
+    changes a CSV between runs, so it needs to write the same key twice)."""
+    fs = s3fs.S3FileSystem(key=access_key, secret=secret_key, client_kwargs={"endpoint_url": endpoint})
+    fs.pipe_file(f"{bucket}/{key}", body)

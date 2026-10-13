@@ -24,8 +24,13 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 async fn connector(pool: &PgPool) -> String {
+    connector_named(pool, "schema change test").await
+}
+
+/// Connector names are unique, so a test that needs several names them.
+async fn connector_named(pool: &PgPool, name: &str) -> String {
     let input = CreateConnectorInput {
-        name: "schema change test".to_owned(),
+        name: name.to_owned(),
         kind: "PostgreSQL".to_owned(),
         direction: "source".to_owned(),
         host: "db.example".to_owned(),
@@ -157,6 +162,122 @@ async fn the_policy_can_be_set_and_an_unknown_one_is_refused(pool: PgPool) -> sq
     .await;
     assert!(refused.is_err());
     Ok(())
+}
+
+/// `SRC-16` F3: moving the policy from `pause` to another lifts the
+/// schema-change pause in the same write, leaves the waiting change, and
+/// leaves a pause with another reason; a write that keeps `pause` lifts
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn leaving_the_pause_policy_lifts_the_schema_change_pause_only(pool: PgPool) {
+    let id = connector(&pool).await;
+    let set = |policy: &str| {
+        let (pool, id, policy) = (pool.clone(), id.clone(), policy.to_owned());
+        async move {
+            update_connector(
+                &pool,
+                &id,
+                &UpdateConnectorInput {
+                    schema_change_policy: Some(policy),
+                    ..UpdateConnectorInput::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    set("pause").await;
+    baseline(&pool, &id, &[col("id", "integer"), col("note", "text")]).await;
+    wait_for_removal(&pool, &id, &[col("id", "integer")], true).await;
+
+    let kept = set("pause").await;
+    assert_eq!(
+        kept.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+
+    let moved = set("ask_first").await;
+    assert_eq!(moved.paused_reason, None);
+    assert_eq!(moved.paused_at, None);
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+
+    set("pause").await;
+    sqlx::query("UPDATE connector SET paused_reason = 'other', paused_at = now() WHERE id = $1")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let other = set("apply_all").await;
+    assert_eq!(other.paused_reason.as_deref(), Some("other"));
+    assert!(other.paused_at.is_some());
+}
+
+/// `SRC-16` D-d: migration `0067` releases a schema-change pause that has no
+/// pending change (what the after-load `pause` of `SRC-8` left behind) and
+/// nothing else: not a pause that still has something to approve, not a
+/// pause with another reason. The migration already ran on the empty
+/// database `sqlx::test` made, so its statement is run again on seeded rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_release_migration_lifts_only_a_schema_change_pause_with_nothing_pending(pool: PgPool) {
+    const MIGRATION: &str = include_str!(
+        "../../../migrations/0067_release_schema_change_pause_with_nothing_to_approve.sql"
+    );
+    assert!(
+        MIGRATION.contains(SCHEMA_CHANGE_PAUSE_REASON),
+        "the migration's literal must be the constant's text"
+    );
+    let stuck = connector_named(&pool, "stuck").await;
+    let waiting = connector_named(&pool, "waiting").await;
+    let other = connector_named(&pool, "other").await;
+    for id in [&stuck, &waiting] {
+        sqlx::query("UPDATE connector SET paused_reason = $2, paused_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(SCHEMA_CHANGE_PAUSE_REASON)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE connector SET paused_reason = 'other', paused_at = now() WHERE id = $1")
+        .bind(&other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    baseline(
+        &pool,
+        &waiting,
+        &[col("id", "integer"), col("note", "text")],
+    )
+    .await;
+    wait_for_removal(&pool, &waiting, &[col("id", "integer")], true).await;
+
+    sqlx::query(MIGRATION).execute(&pool).await.unwrap();
+
+    let reason = |id: String| {
+        let pool = pool.clone();
+        async move {
+            get_connector(&pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .connector
+                .paused_reason
+        }
+    };
+    assert_eq!(reason(stuck.clone()).await, None);
+    assert_eq!(
+        get_connector(&pool, &stuck)
+            .await
+            .unwrap()
+            .unwrap()
+            .connector
+            .paused_at,
+        None
+    );
+    assert_eq!(
+        reason(waiting).await.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+    assert_eq!(reason(other).await.as_deref(), Some("other"));
 }
 
 /// A first observation is stored as the baseline and reads back.
@@ -1090,6 +1211,104 @@ async fn removing_one_table_leaves_another_tables_pending_change_and_the_pause(p
     assert!(list_pending(&pool, &id).await.unwrap().is_empty());
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
     assert_eq!(after.paused_reason.as_deref(), Some("other"));
+}
+
+// --- SRC-16 F2: only a change Approve would take holds the pause -------------
+
+/// Observe `customers` as a baseline `[id, qty integer]`, then a waiting
+/// `qty integer -> text` change (the type the column cannot hold). It sets no
+/// pause itself (`SRC-8 review BLOCKER 3a`).
+async fn customers_waiting_on_an_unloadable_type(pool: &PgPool, id: &str) {
+    for (observed, changes, accept) in [
+        (
+            vec![col("id", "integer"), col("qty", "integer")],
+            vec![],
+            true,
+        ),
+        (
+            vec![col("id", "integer"), col("qty", "text")],
+            vec![type_change("qty", "integer", "text")],
+            false,
+        ),
+    ] {
+        let mut tx = ObservationTx::begin(pool, id, "customers").await.unwrap();
+        tx.record(&ObservationWrite {
+            observed_columns: &observed,
+            observed_primary_key: &["id".to_owned()],
+            changes: &changes,
+            accept_observed: accept,
+            pause_connector: false,
+            run_id: None,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+/// `SRC-16` F2: `orders` waits on a removal and paused the connector;
+/// `customers` waits on a type Approve refuses. Approving `orders` lifts the
+/// pause, `customers` keeps waiting, and removing `customers` from the
+/// selection clears it (`SRC-8 review BLOCKER 3b` still holds).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unapprovable_change_on_another_table_does_not_keep_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    observe_object(&pool, &id, "orders", false, false).await;
+    observe_object(&pool, &id, "orders", true, true).await;
+    customers_waiting_on_an_unloadable_type(&pool, &id).await;
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 2);
+
+    let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    assert!(approval.pause_lifted, "customers cannot be approved");
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_at, None);
+    let pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(pending.len(), 1, "customers keeps waiting on its own");
+    assert_eq!(pending[0].object_name, "customers");
+    assert!(!pending[0].can_approve);
+
+    // Removing the table still clears what waits for it, and a schema-change
+    // pause written meanwhile goes with it.
+    sqlx::query("UPDATE connector SET paused_reason = $2, paused_at = now() WHERE id = $1")
+        .bind(&id)
+        .bind(SCHEMA_CHANGE_PAUSE_REASON)
+        .execute(&pool)
+        .await
+        .unwrap();
+    select_tables(&pool, &id, &["orders"]).await;
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_at, None);
+}
+
+/// `SRC-16` F2, the other side: an approvable change on another table still
+/// holds the pause.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_approvable_change_on_another_table_still_keeps_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    for object in ["orders", "customers"] {
+        observe_object(&pool, &id, object, false, false).await;
+        observe_object(&pool, &id, object, true, true).await;
+    }
+
+    let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    assert!(!approval.pause_lifted);
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        after.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
 }
 
 // --- SRC-8 task 11: inactive columns of one Bronze table ------------------------

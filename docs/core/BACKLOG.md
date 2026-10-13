@@ -65,7 +65,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | In Acceptance | #82 | `docker-compose.yml`, `connector_probe.rs` |
 | `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Todo |  | commit `7ec3a81` |
 | `SEC-24` | Task | The assistant's system prompt gives any signed-in user the DATA MAP (tables, row counts, sample values) without `catalog:read`; a Dashboard Viewer sees samples Query Studio would refuse it. Give the map only with `catalog:read`, and sample values only with `query:read` | Administration & Security | P1 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SEC-9` gap) |
-| `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
+| `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | In Progress | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
 ## Next (P2)
 
@@ -124,7 +124,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-6` | Feature | Fix the broken connectors: object-storage test and key change, Oracle credential change, Sheets shown as unsupported, Sources header text | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-7` | Feature | Alerts when a connector run or an upload load fails; health from real runs | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | In Progress | #114 | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Done | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | Building | #115 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
@@ -162,6 +162,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | Planned |  | `lakehouse-embed` |
 | `SEC-25` | Task | Connector security follow-ups: a connector that signs in with no credential (Kafka, auth `none`) can never be re-pointed (409 without a credential, 400 with one); the PATCH-`host` rule and its doc for `files` connectors are stale since `SRC-6`; the `SEC-15` refusal message has runs of spaces | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 | `SEC-26` | Task | About thirty assistant tool results carry raw upstream error text (`err.to_string()`) into the chat response's `toolTrace`. Same rule as `SEC-6` | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
+| `SEC-27` | Task | The Security workflow is red on `main`: `cargo audit` reports advisories for `quinn-proto` 0.11.17 (`RUSTSEC-2026-0338`, `-0340`, `-0343`), and both `gitleaks` jobs fail. Update or waive the dependency with a reason; triage the `gitleaks` findings as `docs/CI.md` describes. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Todo |  | CI on `main` at `c083125` (2026-10-13); named in the `SRC-16` review |
 | `SRC-17` | Task | Load-failure alert delivery: a failed delivery is recorded as if sent (feature-page row 5 cannot pass); a rule-store failure loses the alert because the dedupe row is written first; the Alerts page still says nothing raises `connector_schema_change`; a gate step that receives a webhook, and `SRC-7-RESULT.md` with measured seconds | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-7`) |
 | `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
 | `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | Todo |  | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
@@ -220,7 +221,7 @@ set by the product owner and are left empty until they are.
 | `SRC-6` | 2026-10-08 | 2026-10-12 | |
 | `SRC-7` | 2026-10-08 | 2026-10-12 | |
 | `SRC-8` | 2026-10-09 | 2026-10-12 | |
-| `SRC-9` | 2026-10-10 | | |
+| `SRC-9` | 2026-10-10 | 2026-10-13 | |
 
 ## Decide
 

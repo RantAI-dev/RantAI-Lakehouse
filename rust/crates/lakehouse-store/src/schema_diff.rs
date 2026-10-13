@@ -259,8 +259,16 @@ pub fn diff(previous: Option<&TableShape>, observed: &TableShape) -> Vec<Change>
 ///
 /// `can_hold_back` is `false` for the after-load phase of files, REST,
 /// `MongoDB`, Kafka and SFTP (decision D4): the changes are already in the
-/// table, so they are recorded as applied and the answer is always `Load`.
-/// `pause` still sets `pause_connector` there, so LATER runs stop.
+/// table, so the answer is always `Load`. Under `apply_non_breaking`,
+/// `apply_all` and `ask_first` they are recorded as applied. Under `pause`
+/// they are recorded as `pending` and the connector pauses, so LATER runs
+/// stop AND there is something to approve (`SRC-16` F1, delivery review
+/// 2026-10-12): an applied change under a pause left nothing for
+/// `POST .../schema-changes/approve` to take, so nothing could lift it. A
+/// type change Approve refuses (`TypeChange::Other`) is the exception, as
+/// it is before the load (`SRC-8 review BLOCKER 3a`): it is recorded as
+/// applied and pauses nothing, because the data is already in the table and
+/// a pause that no approval can lift is the very defect.
 ///
 /// When a breaking change and a non-breaking one arrive together, the whole
 /// table waits and every change is pending: approving the table accepts
@@ -288,6 +296,10 @@ pub fn decide(
 /// it makes the table wait without pausing the connector (a pause nobody
 /// could lift by approving would stick for good); the way out is to change
 /// the table's key or mode, after which the change can be approved.
+///
+/// The same holds after the load (`can_hold_back == false`, `SRC-16` F1): a
+/// removed key column is then recorded as applied and pauses nothing, because
+/// no approval could lift that pause.
 ///
 /// This differs from a source primary-key change, which stays approvable
 /// (`SRC-8`): that one only says the SOURCE's uniqueness moved, while the
@@ -317,29 +329,41 @@ pub fn decide_for_key(
         };
     }
     let pause_connector = policy == SchemaChangePolicy::Pause;
+    // `SRC-8 review BLOCKER 3a`: a type change the existing column cannot
+    // hold is refused by Approve, so only the source putting the column back
+    // clears it, and that is seen only by a connector that keeps running.
+    // Pausing it would leave it stuck for good.
+    //
+    // `SRC-10`: a removed column of the table's deduplication key is refused
+    // by Approve too (`KeyStillNamed`), so it cannot hold a pause either.
+    // `SRC-16` F1 reads this below, for a connector that cannot hold back.
+    let cannot_be_approved = changes.iter().any(|c| {
+        matches!(
+            c,
+            Change::TypeChanged {
+                change: TypeChange::Other,
+                ..
+            }
+        ) || key.is_some_and(|key| c.removes_a_column_of(key))
+    });
     if !can_hold_back {
+        // `SRC-16` F1 (delivery review 2026-10-12): see the function doc.
+        if pause_connector && !cannot_be_approved {
+            return Decision {
+                action: Action::Load,
+                columns: None,
+                pause_connector: true,
+                changes: classify(ChangeStatus::Pending),
+            };
+        }
         return Decision {
             action: Action::Load,
             columns: None,
-            pause_connector,
+            pause_connector: false,
             changes: classify(ChangeStatus::Applied),
         };
     }
     if changes.iter().any(Change::is_breaking) {
-        // `SRC-8 review BLOCKER 3a`: a type change the existing column
-        // cannot hold is refused by Approve, so only the source putting the
-        // column back clears it, and that is seen only by a connector that
-        // keeps running. Pausing it would leave it stuck for good: the table
-        // waits, the rest of the connector runs.
-        let cannot_be_approved = changes.iter().any(|c| {
-            matches!(
-                c,
-                Change::TypeChanged {
-                    change: TypeChange::Other,
-                    ..
-                }
-            ) || key.is_some_and(|key| c.removes_a_column_of(key))
-        });
         return Decision {
             action: Action::Wait,
             columns: None,
@@ -942,18 +966,45 @@ mod tests {
     }
 
     /// Decision D4: where the source cannot hold back, the changes are
-    /// already in the table. Recorded applied, always `Load`; `pause` still
-    /// stops later runs.
+    /// already in the table, so the answer is always `Load`. `SRC-16` F1
+    /// (corrects the former "recorded applied and paused under `pause`"): the
+    /// three other policies record them applied and pause nothing; `pause`
+    /// records them `pending` and pauses, so that Approve has something to
+    /// take and the pause can lift.
     #[test]
-    fn a_source_that_cannot_hold_back_always_loads_and_records_applied() {
+    fn a_source_that_cannot_hold_back_always_loads_and_only_pause_holds_the_change() {
         for observed in [with_added(), with_removed(), with_widened()] {
             for policy in POLICIES {
                 let d = evaluate(policy, false, Some(&base()), &observed);
                 assert_eq!(d.action, Action::Load);
                 assert_eq!(d.columns, None);
-                assert!(d.changes.iter().all(|c| c.status == ChangeStatus::Applied));
-                assert_eq!(d.pause_connector, policy == SchemaChangePolicy::Pause);
+                let pause = policy == SchemaChangePolicy::Pause;
+                let want = if pause {
+                    ChangeStatus::Pending
+                } else {
+                    ChangeStatus::Applied
+                };
+                assert!(!d.changes.is_empty(), "{policy:?}");
+                assert!(d.changes.iter().all(|c| c.status == want), "{policy:?}");
+                assert_eq!(d.pause_connector, pause, "{policy:?}");
             }
+        }
+    }
+
+    /// `SRC-16` F1: after the load, a type change Approve refuses is recorded
+    /// applied under every policy and pauses nothing, so `pause` cannot
+    /// create the very stuck state `SRC-16` removes.
+    #[test]
+    fn after_the_load_a_type_change_that_cannot_be_approved_is_applied_and_pauses_nothing() {
+        let other = shape(&[("id", "timestamp"), ("note", "text")], &["id"]);
+        for policy in POLICIES {
+            let d = evaluate(policy, false, Some(&base()), &other);
+            assert_eq!(d.action, Action::Load, "{policy:?}");
+            assert!(!d.pause_connector, "{policy:?}");
+            assert!(
+                d.changes.iter().all(|c| c.status == ChangeStatus::Applied),
+                "{policy:?}"
+            );
         }
     }
 
@@ -1118,14 +1169,17 @@ mod tests {
             columns: vec![col("note", "text")],
             primary_key: vec!["id".to_owned()],
         };
-        let d = evaluate_for_key(
-            SchemaChangePolicy::ApplyAll,
-            false,
-            Some(&base()),
-            &removed,
-            Some(&key),
-        );
-        assert_eq!(d.action, Action::Load);
-        assert!(d.changes.iter().all(|c| c.status == ChangeStatus::Applied));
+        // Under every policy, `pause` included: `SRC-16` F1 records an
+        // after-load change as pending only when Approve could take it, and
+        // Approve refuses a removed key column (`KeyStillNamed`).
+        for policy in POLICIES {
+            let d = evaluate_for_key(policy, false, Some(&base()), &removed, Some(&key));
+            assert_eq!(d.action, Action::Load, "{policy:?}");
+            assert!(!d.pause_connector, "{policy:?}");
+            assert!(
+                d.changes.iter().all(|c| c.status == ChangeStatus::Applied),
+                "{policy:?}"
+            );
+        }
     }
 }
