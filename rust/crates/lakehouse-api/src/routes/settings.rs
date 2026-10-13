@@ -7,7 +7,7 @@
 //! ("this month", "last 7 days"), both need to know which zone's midnight
 //! counts. One zone for everybody keeps a chart and a filter from disagreeing
 //! (feature page `docs/core/features/time-grain.md`, "Limits to tell a
-//! customer"). Stored in Postgres (`reporting_settings`, migration `0066`);
+//! customer"). Stored in Postgres (`reporting_settings`, migration `0070`);
 //! with no row saved the defaults apply (`Asia/Jakarta`, Monday).
 //!
 //! # Who may do what

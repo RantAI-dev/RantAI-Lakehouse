@@ -129,17 +129,14 @@ async fn test_connection_route_reports_unsupported_dial_not_unsupported_type_for
 }
 
 /// `GET /api/connectors/{id}/debezium-properties` for a `mysql`-driver
-/// `sql`/`cdc` connector: the rendered template must name the real
-/// Debezium `MySQL` connector class, and still carry only `${ENV_VAR_NAME}`
-/// references for every credential-shaped field — never a resolved
-/// secret. This is the route-level counterpart to
-/// `lakehouse-store::cdc`'s pure
-/// `template_renders_the_mysql_connector_class_for_a_mysql_source` unit
-/// test: it proves the HTTP handler actually reaches that renderer with
-/// the right `connector_class` for a non-Postgres driver, not just that
-/// the renderer itself is correct in isolation.
+/// CDC connector (`SRC-9` decision 8): the route used to render the
+/// PostgreSQL-shaped template with the `MySQL` class name, which `Debezium`
+/// rejects. It now refuses with HTTP 409 and a fixed `supported: false`
+/// reason, like the Oracle refusal, and renders no properties at all. This
+/// replaces the old test that asserted the rendered `MySQL` class (that
+/// expectation followed the old behaviour, it is not loosened here).
 #[tokio::test]
-async fn debezium_properties_route_names_the_mysql_connector_class_and_leaks_no_secret() {
+async fn debezium_properties_route_refuses_a_mysql_cdc_connector() {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
@@ -170,26 +167,18 @@ async fn debezium_properties_route_names_the_mysql_connector_class_and_leaks_no_
         .await
         .expect("router never fails a request outright");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    let properties = body["properties"].as_str().expect("properties field");
-
+    assert_eq!(body["supported"], false, "{body}");
+    let reason = body["reason"].as_str().expect("reason field");
+    assert!(reason.contains("not built yet"), "{reason}");
+    assert!(reason.contains("database.server.id"), "{reason}");
     assert!(
-        properties
-            .contains("debezium.source.connector.class=io.debezium.connector.mysql.MySqlConnector"),
-        "must name the real Debezium MySQL connector class: {properties}"
+        body.get("properties").is_none(),
+        "a refused connector must get no template: {body}"
     );
-    assert!(
-        properties.contains("debezium.source.database.password=${CONNECTOR_MYSQL_CDC_PASSWORD}"),
-        "must reference this connector's own secretRef by name, never resolve it: {properties}"
-    );
-    // The property that must hold end to end: nothing resolved-looking
-    // ever appears. There is no real credential configured for this
-    // connector in this test's environment, so this also proves the
-    // handler never attempts (and never could accidentally succeed at)
-    // resolving one.
-    assert!(!properties.contains("hunter2"));
+    assert!(!reason.contains("hunter2"));
 }

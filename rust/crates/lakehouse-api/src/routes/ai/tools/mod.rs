@@ -5,6 +5,8 @@
 //!   `get_lineage`, `get_quality`, `describe_mart`.
 //! - [`ask`] — `ask_user`, the question with options the console shows as
 //!   buttons.
+//! - [`propose`] — `propose_sql`, a corrected statement checked for the
+//!   caller and shown to the person, never run.
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
@@ -37,6 +39,7 @@ mod lakehouse;
 mod metrics;
 mod ops;
 mod pipelines;
+mod propose;
 mod queries;
 
 use axum::response::{IntoResponse, Response};
@@ -112,10 +115,16 @@ pub(in crate::routes) async fn run_tool(
     if name == registry::ASK_USER && !state.config.ai_ask_back {
         return json!({ "error": "asking the user is switched off" });
     }
+    // Same shape as the refusal above: `propose_sql` is hidden from the list
+    // when `AI_SQL_HELP` is off, and this refuses a call the model makes anyway.
+    if name == registry::PROPOSE_SQL && !state.config.ai_sql_help {
+        return json!({ "error": "SQL help is switched off" });
+    }
     let ch = &state.clickhouse;
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
         "ask_user" => ask::ask_user(args),
+        "propose_sql" => propose::propose_sql(state, principal, args).await,
         "list_datasets" => data::list_datasets(ch, args).await,
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,
@@ -143,14 +152,10 @@ pub(in crate::routes) async fn run_tool(
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
-        "list_alert_rules" => alerts::list_alert_rules(ch).await,
-        "create_alert_rule" => {
-            alerts::create_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await
-        }
-        "update_alert_rule" => {
-            alerts::update_alert_rule(ch, &crate::webhook_guard::sender(&state.config), args).await
-        }
-        "delete_alert_rule" => alerts::delete_alert_rule(ch, args).await,
+        "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
+        "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
+        "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
+        "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
         "run_alert_rule" => alerts::run_alert_rule(state, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,

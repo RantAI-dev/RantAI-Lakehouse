@@ -131,3 +131,164 @@ describe("clickhouseQueryService.generateSql", () => {
     expect(err.message).toBe("chat_unavailable")
   })
 })
+
+describe("clickhouseQueryService.explainSql request", () => {
+  it("posts the explain sentence, the engine and the statement as one user message with propose_sql as the only tool", async () => {
+    const calls = stubFetch(() => json({ answer: "It counts rows.", toolTrace: [] }))
+    await expect(clickhouseQueryService.explainSql("SELECT count() FROM t", "clickhouse")).resolves.toBe(
+      "It counts rows.",
+    )
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe("/api/ai/chat")
+    expect(calls[0]!.init.method).toBe("POST")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      messages: [
+        {
+          role: "user",
+          content: "Explain what this query does.\n\nEngine: clickhouse\nSQL:\nSELECT count() FROM t",
+        },
+      ],
+      tools: ["propose_sql"],
+    })
+  })
+})
+
+describe("clickhouseQueryService.proposeFix request", () => {
+  it("posts the fix sentence, the engine, the statement and the error as one user message with propose_sql as the only tool", async () => {
+    const calls = stubFetch(() => json({ answer: "No fix.", toolTrace: [] }))
+    await clickhouseQueryService.proposeFix("SELECT nope FROM t", "clickhouse", "Unknown identifier: nope")
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe("/api/ai/chat")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      messages: [
+        {
+          role: "user",
+          content:
+            "Why does this query fail? Fix it.\n\nEngine: clickhouse\nSQL:\nSELECT nope FROM t\nError:\nUnknown identifier: nope",
+        },
+      ],
+      tools: ["propose_sql"],
+    })
+  })
+
+  it("returns the sql and reason of the proposal the chat accepted", async () => {
+    stubFetch(() =>
+      json({
+        answer: "The column is named amount.",
+        toolTrace: [
+          {
+            tool: "propose_sql",
+            ok: true,
+            args: { sql: "SELECT amount FROM t", reason: "The column is named amount." },
+            result: {
+              proposed: true,
+              sql: "SELECT amount FROM t",
+              reason: "The column is named amount.",
+              engine: "clickhouse",
+            },
+          },
+        ],
+      }),
+    )
+    await expect(
+      clickhouseQueryService.proposeFix("SELECT amont FROM t", "clickhouse", "unknown column"),
+    ).resolves.toEqual({ sql: "SELECT amount FROM t", reason: "The column is named amount." })
+  })
+
+  it("returns the last successful proposal when an earlier one failed the check", async () => {
+    stubFetch(() =>
+      json({
+        answer: "The column is named amount.",
+        toolTrace: [
+          {
+            tool: "propose_sql",
+            ok: false,
+            args: { sql: "SELECT amont2 FROM t", reason: "guess" },
+            result: { error: "Unknown identifier: amont2" },
+          },
+          {
+            tool: "propose_sql",
+            ok: true,
+            args: { sql: "SELECT amount FROM t", reason: "The column is named amount." },
+            result: {
+              proposed: true,
+              sql: "SELECT amount FROM t",
+              reason: "The column is named amount.",
+              engine: "clickhouse",
+            },
+          },
+        ],
+      }),
+    )
+    await expect(
+      clickhouseQueryService.proposeFix("SELECT amont FROM t", "clickhouse", "unknown column"),
+    ).resolves.toEqual({ sql: "SELECT amount FROM t", reason: "The column is named amount." })
+  })
+
+  it("skips a refused proposal that comes after an accepted one, so only a checked statement is returned", async () => {
+    stubFetch(() =>
+      json({
+        answer: "The column is named amount.",
+        toolTrace: [
+          {
+            tool: "propose_sql",
+            ok: true,
+            args: { sql: "SELECT amount FROM t", reason: "The column is named amount." },
+            result: {
+              proposed: true,
+              sql: "SELECT amount FROM t",
+              reason: "The column is named amount.",
+              engine: "clickhouse",
+            },
+          },
+          {
+            tool: "propose_sql",
+            ok: false,
+            args: { sql: "SELECT amont2 FROM t", reason: "guess" },
+            result: { error: "Unknown identifier: amont2" },
+          },
+        ],
+      }),
+    )
+    await expect(
+      clickhouseQueryService.proposeFix("SELECT amont FROM t", "clickhouse", "unknown column"),
+    ).resolves.toEqual({ sql: "SELECT amount FROM t", reason: "The column is named amount." })
+  })
+
+  it("returns the answer alone when the chat proposed no fix", async () => {
+    stubFetch(() =>
+      json({
+        answer: "I need the table's columns to fix this.",
+        toolTrace: [
+          {
+            tool: "propose_sql",
+            ok: false,
+            args: { sql: "SELECT x", reason: "guess" },
+            result: { error: "Unknown identifier: x" },
+          },
+        ],
+      }),
+    )
+    await expect(
+      clickhouseQueryService.proposeFix("SELECT x", "clickhouse", "Unknown identifier: x"),
+    ).resolves.toEqual({ answer: "I need the table's columns to fix this." })
+  })
+
+  it("refuses a statement of more than 20,000 characters before any call, counting code points", async () => {
+    const calls = stubFetch(() => json({ answer: "", toolTrace: [] }))
+    const long = "é".repeat(20_001)
+    const err = await rejection(clickhouseQueryService.proposeFix(long, "clickhouse", "err"))
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe("This query is too long for the assistant to fix.")
+    expect(calls).toHaveLength(0)
+  })
+
+  it("accepts a statement of exactly 20,000 characters", async () => {
+    const calls = stubFetch(() => json({ answer: "", toolTrace: [] }))
+    const exact = "a".repeat(20_000)
+    await clickhouseQueryService.proposeFix(exact, "clickhouse", "err")
+    expect(calls).toHaveLength(1)
+  })
+})

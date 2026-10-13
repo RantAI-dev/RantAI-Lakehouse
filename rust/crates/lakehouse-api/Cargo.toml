@@ -148,6 +148,9 @@ tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
+# `AppState::webhook_sender_override`: tests that deliver to a loopback
+# `wiremock` listener need a resolver that approves it (`SEC-10` merge).
+lakehouse-notify = { path = "../lakehouse-notify", features = ["test-support"] }
 # connector_probe.rs's own tests (`PanicIfCalledResolver`) implement
 # `lakehouse_core::secret::DynSecretResolver` directly -- that trait is
 # `#[async_trait::async_trait]` at its definition site

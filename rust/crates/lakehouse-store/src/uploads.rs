@@ -307,6 +307,25 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<Upload>, StoreError> 
     Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
 }
 
+/// The upload whose load is run `run_id`, or `None` (`SRC-7` F6): the
+/// orchestrator's failure report names a run, not an upload. NOT
+/// tenant-scoped, like [`get`]: the caller is the run-event route, which
+/// is admitted by service identity, not a tenant. A relaunch replaces the
+/// row's `run_id` ([`attach_run`]), so the newest claim is the one named.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn get_by_run_id(pool: &PgPool, run_id: &str) -> Result<Option<Upload>, StoreError> {
+    let sql = format!(
+        "SELECT {COLS} FROM file_upload WHERE run_id = $1 ORDER BY updated_at DESC LIMIT 1"
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// Whether upload `id` belongs to one of `tenant_ids`: the access rule every
 /// `/api/uploads/{id}` route applies. `false` for an unknown id, another
 /// tenant's upload, an upload whose tenant was deleted and an empty

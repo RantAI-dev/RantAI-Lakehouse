@@ -4714,5 +4714,38 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "propose_sql",
+      "description": "Propose the whole corrected statement once, with one sentence saying what was wrong. The server checks that it would run for this user, and the person sees it as a diff and accepts or rejects it. It is never run by you or by the server. Use it only for a query the person asked you to fix.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "the whole corrected statement, not a fragment (1 to 20000 characters)"
+          },
+          "reason": {
+            "type": "string",
+            "description": "one sentence saying what was wrong (1 to 300 characters)"
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "clickhouse",
+              "trino"
+            ],
+            "description": "the engine the statement is for"
+          }
+        },
+        "required": [
+          "sql",
+          "reason",
+          "engine"
+        ]
+      }
+    }
   }
 ]

@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { LayoutDashboard, Play, Save, Square, WandSparkles } from "lucide-react"
+import { BookOpen, LayoutDashboard, Play, Save, Square, WandSparkles } from "lucide-react"
 
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql } from "@/lib/sql-format"
@@ -42,8 +42,11 @@ export function SqlPanel({
     estimatable,
     runQuery,
     reEstimate,
+    explain,
   } = studio
   const running = runAct.status === "pending"
+  const explainBusy = explain.busy
+  const explainRun = explain.run
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -110,6 +113,15 @@ export function SqlPanel({
           disabled={estimateAct.status === "pending" || !estimatable}
         >
           Estimate
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void explainRun()}
+          disabled={explainBusy || !estimatable}
+        >
+          <BookOpen className="size-4" aria-hidden />
+          {explainBusy ? "Explaining…" : "Explain"}
         </Button>
         <span className="ml-auto text-xs text-muted-foreground">
           ⌘/Ctrl+Enter to run

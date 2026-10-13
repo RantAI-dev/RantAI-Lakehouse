@@ -1,0 +1,139 @@
+{
+  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest supported:false today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'.",
+  "types": {
+    "PostgreSQL": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "PostgreSQL CDC": {
+      "gate": "g4",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 6: ops/g4/g4_test.py records all four steps through gate_summary.",
+        "connect": "ops/g4 registers the demo source as a 'PostgreSQL CDC' connector (adapter cdc) and POST .../test must answer supported:true, ok:true, like its SQL twin.",
+        "discover": "ops/g4: POST .../discover?schema=p5_cdc must list p5_cdc.orders with its columns.",
+        "load": "ops/g4: the initial snapshot reaches Bronze and holds the seeded rows (first copy).",
+        "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
+      }
+    },
+    "MySQL": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "MariaDB": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 3: mariadb:11.4 in the g6 override. MariaDB uses the MySQL driver (wire driver 'mysql'), so connect and discover go through the same code paths as MySQL."
+      }
+    },
+    "SQL Server": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      }
+    },
+    "Object storage": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "REST API": {
+      "gate": "g6",
+      "steps": {
+        "connect": "real",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "Oracle": {
+      "gate": "g6-oracle",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. Plaintext dial: the adapter refuses TLS without an operator-typed sslServerCertDn, so TLS to Oracle is not exercised.",
+        "connect": "SRC-5: an Oracle connector cannot be tested from the console (the API has no Oracle client).",
+        "discover": "SRC-13: Oracle tables are listed by the orchestrator, not the console. The product answers supported:false (SRC-9 finding G2; it was HTTP 422)."
+      }
+    },
+    "MongoDB": {
+      "gate": "g6",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "connect": "SRC-5: a MongoDB connector cannot be tested from the console.",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    },
+    "Kafka": {
+      "gate": "g6",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "connect": "SRC-5: a Kafka connector cannot be tested from the console.",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server.",
+        "reload": "A micro-batch: the gate produces a known number of new messages before the second run and expects the table to grow by exactly the messages the consumer group had not yet committed."
+      }
+    },
+    "SFTP": {
+      "gate": "g6",
+      "steps": {
+        "connect": "refused",
+        "discover": "refused",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-9 plan task 4: atmoz/sftp in the g6 override, with a host key minted by the fixture so the pinned fingerprint is its own.",
+        "connect": "SRC-5: an SFTP connector cannot be tested from the console.",
+        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+      }
+    }
+  }
+}
