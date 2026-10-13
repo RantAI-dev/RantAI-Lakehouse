@@ -103,6 +103,13 @@ const MAX_ITER: u32 = 8;
 /// next round, so it asks the model to answer with the reading it used.
 const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
 
+/// What a call gets back when the console's allowlist did not offer the tool
+/// (plan 17). The model reads it on its next round, so it is told to answer
+/// without the tool.
+fn not_offered_refusal(name: &str) -> String {
+    format!("{name} is not available in this chat. Answer without it.")
+}
+
 /// A single incoming `{role, content}` chat turn (only `user`/`assistant`
 /// are kept, matching the `TypeScript`'s `.filter`).
 #[derive(Debug, Deserialize)]
@@ -192,6 +199,10 @@ struct PreparedChat {
     messages: Vec<LlmMessage>,
     tools: Vec<Value>,
     is_build: bool,
+    /// `true` when the request carried a non-empty `tools` list. Then a call
+    /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
+    /// with no allowlist dispatches as before.
+    allowlisted: bool,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -490,6 +501,7 @@ async fn prepare_chat(
         messages,
         tools,
         is_build,
+        allowlisted: allow.is_some(),
     })
 }
 
@@ -632,6 +644,7 @@ async fn run_chat(
         mut messages,
         tools,
         is_build,
+        allowlisted,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
@@ -775,6 +788,14 @@ async fn run_chat(
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            // plan 17: with an allowlist, the tools the console named are the
+            // only ones a call may reach. The check is against the offered
+            // list, not the request's strings, so a tool the switch or the
+            // permission removed stays refused here too.
+            let not_offered = allowlisted
+                && !tools
+                    .iter()
+                    .any(|t| t["function"]["name"].as_str() == Some(call.function.name.as_str()));
             let (result, outcome, run_id, approval_id) = if late_ask {
                 (json!({ "error": LATE_ASK_REFUSAL }), "failed", None, None)
             } else if let Some(refusal) = gate_result {
@@ -818,6 +839,9 @@ async fn run_chat(
                     let outcome = gate::outcome_of(&refusal);
                     (refusal, outcome, None, None)
                 }
+            } else if not_offered {
+                let error = not_offered_refusal(&call.function.name);
+                (json!({ "error": error }), "failed", None, None)
             } else {
                 let clean_args = gate::strip_confirmed(&args);
                 let result =
