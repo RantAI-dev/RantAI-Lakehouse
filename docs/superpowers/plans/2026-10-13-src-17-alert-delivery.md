@@ -110,7 +110,146 @@ and the gate are *not verified* until CI on the pull request.
 
 ## Handoff
 
-*(developer)*
+**Developer (Claude Sonnet 5.5), 2026-10-13, branch `fix/src-17-alert-delivery`, base `432a3c9`.**
+Tasks 1 to 4 built; **task 5 (the gate) STOPPED on both stop conditions of
+D-d**, nothing of it was written. Task 6 is the planner's.
+
+### Commits
+
+1. `4167acd` task 1, D-a store and crate (migration `0068`).
+2. `4703e85` task 2, D-a API and console.
+3. `15c7519` task 3, D-b (migration `0069`).
+4. `3e5b550` task 4, D-c true texts.
+
+### D-a: where the outcome lives
+
+- `lakehouse-notify`: `DeliveryFailure`, eight fixed sentences (webhook
+  address refused / server could not be reached / server answered with an
+  error; e-mail not set up / address refused; mail server could not be reached
+  / refused the message; channel not supported). `DeliverResult.error` is now
+  always one of them, so the status code, the driver's text and the SMTP
+  reply are dropped. This also stops `/api/alerts/run` returning driver text
+  in `delivered.error`.
+- `lakehouse-alerts`: `evaluate_connector_event` returns `RuleDelivery`
+  (`rule`, `result`) instead of the bare rules.
+- Postgres `alert_instance`: migration `0068` adds `delivery_reason` and CHECKs
+  the existing, never-written `delivery_status` (`delivered` | `not_delivered`;
+  NULL = not known, never filled in for older rows).
+  `overview::insert_from_fired_rule_with_delivery`; `AlertItem` carries
+  `delivered?` and `deliveryReason?`; both persist paths (load alerts and
+  `/api/alerts/run`) pass the outcome. Console: a Delivery column and a
+  Delivery row in the drawer (`features/overview/alert-delivery.tsx`).
+- Known limit: `insert_from_fired_rule` still dedupes 15 minutes per rule, so
+  a failed delivery inside the window of an earlier instance of the same rule
+  is not shown on its own row (unchanged primitive; the delivery itself is
+  attempted).
+
+### D-b: mechanism
+
+Two rows, two steps. `connectors::record_run_once` writes the `(run_id, kind)`
+row and the connector's health facts in one transaction and keeps the streak
+the run produced (`pipeline_run_event.failure_streak`, migration `0069`).
+Then the rules are read; only then is `(run_id, "<kind>_alerted")` written,
+and delivery runs from the rules already in memory
+(`lakehouse_alerts::load_rules` + `deliver_connector_event_to`), so the rule
+store cannot fail after the run is counted.
+
+- Rules unreadable: 503, run counted once, no `_alerted` row; the retry counts
+  nothing again, delivers, and decides "3 in a row" from the run's own stored
+  streak (never from the connector's current one), so it fires once.
+- Everything went through: both rows exist; a retry delivers and counts
+  nothing.
+- Uploads (no health facts): the rules are read before the single dedupe row.
+- Delivery is at most once: `_alerted` is written before the deliveries. A
+  crash between that row and the sends loses the alert (the limit D-b already
+  accepts; no durable queue, section 5).
+
+### Stop conditions hit (task 5 not built)
+
+1. `SEC-10` has no opt-in, it has no implementation: `BACKLOG.md` has it
+   `Todo`; `lakehouse-notify::send_webhook` checks only the `http(s)` prefix
+   and `deliver_event` uses a plain `reqwest::Client::new()`. There is no
+   setting to name in a comment. Today a gate webhook to a container would
+   work only because the check does not exist yet, and would break when
+   `SEC-10` lands.
+2. E-mail cannot be pointed at a plain SMTP sink without changing product
+   behaviour: `EmailSender::send` uses `starttls_relay` (`SMTP_SECURE=false`)
+   or `relay` (`true`); both need TLS with a certificate verified against the
+   host name, and there is no plain mode and no way to trust a gate-made CA
+   without changing the image or the sender.
+
+Needed from the planner before task 5: `SEC-10` with its documented opt-in
+landing first (or the gate waits for it), and a decision on e-mail (a plain
+mode for tests is a product change; a TLS sink with a CA mounted into the
+API image is a compose/image change).
+
+### Commands run (all from `/home/hv/lakehouse-sec27`)
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo check -p lakehouse-notify -p lakehouse-alerts -p lakehouse-store`,
+  `cargo check -p lakehouse-api`, `cargo check -p lakehouse-store -p
+  lakehouse-api --tests` (shared `CARGO_TARGET_DIR`, jobs 2, no incremental):
+  finished.
+- `find crates -name '*.rs' | xargs touch`, then `cargo clippy --workspace
+  --all-targets --all-features --locked -- -D warnings`, detached: `EXIT=0`
+  (test code included, so every Rust test compiles).
+- `bun install --frozen-lockfile`; `bun run typecheck`: clean; `bun run lint`:
+  0 errors, 6 warnings (all in files this work did not touch, except the
+  existing `rules` warning in `alerts-page.tsx`); `bun run test`: 1110 pass, 1
+  skip, 0 fail (1111 tests, 114 files).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`,
+  `check_connector_gate_coverage.py`: OK. `bash scripts/ci/tests/test_required_gate.sh`:
+  30 passed, 0 failed. `ci.yml` parses.
+- No Python or `dagster/` file changed, so no pytest and no `py_compile`.
+
+### Not verified
+
+- Every Rust test (`cargo test` is forbidden here). They compile (clippy
+  `--all-targets`), none ran. CI is the proof.
+- The mail-server-refused classification (`is_permanent() || is_transient()`
+  to `MailServerRefused`) has no test: it needs an SMTP server.
+- Migrations `0068` and `0069` ran against no database.
+- The console was not opened in a browser.
+
+### Existing tests changed
+
+- `lakehouse-notify` tests that pinned upstream-shaped text:
+  `webhook_rejects_non_http_url`, `webhook_reports_non_2xx_status`,
+  `email_reports_unconfigured_smtp`, `email_rejects_invalid_address`,
+  `deliver_dispatches_email_channel_and_still_validates_smtp`,
+  `deliver_rejects_unknown_channel` now pin the fixed sentences.
+- `lakehouse-alerts`: `evaluate_connector_event_matches_its_connector_star_and_kind_only`
+  and `..._delivers_connector_disabled_and_schema_change_rules` read
+  `.rule.id` (new return type); the doc of the second is corrected.
+- `load_alerts.rs`: `a_success_run_of_a_connector_with_a_waiting_schema_change_is_a_success_and_never_a_failure`
+  expected exactly one `success` row; it now expects `success` and
+  `success_alerted` (still no failure row). The harness field `_clickhouse`
+  is renamed `clickhouse` because tests now use it.
+- `alerts-page.test.tsx`: the schema change sentence (task 4, reason in the
+  commit).
+- Greped and unchanged: `a_sensor_retry_neither_delivers_nor_counts_a_second_time`
+  (still counts 1 `failure` row), the third-failure test, the
+  `/api/alerts/run` tests (`delivered` stays absent when silenced).
+
+### Tests added
+
+notify: unreachable webhook, unreachable mail server, every sentence pinned.
+alerts: `evaluate_connector_event_reports_each_deliverys_outcome_with_a_fixed_reason`.
+store: `an_instance_records_whether_its_delivery_arrived`,
+`record_run_once_counts_a_run_once_and_hands_a_retry_the_runs_own_streak`,
+`record_run_once_leaves_no_dedupe_row_for_an_unknown_connector`.
+api (`load_alerts.rs`): a webhook answering an error leaves a "not delivered"
+instance; both D-b properties; "3 in a row" after a failed first report; the
+upload path. Console: `alert-delivery.test.tsx`.
+
+### Most likely to fail in CI
+
+The `load_alerts.rs` route tests that make the mocked rule store answer 500
+once (`up_to_n_times(1)` with `with_priority(1)`): they rely on wiremock
+falling through to the harness mock afterwards, and on the Dagster/ClickHouse
+mock servers staying alive (they do: held in `Harness`). Next, the migration
+`0068` CHECK against any code path that writes `delivery_status`.
+
 
 ## Review
 
