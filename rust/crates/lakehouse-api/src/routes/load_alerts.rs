@@ -672,6 +672,60 @@ mod tests {
         assert_eq!(instances, 1);
     }
 
+    /// `SRC-17` F1 (D-a): a webhook that answers 500 leaves an alert that is
+    /// listed (the failure happened) but reads "not delivered", with the
+    /// API's fixed reason and nothing of what the server said. A webhook that
+    /// answers 200 reads delivered. The response's `matched` still counts the
+    /// attempt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_webhook_that_answers_an_error_leaves_an_alert_that_says_it_was_not_delivered(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-bad", "connector_failure", CONNECTOR),
+                ("al-good", "connector_failure", CONNECTOR),
+            ],
+        )
+        .await;
+        // Higher priority than the harness's catch-all 200.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/al-bad"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream-secret-detail"))
+            .with_priority(1)
+            .mount(&h.webhook)
+            .await;
+        h.knows_run("run-1", Some(CONNECTOR), "FAILURE").await;
+
+        let resp = h.failed("run-1").await;
+        assert_eq!(resp["matched"], 2);
+
+        let listed = lakehouse_store::overview::list_alerts(&pool).await.unwrap();
+        let bad = listed
+            .iter()
+            .find(|a| a.rule_id.as_deref() == Some("al-bad"))
+            .expect("a failed delivery is still listed");
+        let good = listed
+            .iter()
+            .find(|a| a.rule_id.as_deref() == Some("al-good"))
+            .expect("the delivered alert is listed");
+        assert_eq!(bad.delivered, Some(false));
+        assert_eq!(
+            bad.delivery_reason.as_deref(),
+            Some("the webhook server answered with an error")
+        );
+        assert_eq!(good.delivered, Some(true));
+        assert_eq!(good.delivery_reason, None);
+        // The list route serializes the item as is: camelCase names, and no
+        // trace of the server's status or body.
+        let json = serde_json::to_value(bad).unwrap();
+        assert_eq!(json["delivered"], false);
+        assert!(!json.to_string().contains("upstream-secret-detail"));
+        // Not the whole JSON: the instance id is a UUID and may hold "500".
+        assert!(!json["deliveryReason"].as_str().unwrap().contains("500"));
+    }
+
     /// A sensor retry neither delivers twice nor counts the failure twice.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_sensor_retry_neither_delivers_nor_counts_a_second_time(pool: sqlx::PgPool) {
