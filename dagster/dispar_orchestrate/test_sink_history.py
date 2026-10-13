@@ -20,6 +20,10 @@ from dispar_orchestrate.adapters.history import HISTORY_COLUMNS, HistoryRefused
 from dispar_orchestrate.adapters.sink import LoadPlan, SinkResult, clear_table, load_via_sink
 from dispar_orchestrate.test_load_modes_measurement import Lab, lab  # noqa: F401 -- `lab` is a fixture
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 
 def _plan(*key: str, refresh: str | None = None) -> LoadPlan:
     return LoadPlan(mode="history", key=key or ("id",), refresh=refresh)

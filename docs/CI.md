@@ -38,7 +38,8 @@ On a `push` to `main`, all jobs run unconditionally.
 Downstream jobs execute according to scope:
 - **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
-- **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
+- **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
+- **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
 - **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 

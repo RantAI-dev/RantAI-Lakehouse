@@ -86,6 +86,10 @@ from pyiceberg.table import StaticTable, Table, Transaction
 from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, load_via_sink
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 HISTORY_COLUMNS = ("_valid_from", "_valid_to", "_is_current", "_row_hash")
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 

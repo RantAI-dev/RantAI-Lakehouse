@@ -23,6 +23,7 @@
 #   RUST_TEST_RESULT      result of `test` job (stable)
 #   RUST_MSRV_RESULT      result of `msrv` job (1.88.0)
 #   DAGSTER_TESTS_RESULT  result of `dagster-unit-tests` job
+#   DAGSTER_LOADER_TESTS_RESULT result of `dagster-loader-tests` job
 #   G1_RUSTFS_RESULT      result of `g1-rustfs` job
 #   G2_SEAWEEDFS_RESULT   result of `g2-seaweedfs` job
 #   G3A_DAGSTER_RESULT    result of `g3a-dagster` job
@@ -127,6 +128,7 @@ run_gate() {
 
   # Dagster
   check_job "dagster-unit-tests" "${DAGSTER_TESTS_RESULT:-skipped}" "$req_dagster"
+  check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
 
   # Acceptance
   check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_acceptance"

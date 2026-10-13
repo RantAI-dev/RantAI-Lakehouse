@@ -97,6 +97,10 @@ from dispar_orchestrate.test_load_modes_measurement import (
     lab,  # noqa: F401 -- a fixture
 )
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 # All four NULLABLE: the table keeps its columns through `clear_table`, so a table
 # that carries them as REQUIRED could never again be loaded in another mode, even
 # after "Refresh, removing rows" (`test_required_history_columns_...`); and a

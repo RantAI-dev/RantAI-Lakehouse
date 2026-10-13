@@ -29,6 +29,10 @@ from dispar_orchestrate.adapters.dedup import MissingKeyValue, TooManyKeys
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.test_load_modes_measurement import Lab, lab  # noqa: F401 -- `lab` is a fixture
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 # ---------------------------------------------------------------------------
 # LoadPlan
 # ---------------------------------------------------------------------------

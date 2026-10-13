@@ -33,6 +33,10 @@ from dispar_orchestrate.adapters import dedup
 from dispar_orchestrate.adapters.sink import LoadPlan, clear_table, load_via_sink
 from dispar_orchestrate.test_load_modes_measurement import Lab, lab  # noqa: F401 -- `lab` is a fixture
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 
 @pytest.fixture
 def items_db(tmp_path: Path) -> sqlite3.Connection:

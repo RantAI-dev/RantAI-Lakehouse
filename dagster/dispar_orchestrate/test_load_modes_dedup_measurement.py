@@ -46,6 +46,10 @@ from dispar_orchestrate.test_load_modes_measurement import (  # noqa: F401 -- `l
     lab,
 )
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 
 class _Failure:
     """A failure injected into `owner.name` from its `from_call`-th call on, until

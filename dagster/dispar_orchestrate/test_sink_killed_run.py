@@ -27,6 +27,10 @@ from dispar_orchestrate.adapters.sink import LoadPlan, load_via_sink
 from dispar_orchestrate.test_load_modes_dedup_measurement import Killed, kill_before
 from dispar_orchestrate.test_load_modes_measurement import Lab, _items_source, items_db, lab  # noqa: F401 -- fixtures
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 KILLED_BEFORE = ["normalize", "load"]
 
 
