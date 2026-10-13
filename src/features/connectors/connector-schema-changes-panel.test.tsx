@@ -8,6 +8,9 @@ import {
   APPLY_ALL_NOTE,
   CANNOT_BE_LOADED_NOTE,
   ConnectorSchemaChangesPanel,
+  PAUSED_APPROVE_NOTE,
+  PAUSED_NOTHING_TO_APPROVE_NOTE,
+  SCHEMA_CHANGE_PAUSE_REASON,
   changeLabel,
   waitingTables,
 } from "./connector-schema-changes-panel"
@@ -180,6 +183,42 @@ describe("ConnectorSchemaChangesPanel", () => {
 
     expect((await screen.findByRole("alert")).textContent).toBe(CANNOT_BE_LOADED_NOTE)
     expect(onChanged).not.toHaveBeenCalled()
+  })
+
+  // `SRC-16` D-e: a pause is never shown beside "Nothing is waiting".
+  it("tells a paused connector with something to approve to approve it", async () => {
+    stubFetch([{ pending: [change({})], recent: [], inactiveColumns: [] }])
+    renderPanel({ policy: "pause", pausedReason: SCHEMA_CHANGE_PAUSE_REASON })
+    expect(await screen.findByText(PAUSED_APPROVE_NOTE)).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Approve and resume" })).toBeTruthy()
+    expect(screen.queryByText("Nothing is waiting for a decision.")).toBeNull()
+  })
+
+  it("points a paused connector with nothing waiting to the policy instead of saying nothing waits", async () => {
+    stubFetch([EMPTY])
+    renderPanel({ policy: "pause", pausedReason: SCHEMA_CHANGE_PAUSE_REASON })
+    expect(await screen.findByText(PAUSED_NOTHING_TO_APPROVE_NOTE)).toBeTruthy()
+    expect(screen.queryByText("Nothing is waiting for a decision.")).toBeNull()
+  })
+
+  it("points a paused connector whose waiting change cannot be approved to the policy", async () => {
+    const list: SchemaChangeList = {
+      pending: [change({ kind: "type_changed", columnName: "qty", beforeValue: "integer", afterValue: "text", canApprove: false })],
+      recent: [],
+      inactiveColumns: [],
+    }
+    stubFetch([list])
+    renderPanel({ policy: "pause", pausedReason: SCHEMA_CHANGE_PAUSE_REASON })
+    expect(await screen.findByText(PAUSED_NOTHING_TO_APPROVE_NOTE)).toBeTruthy()
+    expect(screen.getByText(CANNOT_BE_LOADED_NOTE)).toBeTruthy()
+    expect(screen.queryByText(PAUSED_APPROVE_NOTE)).toBeNull()
+  })
+
+  it("leaves the tab as it was for a connector that is not paused or is paused for another reason", async () => {
+    stubFetch([EMPTY])
+    renderPanel({ pausedReason: "Disabled after five failed runs" })
+    expect(await screen.findByText("Nothing is waiting for a decision.")).toBeTruthy()
+    expect(screen.queryByText(PAUSED_NOTHING_TO_APPROVE_NOTE)).toBeNull()
   })
 
   it("lists recent changes in plain words with their before and after", async () => {

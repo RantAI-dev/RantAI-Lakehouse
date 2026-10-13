@@ -47,6 +47,20 @@ export const APPLY_ALL_NOTE = "For this source type this works like 'Apply non-b
 export const CANNOT_BE_LOADED_NOTE =
   "This type change cannot be loaded into the existing column. Change the column back at the source, or remove the table from the connector and add it again under a new target."
 
+/**
+ * The `pausedReason` the API writes for the `pause` policy
+ * (`SCHEMA_CHANGE_PAUSE_REASON` in `lakehouse-store`). A pause with any other
+ * reason is not this tab's to explain.
+ */
+export const SCHEMA_CHANGE_PAUSE_REASON = "Paused by the schema-change policy until a change is approved"
+
+/** `SRC-16` D-e: the paused connector has a change waiting that can be approved. */
+export const PAUSED_APPROVE_NOTE = "This connector is paused. Approve the change below to resume it."
+
+/** `SRC-16` D-e: paused, and nothing waiting can be approved (or nothing waits). The way out is the policy. */
+export const PAUSED_NOTHING_TO_APPROVE_NOTE =
+  "This connector is paused, but there is nothing here to approve. To resume it, choose a policy other than Pause under 'When the source changes' and save."
+
 const KIND_LABEL: Record<string, string> = {
   column_added: "Column added",
   column_removed: "Column removed",
@@ -266,18 +280,23 @@ function PolicyCard({
  * could not add, and the recent changes. `onWaiting` tells the page which
  * tables wait, so the ingest panel can mark them without a request per
  * table; `onChanged` tells it to reload the connector (the pause may have
- * lifted, the policy changed).
+ * lifted, the policy changed). `SRC-16` D-e: while the connector is paused
+ * for a schema change the tab says what to do, following what is pending, and
+ * never "Nothing is waiting" beside a pause.
  */
 export function ConnectorSchemaChangesPanel({
   connectorId,
   connectorType,
   policy,
+  pausedReason = null,
   onChanged,
   onWaiting,
 }: {
   connectorId: string
   connectorType: string
   policy: SchemaChangePolicy
+  /** The connector's `pausedReason`; only the schema-change one changes what this tab says. */
+  pausedReason?: string | null
   onChanged: () => void
   onWaiting?: (tables: Set<string>, groups: number) => void
 }) {
@@ -293,6 +312,10 @@ export function ConnectorSchemaChangesPanel({
     list.reload()
     onChanged()
   }
+  const schemaPaused = pausedReason === SCHEMA_CHANGE_PAUSE_REASON
+  // Approvable means the API's own `canApprove` on a change that waits; the
+  // console does not re-derive the rule (`SRC-16` D-b shares it server-side).
+  const approvable = (data?.pending ?? []).some((c) => !isNotice(c) && c.canApprove)
   const inactiveSince = (c: SchemaChange) =>
     data?.inactiveColumns.find((i) => i.objectName === c.objectName && i.columnName === c.columnName)
       ?.inactiveSince ?? null
@@ -305,14 +328,23 @@ export function ConnectorSchemaChangesPanel({
             <LoadingSkeleton rows={2} />
           ) : list.status === "error" ? (
             <ErrorState error={list.error} onRetry={list.reload} />
-          ) : list.data.pending.length === 0 ? (
-            <p className="text-sm text-muted-foreground">Nothing is waiting for a decision.</p>
           ) : (
-            <ul className="divide-y divide-border rounded-md border border-border">
-              {groupByTable(list.data.pending).map((group) => (
-                <PendingGroup key={group.objectName} connectorId={connectorId} group={group} onDone={done} />
-              ))}
-            </ul>
+            <>
+              {schemaPaused ? (
+                <p role="status" className="mb-2 text-sm">
+                  {approvable ? PAUSED_APPROVE_NOTE : PAUSED_NOTHING_TO_APPROVE_NOTE}
+                </p>
+              ) : null}
+              {list.data.pending.length === 0 ? (
+                schemaPaused ? null : <p className="text-sm text-muted-foreground">Nothing is waiting for a decision.</p>
+              ) : (
+                <ul className="divide-y divide-border rounded-md border border-border">
+                  {groupByTable(list.data.pending).map((group) => (
+                    <PendingGroup key={group.objectName} connectorId={connectorId} group={group} onDone={done} />
+                  ))}
+                </ul>
+              )}
+            </>
           )}
         </SectionCard>
         <SectionCard size="sm" title="Recent changes">

@@ -1104,6 +1104,16 @@ async fn accept_waiting_shape(
 /// ([`clear_removed_tables_in`]) both end here. Pending `table_added` rows
 /// are notices, not waiting tables (`SRC-8 review SHOULD-FIX 3`).
 ///
+/// `SRC-16` F2 (delivery review 2026-10-12): only a change Approve would take
+/// holds the pause. A pending change Approve refuses (a type the column
+/// cannot hold, and every other waiting change of that table) can never be
+/// cleared by approving anything, so counting it kept the connector paused
+/// for good after everything approvable was approved. The rule is
+/// [`mark_approvable`]'s, the one `canApprove` is computed with, so what the
+/// console offers to approve and what keeps the pause cannot drift apart.
+/// Such a table keeps waiting on its own (the source putting the column back
+/// withdraws it; removing the table clears it, `SRC-8 review BLOCKER 3b`).
+///
 /// # Errors
 ///
 /// [`StoreError::Database`] if a statement fails.
@@ -1111,14 +1121,19 @@ async fn lift_pause_if_nothing_waits(
     tx: &mut sqlx::PgConnection,
     connector_id: &str,
 ) -> Result<bool, StoreError> {
-    let (others,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM connector_schema_change \
-         WHERE connector_id = $1 AND status = 'pending' AND kind <> 'table_added')",
-    )
-    .bind(connector_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if others {
+    let sql = format!(
+        "SELECT {CHANGE_COLUMNS} FROM connector_schema_change \
+         WHERE connector_id = $1 AND status = 'pending'"
+    );
+    let mut pending: Vec<SchemaChange> = sqlx::query_as(&sql)
+        .bind(connector_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    mark_approvable(&mut pending);
+    let holds = pending
+        .iter()
+        .any(|c| c.can_approve && c.kind != ChangeKind::TableAdded.as_str());
+    if holds {
         return Ok(false);
     }
     Ok(sqlx::query(
@@ -1181,6 +1196,12 @@ pub(crate) async fn clear_removed_tables_in(
 /// become `approved`, the baseline becomes the last OBSERVED shape, removed
 /// columns become inactive, and the connector's schema-change pause is
 /// lifted when nothing else waits.
+///
+/// `SRC-16` F1: this is also how a change seen AFTER the load (files, REST,
+/// `MongoDB`, Kafka, SFTP) under `pause` is cleared. It needs nothing
+/// different: the observation stored the shape it saw (the batch's columns
+/// plus the carried-over ones) as the waiting shape, which is what the
+/// baseline becomes.
 ///
 /// Pending `table_added` rows (`SRC-8 review SHOULD-FIX 3`) are notices that
 /// a table could NOT be added, not a table that waits: they do not count as

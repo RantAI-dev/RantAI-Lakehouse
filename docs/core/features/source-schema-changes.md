@@ -73,6 +73,12 @@ Rows 5 to 9 are beyond the spec.
   (integer to text, text to number) cannot be loaded: the table waits until
   the column is changed back or the table is re-added under a new target
   (decisions 9 and 10).
+- Under "Pause", a files, REST, MongoDB, Kafka or SFTP connector stops after
+  the run that loaded the change: the change is already in the table, and
+  approving it accepts it and resumes the connector (`SRC-16`). A type change
+  that cannot be approved does not pause such a connector.
+- Choosing another policy than "Pause" resumes a connector paused by a schema
+  change; tables with a change that waits keep waiting (`SRC-16`).
 - A column added at the source is filled from the run that first sees it;
   older rows are empty in it (spec: backfill is later).
 
