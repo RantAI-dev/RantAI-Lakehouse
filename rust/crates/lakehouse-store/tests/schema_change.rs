@@ -1092,6 +1092,104 @@ async fn removing_one_table_leaves_another_tables_pending_change_and_the_pause(p
     assert_eq!(after.paused_reason.as_deref(), Some("other"));
 }
 
+// --- SRC-16 F2: only a change Approve would take holds the pause -------------
+
+/// Observe `customers` as a baseline `[id, qty integer]`, then a waiting
+/// `qty integer -> text` change (the type the column cannot hold). It sets no
+/// pause itself (`SRC-8 review BLOCKER 3a`).
+async fn customers_waiting_on_an_unloadable_type(pool: &PgPool, id: &str) {
+    for (observed, changes, accept) in [
+        (
+            vec![col("id", "integer"), col("qty", "integer")],
+            vec![],
+            true,
+        ),
+        (
+            vec![col("id", "integer"), col("qty", "text")],
+            vec![type_change("qty", "integer", "text")],
+            false,
+        ),
+    ] {
+        let mut tx = ObservationTx::begin(pool, id, "customers").await.unwrap();
+        tx.record(&ObservationWrite {
+            observed_columns: &observed,
+            observed_primary_key: &["id".to_owned()],
+            changes: &changes,
+            accept_observed: accept,
+            pause_connector: false,
+            run_id: None,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+/// `SRC-16` F2: `orders` waits on a removal and paused the connector;
+/// `customers` waits on a type Approve refuses. Approving `orders` lifts the
+/// pause, `customers` keeps waiting, and removing `customers` from the
+/// selection clears it (`SRC-8 review BLOCKER 3b` still holds).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unapprovable_change_on_another_table_does_not_keep_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    observe_object(&pool, &id, "orders", false, false).await;
+    observe_object(&pool, &id, "orders", true, true).await;
+    customers_waiting_on_an_unloadable_type(&pool, &id).await;
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 2);
+
+    let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    assert!(approval.pause_lifted, "customers cannot be approved");
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_at, None);
+    let pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(pending.len(), 1, "customers keeps waiting on its own");
+    assert_eq!(pending[0].object_name, "customers");
+    assert!(!pending[0].can_approve);
+
+    // Removing the table still clears what waits for it, and a schema-change
+    // pause written meanwhile goes with it.
+    sqlx::query("UPDATE connector SET paused_reason = $2, paused_at = now() WHERE id = $1")
+        .bind(&id)
+        .bind(SCHEMA_CHANGE_PAUSE_REASON)
+        .execute(&pool)
+        .await
+        .unwrap();
+    select_tables(&pool, &id, &["orders"]).await;
+    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(after.paused_at, None);
+}
+
+/// `SRC-16` F2, the other side: an approvable change on another table still
+/// holds the pause.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_approvable_change_on_another_table_still_keeps_the_pause(pool: PgPool) {
+    let id = connector_selecting_orders_and_customers(&pool).await;
+    for object in ["orders", "customers"] {
+        observe_object(&pool, &id, object, false, false).await;
+        observe_object(&pool, &id, object, true, true).await;
+    }
+
+    let approval = approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .into_approval()
+        .unwrap();
+
+    assert!(!approval.pause_lifted);
+    let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        after.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+}
+
 // --- SRC-8 task 11: inactive columns of one Bronze table ------------------------
 
 /// Approving a removal stores the loaded name read from the old baseline, and
