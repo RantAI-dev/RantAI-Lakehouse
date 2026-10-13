@@ -389,4 +389,32 @@ Most likely to fail in CI
 
 ## Review
 
-*(planner)*
+### Review 1, 2026-10-13 (planner), commits `4167acd`..`2e59283`
+
+Read: the migrations, `record_run_once`, the run-report route's new order,
+the gate commit's file list and its CI job. Re-run by the reviewer:
+`cargo fmt --check` clean; workspace clippy clean (2m38s, every source
+touched first); `bun run typecheck` clean; `bun run test` 1110 pass, 1 skip,
+0 fail; `test_required_gate.sh` 31 passed; `check_connector_gate_coverage`
+OK; `py_compile` of the gate.
+
+CI on pull request #124 at `2e59283`: 27 checks pass, among them
+"Rust · test (stable)" (every new Rust test and both migrations) and the new
+"Rust · SRC-17 alert delivery" (15m36s; the step itself 52 s), on the first
+run. Red and not caused by this branch: the two `gitleaks` jobs, red on
+`main` too (`SEC-27`).
+
+No `BLOCKER`. No `SHOULD-FIX`.
+
+Recorded:
+
+- The developer stopped task 5 on both stop conditions, as the plan asked.
+  D-d was then changed by the planner: webhook measured, e-mail not.
+  E-mail against the spec's "an email and a webhook arrive within 5
+  minutes" stays open; the product owner decides whether and how it is
+  measured.
+- Runs reported before migration `0069` have no stored streak; a retry of
+  such a report fires no "3 in a row" alert. Only reports in flight during
+  the upgrade are affected.
+- `SEC-10` is in open pull request #105. Whichever of the two merges second
+  must make the gate's receiver reachable through `SEC-10`'s opt-in.
