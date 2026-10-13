@@ -531,3 +531,24 @@ job of its own (recorded in `docs/plans/SRC-10-RESULT.md`).
 Open before merge: the product owner's browser check of the Ingest tab
 (mode choice, key field, the refresh and clear menu, "Keep history").
 
+### Merge of `main` at `432a3c9` (`SRC-16`, `SEC-27` part 1), 2026-10-13 (planner)
+
+Merge commit `8db765b`, by the developer. Conflicts: `BACKLOG.md` (both
+status changes kept), the gate file (both new steps kept whole), and
+`schema_diff.rs` `decide_for_key`, where `SRC-16` moved the
+"cannot be approved" test above the after-load branch and this branch had
+added the removed-key-column case to it: one definition, at `SRC-16`'s
+place, with this branch's case.
+
+One change beyond the conflicts, accepted: `lift_pause_if_nothing_waits`
+(from `SRC-16`) now reads the deduplication keys, as every other place that
+computes `canApprove` does. Without it a pending removal of a key column,
+which Approve refuses, would hold a pause after everything approvable is
+approved: the stuck state `SRC-16` removes. No test covers that pair of
+tables yet: `SHOULD-FIX`, not blocking.
+
+Re-run by the reviewer: `cargo fmt --check` clean. The developer's runs on
+the merge commit: workspace clippy clean, `bun run typecheck` clean,
+`bun run test` 1132 pass, 1 skip, 0 fail. Rust tests and gates: *not
+verified* until CI on this commit.
+
