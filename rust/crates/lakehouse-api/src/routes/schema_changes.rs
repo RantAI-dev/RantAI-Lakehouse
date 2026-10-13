@@ -1395,38 +1395,63 @@ mod tests {
         assert!(!paused(&pool, &id).await);
     }
 
-    /// Changing the policy away from `pause` does not lift a pause; only
-    /// approval does. A policy outside the four is a 400.
+    /// `SRC-16` F3 (delivery review 2026-10-12; it was "changing the policy
+    /// does not lift a pause", pinned by `SRC-8`): moving the policy from
+    /// `pause` to another lifts the schema-change pause and leaves the waiting
+    /// change listed; a pause with another reason stays; a patch that keeps
+    /// `pause` lifts nothing. A policy outside the four is a 400.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn changing_the_policy_does_not_lift_a_pause(pool: sqlx::PgPool) {
+    async fn moving_the_policy_away_from_pause_lifts_the_schema_change_pause(pool: sqlx::PgPool) {
         let h = harness(&pool, &[]).await;
         let id = connector(&h, "policy patch", "pause").await;
         let manager = user(&[h.tenant]);
+        let patch = |body: Value| {
+            let (h, manager, id) = (&h, &manager, &id);
+            async move {
+                call(
+                    h,
+                    manager,
+                    "PATCH",
+                    &format!("/api/connectors/{id}"),
+                    Some(body),
+                )
+                .await
+            }
+        };
         observe_as_service(&h, &id, &BASE, "before_load").await;
         observe_as_service(&h, &id, &WITH_QTY, "before_load").await;
         assert!(paused(&pool, &id).await);
 
-        let (status, patched) = call(
-            &h,
-            &manager,
-            "PATCH",
-            &format!("/api/connectors/{id}"),
-            Some(json!({ "schemaChangePolicy": "ask_first" })),
-        )
-        .await;
+        let (status, kept) =
+            patch(json!({ "schemaChangePolicy": "pause", "name": "renamed" })).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert!(paused(&pool, &id).await, "still on pause: nothing lifted");
+
+        let (status, patched) = patch(json!({ "schemaChangePolicy": "ask_first" })).await;
         assert_eq!(status, StatusCode::OK, "{patched}");
         assert_eq!(patched["schemaChangePolicy"], "ask_first");
-        assert!(patched["pausedAt"].is_string(), "{patched}");
-        assert!(paused(&pool, &id).await, "only an approval lifts the pause");
+        assert!(patched["pausedAt"].is_null(), "{patched}");
+        assert!(!paused(&pool, &id).await, "leaving pause lifts it");
+        assert_eq!(
+            listed(&h, &id).await["pending"].as_array().unwrap().len(),
+            1,
+            "the table still waits on its own"
+        );
 
-        let (status, _) = call(
-            &h,
-            &manager,
-            "PATCH",
-            &format!("/api/connectors/{id}"),
-            Some(json!({ "schemaChangePolicy": "whenever" })),
-        )
-        .await;
+        // Not this module's pause: another reason stays through a policy move.
+        sqlx::query("UPDATE connector SET schema_change_policy = 'pause', paused_reason = 'other', paused_at = now() WHERE id = $1")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _) = patch(json!({ "schemaChangePolicy": "apply_all" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            paused(&pool, &id).await,
+            "a pause with another reason stays"
+        );
+
+        let (status, _) = patch(json!({ "schemaChangePolicy": "whenever" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 

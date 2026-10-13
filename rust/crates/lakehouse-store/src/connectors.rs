@@ -2014,8 +2014,9 @@ pub struct UpdateConnectorInput {
     pub host: Option<String>,
     /// New `SRC-8` schema-change policy (one of
     /// [`crate::schema_change::SchemaChangePolicy`]'s wire values; the
-    /// column's CHECK refuses anything else). Changing it never lifts an
-    /// existing pause -- only an approval does.
+    /// column's CHECK refuses anything else). Moving it from `pause` to
+    /// another policy lifts a schema-change pause in the same transaction
+    /// (`SRC-16` F3); it never touches a pause set for another reason.
     pub schema_change_policy: Option<String>,
 }
 
@@ -2035,6 +2036,14 @@ impl UpdateConnectorInput {
 /// Apply an [`UpdateConnectorInput`]. Every value is bound, never
 /// interpolated; an absent field keeps its current value via `COALESCE`.
 ///
+/// `SRC-16` F3 (delivery review 2026-10-12): when the policy moves from
+/// `pause` to another, a pause whose reason is
+/// [`crate::schema_change::SCHEMA_CHANGE_PAUSE_REASON`] is lifted in the
+/// same transaction. Before, only an approval lifted it, and a pause with
+/// nothing to approve (`SRC-16` F1) had no way out. Tables with pending
+/// changes keep waiting individually, as under the other policies; a pause
+/// with another reason (`SRC-11`) is left alone.
+///
 /// # Errors
 ///
 /// [`StoreError::NotFound`] if no connector has `id`;
@@ -2045,6 +2054,32 @@ pub async fn update_connector(
     id: &str,
     input: &UpdateConnectorInput,
 ) -> Result<Connector, StoreError> {
+    let mut tx = pool.begin().await?;
+    let previous: Option<(String,)> =
+        sqlx::query_as("SELECT schema_change_policy FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((previous,)) = previous else {
+        return Err(StoreError::NotFound);
+    };
+    let pause = crate::schema_change::SchemaChangePolicy::Pause.as_str();
+    if previous == pause
+        && input
+            .schema_change_policy
+            .as_deref()
+            .is_some_and(|new| new != pause)
+    {
+        // Before the main UPDATE, so its RETURNING row already shows it.
+        sqlx::query(
+            "UPDATE connector SET paused_reason = NULL, paused_at = NULL \
+             WHERE id = $1 AND paused_reason = $2",
+        )
+        .bind(id)
+        .bind(crate::schema_change::SCHEMA_CHANGE_PAUSE_REASON)
+        .execute(&mut *tx)
+        .await?;
+    }
     let sql = format!(
         "UPDATE connector SET \
            name = COALESCE($2, name), \
@@ -2063,9 +2098,11 @@ pub async fn update_connector(
         .bind(input.residency.as_deref())
         .bind(input.host.as_deref())
         .bind(input.schema_change_policy.as_deref())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    row.map(Connector::from).ok_or(StoreError::NotFound)
+    let connector = row.map(Connector::from).ok_or(StoreError::NotFound)?;
+    tx.commit().await?;
+    Ok(connector)
 }
 
 /// A slug-based id, same shape `pipelines::slug_id` uses

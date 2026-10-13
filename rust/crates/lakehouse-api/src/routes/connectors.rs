@@ -348,10 +348,13 @@ fn update_input(body: UpdateConnectorBody) -> Result<connectors::UpdateConnector
         environment: non_blank("environment", body.environment)?,
         residency: non_blank("residency", body.residency)?,
         host: non_blank("host", body.host)?,
-        // `SRC-8`: changing the policy never lifts an existing pause. Only an
-        // approval does (`schema_change::approve_object`), so moving a
-        // connector from `pause` to another policy while a change waits
-        // does not start loading behind that change's back.
+        // `SRC-16` F3 (delivery review 2026-10-12): moving the policy from
+        // `pause` to another lifts a schema-change pause, in the store's
+        // transaction (`connectors::update_connector`). It was "only an
+        // approval lifts it", which left a pause with nothing to approve
+        // (F1) no way out. A table with a waiting change keeps waiting on
+        // its own under the other policies (a breaking change waits under
+        // every one), so nothing loads behind that change's back.
         schema_change_policy,
     };
     if input.is_empty() {

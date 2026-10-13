@@ -24,8 +24,13 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 async fn connector(pool: &PgPool) -> String {
+    connector_named(pool, "schema change test").await
+}
+
+/// Connector names are unique, so a test that needs several names them.
+async fn connector_named(pool: &PgPool, name: &str) -> String {
     let input = CreateConnectorInput {
-        name: "schema change test".to_owned(),
+        name: name.to_owned(),
         kind: "PostgreSQL".to_owned(),
         direction: "source".to_owned(),
         host: "db.example".to_owned(),
@@ -157,6 +162,122 @@ async fn the_policy_can_be_set_and_an_unknown_one_is_refused(pool: PgPool) -> sq
     .await;
     assert!(refused.is_err());
     Ok(())
+}
+
+/// `SRC-16` F3: moving the policy from `pause` to another lifts the
+/// schema-change pause in the same write, leaves the waiting change, and
+/// leaves a pause with another reason; a write that keeps `pause` lifts
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn leaving_the_pause_policy_lifts_the_schema_change_pause_only(pool: PgPool) {
+    let id = connector(&pool).await;
+    let set = |policy: &str| {
+        let (pool, id, policy) = (pool.clone(), id.clone(), policy.to_owned());
+        async move {
+            update_connector(
+                &pool,
+                &id,
+                &UpdateConnectorInput {
+                    schema_change_policy: Some(policy),
+                    ..UpdateConnectorInput::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    set("pause").await;
+    baseline(&pool, &id, &[col("id", "integer"), col("note", "text")]).await;
+    wait_for_removal(&pool, &id, &[col("id", "integer")], true).await;
+
+    let kept = set("pause").await;
+    assert_eq!(
+        kept.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+
+    let moved = set("ask_first").await;
+    assert_eq!(moved.paused_reason, None);
+    assert_eq!(moved.paused_at, None);
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 1);
+
+    set("pause").await;
+    sqlx::query("UPDATE connector SET paused_reason = 'other', paused_at = now() WHERE id = $1")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let other = set("apply_all").await;
+    assert_eq!(other.paused_reason.as_deref(), Some("other"));
+    assert!(other.paused_at.is_some());
+}
+
+/// `SRC-16` D-d: migration `0067` releases a schema-change pause that has no
+/// pending change (what the after-load `pause` of `SRC-8` left behind) and
+/// nothing else: not a pause that still has something to approve, not a
+/// pause with another reason. The migration already ran on the empty
+/// database `sqlx::test` made, so its statement is run again on seeded rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_release_migration_lifts_only_a_schema_change_pause_with_nothing_pending(pool: PgPool) {
+    const MIGRATION: &str = include_str!(
+        "../../../migrations/0067_release_schema_change_pause_with_nothing_to_approve.sql"
+    );
+    assert!(
+        MIGRATION.contains(SCHEMA_CHANGE_PAUSE_REASON),
+        "the migration's literal must be the constant's text"
+    );
+    let stuck = connector_named(&pool, "stuck").await;
+    let waiting = connector_named(&pool, "waiting").await;
+    let other = connector_named(&pool, "other").await;
+    for id in [&stuck, &waiting] {
+        sqlx::query("UPDATE connector SET paused_reason = $2, paused_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(SCHEMA_CHANGE_PAUSE_REASON)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE connector SET paused_reason = 'other', paused_at = now() WHERE id = $1")
+        .bind(&other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    baseline(
+        &pool,
+        &waiting,
+        &[col("id", "integer"), col("note", "text")],
+    )
+    .await;
+    wait_for_removal(&pool, &waiting, &[col("id", "integer")], true).await;
+
+    sqlx::query(MIGRATION).execute(&pool).await.unwrap();
+
+    let reason = |id: String| {
+        let pool = pool.clone();
+        async move {
+            get_connector(&pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .connector
+                .paused_reason
+        }
+    };
+    assert_eq!(reason(stuck.clone()).await, None);
+    assert_eq!(
+        get_connector(&pool, &stuck)
+            .await
+            .unwrap()
+            .unwrap()
+            .connector
+            .paused_at,
+        None
+    );
+    assert_eq!(
+        reason(waiting).await.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+    assert_eq!(reason(other).await.as_deref(), Some("other"));
 }
 
 /// A first observation is stored as the baseline and reads back.
