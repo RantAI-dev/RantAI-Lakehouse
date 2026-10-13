@@ -1599,6 +1599,119 @@ def step_source_schema_changes() -> None:
     print(f"[g6] SRC-8 step 4: catalog detail of {slug} marks qty inactiveSince {qty_marks[0]}, no other column")
 
 
+# SRC-16: a table of its own for the pause step, on a bucket key no other step reads.
+SRC16_KEY = "landing/src16_pause.csv"
+SRC16_BRONZE = "g6_files_pause"
+
+
+def _src16_put(body: bytes) -> None:
+    import seed_files_fixture
+    seed_files_fixture.put(
+        endpoint="http://rustfs:9000", bucket="lakehouse-warehouse",
+        access_key=RUSTFS_ACCESS_KEY, secret_key=RUSTFS_SECRET_KEY, key=SRC16_KEY, body=body,
+    )
+
+
+def _connector_paused(connector_id: str) -> bool:
+    resp = API.get(f"{API_URL}/api/connectors/{connector_id}", timeout=10)
+    if not resp.ok:
+        raise G6Failure(f"GET /api/connectors/{connector_id} failed: {resp.status_code} {resp.text[:300]}")
+    return bool(resp.json().get("pausedAt"))
+
+
+def step_files_pause_after_the_load() -> None:
+    """SRC-16 (delivery review 2026-10-12, F1): a files connector on the
+    `pause` policy, whose CSV gains a column. Files changes are seen only
+    AFTER the load, and used to be recorded as applied while still pausing the
+    connector: nothing was left to approve, so the pause could not be lifted.
+
+    1. `id,name` is loaded (the baseline); the connector is not paused.
+    2. The CSV gains `qty`; the run loads it, then the connector is paused and
+       exactly one change waits (`column_added` qty, `canApprove`); a new run
+       is refused with a 409.
+    3. Approve: the pause is lifted and nothing waits.
+    4. A second run loads, and the connector stays unpaused.
+
+    NOT asserted here: leaving the `pause` policy (route and store tests)."""
+    _src16_put(b"id,name\n1,a\n2,b\n")
+    run_id = _register_and_run(
+        name="g6-files-pause", kind="Object storage", host="rustfs:9000",
+        credential={"source": "file", "primary": "access_key", "secondary": "secret_key"},
+        credential_values={"primary": RUSTFS_ACCESS_KEY, "secondary": RUSTFS_SECRET_KEY},
+        adapter="files",
+        dial={"protocol": "s3", "endpoint": "http://rustfs:9000", "bucket": "lakehouse-warehouse", "format": "csv"},
+        source_objects=[{"name": SRC16_KEY, "target": SRC16_BRONZE, "loadMode": "replace"}],
+        connector_ids=(ids := {}),
+    )
+    connector_id = ids["g6-files-pause"]
+    if not run_id:
+        raise G6Failure("SRC-16 step 1: ingest/run returned no runId")
+    step_wait_for_run_success(run_id)
+    rows = _wait_for(f"bronze.{SRC16_BRONZE} rows visible", lambda: _bronze_row_count(SRC16_BRONZE) or None, 30, interval_s=3.0)
+    patched = API.patch(
+        f"{API_URL}/api/connectors/{connector_id}", json={"schemaChangePolicy": "pause"}, timeout=10
+    )
+    if not patched.ok:
+        raise G6Failure(f"SRC-16: setting the pause policy failed: {patched.status_code} {patched.text[:300]}")
+    listing = _schema_changes(connector_id)
+    if rows != 2 or listing["pending"] or _connector_paused(connector_id):
+        raise G6Failure(
+            f"SRC-16 step 1: expected 2 rows, nothing pending and no pause, got {rows} rows, "
+            f"pending={listing['pending']!r} paused={_connector_paused(connector_id)}"
+        )
+    print(f"[g6] SRC-16 step 1: {rows} rows in bronze.{SRC16_BRONZE}, policy pause, not paused")
+
+    _src16_put(b"id,name,qty\n1,a,10\n2,b,20\n3,c,30\n")
+    run_id = _post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise G6Failure("SRC-16 step 2: ingest/run returned no runId")
+    step_wait_for_run_success(run_id)
+    # The observation is posted by the run itself, after the load.
+    listing = _wait_for(
+        "SRC-16 step 2: the added column waits",
+        lambda: (lambda found: found if found["pending"] else None)(_schema_changes(connector_id)),
+        45, interval_s=3.0,
+    )
+    waiting = [c for c in listing["pending"] if c["kind"] == "column_added" and c["columnName"] == "qty"]
+    if len(listing["pending"]) != 1 or len(waiting) != 1 or not waiting[0]["canApprove"] or not _connector_paused(connector_id):
+        raise G6Failure(
+            "SRC-16 step 2: expected one pending approvable column_added for qty and a paused connector, "
+            f"got pending={listing['pending']!r} paused={_connector_paused(connector_id)}"
+        )
+    refused = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
+    if refused.status_code != 409:
+        raise G6Failure(f"SRC-16 step 2: a run of a paused connector must be refused with 409, got {refused.status_code}")
+    print("[g6] SRC-16 step 2: loaded, one change waits (approvable), connector paused, a new run answers 409")
+
+    approved = API.post(
+        f"{API_URL}/api/connectors/{connector_id}/schema-changes/approve", json={"object": SRC16_KEY}, timeout=10
+    )
+    if not approved.ok or approved.json().get("pauseLifted") is not True:
+        raise G6Failure(f"SRC-16 step 3: approve failed or did not lift the pause: {approved.status_code} {approved.text[:300]}")
+    listing = _schema_changes(connector_id)
+    if listing["pending"] or _connector_paused(connector_id):
+        raise G6Failure(
+            f"SRC-16 step 3: expected nothing pending and no pause, got pending={listing['pending']!r} "
+            f"paused={_connector_paused(connector_id)}"
+        )
+    print("[g6] SRC-16 step 3: approved, pause lifted, nothing waits")
+
+    run_id = _post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise G6Failure("SRC-16 step 4: ingest/run returned no runId")
+    step_wait_for_run_success(run_id)
+    rows = _wait_for(
+        f"bronze.{SRC16_BRONZE} has 3 rows", lambda: (lambda n: n if n == 3 else None)(_bronze_row_count(SRC16_BRONZE)), 45, interval_s=3.0
+    )
+    listing = _schema_changes(connector_id)
+    if listing["pending"] or _connector_paused(connector_id):
+        raise G6Failure(
+            f"SRC-16 step 4: expected nothing pending and no pause after the second run, got "
+            f"pending={listing['pending']!r} paused={_connector_paused(connector_id)}"
+        )
+    print(f"[g6] SRC-16 step 4: the second run loaded ({rows} rows), connector still not paused")
+
+
 def step_column_gate_rejects_an_unsupported_column() -> None:
     """A real, asserted FAILURE -- calls column_gate.reject_unsupported_column_types
     inside the REAL shipped image (not a mocked unit test), asserting it
@@ -1805,6 +1918,9 @@ def main() -> int:
             step_sheets_reports_unsupported()
         if _group_runs("other"):
             step_cdc_mongo_debezium_properties()
+            # SRC-16: needs the files fixture's bucket, which this half seeds.
+            if _active("g6-files"):
+                step_files_pause_after_the_load()
         # SRC-9 task 2: connect, discover and reload record their failures and
         # let the gate run on; the verdict comes here, once, naming each.
         failed = _recorder().failures()
