@@ -394,6 +394,22 @@ async fn system_prompt(
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
 }
 
+/// Plan 17: an Explain turn offers no tool. The console's Explain sends the
+/// statement with the sentence [`prompt::EXPLAIN_REQUEST`] first, and the
+/// model is told in the rules to call no tool. A Fix message keeps every tool
+/// it was offered, and so does a message that holds the sentence only inside
+/// the statement.
+fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<Value> {
+    let explain = newest_user.is_some_and(|m| m.trim_start().starts_with(prompt::EXPLAIN_REQUEST));
+    if !explain {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|t| t["function"]["name"].as_str() != Some(registry::PROPOSE_SQL))
+        .collect()
+}
+
 /// Validates the body and assembles the system prompt, history and the tool
 /// list for this principal and mode. A bad body is a ready 400 response.
 async fn prepare_chat(
@@ -477,6 +493,9 @@ async fn prepare_chat(
     let sql_help = tools
         .iter()
         .any(|t| t["function"]["name"].as_str() == Some(registry::PROPOSE_SQL));
+    // plan 17: `sql_help` was read above, before this, so the SQL help rules
+    // stay in the prompt while the tool is taken out of an Explain turn.
+    let tools = without_tool_in_explain(tools, recent_user.last().copied());
     let sys = system_prompt(
         state,
         principal,

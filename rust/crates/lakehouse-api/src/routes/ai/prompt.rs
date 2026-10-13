@@ -82,6 +82,15 @@ UNCLEAR WORDS
 - Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
 - If the question is not about data, answer it as it is. Do not ask.";
 
+/// The two sentences the console sends with the SQL help. `prepare_chat`
+/// matches the Explain one to take the tool out of its turn (plan 17); the
+/// test below holds the rules to the same words.
+pub(super) const EXPLAIN_REQUEST: &str = "Explain what this query does.";
+/// The Fix sentence is named only for the test that holds the rules to it:
+/// no product code matches it, so it is not compiled outside tests.
+#[cfg(test)]
+pub(super) const FIX_REQUEST: &str = "Why does this query fail? Fix it.";
+
 /// Appended after the mode text when `AI_SQL_HELP` is on and `propose_sql` is
 /// in the chat's tool list. It is a separate block, so a chat without the
 /// tool keeps the prompt it had, byte for byte.
@@ -661,14 +670,8 @@ mod tests {
         assert!(lines <= 6, "{lines} lines: {SQL_HELP_RULES}");
         // The console sends these two sentences; the rules must name them
         // exactly, or the model does not know which branch a message is in.
-        assert!(
-            SQL_HELP_RULES.contains("Why does this query fail? Fix it."),
-            "{SQL_HELP_RULES}"
-        );
-        assert!(
-            SQL_HELP_RULES.contains("Explain what this query does."),
-            "{SQL_HELP_RULES}"
-        );
+        assert!(SQL_HELP_RULES.contains(FIX_REQUEST), "{SQL_HELP_RULES}");
+        assert!(SQL_HELP_RULES.contains(EXPLAIN_REQUEST), "{SQL_HELP_RULES}");
     }
 
     #[test]

@@ -506,3 +506,150 @@ async fn with_the_switch_off_a_proposal_the_model_makes_anyway_is_refused() {
         statements(&ch).await
     );
 }
+
+/// The explain sentence, the engine and the statement, as the console sends
+/// them for Explain.
+const EXPLAIN_MESSAGE: &str =
+    "Explain what this query does.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT 1 AS probe";
+
+#[tokio::test]
+async fn an_explain_turn_offers_no_tool_and_keeps_the_sql_help_rules() {
+    let llm = mock_model(vec![model_round(Some("It returns one row."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, _) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (names, system) = first_model_request(&llm).await;
+    assert!(
+        names.is_empty(),
+        "an Explain turn offers no tool: {names:?}"
+    );
+    assert!(
+        system.contains("SQL HELP"),
+        "the rules stay for the Explain turn: {system}"
+    );
+}
+
+#[tokio::test]
+async fn a_proposal_in_an_explain_turn_is_refused_and_the_explanation_is_the_answer() {
+    // The staging failure: the model proposes a statement during an Explain.
+    // RIGHT_PROPOSAL would pass the check, so only the offer decides here.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", RIGHT_PROPOSAL)]),
+        model_round(Some("It returns one row."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    // The check first, as in T1: the proposal's SQL must not reach ClickHouse.
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter()
+            .all(|s| !s.contains("EXPLAIN PLAN") && !s.contains("order_id")),
+        "the proposal reached ClickHouse: {sent:?}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "propose_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+    assert_eq!(
+        trace[0]["result"]["error"],
+        "propose_sql is not available in this chat. Answer without it.",
+        "{trace:?}"
+    );
+    assert!(
+        trace
+            .iter()
+            .all(|step| step["result"]["proposed"] != json!(true)),
+        "no step proposes: {trace:?}"
+    );
+    assert_eq!(body["answer"], "It returns one row.", "{body}");
+}
+
+#[tokio::test]
+async fn a_query_in_an_explain_turn_is_refused_and_runs_nothing() {
+    let llm = mock_model(vec![
+        model_round(
+            None,
+            &[("call_1", "run_sql", r#"{"sql":"SELECT 1 AS probe"}"#)],
+        ),
+        model_round(Some("It returns one row."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        EXPLAIN_MESSAGE,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter().all(|s| !s.contains("AS probe")),
+        "the query reached ClickHouse: {sent:?}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["tool"], "run_sql");
+    assert_eq!(trace[0]["ok"], false, "{trace:?}");
+}
+
+#[tokio::test]
+async fn a_fix_turn_still_offers_the_tool_after_the_explain_change() {
+    // The existing fixture `an_allowlist_naming_propose_sql_offers_it_with_the_rules`
+    // is the pin; this one checks the same offer on the Fix message in the
+    // same file, next to the Explain tests.
+    let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, _) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (names, _) = first_model_request(&llm).await;
+    assert_eq!(names, ["propose_sql"], "{names:?}");
+}
+
+#[tokio::test]
+async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
+    // The sentence is matched at the start of the message only. A Fix message
+    // whose statement holds the sentence in a comment keeps the tool.
+    let fix_with_comment = "Why does this query fail? Fix it.\n\nENGINE: clickhouse\n\nSTATEMENT:\nSELECT 1 /* Explain what this query does. */ AS probe\n\nERROR:\nUNKNOWN_IDENTIFIER";
+    let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, _) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["propose_sql"])),
+        fix_with_comment,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (names, _) = first_model_request(&llm).await;
+    assert!(names.contains(&"propose_sql".to_owned()), "{names:?}");
+}
