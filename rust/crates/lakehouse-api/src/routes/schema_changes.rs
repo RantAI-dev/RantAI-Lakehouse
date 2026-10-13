@@ -1476,10 +1476,14 @@ mod tests {
     const WITHOUT_NOTE_QTY: [(&str, &str); 2] = [("id", "integer"), ("qty", "integer")];
 
     /// Decision D4: after the load nothing is held back. A column missing
-    /// from the batch is not a removal; an added column is applied; `pause`
-    /// still pauses the connector for later runs.
+    /// from the batch is not a removal; an added column is already in the
+    /// table (`action` is `load`); under `pause` it waits for an approval and
+    /// the connector pauses for later runs (`SRC-16` F1, delivery review
+    /// 2026-10-12: it used to be recorded `applied`, which left nothing to
+    /// approve and no way to lift the pause). The baseline stays until the
+    /// approval.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn after_the_load_changes_are_applied_and_a_missing_column_is_not_removed(
+    async fn after_the_load_under_pause_a_change_waits_and_a_missing_column_is_not_removed(
         pool: sqlx::PgPool,
     ) {
         let h = harness(&pool, &[]).await;
@@ -1497,9 +1501,26 @@ mod tests {
             added["action"], "load",
             "the change is already in the table"
         );
-        assert_eq!(added["changes"][0]["status"], "applied");
-        assert_eq!(baseline_columns(&pool, &id).await, 3);
+        assert_eq!(added["changes"][0]["status"], "pending");
+        assert_eq!(added["changes"][0]["canApprove"], true);
+        assert_eq!(baseline_columns(&pool, &id).await, 2, "until approved");
         assert!(paused(&pool, &id).await, "later runs stop");
+    }
+
+    /// Under the three other policies a change seen after the load is
+    /// applied, moves the baseline and pauses nothing (`SRC-16` F1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn after_the_load_under_the_other_policies_a_change_is_applied(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        for policy in ["apply_non_breaking", "apply_all", "ask_first"] {
+            let id = connector(&h, &format!("after load {policy}"), policy).await;
+            observe_as_service(&h, &id, &BASE, "after_load").await;
+            let added = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+            assert_eq!(added["action"], "load", "{policy}");
+            assert_eq!(added["changes"][0]["status"], "applied", "{policy}");
+            assert_eq!(baseline_columns(&pool, &id).await, 3, "{policy}");
+            assert!(!paused(&pool, &id).await, "{policy}");
+        }
     }
 
     /// An unknown connector is a 404 and a malformed or oversize body a 400,
