@@ -1182,6 +1182,12 @@ pub(crate) async fn clear_removed_tables_in(
 /// columns become inactive, and the connector's schema-change pause is
 /// lifted when nothing else waits.
 ///
+/// `SRC-16` F1: this is also how a change seen AFTER the load (files, REST,
+/// `MongoDB`, Kafka, SFTP) under `pause` is cleared. It needs nothing
+/// different: the observation stored the shape it saw (the batch's columns
+/// plus the carried-over ones) as the waiting shape, which is what the
+/// baseline becomes.
+///
 /// Pending `table_added` rows (`SRC-8 review SHOULD-FIX 3`) are notices that
 /// a table could NOT be added, not a table that waits: they do not count as
 /// waiting and do not keep a pause. Approving the table name marks them

@@ -1331,6 +1331,70 @@ mod tests {
         assert!(listed(&resumed));
     }
 
+    /// `SRC-16` F1 (delivery review 2026-10-12): a connector whose changes
+    /// are seen after the load, on `pause`, sees a change. It pauses with the
+    /// change pending and approvable; `ingest/run` answers 409 and the due
+    /// list leaves it out; approving the table moves the baseline to the
+    /// loaded shape, lifts the pause and the connector can run again.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn after_the_load_a_pause_is_lifted_by_approving_the_change(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "files paused", "pause").await;
+        sqlx::query(
+            "UPDATE connector SET adapter = 'files', ingest_mode = 'batch', \
+             schedule_cron = '0 2 * * *' WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let manager = user(&[h.tenant]);
+        let due = "/api/connectors/ingestible?dueAfter=2026-09-30T01:59:00Z&dueUntil=2026-09-30T02:00:00Z";
+        let is_listed = |body: &Value| {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == id.as_str())
+        };
+        observe_as_service(&h, &id, &BASE, "after_load").await;
+        let answer = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+        assert_eq!(answer["action"], "load");
+        assert_eq!(answer["changes"][0]["status"], "pending");
+        assert_eq!(answer["changes"][0]["canApprove"], true);
+        assert!(paused(&pool, &id).await);
+        let waiting = listed(&h, &id).await;
+        assert_eq!(waiting["pending"][0]["canApprove"], true);
+
+        let run = format!("/api/connectors/{id}/ingest/run");
+        let (status, _) = call(&h, &manager, "POST", &run, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (_, while_paused) = call(&h, &service(), "GET", due, None).await;
+        assert!(!is_listed(&while_paused), "{while_paused}");
+
+        let (status, approved) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["approved"][0]["status"], "approved");
+        assert_eq!(approved["pauseLifted"], true);
+        assert!(!paused(&pool, &id).await);
+        assert_eq!(
+            baseline_columns(&pool, &id).await,
+            3,
+            "the loaded shape is the baseline"
+        );
+        assert_eq!(listed(&h, &id).await["pending"], json!([]));
+        let (_, resumed) = call(&h, &service(), "GET", due, None).await;
+        assert!(is_listed(&resumed), "{resumed}");
+        // Past the pause check: Dagster is a bare mock here, so the launch
+        // fails with something other than the pause's 409.
+        let (status, _) = call(&h, &manager, "POST", &run, None).await;
+        assert_ne!(status, StatusCode::CONFLICT);
+
+        // A second run sees the same shape: no new change, nothing pauses.
+        let again = observe_as_service(&h, &id, &WITH_QTY, "after_load").await;
+        assert_eq!(again["changes"], json!([]));
+        assert!(!paused(&pool, &id).await);
+    }
+
     /// Changing the policy away from `pause` does not lift a pause; only
     /// approval does. A policy outside the four is a 400.
     #[sqlx::test(migrations = "../../migrations")]
