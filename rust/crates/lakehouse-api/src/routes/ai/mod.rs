@@ -99,6 +99,10 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// What a late `ask_user` gets back (plan 14). The model reads it on its
+/// next round, so it asks the model to answer with the reading it used.
+const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+
 /// A single incoming `{role, content}` chat turn (only `user`/`assistant`
 /// are kept, matching the `TypeScript`'s `.filter`).
 #[derive(Debug, Deserialize)]
@@ -735,6 +739,14 @@ async fn run_chat(
             }
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // plan 14: an ask after any tool that ran in this turn is refused
+            // before the gate. The prompt asks the model to ask first; this
+            // is the check that holds when it does not.
+            let late_ask = call.function.name == registry::ASK_USER
+                && tool_trace.iter().any(|step| {
+                    step["tool"].as_str() != Some(registry::ASK_USER)
+                        && step["ok"].as_bool() == Some(true)
+                });
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
@@ -750,7 +762,9 @@ async fn run_chat(
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
-            let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
+            let (result, outcome, run_id, approval_id) = if late_ask {
+                (json!({ "error": LATE_ASK_REFUSAL }), "failed", None, None)
+            } else if let Some(refusal) = gate_result {
                 if gate::is_write_high_pending(&refusal) {
                     let Some(spec) = registry::find(&call.function.name) else {
                         unreachable!("is_write_high_pending only set for a registered tool")
@@ -818,6 +832,22 @@ async fn run_chat(
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
             }));
+            // plan 14: an accepted ask ends the turn. The question is the
+            // reply, so the reader sees it above the option buttons; calls
+            // after it in this round are neither run nor recorded.
+            if call.function.name == registry::ASK_USER
+                && let Value::Object(m) = &result
+                && m.get("asked") == Some(&Value::Bool(true))
+            {
+                let question = m.get("question").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    question,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
             if let Value::Object(m) = &result
                 && let Some(Value::String(rid)) = m.get("runId")
             {
