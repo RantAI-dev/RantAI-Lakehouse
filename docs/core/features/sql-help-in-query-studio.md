@@ -35,7 +35,7 @@ A query that fails in Query Studio shows its error and nothing else. The person 
 
 ## Asking the assistant
 
-This feature is the assistant working inside Query Studio. The user asks with one fixed sentence: "Why does this query fail? Fix it." with the engine, the SQL and the error the run raised, or "Explain what this query does." with the engine and the SQL. For an explanation the assistant writes plain words and calls no tool. For a fix it proposes the whole corrected statement through `propose_sql`, a checked, read-only tool that never runs it. A proposal that fails the server's check comes back to the model as an error, so the model can correct it in the same turn; only a checked proposal reaches the person.
+This feature is the assistant working inside Query Studio. The user asks with one fixed sentence: "Why does this query fail? Fix it." with the engine, the SQL and the error the run raised, or "Explain what this query does." with the engine and the SQL. For an explanation the assistant writes plain words and calls no tool; the server offers it none in that turn. For a fix it proposes the whole corrected statement through `propose_sql`, a checked, read-only tool that never runs it. A proposal that fails the server's check comes back to the model as an error, so the model can correct it in the same turn; only a checked proposal reaches the person.
 
 ## Decisions
 
@@ -56,6 +56,8 @@ This feature is the assistant working inside Query Studio. The user asks with on
 - The console refuses to send a statement of more than 20,000 characters to be fixed; it says the query is too long for the assistant to fix.
 - The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text.
 - The diff is against the editor as it was when the proposal came back. Typing in the editor closes the proposal, and so does running the query.
+- In an Explain turn the assistant is offered no tool, so it can neither propose a fix nor run a query.
+- A chat the console opened with a tool list refuses any tool outside that list.
 - `AI_SQL_HELP=false` takes the `propose_sql` tool and the rules that tell the model when to use it out of the chat. The Explain and Fix with AI buttons stay in Query Studio's SQL tab: Fix with AI then shows the assistant's answer and "No fix to apply was proposed.", never a diff.
 - `AI_SQL_HELP` set to anything other than `true` or `false` stops the API at start. Unset or empty means on.
 
