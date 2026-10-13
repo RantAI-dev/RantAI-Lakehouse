@@ -191,3 +191,16 @@ Accepted, and recorded because they go beyond the plan's words:
 
 Open for the product owner: a browser check of the Schema changes tab's two
 new notes.
+
+### CI on the pull request (#120), 2026-10-13
+
+At `fd5f8c1`: every Rust test, the three `g6` jobs (the new step runs in
+"files, APIs, streams", 18m53s), `g1` to `g4`, `g8` masking, `g9`, clippy,
+MSRV and the frontend job pass. Red, and not caused by this branch (it
+touches no dependency and no secret):
+
+- `cargo audit` and both `gitleaks` jobs: red on `main` too (`c083125`).
+  No backlog item existed; filed as `SEC-27`.
+- "G8 time travel keeps the policy": the image build failed in `apt-get`
+  before any test ran. Re-run.
+
