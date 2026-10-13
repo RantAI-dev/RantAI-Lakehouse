@@ -241,6 +241,62 @@ async fn execute_query_against_engine(
     }
 }
 
+/// Answers whether `sql` would run for `principal` on `engine`, without
+/// running it. Plan 15's proposal check: a statement a person could be
+/// shown as a fix must pass the same guard and policy `run` applies, and
+/// must plan on `ClickHouse`.
+///
+/// The order matches `run`: [`is_read_only`] first, then
+/// [`rewrite_sql_for_principal`], so the statement that is planned is the
+/// one `run` would execute. On `ClickHouse` the rewritten statement is sent
+/// as `EXPLAIN PLAN` with its trailing `;` stripped, the same shape
+/// `estimate_body` uses for `EXPLAIN ESTIMATE`. `EXPLAIN PLAN` resolves
+/// column names, which `EXPLAIN AST` does not. Only one request is sent,
+/// and it is an `EXPLAIN`.
+///
+/// # Errors
+///
+/// Returns the message for the statement's author, as text. It is never an
+/// [`ApiError`] and reaches no HTTP response body from here; the caller
+/// hands it to a tool, which cleans it.
+/// - A statement that is not read-only: a fixed sentence naming that only
+///   read statements can be proposed.
+/// - A statement the policy refuses: the policy's own non-leaking message,
+///   from [`rewrite_sql_for_principal`].
+/// - A statement `ClickHouse` cannot plan: its own SQL error text, which is
+///   the author's to see, the same text `run_sql` already treats as such.
+/// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
+///   replaces this arm.
+#[allow(
+    dead_code,
+    reason = "plan 15 Step 2 adds its caller, the `propose_sql` tool; remove this allow then"
+)]
+pub(crate) async fn check_statement_would_run(
+    state: &AppState,
+    principal: &Principal,
+    sql: &str,
+    engine: &str,
+) -> Result<(), String> {
+    if !is_read_only(sql) {
+        return Err(
+            "Only read statements (SELECT/SHOW/DESCRIBE/EXPLAIN) can be proposed.".to_owned(),
+        );
+    }
+    let rewritten = rewrite_sql_for_principal(state, sql, engine, principal)
+        .await
+        .map_err(|err| err.to_string())?;
+    if is_trino_engine(engine) {
+        return Err("Checking a Trino statement is not supported yet.".to_owned());
+    }
+    let query = format!("EXPLAIN PLAN {}", strip_trailing_semicolon(&rewritten));
+    state
+        .clickhouse
+        .query(&query, None)
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 /// The most rows one run hands back to the browser.
 ///
 /// The console renders every row it receives, so an unbounded `SELECT *`
@@ -1981,6 +2037,233 @@ mod tests {
         /// `assertion failed: requests.is_empty()`, `left: false, right:
         /// true` (a request WAS recorded, the table function reached
         /// `ClickHouse`).
+        /// Step 1 of plan 15: the check refuses a write before `ClickHouse`
+        /// is called. No mock is mounted, so a request reaching `ClickHouse`
+        /// would also fail, but `requests.is_empty()` is the stronger proof.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn check_refuses_a_write_statement_before_touching_clickhouse(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let result = check_statement_would_run(
+                &state,
+                &analyst_principal().0,
+                "DELETE FROM serving.mart_x",
+                "clickhouse",
+            )
+            .await;
+            assert!(result.is_err(), "a write must be refused: {result:?}");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.is_empty(),
+                "a write must never reach ClickHouse at all: {requests:?}"
+            );
+            Ok(())
+        }
+
+        /// Step 1 of plan 15: a statement the policy refuses (a table
+        /// function) is refused by the check before `ClickHouse` is called.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn check_refuses_a_policy_refused_statement_before_touching_clickhouse(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let result = check_statement_would_run(
+                &state,
+                &analyst_principal().0,
+                "SELECT * FROM url('h','CSV')",
+                "clickhouse",
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "a table function must be refused: {result:?}"
+            );
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.is_empty(),
+                "a refused statement must never reach ClickHouse at all: {requests:?}"
+            );
+            Ok(())
+        }
+
+        /// Step 1 of plan 15: the check sends `EXPLAIN PLAN` of the
+        /// rewritten statement and nothing else, so the body starts with
+        /// `EXPLAIN PLAN ` and holds the rewritten form, never the caller's
+        /// literal `SELECT`, and its trailing `;` is stripped.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn check_sends_explain_plan_of_the_rewritten_statement(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            lakehouse_store::governance::create_policy(
+                &pool,
+                &CreatePolicyInput {
+                    name: "check-explain-plan-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            let server = MockServer::start().await;
+            mount_governed_table_responses(&server).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let result = check_statement_would_run(
+                &state,
+                &analyst_principal().0,
+                "SELECT * FROM serving.mart_x;",
+                "clickhouse",
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "a governed read must pass the check: {result:?}"
+            );
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            let explain: Vec<String> = requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| b.starts_with("EXPLAIN PLAN "))
+                .collect();
+            assert_eq!(
+                explain.len(),
+                1,
+                "the check must send exactly one EXPLAIN PLAN: {explain:?}"
+            );
+            assert!(
+                explain[0].contains("replaceRegexpOne"),
+                "the EXPLAIN PLAN must hold the rewritten, masked statement: {}",
+                explain[0]
+            );
+            assert!(
+                !explain[0].contains(';'),
+                "the trailing semicolon must be stripped before EXPLAIN PLAN: {}",
+                explain[0]
+            );
+            Ok(())
+        }
+
+        /// Step 1 of plan 15: the masking proof on the check's path. The
+        /// `EXPLAIN PLAN` body must carry the masking the caller would get
+        /// from `run`. Mutation evidence: sending the caller's statement
+        /// instead of the rewritten one makes this assertion fail.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn check_masks_a_governed_column_in_the_explain_plan_body(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            lakehouse_store::governance::create_policy(
+                &pool,
+                &CreatePolicyInput {
+                    name: "check-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            let server = MockServer::start().await;
+            mount_governed_table_responses(&server).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            check_statement_would_run(
+                &state,
+                &analyst_principal().0,
+                "SELECT * FROM serving.mart_x",
+                "clickhouse",
+            )
+            .await
+            .expect("a governed read must pass the check");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.iter().any(|r| {
+                    let body = String::from_utf8_lossy(&r.body);
+                    body.starts_with("EXPLAIN PLAN ") && body.contains("replaceRegexpOne")
+                }),
+                "the EXPLAIN PLAN ClickHouse receives must be the masked form: {requests:?}"
+            );
+            Ok(())
+        }
+
+        /// Step 1 of plan 15: the Trino arm is not built yet (plan 16), so
+        /// it answers "not supported yet" and sends nothing to `ClickHouse`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn check_answers_not_supported_yet_for_trino_without_clickhouse(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let result =
+                check_statement_would_run(&state, &analyst_principal().0, "SELECT 1", "trino")
+                    .await;
+            let message = result.expect_err("the Trino arm must not pass the check yet");
+            assert!(
+                message.contains("not supported yet"),
+                "the Trino arm must say it is not supported yet: {message}"
+            );
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(requests.is_empty(), "no ClickHouse request: {requests:?}");
+            Ok(())
+        }
+
         #[sqlx::test(migrations = "../../migrations")]
         async fn run_refuses_a_table_function_before_touching_clickhouse_at_all(
             pool: PgPool,
