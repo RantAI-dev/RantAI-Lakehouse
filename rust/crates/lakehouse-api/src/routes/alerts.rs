@@ -720,7 +720,15 @@ async fn persist_fired_results(
             affected: rule.mart.as_deref().unwrap_or(""),
             detail: &detail,
         };
-        if let Err(err) = overview::insert_from_fired_rule(pg, &fired, now).await {
+        // `SRC-17` F1: the instance keeps whether the delivery arrived (the
+        // result's `error` is a fixed sentence, never upstream text).
+        let delivery = result
+            .delivered
+            .as_ref()
+            .and_then(crate::routes::load_alerts::delivery_record);
+        if let Err(err) =
+            overview::insert_from_fired_rule_with_delivery(pg, &fired, delivery, now).await
+        {
             tracing::warn!(%err, rule_id = %rule.id, "failed to persist fired alert instance (delivery already happened)");
         }
     }

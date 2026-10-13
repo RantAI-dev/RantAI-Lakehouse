@@ -244,8 +244,17 @@ describe("ConnectorDetailPage", () => {
       }
     )
     render(<ConnectorDetailPage connectorId="conn-a" />)
-    expect(await screen.findAllByText("Waiting for a decision")).toHaveLength(1)
-    expect(tab("Schema changes").textContent).toBe("Schema changes1")
+    // SRC-17 flaky-test fix (surfaced on PR #124's CI): "Waiting for a decision"
+    // is also the title of the always-rendered Schema changes card, so awaiting
+    // that text resolved on the card while the list was still loading, before the
+    // tab's count and the Ingest mark arrived. Await the mark itself (found by its
+    // title, which only the Ingest pill carries), then the count, then assert.
+    const marks = await screen.findAllByTitle("A change at the source waits for approval; see Schema changes")
+    expect(marks).toHaveLength(1)
+    expect(marks[0].textContent).toBe("Waiting for a decision")
+    await waitFor(() => expect(tab("Schema changes").textContent).toBe("Schema changes1"))
+    await settle()
+    expect(screen.getAllByTitle("A change at the source waits for approval; see Schema changes")).toHaveLength(1)
     expect(count("GET /api/connectors/conn-a/schema-changes")).toBe(1)
   })
 

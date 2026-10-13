@@ -1538,6 +1538,107 @@ pub struct RunHealth {
     pub failure_streak: i32,
 }
 
+/// The statement behind [`record_run_result`] and [`record_run_once`]: one
+/// `UPDATE ... RETURNING` for the run facts, the streak and the health.
+const RECORD_RUN_SQL: &str = "UPDATE connector SET \
+                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
+                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
+                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
+                 health = CASE WHEN $2 THEN 'healthy' \
+                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
+                               ELSE 'degraded' END \
+               WHERE id = $1 RETURNING health, failure_streak";
+
+/// What [`record_run_once`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRecord {
+    /// `true` when this call counted the run; `false` for a retry of a run
+    /// that was already counted (nothing was changed).
+    pub first_seen: bool,
+    /// The connector's failure streak right after THIS run was counted: the
+    /// value of the first report, also returned to its retries. `None` only
+    /// for a run counted before `0069` kept it.
+    pub failure_streak: Option<i32>,
+}
+
+/// Count one real run on the connector exactly once, and remember the streak
+/// it produced (`SRC-17` F2, `0069`).
+///
+/// The dedupe row `(run_id, kind)` and the connector's run facts are written
+/// in one transaction: a failure in between leaves neither, so the
+/// orchestrator's retry counts the run, instead of finding a dedupe row and
+/// skipping a run that was never counted. A retry of a run that was counted
+/// changes nothing and gets the same streak back, so "3 in a row" is decided
+/// by the run's own streak, not by whatever the connector has reached since.
+///
+/// `kind` is the dedupe kind of the outcome (`"failure"` or `"success"`,
+/// `routes::load_alerts::Outcome::event_kind`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector (the
+/// transaction is rolled back, nothing is recorded), or
+/// [`StoreError::Database`] on any other failure.
+pub async fn record_run_once(
+    pool: &PgPool,
+    run_id: &str,
+    id: &str,
+    kind: &str,
+    succeeded: bool,
+    at: OffsetDateTime,
+) -> Result<RunRecord, StoreError> {
+    let mut tx = pool.begin().await?;
+    let inserted: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (run_id, kind) DO NOTHING \
+         RETURNING run_id",
+    )
+    .bind(run_id)
+    .bind(format!("connector:{id}"))
+    .bind(kind)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if inserted.is_none() {
+        let stored: Option<(Option<i32>,)> = sqlx::query_as(
+            "SELECT failure_streak FROM pipeline_run_event WHERE run_id = $1 AND kind = $2",
+        )
+        .bind(run_id)
+        .bind(kind)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(RunRecord {
+            first_seen: false,
+            failure_streak: stored.and_then(|(streak,)| streak),
+        });
+    }
+    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
+        .bind(id)
+        .bind(succeeded)
+        .bind(at)
+        .bind(REPEATED_FAILURE_STREAK)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((_health, failure_streak)) = row else {
+        // Dropping `tx` rolls the dedupe row back with it.
+        return Err(StoreError::NotFound);
+    };
+    sqlx::query(
+        "UPDATE pipeline_run_event SET failure_streak = $3 WHERE run_id = $1 AND kind = $2",
+    )
+    .bind(run_id)
+    .bind(kind)
+    .bind(failure_streak)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(RunRecord {
+        first_seen: true,
+        failure_streak: Some(failure_streak),
+    })
+}
+
 /// Record the outcome of one real run (not a manual test) on the connector:
 /// the run time, the failure streak and `health`, together in one
 /// `UPDATE ... RETURNING` (`SRC-7` F4, decision D6). Success: `healthy`,
@@ -1545,8 +1646,9 @@ pub struct RunHealth {
 /// [`REPEATED_FAILURE_STREAK`], `unhealthy` from it. `at` is the caller's
 /// run-end time; nothing is stamped that was not reported.
 ///
-/// The caller must dedupe the run first (`pipelines::record_pipeline_run_event`):
-/// this function counts every call.
+/// This function counts every call. The run report does not use it directly:
+/// it goes through [`record_run_once`], which dedupes the run in the same
+/// transaction (`SRC-17` F2).
 ///
 /// # Errors
 ///
@@ -1558,15 +1660,7 @@ pub async fn record_run_result(
     succeeded: bool,
     at: OffsetDateTime,
 ) -> Result<RunHealth, StoreError> {
-    let sql = "UPDATE connector SET \
-                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
-                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
-                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
-                 health = CASE WHEN $2 THEN 'healthy' \
-                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
-                               ELSE 'degraded' END \
-               WHERE id = $1 RETURNING health, failure_streak";
-    let row: Option<(String, i32)> = sqlx::query_as(sql)
+    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
         .bind(id)
         .bind(succeeded)
         .bind(at)
