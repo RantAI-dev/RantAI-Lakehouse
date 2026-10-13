@@ -48,12 +48,12 @@
 //! D8). Failures of the orchestrator, the rule store or the database are
 //! logged and answered with fixed text.
 
-use lakehouse_alerts::{AlertKind, AlertRule, SilenceSource};
+use lakehouse_alerts::{AlertKind, RuleDelivery, SilenceSource};
 use lakehouse_core::ApiError;
-use lakehouse_notify::EmailSender;
+use lakehouse_notify::{DeliverResult, EmailSender};
 use lakehouse_store::PgPool;
 use lakehouse_store::connectors::{self, REPEATED_FAILURE_STREAK};
-use lakehouse_store::overview::{self, FiredRule};
+use lakehouse_store::overview::{self, DeliveryRecord, FiredRule};
 use lakehouse_store::pipelines;
 use lakehouse_store::uploads;
 use serde_json::{Value, json};
@@ -196,7 +196,8 @@ async fn confirm_status(
 }
 
 /// Send one event to the rules of `kind` and record an `alert_instance` for
-/// each rule a delivery was attempted for (when `persist_as` names a source).
+/// each rule a delivery was attempted for (when `persist_as` names a source),
+/// with how that delivery ended (`SRC-17` F1).
 /// `scope_id` is the connector id, or the upload id for `upload_failure`; it is
 /// also the instance's `affected`.
 ///
@@ -235,18 +236,33 @@ pub(super) async fn deliver_event(
     Ok(delivered.len())
 }
 
-/// Best-effort `alert_instance` rows for the rules that were delivered to: a
-/// Postgres failure must not turn a delivered alert into an error response
-/// (the same posture as `routes::alerts::persist_fired_results`).
+/// How a delivery ended, in the form the alert instance stores it
+/// (`SRC-17` F1). `error` is always one of the fixed sentences of
+/// `lakehouse_notify::DeliveryFailure` (never upstream text), so it is
+/// stored and shown as it is. A failed result with no reason records
+/// nothing rather than an invented one.
+pub(super) fn delivery_record(result: &DeliverResult) -> Option<DeliveryRecord<'_>> {
+    if result.ok {
+        Some(DeliveryRecord::Delivered)
+    } else {
+        result.error.as_deref().map(DeliveryRecord::NotDelivered)
+    }
+}
+
+/// Best-effort `alert_instance` rows for the rules a delivery was attempted
+/// for, delivered or not: a Postgres failure must not turn a delivered alert
+/// into an error response (the same posture as
+/// `routes::alerts::persist_fired_results`). An alert whose delivery failed
+/// is still listed, with the reason (`SRC-17` F1: the event happened).
 async fn persist_instances(
     pool: &PgPool,
-    rules: &[AlertRule],
+    attempted: &[RuleDelivery],
     source: &str,
     affected: &str,
     detail: &str,
 ) {
     let now = OffsetDateTime::now_utc();
-    for rule in rules {
+    for RuleDelivery { rule, result } in attempted {
         let fired = FiredRule {
             rule_id: &rule.id,
             title: &rule.name,
@@ -255,7 +271,14 @@ async fn persist_instances(
             affected,
             detail,
         };
-        if let Err(err) = overview::insert_from_fired_rule(pool, &fired, now).await {
+        if let Err(err) = overview::insert_from_fired_rule_with_delivery(
+            pool,
+            &fired,
+            delivery_record(result),
+            now,
+        )
+        .await
+        {
             tracing::warn!(%err, rule_id = %rule.id, "failed to persist a load alert instance (delivery already happened)");
         }
     }

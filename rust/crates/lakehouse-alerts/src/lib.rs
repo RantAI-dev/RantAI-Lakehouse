@@ -1640,6 +1640,20 @@ async fn deliver_one_kind(
     .map(|delivered| delivered.len())
 }
 
+/// One rule a delivery was attempted for, with how it went (`SRC-17` F1,
+/// delivery review 2026-10-12): the caller records the outcome on the alert
+/// instance instead of treating "attempted" as "delivered".
+///
+/// `result.error` is one of the fixed [`lakehouse_notify::DeliveryFailure`]
+/// sentences, never text from the webhook or the mail server.
+#[derive(Debug, Clone)]
+pub struct RuleDelivery {
+    /// The rule the delivery was attempted for.
+    pub rule: AlertRule,
+    /// Whether it arrived, and if not, the fixed reason.
+    pub result: DeliverResult,
+}
+
 /// Which `console.alert_rule` scope column a delivery matches against: the
 /// `pipeline` column (the pipeline kinds) or the `connector` column
 /// (`SRC-7`). In either, a stored `"*"` matches every id.
@@ -1662,8 +1676,9 @@ impl RuleScope<'_> {
 /// The shared filter-and-deliver of [`deliver_one_kind`] (`SRC-7`, AGENTS.md
 /// rule 4: generalised rather than copied): list the enabled rules of
 /// `kind` whose scope matches, deliver `text` to each unless silenced, and
-/// return the rules a delivery was attempted for (so the caller can record
-/// an `alert_instance` for each).
+/// return each rule a delivery was attempted for with its outcome (so the
+/// caller can record an `alert_instance` for each, delivered or not;
+/// `SRC-17` F1: the outcome used to be discarded here).
 async fn deliver_matching(
     ch: &ChClient,
     http: &reqwest::Client,
@@ -1673,27 +1688,101 @@ async fn deliver_matching(
     scope: RuleScope<'_>,
     title_prefix: &str,
     text: &str,
-) -> Result<Vec<AlertRule>, ChError> {
-    let rules: Vec<AlertRule> = list_rules(ch)
-        .await?
-        .into_iter()
+) -> Result<Vec<RuleDelivery>, ChError> {
+    let rules = list_rules(ch).await?;
+    Ok(deliver_to_matching(
+        &rules,
+        http,
+        email,
+        silence,
+        kind,
+        scope,
+        title_prefix,
+        text,
+    )
+    .await)
+}
+
+/// The delivery half of [`deliver_matching`], over rules the caller already
+/// read. Reading the rules and delivering are separate so a caller can read
+/// them BEFORE it records anything (`SRC-17` F2, [`load_rules`]): this cannot
+/// fail on the rule store.
+async fn deliver_to_matching(
+    rules: &[AlertRule],
+    http: &reqwest::Client,
+    email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
+    kind: AlertKind,
+    scope: RuleScope<'_>,
+    title_prefix: &str,
+    text: &str,
+) -> Vec<RuleDelivery> {
+    let mut attempted = Vec::new();
+    for rule in rules
+        .iter()
         .filter(|r| r.enabled && r.kind == kind && scope.matches(r))
-        .collect();
-    let mut delivered = Vec::new();
-    for rule in rules {
+    {
         let title = format!("{title_prefix}: {}", rule.name);
-        if let Some(DeliverResult { .. }) =
-            deliver_unless_silenced(http, email, silence, &rule, &title, text).await
+        if let Some(result) =
+            deliver_unless_silenced(http, email, silence, rule, &title, text).await
         {
-            delivered.push(rule);
+            attempted.push(RuleDelivery {
+                rule: rule.clone(),
+                result,
+            });
         }
     }
-    Ok(delivered)
+    attempted
+}
+
+/// Read the alert rules once, for [`deliver_connector_event_to`]
+/// (`SRC-17` F2, delivery review 2026-10-12).
+///
+/// A run report reads the rules BEFORE it writes its dedupe row and counts
+/// the run, then delivers from this list: the rule store can no longer fail
+/// after the run has been recorded, so a retry of a report that failed here
+/// finds nothing recorded and does everything, and a retry of one that
+/// succeeded finds the dedupe row and does nothing.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if the rule store cannot be read.
+pub async fn load_rules(ch: &ChClient) -> Result<Vec<AlertRule>, ChError> {
+    list_rules(ch).await
+}
+
+/// [`evaluate_connector_event`] over rules already read with [`load_rules`]:
+/// it cannot fail, and returns each rule a delivery was attempted for with
+/// its outcome (`SRC-17` F1, F2). Non-`SRC-7` kinds deliver nothing.
+pub async fn deliver_connector_event_to(
+    rules: &[AlertRule],
+    http: &reqwest::Client,
+    email: &EmailSender,
+    kind: AlertKind,
+    connector_id: &str,
+    title_prefix: &str,
+    text: &str,
+    silence: Option<&dyn SilenceSource>,
+) -> Vec<RuleDelivery> {
+    if !kind.is_connector_scoped() {
+        return Vec::new();
+    }
+    deliver_to_matching(
+        rules,
+        http,
+        email,
+        silence,
+        kind,
+        RuleScope::Connector(connector_id),
+        title_prefix,
+        text,
+    )
+    .await
 }
 
 /// Deliver every enabled rule of the `SRC-7` `kind` whose connector scope
 /// matches `connector_id` (or is `"*"`), and return the rules a delivery was
-/// attempted for. This is the one public entry point for all six kinds:
+/// attempted for, each with its outcome ([`RuleDelivery`], `SRC-17` F1). This is the one public entry point for all six kinds:
 /// `run_failed_event` and `run_finished_event` call it for
 /// `connector_failure`, `connector_repeated_failure`, `connector_success`
 /// and `upload_failure`; `SRC-11` (auto-disable) will call it for
@@ -1720,7 +1809,7 @@ pub async fn evaluate_connector_event(
     title_prefix: &str,
     text: &str,
     silence: Option<&dyn SilenceSource>,
-) -> Result<Vec<AlertRule>, ChError> {
+) -> Result<Vec<RuleDelivery>, ChError> {
     if !kind.is_connector_scoped() {
         // Not a `SRC-7` kind: nothing to match on the `connector` column.
         return Ok(Vec::new());
@@ -3864,7 +3953,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut ids: Vec<&str> = delivered.iter().map(|r| r.id.as_str()).collect();
+        let mut ids: Vec<&str> = delivered.iter().map(|d| d.rule.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["all", "one"]);
     }
@@ -3962,7 +4051,7 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(delivered.len(), 1);
-            assert_eq!(delivered[0].id, expected);
+            assert_eq!(delivered[0].rule.id, expected);
         }
     }
 
@@ -3987,6 +4076,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(delivered.len(), 1);
+    }
+
+    /// `SRC-17` F1 (delivery review 2026-10-12, D-a): the entry point hands
+    /// back what each delivery did. A webhook answering 500, a host nobody
+    /// listens on, a non-`http` address and an e-mail rule on an installation
+    /// without `SMTP` each give their own fixed reason, and none of those
+    /// reasons contains anything of the other side (status code, address).
+    #[tokio::test]
+    async fn evaluate_connector_event_reports_each_deliverys_outcome_with_a_fixed_reason() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let closed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let server = MockServer::start().await;
+        for (route, status) in [("err", 500), ("ok", 200)] {
+            Mock::given(method("POST"))
+                .and(path(format!("/hooks/{route}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        let down = format!("http://127.0.0.1:{closed_port}/hooks/down");
+        let err = format!("{}/hooks/err", server.uri());
+        let ok = format!("{}/hooks/ok", server.uri());
+        let mut rules = connector_rules_json(&[
+            ("r_ok", "connector_failure", "conn-a", &ok, true),
+            ("r_500", "connector_failure", "conn-a", &err, true),
+            ("r_down", "connector_failure", "conn-a", &down, true),
+            (
+                "r_bad",
+                "connector_failure",
+                "conn-a",
+                "ftp://example.invalid/x",
+                true,
+            ),
+            (
+                "r_mail",
+                "connector_failure",
+                "conn-a",
+                "ops@example.com",
+                true,
+            ),
+        ]);
+        rules["data"][4]["channel"] = serde_json::json!("email");
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rules))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let attempted = evaluate_connector_event(
+            &ch,
+            &http,
+            &email,
+            AlertKind::ConnectorFailure,
+            "conn-a",
+            "Connector failure",
+            "text",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempted.len(), 5);
+        let by_id = |id: &str| {
+            attempted
+                .iter()
+                .find(|d| d.rule.id == id)
+                .unwrap_or_else(|| panic!("no delivery for {id}"))
+        };
+        assert!(by_id("r_ok").result.ok);
+        assert_eq!(by_id("r_ok").result.error, None);
+        for (id, reason) in [
+            ("r_500", "the webhook server answered with an error"),
+            ("r_down", "the webhook server could not be reached"),
+            ("r_bad", "the webhook address was refused"),
+            ("r_mail", "e-mail is not set up on this installation"),
+        ] {
+            let result = &by_id(id).result;
+            assert!(!result.ok, "{id} must not read as delivered");
+            assert_eq!(result.error.as_deref(), Some(reason), "{id}");
+        }
+        for d in &attempted {
+            let text = d.result.error.clone().unwrap_or_default();
+            assert!(
+                !text.contains("500") && !text.contains("127.0.0.1") && !text.contains("ftp"),
+                "upstream text leaked into {}: {text}",
+                d.rule.id
+            );
+        }
     }
 
     /// A pipeline kind passed here is not a `SRC-7` kind: nothing is
