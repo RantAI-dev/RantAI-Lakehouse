@@ -158,4 +158,36 @@ step are *not verified* until CI on the pull request.
 
 ## Review
 
-*(planner)*
+### Review 1, 2026-10-13 (planner), commits `8a05a92`..`616191b`
+
+Read: the whole diff against `ce9d8ed`. Re-run by the reviewer on `616191b`:
+`cargo fmt --check` clean; the workspace clippy command of section 4 clean
+(2m23s, all targets, so every test compiles); `bun run typecheck` clean;
+`bun run lint` 0 errors, 6 warnings in files this branch does not touch;
+`bun run test` 1104 pass, 1 skip, 0 fail (1105 tests, 113 files); the three
+`ops/lint` checks pass; `py_compile` of the two gate files. *Not verified*:
+every Rust test and the gate step, which only the pull request's CI can run.
+
+No `BLOCKER`. No `SHOULD-FIX`.
+
+Accepted, and recorded because they go beyond the plan's words:
+
+- **D-a, narrowed by the developer.** A type change Approve refuses, seen
+  after the load, is recorded `applied` and pauses nothing under every
+  policy, and so is a batch that mixes it with an approvable change. As
+  written, D-a would have made it `pending` under `pause` and recreated the
+  stuck state. This is the rule `SRC-8 review BLOCKER 3a` already applies
+  before the load. Accepted.
+- **D-b.** The lift check reads the connector's pending rows and applies
+  `mark_approvable` in Rust, because "cannot be loaded" is decided there.
+  One rule, as the plan asked.
+- **D-d, a limit.** Migration `0067` releases a paused connector with no
+  pending row. A connector paused with only unapprovable rows pending (F2
+  reached before this fix) is not released by it; choosing another policy
+  than "pause", or removing the table, releases it. The console now says so.
+- **After D-c on an after-load source.** A change left pending when the
+  policy leaves `pause` is recorded `applied` by the next run and the stale
+  pending row is withdrawn by the observation's own delete. Read, not run.
+
+Open for the product owner: a browser check of the Schema changes tab's two
+new notes.
