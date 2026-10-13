@@ -356,6 +356,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               connectorId={id}
               connectorType={c.type}
               policy={c.schemaChangePolicy}
+              pausedReason={c.pausedReason}
               onChanged={state.reload}
               onWaiting={onWaiting}
             />
