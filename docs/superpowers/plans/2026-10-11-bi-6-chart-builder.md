@@ -286,6 +286,19 @@ Console only; no route, no Rust, no change to a chart definition (stored names s
 
 **Not verified.** Everything in a browser (happy-dom does not lay out): that the arbitrary-variant grid rule and `minmax(0,1fr)` really remove the scroll at the minimum dialog width, the popup's width and position, the legend truncation and its tooltip in ECharts, that the ECharts `legend.tooltip` and `textStyle.overflow` render as intended in the installed version (only the option object is tested). The `sm` breakpoint is the viewport's, not the pane's, so with the form pane at half width the two-column rows can be narrow. A full `bun run test` was not run. No cargo command was run.
 
+### Handoff — builder round 4 (developer, 2026-10-15, on top of `4ff66f0c`)
+
+Console only. Findings R17 to R20 of "Chart builder, round 4".
+
+- R17: the folded type menu is now a `@base-ui/react/popover` (the family the dialog and `Select` are made of), controlled by `kindMenu`; the hand-made inline panel is gone. The repo's `components/ui/popover.tsx` is the Radix one, whose portal a base-ui dialog counts as an outside press, so it was not used (no new dependency: `@base-ui/react` is already installed). Outside press and Escape close only the popover, focus returns to the trigger, search and Enter-to-pick are unchanged. Tests: Escape closes and focus is back on the trigger with the dialog still open; a press outside closes it.
+- R18: see "Verified for R18" below. No code change was needed.
+- R19: `NextButton` and its two uses removed, with the `missingIn` helper that only they used; the test for Next became a test that there is none and that opening a heading still folds the open section.
+- R20: the metric and segment editors' Source select takes `items`, so the closed trigger shows the name (SQL sources: title with a small "SQL" tag, also in the list) instead of `mart:...`; `SourceChoice` has a `tag`, the label no longer starts with "SQL ·" (`source-choice-label.tsx`). The default title is built from `columnRef(...).text` (metric label, joined column's own name) in the builder, `suggestChartTitle` is unchanged. "Value now" goes through `formatNumber(n, decimalsFor([n]))` (numeric strings too; 1177.0253164556962 reads 1,177). The breadcrumb draws the chevron only when the kind follows it (list open); folded, the kind is on the menu button.
+
+Verified for R18 (happy-dom, no layout): at a wide media query the builder draws one `ResizableHandle` with `role="separator"`, `aria-orientation="vertical"`, `tabindex=0`, between two `ResizablePanel`s, the first holding the form, the second the preview (test "draws a focusable separator..."). By reading: `react-resizable-panels` 4.14.4 gives each Panel `min-width: 0` and `overflow: hidden`, sizes are percentages (`defaultSize="50"` string = percent, `minSize="30"`), and the form sits inside `h-full min-w-0 overflow-y-auto`; the sections' `grid-cols-[minmax(0,1fr)]` can therefore not widen the panel, and the panel width is decided by the library, not the content. Nothing in round 1 to 3 changed the group, panels or handle markup. NOT verified (needs a browser): that a pointer drag moves the divider, that the arrow keys on the focused handle resize, and that double-click resets; happy-dom does no layout, so `aria-valuenow` and the pointer maths cannot be exercised.
+
+Commands: `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings (all in files this round did not touch); `bun test src/features/dashboards` 228 pass, 0 fail; `bun test src/lib` 722 pass; `bun test src/components` 27 pass; `chart-builder.test.tsx` alone 25 pass. Not run: Rust, `bun install`, browser.
+
 ## 8. Review (planner appends)
 
 ### BI-6 part 1 — smoke check and planner answers (reviewer, 2026-10-11)
