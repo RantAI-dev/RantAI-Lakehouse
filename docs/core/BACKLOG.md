@@ -105,7 +105,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | AI Copilot | P2 | Todo |  | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BLD-1` | Feature | Joins and aggregations in the pipeline builder | Build | P2 | Idea |  | PRODUCT §2 |
+| `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. **Waits for `BLD-3`** | Build | P2 | Planned |  | PRODUCT §2; [spec](specs/bld-1.md) |
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer) | Dashboards | P2 | Planned |  | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
@@ -116,9 +116,9 @@ estimate (S, M, L), which the base has no field for.
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
 | `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Todo |  | `README.md` |
-| `DATA-2` | Task | Trim old copies in published Gold tables | Build | P2 | Todo |  | `features/gold-publish-per-mart.md` |
+| `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. **Waits for `DATA-10`** | Build | P2 | Todo |  | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
 | `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Todo |  | Slice B review, gold-publish plan |
-| `DATA-6` | Feature | A "latest copy only" view for outside readers of published tables | Build | P2 | Idea |  | `features/gold-publish-per-mart.md` |
+| `DATA-6` | Feature | A "latest copy only" table for outside readers of published tables. **Waits for `DATA-2`** | Build | P2 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-6.md) |
 | `SEC-4` | Task | Human security review | Administration & Security | P2 | Todo |  | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decision | Decide a support commitment | Business | P2 | Open |  | PRODUCT §4 blocker 5 |
 | `OPS-7` | Task | Test and time a restore from backup | Operations | P2 | Todo |  | PRODUCT §2 |
@@ -144,7 +144,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-25` | Task | Time travel follow-ups from the `DATA-16` review: a past version that does not exist reaches the Query Studio response as ClickHouse's own text (principle 4); the Trino refusal (422) for a past-version query has no route-level test | Data | P2 | Todo |  | PR #100 review |
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. **Waits for `BLD-3`** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -186,11 +186,11 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | P3 | Planned |  | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
-| `BLD-2` | Feature | Tables that refresh themselves when their inputs change | Build | P3 | Idea |  | PRODUCT §2 |
+| `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. **Waits for `BLD-3`, `DATA-10`** | Build | P3 | Planned |  | PRODUCT §2; [spec](specs/bld-2.md) |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
-| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy | Build | P3 | Idea |  | ADR 0010 |
-| `DATA-4` | Feature | Publish Silver in open format | Build | P3 | Idea |  | `features/gold-publish-per-mart.md` |
+| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Waits for `DATA-4`** and a new ADR | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
+| `DATA-4` | Feature | Publish Silver in open format. **Waits for `DATA-10`, `DATA-2`** | Build | P3 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-4.md) |
 | `DATA-5` | Task | Measure outside readers of published tables | Build | P3 | Todo |  | `routes::gold::consumers` |
 | `BI-3` | Feature | Import dashboards from Tableau and Power BI | Dashboards | P3 | Idea |  | PRODUCT §2 |
 | `BI-20` | Feature | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | P3 | Idea |  | `reference/competitive-comparison.md` (BI matrix) |
@@ -372,6 +372,17 @@ builds it (`AGENTS.md`).
 | [`DATA-19`](specs/data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
 | [`SRC-4`](specs/src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](specs/src-3.md) | Connectors for business apps | Later | L |
+
+### Pipelines (Build)
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`BLD-1`](specs/bld-1.md) | Joins, aggregations and a SQL step | Next | L, in two parts |
+| [`BLD-2`](specs/bld-2.md) | Tables that refresh themselves within a target lag | Later | L |
+| [`DATA-2`](specs/data-2.md) | Keep the last copies of a published Gold table | Next | M |
+| [`DATA-6`](specs/data-6.md) | A latest-copy-only table for outside readers | Next | S |
+| [`DATA-4`](specs/data-4.md) | Publish Silver in open format | Later | M |
+| [`DATA-3`](specs/data-3.md) | Store Gold in open format first | Later | L |
 
 ### Query Studio
 
