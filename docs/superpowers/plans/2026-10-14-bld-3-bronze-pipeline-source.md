@@ -303,13 +303,236 @@ past `in_scope` at all, so both now seed a row and call as
    docker compose --profile '*' config --quiet   # rc 0, no output
    ```
 
+6. **The real local run of the `g3a-dagster` job, from a clean
+   project — PASS, twice.**
+
+   `.local/ci-g3a-g7.sh` runs the job's steps in the job's order, on
+   project `bld3`, profile `dagster`, under one `flock`: `down -v`;
+   write the CI-only `.env` (the same six values `ci.yml` writes, deleted
+   again at the end); build the two images at THIS commit plus the
+   `oidc-mock` fixture; `up -d --no-build lakehouse-api
+   dagster-code-location dagster-webserver dagster-daemon
+   g3a-source-init`; `run --rm g3a-test-runner`; `run --rm
+   g7-test-runner`; dump the code-location log; `down -v`.
+
+   Run 1, from a clean project with the images built from scratch:
+
+   ```
+   GIT_SHA=a01e34dba77e6a66b4b3887be1b32d2f3e2264ab
+   build rc=0 in 431s
+   up rc=0 in 23s
+   g3a rc=0 in 44s
+   g7  rc=0 in 35s
+   ```
+
+   Run 2, same script, images rebuilt at the same commit from cache (5s),
+   this time with the runners' output captured rather than swallowed by
+   `>/dev/null` (run 1's log kept only the exit codes — a script bug,
+   fixed, not a product change):
+
+   ```
+   build rc=0 in 5s
+   up rc=0 in 22s
+   g3a rc=0 in 40s
+   g7  rc=0 in 35s
+   SUMMARY g3a_rc=0 g7_rc=0 up_rc=0 build_rc=0
+   ```
+
+   g7's output lines, verbatim from run 2:
+
+   ```
+   [g7] logged in as bootstrap admin
+   [g7] authored pipeline 'pl-g7-dedupe-select-mv86vkg9' created and activated
+   [g7] ready: run 98db5d9f-9e98-49ab-9b3c-b74cd81ebe53 terminal
+   [g7] run 98db5d9f-9e98-49ab-9b3c-b74cd81ebe53 reports real row materializations
+   [g7] silver.g7_dedupe_select_out holds 2000 rows = the 2000 distinct ids of bronze.g3a_orders
+   [g7] 'bronze_maintenance_job' graph has 3 op(s); source contains 'list_bronze_tables'
+   [g7] PASS
+   ```
+
+   **g7 wall time: 35 s** (34 s in run 1, 30 s in the first session's run
+   at `f8d4e76f`). That is the number `timeout-minutes: 30` in the CI job
+   was set from, and it still holds on this branch's head after the
+   merge of #80. g3a's own line for the record: `[g3a] PASS`, 40 s.
+
+   Both runs ended in `down -v`; `docker ps -a --filter name=bld3` is
+   empty afterwards, and `git status` shows only the untracked
+   `.local/`.
+
+   Extra diagnostic run for section 6 question 3 below
+   (`.local/probe-dedupe.sh`, same clean-project shape, CI-only `.env`,
+   ends in `down -v`): `.local/logs/probe-dedupe3.log`.
+
 ### Section 6 answers
 
-(Appended after the run.)
+**T1's real error text, verbatim** (from commit `4c5dabfb`, reproduced
+on `main`'s code with a clean `-p bld3` stack, G3a first then g7):
+
+```
+[g7] authored pipeline 'pl-g7-dedupe-select-mv7tszyb' created and activated
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url:
+  http://clickhouse:8123/
+  File "authored_factory.py", line 443, in _run
+    written = _write_clickhouse_table(ch, target_zone, target_table, select_sql)
+  File "authored_factory.py", line 293, in _ensure_target_table
+  File "bronze_catalog.py", line 210, in _ch_exec -> resp.raise_for_status()
+Exceeded max_retries of 2  (run failed after 1m59s)
+```
+
+**1. Does `CREATE TABLE ... ENGINE = MergeTree ... AS SELECT ... FROM
+<catalog db>.`bronze.t` LIMIT 0` infer the column types correctly?**
+Yes. Measured on a running stack (`.local/probe-types.sh`,
+`.local/logs/probe4.log`), on the exact shape the op sends with
+`SETTINGS` last:
+
+```
+CREATE TABLE IF NOT EXISTS silver.`probe_all_cols` ENGINE = MergeTree
+  ORDER BY tuple() AS SELECT * FROM icecat_authored.`bronze.g3a_orders`
+  LIMIT 0 SETTINGS allow_database_iceberg = 1        -- status 200
+DESCRIBE TABLE silver.`probe_all_cols`
+  id             Int64
+  customer       String
+  amount         Decimal(12, 2)
+  created_at     DateTime64(6, 'UTC')
+  _ingested_at   Nullable(DateTime64(6, 'UTC'))
+  _dlt_load_id   String
+  _dlt_id        String                              -- status 200
+INSERT INTO silver.`probe_all_cols` SELECT * FROM
+  icecat_authored.`bronze.g3a_orders`
+  SETTINGS allow_database_iceberg = 1                -- status 200
+SELECT count() FROM silver.`probe_all_cols`          -- 2000
+```
+
+The `DESCRIBE` of the Iceberg source and of the MergeTree table it
+created are identical, column for column: `Nullable` stays `Nullable`,
+`Decimal(12,2)` stays `Decimal(12,2)`, timestamps stay `DateTime64(6,
+'UTC')`. Also measured (D2's "put the setting where ClickHouse accepts
+it"): `SETTINGS` **after** `LIMIT 0` is accepted; putting it before
+`LIMIT 0` is a syntax error —
+
+```
+Code: 62. DB::Exception: Syntax error: failed at position 204 (LIMIT):
+LIMIT 0. Expected one of: UNION, EXCEPT, INTERSECT, ... (SYNTAX_ERROR)
+```
+
+— which is why `_reading` appends `SETTINGS` to the whole statement
+(`authored_factory.py:322`).
+
+**2. Which ClickHouse user, and can it read the catalog database with
+authz on?** `default`, and yes. `SELECT currentUser()` sent from inside
+`dagster-code-location` returns `default` (`.local/logs/probe2.log`);
+that is `bronze_catalog.py:78-79` reading `CH_USER`/`CH_PASSWORD`,
+whose compose defaults are `default` and empty
+(`docker-compose.yml:160-161`). With authz on (the compose default
+installs `clickhouse-iceberg-init`, `clickhouse-oauth-init`), the same
+identity created `icecat_authored` as a `DataLakeCatalog` and read
+2000 rows out of it through `lakekeeper` + `oidc-mock` OAuth
+(`catalog_credential`/`oauth_server_uri`), status 200. So the refusal in
+the API and the op is the only place that needed to change; the read
+identity needed nothing.
+
+**3. Does `ORDER BY ... LIMIT 1 BY` dedupe behave the same over an
+Iceberg source?** Yes — measured this session, because the first
+session's measurement did not answer it. `.local/probe-dedupe.sh` sends
+the shape `_build_select_sql` actually builds (`authored_factory.py:377`:
+the dedupe on the OUTER select that reads the Iceberg table, `SETTINGS`
+last) over a source doubled with `UNION ALL` so duplicates exist — the
+G3a fixture's own ids are unique, so g7's green 2000 rows do **not**
+exercise dedupe:
+
+```
+SELECT count() FROM (SELECT id, customer FROM icecat_authored.`bronze.g3a_orders`
+                     UNION ALL SELECT id, customer FROM icecat_authored.`bronze.g3a_orders`)
+                                                        -- 4000  (control, no dedupe)
+SELECT count() FROM (SELECT id, customer FROM (
+      SELECT id, customer FROM icecat_authored.`bronze.g3a_orders`
+      UNION ALL SELECT id, customer FROM icecat_authored.`bronze.g3a_orders`)
+      ORDER BY id LIMIT 1 BY id SETTINGS allow_database_iceberg = 1)
+                                                        -- 2000  (the op's shape)
+```
+
+4000 → 2000: the dedupe collapses exactly as it does over a MergeTree
+source. The earlier probe (`.local/logs/probe2.log`) measured **4000 and
+4000** and so answered nothing — it had put `ORDER BY .. LIMIT 1 BY`
+*inside* the subquery it then counted, a shape the op never sends. Named
+here so the reviewer does not read that log as a contradiction.
+
+**4. Any other caller that builds `bronze.<table>` as a ClickHouse name
+for an authored pipeline?** No. Swept `src/`, `rust/crates/`,
+`dagster/` and `ops/` for the broken shape: it existed only in
+`authored_factory._resolve_source`, which T2 fixed. Every other Bronze
+read already goes through a per-component `DataLakeCatalog` database:
+`icecat_api` (`routes/catalog_source.rs:142`, the one canonical helper,
+over `config.iceberg_query_db`), `icecat_ingest`
+(`connector_catalog.py:59`), `icecat_maintenance` (`maintenance.py`),
+`icecat_authored` (T2), and `icecat_g3a` / the gates' own `CATALOG_DB`
+(`ops/g3a`, `ops/g7`, `ops/g6`, `ops/g8`, `ops/g9`). Reported, not
+fixed, because none of them is broken:
+
+- `src/lib/uploads.ts:292` builds `` `bronze.${table}` `` — that is the
+  Iceberg namespace the API and Data Explorer use, not a ClickHouse
+  database.
+- `src/lib/asset-query.ts:39` can build `<namespace>.<name>` with
+  `engine: "clickhouse"`, but a Bronze asset takes the earlier branch
+  at `:37` (Trino) or the API's own `queryTarget`
+  (`icecat_api.`bronze.<t>``); `:89` even refuses the snapshot link
+  unless the name contains `` `bronze. `` inside a catalog database.
+- `lake.`bronze_meta.*`` (`routes/catalog.rs`, `bronze_catalog.py`,
+  `gold_export.py`) is the console's MergeTree **metadata registry**, a
+  different database.
+- `bronze.<table>` as a policy key / lineage node id
+  (`routes/catalog.rs`, `routes/lineage.rs`, `sql_rewrite.rs`) is a
+  key, never SQL.
+
+And, to answer the shape of the question directly: **neither the console
+nor the assistant builds pipeline SQL at all**, so neither can carry
+this defect. The console collects and displays `sourceZone`/
+`sourceTable` only (`pipeline-definition.tsx:281` says the orchestrator
+builds the SQL from the transforms); `routes/mod.rs` registers no
+preview/dry-run route for authored pipelines; the assistant's
+`create_pipeline` (`routes/ai/tools/pipelines.rs`) forwards the body to
+`routes::pipelines::create`, which persists it. What they *do* preview is
+a user's own SQL, or a catalog asset through the API's catalog database.
 
 ### Not verified
 
-(Appended at the end.)
+- **`bun run test` as one process was deliberately not run.** On this
+  machine that single process reaches 7.2 GB and is killed (the machine
+  rule this session was given). The same files were run per folder:
+  `pass=1284 fail=0 skip=2`, no folder exited non-zero. A CI job that
+  runs the whole suite in one process is therefore *not* covered by
+  anything measured here.
+- **CI itself was not observed.** No PR was opened and no CI run was
+  read. The local run in item 6 is the job's steps replayed by hand, not
+  a green check on GitHub.
+- **Compose: only the `dagster` profile was really brought up.** That is
+  the profile this slice's new service (`g7-test-runner`, T1) belongs
+  to, and it was really run twice, on clean projects. The other
+  profiles were only `config --quiet`-checked. No profile outside
+  `dagster` was changed by this slice.
+- **`cargo test --workspace` includes doc-tests** (14 of the 97 suites);
+  they are counted in the 4742. It is not a separate number because
+  the workspace run reports them inline.
+- **The pytest marker split CI uses was not reproduced as two runs.**
+  Both halves were covered in one: `pytest dispar_orchestrate -q` with
+  no marker filter ran all 1039, of which 258 carry `-m loader`
+  (`--collect-only -m loader`: "258/1039 tests collected (781
+  deselected)"). No test was deselected in the real run and nothing was
+  skipped.
+- **Masking across zones (D5) is untouched and unmeasured** — out of
+  scope by decision, recorded by the planner as its own backlog item.
+- **A stored pipeline with a `bronze` target left in the database** (the
+  D4 case that is not migrated away) is asserted at the route level and
+  in the op's unit tests, but no such row was seeded on a real stack
+  and run end to end. What the stack run does cover is the
+  `bronze`->`silver` happy path.
+- **The first session's probe logs were read, not re-run.** Questions 1
+  and 2 of section 6 are answered from `.local/logs/probe4.log` and
+  `.local/logs/probe2.log`, which were measured at `ad3db91e`/`bcd9b546`,
+  not at this head. Question 3 was re-measured at this head because the
+  earlier measurement did not answer it (see section 6, Q3). Nothing in
+  the merge of #80 or in the g7 reword touched any statement those two
+  probes sent, and the g7/g3a run at this head exercises the same reads.
 
 ## 8. Review
 
