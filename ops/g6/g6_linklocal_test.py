@@ -189,7 +189,7 @@ def step_rest_link_local() -> None:
     )
     if not spec_resp.ok:
         raise SystemExit(f"[g6-linklocal] set ingest-spec failed: {spec_resp.status_code} {spec_resp.text}")
-    run_resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
+    run_resp = _post_ingest_run(connector_id)
     run_id = run_resp.json().get("runId")
     if not run_id:
         raise SystemExit(f"[g6-linklocal] no runId launched: {run_resp.text}")
@@ -234,7 +234,7 @@ def step_kafka_spoofed_advertised_broker() -> None:
     )
     if not spec_resp.ok:
         raise SystemExit(f"[g6-linklocal] set ingest-spec for kafka-spoofed failed: {spec_resp.status_code} {spec_resp.text}")
-    run_resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", timeout=10)
+    run_resp = _post_ingest_run(connector_id)
     run_id = run_resp.json().get("runId")
     if not run_id:
         raise SystemExit(f"[g6-linklocal] no runId launched for kafka-spoofed: {run_resp.text}")
@@ -248,11 +248,33 @@ def step_kafka_spoofed_advertised_broker() -> None:
     _assert_rejected(connector_id=connector_id, label="kafka advertised-broker spoof")
 
 
+def _post_ingest_run(connector_id: str) -> requests.Response:
+    """POST ingest/run, retried only while the API says the orchestrator is
+    not ready: 503 with `code` `orchestrator_job_not_loaded` or
+    `orchestrator_unreachable`. Dagster's own error text no longer reaches a
+    response (SEC-11), so the code is the only signal (PR #105 CI fix). At
+    most three launches, each after waiting for the job to be listed; any
+    other answer is returned for the caller's own check."""
+    url = f"{API_URL}/api/connectors/{connector_id}/ingest/run"
+    resp = API.post(url, timeout=10)
+    for _ in range(2):
+        try:
+            code = resp.json().get("code")
+        except (ValueError, AttributeError):
+            code = None
+        if resp.status_code != 503 or code not in ("orchestrator_job_not_loaded", "orchestrator_unreachable"):
+            break
+        print(f"[g6-linklocal] ingest/run answered {code}; waiting for ingest_job to load")
+        _wait_for_ingest_job()
+        resp = API.post(url, timeout=10)
+    return resp
+
+
 def _wait_for_ingest_job(timeout_s: int = 120) -> None:
     """Wait until Dagster's code location lists `ingest_job`. The webserver
     answering is not enough: compose can recreate `dagster-code-location`
     when this runner starts, and an `ingest/run` in that window fails with
-    PipelineNotFoundError (seen in CI) instead of reaching the SSRF
+    PipelineNotFoundError (seen in CI; the API now answers `code: orchestrator_job_not_loaded`) instead of reaching the SSRF
     assertion this file exists for."""
     query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
     deadline = time.time() + timeout_s

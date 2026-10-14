@@ -186,17 +186,29 @@ def _dagster_job_is_loaded(job_name: str) -> bool:
     return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
 
 
+def _job_not_loaded(resp: requests.Response) -> bool:
+    """Whether the API answered "the orchestrator has not loaded this job
+    yet": 503 and the stable `code`, never the message text. SEC-11 removed
+    Dagster's `PipelineNotFoundError` text from responses, which this gate
+    used to match (PR #105 CI fix)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return resp.status_code == 503 and isinstance(body, dict) and body.get("code") == "orchestrator_job_not_loaded"
+
+
 def _post_trigger(url: str, job_name: str) -> requests.Response:
     """POST a trigger with a one-shot retry for the code-location start-up
     race. SRC-9 F-c: `ops/g3/g3_test.py::_post_trigger` (its twin, and
     `ops/g6/g6_ingest_matrix_test.py::_post_ingest_run`) hit
     `422 {"error":"PipelineNotFoundError"}` when the first trigger came
-    before the code location had loaded. On that 422, wait up to 120 s for
+    before the code location had loaded. On that 503 `orchestrator_job_not_loaded`, wait up to 120 s for
     Dagster to list `job_name` (here the fixture job, which lives in the
     same code location as the authored pipeline's job) and POST once more. Any other failure is
     returned unchanged for the caller's own assertion."""
     resp = API.post(url, timeout=30)
-    if resp.ok or resp.status_code != 422 or "PipelineNotFoundError" not in resp.text:
+    if resp.ok or not _job_not_loaded(resp):
         return resp
     print(f"[g7] trigger hit the code-location start-up window; waiting for {job_name} to load")
     _wait_for(f"Dagster code location ({job_name} loaded)", lambda: _dagster_job_is_loaded(job_name), 120)
