@@ -244,6 +244,42 @@ past `in_scope` at all, so both now seed a row and call as
    killed on this machine. `skip=2` is the same two skips the full run
    reports; no test folder failed.
 
+3. **Python lint scripts — FAILED on this branch's own code, fixed,
+   re-run green.**
+
+   ```
+   python3 ops/lint/check_intra_package_imports.py   # rc 0
+   python3 ops/lint/check_bare_iceberg_count.py      # rc 1 (see below)
+   ```
+
+   First run of `check_bare_iceberg_count.py` exited 1 with two
+   findings, both on lines **T5/D7 added** to
+   `ops/g7/g7_pipeline_test.py`:
+
+   ```
+   ops/g7/g7_pipeline_test.py:362: bare count() against an Iceberg/Bronze table (R11)
+   ops/g7/g7_pipeline_test.py:401: bare count() against an Iceberg/Bronze table (R11)
+   ```
+
+   Neither is SQL. Line 362 is the new step's own docstring prose
+   (`must hold exactly \`count(DISTINCT id)\` rows`), line 401 is a
+   `G7Failure` message; the guard is a +-800-char text heuristic, so
+   both pair a literal `count(` with `bronze.`. The guard's own
+   docstring names the fix for this case — *"reword the comment, not
+   weaken the check"* — so both were reworded in their own commit
+   (rule 2: the check was not touched). The SQL never changed and was
+   already right: the Bronze side carries `WHERE 1` and reads through
+   the gate's `DataLakeCatalog` database, the Silver side is a plain
+   MergeTree table.
+
+   ```
+   python3 ops/lint/check_intra_package_imports.py   # rc 0
+   python3 ops/lint/check_bare_iceberg_count.py      # rc 0
+   python3 ops/lint/check_bare_iceberg_count.py      # "R11 guard: no bare
+                                                    #  count() against a Bronze
+                                                    #  Iceberg table found."
+   ```
+
 ### Section 6 answers
 
 (Appended after the run.)
