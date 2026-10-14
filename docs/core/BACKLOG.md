@@ -55,7 +55,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-23` | Task | Adding a quality, classification or residency rule asked only for a login, while changing one asks for `governance:write`; adding now asks for it too, in the API, the assistant's tools and the console | Administration & Security | P1 | Done | #97 | `features/governance-rule-create.md` |
 | `DATA-1` | Feature | Gold tables publish to open format automatically, as an option per table | Build | P1 | In Acceptance | #60, #63, #64 | `features/gold-publish-per-mart.md` |
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
-| `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history | Administration & Security | P1 | Todo |  | `SECURITY.md` |
+| `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history. Decided 2026-10-14: no rewrite; the key and the staging values are rotated (product owner) and their history findings are baselined by exact fingerprint in `.gitleaksignore` | Administration & Security | P1 | Done | TBD | `SECURITY.md` |
 | `REL-1` | Task | Protect the main branch | Delivery | P1 | Todo |  | `docs/CI.md` |
 | `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Todo |  | PRODUCT §6 |
 | `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
@@ -63,7 +63,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Todo |  | `routes/support.rs` |
 | `SEC-14` | Feature | A stored connector password can be stolen by re-pointing the connector: a host change keeps the secret and the next test sends it to the new server | Administration & Security | P0 | Building | #85 | `routes/connectors.rs`, `connector_probe.rs` |
 | `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | In Acceptance | #82 | `docker-compose.yml`, `connector_probe.rs` |
-| `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Todo |  | commit `7ec3a81` |
+| `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Done | #130 | commit `7ec3a81` |
 | `SEC-24` | Task | The assistant's system prompt gives any signed-in user the DATA MAP (tables, row counts, sample values) without `catalog:read`; a Dashboard Viewer sees samples Query Studio would refuse it. Give the map only with `catalog:read`, and sample values only with `query:read` | Administration & Security | P1 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SEC-9` gap) |
 | `BLD-3` | Task | A pipeline built in the console cannot read a Bronze table, so Bronze to Silver does not run: the job reads its source as the ClickHouse table `<sourceZone>.<sourceTable>`, and ClickHouse has no `bronze` database; Bronze is Iceberg, readable only through a `DataLakeCatalog` database (`icecat_api`, tables named `bronze.<table>`). The console and the assistant still offer Bronze as a source. Read the source through the job's own `DataLakeCatalog` database, as `maintenance.py` does, with masking and governance still applied; prove it on a running stack, which needs `SRC-20`. Found by reading the code after a user report, not yet reproduced | Build | P1 | Todo |  | `authored_factory.py` (`_op_for_pipeline`), `scripts/seed-clickhouse.sql` |
 | `SEC-28` | Task | A pipeline built in the console can be read, edited, deleted, restored, run and paused by its ID from another organisation: the per-ID pipeline routes and the run routes do not check the caller's tenant. Also: run settings checked by top-level key only; a restored version is not validated; orchestrator error text in some responses. Fixed on the branch of PR #80, written before this backlog tracked it | Administration & Security | P1 | Done | #80 | PR #59 review (F2); PR #80 review |
@@ -236,6 +236,8 @@ set by the product owner and are left empty until they are.
 | `SRC-10` | 2026-10-12 | 2026-10-14 | |
 | `SRC-21` | 2026-10-14 | 2026-10-14 | |
 | `SEC-28` | 2026-10-07 | 2026-10-14 | |
+| `SEC-13` | 2026-10-13 | 2026-10-14 | |
+| `SEC-1` | 2026-10-14 | 2026-10-14 | |
 
 ## Decide
 
