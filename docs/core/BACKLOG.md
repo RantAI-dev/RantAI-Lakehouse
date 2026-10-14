@@ -65,6 +65,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-15` | Feature | Connection tests can reach internal addresses: the block is off by default in compose, the REST test follows redirects, no address pinning, CDC delete skips the check | Administration & Security | P0 | In Acceptance | #82 | `docker-compose.yml`, `connector_probe.rs` |
 | `SEC-13` | Task | Check `.env.staging`, pushed straight to `main` in `7ec3a81`, for real credentials or hostnames; rotate anything real | Administration & Security | P1 | Todo |  | commit `7ec3a81` |
 | `SEC-24` | Task | The assistant's system prompt gives any signed-in user the DATA MAP (tables, row counts, sample values) without `catalog:read`; a Dashboard Viewer sees samples Query Studio would refuse it. Give the map only with `catalog:read`, and sample values only with `query:read` | Administration & Security | P1 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SEC-9` gap) |
+| `BLD-3` | Task | A pipeline built in the console cannot read a Bronze table, so Bronze to Silver does not run: the job reads its source as the ClickHouse table `<sourceZone>.<sourceTable>`, and ClickHouse has no `bronze` database; Bronze is Iceberg, readable only through a `DataLakeCatalog` database (`icecat_api`, tables named `bronze.<table>`). The console and the assistant still offer Bronze as a source. Read the source through the job's own `DataLakeCatalog` database, as `maintenance.py` does, with masking and governance still applied; prove it on a running stack, which needs `SRC-20`. Found by reading the code after a user report, not yet reproduced | Build | P1 | Todo |  | `authored_factory.py` (`_op_for_pipeline`), `scripts/seed-clickhouse.sql` |
+| `SEC-28` | Task | A pipeline built in the console can be read, edited, deleted, restored, run and paused by its ID from another organisation: the per-ID pipeline routes and the run routes do not check the caller's tenant. Also: run settings checked by top-level key only; a restored version is not validated; orchestrator error text in some responses. Fixed on the branch of PR #80, written before this backlog tracked it | Administration & Security | P1 | In Progress | #80 | PR #59 review (F2); PR #80 review |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
 ## Next (P2)
@@ -103,7 +105,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | AI Copilot | P2 | Todo |  | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26` | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BLD-1` | Feature | Joins and aggregations in the pipeline builder | Build | P2 | Idea |  | PRODUCT §2 |
+| `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. **Waits for `BLD-3`** | Build | P2 | Planned |  | PRODUCT §2; [spec](specs/bld-1.md) |
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer) | Dashboards | P2 | Planned |  | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
@@ -114,9 +116,9 @@ estimate (S, M, L), which the base has no field for.
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
 | `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Todo |  | `README.md` |
-| `DATA-2` | Task | Trim old copies in published Gold tables | Build | P2 | Todo |  | `features/gold-publish-per-mart.md` |
+| `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. **Waits for `DATA-10`** | Build | P2 | Todo |  | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
 | `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Todo |  | Slice B review, gold-publish plan |
-| `DATA-6` | Feature | A "latest copy only" view for outside readers of published tables | Build | P2 | Idea |  | `features/gold-publish-per-mart.md` |
+| `DATA-6` | Feature | A "latest copy only" table for outside readers of published tables. **Waits for `DATA-2`** | Build | P2 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-6.md) |
 | `SEC-4` | Task | Human security review | Administration & Security | P2 | Todo |  | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decision | Decide a support commitment | Business | P2 | Open |  | PRODUCT §4 blocker 5 |
 | `OPS-7` | Task | Test and time a restore from backup | Operations | P2 | Todo |  | PRODUCT §2 |
@@ -142,7 +144,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-25` | Task | Time travel follow-ups from the `DATA-16` review: a past version that does not exist reaches the Query Studio response as ClickHouse's own text (principle 4); the Trino refusal (422) for a past-version query has no route-level test | Data | P2 | Todo |  | PR #100 review |
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. **Waits for `BLD-3`** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Waits for `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -152,6 +154,10 @@ estimate (S, M, L), which the base has no field for.
 | `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names | AI Copilot | P2 | In Acceptance | #81 | `features/chat-ask-back.md` |
 | `WEB-1` | Feature | Landing page at `/landing`: a 3D night lake with the logo's creature, and a scroll story through sources, the Bronze/Silver/Gold layers, the assistant, dashboards, governance and open source. Copy limited to what is built | Business | P2 | In Acceptance | #107 | `superpowers/plans/2026-10-11-landing-page.md` |
 | `REL-3` | Task | `package-lock.json` is stale: it lacks packages `package.json` lists (`@dnd-kit/core` and others). Delete it (bun is the package manager; CI and the Dockerfile read `bun.lock`) or regenerate it, in a PR of its own | Delivery | P3 | Done | TBD | WEB-1 review round 1 |
+| `REL-4` | Task | Move the console to TypeScript 7 (the new compiler); dependabot #136 fails typecheck and build. Dependabot ignores TypeScript majors until this is planned | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-5` | Task | Move to eslint 10 and its flat-config changes; dependabot #143 fails lint. Dependabot ignores eslint majors until this is planned | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-6` | Task | Move the data grids to TanStack Table 9; dependabot #133 fails typecheck. Dependabot ignores its majors until this is planned | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-7` | Task | arrow and parquet 60 with a newer `iceberg` crate: `iceberg = "=0.10.1"` still uses arrow 58, so #139, #140 and #142 fail to compile. **Waits for** an `iceberg` release on arrow 60; dependabot now groups the three | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
 | `SEC-6` | Task | Stop older API handlers from returning internal error text | Administration & Security | P2 | Todo |  | `AGENTS.md` |
 | `SEC-16` | Task | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Administration & Security | P2 | Todo |  | Data module code audit |
 | `SEC-17` | Task | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Administration & Security | P2 | Todo |  | Data module code audit |
@@ -166,6 +172,8 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-17` | Task | Load-failure alert delivery: a failed delivery is recorded as if sent (feature-page row 5 cannot pass); a rule-store failure loses the alert because the dedupe row is written first; the Alerts page still says nothing raises `connector_schema_change`; a gate step that receives a webhook, and `SRC-7-RESULT.md` with measured seconds | Data | P2 | In Progress | #124 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-7`) |
 | `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
 | `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | Todo |  | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
+| `SEC-29` | Task | 25 responses in `routes/pipelines.rs` put the orchestrator's error text in the body (`js_error(err)`; `DagsterError::Server` is Dagster's own GraphQL text). Same rule as `SEC-6`: a fixed body, the detail to `tracing` | Administration & Security | P2 | Todo |  | PR #80 review |
+| `GOV-4` | Task | A masking policy on a column does not follow its rows through a pipeline: the pipeline copies unmasked rows into its Silver or Gold table, and the policy on the source column does not apply to the copy. Decide whether policies carry to outputs or outputs must be classified again | Governance | P2 | Todo |  | `BLD-3` plan, D5 |
 | `SRC-20` | Task | The pipeline gate `ops/g7` is run by no CI job | Data | P3 | Todo |  | `plans/SRC-9-RESULT.md` |
 | `SRC-21` | Task | Load-mode follow-ups from `SRC-10`: the assistant's `set_ingest_spec` schema does not know `loadMode` or `primaryKey`, so a spec it saves drops each table's mode and key (the job then replaces); no test covers a pending removal of a key column next to an approvable change when the pause is lifted | Data | P2 | Done | #145 | PR #115 review; `superpowers/plans/2026-10-14-src-21-load-modes-followups.md` |
 | `DATA-24` | Task | Catalog search follow-ups: measure the 500 ms target on 10,000 tables (`DATA-11-RESULT.md`); keep the Owner and Tags filters reachable on a laptop-width window; read column rows with `FINAL`; run acceptance rows 10, 11 and 13 | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`DATA-11`) |
@@ -178,11 +186,11 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Waits for `DEC-9`** | Data | P3 | Planned |  | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
-| `BLD-2` | Feature | Tables that refresh themselves when their inputs change | Build | P3 | Idea |  | PRODUCT §2 |
+| `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. **Waits for `BLD-3`, `DATA-10`** | Build | P3 | Planned |  | PRODUCT §2; [spec](specs/bld-2.md) |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
-| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy | Build | P3 | Idea |  | ADR 0010 |
-| `DATA-4` | Feature | Publish Silver in open format | Build | P3 | Idea |  | `features/gold-publish-per-mart.md` |
+| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Waits for `DATA-4`** and a new ADR | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
+| `DATA-4` | Feature | Publish Silver in open format. **Waits for `DATA-10`, `DATA-2`** | Build | P3 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-4.md) |
 | `DATA-5` | Task | Measure outside readers of published tables | Build | P3 | Todo |  | `routes::gold::consumers` |
 | `BI-3` | Feature | Import dashboards from Tableau and Power BI | Dashboards | P3 | Idea |  | PRODUCT §2 |
 | `BI-20` | Feature | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | P3 | Idea |  | `reference/competitive-comparison.md` (BI matrix) |
@@ -364,6 +372,17 @@ builds it (`AGENTS.md`).
 | [`DATA-19`](specs/data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
 | [`SRC-4`](specs/src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](specs/src-3.md) | Connectors for business apps | Later | L |
+
+### Pipelines (Build)
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`BLD-1`](specs/bld-1.md) | Joins, aggregations and a SQL step | Next | L, in two parts |
+| [`BLD-2`](specs/bld-2.md) | Tables that refresh themselves within a target lag | Later | L |
+| [`DATA-2`](specs/data-2.md) | Keep the last copies of a published Gold table | Next | M |
+| [`DATA-6`](specs/data-6.md) | A latest-copy-only table for outside readers | Next | S |
+| [`DATA-4`](specs/data-4.md) | Publish Silver in open format | Later | M |
+| [`DATA-3`](specs/data-3.md) | Store Gold in open format first | Later | L |
 
 ### Query Studio
 
