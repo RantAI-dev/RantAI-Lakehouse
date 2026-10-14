@@ -1103,6 +1103,108 @@ jobs:
         if: always()
         run: docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster down -v
 
+  # ── SRC-11 task 8 (decision D14) — connector operations, from Rust and
+  # Dagster together: `ops/g6/src11_connector_operations_test.py` runs real
+  # Dagster runs against the `mysql-g6` fixture (through a forwarder the gate
+  # switches off and on) and the stack's own PostgreSQL: retry then success,
+  # no retry for a refused sign-in, auto-disable and Resume, a paused
+  # connector that does not load, a column left out of a load, an honest run
+  # log and the run history. A job of its own, shaped like `g6-alerts`, so no
+  # existing gate grows.
+  #
+  # TWO SETTINGS ARE LOWERED HERE, on purpose (feature page checklist row 6):
+  # `INGEST_RETRY_DELAYS_SECONDS=5,10,20` (the product's default is
+  # 60,300,900, i.e. up to 21 minutes of waiting per failing table) and
+  # `CONNECTOR_AUTO_DISABLE_AFTER=3` (default 30). The gate proves the
+  # mechanism at the configured numbers, not the defaults; the script's
+  # docstring says the same. The runner needs the second value too, to check
+  # the pause reason, and reads it from the same `.env`.
+  #
+  # SEC-10 (alert webhooks cannot reach internal addresses) is NOT built yet.
+  # The gate's receiver is a listener in its own container; when SEC-10 lands
+  # it must give this gate its documented opt-in, never weaken the default.
+  # Scope gate as g6-ingest. ──
+  g6-ops:
+    name: Rust · SRC-11 connector operations
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Write CI-only .env (retry delays and auto-disable threshold LOWERED)
+        # As g6-alerts, plus the two lowered settings at the end, which
+        # docker-compose.yml passes to dagster-code-location and
+        # lakehouse-api (`${X:-}`), and the runner. Obviously fake values of
+        # a throwaway stack.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          INGEST_RETRY_DELAYS_SECONDS=5,10,20
+          CONNECTOR_AUTO_DISABLE_AFTER=3
+          EOF
+
+      - name: Bring up the connector operations stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as g6-alerts and g6-ingest explain. The
+        # sensors (`dagster-daemon`) are needed: a failed run is counted when
+        # the run sensor reports it to the API.
+        run: >
+          docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile g6-ops --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          mysql-g6 clickhouse-iceberg-init
+
+      - name: Run the SRC-11 connector operations gate inside the compose network
+        # `shell: bash` for pipefail and `-T` for no pseudo-terminal, and
+        # `--no-deps` so `compose run` does not re-reconcile the services the
+        # "up" step started (PR #129, run #127: the code server went
+        # UNAVAILABLE right after the gate's wait passed). The gate itself
+        # waits for `ingest_job` to be loaded (`step_wait_for_services`).
+        shell: bash
+        run: |
+          docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-sql --profile g6-ops --profile dagster run --rm -T --no-deps g6-ops-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-ops-run.log"
+
+      - name: Add the gate's lines to the job summary
+        # `always()`: a failed gate prints its lines too. Only the gate's own
+        # `SRC-11` lines are copied.
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-ops-run.log" ]; then
+            {
+              echo '### SRC-11 connector operations (retry delays 5,10,20 and auto-disable after 3: lowered)'
+              echo '```'
+              grep -E '^\[g6-ops\]' "$RUNNER_TEMP/g6-ops-run.log" | grep -E 'SRC-11|PASS|FAILED' || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-ops --profile dagster logs
+
+      - name: Tear down the connector operations project
+        if: always()
+        run: docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-ops --profile dagster down -v
+
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
   # ClickHouse and appends it to the `gold` Iceberg namespace through
@@ -1261,6 +1363,7 @@ jobs:
       - g6-oracle
       - g9-upload
       - g6-alerts
+      - g6-ops
       - gold-export
       - g8-governance
       - g8-time-travel
@@ -1301,6 +1404,7 @@ jobs:
           G6_ORACLE_RESULT: ${{ needs.g6-oracle.result }}
           G9_UPLOAD_RESULT: ${{ needs.g9-upload.result }}
           G6_ALERTS_RESULT: ${{ needs.g6-alerts.result }}
+          G6_OPS_RESULT: ${{ needs.g6-ops.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
           G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}

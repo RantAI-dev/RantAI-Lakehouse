@@ -303,3 +303,63 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests && python src17_alert_delivery_test.py"]
+
+  # SRC-11 task 8: the connector operations gate,
+  # `ops/g6/src11_connector_operations_test.py`, in a job of its own
+  # (`g6-ops`). Same shape as `g6-alerts-test-runner` above: it reuses this
+  # file's gate-only `INGEST_ALLOW_INTERNAL_HOSTS` and
+  # `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`, the `g6_secrets` volume and the
+  # `mysql-g6` fixture (profile `g6-ops` together with `g6-sql` and
+  # `dagster`; the job names the services it starts).
+  #
+  # The gate starts two listeners of its own in this container, both reached
+  # over the compose network (nothing is published): a TCP forwarder to
+  # `mysql-g6` that it switches off and on (the source going away and coming
+  # back), and the webhook receiver of `SRC-17`'s gate. The container's own
+  # address is found by a UDP route probe, not by service name (`compose run`
+  # gives no alias). `SEC-10` is not built yet; see `g6-alerts-test-runner`.
+  #
+  # `CONNECTOR_AUTO_DISABLE_AFTER` and `INGEST_SERVICE_TOKEN` are `${X:-}`,
+  # not `${X:?}`: this file is loaded by every g6 job, and only this job's
+  # `.env` sets them (the gate itself fails when the first is empty). The
+  # first must equal the value the API container gets from the same `.env`.
+  g6-ops-test-runner:
+    profiles: ["g6-ops"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+      mysql-g6:
+        condition: service_healthy
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      CONNECTOR_MYSQL_PASSWORD: ${CONNECTOR_MYSQL_PASSWORD:?}
+      INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
+      CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python src11_connector_operations_test.py"]
