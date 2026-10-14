@@ -101,6 +101,23 @@ pub enum ApiError {
         /// How many seconds until the caller should retry, as an integer.
         retry_after_secs: u64,
     },
+    /// A backing service this request needs is not ready yet, and the same
+    /// request is expected to succeed shortly (an orchestrator code location
+    /// still loading). Maps to HTTP 503, like [`Self::Unavailable`], but
+    /// carries a stable machine-readable `code` (rendered as the body's
+    /// `code` field) and a `Retry-After` hint, so a client or a gate can
+    /// retry on the code instead of matching message text
+    /// (`PR #105 CI fix`, `SEC-11`).
+    #[error("{message}")]
+    NotReady {
+        /// The fixed message shown to the caller.
+        message: String,
+        /// Stable identifier of the condition, e.g.
+        /// `orchestrator_job_not_loaded`. Part of the API contract.
+        code: &'static str,
+        /// How many seconds until the caller should retry.
+        retry_after_secs: u64,
+    },
 }
 
 impl ApiError {
@@ -129,7 +146,7 @@ impl ApiError {
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
-            Self::Unavailable(_) => 503,
+            Self::Unavailable(_) | Self::NotReady { .. } => 503,
             Self::TooManyRequests { .. } => 429,
         }
     }
@@ -190,6 +207,19 @@ mod tests {
     fn unavailable_maps_to_503() {
         assert_eq!(
             ApiError::Unavailable("database is not available".to_owned()).status(),
+            503
+        );
+    }
+
+    #[test]
+    fn not_ready_maps_to_503() {
+        assert_eq!(
+            ApiError::NotReady {
+                message: "later".to_owned(),
+                code: "x",
+                retry_after_secs: 5,
+            }
+            .status(),
             503
         );
     }

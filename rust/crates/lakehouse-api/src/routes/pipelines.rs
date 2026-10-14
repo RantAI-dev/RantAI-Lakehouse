@@ -1476,6 +1476,11 @@ pub(super) async fn record_pipeline_audit(
 /// Returns a 401 [`Response`] (not a propagated [`ApiError`] — this
 /// handler predates `ApiResult` and stays bare-`Response`-returning, like
 /// [`pause`]/[`resume`]) if no principal is present.
+///
+/// A launch that meets a job `Dagster` has not loaded yet answers `503`
+/// with `code: orchestrator_job_not_loaded` (`PR #105 CI fix`; see
+/// `routes::connectors::ingest_run` for the contract); any other launch
+/// failure is the generic `422`.
 pub async fn trigger(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1543,6 +1548,15 @@ pub async fn trigger(
     match launch {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
+                // `PR #105 CI fix` (SEC-11): a job the orchestrator has not
+                // loaded yet is a 503 with the stable `orchestrator_job_not_loaded`
+                // code, decided from Dagster's typed result, so the gates
+                // retry on the code and not on Dagster's text. Everything
+                // else stays the generic 422 below.
+                if outcome.job_not_loaded {
+                    return ApiRejection(crate::upstream_error::job_not_loaded(&error))
+                        .into_response();
+                }
                 // SEC-11: Dagster's launch message is the orchestrator's own text.
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
