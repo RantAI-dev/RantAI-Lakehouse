@@ -23,7 +23,7 @@ from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import schema_observer as so
 
-TOKEN = "tok-very-secret-123"
+TOKEN = "test-token"
 
 
 def _cfg(token: str = TOKEN) -> so.ObserverConfig:

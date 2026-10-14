@@ -45,12 +45,12 @@ use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::audit as store_audit;
 use lakehouse_store::connectors as store_connectors;
-use lakehouse_store::ingest_spec::default_bronze_target;
+use lakehouse_store::ingest_spec::{dedup_keys, default_bronze_target};
 use lakehouse_store::schema_change::{
     self, ApproveOutcome, InactiveColumn, ObservationTx, ObservationWrite, ObservedColumn,
     RecordedChange, SchemaChange, SchemaChangePolicy, TableCandidate, TableRefusal,
 };
-use lakehouse_store::schema_diff::{Action, Decision, TableShape, evaluate};
+use lakehouse_store::schema_diff::{Action, Decision, TableShape, evaluate_for_key};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -95,6 +95,12 @@ const TABLES_NOT_SUPPORTED: &str =
 const CANNOT_BE_LOADED: &str = "This type change cannot be loaded into the existing column. \
      Change the column back at the source, or remove the table from the connector \
      and add it again under a new target.";
+
+/// Fixed 409 text: the table deduplicates on a key column the source no longer
+/// has (`SRC-10` decision 6). Approving would make every later load fail on a
+/// missing key column. No source text goes in.
+const KEY_COLUMN_REMOVED: &str = "A column of this table's key was removed at the source. \
+     Change the table's key or its load mode first, then approve the change.";
 
 /// Fixed 500 text for a stored policy this code does not know.
 const UNKNOWN_POLICY: &str = "the connector's schema-change policy is not one this version knows";
@@ -335,12 +341,24 @@ pub async fn observe(
         return Err(ApiError::Internal(UNKNOWN_POLICY.to_owned()).into());
     };
     let can_hold_back = req.phase == Phase::BeforeLoad;
+    // `SRC-10` decision 6: the table's mode and key come from the STORED
+    // ingest spec, never from this request (the orchestrator could not be
+    // trusted to say a table has no key, and does not know it changed).
+    let key = store_connectors::get_ingest_spec(pool, &id)
+        .await?
+        .and_then(|spec| dedup_keys(&spec.source_objects).remove(&req.object));
 
     let mut tx = ObservationTx::begin(pool, &id, &req.object).await?;
     let accepted = tx.accepted().await?;
     let previous = accepted.as_ref().map(TableShape::from);
     let observed = shape_for_phase(req.phase, previous.as_ref(), req.columns, req.primary_key);
-    let decision = evaluate(policy, can_hold_back, previous.as_ref(), &observed);
+    let decision = evaluate_for_key(
+        policy,
+        can_hold_back,
+        previous.as_ref(),
+        &observed,
+        key.as_deref(),
+    );
     // Only changes that took effect (and a first observation) move the
     // baseline; a waiting change must keep being compared against what the
     // table was last told to hold.
@@ -631,7 +649,8 @@ pub async fn list(
 ///
 /// 404 when nothing waits for that table or the connector is another
 /// tenant's or unknown, 409 with a fixed text when what waits includes a type
-/// change the column cannot hold (decision 10), 400 for a bad body, 503/500 as
+/// change the column cannot hold (decision 10) or the removal of a column the
+/// table's deduplicating key still names (`SRC-10` decision 6), 400 for a bad body, 503/500 as
 /// the store reports.
 pub async fn approve(
     State(state): State<AppState>,
@@ -667,6 +686,10 @@ pub async fn approve(
         // pending changes (approval accepts the observed shape as a whole).
         ApproveOutcome::CannotBeLoaded => {
             return Err(ApiError::Conflict(CANNOT_BE_LOADED.to_owned()).into());
+        }
+        // `SRC-10` decision 6: the key still names a removed column.
+        ApproveOutcome::KeyStillNamed => {
+            return Err(ApiError::Conflict(KEY_COLUMN_REMOVED.to_owned()).into());
         }
     };
     // Counts and the table name only: never a column value, never source data.
@@ -2147,5 +2170,193 @@ mod tests {
         assert!(!lists_tables(Some("sql"), &json!({"driver": "oracle"})));
         assert!(!lists_tables(Some("cdc"), &json!({"driver": "postgres"})));
         assert!(!lists_tables(None, &json!({})));
+    }
+
+    // --- SRC-10 decision 6: schema changes meet the key ----------------------
+
+    /// Store `mode` and `key` on the connector's `orders` object. Written with
+    /// a plain `UPDATE`: the spec is what the API reads, wherever it came from.
+    async fn with_load_mode(pool: &sqlx::PgPool, id: &str, mode: &str, key: &[&str]) {
+        sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+            .bind(id)
+            .bind(json!([{
+                "name": "orders", "target": "orders_bronze",
+                "loadMode": mode, "primaryKey": key,
+            }]))
+            .execute(pool)
+            .await
+            .expect("source objects");
+    }
+
+    /// `SRC-10` decision 6: for a deduplicating table whose key names `id`,
+    /// the removal of `id` waits under every policy, is shown as not
+    /// approvable, approving it is a 409 with the fixed text that writes
+    /// nothing, and the connector is not paused (nobody could lift that).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn removing_a_key_column_of_a_deduplicating_table_cannot_be_approved(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        for policy in ["apply_non_breaking", "apply_all", "ask_first", "pause"] {
+            for mode in ["replace_dedup", "incremental_dedup"] {
+                let id = connector(&h, &format!("key {policy} {mode}"), policy).await;
+                with_load_mode(&pool, &id, mode, &["id"]).await;
+                observe_as_service(&h, &id, &BASE, "before_load").await;
+                let answer = observe_as_service(&h, &id, &[("note", "text")], "before_load").await;
+                assert_eq!(answer["action"], "wait", "{policy} {mode}");
+                let removed = answer["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c["kind"] == "column_removed" && c["columnName"] == "id")
+                    .count();
+                assert_eq!(removed, 1, "{policy} {mode}: {answer}");
+                assert!(
+                    answer["changes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|c| c["canApprove"] == false),
+                    "{policy} {mode}: {answer}"
+                );
+                assert!(!paused(&pool, &id).await, "{policy} {mode}");
+
+                let list = listed(&h, &id).await;
+                assert!(
+                    list["pending"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|c| c["canApprove"] == false),
+                    "{policy} {mode}: {list}"
+                );
+                let (status, refused) = approve_orders(&h, &id, "orders").await;
+                assert_eq!(status, StatusCode::CONFLICT, "{policy} {mode}");
+                assert_eq!(refused["error"], KEY_COLUMN_REMOVED, "{policy} {mode}");
+                let after = listed(&h, &id).await;
+                assert_eq!(after["pending"], list["pending"], "{policy} {mode}");
+                assert_eq!(after["recent"], json!([]), "{policy} {mode}");
+                assert_eq!(baseline_columns(&pool, &id).await, 2, "{policy} {mode}");
+            }
+        }
+    }
+
+    /// The way out the 409 names: once the key (or the mode) no longer names
+    /// the column, the SAME waiting change is approvable and approves.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn after_the_key_is_changed_the_removal_can_be_approved(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "key changed", "apply_non_breaking").await;
+        with_load_mode(&pool, &id, "replace_dedup", &["id"]).await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        observe_as_service(&h, &id, &[("note", "text")], "before_load").await;
+        assert_eq!(
+            approve_orders(&h, &id, "orders").await.0,
+            StatusCode::CONFLICT
+        );
+
+        with_load_mode(&pool, &id, "replace_dedup", &["note"]).await;
+        let list = listed(&h, &id).await;
+        assert!(
+            list["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["canApprove"] == true),
+            "{list}"
+        );
+        let (status, approved) = approve_orders(&h, &id, "orders").await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+
+        // The mode path: back to a non-deduplicating mode, a fresh table.
+        let id = connector(&h, "mode changed", "apply_non_breaking").await;
+        with_load_mode(&pool, &id, "incremental_dedup", &["id"]).await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        observe_as_service(&h, &id, &[("note", "text")], "before_load").await;
+        assert_eq!(
+            approve_orders(&h, &id, "orders").await.0,
+            StatusCode::CONFLICT
+        );
+        with_load_mode(&pool, &id, "replace", &[]).await;
+        assert_eq!(approve_orders(&h, &id, "orders").await.0, StatusCode::OK);
+    }
+
+    /// Only the removal of a KEY column is blocked: another column of a
+    /// deduplicating table, and any column of a table in a mode with no key,
+    /// stay approvable as in `SRC-8`; so does a changed source primary key.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn other_removals_and_source_key_changes_stay_approvable(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        // A column outside the key.
+        let id = connector(&h, "outside key", "pause").await;
+        with_load_mode(&pool, &id, "replace_dedup", &["id"]).await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        let answer = observe_as_service(&h, &id, &WITHOUT_NOTE, "before_load").await;
+        assert_eq!(answer["changes"][0]["canApprove"], true);
+        assert!(paused(&pool, &id).await, "approvable, so pause pauses");
+        assert_eq!(approve_orders(&h, &id, "orders").await.0, StatusCode::OK);
+
+        // Every other mode: the key column itself.
+        for mode in ["replace", "append", "incremental"] {
+            let id = connector(&h, &format!("mode {mode}"), "apply_all").await;
+            with_load_mode(&pool, &id, mode, &["id"]).await;
+            observe_as_service(&h, &id, &BASE, "before_load").await;
+            let answer = observe_as_service(&h, &id, &[("note", "text")], "before_load").await;
+            assert_eq!(answer["changes"][0]["canApprove"], true, "{mode}");
+            assert_eq!(approve_orders(&h, &id, "orders").await.0, StatusCode::OK);
+        }
+
+        // A changed source primary key of a deduplicating table.
+        let id = connector(&h, "source key", "apply_all").await;
+        with_load_mode(&pool, &id, "replace_dedup", &["id"]).await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        let (status, answer) = call(
+            &h,
+            &service(),
+            "POST",
+            &format!("/api/connectors/{id}/schema-observations"),
+            Some(observation("orders", &BASE, &["note"], "before_load")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["changes"][0]["kind"], "primary_key_changed");
+        assert_eq!(answer["changes"][0]["canApprove"], true);
+        assert_eq!(approve_orders(&h, &id, "orders").await.0, StatusCode::OK);
+    }
+
+    /// The table's key is the STORED one: nothing in the observation request
+    /// can say otherwise (the body has no field for a mode or a key, and an
+    /// extra field is refused), and the stored mode is read at the time of
+    /// the observation, so a table switched to `replace` is not held.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_key_comes_from_the_stored_spec_not_from_the_request(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[]).await;
+        let id = connector(&h, "stored key", "apply_non_breaking").await;
+        observe_as_service(&h, &id, &BASE, "before_load").await;
+        let mut body = observation("orders", &[("note", "text")], &["id"], "before_load");
+        body["primaryKey"] = json!(["id"]);
+        body["loadMode"] = json!("replace_dedup");
+        let (status, _) = call(
+            &h,
+            &service(),
+            "POST",
+            &format!("/api/connectors/{id}/schema-observations"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unknown field is refused"
+        );
+
+        // A spec with no deduplicating object: the removal is approvable.
+        let answer = observe_as_service(&h, &id, &[("note", "text")], "before_load").await;
+        assert!(
+            answer["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["canApprove"] == true),
+            "{answer}"
+        );
     }
 }
