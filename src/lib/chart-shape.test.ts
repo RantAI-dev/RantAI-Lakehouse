@@ -4,7 +4,7 @@ import test from "node:test"
 import {
   effectiveOrder, entriesFromRows, isOtherRow, labelOtherRows, measureLabel, measureLimits, parseSortChoice,
   resultName, rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortChoiceOf, sortOptions,
-  tileMeasureLabels, usesGroupings, emptyShapeDraft,
+  tileMeasureLabels, usesGroupings, emptyShapeDraft, effectiveAggregate, storedAggregate, type MeasureEntry,
 } from "./chart-shape"
 
 test("a plain name stays a name and an own aggregate becomes an object", () => {
@@ -154,6 +154,7 @@ const base: ResultColumns = {
   groups: [{ name: "kab", kind: "text" }, { name: "d", kind: "date" }],
   measures: ["visitors", "avg_stay"],
   labels: { avg_stay: "avg of stay" },
+  bases: { avg_stay: "stay" },
 }
 const summarise: StepDef = { summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }, { column: "avg_stay", aggregate: "max" }] } }
 
@@ -161,8 +162,20 @@ test("a summary leaves the groupings it keeps and measures named by aggregate an
   const after = columnsAfterSteps(base, [summarise])
   assert.deepEqual(after.groups, [{ name: "kab", kind: "text" }])
   assert.deepEqual(after.measures, ["sum_visitors", "max_avg_stay"])
-  assert.equal(after.labels.sum_visitors, "sum of visitors")
-  assert.equal(after.labels.max_avg_stay, "max of avg of stay")
+  // Phase 2 QA R8: plain words and the original column, never "max of avg of stay".
+  assert.equal(after.labels.sum_visitors, "total visitors")
+  assert.equal(after.labels.max_avg_stay, "highest stay")
+})
+
+test("a second summary names its output from the original column and keeps the result name when two would read the same", () => {
+  const twice = columnsAfterSteps(base, [summarise, { summarise: { by: ["kab"], measures: [{ column: "sum_visitors", aggregate: "avg" }] } }])
+  assert.equal(twice.labels.avg_sum_visitors, "average visitors")
+  const clash = columnsAfterSteps(
+    { groups: base.groups, measures: ["visitors", "sum_visitors"], labels: {}, bases: { sum_visitors: "visitors" } },
+    [{ summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }, { column: "sum_visitors", aggregate: "sum" }] } }],
+  )
+  assert.equal(clash.labels.sum_visitors, "sum_visitors")
+  assert.equal(clash.labels.sum_sum_visitors, "sum_sum_visitors")
 })
 
 test("a filter step leaves the columns as they were and a second summary reads the first", () => {
@@ -208,7 +221,7 @@ test("a step is sent trimmed and without the empty fields of the other operator"
 
 test("the labels of a tile with steps come from the last step, not from the measures by position", () => {
   const labels = tileMeasureLabels(["visitors"], ["sum_visitors"], [{ summarise: { by: ["kab"], measures: [{ column: "visitors", aggregate: "sum" }] } }])
-  assert.deepEqual(labels, { sum_visitors: "sum of visitors" })
+  assert.deepEqual(labels, { sum_visitors: "total visitors" })
   assert.deepEqual(tileMeasureLabels([{ column: "stay", aggregate: "avg" }], "avg_stay", [{ filter: [{ column: "avg_stay", op: "gt", value: "1" }] }]), { avg_stay: "avg of stay" })
   // BI-2 review fix (SHOULD-FIX) R3: the tile payload's label wins for a metric; a column or an own aggregate keeps its reading.
   assert.deepEqual(
@@ -277,4 +290,57 @@ test("a metric is a measure row named metric:<name> and is sent as { metric }, w
   assert.equal(measureLabel(rows[0], new Set()), "total_visitors")
   // A tile of a chart with a metric names its series by the metric, not "undefined of undefined".
   assert.deepEqual(tileMeasureLabels([{ metric: "total_visitors" }, { column: "stay", aggregate: "avg" }], ["total_visitors", "avg_stay"]), { avg_stay: "avg of stay" })
+})
+
+test("a measure left on the chart's aggregate says that aggregate, so an average is never drawn as the bare column (phase 2 QA R7)", () => {
+  const none = new Set<string>()
+  const plain = { column: "visitors", aggregate: "" }
+  assert.equal(measureLabel(plain, none), "visitors")
+  assert.equal(measureLabel(plain, none, "sum"), "visitors")
+  assert.equal(measureLabel(plain, none, "avg"), "avg of visitors")
+  assert.equal(measureLabel(plain, none, "count"), "count of visitors")
+  // An aggregate of its own always reads, and a calculated aggregate or a metric keeps its name.
+  assert.equal(measureLabel({ column: "visitors", aggregate: "max" }, none, "avg"), "max of visitors")
+  assert.equal(measureLabel(plain, new Set(["visitors"]), "avg"), "visitors")
+  assert.equal(measureLabel({ column: "metric:total", aggregate: "" }, none, "avg"), "total")
+  assert.equal(effectiveAggregate(plain, "avg"), "avg")
+  assert.equal(effectiveAggregate({ column: "x", aggregate: "min" }, "avg"), "min")
+  assert.equal(effectiveAggregate(plain), "sum")
+})
+
+test("a tile reads a plain measure with the chart's aggregate, and keeps a measure's own", () => {
+  assert.deepEqual(tileMeasureLabels(["visitors", { column: "stay", aggregate: "max" }], ["visitors", "max_stay"], undefined, undefined, "avg"), {
+    visitors: "avg of visitors", max_stay: "max of stay",
+  })
+  assert.deepEqual(tileMeasureLabels(["visitors"], ["visitors"], undefined, undefined, "sum"), {})
+  assert.deepEqual(tileMeasureLabels(["visitors"], ["visitors"]), {})
+  // A definition saved before the aggregate was shown per measure reads the same way: the aggregate is the chart's.
+  assert.deepEqual(tileMeasureLabels(["a", "b"], ["a", "b"], undefined, undefined, "count"), { a: "count of a", b: "count of b" })
+})
+
+test("a chart saved before is opened and saved back with the same measures and the same aggregate (phase 2 QA R4)", () => {
+  type Saved = { measures: MeasureEntry[]; aggregate: string }
+  const roundTrip = (saved: Saved): Saved => {
+    // The builder keeps `aggregate` as the chart's and reads the measures as rows; an untouched row stores no aggregate of its own.
+    const rows = rowsFromEntries(saved.measures)
+    return { measures: entriesFromRows(rows, true), aggregate: saved.aggregate }
+  }
+  const olds: Saved[] = [
+    { measures: ["visitors"], aggregate: "sum" },
+    { measures: ["visitors", "stay"], aggregate: "avg" },
+    { measures: ["visitors", { column: "stay", aggregate: "max" }], aggregate: "sum" },
+    // An own aggregate equal to the chart's stays own, so its result name (`sum_visitors`) is the one the sort and the steps already use.
+    { measures: [{ column: "visitors", aggregate: "sum" }], aggregate: "sum" },
+    { measures: [{ metric: "total_visitors" }, "rooms"], aggregate: "count" },
+  ]
+  for (const old of olds) assert.deepEqual(roundTrip(old), old, JSON.stringify(old))
+  // The statement is the same because the result names are the same.
+  const rows = rowsFromEntries(["visitors", { column: "stay", aggregate: "avg" }])
+  assert.deepEqual(rows.map((r) => resultName(r, new Set())), ["visitors", "avg_stay"])
+})
+
+test("a measure row that picks the chart's aggregate again stores none, so the result name does not change", () => {
+  assert.equal(storedAggregate("sum", "sum"), "")
+  assert.equal(resultName({ column: "visitors", aggregate: storedAggregate("sum", "sum") }, new Set()), "visitors")
+  assert.equal(resultName({ column: "visitors", aggregate: storedAggregate("avg", "sum") }, new Set()), "avg_visitors")
 })
