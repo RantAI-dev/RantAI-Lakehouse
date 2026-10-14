@@ -85,6 +85,11 @@ export type InactiveColumn = {
   inactiveSince: string
   /** The name the Bronze table gives the column; `null` when it was not reported, and then the Schema tab marks nothing. */
   loadedName: string | null
+  /**
+   * `SRC-11` decision 10: why the column is inactive. `removed_at_source`: the source dropped it (`SRC-8`).
+   * `excluded`: the user left it out of the load. Widened: a newer API may add a reason.
+   */
+  reason: "removed_at_source" | "excluded" | string
 }
 
 export type SchemaChangeList = {
@@ -549,6 +554,13 @@ export type SourceObject = {
    * detected survives a switch of mode; the API ignores it for a mode that
    * does not use it. */
   primaryKey?: string[]
+  /**
+   * `SRC-11` decisions 9 to 11: the columns left out of the load, stored as what is left out, not what is kept,
+   * so a column that appears later follows the schema-change policy. Accepted only for `sql` connectors on
+   * the `postgres`, `mysql` or `mssql` driver, and never a key column of a deduplicating or history object nor
+   * the cursor column (the API answers 422). Absent or empty: none left out.
+   */
+  excludedColumns?: string[]
   target: string
 }
 
@@ -754,46 +766,90 @@ export type IngestTableRequest = {
   action: IngestTableAction
 }
 
-/**
- * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
- * returned by `GET /api/governance/ingest-runs?connectorId=`.
- */
-export type IngestRun = {
-  connectorId: string
-  job: string
-  object: string
-  /** `null` means "not measured" (dlt's normalize row count was
-   * unavailable), never a fabricated `0` (WS3 plan review Z9). */
-  rows: number | null
-  startedAt: string
-  endedAt: string
-  status: string
-  error: string
-}
+/** Why a run was started (`SRC-11` decision 7). `other`: launched from the orchestrator's own screen. Widened. */
+export type RunTrigger = "schedule" | "user" | "refresh" | "clear" | "other" | string
+
+/** Where a run stands in the product's own record; `running` is also what a killed run keeps, see the Runs card. Widened. */
+export type RunStatus = "running" | "succeeded" | "failed" | "paused" | string
+
+/** Why a run ended (`SRC-11` decision 5). Widened. */
+export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "other" | string
 
 /**
- * One `ingest_job` run of one connector, from
- * `GET /api/connectors/{id}/ingest/runs` (newest first). Mirrors Rust
- * `ConnectorIngestRun` (`routes/connectors.rs`). A run that failed before
- * reaching any table has no `IngestRun` rows at all; this is where it still
- * shows.
+ * One run of a connector, from `GET /api/connectors/{id}/runs` (newest 50 first). Mirrors the API's run record
+ * (`routes/connector_runs.rs`, `SRC-11` decision 7). Times are ISO 8601 with milliseconds.
  */
-export type IngestJobRun = {
+export type ConnectorRun = {
   runId: string
-  /** The pipelines pages' vocabulary (`lakehouse_dagster::map_run_status`). */
-  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown"
-  /** ISO 8601; `null` until the run starts. */
-  startedAt: string | null
-  /** ISO 8601; `null` until the run ends. */
+  trigger: RunTrigger
+  status: RunStatus
+  startedAt: string
+  /** `null` until the run reports its end; a killed run may never. */
   endedAt: string | null
-  /**
-   * `SRC-10`: the one table a run of a single table named (from the run's
-   * config), `null` for a run of every table.
-   */
-  object: string | null
-  /** `refresh_keep | refresh_remove | clear` for such a run, else `null`. Widened: a newer API may add actions. */
-  action: IngestTableAction | string | null
+  durationSeconds: number | null
+  /** Rows of the attempts that succeeded. */
+  rowsLoaded: number
+  /** All attempts at all tables. */
+  attempts: number
+  endReason: RunEndReason | null
 }
+
+/** The closed list of why an attempt failed (`SRC-11` decision 2); a success carries none. Widened. */
+export type AttemptErrorClass =
+  | "unreachable"
+  | "timeout"
+  | "source_busy"
+  | "api_unreachable"
+  | "sign_in_refused"
+  | "address_refused"
+  | "unsupported"
+  | "setting_rejected"
+  | "schema_decision_pending"
+  | "other"
+  | string
+
+/** One attempt at one table of a run. */
+export type ConnectorRunAttempt = {
+  table: string
+  attempt: number
+  startedAt: string
+  endedAt: string
+  rowsLoaded: number
+  result: "succeeded" | "failed" | string
+  errorClass: AttemptErrorClass | null
+  /** The wait before the next attempt, in seconds; only on a failure that is retried. */
+  waitSeconds: number | null
+}
+
+/** The closed list of lines a run's log holds. Widened. */
+export type RunLogEvent =
+  | "run_started"
+  | "attempt"
+  | "retry_wait"
+  | "schema_decision_pending"
+  | "columns_left_out"
+  | "report_gap"
+  | "run_ended"
+  | string
+
+/** One line of a run's log; `text` is the product's own sentence, never the source's or the driver's. */
+export type ConnectorRunLine = {
+  at: string
+  event: RunLogEvent
+  table: string | null
+  attempt: number | null
+  text: string
+}
+
+/** `GET /api/connectors/{id}/runs/{runId}/log`. Attempts and lines older than 30 days are gone (empty arrays). */
+export type ConnectorRunLog = {
+  run: ConnectorRun
+  attempts: ConnectorRunAttempt[]
+  lines: ConnectorRunLine[]
+}
+
+/** `POST /api/connectors/{id}/resume`. */
+export type ResumeConnectorResponse = { resumed: boolean }
 
 /**
  * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
@@ -853,8 +909,14 @@ export interface ConnectorService {
   discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
-  listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
-  listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
+  /** `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record. */
+  listConnectorRuns(connectorId: string, signal?: AbortSignal): Promise<ConnectorRun[]>
+  /** `GET /api/connectors/{id}/runs/{runId}/log` (`SRC-11`): the attempts and lines of one run. */
+  getConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<ConnectorRunLog>
+  /** The same log as text (`?format=text`), for the Download log button. */
+  downloadConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<string>
+  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, and only that one. */
+  resumeConnector(connectorId: string, signal?: AbortSignal): Promise<ResumeConnectorResponse>
   /**
    * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
    * rendering of the `Debezium` `.properties` file body for a `cdc`

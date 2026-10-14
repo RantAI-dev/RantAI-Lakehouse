@@ -5,8 +5,9 @@ import {
   cronProblem,
   defaultDiscoverSchema,
   defaultTarget,
-  groupResultsByRun,
+  isAutoDisablePause,
   loadModeProblem,
+  lockedColumns,
   targetProblem,
 } from "./connector-ingest-panel"
 
@@ -35,9 +36,11 @@ type Call = { url: string; method: string; body: unknown }
 
 function stubFetch(
   spec: typeof SPEC = SPEC,
-  history: { runs: unknown[]; results: unknown[] } = { runs: [], results: [] },
+  // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
+  history: { runs: unknown[]; logs?: Record<string, unknown> } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
-  options: { discovered?: unknown[]; onRun?: (body: unknown) => Response } = {}
+  // SRC-11: how Resume is answered (the default lifts the pause).
+  options: { discovered?: unknown[]; onRun?: (body: unknown) => Response; onResume?: () => Response } = {}
 ): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -50,8 +53,14 @@ function stubFetch(
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.includes("/api/governance/ingest-runs")) return json(history.results)
-    if (url.includes("/ingest/runs")) return json(history.runs)
+    if (url.endsWith("/runs")) return json({ runs: history.runs })
+    const log = /\/runs\/([^/]+)\/log(\?format=text)?$/.exec(url)
+    if (log) {
+      if (log[2]) return new Response("run 0123 (schedule), succeeded\n", { status: 200, headers: { "Content-Type": "text/plain" } })
+      const body = history.logs?.[log[1]!]
+      return body ? json(body) : json({ error: "not found" }, 404)
+    }
+    if (url.endsWith("/resume") && method === "POST") return options.onResume ? options.onResume() : json({ resumed: true })
     if (url.includes("/debezium-properties")) {
       return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
     }
@@ -328,18 +337,16 @@ describe("ConnectorIngestPanel layout", () => {
   describe("a run's row", () => {
     const history = {
       runs: [
-        { runId: "run-1234567890", status: "completed", startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z" },
-      ],
-      results: [
         {
-          connectorId: "conn-northwind",
-          job: "ingest_job",
-          object: "public.orders",
-          rows: 7,
-          startedAt: "2026-09-29T08:22:00.000Z",
-          endedAt: "2026-09-29T08:22:10.000Z",
+          runId: "run-1234567890",
+          trigger: "schedule",
           status: "succeeded",
-          error: "",
+          startedAt: "2026-09-29T08:21:51.171Z",
+          endedAt: "2026-09-29T08:22:33.646Z",
+          durationSeconds: 42,
+          rowsLoaded: 7,
+          attempts: 1,
+          endReason: "completed",
         },
       ],
     }
@@ -347,10 +354,10 @@ describe("ConnectorIngestPanel layout", () => {
     it("has two lines in the card layout: the verdict, id and untruncated summary, then when and how long", async () => {
       stubFetch(SPEC, history)
       render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      const summaryText = await screen.findByText("7 rows · 1 attempt")
       expect(summaryText.className).not.toContain("truncate")
       const firstLine = summaryText.parentElement as HTMLElement
-      expect(within(firstLine).getByText("Completed")).toBeDefined()
+      expect(within(firstLine).getByText("Succeeded")).toBeDefined()
       expect(within(firstLine).getByText("run-1234")).toBeDefined()
       // When and how long is on its own, muted line below, whole.
       const second = screen.getByText(/took 42 s|took 42\.\d s/)
@@ -363,10 +370,10 @@ describe("ConnectorIngestPanel layout", () => {
     it("keeps one line, with the summary truncated, in the embedded layout", async () => {
       stubFetch(SPEC, history)
       render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      const summaryText = await screen.findByText("7 rows · 1 attempt")
       expect(summaryText.className).toContain("truncate")
       const line = summaryText.parentElement as HTMLElement
-      expect(within(line).getByText("Completed")).toBeDefined()
+      expect(within(line).getByText("Succeeded")).toBeDefined()
       expect(within(line).getByText(/took /)).toBeDefined()
     })
   })
@@ -437,45 +444,6 @@ describe("ConnectorIngestPanel onTableCount", () => {
     )
     await screen.findByText(/has no connection settings saved yet/)
     expect(counts).toEqual([])
-  })
-})
-
-describe("groupResultsByRun", () => {
-  const result = (object: string, startedAt: string, status = "succeeded") => ({
-    connectorId: "conn-northwind",
-    job: "ingest_job",
-    object,
-    rows: 1,
-    startedAt,
-    endedAt: startedAt,
-    status,
-    error: "",
-  })
-
-  it("puts each table result under the run it happened in, oldest table first, and older results last", () => {
-    const runs = [
-      { runId: "run-2", status: "running" as const, startedAt: "2026-09-29T08:22:39.206Z", endedAt: null, object: null, action: null },
-      { runId: "run-1", status: "completed" as const, startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z", object: null, action: null },
-    ]
-    const groups = groupResultsByRun(runs, [
-      result("public.orders", "2026-09-29T08:22:59.700710+00:00"),
-      result("public.categories", "2026-09-29T08:22:42.972055+00:00"),
-      result("public.us_states", "2026-09-29T08:22:30.023414+00:00"),
-      result("public.categories", "2026-09-29T07:48:10.000000+00:00", "rejected"),
-    ])
-    expect(groups.map((g) => g.run?.runId ?? "earlier")).toEqual(["run-2", "run-1", "earlier"])
-    expect(groups[0]!.results.map((r) => r.object)).toEqual(["public.categories", "public.orders"])
-    expect(groups[1]!.results.map((r) => r.object)).toEqual(["public.us_states"])
-    expect(groups[2]!.results[0]!.status).toBe("rejected")
-  })
-
-  it("keeps a run that reached no table, so a failure before the first table still shows", () => {
-    const groups = groupResultsByRun(
-      [{ runId: "run-401", status: "failed", startedAt: "2026-09-29T06:48:06.638Z", endedAt: "2026-09-29T06:48:09.000Z", object: null, action: null }],
-      []
-    )
-    expect(groups).toHaveLength(1)
-    expect(groups[0]!.results).toEqual([])
   })
 })
 
@@ -774,6 +742,22 @@ describe("ConnectorIngestPanel history mode", () => {
  * SRC-10 decision 5: refresh or clear one table, each behind a confirmation, and
  * the run view naming the table and the action.
  */
+/** A run record as `GET .../runs` answers it; a test overrides what it is about. */
+function record(extra: Record<string, unknown> = {}) {
+  return {
+    runId: "run-0000000001",
+    trigger: "schedule",
+    status: "succeeded",
+    startedAt: "2026-10-12T08:00:00.000Z",
+    endedAt: "2026-10-12T08:00:30.000Z",
+    durationSeconds: 30,
+    rowsLoaded: 100,
+    attempts: 1,
+    endReason: "completed",
+    ...extra,
+  }
+}
+
 describe("ConnectorIngestPanel refresh and clear", () => {
   const SAVED = {
     ...SPEC,
@@ -831,8 +815,7 @@ describe("ConnectorIngestPanel refresh and clear", () => {
 
   it("is disabled, with the reason as its title, while a run of this connector is going", async () => {
     stubFetch(SAVED, {
-      runs: [{ runId: "run-live-0001", status: "running", startedAt: "2026-10-12T08:00:00Z", endedAt: null, object: null, action: null }],
-      results: [],
+      runs: [record({ runId: "run-live-0001", status: "running", startedAt: new Date().toISOString(), endedAt: null })],
     })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await waitFor(() => expect(menu().disabled).toBe(true))
@@ -900,28 +883,362 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
   })
 
-  it("names the table and the action in the run list", async () => {
-    stubFetch(SAVED, {
-      runs: [
-        { runId: "run-clear-0001", status: "completed", startedAt: "2026-10-12T08:00:00Z", endedAt: "2026-10-12T08:00:05Z", object: "public.orders", action: "clear" },
-        { runId: "run-all-000001", status: "completed", startedAt: "2026-10-12T07:00:00Z", endedAt: "2026-10-12T07:00:30Z", object: null, action: null },
-      ],
-      results: [
-        { connectorId: "conn-northwind", job: "ingest_job", object: "public.orders", rows: 0, startedAt: "2026-10-12T08:00:01Z", endedAt: "2026-10-12T08:00:02Z", status: "cleared", error: "" },
-      ],
-    })
-    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    expect(await screen.findByText("Clear · public.orders")).toBeDefined()
-    expect(screen.getByText("Table emptied · nothing loaded")).toBeDefined()
-    expect(screen.getByText("cleared")).toBeDefined()
-    // A run of every table names no table.
-    expect(screen.queryByText(/Refresh, keeping rows · /)).toBeNull()
-  })
-
   it("has no table menu for a CDC connector, whose tables stream", async () => {
     stubFetch({ ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await screen.findByText("public.orders")
     expect(screen.queryByRole("button", { name: "Refresh or clear public.orders" })).toBeNull()
+  })
+})
+
+/**
+ * SRC-11 decision 7: the Runs card reads the product's own run record (newest 50), with how each run was started,
+ * its rows, duration and attempts, and no longer matches table results to orchestrator runs by time. A run whose
+ * record says running for longer than the bound is "no end reported", not active forever.
+ */
+describe("ConnectorIngestPanel runs from the run record", () => {
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+
+  it("lists each run with its trigger, rows, attempts and duration, from the run record only", async () => {
+    const calls = stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-sched-0001", trigger: "schedule", rowsLoaded: 1200, attempts: 3, durationSeconds: 95 }),
+        record({ runId: "run-user-00002", trigger: "user", status: "failed", endReason: "table_failed", rowsLoaded: 0, attempts: 4 }),
+        record({ runId: "run-clear-0003", trigger: "clear", rowsLoaded: 0 }),
+        record({ runId: "run-paused-004", trigger: "other", status: "paused", endReason: "connector_paused", rowsLoaded: 0, attempts: 0 }),
+      ],
+    })
+    panel()
+    expect(await screen.findByText("1,200 rows · 3 attempts")).toBeDefined()
+    // "Schedule" is also the title of the card beside this one.
+    const runsCard = screen.getByText("Runs", { selector: "[data-slot=card-title]" }).closest("[data-slot=card]") as HTMLElement
+    expect(within(runsCard).getByText("Schedule")).toBeDefined()
+    expect(screen.getByText("Started by a user")).toBeDefined()
+    expect(screen.getByText("Clear")).toBeDefined()
+    expect(screen.getByText("Started from the orchestrator")).toBeDefined()
+    expect(screen.getByText(/took 1m 35s/)).toBeDefined()
+    expect(screen.getByText("0 rows · 4 attempts")).toBeDefined()
+    expect(screen.getByText("Failed")).toBeDefined()
+    expect(screen.getByText("Paused")).toBeDefined()
+    // The old reads are gone: no per-table results, no orchestrator run list.
+    expect(calls.some((c) => c.url.includes("/api/governance/ingest-runs") || c.url.includes("/ingest/runs"))).toBe(false)
+    expect(calls.some((c) => c.url.endsWith("/api/connectors/conn-northwind/runs"))).toBe(true)
+  })
+
+  it("says why each run ended, in plain words", async () => {
+    stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-0000000001", endReason: "completed" }),
+        record({ runId: "run-0000000002", status: "failed", endReason: "table_failed" }),
+        record({ runId: "run-0000000003", status: "paused", endReason: "connector_paused" }),
+      ],
+    })
+    panel()
+    expect(await screen.findAllByText("Every table was loaded.")).toHaveLength(1)
+    expect(screen.getByText("At least one table could not be loaded.")).toBeDefined()
+    expect(screen.getByText("The connector was paused, so nothing was loaded.")).toBeDefined()
+  })
+
+  it("says there are no runs yet when the record is empty", async () => {
+    stubFetch(SPEC)
+    panel()
+    expect(await screen.findByText("No runs yet.")).toBeDefined()
+  })
+
+  it("shows a run recorded as running but started long ago as no end reported, and leaves Run now enabled", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      runs: [record({ runId: "run-stuck-0001", status: "running", startedAt: "2026-10-01T08:00:00.000Z", endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findAllByText("No end reported")).toHaveLength(2) // the pill and the summary
+    expect(screen.getByText("This run never reported its end. It may have been stopped before it finished.")).toBeDefined()
+    expect(screen.queryByText(/is running/)).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  it("shows a run recorded as running a moment ago as active, with Run now disabled", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      runs: [record({ runId: "run-live-00001", status: "running", startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-live is running/)).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("says the run record could not be loaded, with the API's words", async () => {
+    stubFetch(SPEC)
+    const original = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/runs")) return json({ error: "the store is unavailable" }, 500)
+      return original(input, init)
+    }) as unknown as typeof fetch
+    panel()
+    expect(await screen.findByText(/the store is unavailable/)).toBeDefined()
+  })
+})
+
+describe("ConnectorIngestPanel run log", () => {
+  const LOG = {
+    run: record({ runId: "run-log-000001", status: "succeeded", attempts: 3 }),
+    attempts: [
+      { table: "public.orders", attempt: 1, startedAt: "2026-10-12T08:00:01.000Z", endedAt: "2026-10-12T08:00:02.000Z", rowsLoaded: 0, result: "failed", errorClass: "unreachable", waitSeconds: 60 },
+      { table: "public.orders", attempt: 2, startedAt: "2026-10-12T08:01:05.000Z", endedAt: "2026-10-12T08:01:06.000Z", rowsLoaded: 0, result: "failed", errorClass: "sign_in_refused", waitSeconds: null },
+      { table: "public.customers", attempt: 1, startedAt: "2026-10-12T08:01:10.000Z", endedAt: "2026-10-12T08:01:20.000Z", rowsLoaded: 1200, result: "succeeded", errorClass: null, waitSeconds: null },
+    ],
+    lines: [
+      { at: "2026-10-12T08:00:00.000Z", event: "run_started", table: null, attempt: null, text: "Run started by the schedule" },
+      { at: "2026-10-12T08:00:02.000Z", event: "retry_wait", table: "public.orders", attempt: 1, text: "Next attempt in 1 min" },
+      { at: "2026-10-12T08:01:20.000Z", event: "run_ended", table: null, attempt: null, text: "Run ended: every table loaded" },
+    ],
+  }
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+
+  it("opens a run's log on request: each attempt with its result in product words, then the lines", async () => {
+    const calls = stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": LOG } })
+    panel()
+    // Nothing is read until the log is asked for.
+    await screen.findByText("Show log")
+    expect(calls.some((c) => c.url.includes("/log"))).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Show log" }))
+
+    expect(await screen.findByText("The source could not be reached. Next attempt in 1 min.")).toBeDefined()
+    expect(screen.getByText("The source refused the sign-in")).toBeDefined()
+    expect(screen.getByText("1,200 rows")).toBeDefined()
+    expect(screen.getAllByText("attempt 1")).toHaveLength(2)
+    expect(screen.getByText("Run started")).toBeDefined()
+    expect(screen.getByText("Waiting to retry")).toBeDefined()
+    expect(screen.getByText("Run ended")).toBeDefined()
+    expect(screen.getByText("Next attempt in 1 min")).toBeDefined()
+    expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log"))).toBe(true)
+  })
+
+  it("downloads the same log as text from the same route with ?format=text", async () => {
+    const calls = stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": LOG } })
+    const created: Blob[] = []
+    const originalCreate = URL.createObjectURL
+    const originalRevoke = URL.revokeObjectURL
+    URL.createObjectURL = ((blob: Blob) => {
+      created.push(blob)
+      return "blob:log"
+    }) as typeof URL.createObjectURL
+    URL.revokeObjectURL = (() => {}) as typeof URL.revokeObjectURL
+    try {
+      panel()
+      fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+      fireEvent.click(await screen.findByRole("button", { name: "Download log" }))
+      await waitFor(() => expect(created).toHaveLength(1))
+      expect(await created[0]!.text()).toBe("run 0123 (schedule), succeeded\n")
+      expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log?format=text"))).toBe(true)
+    } finally {
+      URL.createObjectURL = originalCreate
+      URL.revokeObjectURL = originalRevoke
+    }
+  })
+
+  it("says so, and still offers the download, when a run has no log lines left", async () => {
+    stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": { run: LOG.run, attempts: [], lines: [] } } })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    expect(await screen.findByText(/This run has no log lines\. Logs are kept for 30 days/)).toBeDefined()
+    expect(screen.getByRole("button", { name: "Download log" })).toBeDefined()
+  })
+
+  it("shows the API's words when the log cannot be read", async () => {
+    stubFetch(SPEC, { runs: [LOG.run], logs: {} })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    expect(await screen.findByText(/not found/)).toBeDefined()
+  })
+})
+
+describe("ConnectorIngestPanel resume", () => {
+  const AUTO = "Paused after 30 failed runs in a row"
+  const panel = (props: Partial<React.ComponentProps<typeof ConnectorIngestPanel>> = {}) =>
+    render(
+      <ConnectorIngestPanel
+        connectorId="conn-northwind"
+        connectorName="northwind"
+        layout="page"
+        pausedReason={AUTO}
+        {...props}
+      />
+    )
+
+  it("recognises the pause repeated failures set, whatever the number, and no other", () => {
+    expect(isAutoDisablePause("Paused after 30 failed runs in a row")).toBe(true)
+    expect(isAutoDisablePause("Paused after 3 failed runs in a row")).toBe(true)
+    expect(isAutoDisablePause("Paused after  failed runs in a row")).toBe(false)
+    expect(isAutoDisablePause("Paused by the schema-change policy until a change is approved")).toBe(false)
+    expect(isAutoDisablePause(null)).toBe(false)
+  })
+
+  it("offers Resume on the auto-disable pause, posts it, and tells the page", async () => {
+    const calls = stubFetch(SPEC)
+    const onResumed = mock(() => {})
+    panel({ onResumed })
+    expect(await screen.findByText(`Paused: ${AUTO}`)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }))
+    await waitFor(() => expect(onResumed).toHaveBeenCalled())
+    const post = calls.find((c) => c.url.endsWith("/api/connectors/conn-northwind/resume"))
+    expect(post?.method).toBe("POST")
+    expect(post?.body).toBeUndefined()
+  })
+
+  it("shows the 409's fixed text as it came, and does not tell the page", async () => {
+    const refusal =
+      "This connector is not paused because of repeated failures. If a schema change is waiting, approve it under Schema changes to resume it."
+    stubFetch(SPEC, undefined, { onResume: () => json({ error: refusal }, 409) })
+    const onResumed = mock(() => {})
+    panel({ onResumed })
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }))
+    expect((await screen.findByRole("alert")).textContent).toBe(refusal)
+    expect(onResumed).not.toHaveBeenCalled()
+  })
+
+  it("offers no Resume for a pause the schema-change policy set", async () => {
+    stubFetch(SPEC)
+    panel({ pausedReason: "Paused by the schema-change policy until a change is approved" })
+    expect(await screen.findByText(/Paused: Paused by the schema-change policy/)).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull()
+  })
+
+  it("disables Run now while paused", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    panel()
+    await screen.findByText(`Paused: ${AUTO}`)
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+/**
+ * SRC-11 decisions 9 to 11: column choice per table for PostgreSQL, MySQL (MariaDB) and SQL Server; key and
+ * cursor columns ticked and locked with the reason; other types say it is not available.
+ */
+describe("ConnectorIngestPanel column choice", () => {
+  const FOUND = [
+    {
+      name: "public.orders",
+      columns: [
+        { name: "order_id", typeName: "integer" },
+        { name: "region", typeName: "text" },
+        { name: "updated_at", typeName: "timestamp" },
+        { name: "discount", typeName: "numeric" },
+      ],
+      primaryKey: ["order_id"],
+    },
+  ]
+  const saved = (extra: Record<string, unknown> = {}, spec: typeof SPEC = SPEC) => ({
+    ...spec,
+    sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "replace", ...extra }],
+  })
+  const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" })
+  const box = (column: string) => screen.getByLabelText(`Load column ${column} of public.orders`) as HTMLInputElement
+
+  async function openColumns() {
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    await screen.findByText("1 tables found")
+    fireEvent.click(await screen.findByText(/^Columns/))
+  }
+
+  it("lists the columns discovery found, ticked, and saves an unticked one as excluded", async () => {
+    const calls = stubFetch(saved(), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(["order_id", "region", "updated_at", "discount"].map((c) => box(c).checked)).toEqual([true, true, true, true])
+
+    fireEvent.click(box("discount"))
+    expect(box("discount").checked).toBe(false)
+    expect(screen.getByText(/^Columns · 1 left out/)).toBeDefined()
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "replace", excludedColumns: ["discount"] },
+    ])
+  })
+
+  it("shows a saved exclusion unticked, lets it be ticked again, and then saves none", async () => {
+    const calls = stubFetch(saved({ excludedColumns: ["discount"] }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("discount").checked).toBe(false)
+    fireEvent.click(box("discount"))
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown[] }).sourceObjects[0]).toEqual({
+      name: "public.orders",
+      target: "northwind_orders",
+      loadMode: "replace",
+    })
+  })
+
+  it("locks the key columns of a deduplicating table and the cursor column, ticked, with the reason", async () => {
+    stubFetch(
+      saved({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["order_id"] }),
+      undefined,
+      { discovered: FOUND }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    for (const locked of ["order_id", "updated_at"]) {
+      expect(box(locked).checked).toBe(true)
+      expect(box(locked).disabled).toBe(true)
+    }
+    expect(screen.getByText("Key column: it identifies a row of this table.")).toBeDefined()
+    expect(screen.getByText("Cursor column: it marks which rows are new.")).toBeDefined()
+    expect(box("region").disabled).toBe(false)
+  })
+
+  it("never sends a key or cursor column as excluded, even if it was unticked before the mode needed it", async () => {
+    stubFetch(
+      saved({ loadMode: "replace_dedup", primaryKey: ["order_id"], excludedColumns: ["order_id", "discount"] }),
+      undefined,
+      { discovered: FOUND }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("order_id").checked).toBe(true)
+    // The saved list held a key column; what would be saved now drops it, so the page is changed, not silently different.
+    expect(screen.getByText(/^Columns · 1 left out/)).toBeDefined()
+  })
+
+  it("says to find the table first when its columns have not been listed", async () => {
+    stubFetch(saved({ excludedColumns: ["discount"] }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    fireEvent.click(await screen.findByText(/^Columns/))
+    expect(screen.getByText(/Left out: discount\. Find this table above to list its columns\./)).toBeDefined()
+  })
+
+  it.each(["mysql", "mssql"])("is offered for the %s driver too", async (driver) => {
+    stubFetch(saved({}, { ...SPEC, dial: { ...SPEC.dial, driver } }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("region").checked).toBe(true)
+  })
+
+  it.each([
+    ["Oracle", { ...SPEC, dial: { ...SPEC.dial, driver: "oracle" } }],
+    ["files", { ...SPEC, adapter: "files", dial: {} }],
+    ["REST", { ...SPEC, adapter: "rest", dial: {} }],
+  ])("says column choice is not available for a %s source and offers no column list", async (_label, spec) => {
+    stubFetch(saved({}, spec as typeof SPEC))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect(await screen.findByText("Column choice is not available for this source type.")).toBeDefined()
+    expect(screen.queryByText(/^Columns/)).toBeNull()
+  })
+
+  it("does not say it for a source that has no tables selected, nor offer it for a change-capture one", async () => {
+    stubFetch({ ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("public.orders")
+    expect(screen.queryByText("Column choice is not available for this source type.")).toBeNull()
+  })
+
+  it("works out what a mode locks", () => {
+    expect(lockedColumns({ loadMode: "replace", primaryKey: ["id"], incrementalKey: "ts" }).size).toBe(0)
+    expect([...lockedColumns({ loadMode: "history", primaryKey: ["id", "region"] }).keys()]).toEqual(["id", "region"])
+    expect([...lockedColumns({ loadMode: "incremental", incrementalKey: " ts " }).keys()]).toEqual(["ts"])
   })
 })

@@ -3,6 +3,8 @@ import type {
   ApproveSchemaChangeResponse,
   Connector,
   ConnectorDetail,
+  ConnectorRun,
+  ConnectorRunLog,
   ConnectorService,
   ConnectorTestResult,
   ConnectorType,
@@ -11,12 +13,11 @@ import type {
   DebeziumProperties,
   DiscoverResult,
   IngestibleConnector,
-  IngestJobRun,
-  IngestRun,
   IngestRunResult,
   IngestSpec,
   IngestSpecInput,
   ProbeHistoryResponse,
+  ResumeConnectorResponse,
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
   SchemaChangeList,
@@ -133,14 +134,37 @@ export const postgresConnectorService: ConnectorService = {
   runIngest(id, signal, table) {
     return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, table, signal);
   },
-  listIngestRuns(connectorId, signal) {
-    return getJson<IngestRun[]>(
-      `/api/governance/ingest-runs?connectorId=${encodeURIComponent(connectorId)}`,
+  async listConnectorRuns(connectorId, signal) {
+    const body = await getJson<{ runs: ConnectorRun[] }>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/runs`,
+      { signal }
+    );
+    return body.runs;
+  },
+  getConnectorRunLog(connectorId, runId, signal) {
+    return getJson<ConnectorRunLog>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/runs/${encodeURIComponent(runId)}/log`,
       { signal }
     );
   },
-  listIngestJobRuns(connectorId, signal) {
-    return getJson<IngestJobRun[]>(`/api/connectors/${encodeURIComponent(connectorId)}/ingest/runs`, { signal });
+  async downloadConnectorRunLog(connectorId, runId, signal) {
+    const res = await apiFetch(
+      `/api/connectors/${encodeURIComponent(connectorId)}/runs/${encodeURIComponent(runId)}/log?format=text`,
+      { signal }
+    );
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
+      throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
+    }
+    return res.text();
+  },
+  resumeConnector(connectorId, signal) {
+    return postJson<ResumeConnectorResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/resume`,
+      undefined,
+      signal
+    );
   },
   getDebeziumProperties(id, table, signal) {
     return getJson<DebeziumProperties>(

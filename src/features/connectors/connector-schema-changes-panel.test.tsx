@@ -12,6 +12,7 @@ import {
   PAUSED_NOTHING_TO_APPROVE_NOTE,
   SCHEMA_CHANGE_PAUSE_REASON,
   changeLabel,
+  inactiveReasonLabel,
   waitingTables,
 } from "./connector-schema-changes-panel"
 
@@ -157,7 +158,7 @@ describe("ConnectorSchemaChangesPanel", () => {
     const after: SchemaChangeList = {
       pending: [],
       recent: [change({ status: "approved", canApprove: false })],
-      inactiveColumns: [{ objectName: "public.orders", columnName: "note", inactiveSince: "2026-10-09T02:00:00.000Z", loadedName: "note" }],
+      inactiveColumns: [{ objectName: "public.orders", columnName: "note", inactiveSince: "2026-10-09T02:00:00.000Z", loadedName: "note", reason: "removed_at_source" }],
     }
     const calls = stubFetch([pending, after], {
       "POST /api/connectors/conn-a/schema-changes/approve": () =>
@@ -282,6 +283,43 @@ describe("ConnectorSchemaChangesPanel", () => {
     await settle()
     expect(screen.queryByText(APPLY_ALL_NOTE)).toBeNull()
     expect(within(screen.getByRole("group")).getAllByRole("radio")).toHaveLength(4)
+  })
+})
+
+describe("inactive columns (SRC-11 decision 10)", () => {
+  it("lists a column removed at the source and one left out by the user, each with its own words", async () => {
+    stubFetch([
+      {
+        pending: [],
+        recent: [],
+        inactiveColumns: [
+          { objectName: "public.orders", columnName: "note", inactiveSince: "2026-10-09T02:00:00.000Z", loadedName: "note", reason: "removed_at_source" },
+          { objectName: "public.orders", columnName: "discount", inactiveSince: "2026-10-10T02:00:00.000Z", loadedName: "discount", reason: "excluded" },
+        ],
+      },
+    ])
+    renderPanel()
+    const card = (await screen.findByText("Inactive columns", { selector: "[data-slot=card-title]" })).closest(
+      "[data-slot=card]"
+    ) as HTMLElement
+    const rows = within(card).getAllByRole("listitem")
+    expect(rows).toHaveLength(2)
+    expect(within(rows[0]!).getByText("removed at the source")).toBeTruthy()
+    expect(within(rows[1]!).getByText("discount")).toBeTruthy()
+    expect(within(rows[1]!).getByText("left out by you")).toBeTruthy()
+  })
+
+  it("shows no inactive columns card when there are none", async () => {
+    stubFetch([EMPTY])
+    renderPanel()
+    await screen.findByText("Nothing is waiting for a decision.")
+    expect(screen.queryByText("Inactive columns")).toBeNull()
+  })
+
+  it("words a reason a newer API adds as plain inactive, not as a guess", () => {
+    expect(inactiveReasonLabel("excluded")).toBe("left out by you")
+    expect(inactiveReasonLabel("removed_at_source")).toBe("removed at the source")
+    expect(inactiveReasonLabel("something_new")).toBe("inactive")
   })
 })
 

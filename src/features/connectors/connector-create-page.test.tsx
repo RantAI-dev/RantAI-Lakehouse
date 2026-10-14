@@ -158,8 +158,7 @@ describe("ConnectorCreatePage", () => {
       if (url.includes("/test")) {
         return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
       }
-      if (url.includes("/api/governance/ingest-runs")) return json([])
-      if (url.includes("/ingest/runs")) return json([])
+      if (url.endsWith("/runs")) return json({ runs: [] })
       return null
     })
     const page = renderPage()

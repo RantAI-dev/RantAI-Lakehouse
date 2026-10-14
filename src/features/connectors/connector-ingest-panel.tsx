@@ -5,6 +5,7 @@ import Link from "next/link"
 import {
   CalendarClockIcon,
   ChevronRightIcon,
+  DownloadIcon,
   LoaderIcon,
   PlayIcon,
   PlusIcon,
@@ -22,14 +23,13 @@ import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
-import { withNotify } from "@/lib/notify"
+import { notifySuccess, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
-import { TableActionsMenu, tableActionLabel } from "./connector-table-actions"
+import { TableActionsMenu } from "./connector-table-actions"
 import type {
+  ConnectorRun,
   Dial,
-  IngestJobRun,
-  IngestRun,
   IngestSpec,
   LoadMode,
   SourceObject,
@@ -107,15 +107,6 @@ export function scheduleLabel(cron: string | null): string {
   return SCHEDULE_PRESETS.find((p) => p.value === cron)?.label ?? `${cron} (UTC)`
 }
 
-const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"> = {
-  succeeded: "success",
-  // SRC-10: a clear loads nothing and says so; it did what it was asked.
-  cleared: "success",
-  failed: "destructive",
-  rejected: "warning",
-  unsupported: "neutral",
-}
-
 type Selected = {
   name: string
   target: string
@@ -124,6 +115,8 @@ type Selected = {
   /** SRC-10: the columns that identify one row, for the two deduplicating modes. Kept whatever the mode, so a key
    * filled from discovery survives a switch to a mode that does not use it (the API ignores it there). */
   primaryKey?: string[]
+  /** SRC-11: the columns left out of the load (SQL sources whose columns can be listed). */
+  excludedColumns?: string[]
 }
 type Selection = Selected[]
 
@@ -213,6 +206,44 @@ export function loadModeProblem(selected: {
   return null
 }
 
+/**
+ * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
+ * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle follows with
+ * `SRC-13`; files, REST, MongoDB, Kafka and SFTP have no column list to choose from.
+ */
+export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
+  const driver = typeof dial?.driver === "string" ? dial.driver : ""
+  return adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql")
+}
+
+/**
+ * The columns a table cannot leave out, with the reason (`SRC-11` decision 11): the key of a table that
+ * deduplicates or keeps history, and the cursor of an incremental one. The API answers 422 for either.
+ */
+export function lockedColumns(s: {
+  loadMode: LoadMode
+  incrementalKey?: string
+  primaryKey?: string[]
+}): Map<string, string> {
+  const locked = new Map<string, string>()
+  if (needsKey(s.loadMode)) {
+    for (const column of s.primaryKey ?? []) locked.set(column, "Key column: it identifies a row of this table.")
+  }
+  if ((s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()) {
+    locked.set(s.incrementalKey.trim(), "Cursor column: it marks which rows are new.")
+  }
+  return locked
+}
+
+/**
+ * What is saved as left out: the user's choice minus the columns the table's current mode locks, so choosing
+ * a mode or a key that needs a column the user had unticked never sends the API a combination it refuses.
+ */
+function effectiveExcluded(s: Selected): string[] {
+  const locked = lockedColumns(s)
+  return (s.excludedColumns ?? []).filter((c) => !locked.has(c))
+}
+
 function fromSpec(spec: IngestSpec): Selection {
   return spec.sourceObjects.map((o) => ({
     name: o.name,
@@ -221,6 +252,7 @@ function fromSpec(spec: IngestSpec): Selection {
     loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
     incrementalKey: o.incrementalKey,
     primaryKey: o.primaryKey,
+    excludedColumns: o.excludedColumns,
   }))
 }
 
@@ -234,6 +266,7 @@ function toSourceObjects(selection: Selection, withModes: boolean): SourceObject
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
     ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
+    ...(withModes && effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
   }))
 }
 
@@ -261,11 +294,14 @@ export function ConnectorIngestPanel({
   onTableCount,
   pausedReason = null,
   waitingTables,
+  onResumed,
 }: {
   connectorId: string
   connectorName: string
   layout?: "page" | "embedded"
   onTableCount?: (count: number) => void
+  /** Called after Resume lifted a pause (`SRC-11`), so the page reloads the connector and the pause goes. */
+  onResumed?: () => void
   /** Why the connector is paused (`SRC-8`); the API refuses a run meanwhile. */
   pausedReason?: string | null
   /** Source tables that wait for a schema decision (`SRC-8`), from the Schema changes tab's one list. */
@@ -307,6 +343,7 @@ export function ConnectorIngestPanel({
       onSaved={setSavedSpec}
       pausedReason={pausedReason}
       waitingTables={waitingTables}
+      onResumed={onResumed}
     />
   )
 }
@@ -319,6 +356,7 @@ function IngestEditor({
   onSaved,
   pausedReason,
   waitingTables,
+  onResumed,
 }: {
   connectorId: string
   connectorName: string
@@ -327,11 +365,13 @@ function IngestEditor({
   onSaved: (spec: IngestSpec) => void
   pausedReason: string | null
   waitingTables?: ReadonlySet<string>
+  onResumed?: () => void
 }) {
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
   const isStream = adapter === "kafka"
   const canDiscover = adapter === "sql" || adapter === "cdc"
+  const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
   const runState = useIngestRunState(connectorId)
 
@@ -475,6 +515,10 @@ function IngestEditor({
             No tables selected yet.{canDiscover ? " Find tables below and tick the ones to copy." : ""}
           </p>
         ) : (
+          <>
+          {!columnChoice && !isCdc ? (
+            <p className="text-xs text-muted-foreground">{NO_COLUMN_CHOICE_NOTE}</p>
+          ) : null}
           <ul className="divide-y divide-border rounded-md border border-border">
             {selection.map((s, i) => (
               <li key={s.name} className="space-y-1.5 px-3 py-2">
@@ -534,9 +578,17 @@ function IngestEditor({
                     onChange={(patch) => change(s.name, patch)}
                   />
                 ) : null}
+                {columnChoice ? (
+                  <ColumnChoice
+                    selected={s}
+                    columns={columnsOf.get(s.name) ?? null}
+                    onChange={(excludedColumns) => change(s.name, { excludedColumns })}
+                  />
+                ) : null}
               </li>
             ))}
           </ul>
+          </>
         )}
       </div>
 
@@ -749,7 +801,8 @@ function IngestEditor({
       layout={layout}
       connectorId={connectorId}
       state={runState}
-      tableCount={saved.length}
+      pausedReason={pausedReason}
+      onResumed={onResumed}
       blockedReason={
         pausedReason
           ? `Paused: ${pausedReason}`
@@ -910,6 +963,75 @@ function LoadModeFields({
   )
 }
 
+/** `SRC-11` decision 9: said when the source type cannot list its columns before loading. */
+export const NO_COLUMN_CHOICE_NOTE = "Column choice is not available for this source type."
+
+/**
+ * Which columns of a table a load reads (`SRC-11` decisions 9 to 11). Opened per table; the columns come from
+ * discovery, so a table not found in this visit says to find it first. Unticking adds the column to
+ * `excludedColumns`. A key column of a table that deduplicates or keeps history, and the cursor column, are
+ * ticked and locked with the reason. A column left out earlier that discovery no longer lists still shows,
+ * so it can be ticked again.
+ */
+function ColumnChoice({
+  selected,
+  columns,
+  onChange,
+}: {
+  selected: Selected
+  columns: string[] | null
+  onChange: (excluded: string[]) => void
+}) {
+  const locked = lockedColumns(selected)
+  const excluded = effectiveExcluded(selected)
+  const shown = columns ? [...columns, ...excluded.filter((c) => !columns.includes(c))] : null
+  return (
+    <details className="group">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-open:rotate-90" />
+        Columns
+        {excluded.length > 0 ? ` · ${excluded.length} left out` : ""}
+      </summary>
+      <div className="mt-1 space-y-1 pl-5">
+        {shown === null ? (
+          <p className="text-xs text-muted-foreground">
+            {excluded.length > 0 ? `Left out: ${excluded.join(", ")}. ` : ""}
+            Find this table above to list its columns.
+          </p>
+        ) : (
+          <>
+            <ul className="space-y-0.5">
+              {shown.map((column) => {
+                const reason = locked.get(column)
+                return (
+                  <li key={column}>
+                    <label className="flex items-center gap-1.5 font-mono text-xs">
+                      <input
+                        type="checkbox"
+                        aria-label={`Load column ${column} of ${selected.name}`}
+                        checked={reason !== undefined || !excluded.includes(column)}
+                        disabled={reason !== undefined}
+                        onChange={(e) =>
+                          onChange(e.target.checked ? excluded.filter((c) => c !== column) : [...excluded, column])
+                        }
+                      />
+                      {column}
+                      {reason ? <span className="font-sans text-muted-foreground">{reason}</span> : null}
+                    </label>
+                  </li>
+                )
+              })}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              An unticked column is not read from the source on the next load.
+            </p>
+          </>
+        )}
+      </div>
+    </details>
+  )
+}
+
 /**
  * The columns that identify one row of a deduplicating table (SRC-10 decision 3).
  * A table found by discovery lists its columns to tick, with the source's own key
@@ -992,116 +1114,152 @@ function sameColumns(a: string[], b: string[]): boolean {
 /** How often a run in progress is checked on. */
 const POLL_MS = 3_000
 
-/** How long a run just launched is waited for before Dagster lists it. */
+/** How long a run just launched is waited for before the run record lists it. */
 const LAUNCH_GRACE_MS = 60_000
 
-export const RUN_STATUS_LABEL: Record<IngestJobRun["status"], string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  unknown: "Unknown",
-}
-
-export const RUN_STATUS_TONE: Record<IngestJobRun["status"], "success" | "destructive" | "warning" | "neutral" | "info"> = {
-  queued: "neutral",
-  running: "info",
-  completed: "success",
-  failed: "destructive",
-  cancelled: "warning",
-  unknown: "neutral",
-}
-
-export function isActive(run: IngestJobRun): boolean {
-  return run.status === "queued" || run.status === "running"
-}
-
-/** Epoch milliseconds, or `null`. The per-table results carry
- * microseconds, which not every engine's `Date` parses. */
-function toMillis(iso: string | null): number | null {
-  if (!iso) return null
-  const t = parseTimestamp(iso.replace(/(\.\d{3})\d+/, "$1")).getTime()
-  return Number.isNaN(t) ? null : t
-}
-
-export type RunGroup = { run: IngestJobRun | null; results: IngestRun[] }
-
 /**
- * Each run (newest first) with the table results recorded while it ran,
- * in the order the tables were loaded. A result is matched to a run by
- * time, since the results do not carry a run id; runs of one connector
- * never overlap (the API refuses a second one). Results older than every
- * listed run come last, under `run: null`.
+ * How long a run whose record still says `running` is believed. A table holds
+ * a run open for at most about 21 minutes of waiting between its three retries
+ * (`SRC-11` decision 1) plus the load itself, so a run with no end reported
+ * after six hours was stopped without reporting one: a worker killed or a run
+ * cancelled in the orchestrator fires neither of the reports that close a
+ * record (the Rust handoff of tasks 1 to 4 says so). It is shown as "no end
+ * reported", not as active forever, and it no longer disables Run now.
  */
-export function groupResultsByRun(runs: IngestJobRun[], results: IngestRun[]): RunGroup[] {
-  const slack = 2_000
-  const groups: RunGroup[] = runs.map((run) => ({ run, results: [] }))
-  const earlier: IngestRun[] = []
-  for (const result of results) {
-    const at = toMillis(result.startedAt)
-    const group =
-      at === null
-        ? undefined
-        : groups.find(({ run }) => {
-            const start = toMillis(run?.startedAt ?? null)
-            if (start === null) return false
-            const end = toMillis(run?.endedAt ?? null) ?? Number.POSITIVE_INFINITY
-            return at >= start - slack && at <= end + slack
-          })
-    ;(group ? group.results : earlier).push(result)
+export const STALE_RUN_MS = 6 * 60 * 60 * 1000
+
+function startedMillis(run: ConnectorRun): number {
+  return parseTimestamp(run.startedAt).getTime()
+}
+
+/** Whether the run's record says it is going and the bound above has not passed. */
+export function isActive(run: ConnectorRun, now = Date.now()): boolean {
+  if (run.status !== "running") return false
+  const started = startedMillis(run)
+  return Number.isNaN(started) || now - started < STALE_RUN_MS
+}
+
+/** A record that says `running` for longer than `STALE_RUN_MS`: its end was never reported. */
+export function isNoEndReported(run: ConnectorRun, now = Date.now()): boolean {
+  return run.status === "running" && !isActive(run, now)
+}
+
+export function runStatusLabel(run: ConnectorRun, now = Date.now()): string {
+  if (isNoEndReported(run, now)) return "No end reported"
+  switch (run.status) {
+    case "running":
+      return "Running"
+    case "succeeded":
+      return "Succeeded"
+    case "failed":
+      return "Failed"
+    case "paused":
+      return "Paused"
+    default:
+      return run.status
   }
-  const byTime = (x: IngestRun, y: IngestRun) => (toMillis(x.startedAt) ?? 0) - (toMillis(y.startedAt) ?? 0)
-  for (const group of groups) group.results.sort(byTime)
-  earlier.sort((x, y) => byTime(y, x))
-  return earlier.length > 0 ? [...groups, { run: null, results: earlier }] : groups
+}
+
+export function runStatusTone(
+  run: ConnectorRun,
+  now = Date.now()
+): "success" | "destructive" | "warning" | "neutral" | "info" {
+  if (isNoEndReported(run, now)) return "neutral"
+  switch (run.status) {
+    case "running":
+      return "info"
+    case "succeeded":
+      return "success"
+    case "failed":
+      return "destructive"
+    case "paused":
+      return "warning"
+    default:
+      return "neutral"
+  }
+}
+
+const TRIGGER_LABEL: Record<string, string> = {
+  schedule: "Schedule",
+  user: "Started by a user",
+  refresh: "Refresh",
+  clear: "Clear",
+  other: "Started from the orchestrator",
+}
+
+const END_REASON_LABEL: Record<string, string> = {
+  completed: "Every table was loaded.",
+  table_failed: "At least one table could not be loaded.",
+  connector_paused: "The connector was paused, so nothing was loaded.",
+  other: "The run ended for another reason.",
+}
+
+/** What an attempt's closed error class says (`SRC-11` decision 2); never the source's own text. */
+const ERROR_CLASS_LABEL: Record<string, string> = {
+  unreachable: "The source could not be reached",
+  timeout: "The source took too long to answer",
+  source_busy: "The source was busy",
+  api_unreachable: "The product's own API could not be reached",
+  sign_in_refused: "The source refused the sign-in",
+  address_refused: "The address was refused",
+  unsupported: "The source type or load mode is not supported",
+  setting_rejected: "A setting was rejected",
+  schema_decision_pending: "The table is waiting for a schema decision",
+  other: "Failed for another reason",
+}
+
+/** The retried classes, for the word beside them; the others fail at once. */
+const RETRIED_CLASSES = new Set(["unreachable", "timeout", "source_busy", "api_unreachable"])
+
+const EVENT_LABEL: Record<string, string> = {
+  run_started: "Run started",
+  attempt: "Attempt",
+  retry_wait: "Waiting to retry",
+  schema_decision_pending: "Waiting for a schema decision",
+  columns_left_out: "Columns left out",
+  report_gap: "Log may be incomplete",
+  run_ended: "Run ended",
 }
 
 /**
- * The two run lists of a connector and what is known from them: whether a run is
- * going, including one just launched that Dagster does not list yet. Checked every
- * few seconds while a run is going. Used by the editor (the per-table actions are
- * disabled meanwhile) and handed to the Runs card.
+ * The run record of a connector and what is known from it: whether a run is
+ * going, including one just launched that the record does not list yet. Checked
+ * every few seconds while a run is going. Used by the editor (the per-table
+ * actions are disabled meanwhile) and handed to the Runs card.
  */
 function useIngestRunState(connectorId: string) {
-  const jobRuns = useRefreshable((s) => connectorService.listIngestJobRuns(connectorId, s), connectorId)
-  const results = useRefreshable((s) => connectorService.listIngestRuns(connectorId, s), connectorId)
-  // A run just launched, until Dagster lists it.
+  const list = useRefreshable((s) => connectorService.listConnectorRuns(connectorId, s), connectorId)
+  // A run just launched, until the record lists it.
   const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
 
-  const runs = jobRuns.data ?? []
-  const activeRun = runs.find(isActive) ?? null
+  const runs = list.data ?? []
+  const activeRun = runs.find((r) => isActive(r)) ?? null
   const awaitingLaunch = launchedRunId !== null && !runs.some((r) => r.runId === launchedRunId)
   const watching = activeRun !== null || awaitingLaunch
-  const { refresh: refreshRuns } = jobRuns
-  const { refresh: refreshResults } = results
+  const { refresh: refreshRuns } = list
 
   React.useEffect(() => {
     if (!watching) return
-    const timer = window.setInterval(() => {
-      refreshRuns()
-      refreshResults()
-    }, POLL_MS)
+    const timer = window.setInterval(refreshRuns, POLL_MS)
     return () => window.clearInterval(timer)
-  }, [watching, refreshRuns, refreshResults])
+  }, [watching, refreshRuns])
 
-  // Stop waiting for a launched run Dagster never lists.
+  // Stop waiting for a launched run the record never lists.
   React.useEffect(() => {
     if (!launchedRunId) return
     const timer = window.setTimeout(() => setLaunchedRunId(null), LAUNCH_GRACE_MS)
     return () => window.clearTimeout(timer)
   }, [launchedRunId])
 
-  // A run that just finished: one last read, so its final tables show.
+  // A run that just finished: one last read, so its final numbers show.
   const wasWatching = React.useRef(false)
   React.useEffect(() => {
-    if (wasWatching.current && !watching) refreshResults()
+    if (wasWatching.current && !watching) refreshRuns()
     wasWatching.current = watching
-  }, [watching, refreshResults])
+  }, [watching, refreshRuns])
 
   return {
-    jobRuns,
-    results,
+    list,
     runs,
     activeRun,
     awaitingLaunch,
@@ -1109,34 +1267,45 @@ function useIngestRunState(connectorId: string) {
     watching,
     launch: setLaunchedRunId,
     refreshRuns,
-    refreshResults,
   }
 }
 
 type IngestRunState = ReturnType<typeof useIngestRunState>
 
 /**
- * The connector's runs, each with the tables it loaded, and a Run now
- * that stays disabled while a run is going: Bronze is append-only, so a
- * second run would copy every table in again.
+ * `SRC-11` decision 3, mirrored from `AUTO_DISABLE_REASON_HEAD` / `_TAIL` in
+ * `rust/crates/lakehouse-store/src/connectors.rs` (`is_auto_disable_pause_reason`):
+ * "Paused after N failed runs in a row", N from the API's setting. Resume lifts
+ * only this pause; a schema-change pause is lifted by approving the change.
+ */
+export function isAutoDisablePause(reason: string | null | undefined): boolean {
+  return /^Paused after \d+ failed runs in a row$/.test(reason ?? "")
+}
+
+/**
+ * The connector's runs from the product's own record (newest 50), each opening
+ * to its log, and a Run now that stays disabled while a run is going: Bronze is
+ * append-only, so a second run would copy every table in again. While the
+ * connector is paused the card says so, with Resume when the pause is the
+ * auto-disable one.
  */
 function IngestRuns({
   layout,
   connectorId,
   state,
-  tableCount,
   blockedReason,
+  pausedReason,
+  onResumed,
 }: {
   layout: "page" | "embedded"
   connectorId: string
   state: IngestRunState
-  tableCount: number
   blockedReason: string | null
+  pausedReason: string | null
+  onResumed?: () => void
 }) {
-  const { jobRuns, results, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
+  const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
   const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
-
-  const groups = groupResultsByRun(runs, results.data ?? [])
 
   const runNowButton = (
     <Button
@@ -1157,11 +1326,15 @@ function IngestRuns({
 
   const body = (
     <>
-      {blockedReason && !watching ? <p className="text-xs text-muted-foreground">{blockedReason}</p> : null}
+      {pausedReason ? (
+        <PausedNote connectorId={connectorId} reason={pausedReason} onResumed={onResumed} />
+      ) : blockedReason && !watching ? (
+        <p className="text-xs text-muted-foreground">{blockedReason}</p>
+      ) : null}
       {activeRun ? (
         <p className="flex items-center gap-1.5 text-xs text-primary">
           <LoaderIcon className="size-3.5 animate-spin" />
-          Run {activeRun.runId.slice(0, 8)} is {activeRun.status}. Tables appear below as each one is loaded.
+          Run {activeRun.runId.slice(0, 8)} is running. Its log shows each attempt as it ends.
         </p>
       ) : awaitingLaunch ? (
         <p className="flex items-center gap-1.5 text-xs text-primary">
@@ -1174,23 +1347,20 @@ function IngestRuns({
         <p className="text-xs text-muted-foreground">Not runnable · {runNow.data.reason}</p>
       ) : null}
 
-      {jobRuns.error ? (
-        <ErrorState error={jobRuns.error} onRetry={refreshRuns} />
-      ) : jobRuns.data === null || (results.data === null && results.error === null) ? (
+      {list.error ? (
+        <ErrorState error={list.error} onRetry={refreshRuns} />
+      ) : list.data === null ? (
         <LoadingSkeleton rows={2} />
-      ) : groups.length === 0 ? (
+      ) : runs.length === 0 ? (
         <p className="text-xs text-muted-foreground">No runs yet.</p>
       ) : (
         <div className="space-y-2">
-          {results.error ? (
-            <p className="text-xs text-destructive">Table results could not be loaded · {results.error.message}</p>
-          ) : null}
-          {groups.map((group, index) => (
-            <RunGroupCard
-              key={group.run?.runId ?? "earlier"}
+          {runs.map((run, index) => (
+            <RunCard
+              key={run.runId}
               layout={layout}
-              group={group}
-              tableCount={tableCount}
+              connectorId={connectorId}
+              run={run}
               defaultOpen={index === 0}
             />
           ))}
@@ -1218,61 +1388,85 @@ function IngestRuns({
   )
 }
 
-function RunGroupCard({
+/**
+ * The pause, in the Runs card. Resume (`SRC-11` decision 4) only for the pause
+ * repeated failures set; the API answers any other with a fixed 409 and nothing
+ * changes, which is shown as it came if it ever happens.
+ */
+function PausedNote({
+  connectorId,
+  reason,
+  onResumed,
+}: {
+  connectorId: string
+  reason: string
+  onResumed?: () => void
+}) {
+  const resume = useServiceAction(async (signal) => {
+    const result = await connectorService.resumeConnector(connectorId, signal)
+    if (!signal.aborted) notifySuccess("Resumed; the connector runs on its schedule again")
+    return result
+  })
+  return (
+    <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
+      <p className="text-xs">Paused: {reason}</p>
+      {isAutoDisablePause(reason) ? (
+        <>
+          <p className="text-xs text-muted-foreground">
+            Fix the cause, then resume. The count of failed runs starts again from zero.
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            disabled={resume.status === "pending"}
+            onClick={async () => {
+              if (await resume.run()) onResumed?.()
+            }}
+          >
+            {resume.status === "pending" ? "Resuming…" : "Resume"}
+          </Button>
+        </>
+      ) : null}
+      {resume.status === "error" ? (
+        <p role="alert" className="text-xs text-destructive">
+          {resume.error.message}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function RunCard({
   layout,
-  group,
-  tableCount,
+  connectorId,
+  run,
   defaultOpen,
 }: {
   layout: "page" | "embedded"
-  group: RunGroup
-  tableCount: number
+  connectorId: string
+  run: ConnectorRun
   defaultOpen: boolean
 }) {
-  const { run, results } = group
-  const loaded = results.filter((r) => r.status === "succeeded")
-  const notLoaded = results.length - loaded.length
-  const rows = loaded.reduce((sum, r) => sum + (r.rows ?? 0), 0)
-  const start = toMillis(run?.startedAt ?? null)
-  const end = toMillis(run?.endedAt ?? null)
+  const [logOpen, setLogOpen] = React.useState(false)
+  const noEnd = isNoEndReported(run)
+  const attempts = `${run.attempts} ${run.attempts === 1 ? "attempt" : "attempts"}`
+  const summary = noEnd
+    ? "No end reported"
+    : `${run.rowsLoaded.toLocaleString()} rows · ${attempts}`
 
-  // SRC-10 decision 5: a run of one table says which table and what it was asked to do.
-  const scope = run?.object ? `${run.action ? `${tableActionLabel(run.action)} · ` : ""}${run.object}` : null
-  const summary = !run
-    ? `${results.length} older ${results.length === 1 ? "result" : "results"}`
-    : isActive(run)
-      ? run.object
-        ? `${results.length} of 1 table so far`
-        : `${results.length} of ${tableCount} tables so far`
-      : run.action === "clear" && results.length > 0
-        ? "Table emptied · nothing loaded"
-        : results.length === 0
-        ? "No table reached"
-        : `${loaded.length} of ${results.length} tables · ${rows.toLocaleString()} rows${
-            notLoaded > 0 ? ` · ${notLoaded} not loaded` : ""
-          }`
-
-  const status = run ? (
-    <Pill tone={RUN_STATUS_TONE[run.status]}>{RUN_STATUS_LABEL[run.status]}</Pill>
-  ) : (
-    <Pill tone="neutral">Earlier</Pill>
-  )
-  const runId = run ? (
+  const status = <Pill tone={runStatusTone(run)}>{runStatusLabel(run)}</Pill>
+  const runId = (
     <>
       <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>
-      {scope ? (
-        <span className="max-w-full truncate text-xs font-medium" title={scope}>
-          {scope}
-        </span>
-      ) : null}
+      <span className="max-w-full truncate text-xs font-medium">{TRIGGER_LABEL[run.trigger] ?? run.trigger}</span>
     </>
-  ) : null
-  const when = run ? (
+  )
+  const when = (
     <>
       {formatRelativeTime(run.startedAt)}
-      {start !== null && end !== null ? ` · took ${formatDuration(end - start)}` : ""}
+      {run.durationSeconds !== null ? ` · took ${formatDuration(run.durationSeconds * 1000)}` : ""}
     </>
-  ) : null
+  )
   const summaryClass =
     "flex cursor-pointer list-none gap-2 px-3 py-2 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden"
   const chevron = "size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90"
@@ -1292,7 +1486,7 @@ function RunGroupCard({
               {runId}
               <span className="ml-auto text-xs text-muted-foreground">{summary}</span>
             </span>
-            {when ? <span className="block text-xs text-muted-foreground">{when}</span> : null}
+            <span className="block text-xs text-muted-foreground">{when}</span>
           </span>
         </summary>
       ) : (
@@ -1300,51 +1494,130 @@ function RunGroupCard({
           <ChevronRightIcon className={chevron} />
           {status}
           {runId}
-          {when ? <span className="text-xs text-muted-foreground">{when}</span> : null}
+          <span className="text-xs text-muted-foreground">{when}</span>
           <span className="ml-auto truncate pl-2 text-xs text-muted-foreground">{summary}</span>
         </summary>
       )}
-      <div className="border-t border-border">
-        {results.length === 0 ? (
-          <p className="px-3 py-2 text-xs text-muted-foreground">
-            {run && run.status === "failed" ? (
-              <>
-                This run failed before it reached any table. Its log on the{" "}
-                <Link href="/pipelines/ingest_job" className="text-primary hover:underline">
-                  ingest_job pipeline
-                </Link>{" "}
-                says why.
-              </>
-            ) : run && isActive(run) ? (
-              "Waiting for the first table…"
-            ) : (
-              "No table results were recorded for this run."
-            )}
-          </p>
+      <div className="space-y-2 border-t border-border px-3 py-2">
+        <p className="text-xs text-muted-foreground">
+          {noEnd
+            ? "This run never reported its end. It may have been stopped before it finished."
+            : run.endReason
+              ? (END_REASON_LABEL[run.endReason] ?? run.endReason)
+              : run.status === "running"
+                ? "Still going."
+                : null}
+        </p>
+        {logOpen ? (
+          <RunLog connectorId={connectorId} runId={run.runId} />
         ) : (
-          <ul className="divide-y divide-border">
-            {results.map((r) => (
-              <li key={`${r.object}-${r.startedAt}`} className="space-y-0.5 px-3 py-1.5">
-                <div className="flex items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate font-mono text-xs" title={r.object}>
-                    {r.object}
-                  </span>
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {r.rows === null ? "rows not measured" : `${r.rows.toLocaleString()} rows`}
-                  </span>
-                  <Pill tone={RUN_TONE[r.status] ?? "neutral"}>{r.status}</Pill>
-                </div>
-                {r.error ? (
-                  <p className="line-clamp-2 text-xs text-destructive" title={r.error}>
-                    {r.error}
-                  </p>
-                ) : null}
-              </li>
-            ))}
-          </ul>
+          <Button type="button" size="xs" variant="outline" onClick={() => setLogOpen(true)}>
+            Show log
+          </Button>
         )}
       </div>
     </details>
+  )
+}
+
+/** "90" → "2 min": the wait before a retry, rounded up to whole minutes. */
+function waitLabel(seconds: number): string {
+  return seconds < 60 ? `${seconds} s` : `${Math.ceil(seconds / 60)} min`
+}
+
+/**
+ * One run's log (`SRC-11` decision 5): its attempts, table by table, then the
+ * product's own lines, with a download of the same lines as text. The API
+ * writes the lines from a closed list and never carries the source's or the
+ * driver's error text; this view only words the closed event and error class.
+ */
+function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) {
+  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId])
+  const download = useServiceAction(async (signal) => {
+    const text = await connectorService.downloadConnectorRunLog(connectorId, runId, signal)
+    if (signal.aborted) return text
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }))
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `run-${runId}.log`
+    a.click()
+    URL.revokeObjectURL(url)
+    return text
+  })
+
+  if (log.status === "loading") return <LoadingSkeleton rows={2} />
+  if (log.status === "error") return <ErrorState error={log.error} onRetry={log.reload} />
+  const { attempts, lines } = log.data
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-muted-foreground">Log</p>
+        <Button
+          type="button"
+          size="xs"
+          variant="outline"
+          className="ml-auto"
+          disabled={download.status === "pending"}
+          onClick={() => void download.run()}
+        >
+          <DownloadIcon data-icon="inline-start" />
+          Download log
+        </Button>
+      </div>
+      {download.status === "error" ? (
+        <p role="alert" className="text-xs text-destructive">
+          {download.error.message}
+        </p>
+      ) : null}
+      {attempts.length === 0 && lines.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          This run has no log lines. Logs are kept for 30 days, and a run shows lines once the orchestrator reports them.
+        </p>
+      ) : (
+        <>
+          {attempts.length > 0 ? (
+            <ul className="divide-y divide-border rounded-md border border-border">
+              {attempts.map((a) => (
+                <li key={`${a.table}-${a.attempt}`} className="space-y-0.5 px-3 py-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs" title={a.table}>
+                      {a.table}
+                    </span>
+                    <span className="shrink-0 text-xs text-muted-foreground">attempt {a.attempt}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{a.rowsLoaded.toLocaleString()} rows</span>
+                    <Pill tone={a.result === "succeeded" ? "success" : "destructive"}>
+                      {a.result === "succeeded" ? "Succeeded" : "Failed"}
+                    </Pill>
+                  </div>
+                  {a.result !== "succeeded" ? (
+                    <p className="text-xs text-destructive">
+                      {a.errorClass ? (ERROR_CLASS_LABEL[a.errorClass] ?? a.errorClass) : "Failed"}
+                      {a.errorClass && RETRIED_CLASSES.has(a.errorClass) && a.waitSeconds === null
+                        ? ". Retries are used up."
+                        : ""}
+                      {a.waitSeconds !== null ? `. Next attempt in ${waitLabel(a.waitSeconds)}.` : ""}
+                    </p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {lines.length > 0 ? (
+            <ol className="space-y-0.5 rounded-md border border-border bg-muted/30 px-3 py-2">
+              {lines.map((l, i) => (
+                <li key={`${l.at}-${i}`} className="flex flex-wrap gap-x-2 text-xs">
+                  <span className="shrink-0 text-muted-foreground" title={formatDateTime(l.at)}>
+                    {formatDateTime(l.at)}
+                  </span>
+                  <span className="shrink-0 font-medium">{EVENT_LABEL[l.event] ?? l.event}</span>
+                  <span className="min-w-0 break-words text-muted-foreground">{l.text}</span>
+                </li>
+              ))}
+            </ol>
+          ) : null}
+        </>
+      )}
+    </div>
   )
 }
 

@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import type { ConnectorDetail, IngestJobRun, IngestRun } from "@/services/contracts/connectors"
+import type { ConnectorDetail, ConnectorRun } from "@/services/contracts/connectors"
 import { ConnectorOverview, recentProblems } from "./connector-overview"
 
 const originalFetch = global.fetch
@@ -56,52 +56,57 @@ const SPEC = {
   nextRunAt: "2026-10-01T02:00:00Z",
 }
 
-function run(runId: string, status: IngestJobRun["status"], startedAt: string, endedAt: string | null): IngestJobRun {
-  return { runId, status, startedAt, endedAt, object: null, action: null }
-}
-
-function result(object: string, status: string, startedAt: string, error = ""): IngestRun {
-  return { connectorId: "conn-northwind", job: "ingest_job", object, rows: 10, startedAt, endedAt: startedAt, status, error }
+function run(runId: string, status: ConnectorRun["status"], startedAt: string, extra: Partial<ConnectorRun> = {}): ConnectorRun {
+  return {
+    runId,
+    trigger: "schedule",
+    status,
+    startedAt,
+    endedAt: status === "running" ? null : startedAt,
+    durationSeconds: status === "running" ? null : 30,
+    rowsLoaded: 10,
+    attempts: 1,
+    endReason: status === "running" ? null : "completed",
+    ...extra,
+  }
 }
 
 describe("recentProblems", () => {
   it("reports only the latest connection test, and only when it failed", () => {
     const failed = { testedAt: "2026-09-30T05:00:00Z", ok: false, latencyMs: null, message: "authentication failed" }
     const passed = { testedAt: "2026-09-30T06:00:00Z", ok: true, latencyMs: 4, message: "connected" }
-    expect(recentProblems([failed], null, null).map((p) => p.message)).toEqual([
+    expect(recentProblems([failed], null).map((p) => p.message)).toEqual([
       "Connection test failed: authentication failed",
     ])
     // A later pass resolves the earlier failure.
-    expect(recentProblems([passed, failed], null, null)).toEqual([])
+    expect(recentProblems([passed, failed], null)).toEqual([])
   })
 
-  it("reports the last finished run, naming the tables it did not load", () => {
+  it("reports the last finished run, and does not judge one that is still going", () => {
     const runs = [
       // Still going: not judged yet.
-      run("r3", "running", "2026-09-30T06:00:00Z", null),
-      run("r2", "completed", "2026-09-30T05:00:00Z", "2026-09-30T05:01:00Z"),
+      run("r3", "running", new Date().toISOString()),
+      run("r2", "failed", "2026-09-30T05:00:00.000Z", { endReason: "table_failed" }),
     ]
-    const results = [
-      result("public.orders", "succeeded", "2026-09-30T05:00:10Z"),
-      result("public.shippers", "failed", "2026-09-30T05:00:20Z", "relation does not exist"),
-    ]
-    expect(recentProblems(null, runs, results).map((p) => p.message)).toEqual([
-      "The last ingest run did not load 1 table: public.shippers (relation does not exist).",
+    expect(recentProblems(null, runs).map((p) => p.message)).toEqual([
+      "The last ingest run did not load every table. Its log under Runs says which.",
     ])
   })
 
-  it("says when the last run failed before any table", () => {
-    const runs = [run("r1", "failed", "2026-09-30T05:00:00Z", "2026-09-30T05:00:05Z")]
-    expect(recentProblems(null, runs, []).map((p) => p.message)).toEqual([
-      "The last ingest run failed before it reached any table.",
-    ])
+  it("says when the last run failed for another reason", () => {
+    const runs = [run("r1", "failed", "2026-09-30T05:00:00.000Z", { endReason: "other" })]
+    expect(recentProblems(null, runs).map((p) => p.message)).toEqual(["The last ingest run failed."])
+  })
+
+  it("does not judge a run whose end was never reported, and a paused run is not a failure", () => {
+    expect(recentProblems(null, [run("r1", "running", "2026-09-30T05:00:00.000Z")])).toEqual([])
+    expect(recentProblems(null, [run("r1", "paused", "2026-09-30T05:00:00.000Z", { endReason: "connector_paused" })])).toEqual([])
   })
 
   it("has nothing to say about a clean run or data it could not load", () => {
-    const runs = [run("r1", "completed", "2026-09-30T05:00:00Z", "2026-09-30T05:01:00Z")]
-    const results = [result("public.orders", "succeeded", "2026-09-30T05:00:10Z")]
-    expect(recentProblems(null, runs, results)).toEqual([])
-    expect(recentProblems(null, null, null)).toEqual([])
+    const runs = [run("r1", "succeeded", "2026-09-30T05:00:00.000Z")]
+    expect(recentProblems(null, runs)).toEqual([])
+    expect(recentProblems(null, null)).toEqual([])
   })
 })
 
@@ -123,10 +128,9 @@ describe("ConnectorOverview", () => {
           ],
         })
       }
-      if (url.includes("/ingest/runs")) {
-        return runs ? runs() : json([run("r1", "completed", "2026-09-30T05:00:00Z", "2026-09-30T05:01:00Z")])
+      if (url.endsWith("/runs")) {
+        return runs ? runs() : json({ runs: [run("r1", "succeeded", "2026-09-30T05:00:00.000Z")] })
       }
-      if (url.includes("/api/governance/ingest-runs")) return json([])
       throw new Error(`unexpected fetch: ${url}`)
     }) as unknown as typeof fetch
   }
@@ -150,7 +154,7 @@ describe("ConnectorOverview", () => {
     expect(screen.getByText("2 tables")).toBeDefined()
     expect(screen.getByText("Every day at 02:00 UTC")).toBeDefined()
     expect(screen.getByText(/^Next /)).toBeDefined()
-    await waitFor(() => expect(screen.getByText("Completed")).toBeDefined())
+    await waitFor(() => expect(screen.getByText("Succeeded")).toBeDefined())
     expect(screen.getByRole("link", { name: "ingest_northwind" }).getAttribute("href")).toBe("/pipelines/pl-1")
     expect(screen.queryByText(/Discovered/)).toBeNull()
     expect(screen.queryByText(/Capabilities/)).toBeNull()
@@ -232,20 +236,28 @@ describe("ConnectorOverview", () => {
     stubFetch()
     const first = render(<ConnectorOverview detail={DETAIL} onOpenTab={() => {}} />)
     const last = await screen.findByRole("button", { name: /^Last run/ })
-    await waitFor(() => expect(last.textContent).toContain("Completed"))
+    await waitFor(() => expect(last.textContent).toContain("Succeeded"))
     expect(last.textContent).toMatch(/\d+(m|h|d|mo) ago/)
     expect(last.querySelector("[title]")?.getAttribute("title")).toMatch(/2026/)
     first.unmount()
 
-    stubFetch({ runs: () => json([]) })
+    stubFetch({ runs: () => json({ runs: [] }) })
     render(<ConnectorOverview detail={DETAIL} onOpenTab={() => {}} />)
     expect(await screen.findByText("Never run")).toBeDefined()
   })
 
-  it("says the orchestrator could not be asked, rather than that nothing has run", async () => {
-    stubFetch({ runs: () => json({ error: "orchestrator unreachable" }, 502) })
+  it("shows a run whose end was never reported as such, not as running", async () => {
+    stubFetch({ runs: () => json({ runs: [run("r9", "running", "2026-09-30T05:00:00.000Z")] }) })
     render(<ConnectorOverview detail={DETAIL} onOpenTab={() => {}} />)
-    expect(await screen.findByText("Could not ask the orchestrator")).toBeDefined()
+    const last = await screen.findByRole("button", { name: /^Last run/ })
+    await waitFor(() => expect(last.textContent).toContain("No end reported"))
+    expect(last.textContent).not.toContain("Running")
+  })
+
+  it("says the run history could not be loaded, rather than that nothing has run", async () => {
+    stubFetch({ runs: () => json({ error: "the store is unavailable" }, 500) })
+    render(<ConnectorOverview detail={DETAIL} onOpenTab={() => {}} />)
+    expect(await screen.findByText("Run history could not be loaded")).toBeDefined()
     expect(screen.queryByText("Never run")).toBeNull()
   })
 

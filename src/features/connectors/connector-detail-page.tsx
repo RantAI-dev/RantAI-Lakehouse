@@ -349,6 +349,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               onTableCount={setSavedTables}
               pausedReason={c.pausedReason}
               waitingTables={waiting.tables}
+              onResumed={state.reload}
             />
           </TabsContent>
           <TabsContent value="schema" keepMounted>

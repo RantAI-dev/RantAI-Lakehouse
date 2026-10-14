@@ -112,8 +112,7 @@ function stubFetch(
       return json({ results: key.endsWith("?limit=1") ? probes.slice(0, 1) : probes })
     }
     if (key === "GET /api/connectors/conn-a/schema-changes") return json({ pending: [], recent: [], inactiveColumns: [] })
-    if (key === "GET /api/connectors/conn-a/ingest/runs") return json([])
-    if (key === "GET /api/governance/ingest-runs?connectorId=conn-a") return json([])
+    if (key === "GET /api/connectors/conn-a/runs") return json({ runs: [] })
     if (key === "POST /api/connectors/conn-a/test") {
       probes.unshift({ testedAt: "2026-10-05T01:00:00.000Z", ok: true, latencyMs: 5, message: "Connected via PostgreSQL" })
       return json({ ok: true, supported: true, latencyMs: 5, message: "Connected via PostgreSQL", testedAt: probes[0].testedAt })
