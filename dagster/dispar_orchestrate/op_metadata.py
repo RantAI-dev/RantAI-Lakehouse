@@ -4,7 +4,10 @@ commit it was built from, so `GET /api/pipelines/{id}/source?op=` can
 serve real text and detect a stale build (`GIT_SHA` mismatch -> 409).
 
 Also exposes `DEFAULT_RETRY_POLICY`: the single `dagster.RetryPolicy`
-every `@op` in this code location is wired with. Transient blips — a
+every `@op` in this code location is wired with, EXCEPT the two ingest ops
+(`run_ingest`, `ingest_source_object`): those retry up to three times after
+1, 5 and 15 minutes and only for a transient class, which a policy cannot
+express (SRC-11 D1; `ingest_errors.py`, `ingest_factory._fail_or_retry`). Transient blips — a
 network hiccup, a busy ClickHouse — deserve two self-healing attempts
 with exponential backoff and jitter (so synchronized retries do not
 arrive as a single thundering herd); config, auth, SSRF, and

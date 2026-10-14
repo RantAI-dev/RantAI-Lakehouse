@@ -1648,7 +1648,7 @@ def test_a_source_build_that_reflects_no_table_is_refused_rather_than_loaded_unc
 
 
 def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> None:
-    from dagster import Failure, build_op_context
+    from dagster import Failure, RetryRequested, build_op_context
 
     import dispar_orchestrate.ingest_factory as f
 
@@ -1661,9 +1661,11 @@ def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> Non
         return fake
 
     monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationUnreachable("down")))
-    with pytest.raises(Failure) as unreachable:
+    # SRC-11 D1: a transient failure is a `RetryRequested` with the first wait,
+    # no longer a `Failure` that `DEFAULT_RETRY_POLICY` retries.
+    with pytest.raises(RetryRequested) as unreachable:
         f.ingest_source_object(build_op_context(), payload)
-    assert unreachable.value.allow_retries is True  # DEFAULT_RETRY_POLICY keeps retrying a transient failure
+    assert unreachable.value.seconds_to_wait == 60
 
     monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationRefused("HTTP 403")))
     with pytest.raises(Failure) as refused:
@@ -1747,7 +1749,7 @@ def test_failures_that_are_not_a_refused_credential_are_not_recognised() -> None
 
 def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driver_errors(monkeypatch) -> None:
     import pymysql.err
-    from dagster import Failure, build_op_context
+    from dagster import Failure, RetryRequested, build_op_context
 
     import dispar_orchestrate.ingest_factory as f
 
@@ -1772,7 +1774,7 @@ def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driv
 
     unreachable = _wrapped_like_sqlalchemy(pymysql.err.OperationalError(2003, "Can't connect to MySQL server"))
     monkeypatch.setattr(f, "_run_one_object", raises(unreachable))
-    with pytest.raises(type(unreachable)):  # propagates as it did: the retry policy handles it
+    with pytest.raises(RetryRequested):  # SRC-11 D1: retried on the ingest schedule, not by the default policy
         f.ingest_source_object(build_op_context(), payload)
 
 

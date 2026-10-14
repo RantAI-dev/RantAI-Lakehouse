@@ -127,7 +127,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 import requests
@@ -139,6 +139,7 @@ from dagster import (
     DynamicOutput,
     Failure,
     Field,
+    RetryRequested,
     RunRequest,
     RunsFilter,
     SensorEvaluationContext,
@@ -151,9 +152,14 @@ from dagster import (
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from dispar_orchestrate import connector_catalog, dlt_pipeline, schema_observer, secret_resolver, ssrf_guard
-from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
-from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
+from dispar_orchestrate import (
+    connector_catalog,
+    dlt_pipeline,
+    ingest_errors,
+    schema_observer,
+    secret_resolver,
+    ssrf_guard,
+)
 from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
@@ -167,22 +173,14 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
+from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 _POSTGRES_DRIVERS = ("postgres", "postgresql")
 
 logger = logging.getLogger(__name__)
-
-
-class UnknownAdapter(Exception):
-    """`connector["adapter"]` names no dispatch arm this factory knows how
-    to run -- raised BY NAME rather than left to surface as a bare
-    `KeyError` from a dict lookup, so a future adapter added to the
-    `connector_type`/`connector` CHECK constraints (`0033_connector_ingest_spec.sql`,
-    `0043_ingest_tier2_adapters.sql`) without a matching dispatch arm here
-    fails loudly and legibly at run time, never a silent no-op."""
 
 
 def _env(name: str, default: str) -> str:
@@ -293,64 +291,9 @@ def _classify_exception(exc: Exception) -> str:
     return f"{type(exc).__module__}.{type(exc).__name__}"
 
 
-# SQLSTATE a driver reports for a refused login (class 28, "invalid
-# authorization specification"); SQL Server's error 18456 carries it.
-_SQLSTATE_LOGIN_REFUSED = "28000"
-# `pymysql.constants.ER.ACCESS_DENIED_ERROR` / Oracle `ORA-01017`.
-_MYSQL_ACCESS_DENIED = 1045
-_ORACLE_LOGON_DENIED = "ORA-01017"
-# Bounded walk: SQLAlchemy's `.orig`, `raise ... from` and implicit contexts
-# are chains of a few links; the bound only guards against a cycle.
-_MAX_CAUSE_DEPTH = 8
-
-
-def _is_authentication_refusal(exc: BaseException) -> bool:
-    """Whether `exc`, or anything it wraps, is a database driver telling us
-    the source REFUSED THE CREDENTIAL (a wrong user or password).
-
-    That answer does not change between attempts, so retrying it only burns
-    `DEFAULT_RETRY_POLICY`'s two backed-off retries (a measured 2m23s run in
-    the G6 gate, PR #101 CI) before the same refusal and delays the failure
-    alert. Decided by the driver's exception TYPE and error CODE, never by
-    matching message text (which is localised, version-dependent and can
-    carry a host or user name):
-
-    - `pymysql` (mysql/mariadb): `OperationalError` with `args[0] == 1045`
-      (`ER_ACCESS_DENIED_ERROR`).
-    - `pyodbc` (mssql): any `pyodbc.Error` whose `args[0]` (the SQLSTATE) is
-      `28000`, what SQL Server's "Login failed" (18456) maps to.
-    - `oracledb` (oracle): a `DatabaseError` whose first argument is the
-      driver's error object with `full_code == "ORA-01017"`.
-
-    The drivers are recognised by their module so this file imports none of
-    them (`pyodbc` needs a system ODBC library to import at all).
-
-    NOT covered, deliberately: `psycopg2` (postgres). Checked against the
-    pinned `psycopg2` 2.9.10 with a refused login: `pgcode` and
-    `diag.sqlstate` are `None` for an error raised while connecting (libpq
-    gives no SQLSTATE there), so the only signal is the message text, which
-    this function will not read. A Postgres credential failure therefore
-    still retries until a verifiable signal exists.
-    """
-    seen: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    for _ in range(_MAX_CAUSE_DEPTH):
-        if not pending:
-            break
-        current = pending.pop(0)
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        root = type(current).__module__.split(".")[0]
-        first = current.args[0] if current.args else None
-        if root == "pymysql" and first == _MYSQL_ACCESS_DENIED:
-            return True
-        if root == "pyodbc" and first == _SQLSTATE_LOGIN_REFUSED:
-            return True
-        if root == "oracledb" and getattr(first, "full_code", None) == _ORACLE_LOGON_DENIED:
-            return True
-        pending.extend([getattr(current, "orig", None), current.__cause__, current.__context__])
-    return False
+# `ingest_errors.is_authentication_refusal` is the one reader of a driver's
+# refused sign-in (SRC-11 D2, SRC-19); the old name stays for its callers.
+_is_authentication_refusal = ingest_errors.is_authentication_refusal
 
 
 def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> dict[str, str]:
@@ -830,11 +773,6 @@ def _run_one_object(
         raise
 
 
-class UnsupportedKafkaAuth(Exception):
-    """The dial names a Kafka auth type this consumer cannot honour. Raised
-    before any connection is attempted."""
-
-
 def kafka_security_kwargs(spec: dict, secrets: dict) -> dict:
     """The `KafkaConsumer` security settings the dial's `auth` declares.
 
@@ -1034,6 +972,84 @@ def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
     )
 
 
+def _retry_number(context: Any) -> int:
+    """Which attempt of this step is running (0 for the first). A context built
+    for a direct call of the op in a unit test has no step behind it and so no
+    attempt count: it is the first attempt."""
+    try:
+        return int(context.retry_number)
+    except AttributeError:
+        return 0
+
+
+def _fetch_connector_for_run(cfg: IngestFactoryConfig, connector_id: str, retry_number: int) -> dict[str, Any]:
+    """`_fetch_one_connector` for `run_ingest`, with its failures named by the
+    one classification (SRC-11 D2): the product's own API not answering is
+    `api_unreachable` and is retried; an answer that cannot run the connector
+    (a 4xx, a connector that is no longer ingestible) is not.
+
+    # Errors
+
+    Raises what `_fail_or_retry` raises.
+    """
+    try:
+        return _fetch_one_connector(cfg, connector_id)
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            refused: Exception = ingest_errors.ApiRefused("the API refused the connector request")
+        else:
+            refused = ingest_errors.ApiUnreachable("the API failed on the connector request")
+        _fail_or_retry(refused, label=repr(connector_id), retry_number=retry_number)
+    except StopIteration:
+        _fail_or_retry(
+            ingest_errors.ApiRefused("the connector is not ingestible"), label=repr(connector_id), retry_number=retry_number
+        )
+    except requests.RequestException:
+        _fail_or_retry(
+            ingest_errors.ApiUnreachable("the API could not be reached"), label=repr(connector_id), retry_number=retry_number
+        )
+
+
+def _fail_or_retry(exc: Exception, *, label: str, retry_number: int) -> NoReturn:
+    """Turn a failed attempt into what Dagster should do next (SRC-11 D1, D2).
+
+    `ingest_errors.classify` is the only place that decides. A transient
+    class with a retry left raises `RetryRequested` carrying that attempt's
+    wait (`INGEST_RETRY_DELAYS_SECONDS`, 1, 5 and 15 minutes by default);
+    Dagster's `RetryPolicy` cannot express a different wait per attempt. The
+    step is the unit that retries, so for the mapped per-table step only the
+    failing table is tried again; the tables that loaded are not touched.
+
+    Everything else ends the step: a refused credential with a fixed text
+    (nothing from the driver: it names the user and the client address), the
+    other classes with the message their own type gave (as before SRC-11), a
+    transient class whose retries are used up with the class's fixed phrase,
+    and an unexplained failure (`other`) as itself, so its traceback is in the
+    step log.
+
+    # Errors
+
+    Always raises: `RetryRequested`, `Failure(allow_retries=False)`, or `exc`.
+    """
+    settings = ingest_errors.RetrySettings.from_env()
+    verdict = ingest_errors.classify(exc)
+    wait = settings.delay_for(retry_number) if verdict.retried else None
+    if wait is not None:
+        raise RetryRequested(max_retries=settings.max_retries, seconds_to_wait=wait) from exc
+    phrase = ingest_errors.CLASS_PHRASES[verdict.error_class]
+    if verdict.error_class == ingest_errors.SIGN_IN_REFUSED:
+        raise Failure(description=f"ingest of {label}: {phrase}", allow_retries=False) from exc
+    if verdict.retried:
+        raise Failure(
+            description=f"ingest of {label}: {phrase}; gave up after {retry_number + 1} attempts",
+            allow_retries=False,
+        ) from exc
+    if verdict.error_class != ingest_errors.OTHER:
+        raise Failure(description=f"ingest of {label}: {exc}", allow_retries=False) from exc
+    raise exc
+
+
 @op(
     config_schema={
         "connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest."),
@@ -1051,7 +1067,8 @@ def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
         ),
     },
     out=DynamicOut(),
-    retry_policy=DEFAULT_RETRY_POLICY,
+    # SRC-11 D1: no `retry_policy`. `_fail_or_retry` raises `RetryRequested` with
+    # the attempt's own wait (a policy cannot), and everything else ends the step.
     tags=source_metadata(
         "dispar_orchestrate/ingest_factory.py::run_ingest",
         reads=["Connector source objects (per its ingest spec)"],
@@ -1113,7 +1130,7 @@ def run_ingest(context) -> Any:
     connector_id: str = context.op_config["connector_id"]
     single = _single_table_request(connector_id, context.op_config.get("object"), context.op_config.get("action"))
     cfg = IngestFactoryConfig.from_env()
-    connector = _fetch_one_connector(cfg, connector_id)
+    connector = _fetch_connector_for_run(cfg, connector_id, _retry_number(context))
     if single is not None and (connector["adapter"] == "cdc" or connector.get("ingestMode") == "stream"):
         raise Failure(
             f"connector {connector_id!r} streams its rows; a run of one table with an action is for batch connectors",
@@ -1131,13 +1148,17 @@ def run_ingest(context) -> Any:
         # cannot run: a kafka connector's rows arrive from one bounded
         # consumer.poll() loop over the whole topic, not from a
         # build_source() call per sourceObjects entry.
-        _run_stream_connector(connector, run_id=context.run_id)
+        try:
+            _run_stream_connector(connector, run_id=context.run_id)
+        except Exception as exc:  # noqa: BLE001 -- classified by `_fail_or_retry`, which always raises
+            # The Kafka path gets the same rule as a table (SRC-11 D2).
+            _fail_or_retry(exc, label=repr(connector_id), retry_number=_retry_number(context))
         return
     if single is None and _discover_new_tables(connector, context.run_id):
         # Added in this run, loaded in this run: the API wrote them to the
         # connector's tables, so one more read of the connector (the same call
         # that started this run) fans out over the new list.
-        connector = _fetch_one_connector(cfg, connector_id)
+        connector = _fetch_connector_for_run(cfg, connector_id, _retry_number(context))
     objects = connector.get("sourceObjects", [])
     action = None
     if single is not None:
@@ -1168,7 +1189,7 @@ def run_ingest(context) -> Any:
 
 
 @op(
-    retry_policy=DEFAULT_RETRY_POLICY,
+    # SRC-11 D1: no `retry_policy`; see `run_ingest` and `_fail_or_retry`.
     tags=source_metadata(
         "dispar_orchestrate/ingest_factory.py::ingest_source_object",
         reads=["Connector source object spec"],
@@ -1189,75 +1210,21 @@ def ingest_source_object(context, payload: dict[str, Any]) -> Any:
     `run_ingest` emitted; the per-step failure unit is the only thing
     that changed.
 
-PART D: a config-shaped failure retries with the same input and
-    gets the same answer -- so it is wrapped in
-    `Failure(allow_retries=False)` at this op's boundary, which lets
-    the `DEFAULT_RETRY_POLICY` keep absorbing transient network blips
-    without wasting its two retries on a config that will never change
-    between attempts. The set is closed by `UnsupportedKafkaAuth` /
-    `OracleTlsConfigError` / `HostKeyMismatch` / `MongoConfigRejected`
-    (each adapter's own config-rejection contract) and by `ValueError`
-    (broader catch -- see comment below). Other exceptions
-    (HTTP/connection/transient) propagate so the policy does what it
-    says it says."""
+A failure is classified by `ingest_errors.classify` and either retried or
+    ends the step (`_fail_or_retry`, SRC-11 D1 and D2): up to three retries of
+    THIS table, after 1, 5 and 15 minutes, for an unreachable source, a
+    timeout, a busy or failing source or an unreachable product API; never for
+    a refused credential (PostgreSQL's included, SRC-19), a refused address, an
+    unsupported table or mode, a rejected setting or an unexplained failure.
+    The other tables of the run are separate steps and are not repeated."""
     connector, obj = payload["connector"], payload["obj"]
     try:
         # `action` only when set: an ordinary run calls `_run_one_object` exactly as
         # it did before SRC-10.
         action = payload.get("action")
         rows = _run_one_object(connector, obj, run_id=context.run_id, **({"action": action} if action else {}))
-    except schema_observer.ObservationUnreachable as exc:
-        # SRC-8, fail closed: the API could not be asked, so the table was
-        # NOT loaded unchecked. Transient (a connection error or a 5xx), so
-        # `allow_retries` stays True and `DEFAULT_RETRY_POLICY` retries it.
-        raise Failure(description=f"ingest of {obj.get('target')!r}: {exc}") from exc
-    except (
-        schema_observer.ObservationRefused,
-        UnknownAdapter,
-        SecretRefRejected,
-        ssrf_guard.SsrfBlocked,
-        UnsupportedColumnType,
-        UnsupportedKafkaAuth,
-        oracle_adapter.OracleTlsConfigError,
-        ssrf_guard_sftp_module.HostKeyMismatch,
-        ssrf_guard_mongo_module.MongoConfigRejected,
-        # `ValueError` is the broad one. Every adapter raises
-        # `ValueError` exclusively for rejected adapter configuration:
-        #   - sql.py:134 hostname, :139 control char, :210 driver
-        #     reroute, :226 unknown driver
-        #   - rest.py:128 unknown auth type, :184 unknown pagination type
-        #   - sftp.py:90 unsupported auth type, :120 unsupported fileFormat
-        #   - files.py:110 unsupported format
-        #   - secret_map.py:82 no secret field mapping
-        # `files.py:84` (object-size cap) is the one site where
-        # `ValueError` is data-shaped, not config-shaped -- a future
-        # object exceeding the cap should retry cleanly with the same
-        # object, so we do NOT treat it as non-retryable; the catch
-        # here would over-claim that one as a config failure. The
-        # trade-off is acceptable: the mapped step still records its
-        # `ingest_run` failure row (in `_run_one_object`'s own
-        # `except Exception` branch), and the cap is a project-level
-        # Tier 1 invariant -- a `ValueError` that surfaces after the
-        # retry policy's two attempts is no worse than one that
-        # surfaces after a single attempt, and the message is
-        # preserved.
-        ValueError,
-    ) as exc:
-        raise Failure(
-            description=f"ingest of {obj.get('target')!r}: {exc}",
-            allow_retries=False,
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 -- re-raised unless it is a refused credential
-        if not _is_authentication_refusal(exc):
-            raise
-        # PR #101 CI (G6 `g6-mysql-wrong-password`): the source said the
-        # credential is wrong. Retrying cannot change that answer, and the
-        # two retries turned a 10-second failure into a 2m23s one. Fixed
-        # text: nothing from the driver (it names user and client address).
-        raise Failure(
-            description=f"ingest of {obj.get('target')!r}: the source refused the connector's credential",
-            allow_retries=False,
-        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- classified by `_fail_or_retry`, which always raises
+        _fail_or_retry(exc, label=repr(obj.get("target")), retry_number=_retry_number(context))
     if isinstance(rows, int):
         context.log_event(
             AssetMaterialization(asset_key=f"bronze.{obj['target']}", metadata={"rows": rows})
