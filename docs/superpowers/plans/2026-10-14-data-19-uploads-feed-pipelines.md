@@ -138,6 +138,33 @@ Verified by reading `main` at `caf5784b`:
 
 (Developer appends here, task by task.)
 
+### T1 — D2 in the API (`1c9dc5b6`)
+
+`validate_file_ingest_upstream(source_zone, depends_on)` in
+`routes/authored_pipelines.rs`, called from `update`, `restore_version`
+and `routes::pipelines::create` next to `validate_target_zone`. It reuses
+`routes::uploads::FILE_INGEST_JOB` (the one definition of the job name)
+rather than repeating the literal.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | clean |
+| `cargo test -p lakehouse-api --lib -- file_ingest` | 5 passed, 0 failed, 1655 filtered out |
+
+Tests: `validate_file_ingest_upstream_refuses_a_non_bronze_source_and_accepts_bronze`
+(the pure rule, both directions, `None` skipped, the message pinned and
+asserted to name `FILE_INGEST_JOB`);
+`create_with_a_file_ingest_upstream_on_a_silver_source_is_refused` and
+`create_with_a_file_ingest_upstream_on_a_bronze_source_passes_the_guard`
+(the accepted direction is proven by the guard PASSING: the route then
+reaches `pool(&state)` and answers 503, not 400 — the two differ in one
+field of the body);
+`update_put_refuses_a_file_ingest_upstream_on_a_silver_source` and
+`restore_of_a_file_ingest_upstream_version_returns_400` (real
+`sqlx::test` Postgres; the restore seeds its pre-refusal version through
+the store, since the routes now refuse that body).
+
 ## 8. Review
 
 (Reviewer.)
