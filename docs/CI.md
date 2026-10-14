@@ -56,7 +56,7 @@ At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks e
 ## Images: built once per run
 
 Before CI-SPEED-PLAN PR 2, the acceptance jobs that start the stack (six when it was written;
-thirteen with the gates `main` has added since) and the Docker workflow each built the
+eleven with the gates `main` has added since) and the Docker workflow each built the
 `lakehouse-api` image from source (a release build of about 515 crates), and most of those
 jobs built the Dagster image as well. Now:
 

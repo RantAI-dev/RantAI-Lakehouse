@@ -611,8 +611,8 @@ docs-only PR skips them and `ci-required` passes (self-test case kept).
   (temp env with the gate secrets added): `g6-alerts-test-runner`,
   `g6-oracle-test-runner` and `g6-test-runner` resolve to
   `rantai-lakehouse-dagster:local` with `GIT_SHA: unknown`.
-- A scripted check over the parsed `ci.yml`: all twelve consumers `needs`
-  `images`, set both image variables, and no `--build` remains.
+- A scripted check over the parsed `ci.yml`: all eleven acceptance consumers (and `image-smoke`) `needs`
+  `images`, the eleven set both image variables, and no `--build` remains.
 
 ### Not verified
 
