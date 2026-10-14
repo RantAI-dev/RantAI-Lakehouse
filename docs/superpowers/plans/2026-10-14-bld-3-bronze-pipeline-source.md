@@ -368,6 +368,10 @@ past `in_scope` at all, so both now seed a row and call as
    (`.local/probe-dedupe.sh`, same clean-project shape, CI-only `.env`,
    ends in `down -v`): `.local/logs/probe-dedupe3.log`.
 
+   The stack ran at `a01e34db`, which already contains every product and
+   fix commit above (including the R11 reword, `2c5b19d4`). The only
+   commits after it are commits to this plan file.
+
 ### Section 6 answers
 
 **T1's real error text, verbatim** (from commit `4c5dabfb`, reproduced
