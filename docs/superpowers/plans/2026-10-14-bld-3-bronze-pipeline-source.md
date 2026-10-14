@@ -159,7 +159,12 @@ planner's instruction and ran the block.
 
 ### Commits (`origin/main..HEAD`)
 
+Product and fix commits, newest first; the `BLD-3 handoff: …` commits
+that carry this section are interleaved with the commands they record and
+are omitted here (they touch only this file).
+
 ```
+2c5b19d4 BLD-3 T5 fix: g7 prose tripped the R11 bare-count guard
 f85b7a72 BLD-3: tests follow PR #80's route signatures
 e055c335 merge: main into fix/bld-3-bronze-pipeline-source (bring #80 in)
 61fb0a58 BLD-3 T6: changelog entry for reading a Bronze table and refusing a Bronze target
