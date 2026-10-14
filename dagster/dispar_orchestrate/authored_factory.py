@@ -209,6 +209,10 @@ FBIC_UNSUPPORTED_REASON = (
     "build-status only) and policy.rs's POLICY_TABLE"
 )
 
+BRONZE_TARGET_REFUSED_REASON = (
+    "a pipeline cannot write to bronze; bronze is written by ingestion"
+)
+
 CONNECTOR_SOURCE_UNSUPPORTED_REASON = (
     "connector-sourced authored pipelines are not executed by this build: WS4 "
     "item E3 implements the direct ClickHouse-zone-to-ClickHouse-zone read/"
@@ -545,6 +549,18 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                     raise AuthoredJobError(
                         f"unsafe ClickHouse identifier in {field!r}: {ident!r}"
                     )
+            # BLD-3 / D4: Bronze is written by ingestion, never by a
+            # pipeline. Accepting a `bronze` target here would run
+            # `CREATE DATABASE IF NOT EXISTS bronze` in ClickHouse and
+            # fill a MergeTree table that is not Bronze (it is not
+            # Iceberg, it is not in the catalog, nothing reads it) --
+            # a silent wrong answer. Refused here, in the API on
+            # create/update/restore and in the assistant's
+            # `create_pipeline` schema, with this same wording. A stored
+            # pipeline that predates the refusal now fails its run with
+            # this message instead of writing somewhere meaningless.
+            if target_zone == "bronze":
+                raise AuthoredJobError(BRONZE_TARGET_REFUSED_REASON)
         except (authored_transforms.TransformError, AuthoredJobError) as exc:
             raise Failure(
                 description=f"authored pipeline {pipeline['id']!r} config rejected: {exc}",

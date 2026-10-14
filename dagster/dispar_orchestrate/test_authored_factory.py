@@ -349,6 +349,15 @@ class BronzeSourceTest(unittest.TestCase):
             self.assertEqual(source.clickhouse_name, f"{zone}.`orders`")
             self.assertFalse(source.reads_iceberg)
 
+    def test_a_bronze_source_with_a_silver_target_is_still_executed(self) -> None:
+        """The refusal is on the TARGET only: `bronze` -> `silver` is the
+        path D1/D2 fixed, and it must keep running (the whole point of
+        this change)."""
+        _, calls = self._run_op(
+            **{"sourceZone": "bronze", "sourceTable": "g3a_orders", "targetZone": "silver"}
+        )
+        self.assertTrue([s for s in self._statements(calls) if "silver.`orders_clean`" in s])
+
 
 class OpForPipelineTest(unittest.TestCase):
     """Executes the built op's own function directly (not through a full
@@ -494,6 +503,32 @@ class OpForPipelineTest(unittest.TestCase):
             run_fn(build_op_context())
         self.assertFalse(ctx.exception.allow_retries)
         self.assertIsInstance(ctx.exception.__cause__, authored_transforms.TransformError)
+
+    def test_a_bronze_target_is_refused_before_any_sql_is_sent(self) -> None:
+        """BLD-3 / D4: Bronze is written by ingestion, so a pipeline with a
+        `bronze` target is a config rejection, not a run failure to retry --
+        retrying gets the same refusal. `Failure(allow_retries=False)`
+        wraps `AuthoredJobError` (the shape the connector-source guard
+        above uses), the guard fires BEFORE any SQL is built, and the
+        wording is the one constant the API and the assistant's schema
+        refusal also use."""
+        from dagster import Failure
+
+        pipeline = _ready_pipeline(targetZone="bronze")
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec, \
+             mock.patch.object(authored_factory, "_ch_query_json") as mocked_query:
+            with self.assertRaises(Failure) as ctx:
+                run_fn(build_op_context())
+        self.assertFalse(ctx.exception.allow_retries)
+        self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredJobError)
+        self.assertIn(authored_factory.BRONZE_TARGET_REFUSED_REASON, str(ctx.exception))
+        self.assertEqual(
+            authored_factory.BRONZE_TARGET_REFUSED_REASON,
+            "a pipeline cannot write to bronze; bronze is written by ingestion",
+        )
+        mocked_exec.assert_not_called()
+        mocked_query.assert_not_called()
 
     def test_connector_sourced_pipeline_raises_a_non_retryable_failure_wrapping_authored_job_error(
         self,
