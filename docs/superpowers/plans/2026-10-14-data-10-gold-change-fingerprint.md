@@ -163,4 +163,53 @@ Clean docker compose run (`-p data10`) verified:
 
 ## 8. Review
 
-(Reviewer.)
+### Round 1 (planner/reviewer, Claude Opus), at `8983c8c8`
+
+Read: the whole diff against `main` (`routes/gold.rs`, `gold_export_history.rs`,
+`routes/mod.rs`, `tests/gold_publication.rs`, the console freshness line and
+its tests, the gate, the Dagster doc). The design matches D1 to D4, the gate
+proves the point on a real stack (skip after `OPTIMIZE FINAL`, skip after
+`EXCHANGE TABLES`, export after one inserted row), and D5 is measured
+(187 ms over 5,000,000 rows). The branch merges into `main` at `c84607e1`+
+with no conflict.
+
+Checked and not a finding: whether `cityHash64(*)` refuses a column type a
+mart could have. Run by the reviewer on ClickHouse 26.8: `AggregateFunction`,
+`Map`, named `Tuple`, `Array(Nullable)`, `JSON`, `Dynamic` and `Variant` all
+hash. So the fingerprint read fails only when ClickHouse itself is down, when
+the export could not read rows either; computing it before a manual "Publish
+now" adds one scan and no new failure.
+
+No BLOCKER.
+
+**SHOULD-FIX 1. `routes::gold` made public for a test.** `routes/mod.rs`
+changes `mod gold` to `pub mod gold` so `tests/gold_publication.rs` can call
+`routes::gold::mart_content_fingerprint`. Route modules are private (only
+`auth` is public), so this widens the crate's API for a test. The fingerprint
+read is a `ClickHouse` query, not a route: move `mart_content_fingerprint`
+(with `content_fingerprint_sql` and `parse_content_fingerprint_row`) into
+`gold_export_history.rs`, which is already public and already owns the
+history row the fingerprint is compared with, keep `mod gold` private, and
+point the test there.
+
+**SHOULD-FIX 2. Stale doc on `export`.** The "# Skip: `?ifChanged=true`"
+section of `export`'s doc comment still says the skip compares
+`max(modification_time)` with the last export's start, "strictly before",
+and that a quiet mart costs "two cheap `ClickHouse` reads". All three are no
+longer true. Rewrite it for the fingerprint (AGENTS rule 1), and check
+`mart_last_changed_at`'s doc: it is still used for `lastChangedAt`, but no
+longer for any decision; say so.
+
+**SHOULD-FIX 3. The handoff does not show the full verification block.**
+Section 7 lists scoped Rust checks only. Rule 7: run, on the final commit,
+`cargo fmt --check && cargo clippy --workspace --all-targets --all-features
+-- -D warnings && cargo test --workspace`, the two `ops/lint` scripts and
+`(cd dagster && python -m pytest dispar_orchestrate -q)`, and record each
+with its counts, or write *not verified* with the reason.
+
+**Nit.** `content_fingerprint_sql` builds one string with long runs of
+spaces (a multi-line literal without `\` continuations); harmless to
+`ClickHouse`, noisy in logs. Use `\` line continuations like the other
+queries in the file.
+
+Cite `DATA-10 review SHOULD-FIX <n>` at each fix site.
