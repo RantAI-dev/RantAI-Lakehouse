@@ -409,6 +409,16 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/classification/{id}",
             axum::routing::delete(governance::delete_classification_rule),
         )
+        // DATA-12 part 2: governed tag keys. Static segments, so they match
+        // ahead of the `{kind}` capture, as `policies` and `sla` do.
+        .route(
+            "/api/governance/tag-keys",
+            get(governance::list_tag_keys).post(governance::create_tag_key),
+        )
+        .route(
+            "/api/governance/tag-keys/{key}",
+            axum::routing::put(governance::update_tag_key).delete(governance::delete_tag_key),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +

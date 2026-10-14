@@ -1393,3 +1393,67 @@ async fn delete_session_writes_an_audit_event() {
          token)"
     );
 }
+
+// ── Governed tag keys (DATA-12 part 2) ───────────────────────────────────
+
+/// The four `/api/governance/tag-keys` routes, asserted in both directions:
+/// a principal holding ONLY `catalog:read` may list the keys (an editor needs
+/// them to render pickers) and is refused every write; a principal holding
+/// ONLY `governance:write` may define, change and remove keys and is refused
+/// the list, which is a distinct, `catalog:read`-gated route. Each write is
+/// sent with an empty body, so a pass is anything but 401/403 (the handler
+/// then answers 400/404 for the body or key) and a refusal stores nothing.
+#[tokio::test]
+async fn tag_key_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+
+    let writes = [
+        ("POST", "/api/governance/tag-keys"),
+        ("PUT", "/api/governance/tag-keys/data_domain"),
+        ("DELETE", "/api/governance/tag-keys/data_domain"),
+    ];
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed =
+        request_with_cookie(&router, "GET", "/api/governance/tag-keys", &reader_cookie).await;
+    assert_ne!(
+        listed.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must be enough to list the tag keys"
+    );
+    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
+    for (method, path) in writes {
+        let resp = request_with_cookie(&router, method, path, &reader_cookie).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "catalog:read alone must NOT be enough to {method} {path}"
+        );
+    }
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let refused =
+        request_with_cookie(&router, "GET", "/api/governance/tag-keys", &admin_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write alone must NOT be enough to list the tag keys"
+    );
+    for (method, path) in writes {
+        let resp = request_with_cookie(&router, method, path, &admin_cookie).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "governance:write must be enough to {method} {path}"
+        );
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
+        .fetch_one(&pool)
+        .await
+        .expect("count keys");
+    assert_eq!(stored, 0, "no empty-bodied request may store a key");
+}

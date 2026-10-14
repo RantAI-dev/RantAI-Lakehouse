@@ -273,6 +273,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // setting one.
     ("DELETE", "/api/governance/sla/{table}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/classification/{id}", Policy::RequiresPermission("governance:write")),
+    // DATA-12 part 2: governed tag keys. Reading the list is `catalog:read`
+    // because an editor with `catalog:write` needs it to render the value
+    // pickers and a definition is not sensitive; defining, changing and
+    // removing a key is a governance act, like a mark (decision 1).
+    ("GET",  "/api/governance/tag-keys",        Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/governance/tag-keys",        Policy::RequiresPermission("governance:write")),
+    ("PUT",  "/api/governance/tag-keys/{key}",  Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/tag-keys/{key}", Policy::RequiresPermission("governance:write")),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -772,6 +780,28 @@ mod tests {
             policy_for("PUT", "/api/catalog/{id}/certification"),
             Some(Policy::RequiresPermission("governance:write"))
         );
+    }
+
+    /// `DATA-12` part 2: reading the tag-key list is `catalog:read` (editors
+    /// need it to render pickers); defining, changing and removing a key is
+    /// `governance:write`, and nothing under `tag-keys` is left unclassified.
+    #[test]
+    fn tag_key_reads_need_catalog_read_and_writes_need_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/tag-keys"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        for (method, path) in [
+            ("POST", "/api/governance/tag-keys"),
+            ("PUT", "/api/governance/tag-keys/{key}"),
+            ("DELETE", "/api/governance/tag-keys/{key}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("governance:write")),
+                "{method} {path}"
+            );
+        }
     }
 
     #[test]
