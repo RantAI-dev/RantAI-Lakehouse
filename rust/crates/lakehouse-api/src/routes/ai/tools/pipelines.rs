@@ -53,8 +53,11 @@ pub(super) async fn trigger_build(state: &AppState, principal: Option<&Principal
     };
     if jobs.iter().any(|j| j == DEMO_BUILD_JOB) {
         return match state.dagster.launch_run(DEMO_BUILD_JOB).await {
-            Ok(outcome) => match outcome.error {
-                Some(error) => json!({ "error": error }),
+            // F2.7: `outcome.failure` is a typed `LaunchFailure`. The
+            // tool body is the FIXED classified string below — Dagster's
+            // own text was logged at the dagster crate boundary.
+            Ok(outcome) => match outcome.failure {
+                Some(_) => json!({ "error": "Dagster did not accept the build run" }),
                 None => json!({
                     "launched": true,
                     "runId": outcome.run_id,
@@ -91,11 +94,16 @@ pub(super) async fn trigger_build(state: &AppState, principal: Option<&Principal
             "pipeline"
         };
         match state.dagster.launch_run(job).await {
-            Ok(outcome) if outcome.error.is_none() => {
+            Ok(outcome) if outcome.failure.is_none() => {
                 launched.push(json!({ "step": step, "job": job, "runId": outcome.run_id }));
             }
-            Ok(outcome) => {
-                skipped.push(json!({ "step": step, "job": job, "error": outcome.error }));
+            // F2.7: `outcome.failure` is the typed `LaunchFailure`. The
+            // tool's "skipped" `error` is the FIXED classified string —
+            // Dagster's own text was logged at the dagster crate boundary.
+            Ok(_outcome) => {
+                skipped.push(
+                    json!({ "step": step, "job": job, "error": "Dagster did not accept the run" }),
+                );
             }
             Err(_) => skipped.push(
                 json!({ "step": step, "job": job, "error": "Dagster did not accept the run" }),
@@ -203,8 +211,11 @@ pub(super) async fn get_build_status(dagster: &lakehouse_dagster::DgClient) -> V
 pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient) -> Value {
     match dagster.launch_run("bronze_maintenance_job").await {
         Ok(outcome) => {
-            if let Some(error) = outcome.error {
-                return json!({ "error": error });
+            // F2.7: `outcome.failure` is the typed `LaunchFailure`. The
+            // tool's `error` is the FIXED classified string — Dagster's
+            // own text was logged at the dagster crate boundary.
+            if outcome.failure.is_some() {
+                return json!({ "error": "Dagster did not accept the maintenance run" });
             }
             json!({
                 "launched": true,
@@ -232,12 +243,27 @@ pub(super) async fn list_pipelines(state: &AppState, principal: Option<&Principa
     .await
 }
 
-pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn list_pipeline_runs(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    response_to_value(crate::routes::pipelines::runs(State(state.clone()), Path(id)).await).await
+    // F2.1 (PR #59 review): forward the principal to the route so the
+    // F2.1 scope check (`in_scope`) runs — a tool call WITHOUT a
+    // principal (e.g. an internal caller that bypasses the AI auth
+    // middleware) would see the route fail closed and return 404. Same
+    // `principal: Option<&Principal>` shape as `trigger_pipeline` /
+    // `pause_pipeline` already take.
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::runs(State(state.clone()), extension, HeaderMap::new(), Path(id))
+            .await,
+    )
+    .await
 }
 
 /// `principal` is forwarded as `Option<Extension<Principal>>` — the same
@@ -268,17 +294,40 @@ pub(super) async fn trigger_pipeline(
     let body = Json(TriggerBody { run_config });
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::trigger(State(state.clone()), extension, Path(id), Some(body))
-            .await,
+        crate::routes::pipelines::trigger(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+            Some(body),
+        )
+        .await,
     )
     .await
 }
 
-pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn retry_pipeline_run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
     }
+    // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    // f2-tenant-scope-and-run-config.md` Part D): `stepKeys` that is
+    // NOT an array of strings used to silently fall through to
+    // "re-run every step" — the `Value::as_array()` adapter returned
+    // `None` for a string/object/null `stepKeys`, and the body
+    // builder then took the empty-body branch (or the `fromFailure`
+    // branch, whichever matched first). That is a silent
+    // reinterpretation of an obvious caller bug: a model that typed
+    // `"stepKeys": "foo"` deserved a 400, not a different run.
+    //
+    // The check is the same shape the rest of this file uses for
+    // argument validation (`{"error": …}` keyed by a stable label,
+    // like `id is required` above and `runId is required`).
     // Plan 1c (R2, day-1): the copilot tool can ask for a specific
     // subset of steps via the `stepKeys` array — the route layer
     // builds the body, so the tool cannot drift from the console's
@@ -287,18 +336,50 @@ pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Valu
     // the failed steps). When both are present, `stepKeys` wins —
     // it is the more specific request, and a model that names keys
     // is presumed to know what it wants.
-    let body = if let Some(step_keys) = args.get("stepKeys").and_then(Value::as_array) {
-        let keys_json = serde_json::to_string(step_keys).unwrap_or_else(|_| "[]".to_owned());
-        Bytes::from(format!(
-            r#"{{"strategy":"selected","stepKeys":{keys_json}}}"#
-        ))
-    } else if args.get("fromFailure").and_then(Value::as_bool) == Some(true) {
-        Bytes::from_static(br#"{"strategy":"fromFailure"}"#)
-    } else {
-        Bytes::new()
+    let body = match args.get("stepKeys") {
+        Some(Value::Array(step_keys)) => {
+            // The route layer's body builder serializes the array
+            // verbatim; an array containing a non-string would
+            // survive the JSON encode and produce an invalid body
+            // downstream. Reject now so the failure shape is the
+            // same one the type-level mismatch above gives.
+            if !step_keys.iter().all(Value::is_string) {
+                return json!({
+                    "error": "stepKeys must be an array of strings (e.g. [\"step_a\", \"step_b\"])"
+                });
+            }
+            let keys_json = serde_json::to_string(step_keys).unwrap_or_else(|_| "[]".to_owned());
+            Bytes::from(format!(
+                r#"{{"strategy":"selected","stepKeys":{keys_json}}}"#
+            ))
+        }
+        Some(_) => {
+            return json!({
+                "error": "stepKeys must be an array of strings (e.g. [\"step_a\", \"step_b\"])"
+            });
+        }
+        None => {
+            if args.get("fromFailure").and_then(Value::as_bool) == Some(true) {
+                Bytes::from_static(br#"{"strategy":"fromFailure"}"#)
+            } else {
+                Bytes::new()
+            }
+        }
     };
+    // F2.1 (PR #59 review): forward the principal so the route's runId
+    // scope check (`enforce_run_id_pipeline_scope`) runs. A tool call
+    // without a principal returns 404 from the same path it does for
+    // a restricted caller — `Restricted(None)` sees nothing.
+    let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::retry_run(State(state.clone()), Path(run_id), body).await,
+        crate::routes::pipelines::retry_run(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(run_id),
+            body,
+        )
+        .await,
     )
     .await
 }
@@ -314,7 +395,13 @@ pub(super) async fn pause_pipeline(
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::pause(State(state.clone()), extension, Path(id)).await,
+        crate::routes::pipelines::pause(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
     )
     .await
 }
@@ -330,18 +417,37 @@ pub(super) async fn resume_pipeline(
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::resume(State(state.clone()), extension, Path(id)).await,
+        crate::routes::pipelines::resume(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(id),
+        )
+        .await,
     )
     .await
 }
 
-pub(super) async fn cancel_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn cancel_pipeline_run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
     }
+    // F2.1 (PR #59 review): forward the principal so the route's runId
+    // scope check runs. Same posture as `retry_pipeline_run` above.
+    let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::cancel_run(State(state.clone()), Path(run_id)).await,
+        crate::routes::pipelines::cancel_run(
+            State(state.clone()),
+            extension,
+            HeaderMap::new(),
+            Path(run_id),
+        )
+        .await,
     )
     .await
 }
@@ -377,7 +483,15 @@ pub(super) async fn get_pipeline(state: &AppState, args: &Map<String, Value>) ->
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    response_to_value(crate::routes::pipelines::detail(State(state.clone()), Path(id)).await).await
+    // F2.1 (PR #59 review): tool calls run with no `x-tenant` header
+    // and no principal — the helper fails closed and the route returns the
+    // standard 404. A principal-bearing tool entry point already runs
+    // the F2.1 scope check on the matching path.
+    response_to_value(
+        crate::routes::pipelines::detail(State(state.clone()), None, HeaderMap::new(), Path(id))
+            .await,
+    )
+    .await
 }
 
 pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Value>) -> Value {
@@ -388,6 +502,8 @@ pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Val
     api_result_to_value(
         crate::routes::pipelines::set_status_route(
             State(state.clone()),
+            None,
+            HeaderMap::new(),
             Path(id),
             axum::body::Bytes::from(json!({ "status": "ready" }).to_string()),
         )
@@ -402,6 +518,10 @@ mod t1_3_tests {
 
     use std::collections::HashMap;
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use lakehouse_dagster::LaunchFailure;
+    use uuid::Uuid;
+
     use super::*;
     use crate::config::Config;
 
@@ -409,11 +529,34 @@ mod t1_3_tests {
         AppState::new(Config::from_map(&HashMap::new()).unwrap())
     }
 
+    fn state_with_dagster(server_uri: &str) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// A logged-in principal holding `pipeline:write` — the permission
+    /// `POST /api/pipelines/{id}/trigger` is gated on, so
+    /// `trigger_pipeline` tests exercise the tool with the identity
+    /// the copilot dispatcher would actually pass (same fixture shape
+    /// as `routes::ai::tools::connectors::fixture_user_principal`).
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "fixture".to_owned(),
+            permissions: PermissionSet::parse("pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn every_id_or_run_id_tool_requires_its_argument() {
         let s = state();
         assert_eq!(
-            list_pipeline_runs(&s, &Map::new()).await,
+            list_pipeline_runs(&s, None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
         assert_eq!(
@@ -429,12 +572,390 @@ mod t1_3_tests {
             json!({ "error": "id is required" })
         );
         assert_eq!(
-            retry_pipeline_run(&s, &Map::new()).await,
+            retry_pipeline_run(&s, None, &Map::new()).await,
             json!({ "error": "runId is required" })
         );
         assert_eq!(
-            cancel_pipeline_run(&s, &Map::new()).await,
+            cancel_pipeline_run(&s, None, &Map::new()).await,
             json!({ "error": "runId is required" })
+        );
+    }
+
+    // ── F2.7 sentinels — see `LakehousePlanDay1.md` (Sentinel-Test
+    //    Discipline). Each test puts a UNIQUE sentinel in the upstream
+    //    GraphQL response and asserts the tool body carries the FIXED
+    //    classified string. The upstream detail is logged at the
+    //    `lakehouse-dagster` crate boundary (`tracing::warn!`), not in
+    //    the tool response.
+
+    /// F2.7 SENTINEL: `trigger_build`'s `DEMO_BUILD_JOB` launch path.
+    /// A `PythonError` from Dagster's `launchRun` carries a UNIQUE
+    /// sentinel in `message`; the tool body's `error` MUST be the
+    /// fixed `"Dagster did not accept the build run"` and the
+    /// sentinel MUST NOT appear.
+    #[tokio::test]
+    async fn trigger_build_demo_path_returns_fixed_body_when_dagster_python_errors() {
+        const SENTINEL: &str = "TOOL_TRIGGER_BUILD_PY_SENTINEL_444000";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            // Production `list_jobs` makes ONE GraphQL call whose
+            // root field is `repositoriesOrError`; the response carries
+            // `nodes[].jobs[].name` (see `lakehouse-dagster::list_jobs`).
+            // Returning the `DEMO_BUILD_JOB` ("refresh_lakehouse") here
+            // makes `trigger_build` take the demo launch path and call
+            // `launchRun(DEMO_BUILD_JOB)`, whose mock below answers
+            // `PythonError` so the FIXED refusal body is the assertion.
+            // Earlier revisions of this test matched the queries
+            // `listJobs` / `listJobsForRepository` from the console
+            // client, but `list_jobs` does NOT emit either query — the
+            // mock never matched, the response shape was missing
+            // `nodes[].jobs[].name`, and `list_jobs` failed to
+            // deserialize so `trigger_build` returned the early
+            // "could not be reached" error instead of the launch
+            // failure this test pins.
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoriesOrError": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [{
+                        "jobs": [{ "name": "refresh_lakehouse" }],
+                    }]
+                } }
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRun"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": {
+                    "__typename": "PythonError",
+                    "message": format!("launch attempt refused — {SENTINEL}"),
+                    "className": "DagsterInvalidDefinitionError",
+                    "stack": [],
+                    "causes": [],
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with_dagster(&server.uri());
+        let body = trigger_build(&state, None).await;
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains(SENTINEL),
+            "Dagster's PythonError message MUST NOT be forwarded into trigger_build body, got {body_str}",
+        );
+        assert_eq!(
+            body,
+            json!({ "error": "Dagster did not accept the build run" }),
+            "trigger_build refusal body MUST be the fixed classified string",
+        );
+        // Sanity: the dagster crate classified the refusal to `Refused`.
+        assert_eq!(
+            LaunchFailure::Refused.as_str(),
+            "refused",
+            "F2.7 typed `LaunchFailure::Refused` classifier returns the fixed `refused` body fragment"
+        );
+    }
+
+    /// F2.7 SENTINEL: `trigger_build`'s "no `demo_build_job`" path —
+    /// which calls `launch_run` for each authored pipeline. A
+    /// `PythonError` from Dagster's `launchRun` carries a UNIQUE
+    /// sentinel in `message`; the tool body's per-step `skipped`
+    /// `error` MUST be the fixed `"Dagster did not accept the run"`
+    /// and the sentinel MUST NOT appear.
+    #[tokio::test]
+    async fn trigger_build_authored_pipelines_path_returns_fixed_body_when_dagster_python_errors() {
+        const SENTINEL: &str = "TOOL_TRIGGER_AUTHORED_PY_SENTINEL_555111";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            // Production `list_jobs` returns the named jobs in this code
+            // location; `trigger_build` only takes the demo launch path
+            // when `DEMO_BUILD_JOB` (`refresh_lakehouse`) is present,
+            // so the mock here returns the `authored__*` jobs the test
+            // asserts on (the per-pipeline `launchRun` mock below
+            // answers `PythonError`, and each errored pipeline is
+            // recorded as a `skipped` entry). See the demo-path test
+            // above for the same production-vs-test query mismatch.
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoriesOrError": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [{
+                        "jobs": [{ "name": "authored__orders" }],
+                    }]
+                } }
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRun"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": {
+                    "__typename": "PythonError",
+                    "message": format!("launch attempt refused — {SENTINEL}"),
+                    "className": "DagsterInvalidDefinitionError",
+                    "stack": [],
+                    "causes": [],
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with_dagster(&server.uri());
+        let body = trigger_build(&state, None).await;
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains(SENTINEL),
+            "Dagster's PythonError message MUST NOT be forwarded into trigger_build body, got {body_str}",
+        );
+        let skipped = body["skipped"]
+            .as_array()
+            .expect("skipped is an array")
+            .iter()
+            .find(|s| s.get("job") == Some(&json!("authored__orders")))
+            .expect("skipped entry for authored__orders");
+        assert_eq!(
+            skipped["error"], "Dagster did not accept the run",
+            "trigger_build authored-pipeline refusal MUST be the fixed classified string",
+        );
+    }
+
+    /// F2.7 SENTINEL: `run_bronze_maintenance` returning a
+    /// `RunNotFoundError` from Dagster's `launchRun` carries a UNIQUE
+    /// sentinel in `message`; the tool body's `error` MUST be the
+    /// fixed `"Dagster did not accept the maintenance run"` and the
+    /// sentinel MUST NOT appear.
+    #[tokio::test]
+    async fn run_bronze_maintenance_returns_fixed_body_when_dagster_python_errors() {
+        const SENTINEL: &str = "TOOL_BRONZE_MAINTENANCE_SENTINEL_666222";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRun"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": {
+                    "__typename": "PythonError",
+                    "message": format!("maintenance refused — {SENTINEL}"),
+                    "className": "DagsterInvalidDefinitionError",
+                    "stack": [],
+                    "causes": [],
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with_dagster(&server.uri());
+        let dagster = state.dagster.clone();
+        let body = run_bronze_maintenance(&dagster).await;
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains(SENTINEL),
+            "Dagster's PythonError message MUST NOT be forwarded into run_bronze_maintenance body, got {body_str}",
+        );
+        assert_eq!(
+            body,
+            json!({ "error": "Dagster did not accept the maintenance run" }),
+            "run_bronze_maintenance refusal body MUST be the fixed classified string",
+        );
+        assert_eq!(
+            LaunchFailure::Refused.as_str(),
+            "refused",
+            "F2.7 typed `LaunchFailure::Refused` classifier returns the fixed `refused` body fragment"
+        );
+    }
+
+    // ── F2.9 (`plans/pipelines/day-1-fixes/f2-tenant-scope-and-run-config.md`
+    //    Part D) — the tool body's `stepKeys` validation and
+    //    `runConfig` forwarding contracts. The route-level handler
+    //    keeps its existing `{"error": "..."}` shape for argument
+    //    validation, so the `stepKeys` tests below mirror the
+    //    `runId is required` pattern from `run_id_required` above;
+    //    the `runConfig` test pins tool → route with a wiremock
+    //    `launchRun` matcher on `variables.cfg` instead, because the
+    //    contract there is forwarding, not validation.
+
+    /// F2.9 (PR #59 review): a `stepKeys` that is NOT a JSON array of
+    /// strings must surface as an `{"error": "..."}` tool result,
+    /// not silently fall through to a "re-run every step" body. The
+    /// pre-F2.9 `Value::as_array()` adapter returned `None` for a
+    /// string/null/object `stepKeys`, and the body builder then
+    /// took the `fromFailure` / empty branch — a silent
+    /// reinterpretation of an obvious caller bug.
+    ///
+    /// **Planned**: dropping the `Some(_)` / `Some(Value::Array(_))`
+    /// type guards in [`retry_pipeline_run`] makes the test fail — a
+    /// string `stepKeys` would fall through to `fromFailure` (or
+    /// the empty-body branch), bypassing the `{"error": ...}`
+    /// response.
+    #[tokio::test]
+    async fn retry_pipeline_run_returns_an_error_for_non_array_step_keys() {
+        let state = state();
+        for bad in [
+            json!("step_a"),            // string
+            json!(null),                // null
+            json!({ "key": "step_a" }), // object
+            json!(["step_a", 42]),      // array of mixed types
+        ] {
+            let mut args = Map::new();
+            args.insert("runId".to_owned(), json!("abc-123"));
+            args.insert("stepKeys".to_owned(), bad.clone());
+            let body = retry_pipeline_run(&state, None, &args).await;
+            assert_eq!(
+                body,
+                json!({
+                    "error": "stepKeys must be an array of strings (e.g. [\"step_a\", \"step_b\"])"
+                }),
+                "non-array stepKeys {bad} must surface as an error result, not be silently reinterpreted"
+            );
+        }
+    }
+
+    /// F2.9 (PR #59 review): a valid array of strings STILL works —
+    /// the validation rejects malformed input without breaking the
+    /// happy path. The wiremock here is only there to keep the
+    /// `state_with_dagster` route from hitting a real host; the
+    /// assertion is about the ARG VALIDATION, not the network
+    /// response — a malformed `stepKeys` never reaches the network
+    /// call.
+    #[tokio::test]
+    async fn retry_pipeline_run_accepts_a_string_array_step_keys() {
+        let server = wiremock::MockServer::start().await;
+        // Three wiremock arms are needed:
+        //
+        // 1. `pipelineRunOrError` — the route's
+        //    `enforce_run_id_pipeline_scope` looks up the run's
+        //    pipeline name BEFORE re-executing. Returning a name with
+        //    no `pl-` prefix short-circuits the scope check before any
+        //    DB read (the function exits on the
+        //    `pipeline_id_from_job_name` `else` branch).
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "pipelineRunOrError",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": {
+                    "__typename": "Run",
+                    "pipelineName": "silver_rebuild",
+                } }
+            })))
+            .mount(&server)
+            .await;
+        // 2. `pipelineRunOrError` (status query) + `runOrError`
+        //    (steps query) — the Selected strategy requires both:
+        //    `pipeline_run_status` confirms the run exists, and
+        //    `run_steps` fetches the parent run's known step keys for
+        //    the per-key verification. Returning `stepStats` covering
+        //    `step_a` and `step_b` makes the route pass the
+        //    verification.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("runOrError"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": {
+                    "__typename": "Run",
+                    "stepStats": [
+                        { "stepKey": "step_a", "status": "SUCCESS" },
+                        { "stepKey": "step_b", "status": "SUCCESS" },
+                    ],
+                } }
+            })))
+            .mount(&server)
+            .await;
+        // 3. `launchRunReexecution` — `retry_pipeline_run` posts
+        //    `launchRunReexecution`, NOT `launchRun` (re-execution is a
+        //    separate GraphQL mutation on Dagster's API). The wiremock
+        //    exists only to keep the test hermetic; the assertion is
+        //    about the absence of the validation
+        //    `{"error": "stepKeys ..."}`.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRunReexecution"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess", "run": { "runId": "abc-123" } } }
+            })))
+            .mount(&server)
+            .await;
+        let state = state_with_dagster(&server.uri());
+        let mut args = Map::new();
+        args.insert("runId".to_owned(), json!("abc-123"));
+        args.insert("stepKeys".to_owned(), json!(["step_a", "step_b"]));
+        let body = retry_pipeline_run(&state, None, &args).await;
+        // The exact `{"runId": ...}` body shape the existing tool
+        // contract produces; this test's only claim is "no
+        // `{"error": "stepKeys ..."}` for valid input". Asserting
+        // on the absence of the error key (rather than the run id)
+        // is the literal negative-control for the test above.
+        assert!(
+            !body.as_object().is_some_and(|o| {
+                o.get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| e.contains("stepKeys"))
+            }),
+            "valid string-array stepKeys must NOT surface as the validation error: got {body}"
+        );
+    }
+
+    /// F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    /// f2-tenant-scope-and-run-config.md` Part D): `trigger_pipeline`
+    /// MUST forward `args["runConfig"]` into the `TriggerBody` it
+    /// hands to `routes::pipelines::trigger` — that tool → route seam
+    /// is the only place the copilot's config can be dropped before
+    /// it reaches Dagster. The route-level test
+    /// `routes::pipelines::tests::trigger_with_config::
+    /// trigger_with_valid_run_config_calls_launch_run_with_config`
+    /// pins route → Dagster; this one pins tool → route: the
+    /// wiremock's `body_partial_json` matcher on `variables.cfg` only
+    /// matches when the caller's config arrives inside the
+    /// `launchRun` mutation, so dropping the forwarding line in
+    /// [`trigger_pipeline`] leaves the mock unmatched (wiremock
+    /// answers 404), the launch errors, and the run-id assertion
+    /// below fails.
+    #[tokio::test]
+    async fn trigger_pipeline_forwards_run_config_to_the_trigger_route() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "isPipelineConfigValid",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": {
+                    "__typename": "PipelineConfigValidationValid",
+                    "pipelineName": "silver_rebuild" } }
+            })))
+            .mount(&server)
+            .await;
+        // The forwarding pin: `variables.cfg` must carry the exact
+        // config the tool was handed, or this mock never matches.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("launchRun"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "variables": {
+                    "cfg": { "ops": { "silver_rebuild_op": {
+                        "config": { "target_table": "x" } } } },
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "r-tool-config" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with_dagster(&server.uri());
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("silver_rebuild"));
+        args.insert(
+            "runConfig".to_owned(),
+            json!({ "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } } }),
+        );
+        let body = trigger_pipeline(&state, Some(&principal), &args).await;
+        assert_eq!(
+            body["id"],
+            json!("r-tool-config"),
+            "args[\"runConfig\"] must reach the trigger route's launch body unchanged: got {body}",
         );
     }
 }
