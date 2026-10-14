@@ -28,7 +28,8 @@
 
 ## Planner decisions (not owner-signed; the reviewer may veto at review)
 
-- **Storage** — two tables in one migration `0070_governed_tags.sql`:
+- **Storage** — two tables in one migration `0071_governed_tags.sql` (numbering
+  decided below):
   - `governed_tag_key(key TEXT PRIMARY KEY, allowed_values TEXT[] NOT NULL,
     created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at
     TIMESTAMPTZ NOT NULL)`.
@@ -53,10 +54,47 @@
 - **Setting values on a table** — the body of `PUT /api/catalog/{id}/annotation`
   (`catalog:write`, `policy.rs:194`) gains an optional `governedTags` object
   (`{"data_domain": "finance"}`). Sending it replaces the table's full governed
-  set (same semantics as `tags`); omitting it changes nothing. The handler
-  validates: key exists, value allowed, ≤ 20 pairs — refusal names the offending
-  key and the allowed values. Store side: one statement replaces the table's
-  rows in the same transaction as the annotation upsert.
+  set (same semantics as `tags`); omitting it changes nothing. Shape bounds and
+  the ≤ 20-pairs cap are validated in the handler; whether a value is in the
+  key's allowed list is checked in the store, inside the write transaction under
+  a row lock on the key (`FOR SHARE` on write, `FOR UPDATE` on edit/delete), so
+  the list checked is the one written against — the developer's task-1 design,
+  accepted by the planner 2026-10-14. Refusals name the offending key and the
+  allowed values. A pair whose value is unchanged keeps its `set_by`/`set_at`.
+  Store side: one statement replaces the table's rows in the same transaction
+  as the annotation upsert (`set_asset_tags_in(&mut PgConnection, …)`).
+
+### Migration numbering after the `bfed22fc` merge (planner decision, 2026-10-14)
+
+The merge left two migrations numbered `0062`: this branch's
+`0062_asset_certification.sql` (part 1, written when main's last was `0061`)
+and main's `0062_connector_type_unsupported_reason.sql` (main renumbered its
+own `0061–0064` to `0062–0065` in `36f2a2ac`, before #115). The branch is the
+second merger, so its own migration moves, following the rule in the master
+plan and the `36f2a2ac` precedent:
+
+- `0062_asset_certification.sql` → **`0070_asset_certification.sql`** (content
+  unchanged — an applied migration is never edited; only its number moves).
+- The governed-tags migration is **`0071_governed_tags.sql`**.
+
+`ls rust/migrations | cut -c1-4 | sort | uniq -d` prints nothing after the
+rename. Code comments that say "`0062`" (`connector_type.rs:11`, its tests)
+refer to main's migration and stay correct.
+
+**Record fix, needed only where asset_certification was already applied as
+version 62** — known instance: the product owner's QA instance (`:18082`, not
+running at the time of writing). Run this once on its Postgres **before**
+starting the API on the new head; the content did not change, so the recorded
+checksum stays valid, and main's `0062` then applies fresh on next start:
+
+```sql
+UPDATE _sqlx_migrations SET version = 70
+ WHERE version = 62 AND description LIKE '%asset_certification%';
+```
+
+The running dev stack (`lakehouse-postgres-1`) stops at version 55 and needs
+nothing. The part-1 plan keeps its historical `0062` mentions; `CHANGELOG.md`'s
+part-1 entry is updated to `0070` by the renumber commit.
 - **Catalog overlay** — rows and detail carry `governedTags` (object, keys
   sorted) next to `tags`, via the annotation overlay in
   `routes/catalog.rs:1481-1490`; absent when empty, like part 1's fields.
@@ -104,8 +142,15 @@ Each task names its scoped check (master plan: only what changed). A task whose
 acceptance check fails stops the developer; mismatches between plan and code
 are reported, not improvised (`AGENTS.md`, developer role).
 
-1. **Migration and store.** `rust/migrations/0070_governed_tags.sql` (why-header
-   citing spec and this plan); store statements in a new
+1. **Renumber, then migration and store.** First commit of this task:
+   `git mv rust/migrations/0062_asset_certification.sql
+   rust/migrations/0070_asset_certification.sql`, update the `CHANGELOG.md`
+   part-1 entry's migration number to `0070`, rename the developer's uncommitted
+   migration to `0071_governed_tags.sql`, and run the duplicate check
+   (`ls rust/migrations | cut -c1-4 | sort | uniq -d` prints nothing). Commit
+   message follows the `36f2a2ac` style, citing this plan section and the
+   precedent. Then the governed-tags migration itself (why-header citing spec
+   and this plan); store statements in a new
    `rust/crates/lakehouse-store/src/governed_tag.rs`: `create_key`, `list_keys`,
    `update_key_values`, `delete_key` (refused when in use, count returned),
    `set_asset_tags` (replace-one-transaction), `list_for_asset`,
