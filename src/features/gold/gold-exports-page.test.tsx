@@ -29,6 +29,7 @@ describe("GoldExportsPage", () => {
           updatedAt: null,
           lastChangedAt: "2026-10-02T03:30:00Z",
           lastExportedAt: null,
+          changedSinceExport: null,
           canEdit: true,
         })
       }
