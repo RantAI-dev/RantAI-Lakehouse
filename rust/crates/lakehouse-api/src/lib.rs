@@ -15,12 +15,14 @@
 //! `axum::Router` (via `tower::ServiceExt::oneshot` — no bound port) that
 //! only a library target can hand out.
 //!
-//! `src/main.rs` itself is untouched: it keeps its own private `mod`
-//! declarations and compiles as its own, separate crate, exactly as
-//! before. This file simply re-declares the same modules as `pub`, from
-//! the same source files, as a second, independent compilation of the
-//! package — the standard "thin bin, real lib" split, applied without
-//! editing the bin side at all.
+//! `src/main.rs` is the thin binary over this library: it imports
+//! `config`, `routes` and `state` from here with
+//! `use lakehouse_api::{…}` instead of re-declaring the module tree with
+//! `mod`. It used to re-declare all of it, which compiled every module,
+//! and ran every unit test in it, twice (once per target); see
+//! `docs/plans/CI-SPEED-PLAN.md` section 3.3. The binary's own tests (the
+//! router registration tests and the `bootstrap_*` tests, which call
+//! functions private to `main.rs`) stay in `main.rs` and compile there.
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod auth;

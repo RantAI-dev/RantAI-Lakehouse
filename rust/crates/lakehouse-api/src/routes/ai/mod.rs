@@ -25,7 +25,7 @@ mod data_map;
 mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
-pub(crate) mod semantic;
+pub mod semantic;
 pub(crate) mod semantic_api;
 pub(crate) mod terms;
 pub(in crate::routes) mod tools;

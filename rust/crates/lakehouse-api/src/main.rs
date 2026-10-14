@@ -7,43 +7,13 @@
 //! (`lakehouse-core`, `lakehouse-clickhouse`, and this crate's own modules)
 //! use `thiserror` typed errors instead.
 
-mod auth;
-mod bounded;
-mod bronze_stats_cache;
-mod catalog_search_cache;
-mod config;
-mod connector_deprovision;
-mod connector_discover;
-mod connector_probe;
-mod connector_secret_store;
-mod error;
-mod gold_export;
-mod gold_export_history;
-mod gold_lock;
-mod health;
-mod internal_hosts;
-mod json;
-mod lakehouse_catalog;
-mod lakekeeper_token;
-mod next_run;
-mod pipeline_source;
-mod policy;
-mod policy_engine;
-mod routes;
-mod rustfs_client;
-mod sql_guard;
-mod sql_rewrite;
-mod state;
-mod tenant;
-mod tenant_scope;
-mod transform_grammar;
-mod upload_parquet;
-mod upload_parse;
-mod upload_store;
-mod upload_workbook;
-
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
+
+// The modules live in the library target (`src/lib.rs`); this binary used to
+// re-declare them with `mod`, which compiled every module, and every unit
+// test in it, a second time (docs/plans/CI-SPEED-PLAN.md section 3.3).
+use lakehouse_api::{config, routes, state};
 
 use config::Config;
 use state::AppState;
@@ -180,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// The created identity is `must_change_password = true` (see
 /// `0019_auth.sql`/[`lakehouse_auth::password`]'s doc comments): it can log
-/// in, but [`crate::routes::auth::change_password`] refuses to let it stay
+/// in, but [`lakehouse_api::routes::auth::change_password`] refuses to let it stay
 /// on that credential without proving a fresh password client-side.
 async fn bootstrap_admin(state: &AppState) {
     let (Some(email), Some(password)) = (
@@ -280,7 +250,7 @@ const GOLD_EXPORT_SERVICE_IDENTITY_NAME: &str = "gold-export-scheduler";
 ///
 /// # Why this exists at all
 ///
-/// `POST /api/agents/employees/{id}/run`'s [`crate::policy::POLICY_TABLE`]
+/// `POST /api/agents/employees/{id}/run`'s [`lakehouse_api::policy::POLICY_TABLE`]
 /// entry is `Policy::RequiresAuth` — a FLOOR, not a ceiling (see that
 /// table's own doc comment on `/api/alerts/run`/`/api/gold/export/{mart}`
 /// for the same shape): `crate::policy::auth_gate` demands a real,

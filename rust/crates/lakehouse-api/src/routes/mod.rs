@@ -6,7 +6,7 @@
 //! domain under `/api/identity/*`.
 
 mod agents;
-pub(crate) mod ai;
+pub mod ai;
 mod alerts;
 pub mod auth;
 mod authored_pipelines;
@@ -36,7 +36,7 @@ mod pipelines;
 mod quality;
 mod query;
 mod schema_changes;
-pub(crate) mod schema_versions;
+pub mod schema_versions;
 mod storage;
 pub(crate) mod support;
 mod uploads;

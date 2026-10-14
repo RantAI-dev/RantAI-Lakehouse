@@ -84,7 +84,11 @@ static GAVE_UP: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(H
 /// Starts one drafting pass in the background and returns at once. Returns
 /// `false`, starting nothing, while another pass runs. A pass that fails is
 /// logged and changes nothing.
-pub(crate) fn spawn_pass(state: &AppState) -> bool {
+#[allow(
+    clippy::must_use_candidate,
+    reason = "fire-and-forget: `main.rs` and `routes::pipelines` start a pass and deliberately ignore the flag"
+)]
+pub fn spawn_pass(state: &AppState) -> bool {
     spawn_pass_on(&PASS_RUNNING, &GAVE_UP, state)
 }
 

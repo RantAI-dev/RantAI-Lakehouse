@@ -544,7 +544,11 @@ impl Drop for PassGuard {
 /// must not wait on a scan of the engine's tables. Returns `false`,
 /// starting nothing, while another pass runs. A failed pass is logged and
 /// changes nothing.
-pub(crate) fn spawn_pass(state: &AppState) -> bool {
+#[allow(
+    clippy::must_use_candidate,
+    reason = "fire-and-forget: `main.rs` and `routes::pipelines` start a pass and deliberately ignore the flag"
+)]
+pub fn spawn_pass(state: &AppState) -> bool {
     spawn_pass_on(&PASS_RUNNING, state)
 }
 
