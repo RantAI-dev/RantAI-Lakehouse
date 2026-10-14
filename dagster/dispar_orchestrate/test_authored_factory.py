@@ -41,6 +41,7 @@ from dagster import (
     RunsFilter,
     build_op_context,
     job,
+    op,
 )
 
 from dispar_orchestrate import authored_factory, authored_transforms
@@ -1466,6 +1467,66 @@ class TestFileIngestRunConfigReader:
         runs = [_file_ingest_run("r", "orders")]
         assert authored_factory._latest_run_for_table(runs, "orders") is runs[0]
         assert authored_factory._latest_run_for_table(runs, "") is None
+
+    def test_a_real_runs_config_resolves_to_the_table_the_load_wrote(self) -> None:
+        """The assumption D1 rests on, proven on a REAL run instead of a
+        stub: `execute_in_process` against a temp instance writes a
+        `file_ingest_job` run whose stored `run_config` -- the exact
+        attribute `_run_config_value` reads, the exact value
+        `context.instance.get_runs` hands the sensor -- is read back and
+        resolves to the table that was launched.
+
+        This is why no tag was added to the launch (plan D1): the config
+        Dagster already stores carries the table. If a future Dagster
+        resolves the config into a different shape, this test fails here,
+        with the real payload, instead of the filter silently matching
+        nothing in production.
+        """
+        from dagster._core.test_utils import instance_for_test
+
+        from dispar_orchestrate.file_ingest import CONFIG_SCHEMA
+
+        @op(name="ingest_uploaded_file", config_schema=CONFIG_SCHEMA)
+        def _ingest_uploaded_file(context):  # noqa: ANN001, ANN202 - a Dagster op
+            return {"bronze_table_name": context.op_config["bronze_table_name"]}
+
+        @job(name="file_ingest_job")
+        def _file_ingest_job() -> None:
+            _ingest_uploaded_file()
+
+        # `routes::uploads::run_config`'s own shape, verbatim.
+        launch = {
+            "ops": {
+                "ingest_uploaded_file": {
+                    "config": {
+                        "upload_id": "up-1",
+                        "storage_key": "uploads/t/up-1.csv",
+                        "bronze_table_name": "stock_raw",
+                        "load_mode": "replace",
+                        "encoding": "utf-8",
+                        "delimiter": ",",
+                        "header_row": 0,
+                    }
+                }
+            }
+        }
+        with instance_for_test() as instance:
+            result = _file_ingest_job.execute_in_process(
+                run_config=launch, instance=instance, raise_on_error=False
+            )
+            assert result.success
+            runs = instance.get_runs(RunsFilter(job_name="file_ingest_job"), limit=1)
+
+        assert len(runs) == 1
+        stored = runs[0]
+        assert (
+            authored_factory._run_config_value(
+                stored, authored_factory.FILE_INGEST_OP_CONFIG
+            )
+            == "stock_raw"
+        ), f"the stored run config resolved to {stored.run_config!r}"
+        assert authored_factory._latest_run_for_table([stored], "stock_raw") is stored
+        assert authored_factory._latest_run_for_table([stored], "invoices_raw") is None
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):
