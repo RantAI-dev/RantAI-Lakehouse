@@ -20,7 +20,7 @@ iceberg-catalog-rest = "=0.10.1"
 object_store = { version = "0.14", features = ["aws"] }
 arrow-array = "58"
 arrow-schema = "58"
-parquet = "58"
+parquet = "60"
 typetag = "0.2"
 async-trait = { workspace = true }
 tokio = { workspace = true }
