@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea"
 import { decimalsFor, formatNumber } from "@/lib/chart-axis"
 import { applySuggestion, callAtCaret, suggest } from "@/lib/formula-assist"
-import { draftFromForm, emptyMetricForm, formFromMetric, formProblems, usageSentence, MAX_DESCRIPTION } from "@/lib/metric-form"
+import { draftForCheck, draftFromForm, emptyMetricForm, formFromMetric, formProblems, usageSentence, MAX_DESCRIPTION } from "@/lib/metric-form"
 import { cn } from "@/lib/utils"
 import { calcFieldService, metricService } from "@/services"
 import type { FormulaFunction } from "@/services/contracts/calc-fields"
@@ -76,15 +76,19 @@ export function MetricDialog({ open, onOpenChange, existing, onChanged }: {
   const sourceKey = source ? (source.mart ?? `sql:${source.source}`) : ""
   const mine = segments.filter((s) => (source?.mart !== undefined ? s.sourceKind === "mart" && s.sourceId === source.mart : s.sourceKind === "sql_source" && s.sourceId === source?.source))
   const problems = formProblems(form, !existing, name)
-  const body = JSON.stringify(draftFromForm(form))
+  const body = JSON.stringify(draftForCheck(form))
+  // A malformed name is reported by the form (and blocks Create), not by the live check.
+  const checkName = problems.includes("Name") ? undefined : name || undefined
 
   // Check once typing pauses; a newer edit cancels the answer to an older one.
+  // The label is not needed for the value: an empty one goes as a provisional
+  // label (`draftForCheck`), so "Value now" shows as soon as source and formula check out.
   React.useEffect(() => {
-    if (!open || !source || !form.formula.trim() || !form.label.trim()) { setCheck(null); return }
+    if (!open || !source || !form.formula.trim()) { setCheck(null); return }
     setCheck("pending")
     const ctl = new AbortController()
     const timer = setTimeout(() => {
-      metricService.validate(source, draftFromForm(form), { name: name || undefined, value: true, signal: ctl.signal })
+      metricService.validate(source, draftForCheck(form), { name: checkName, value: true, signal: ctl.signal })
         .then(setCheck)
         .catch((e: unknown) => {
           if (ctl.signal.aborted) return
