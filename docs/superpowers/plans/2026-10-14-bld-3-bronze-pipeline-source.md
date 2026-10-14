@@ -152,8 +152,64 @@ incremental loads.
 
 ## 7. Handoff
 
-(Developer appends here: commits, every command with exact counts, answers
-to section 6, anything not verified with the reason.)
+Developer: a non-Opus agent (`AGENTS.md`). Two sessions: the first
+built and pushed T1–T6 and reproduced T1, then stopped before the
+verification block; this session merged `origin/main` (PR #80) per the
+planner's instruction and ran the block.
+
+### Commits (`origin/main..HEAD`)
+
+```
+f85b7a72 BLD-3: tests follow PR #80's route signatures
+e055c335 merge: main into fix/bld-3-bronze-pipeline-source (bring #80 in)
+61fb0a58 BLD-3 T6: changelog entry for reading a Bronze table and refusing a Bronze target
+9596092d SRC-20 T5: run g7 in CI, and make it prove the rows and fail on a failed run
+f8d4e76f BLD-3 T4: refuse a bronze target in the API and in the assistant's schema
+bcd9b546 BLD-3 T3: refuse a bronze target in the job, before any SQL
+ad3db91e BLD-3 T2: read a Bronze source through the job's own DataLakeCatalog database
+4c5dabfb BLD-3 T1: reproduce the Bronze-source failure; add the g7-test-runner service
+5442bf34 BLD-3 docs(plan): read Bronze through the catalog; refuse Bronze targets; g7 in CI (SRC-20)
+```
+
+### The merge of PR #80 (5408c797) — order, decided
+
+One conflict file, `rust/crates/lakehouse-api/src/routes/authored_pipelines.rs`,
+six hunks, resolved hunk by hunk (AGENTS rule 9), both sides kept in
+every hunk:
+
+- D4's `BRONZE_TARGET_REFUSED` / `validate_target_zone` stand next to
+  #80's F2.2 tenant helpers.
+- `update` keeps `validate_target_zone`; this branch's inline
+  transform-grammar and `max_retries` loop is dropped because #80's F2.8
+  moved both into the shared `validate_pipeline_input` that `update` and
+  `restore_version` now call. Nothing is lost: the refusal is the only
+  check that is still route-local.
+- `restore_version` likewise.
+
+**Order: `in_scope` (F2.1, #80) first, `validate_target_zone` second**,
+on both routes. So an out-of-scope id answers the same 404 as an
+unknown id whatever the body or the snapshot holds — the existence
+answer never depends on the caller's payload — and the Bronze refusal is
+the next answer for an in-scope id. The refusal cannot be moved ahead of
+`in_scope` without handing an out-of-scope caller a body-dependent
+answer, which is the one thing #80's 404 exists to prevent.
+
+This branch's two route tests for the refusal were re-shaped in the
+next commit (`f85b7a72`): `update`/`restore_version` need a pool to get
+past `in_scope` at all, so both now seed a row and call as
+`unrestricted_principal()`.
+
+### Commands, in the order the block runs them
+
+(Each entry is appended as the command finishes.)
+
+### Section 6 answers
+
+(Appended after the run.)
+
+### Not verified
+
+(Appended at the end.)
 
 ## 8. Review
 
