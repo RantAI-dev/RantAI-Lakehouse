@@ -9,6 +9,7 @@ import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { ExplainCard, FixCard, FixWithAiButton } from "./sql-help-card"
 import { IcebergTimeTravelControls } from "./time-travel-controls"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { SaveQuerySheet } from "./save-query-sheet"
@@ -90,9 +91,36 @@ export function QueryStudioPage() {
             </TabsContent>
           </Tabs>
           {studio.runAct.status === "error" ? (
-            <ErrorState
-              error={studio.runAct.error}
-              onRetry={() => void studio.runQuery()}
+            <div className="space-y-2">
+              <ErrorState
+                error={studio.runAct.error}
+                onRetry={() => void studio.runQuery()}
+              />
+              {/*
+               * Fix with AI works for ClickHouse only: the check that makes a
+               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
+               * Plan 16 lifts this. The reason is the button's title.
+               */}
+              <FixWithAiButton
+                engine={studio.engine}
+                busy={studio.fix.busy}
+                onFix={() => void studio.fix.run(studio.runAct.error?.message ?? "")}
+              />
+            </div>
+          ) : null}
+          {studio.explain.error ? (
+            <ErrorState error={studio.explain.error} />
+          ) : studio.explain.result !== null ? (
+            <ExplainCard text={studio.explain.result} />
+          ) : null}
+          {studio.fix.error ? (
+            <ErrorState error={studio.fix.error} />
+          ) : studio.fix.result ? (
+            <FixCard
+              outcome={studio.fix.result}
+              editorSql={studio.sql}
+              onAccept={studio.fix.accept}
+              onReject={studio.fix.reject}
             />
           ) : null}
           {studio.runAct.data ? (

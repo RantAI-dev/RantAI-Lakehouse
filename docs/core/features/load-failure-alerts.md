@@ -74,6 +74,14 @@ the spec.
 - Alerts need `PIPELINE_RUN_TOKEN` set on the API and the orchestrator.
 - `SEC-10` applies to webhook targets until it is fixed (spec).
 - Rules are shared by the whole installation, not per tenant.
+- A webhook alert arrived 6 and 19 seconds after the run ended in the one
+  measurement there is (`docs/plans/SRC-7-RESULT.md`). E-mail arrival is not
+  measured.
+- An alert whose delivery failed is listed as not delivered, with a reason
+  the product words itself. It is not sent again.
+- If the alert rules cannot be read for longer than the orchestrator's
+  three retries (about ten seconds), the run is counted and its alert is
+  not sent (`SRC-17`).
 
 ## Acceptance checklist
 

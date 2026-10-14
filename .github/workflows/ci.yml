@@ -1002,6 +1002,102 @@ jobs:
         if: always()
         run: docker compose -p g9ci down -v
 
+  # ── SRC-17 (finding F4, the delivery review of 2026-10-12): the alert
+  # delivery gate (ops/g6/src17_alert_delivery_test.py). A real failed
+  # connector run and a real failed upload each reach a webhook the gate
+  # receives within 5 minutes of the run's end (the seconds are printed), and
+  # a webhook that answers 500 is listed as not delivered with a fixed reason
+  # and none of the receiver's text. E-mail is not measured (the sender has no
+  # mode without verified TLS; the plan's D-d says why). It is a job of its own
+  # so no existing gate job grows: g6-ingest is at 19m54s of its 20 minutes.
+  # It brings up only the API, Dagster, the MySQL fixture (a wrong password
+  # makes a run fail in seconds) and the ClickHouse database an upload load
+  # asks about, with the same override as g6-ingest.
+  #
+  # SEC-10 (alert webhooks cannot reach internal addresses) is NOT built yet.
+  # The receiver is a listener in the gate's own container, on the compose
+  # network. When SEC-10 lands it will refuse that address by default and must
+  # give this gate its documented opt-in; the gate must not weaken the default.
+  # Scope gate as g6-ingest. ──
+  g6-alerts:
+    name: Rust · SRC-17 alert delivery
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Write CI-only .env
+        # The nine fixture secrets of g6-ingest, though only the MySQL
+        # fixture starts: ops/g6/docker-compose.g6.override.yml makes each
+        # `${VAR:?}`, which compose interpolates for every service in the
+        # files it loads. UPLOAD_S3_* as in g9-upload (the API has no default
+        # upload credential). PIPELINE_RUN_TOKEN is what lets the sensors
+        # report a failed run to the API, which is the path under test.
+        # Obviously fake values of a throwaway stack.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          EOF
+
+      - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as g6-ingest explains (the dagster profile
+        # also holds debezium-server). `--profile g6-sql` makes `mysql-g6`
+        # a valid dependency of the runner; only the services named here start.
+        run: >
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile g6-alerts --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          mysql-g6 clickhouse-iceberg-init
+
+      - name: Run the SRC-17 alert delivery gate inside the compose network
+        # `shell: bash` for pipefail and `-T` for no pseudo-terminal, as the
+        # g6-ingest run step explains; the same `-f` pair as the "up" step.
+        shell: bash
+        run: |
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
+
+      - name: Add the measured seconds to the job summary
+        # `always()`: a failed gate prints its lines too. Only the gate's own
+        # `SRC-17` lines are copied.
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-alerts-run.log" ]; then
+            {
+              echo '### SRC-17 alert delivery'
+              echo '```'
+              grep -E '^\[g6-alerts\]' "$RUNNER_TEMP/g6-alerts-run.log" | grep -E 'SRC-17|PASS|FAILED' || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster logs
+
+      - name: Tear down the alert delivery project
+        if: always()
+        run: docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster down -v
+
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
   # ClickHouse and appends it to the `gold` Iceberg namespace through
@@ -1159,6 +1255,7 @@ jobs:
       - g6-ingest-other
       - g6-oracle
       - g9-upload
+      - g6-alerts
       - gold-export
       - g8-governance
       - g8-time-travel
@@ -1198,6 +1295,7 @@ jobs:
           G6_INGEST_OTHER_RESULT: ${{ needs.g6-ingest-other.result }}
           G6_ORACLE_RESULT: ${{ needs.g6-oracle.result }}
           G9_UPLOAD_RESULT: ${{ needs.g9-upload.result }}
+          G6_ALERTS_RESULT: ${{ needs.g6-alerts.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
           G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}

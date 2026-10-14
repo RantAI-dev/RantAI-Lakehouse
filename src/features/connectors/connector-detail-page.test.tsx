@@ -244,19 +244,20 @@ describe("ConnectorDetailPage", () => {
       }
     )
     render(<ConnectorDetailPage connectorId="conn-a" />)
-    // SRC-10 R4: "Waiting for a decision" is also the title of the Schema changes
-    // card, which is on the page before the list has loaded, so waiting for that
-    // text waited for nothing and the count on the tab (set by an effect of the
-    // schema panel, after the list arrives) was read before it was there. Wait for
-    // the mark itself: the pill on the table row, found by its own title.
+    // SRC-10 R4 and SRC-17 (PR #124's CI): the same flake, fixed the same way.
+    // "Waiting for a decision" is also the title of the always-rendered Schema
+    // changes card, so awaiting that text resolved while the list was still
+    // loading, before the tab's count and the Ingest mark arrived. Await the mark
+    // itself (found by its title, which only the Ingest pill carries), then the
+    // count, then assert.
     const marks = await screen.findAllByTitle("A change at the source waits for approval; see Schema changes")
     expect(marks).toHaveLength(1)
+    expect(marks[0].textContent).toBe("Waiting for a decision")
     expect(within(marks[0].closest("li") as HTMLElement).getByText("public.orders")).toBeDefined()
     expect(within(screen.getByText("public.items").closest("li") as HTMLElement).queryByText("Waiting for a decision")).toBeNull()
-    // The tab's count is set by the same update as the mark, but read it after
-    // waiting for it all the same, and by its own text apart from the tab's name.
-    await waitFor(() => expect(within(tab("Schema changes")).getByText("1")).toBeDefined())
-    expect(tab("Schema changes").textContent).toBe("Schema changes1")
+    await waitFor(() => expect(tab("Schema changes").textContent).toBe("Schema changes1"))
+    await settle()
+    expect(screen.getAllByTitle("A change at the source waits for approval; see Schema changes")).toHaveLength(1)
     expect(count("GET /api/connectors/conn-a/schema-changes")).toBe(1)
   })
 

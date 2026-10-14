@@ -16,16 +16,25 @@
 //! 2. Confirm the orchestrator's own status for the run (`FAILURE` or
 //!    `SUCCESS`), as the pipeline path does: a sensor that posts the wrong
 //!    run must not turn into an alert.
-//! 3. Dedupe through `pipeline_run_event` BEFORE anything is counted or sent,
-//!    keyed `(run_id, kind)` with `pipeline_id` = `connector:<id>` or
-//!    `upload:<id>`, so a sensor retry can neither count a failure twice
-//!    (the streak that drives the "3 in a row" rule) nor deliver twice. The
-//!    cost of that order: if the write that follows fails after the dedupe
-//!    row exists, the retry is skipped and the event is lost. Losing one
-//!    count is the safe side of the two (a double count could fire "3 in a
-//!    row" early).
-//! 4. Record the run on the connector (`connectors::record_run_result`) and
-//!    deliver through `lakehouse_alerts::evaluate_connector_event`.
+//! 3. Count the run once (`SRC-17` F2). `connectors::record_run_once` writes
+//!    the dedupe row `(run_id, kind)` (`pipeline_id` = `connector:<id>`) and
+//!    the connector's health facts in one transaction, and keeps the streak
+//!    the run produced, so a sensor retry can neither count a failure twice
+//!    (the streak that drives the "3 in a row" rule) nor lose a count to a
+//!    failure between the two writes.
+//! 4. Hand the alerts over once. The rules are read AFTER the run is counted
+//!    and BEFORE a second row `(run_id, "<kind>_alerted")` is written; the
+//!    delivery follows that row. So a rule-store failure answers 503 with the
+//!    run counted and the second row absent: the retry counts nothing again
+//!    and delivers, with the run's own streak (that is what makes "3 in a
+//!    row" fire once even when the third run's first report met the failure).
+//!    A retry after everything went through finds both rows and does nothing.
+//!    Before this, the one dedupe row was written first and the rules read
+//!    after, and the retry of a failed read was skipped as "already
+//!    recorded": the alert was lost, silently. A delivery that was attempted
+//!    is never retried by the API (at most once: a webhook that already fired
+//!    is not fired again); what happened to it is on the alert instance
+//!    (`SRC-17` F1).
 //!
 //! Retries, stated once (`SRC-7` review SHOULD-FIX 4). Dagster's run status
 //! sensor moves past a run whether its function raised or returned, so
@@ -34,7 +43,9 @@
 //! `pipeline_events.py`). So: a 5xx from here may be retried within about
 //! ten seconds; one report per run is all there is; and if this API is
 //! unreachable for that whole window the alert for that run is not sent and
-//! the connector's health catches up at its next run.
+//! the connector's health catches up at its next run. The same bound holds
+//! for a rule store that stays down for the whole window: the run is counted
+//! but its alert is not sent (a durable queue is out of scope for `SRC-17`).
 //!
 //! A cancelled run is neither a failure nor a success and leaves the
 //! connector row alone: the orchestrator's `run_failure_sensor` fires on
@@ -48,12 +59,12 @@
 //! D8). Failures of the orchestrator, the rule store or the database are
 //! logged and answered with fixed text.
 
-use lakehouse_alerts::{AlertKind, AlertRule, SilenceSource};
+use lakehouse_alerts::{AlertKind, AlertRule, RuleDelivery, SilenceSource};
 use lakehouse_core::ApiError;
-use lakehouse_notify::EmailSender;
+use lakehouse_notify::{DeliverResult, EmailSender};
 use lakehouse_store::PgPool;
 use lakehouse_store::connectors::{self, REPEATED_FAILURE_STREAK};
-use lakehouse_store::overview::{self, FiredRule};
+use lakehouse_store::overview::{self, DeliveryRecord, FiredRule};
 use lakehouse_store::pipelines;
 use lakehouse_store::uploads;
 use serde_json::{Value, json};
@@ -89,6 +100,15 @@ impl Outcome {
         match self {
             Self::Failure => "failure",
             Self::Success => "success",
+        }
+    }
+
+    /// The `pipeline_run_event.kind` written once the rules were read and the
+    /// alerts are being handed over (`SRC-17` F2).
+    const fn alerted_kind(self) -> &'static str {
+        match self {
+            Self::Failure => "failure_alerted",
+            Self::Success => "success_alerted",
         }
     }
 
@@ -209,7 +229,8 @@ async fn confirm_status(
 }
 
 /// Send one event to the rules of `kind` and record an `alert_instance` for
-/// each rule a delivery was attempted for (when `persist_as` names a source).
+/// each rule a delivery was attempted for (when `persist_as` names a source),
+/// with how that delivery ended (`SRC-17` F1).
 /// `scope_id` is the connector id, or the upload id for `upload_failure`; it is
 /// also the instance's `affected`.
 ///
@@ -227,11 +248,44 @@ pub(super) async fn deliver_event(
     text: &str,
     persist_as: Option<&str>,
 ) -> Result<usize, ApiError> {
+    let rules = read_rules(state).await?;
+    Ok(deliver_with_rules(
+        state,
+        pool,
+        &rules,
+        (kind, scope_id),
+        title_prefix,
+        text,
+        persist_as,
+    )
+    .await)
+}
+
+/// Read the alert rules once. A failure is logged and answered with fixed
+/// text (principle 4).
+async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiError> {
+    lakehouse_alerts::load_rules(&state.clickhouse)
+        .await
+        .map_err(|err| unavailable(RULES_UNAVAILABLE, err))
+}
+
+/// [`deliver_event`] over rules already read. It cannot fail on the rule
+/// store, which is the point of reading them first (`SRC-17` F2). Returns how
+/// many deliveries were attempted.
+async fn deliver_with_rules(
+    state: &AppState,
+    pool: &PgPool,
+    rules: &[AlertRule],
+    (kind, scope_id): (AlertKind, &str),
+    title_prefix: &str,
+    text: &str,
+    persist_as: Option<&str>,
+) -> usize {
     let http = reqwest::Client::new();
     let email = EmailSender::new(smtp_config(&state.config));
     let silence = ApiSilenceSource { pg: pool };
-    let delivered = lakehouse_alerts::evaluate_connector_event(
-        &state.clickhouse,
+    let attempted = lakehouse_alerts::deliver_connector_event_to(
+        rules,
         &http,
         &email,
         kind,
@@ -240,26 +294,40 @@ pub(super) async fn deliver_event(
         text,
         Some(&silence as &dyn SilenceSource),
     )
-    .await
-    .map_err(|err| unavailable(RULES_UNAVAILABLE, err))?;
+    .await;
     if let Some(source) = persist_as {
-        persist_instances(pool, &delivered, source, scope_id, text).await;
+        persist_instances(pool, &attempted, source, scope_id, text).await;
     }
-    Ok(delivered.len())
+    attempted.len()
 }
 
-/// Best-effort `alert_instance` rows for the rules that were delivered to: a
-/// Postgres failure must not turn a delivered alert into an error response
-/// (the same posture as `routes::alerts::persist_fired_results`).
+/// How a delivery ended, in the form the alert instance stores it
+/// (`SRC-17` F1). `error` is always one of the fixed sentences of
+/// `lakehouse_notify::DeliveryFailure` (never upstream text), so it is
+/// stored and shown as it is. A failed result with no reason records
+/// nothing rather than an invented one.
+pub(super) fn delivery_record(result: &DeliverResult) -> Option<DeliveryRecord<'_>> {
+    if result.ok {
+        Some(DeliveryRecord::Delivered)
+    } else {
+        result.error.as_deref().map(DeliveryRecord::NotDelivered)
+    }
+}
+
+/// Best-effort `alert_instance` rows for the rules a delivery was attempted
+/// for, delivered or not: a Postgres failure must not turn a delivered alert
+/// into an error response (the same posture as
+/// `routes::alerts::persist_fired_results`). An alert whose delivery failed
+/// is still listed, with the reason (`SRC-17` F1: the event happened).
 async fn persist_instances(
     pool: &PgPool,
-    rules: &[AlertRule],
+    attempted: &[RuleDelivery],
     source: &str,
     affected: &str,
     detail: &str,
 ) {
     let now = OffsetDateTime::now_utc();
-    for rule in rules {
+    for RuleDelivery { rule, result } in attempted {
         let fired = FiredRule {
             rule_id: &rule.id,
             title: &rule.name,
@@ -268,7 +336,14 @@ async fn persist_instances(
             affected,
             detail,
         };
-        if let Err(err) = overview::insert_from_fired_rule(pool, &fired, now).await {
+        if let Err(err) = overview::insert_from_fired_rule_with_delivery(
+            pool,
+            &fired,
+            delivery_record(result),
+            now,
+        )
+        .await
+        {
             tracing::warn!(%err, rule_id = %rule.id, "failed to persist a load alert instance (delivery already happened)");
         }
     }
@@ -282,7 +357,8 @@ async fn persist_instances(
 ///
 /// 404 for a run the orchestrator does not know, 409 when its status is not
 /// the one the sensor claims, 503 with fixed text when the orchestrator or
-/// the alert rules cannot be reached, and the store's classified error on a
+/// the alert rules cannot be reached (the run is then counted, if it was not
+/// yet, and the retry delivers, `SRC-17` F2), and the store's classified error on a
 /// database failure.
 pub(super) async fn connector_run_event(
     state: &AppState,
@@ -295,68 +371,79 @@ pub(super) async fn connector_run_event(
         Found::Skip(reason) => return Ok(skipped(reason)),
     };
     let info = confirm_status(state, &req.run_id, outcome).await?;
-    let first_seen = pipelines::record_pipeline_run_event(
+    // Count the run once, with its streak kept for a retry (`SRC-17` F2).
+    let recorded = connectors::record_run_once(
         pool,
         &req.run_id,
-        &format!("connector:{}", connector.id),
-        outcome.event_kind(),
-    )
-    .await?;
-    if !first_seen {
-        return Ok(skipped("run already recorded; sensor retry ignored"));
-    }
-    let health = connectors::record_run_result(
-        pool,
         &connector.id,
+        outcome.event_kind(),
         outcome == Outcome::Success,
         run_end(info.end_time),
     )
     .await?;
+    // `SRC-17` F2 (delivery review 2026-10-12): read the rules BEFORE the
+    // second marker, so a rule-store failure leaves the run counted and the
+    // alerts un-handed-over, and the retry delivers (module doc, item 4).
+    let rules = read_rules(state).await?;
+    let handed_over = pipelines::record_pipeline_run_event(
+        pool,
+        &req.run_id,
+        &format!("connector:{}", connector.id),
+        outcome.alerted_kind(),
+    )
+    .await?;
+    if !handed_over {
+        return Ok(skipped("run already recorded; sensor retry ignored"));
+    }
     let link = format!("/connectors/{}", connector.id);
     let who = format!("Connector {} ({})", connector.name, connector.id);
     let mut matched = 0;
     match outcome {
         Outcome::Failure => {
             let text = format!("{who} run {} failed. View: {link}", req.run_id);
-            matched += deliver_event(
+            matched += deliver_with_rules(
                 state,
                 pool,
-                AlertKind::ConnectorFailure,
-                &connector.id,
+                &rules,
+                (AlertKind::ConnectorFailure, &connector.id),
                 "Connector run failed",
                 &text,
                 Some(CONNECTOR_SOURCE),
             )
-            .await?;
-            if health.failure_streak == REPEATED_FAILURE_STREAK {
+            .await;
+            // The run's own streak (kept on its dedupe row), not the
+            // connector's current one: a retry of the third run's report
+            // still fires "3 in a row", once, and a later run's streak
+            // never fires it for this one.
+            if recorded.failure_streak == Some(REPEATED_FAILURE_STREAK) {
                 let text = format!(
-                    "{who} has failed {} runs in a row; the latest is run {}. View: {link}",
-                    health.failure_streak, req.run_id
+                    "{who} has failed {REPEATED_FAILURE_STREAK} runs in a row; the latest is run {}. View: {link}",
+                    req.run_id
                 );
-                matched += deliver_event(
+                matched += deliver_with_rules(
                     state,
                     pool,
-                    AlertKind::ConnectorRepeatedFailure,
-                    &connector.id,
+                    &rules,
+                    (AlertKind::ConnectorRepeatedFailure, &connector.id),
                     "Connector failing repeatedly",
                     &text,
                     Some(CONNECTOR_SOURCE),
                 )
-                .await?;
+                .await;
             }
         }
         Outcome::Success => {
             let text = format!("{who} run {} succeeded. View: {link}", req.run_id);
-            matched += deliver_event(
+            matched += deliver_with_rules(
                 state,
                 pool,
-                AlertKind::ConnectorSuccess,
-                &connector.id,
+                &rules,
+                (AlertKind::ConnectorSuccess, &connector.id),
                 "Connector run succeeded",
                 &text,
                 None,
             )
-            .await?;
+            .await;
         }
     }
     Ok(json!({ "matched": matched }))
@@ -397,6 +484,11 @@ pub(super) async fn upload_run_failed(
             "the upload could not be settled as failed yet".to_owned(),
         ));
     }
+    // `SRC-17` F2: read the rules before the dedupe row, as the connector
+    // path does. A rule-store failure answers 503 with nothing recorded, so
+    // the retry delivers; the dedupe row below is written only once the
+    // rules are in hand.
+    let rules = read_rules(state).await?;
     let first_seen = pipelines::record_pipeline_run_event(
         pool,
         &req.run_id,
@@ -411,16 +503,16 @@ pub(super) async fn upload_run_failed(
         "File {} (upload {}) failed to load in run {}. View: /connectors/upload?id={}",
         settled.original_filename, settled.id, req.run_id, settled.id
     );
-    let matched = deliver_event(
+    let matched = deliver_with_rules(
         state,
         pool,
-        AlertKind::UploadFailure,
-        &settled.id,
+        &rules,
+        (AlertKind::UploadFailure, &settled.id),
         "Upload failed",
         &text,
         Some(UPLOAD_SOURCE),
     )
-    .await?;
+    .await;
     Ok(json!({ "matched": matched }))
 }
 
@@ -492,7 +584,7 @@ mod tests {
         /// to wiremock's pool, so a `ClickHouse` mock dropped at the end of
         /// `harness` answered 404 (the rules "could not be read") or, once
         /// another test took the port, with that test's rules.
-        _clickhouse: MockServer,
+        clickhouse: MockServer,
     }
 
     /// Postgres plus mocked `Dagster`, `ClickHouse` and webhook servers.
@@ -560,7 +652,7 @@ mod tests {
             state,
             dagster,
             webhook,
-            _clickhouse: ch,
+            clickhouse: ch,
         }
     }
 
@@ -666,6 +758,191 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(instances, 1);
+    }
+
+    /// `SRC-17` F1 (D-a): a webhook that answers 500 leaves an alert that is
+    /// listed (the failure happened) but reads "not delivered", with the
+    /// API's fixed reason and nothing of what the server said. A webhook that
+    /// answers 200 reads delivered. The response's `matched` still counts the
+    /// attempt.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_webhook_that_answers_an_error_leaves_an_alert_that_says_it_was_not_delivered(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-bad", "connector_failure", CONNECTOR),
+                ("al-good", "connector_failure", CONNECTOR),
+            ],
+        )
+        .await;
+        // Higher priority than the harness's catch-all 200.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/al-bad"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream-secret-detail"))
+            .with_priority(1)
+            .mount(&h.webhook)
+            .await;
+        h.knows_run("run-1", Some(CONNECTOR), "FAILURE").await;
+
+        let resp = h.failed("run-1").await;
+        assert_eq!(resp["matched"], 2);
+
+        let listed = lakehouse_store::overview::list_alerts(&pool).await.unwrap();
+        let bad = listed
+            .iter()
+            .find(|a| a.rule_id.as_deref() == Some("al-bad"))
+            .expect("a failed delivery is still listed");
+        let good = listed
+            .iter()
+            .find(|a| a.rule_id.as_deref() == Some("al-good"))
+            .expect("the delivered alert is listed");
+        assert_eq!(bad.delivered, Some(false));
+        assert_eq!(
+            bad.delivery_reason.as_deref(),
+            Some("the webhook server answered with an error")
+        );
+        assert_eq!(good.delivered, Some(true));
+        assert_eq!(good.delivery_reason, None);
+        // The list route serializes the item as is: camelCase names, and no
+        // trace of the server's status or body.
+        let json = serde_json::to_value(bad).unwrap();
+        assert_eq!(json["delivered"], false);
+        assert!(!json.to_string().contains("upstream-secret-detail"));
+        // Not the whole JSON: the instance id is a UUID and may hold "500".
+        assert!(!json["deliveryReason"].as_str().unwrap().contains("500"));
+    }
+
+    /// The rule store answers 500 for its next read only (the retry reads
+    /// it fine), as the alert rules' `ClickHouse` would during a blip.
+    async fn rule_store_fails_once(h: &Harness) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("ch-secret-detail"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&h.clickhouse)
+            .await;
+    }
+
+    async fn failed_status(h: &Harness, run_id: &str) -> u16 {
+        run_failed_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body(run_id, "ingest_job"),
+        )
+        .await
+        .unwrap_err()
+        .0
+        .status()
+    }
+
+    async fn run_event_rows(pool: &sqlx::PgPool, run_id: &str) -> Vec<(String, i64)> {
+        let mut rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, count(*) FROM pipeline_run_event WHERE run_id = $1 GROUP BY kind",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// `SRC-17` F2, property 1: a rule-store failure on a report answers 503
+    /// with the run counted exactly once and nothing delivered, and the
+    /// orchestrator's retry delivers once and counts nothing again. (Before,
+    /// the dedupe row existed already and the retry was skipped: the alert
+    /// was lost.) The failure does not leak the store's text.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rule_store_failure_followed_by_a_retry_delivers_once_and_counts_once(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[("al-f", "connector_failure", CONNECTOR)]).await;
+        h.knows_run("run-1", Some(CONNECTOR), "FAILURE").await;
+        rule_store_fails_once(&h).await;
+
+        let status = failed_status(&h, "run-1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h.posts_to("al-f").await.is_empty());
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
+        // Counted, not yet handed over.
+        assert_eq!(
+            run_event_rows(&pool, "run-1").await,
+            [("failure".to_owned(), 1)]
+        );
+
+        let retry = h.failed("run-1").await;
+        assert_eq!(retry["matched"], 1);
+        assert_eq!(h.posts_to("al-f").await.len(), 1);
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
+        assert_eq!(
+            run_event_rows(&pool, "run-1").await,
+            [("failure".to_owned(), 1), ("failure_alerted".to_owned(), 1)]
+        );
+    }
+
+    /// `SRC-17` F2, property 2: a retry after a report that went all the way
+    /// through delivers nothing and counts nothing, however often it comes.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_retry_after_a_full_success_delivers_nothing_and_counts_nothing(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("al-f", "connector_failure", CONNECTOR)]).await;
+        h.knows_run("run-1", Some(CONNECTOR), "FAILURE").await;
+
+        assert_eq!(h.failed("run-1").await["matched"], 1);
+        for _ in 0..2 {
+            let retry = h.failed("run-1").await;
+            assert_eq!(retry["matched"], 0);
+        }
+        assert_eq!(h.posts_to("al-f").await.len(), 1);
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
+        assert_eq!(
+            run_event_rows(&pool, "run-1").await,
+            [("failure".to_owned(), 1), ("failure_alerted".to_owned(), 1)]
+        );
+    }
+
+    /// `SRC-17` F2: the "3 in a row" rule fires once, on the third run, even
+    /// when that run's first report met a rule-store failure. The retry
+    /// decides by the third run's own streak, kept on its dedupe row, and the
+    /// fourth run (streak 4) does not fire it again.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_repeated_rule_fires_once_when_the_third_runs_first_report_met_a_rule_store_failure(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(
+            &pool,
+            &[
+                ("al-f", "connector_failure", CONNECTOR),
+                ("al-r", "connector_repeated_failure", CONNECTOR),
+            ],
+        )
+        .await;
+        for run in ["run-1", "run-2", "run-3", "run-4"] {
+            h.knows_run(run, Some(CONNECTOR), "FAILURE").await;
+        }
+        h.failed("run-1").await;
+        h.failed("run-2").await;
+
+        rule_store_fails_once(&h).await;
+        assert_eq!(
+            failed_status(&h, "run-3").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 3));
+        assert!(h.posts_to("al-r").await.is_empty());
+
+        let retry = h.failed("run-3").await;
+        assert_eq!(retry["matched"], 2, "the failure and the repeated rule");
+        assert_eq!(h.failed("run-3").await["matched"], 0);
+        h.failed("run-4").await;
+
+        let repeated = h.posts_to("al-r").await;
+        assert_eq!(repeated.len(), 1);
+        assert!(repeated[0].contains("run-3"), "{}", repeated[0]);
+        assert_eq!(h.posts_to("al-f").await.len(), 4);
+        assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 4));
     }
 
     /// A sensor retry neither delivers twice nor counts the failure twice.
@@ -874,7 +1151,16 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(kinds, [("success".to_owned(), 1)]);
+        // SRC-17 F2: a handed-over report leaves two rows, the count and the
+        // marker written once the rules were read (`success_alerted`).
+        // Before, the single `success` row was all there was. Still no
+        // `failure` row.
+        let mut kinds = kinds;
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [("success".to_owned(), 1), ("success_alerted".to_owned(), 1)]
+        );
         let (still_waiting,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM connector_schema_change WHERE id = 'chg-waiting' AND status = 'pending'",
         )
@@ -1076,6 +1362,44 @@ mod tests {
         .0;
         assert_eq!(retry["matched"], 0);
         assert_eq!(h.posts_to("al-u").await.len(), 1);
+    }
+
+    /// `SRC-17` F2 for uploads: a rule-store failure answers 503 with the
+    /// upload settled as failed and no dedupe row, so the retry delivers
+    /// once; a further retry delivers nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rule_store_failure_on_a_failed_upload_run_is_retried_into_one_alert(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[("al-u", "upload_failure", "*")]).await;
+        loading_upload(&pool, "up-1", "run-up").await;
+        h.knows_run("run-up", None, "FAILURE").await;
+        rule_store_fails_once(&h).await;
+
+        let first = run_failed_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-up", "file_ingest_job"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(first.0.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upload_status(&pool, "up-1").await.0, "failed");
+        assert!(h.posts_to("al-u").await.is_empty());
+        assert!(run_event_rows(&pool, "run-up").await.is_empty());
+
+        for (expected_matched, expected_posts) in [(1, 1), (0, 1)] {
+            let resp = run_failed_event(
+                State(h.state.clone()),
+                Extension(service()),
+                body("run-up", "file_ingest_job"),
+            )
+            .await
+            .expect("accepted")
+            .0;
+            assert_eq!(resp["matched"], expected_matched);
+            assert_eq!(h.posts_to("al-u").await.len(), expected_posts);
+        }
     }
 
     /// A run no upload owns is `{"matched": 0}` with a reason, not an error.

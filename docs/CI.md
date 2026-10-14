@@ -41,7 +41,7 @@ Downstream jobs execute according to scope:
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 
 At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
