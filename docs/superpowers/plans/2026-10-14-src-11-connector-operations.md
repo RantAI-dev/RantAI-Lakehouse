@@ -449,7 +449,7 @@ Only `docker-compose.yml`, `.env.example`, `ops/`, `.github/workflows/ci.yml`, `
 | Call in the gate | Route registered | Policy | Handler | Fields and statuses used |
 | --- | --- | --- | --- | --- |
 | `POST /api/connectors` (`matrix._create_connector`) | `routes/mod.rs:542` | `policy.rs:522` `connector:manage` | `routes/connectors.rs:699` | body as the matrix gate sends it; 200 (`ok`); `id`, `credential.primary` |
-| `PUT /api/connectors/{id}/ingest-spec` | `routes/mod.rs:491` | `policy.rs:566` `connector:manage` | `routes/connectors.rs:2956`, body `IngestSpecBody` `:2764` | `adapter`, `ingestMode`, `dial`, `sourceObjects[].{name,target,loadMode,excludedColumns}`, `scheduleCron`; 200; 422/400 for `excludedColumns` (not hit) |
+| `PUT /api/connectors/{id}/ingest-spec` | `routes/mod.rs:491` | `policy.rs:566` `connector:manage` | `routes/connectors.rs:2956`, body `IngestSpecBody` `:2760` | `adapter`, `ingestMode`, `dial`, `sourceObjects[].{name,target,loadMode,excludedColumns}`, `scheduleCron`; 200; 422/400 for `excludedColumns` (not hit) |
 | `POST /api/connectors/{id}/ingest/run` | `routes/mod.rs:495` | `policy.rs:573` `connector:manage` | `routes/connectors.rs:3245` -> `launch_ingest` `:3264`+ | no body; 200 `{"runId"}`; 409 paused/active (the gate waits for each run to end first) |
 | `GET /api/connectors/{id}` | `routes/mod.rs:461` | `policy.rs:523` `connector:manage` | `routes/connectors.rs:286` | `pausedAt`, `pausedReason`, `failureStreak` (`lakehouse-store/src/connectors.rs:113-123`, camelCase) |
 | `GET /api/connectors/{id}/runs` | `routes/mod.rs:505` | `policy.rs:592` `connector:manage` | `routes/connector_runs.rs:102` | `{"runs":[{runId,trigger,status,endReason,rowsLoaded,attempts,...}]}` |
