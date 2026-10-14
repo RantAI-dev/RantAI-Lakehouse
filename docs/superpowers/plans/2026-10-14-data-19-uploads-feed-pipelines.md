@@ -165,6 +165,41 @@ field of the body);
 `sqlx::test` Postgres; the restore seeds its pre-refusal version through
 the store, since the routes now refuse that body).
 
+### T2 — D5 lineage edge (`1bfc5a70`)
+
+`uploads::list_claims(pool, tenant_id: Option<Uuid>)` in
+`lakehouse-store` (one `LEFT JOIN file_upload`, returns
+`ClaimedTable { bronze_table, upload_id, original_filename }`), consumed by
+`routes/lineage.rs::add_claim_rows` — edge `upload:<id>` -> `bronze:<table>`,
+kind `"upload"`, evidence `"upload table claim (upload_table_claim)"`. Label
+is `original_filename` while the row exists, `"deleted upload"` when it does
+not (a blank name is the same case). A claim table this build cannot read
+costs a `coverage` note, not a failed request.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` | clean |
+| `cargo test -p lakehouse-api --lib -- lineage` | 9 passed, 0 failed, 1653 filtered out |
+| `cargo test -p lakehouse-store --test uploads -- list_claims` | 1 passed, 0 failed, 36 filtered out |
+
+The plan's three cases: claim → edge
+(`an_upload_draws_an_edge_into_the_bronze_table_it_claimed`), deleted
+upload → `"deleted upload"` label and still drawn
+(`an_upload_that_was_deleted_is_labelled_as_such_and_still_drawn`), and
+another tenant's claim → no edge — the last is where the tenant filter
+lives, so it is pinned on the store function
+(`list_claims_shows_only_the_caller_s_tenant_and_names_the_upload_when_it_is_there`).
+
+**Section 6, question 4 (answer).** A claim whose `tenant_id` is NULL is
+drawn for an UNSCOPED caller (`tenant_id: None` from
+`tenant_scope::resolve`, the `*:*` principal with no `X-Tenant`), which
+shows every connector and every authored pipeline today, and for NO
+tenant-scoped caller: `Some(t)` is `tenant_id = $1`, SQL `NULL = $1` is
+never true. That is `ConnectorFilter`'s rule verbatim, and it fails
+closed — a claim whose tenant is gone is nobody's, never everybody's.
+Asserted in the store test above.
+
 ## 8. Review
 
 (Reviewer.)
