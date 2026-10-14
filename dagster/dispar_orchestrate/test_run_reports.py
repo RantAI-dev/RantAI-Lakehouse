@@ -62,6 +62,14 @@ def test_the_start_report_names_the_run_and_what_started_it(api) -> None:
     assert call["json"] == {"runId": "run-1", "trigger": "schedule", "startedAt": "2026-10-14T10:00:00+00:00"}
 
 
+def test_a_refresh_start_report_names_its_table_and_an_ordinary_one_sends_none(api) -> None:
+    # SRC-11 review 1 BLOCKER 2: the run list says "Refresh · <table>".
+    _reporter().start("refresh", table="public.orders")
+    _reporter().start("schedule")
+    assert api.calls[0]["json"] == {"runId": "run-1", "trigger": "refresh", "table": "public.orders"}
+    assert "table" not in api.calls[1]["json"]
+
+
 def test_every_report_carries_the_service_token_and_a_timeout(api) -> None:
     reporter = _reporter()
     reporter.start("user")

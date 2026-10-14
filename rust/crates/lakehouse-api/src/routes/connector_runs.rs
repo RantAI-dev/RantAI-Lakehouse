@@ -272,6 +272,11 @@ pub struct StartBody {
     run_id: String,
     /// What started the run.
     trigger: RunTrigger,
+    /// The one source object a `refresh` or `clear` run is about (the run
+    /// config's `object`); absent for every other run (`SRC-11` review 1
+    /// BLOCKER 2: the run list names the table, `SRC-10` decision 5).
+    #[serde(default)]
+    table: Option<String>,
     /// When it started, RFC 3339; the time of this report when absent.
     #[serde(default)]
     started_at: Option<String>,
@@ -295,10 +300,27 @@ pub async fn report_start(
     require_orchestrator(&principal)?;
     let req: StartBody = parse_body(&body)?;
     check_name("runId", &req.run_id, MAX_RUN_ID_LEN)?;
+    // The same name check as the attempt report's `table` (`SRC-11` review 1
+    // BLOCKER 2), and only for the two triggers that are about one table.
+    if let Some(table) = &req.table {
+        check_name("table", table, MAX_TABLE_LEN)?;
+        if !matches!(req.trigger, RunTrigger::Refresh | RunTrigger::Clear) {
+            return Err(
+                ApiError::BadRequest("only a refresh or a clear names a table".to_owned()).into(),
+            );
+        }
+    }
     let started_at = report_time("startedAt", req.started_at.as_deref())?;
     require_connector(&state, &id).await?;
-    let recorded =
-        connector_run::start_run(pool(&state)?, &id, &req.run_id, req.trigger, started_at).await?;
+    let recorded = connector_run::start_run(
+        pool(&state)?,
+        &id,
+        &req.run_id,
+        req.trigger,
+        req.table.as_deref(),
+        started_at,
+    )
+    .await?;
     Ok(ApiJson(RecordedResponse { recorded }))
 }
 
@@ -1027,12 +1049,13 @@ mod tests {
                 &id,
                 &format!("run-{n:02}"),
                 RunTrigger::Schedule,
+                None,
                 base + time::Duration::minutes(n),
             )
             .await
             .unwrap();
         }
-        connector_run::start_run(store, &other, "other-1", RunTrigger::User, base)
+        connector_run::start_run(store, &other, "other-1", RunTrigger::User, None, base)
             .await
             .unwrap();
         let (status, listed) = call(
@@ -1057,5 +1080,58 @@ mod tests {
     fn a_run_id_becomes_a_safe_file_name() {
         assert_eq!(file_stem("a1b2-c3_d.4"), "a1b2-c3_d.4");
         assert_eq!(file_stem("../../etc\"x y"), ".._.._etc_x_y");
+    }
+
+    /// `SRC-11` review 1 BLOCKER 2: a clear names its table in the start
+    /// report and the run list returns it (`table`); a run that is about
+    /// every table has none, a table on such a run is refused, and so is a
+    /// blank or control-character name.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_clear_run_lists_its_table_and_other_runs_have_none(pool: sqlx::PgPool) {
+        let h = harness(&pool).await;
+        let id = connector(&h, "runs table").await;
+        let me = user(&[h.tenant]);
+
+        let (status, _) = report(
+            &h,
+            &id,
+            "",
+            json!({ "runId": "run-c", "trigger": "clear", "table": "public.orders", "startedAt": T0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = report(
+            &h,
+            &id,
+            "",
+            json!({ "runId": "run-s", "trigger": "schedule", "startedAt": T1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for (run, trigger, table) in [
+            ("run-x", "schedule", "public.orders"),
+            ("run-y", "clear", " "),
+            ("run-z", "refresh", "a\nb"),
+        ] {
+            let (status, answer) = report(
+                &h,
+                &id,
+                "",
+                json!({ "runId": run, "trigger": trigger, "table": table }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{run}: {answer}");
+        }
+
+        let (status, listed) =
+            call(&h, &me, "GET", &format!("/api/connectors/{id}/runs"), None).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let runs = listed["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "the refused reports stored nothing");
+        assert_eq!(runs[0]["runId"], "run-s");
+        assert_eq!(runs[0]["table"], Value::Null);
+        assert_eq!(runs[1]["runId"], "run-c");
+        assert_eq!(runs[1]["trigger"], "clear");
+        assert_eq!(runs[1]["table"], "public.orders");
     }
 }

@@ -747,6 +747,7 @@ function record(extra: Record<string, unknown> = {}) {
   return {
     runId: "run-0000000001",
     trigger: "schedule",
+    table: null,
     status: "succeeded",
     startedAt: "2026-10-12T08:00:00.000Z",
     endedAt: "2026-10-12T08:00:30.000Z",
@@ -924,6 +925,22 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     // The old reads are gone: no per-table results, no orchestrator run list.
     expect(calls.some((c) => c.url.includes("/api/governance/ingest-runs") || c.url.includes("/ingest/runs"))).toBe(false)
     expect(calls.some((c) => c.url.endsWith("/api/connectors/conn-northwind/runs"))).toBe(true)
+  })
+
+  // SRC-10 decision 5, restored by SRC-11 review 1 BLOCKER 2: the run record now carries the table.
+  it("names the table and the action in the run list", async () => {
+    stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-clear-0001", trigger: "clear", table: "public.orders", rowsLoaded: 0 }),
+        record({ runId: "run-refresh-002", trigger: "refresh", table: "public.customers" }),
+        record({ runId: "run-all-0000003", trigger: "schedule" }),
+      ],
+    })
+    panel()
+    expect(await screen.findByText("Clear · public.orders")).toBeDefined()
+    expect(screen.getByText("Refresh · public.customers")).toBeDefined()
+    // A run of every table names no table.
+    expect(screen.queryByText(/^Schedule · /)).toBeNull()
   })
 
   it("says why each run ended, in plain words", async () => {

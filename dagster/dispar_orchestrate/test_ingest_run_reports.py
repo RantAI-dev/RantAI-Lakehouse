@@ -86,7 +86,9 @@ def _batch(*names: str, **extra) -> dict:
 def test_the_run_is_reported_with_the_trigger_its_tags_and_action_show(monkeypatch, reports, tags, config, expected) -> None:
     monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, cid: _batch("t"))
     _run_ingest(_run_context({"connector_id": "conn-1", **config}, tags=tags))
-    assert reports[0] == ("start", expected)
+    # A refresh or clear names its table (SRC-11 review 1 BLOCKER 2).
+    expected_report = ("start", expected, "t") if expected in ("refresh", "clear") else ("start", expected)
+    assert reports[0] == expected_report
 
 
 def test_a_directly_invoked_op_without_a_run_reports_other(monkeypatch, reports) -> None:

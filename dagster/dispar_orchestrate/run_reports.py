@@ -77,11 +77,16 @@ class RunReporter:
     def has_gap(self) -> bool:
         return self._gap
 
-    def start(self, trigger: str, started_at: str | None = None) -> bool:
-        """The run began. `trigger` is one of `TRIGGERS`."""
+    def start(self, trigger: str, started_at: str | None = None, table: str | None = None) -> bool:
+        """The run began. `trigger` is one of `TRIGGERS`. `table` is the one
+        source object a `refresh` or `clear` run is about (SRC-11 review 1
+        BLOCKER 2: the run list names it, SRC-10 decision 5); an ordinary run
+        of every table sends none."""
         if trigger not in TRIGGERS:
             trigger = "other"
         payload: dict[str, Any] = {"runId": self._run_id, "trigger": trigger}
+        if table:
+            payload["table"] = table[:256]
         if started_at:
             payload["startedAt"] = started_at
         return self._send(self._base, payload, "run start report")

@@ -60,6 +60,7 @@ function run(runId: string, status: ConnectorRun["status"], startedAt: string, e
   return {
     runId,
     trigger: "schedule",
+    table: null,
     status,
     startedAt,
     endedAt: status === "running" ? null : startedAt,

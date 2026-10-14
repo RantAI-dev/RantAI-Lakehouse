@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(streak(&pool).await.1, 2);
 
         let now = OffsetDateTime::now_utc();
-        start_run(&pool, CONNECTOR, "run-p", RunTrigger::Other, now)
+        start_run(&pool, CONNECTOR, "run-p", RunTrigger::Other, None, now)
             .await
             .unwrap();
         end_run(
@@ -1651,7 +1651,7 @@ mod tests {
         );
 
         // A run the orchestrator never closed.
-        start_run(&pool, CONNECTOR, "run-u", RunTrigger::Schedule, now)
+        start_run(&pool, CONNECTOR, "run-u", RunTrigger::Schedule, None, now)
             .await
             .unwrap();
         h.knows_run("run-u", Some(CONNECTOR), "FAILURE").await;

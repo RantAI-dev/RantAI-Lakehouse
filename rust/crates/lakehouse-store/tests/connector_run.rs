@@ -38,7 +38,7 @@ async fn a_run_with_two_attempts_keeps_each_attempt_and_its_totals(
 ) -> sqlx::Result<()> {
     let t0 = OffsetDateTime::now_utc() - Duration::minutes(10);
     assert!(
-        start_run(&pool, PG, "run-a", RunTrigger::Schedule, t0)
+        start_run(&pool, PG, "run-a", RunTrigger::Schedule, None, t0)
             .await
             .unwrap()
     );
@@ -122,12 +122,12 @@ async fn a_run_with_two_attempts_keeps_each_attempt_and_its_totals(
 async fn a_repeated_report_changes_nothing(pool: PgPool) -> sqlx::Result<()> {
     let t0 = OffsetDateTime::now_utc();
     assert!(
-        start_run(&pool, PG, "run-r", RunTrigger::User, t0)
+        start_run(&pool, PG, "run-r", RunTrigger::User, None, t0)
             .await
             .unwrap()
     );
     assert!(
-        !start_run(&pool, PG, "run-r", RunTrigger::Schedule, t0)
+        !start_run(&pool, PG, "run-r", RunTrigger::Schedule, None, t0)
             .await
             .unwrap()
     );
@@ -174,10 +174,10 @@ async fn a_run_cannot_be_reported_or_read_through_another_connector(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let t0 = OffsetDateTime::now_utc();
-    start_run(&pool, PG, "run-x", RunTrigger::Other, t0)
+    start_run(&pool, PG, "run-x", RunTrigger::Other, None, t0)
         .await
         .unwrap();
-    let err = start_run(&pool, S3, "run-x", RunTrigger::Other, t0)
+    let err = start_run(&pool, S3, "run-x", RunTrigger::Other, None, t0)
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Conflict), "{err:?}");
@@ -211,6 +211,7 @@ async fn the_history_is_the_newest_fifty_runs_of_the_connector(pool: PgPool) -> 
             PG,
             &format!("run-{n:02}"),
             RunTrigger::Schedule,
+            None,
             base + Duration::minutes(n),
         )
         .await
@@ -222,6 +223,7 @@ async fn the_history_is_the_newest_fifty_runs_of_the_connector(pool: PgPool) -> 
             S3,
             &format!("other-{n}"),
             RunTrigger::User,
+            None,
             base + Duration::minutes(n),
         )
         .await
@@ -249,7 +251,7 @@ async fn retention_removes_old_lines_and_attempts_and_keeps_the_runs(
     let old = now - Duration::days(40);
     let recent = now - Duration::days(1);
     for (run, at) in [("run-old", old), ("run-new", recent)] {
-        start_run(&pool, PG, run, RunTrigger::Schedule, at)
+        start_run(&pool, PG, run, RunTrigger::Schedule, None, at)
             .await
             .unwrap();
         let attempt = AttemptReport {
@@ -292,7 +294,7 @@ async fn retention_removes_old_lines_and_attempts_and_keeps_the_runs(
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradictory_reports_are_refused(pool: PgPool) -> sqlx::Result<()> {
     let t0 = OffsetDateTime::now_utc();
-    start_run(&pool, PG, "run-c", RunTrigger::User, t0)
+    start_run(&pool, PG, "run-c", RunTrigger::User, None, t0)
         .await
         .unwrap();
     let mut wait_on_success = failed("t", 1, t0, Some(60));
@@ -350,10 +352,10 @@ async fn contradictory_reports_are_refused(pool: PgPool) -> sqlx::Result<()> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_sensor_settles_only_a_run_still_running(pool: PgPool) -> sqlx::Result<()> {
     let t0 = OffsetDateTime::now_utc();
-    start_run(&pool, PG, "run-open", RunTrigger::Schedule, t0)
+    start_run(&pool, PG, "run-open", RunTrigger::Schedule, None, t0)
         .await
         .unwrap();
-    start_run(&pool, PG, "run-paused", RunTrigger::Other, t0)
+    start_run(&pool, PG, "run-paused", RunTrigger::Other, None, t0)
         .await
         .unwrap();
     end_run(
@@ -383,5 +385,58 @@ async fn the_sensor_settles_only_a_run_still_running(pool: PgPool) -> sqlx::Resu
         Some("paused")
     );
     assert_eq!(run_status(&pool, PG, "run-unknown").await.unwrap(), None);
+    Ok(())
+}
+
+/// `SRC-11` review 1 BLOCKER 2: a refresh or clear names its table in the run
+/// record (the run list says "Clear · public.orders", `SRC-10` decision 5);
+/// any other run has none, and a table on another trigger is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_or_clear_run_keeps_its_table_and_no_other_run_has_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t0 = OffsetDateTime::now_utc();
+    start_run(
+        &pool,
+        PG,
+        "run-clear",
+        RunTrigger::Clear,
+        Some("public.orders"),
+        t0,
+    )
+    .await
+    .unwrap();
+    start_run(
+        &pool,
+        PG,
+        "run-sched",
+        RunTrigger::Schedule,
+        None,
+        t0 + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    let err = start_run(
+        &pool,
+        PG,
+        "run-bad",
+        RunTrigger::Schedule,
+        Some("public.orders"),
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+    assert_eq!(run_status(&pool, PG, "run-bad").await.unwrap(), None);
+
+    let runs = list_runs(&pool, PG, RUN_HISTORY_LIMIT).await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .map(|r| (r.run_id.as_str(), r.table.as_deref()))
+            .collect::<Vec<_>>(),
+        [("run-sched", None), ("run-clear", Some("public.orders"))]
+    );
+    let log = get_run_log(&pool, PG, "run-clear").await.unwrap().unwrap();
+    assert_eq!(log.run.table.as_deref(), Some("public.orders"));
     Ok(())
 }

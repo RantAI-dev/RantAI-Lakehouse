@@ -18,14 +18,16 @@ from dispar_orchestrate import run_reports
 
 class RecordingReporter:
     """Stands in for `RunReporter`. `reports` is shared by every reporter a
-    test creates: `("start", trigger)`, `("attempt", {...})`,
+    test creates: `("start", trigger[, table])`, `("attempt", {...})`,
     `("log", event, table, count)`, `("end", status, reason)`."""
 
     def __init__(self, reports: list, connector_id: str, run_id: str) -> None:
         self.reports, self.connector_id, self.run_id = reports, connector_id, run_id
 
-    def start(self, trigger, started_at=None) -> bool:
-        self.reports.append(("start", trigger))
+    def start(self, trigger, started_at=None, table=None) -> bool:
+        # `("start", trigger)`, or `("start", trigger, table)` for a refresh or
+        # clear, which names its table (SRC-11 review 1 BLOCKER 2).
+        self.reports.append(("start", trigger) if table is None else ("start", trigger, table))
         return True
 
     def attempt(

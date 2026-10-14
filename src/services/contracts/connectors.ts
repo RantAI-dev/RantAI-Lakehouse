@@ -782,6 +782,11 @@ export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "
 export type ConnectorRun = {
   runId: string
   trigger: RunTrigger
+  /**
+   * The one table a `refresh` or `clear` run is about, so the run list can say "Clear · public.orders"
+   * (`SRC-10` decision 5); `null` for every other run and for a run recorded before it was kept.
+   */
+  table: string | null
   status: RunStatus
   startedAt: string
   /** `null` until the run reports its end; a killed run may never. */

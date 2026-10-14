@@ -1271,7 +1271,12 @@ def run_ingest(context) -> Any:
     # SRC-11 D5, D7: the run's start, before anything can fail. A retry of this
     # op sends it again; the API answers `recorded: false` and changes nothing.
     reporter = run_reports.RunReporter.for_run(connector_id, context.run_id)
-    reporter.start(_trigger_of(context, context.op_config.get("action")))
+    trigger = _trigger_of(context, context.op_config.get("action"))
+    # SRC-11 review 1 BLOCKER 2: a refresh or clear names its table in the
+    # start report, so the run list can say "Clear · public.orders"
+    # (SRC-10 decision 5). Other runs are about every table and send none.
+    object_name = context.op_config.get("object")
+    reporter.start(trigger, table=object_name if trigger in ("refresh", "clear") else None)
     single = _single_table_request(connector_id, context.op_config.get("object"), context.op_config.get("action"))
     cfg = IngestFactoryConfig.from_env()
     connector = _fetch_connector_for_run(cfg, connector_id, _retry_number(context))

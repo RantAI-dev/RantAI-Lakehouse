@@ -304,9 +304,15 @@ async fn lock_run(
 /// line. A second report of the same run changes nothing and returns
 /// `false`.
 ///
+/// `table` is the one source object a `refresh` or `clear` run is about
+/// (`SRC-11` review 1 BLOCKER 2: the run list names it, `SRC-10` decision 5);
+/// `None` for every other run. A table on any other trigger is
+/// [`StoreError::Validation`].
+///
 /// # Errors
 ///
-/// [`StoreError::Conflict`] when `run_id` already belongs to another
+/// [`StoreError::Validation`] for a table on a run that is not a refresh or a
+/// clear, [`StoreError::Conflict`] when `run_id` already belongs to another
 /// connector, [`StoreError::ForeignKeyViolation`] when `connector_id` names
 /// no connector, [`StoreError::Database`] otherwise.
 pub async fn start_run(
@@ -314,16 +320,24 @@ pub async fn start_run(
     connector_id: &str,
     run_id: &str,
     trigger: RunTrigger,
+    table: Option<&str>,
     at: OffsetDateTime,
 ) -> Result<bool, StoreError> {
+    let table = table.map(clean);
+    if table.is_some() && !matches!(trigger, RunTrigger::Refresh | RunTrigger::Clear) {
+        return Err(StoreError::Validation(
+            "only a refresh or a clear names a table".to_owned(),
+        ));
+    }
     let mut tx = pool.begin().await?;
     let inserted: Option<(String,)> = sqlx::query_as(
-        "INSERT INTO connector_run (run_id, connector_id, trigger_kind, started_at) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (run_id) DO NOTHING RETURNING run_id",
+        "INSERT INTO connector_run (run_id, connector_id, trigger_kind, table_name, started_at) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (run_id) DO NOTHING RETURNING run_id",
     )
     .bind(run_id)
     .bind(connector_id)
     .bind(trigger.as_str())
+    .bind(table.as_deref())
     .bind(at)
     .fetch_optional(&mut *tx)
     .await?;
@@ -636,6 +650,7 @@ pub async fn run_status(
 struct RunRow {
     run_id: String,
     trigger_kind: String,
+    table_name: Option<String>,
     status: String,
     started_at: OffsetDateTime,
     ended_at: Option<OffsetDateTime>,
@@ -644,8 +659,7 @@ struct RunRow {
     end_reason: Option<String>,
 }
 
-const RUN_COLUMNS: &str =
-    "run_id, trigger_kind, status, started_at, ended_at, rows_loaded, attempts, end_reason";
+const RUN_COLUMNS: &str = "run_id, trigger_kind, table_name, status, started_at, ended_at, rows_loaded, attempts, end_reason";
 
 /// One run in the history (`SRC-11` decision D7). Mirrors the console's
 /// `ConnectorRun`.
@@ -656,6 +670,10 @@ pub struct RunSummary {
     pub run_id: String,
     /// `schedule`, `user`, `refresh`, `clear` or `other`.
     pub trigger: String,
+    /// The one table a `refresh` or `clear` run is about; `null` for any other
+    /// run and for a run recorded before it was kept (`SRC-11` review 1
+    /// BLOCKER 2).
+    pub table: Option<String>,
     /// `running`, `succeeded`, `failed` or `paused`.
     pub status: String,
     /// When the run started.
@@ -677,6 +695,7 @@ impl From<RunRow> for RunSummary {
         Self {
             run_id: row.run_id,
             trigger: row.trigger_kind,
+            table: row.table_name,
             status: row.status,
             duration_seconds: row
                 .ended_at

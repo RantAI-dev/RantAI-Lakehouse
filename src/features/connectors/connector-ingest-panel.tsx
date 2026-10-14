@@ -1458,7 +1458,9 @@ function RunCard({
   const runId = (
     <>
       <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>
-      <span className="max-w-full truncate text-xs font-medium">{TRIGGER_LABEL[run.trigger] ?? run.trigger}</span>
+      <span className="max-w-full truncate text-xs font-medium">
+        {`${TRIGGER_LABEL[run.trigger] ?? run.trigger}${run.table ? ` · ${run.table}` : ""}`}
+      </span>
     </>
   )
   const when = (
