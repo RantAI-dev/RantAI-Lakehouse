@@ -383,9 +383,9 @@ pub struct AttemptReport<'a> {
 ///
 /// [`StoreError::NotFound`] when the run is unknown or belongs to another
 /// connector, [`StoreError::Validation`] when the report contradicts itself
-/// (a wait on a success, a negative number, an attempt below 1). A
-/// failed attempt's rows are stored as sent and never counted in the run's total,
-/// [`StoreError::Database`] otherwise.
+/// (a wait on a success, a negative number, an attempt below 1),
+/// [`StoreError::Database`] otherwise. A failed attempt's rows are stored as
+/// sent and never counted in the run's total.
 pub async fn record_attempt(
     pool: &PgPool,
     connector_id: &str,
