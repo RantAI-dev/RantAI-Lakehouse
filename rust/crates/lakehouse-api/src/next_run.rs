@@ -6,7 +6,41 @@
 //! function always evaluates in UTC, never the server's local timezone.
 
 use croner::Cron;
+use croner::errors::CronError;
+use croner::parser::{CronParser, Seconds, Year};
 use time::OffsetDateTime;
+
+/// Parse `cron_expr` the way `croner` 2.x did, under `croner` 4.x.
+///
+/// `croner` 4 changed two parsing defaults that this module's callers rely
+/// on (`~/.cargo/registry/src/.../croner-4.0.1/MIGRATION.md`, and the field
+/// count in `CronParser::parse`), so both are pinned here instead of taking
+/// `Cron::from_str`, which is `CronParser::new()`:
+///
+/// - seconds and year fields are refused (`Seconds::Disallowed`,
+///   `Year::Disallowed`): 2.x took exactly five fields unless
+///   `with_seconds_optional()` was called, which this module never did,
+///   whereas the 4.x default accepts five to seven. A longer expression
+///   stays unparsable rather than gaining a meaning (see
+///   [`ingest_cron_problem`] for why a seconds field could never fire);
+/// - `sloppy_ranges(true)`: 2.x read `5/10` as "from 5 to the maximum, every
+///   10" and 4.x rejects it by default (OCPS strict steps). Stored schedules
+///   and connector `scheduleCron` values written against 2.x keep parsing.
+///   The same flag also admits `/10` (2.x refused it); that only widens what
+///   a human typed, never what a stored 2.x value meant.
+///
+/// # Errors
+///
+/// [`CronError`] when `cron_expr` is not a valid five-field cron expression
+/// (or `@` nickname) under the settings above.
+fn parse_cron(cron_expr: &str) -> Result<Cron, CronError> {
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .sloppy_ranges(true)
+        .build()
+        .parse(cron_expr)
+}
 
 /// The next fire time strictly after `now`, or `None` when `cron_expr` is
 /// not a 5-field cron expression (e.g. `"manual"`, `dagster_pipeline_row`'s
@@ -17,27 +51,7 @@ use time::OffsetDateTime;
 /// never "now", never the epoch.
 #[must_use]
 pub fn next_run_at(cron_expr: &str, now: OffsetDateTime) -> Option<OffsetDateTime> {
-    // `croner` 2.x's real public API, read from its own source
-    // (`~/.cargo/registry/src/.../croner-2.2.0/src/lib.rs`) after the
-    // plan doc's own hedge ("the exact return type ... was not
-    // independently verified against the crate's source") turned out to
-    // matter: `Cron` is a BUILDER, not a value `FromStr` parses in one
-    // step — `Cron::from_str` (its actual `impl`) just calls `Cron::new`
-    // and always returns `Ok`, doing NO validation; the real parse/
-    // validation step is the separate `&mut self -> Result<Cron,
-    // CronError>` method `.parse()`. Using `FromStr`/`?` here (as the
-    // plan doc's snippet did) would silently accept "not a cron" and
-    // only fail later, if at all, inside `find_next_occurrence` — this
-    // body calls `Cron::new(cron_expr).parse()` instead, the combination
-    // that actually rejects a malformed pattern. There is also no
-    // `chrono` CARGO FEATURE (`rust/Cargo.toml` no longer requests one —
-    // `chrono` is croner's one, non-optional, always-on datetime
-    // backend) and no generic `CronDateTime` trait in this version;
-    // `find_next_occurrence<Tz: chrono::TimeZone>(&self, start:
-    // &chrono::DateTime<Tz>, inclusive: bool) -> Result<DateTime<Tz>,
-    // CronError>` is chrono-specific already, matching this function's
-    // own `chrono::DateTime<Utc>` round trip below directly.
-    let cron = Cron::new(cron_expr).parse().ok()?;
+    let cron = parse_cron(cron_expr).ok()?;
     let now_chrono = chrono::DateTime::from_timestamp(now.unix_timestamp(), 0)?;
     let next = cron.find_next_occurrence(&now_chrono, false).ok()?;
     OffsetDateTime::from_unix_timestamp(next.timestamp()).ok()
@@ -54,8 +68,7 @@ pub fn ingest_cron_problem(cron_expr: &str) -> Option<String> {
             "scheduleCron {cron_expr:?} must have five fields: minute hour day-of-month month day-of-week"
         ));
     }
-    Cron::new(cron_expr)
-        .parse()
+    parse_cron(cron_expr)
         .err()
         .map(|err| format!("scheduleCron {cron_expr:?} is not a valid cron expression: {err}"))
 }
@@ -87,6 +100,24 @@ mod tests {
     fn next_run_at_none_for_manual_or_malformed_cron() {
         assert!(next_run_at("manual", time::OffsetDateTime::now_utc()).is_none());
         assert!(next_run_at("not a cron", time::OffsetDateTime::now_utc()).is_none());
+    }
+
+    // `croner` 4 changed two defaults; these pin the 2.x behaviour that
+    // `parse_cron` keeps (see its doc comment).
+    #[test]
+    fn next_run_at_refuses_a_seconds_or_year_field_as_croner_2_did() {
+        let now = time::macros::datetime!(2026 - 09 - 11 10:00:00 UTC);
+        assert!(next_run_at("0 0 3 * * *", now).is_none());
+        assert!(next_run_at("0 0 3 * * * 2030", now).is_none());
+    }
+
+    #[test]
+    fn next_run_at_keeps_the_start_step_shorthand_croner_2_accepted() {
+        let now = time::macros::datetime!(2026 - 09 - 11 10:00:00 UTC);
+        // "from minute 5 to the end of the hour, every 10": 10:05 comes first.
+        let next = next_run_at("5/10 * * * *", now).expect("2.x accepted the shorthand");
+        assert_eq!((next.hour(), next.minute()), (10, 5));
+        assert_eq!(ingest_cron_problem("0/15 * * * *"), None);
     }
 
     #[test]

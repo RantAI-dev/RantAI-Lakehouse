@@ -65,14 +65,12 @@ jsonwebtoken = { version = "11", default-features = false, features = ["rust_cry
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
-# whichever workstream lands first adds it). No feature flag: `croner`
-# 2.x's plan-doc-assumed `chrono` FEATURE does not exist -- confirmed by
-# reading the crate's own Cargo.toml after `cargo fetch` (a required
-# hedge from this task's own plan doc, which flagged the API as
-# independently unverified) -- `chrono` is croner 2.x's one, non-optional,
-# always-on datetime backend; `next_run.rs`'s own doc comment has the
-# full API-shape correction (`Cron::new(..).parse()`, not `FromStr`).
-croner = { version = "2" }
+# whichever workstream lands first adds it). `croner` 4 keeps `chrono` as
+# its datetime backend behind the `chrono` feature, which is in the default
+# features; the entry therefore keeps the defaults on (4.0.1 `Cargo.toml`,
+# `default = ["chrono"]`). `next_run.rs` documents the parser settings that
+# keep the 2.x behaviour (five fields, lenient steps).
+croner = { version = "4" }
 # WS7 Phase B (`lakehouse-api::sql_rewrite`) — the enforcement-side SQL
 # rewriter needs a real parser, not a regex/string scan, to apply masking
 # and row-filter obligations without ever misreading a construct as safe.
