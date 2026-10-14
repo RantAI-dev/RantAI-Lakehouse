@@ -47,6 +47,7 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 ## Limits to tell a customer
 
 - The chat asks once. If its previous message was a question, it takes the most likely reading and says which.
+- A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn.
 - Options are two to four, each at most 80 characters.
 - A saved word is stored per user. Another user is asked again.
 - A user keeps at most 100 saved words. The 101st is refused until one is deleted. The 30 newest go into the prompt.
@@ -68,7 +69,7 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | In the Copilot, ask a question with a word that fits two tables of the seed data. | The chat asks one question and shows two to four options as buttons. | |
+| 1 | In the Copilot, ask a question with a word that fits two tables of the seed data. | The chat asks one question and shows two to four options as buttons. It shows no answer and no query step in that turn. | |
 | 2 | Click one option. | The chat answers with that reading and says which reading it took. | |
 | 3 | `GET /api/ai/terms`. | The list holds the word with the meaning that was clicked. | |
 | 4 | Open a new chat and ask with the same word. | The chat does not ask again and uses the saved meaning. | |

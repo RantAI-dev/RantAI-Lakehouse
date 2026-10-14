@@ -39,11 +39,12 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 On a `push` to `main`, all jobs run unconditionally.
 
 Downstream jobs execute according to scope:
-- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the four static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports) into one fast job.
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
-- **`dagster-unit-tests`**: Runs if `dagster` or `all` is true.
+- **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
+- **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`, `g8-governance`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
@@ -54,29 +55,34 @@ At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks e
 
 ## Images: built once per run
 
-Before CI-SPEED-PLAN PR 2, six acceptance jobs and the Docker workflow each built the
-`lakehouse-api` image from source (a release build of about 515 crates), and four of those
+Before CI-SPEED-PLAN PR 2, the acceptance jobs that start the stack (six when it was written;
+thirteen with the gates `main` has added since) and the Docker workflow each built the
+`lakehouse-api` image from source (a release build of about 515 crates), and most of those
 jobs built the Dagster image as well. Now:
 
 - The **`images`** job builds both images once and uploads each as a workflow artifact
   (`image-lakehouse-api`, `image-lakehouse-dagster`): `docker buildx` with
   `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
   compression by the artifact service. It prints each archive's size in the log.
-- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `gold-export`,
-  `g8-governance`, `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
+- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`,
+  `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`,
+  `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
   uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
   `g8-governance` and `image-smoke` only use the API image and download only that one.
   A missing image therefore fails the job, it never triggers a silent rebuild. The test
   runner commands are unchanged.
 - `docker-compose.yml` names the images: `lakehouse-api` is
-  `${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}` and the five services built from
-  `./dagster` are `${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}`. CI sets both
+  `${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}` and every service built from
+  `./dagster` is `${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}`. CI sets both
   variables to `…:ci` tags in the job `env:`. The `build:` blocks stay, so local
-  `docker compose up --build` is unchanged. The five Dagster-built services must keep
-  identical `build:` blocks (same `args:`), because a build of any one retags the image
-  all five use.
-- Two small fixture images are **not** shared: `oidc-mock` and `rest-stub-g6`. Each
-  acceptance job builds them with an explicit `docker compose … build` (same `-p`, `-f` and
+  `docker compose up --build` is unchanged. The Dagster-built services (the five in
+  `docker-compose.yml` plus `g6-oracle-test-runner` and `g6-alerts-test-runner` in the
+  `ops/g6` overrides) must keep identical `build:` blocks (same `args:`), because a build of
+  any one retags the image they all use. A new service built from `./dagster` needs the same
+  `image:` key, or `docker compose run` builds the whole Dagster image again.
+- Two small fixture images are **not** shared: `oidc-mock` (every stack that starts
+  `lakehouse-api`) and `rest-stub-g6` (only `g6-ingest-other`, profile `g6-other`). Each
+  acceptance job builds the ones its stack needs with an explicit `docker compose … build` (same `-p`, `-f` and
   `--profile` flags as its `up`) just before `up --no-build`, which would otherwise fail on
   a service that has a `build:` block and no local image.
 - `g1-rustfs` and `g2-seaweedfs` do not use these artifacts: they never built the API image.

@@ -2482,6 +2482,72 @@ async fn a_registry_that_cannot_be_read_is_503_and_assumes_the_name_is_not_free(
     assert!(stack.claims().await.is_empty(), "a doubt claims nothing");
 }
 
+/// SRC-9 finding G4: on a fresh install the `lake` database does not exist
+/// until the orchestrator's first registration, so an upload can be the first
+/// thing a tenant does. `Code: 81` (unknown database) reads as "no registry
+/// row"; the Iceberg half of the check still runs and says the name is free.
+#[tokio::test]
+async fn a_registry_database_that_does_not_exist_yet_reads_as_no_claim_and_the_load_proceeds() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("dataset_catalog"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "Code: 81. DB::Exception: Database lake does not exist. (UNKNOWN_DATABASE) \
+             (version 26.8.1.1 (official build))",
+        ))
+        .mount(&stack.ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Code: 60. (UNKNOWN_TABLE)"))
+        .mount(&stack.ch)
+        .await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1
+    );
+}
+
+/// The other half still counts: a missing registry database does not make a
+/// name free when the Iceberg table already exists.
+#[tokio::test]
+async fn a_missing_registry_database_does_not_hide_an_existing_iceberg_table() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("dataset_catalog"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "Code: 81. DB::Exception: Database lake does not exist. (UNKNOWN_DATABASE)",
+        ))
+        .mount(&stack.ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(rows_body(&json!([{ "name": "a", "type": "String" }]))),
+        )
+        .mount(&stack.ch)
+        .await;
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+}
+
 /// ... nothing listens where `ClickHouse` should be.
 #[tokio::test]
 async fn a_clickhouse_that_is_not_there_is_503_and_assumes_the_name_is_not_free() {

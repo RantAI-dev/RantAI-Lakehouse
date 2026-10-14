@@ -85,7 +85,7 @@ The modules are the groups in the console's navigation
 | **History (Ask AI)** | Returns to past conversations with the assistant, which answers questions and performs actions; a conversation starts on Home (PR #68) | Built; needs a model endpoint |
 | **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
 | **Data** | Browses the catalog and assets; registers sources; uploads a file; switches a Gold table's open-format publishing on or off from its page | Built; publishing (PR #64) and file upload (PR #71) are merged but not yet accepted |
-| **Query Studio** | Writes SQL or asks in plain language; saves queries; downloads results | Built; in the Data menu today. A main module of its own, shared by BI and the lakehouse (product owner, 2026-10-07). Matrix: 4 have, 11 partial, 11 missing |
+| **Query Studio** | Writes SQL or asks in plain language; saves queries; downloads results; explains a query in plain words and, for a failed ClickHouse query, proposes a fix as a diff to accept or reject | Built; in the Data menu today. A main module of its own, shared by BI and the lakehouse (product owner, 2026-10-07). Matrix: 4 have, 11 partial, 11 missing |
 | **Build** | Creates, schedules and operates pipelines | Built |
 | **Governance** | Sets policies, classifies and masks data, checks quality, views lineage, approves AI actions | Built; policies and lineage are partial |
 | **Monitoring** | Checks health, alerts, audit log, workloads, services, capacity, table maintenance, ingestion | Built; some pages partial |
@@ -142,7 +142,7 @@ hands-on testing.
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
 | SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
-| Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct. | Yes, inside the user's permissions | `AI-16` |
+| Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
@@ -153,7 +153,7 @@ hands-on testing.
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
-| Catalog and search | **Partial.** Search matches table names only; no certification | Yes: columns, tags, certification | `DATA-11`, `DATA-12` |
+| Catalog and search | **Partial.** Search finds tables by name, columns, tags and descriptions and forgives a typo (`DATA-11`, In Acceptance; speed not measured); no certification; no per-user table visibility | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
@@ -298,12 +298,17 @@ versions.
 
 ### Risks worth knowing
 
-| Risk | Why it matters |
-| --- | --- |
-| We claim something that fails in a customer's test | Costs more than the claim was worth. Section 3 exists to prevent it |
-| A wrong number is shown without an error | The most damaging kind of failure for a data product |
-| Everything depends on one person and AI agents | Decisions must be written down; that is what this folder is for |
-| Chasing every competitor feature | We cannot match three large platforms. Section 5 picks |
+The base's Risk fields: Owner (the module's owner, held in the base),
+Likelihood and Impact (High / Medium / Low), and the Mitigation. The
+Likelihood and Impact ratings are the planner's estimate, not yet confirmed
+by the product owner.
+
+| Risk | Why it matters | Likelihood | Impact | Mitigation |
+| --- | --- | --- | --- | --- |
+| We claim something that fails in a customer's test | Costs more than the claim was worth | Medium | High | Section 3 lists every limit plainly; a status is Have only when it matches or beats the best competitor |
+| A wrong number is shown without an error | The most damaging kind of failure for a data product | Low | High | Principle 2: show "Not measured" or "unsupported", never an invented value; gate `ops/g8` proves masking end to end |
+| Everything depends on one person and AI agents | Decisions must be written down; that is what this folder is for | High | High | Every decision is written down in `docs/core/`; the base holds who owns and who accepts each item |
+| Chasing every competitor feature | We cannot match three large platforms | Medium | Medium | Section 5 picks the gaps a switching customer hits first; the `DEC-*` list says no to the rest |
 
 ---
 
@@ -359,6 +364,10 @@ is large. Saying no to some is how the product stays simple.
 ---
 
 ## 6. Decisions waiting on the product owner
+
+These are the product-level decisions. Each is tracked as a Decision record
+in `BACKLOG.md` (Decide section: Options, Recommendation, Decider), which is
+the single list the base mirrors. The table here is the summary.
 
 | # | Decision | Recommendation |
 | --- | --- | --- |

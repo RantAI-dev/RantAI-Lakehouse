@@ -14,6 +14,94 @@ export type Connector = {
   lastActivityAt: string | null
   capabilities: string[]
   owner: string
+  /** `null` until the orchestrator has reported a successful run (`SRC-7`). */
+  lastRunSuccessAt: string | null
+  /** `null` until the orchestrator has reported a failed run (`SRC-7`). */
+  lastRunFailureAt: string | null
+  /** Failed runs since the last success; 0 after a success (`SRC-7`). */
+  failureStreak: number
+  /** What a non-breaking source schema change does (`SRC-8`, D1). */
+  schemaChangePolicy: SchemaChangePolicy
+  /** Why the connector is held back from loading; `null` when not paused (`SRC-8`). */
+  pausedReason: string | null
+  /** When the pause began; `null` when not paused. */
+  pausedAt: string | null
+}
+
+export type SchemaChangePolicy =
+  | "apply_non_breaking"
+  | "apply_all"
+  | "ask_first"
+  | "pause"
+
+/**
+ * `GET /api/connectors/{id}/schema-changes` and the approve answer mirror
+ * Rust `lakehouse_store::schema_change::SchemaChange` (`SRC-8`). `kind` and
+ * `status` are widened with `| string` so a value this build does not know
+ * still renders.
+ */
+export type SchemaChangeKind =
+  | "column_added"
+  | "column_removed"
+  | "type_changed"
+  | "primary_key_changed"
+  | "table_added"
+
+export type SchemaChangeStatus = "applied" | "pending" | "approved"
+
+export type SchemaChange = {
+  id: string
+  /** The source table (`<schema>.<table>` for SQL sources). */
+  objectName: string
+  kind: SchemaChangeKind | string
+  /** Empty for `primary_key_changed` and `table_added`. */
+  columnName: string
+  /** For `table_added`: `null`. For `type_changed`: the type before. */
+  beforeValue: string | null
+  /**
+   * For `type_changed`: the type after. For `table_added`: the target Bronze
+   * table when status is `applied`, or the fixed "Not added: ..." reason
+   * when `pending`.
+   */
+  afterValue: string | null
+  breaking: boolean
+  status: SchemaChangeStatus | string
+  runId: string | null
+  detectedAt: string
+  decidedBy: string | null
+  decidedAt: string | null
+  /**
+   * Whether the approve route will take this change. `false` for a change
+   * that does not wait and for every waiting change of a table that has a
+   * SQL type change its column cannot hold (decision 10).
+   */
+  canApprove: boolean
+}
+
+/** A column kept in the Bronze table after the source dropped it. */
+export type InactiveColumn = {
+  objectName: string
+  columnName: string
+  inactiveSince: string
+  /** The name the Bronze table gives the column; `null` when it was not reported, and then the Schema tab marks nothing. */
+  loadedName: string | null
+}
+
+export type SchemaChangeList = {
+  /** What waits for a decision, oldest first. */
+  pending: SchemaChange[]
+  /** The newest changes that no longer wait. */
+  recent: SchemaChange[]
+  inactiveColumns: InactiveColumn[]
+}
+
+/** `POST .../schema-changes/approve` body. For a `table_added` notice, `object` is the table's name and approving only marks it seen. */
+export type ApproveSchemaChangeRequest = { object: string }
+
+export type ApproveSchemaChangeResponse = {
+  object: string
+  approved: SchemaChange[]
+  pauseLifted: boolean
 }
 
 export type ConnectorDependent = {
@@ -208,6 +296,8 @@ export type UpdateConnectorInput = {
   environment?: string
   residency?: string
   host?: string
+  /** What a non-breaking source schema change does (`SRC-8`, decision 1). */
+  schemaChangePolicy?: SchemaChangePolicy
 }
 
 /**
@@ -454,6 +544,11 @@ export type SourceObject = {
   /** How a run's rows meet the Bronze table. Absent on an object saved
    * before load modes existed, which the ingest job runs as `replace`. */
   loadMode?: LoadMode
+  /** The columns that identify one row, for the deduplicating modes and
+   * `history` (`SRC-10`). Kept on the object whatever the mode, so a key the console
+   * detected survives a switch of mode; the API ignores it for a mode that
+   * does not use it. */
+  primaryKey?: string[]
   target: string
 }
 
@@ -462,9 +557,21 @@ export type SourceObject = {
  * `dagster/dispar_orchestrate/adapters/sink.py`, which acts on it:
  * `replace` overwrites the table with what the source returns now,
  * `append` adds every row again, `incremental` adds only rows beyond the
- * cursor column's last seen value (SQL connectors only).
+ * cursor column's last seen value (SQL connectors only), `replace_dedup`
+ * is `replace` keeping one row per `primaryKey`, and `incremental_dedup` is
+ * `incremental` merging into the table on `primaryKey` (SQL connectors only),
+ * and `history` keeps every version of a row, closing the old one and adding a
+ * new one when a run sees it changed. The deduplicating modes and `history` need
+ * a `primaryKey`; `history` reads the whole source every run and takes no
+ * `incrementalKey` (`SRC-10`, decision 10).
  */
-export type LoadMode = "replace" | "append" | "incremental"
+export type LoadMode =
+  | "replace"
+  | "append"
+  | "incremental"
+  | "replace_dedup"
+  | "incremental_dedup"
+  | "history"
 
 /**
  * Credential reference NAMES only (`env:FOO`, `file:/…`), never a
@@ -567,6 +674,8 @@ export type ConnectorType = {
   adapter: IngestAdapter | null
   supported: boolean
   docsUrl: string | null
+  /** Why a `supported: false` type is unavailable (SRC-6 F5); null when there is no specific reason. */
+  unsupportedReason: string | null
 }
 
 /**
@@ -589,6 +698,12 @@ export type DiscoveredColumn = {
 export type DiscoveredObject = {
   name: string
   columns: DiscoveredColumn[]
+  /**
+   * `SRC-10`: the columns of the table's primary key as the source declares it,
+   * in key order; `[]` when the source declares none. SQL drivers only; read from
+   * the source's own catalog views, so it is the source's word, not a guess.
+   */
+  primaryKey: string[]
 }
 
 /**
@@ -625,6 +740,21 @@ export type IngestRunResult = {
 }
 
 /**
+ * What a run of ONE table does (`SRC-10` decision 5), the body of
+ * `POST /api/connectors/{id}/ingest/run`: refresh keeping the rows already
+ * there, refresh after removing them, or clear the table and load nothing.
+ * Mirrors Rust `IngestAction` (`routes/connectors.rs`).
+ */
+export type IngestTableAction = "refresh_keep" | "refresh_remove" | "clear"
+
+/** The optional body of `POST .../ingest/run`: both fields, or no body at all. */
+export type IngestTableRequest = {
+  /** The source object's name, as listed in the ingest spec. */
+  object: string
+  action: IngestTableAction
+}
+
+/**
  * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
  * returned by `GET /api/governance/ingest-runs?connectorId=`.
  */
@@ -656,6 +786,13 @@ export type IngestJobRun = {
   startedAt: string | null
   /** ISO 8601; `null` until the run ends. */
   endedAt: string | null
+  /**
+   * `SRC-10`: the one table a run of a single table named (from the run's
+   * config), `null` for a run of every table.
+   */
+  object: string | null
+  /** `refresh_keep | refresh_remove | clear` for such a run, else `null`. Widened: a newer API may add actions. */
+  action: IngestTableAction | string | null
 }
 
 /**
@@ -714,7 +851,8 @@ export interface ConnectorService {
   /** `schema` is required for a `sql`/`cdc` connector: the server lists
    * only that schema's tables (bound, never interpolated). */
   discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
-  runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
+  /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
+  runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
   listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
   /**
@@ -758,6 +896,18 @@ export interface ConnectorService {
   ): Promise<SetConnectorCredentialResponse>
   /** `PATCH /api/connectors/{id}` — see `UpdateConnectorInput`. */
   updateConnector(id: string, input: UpdateConnectorInput, signal?: AbortSignal): Promise<Connector>
+  /** `GET /api/connectors/{id}/schema-changes` (`SRC-8`): what waits, the recent changes, the inactive columns. */
+  listSchemaChanges(id: string, signal?: AbortSignal): Promise<SchemaChangeList>
+  /**
+   * `POST /api/connectors/{id}/schema-changes/approve` (`SRC-8`): approve
+   * what waits for one table. 409 with a plain message when what waits
+   * includes a type change the column cannot hold (decision 10).
+   */
+  approveSchemaChanges(
+    id: string,
+    body: ApproveSchemaChangeRequest,
+    signal?: AbortSignal
+  ): Promise<ApproveSchemaChangeResponse>
   /**
    * `DELETE /api/connectors/{id}` — removes the connector and its managed
    * credential files. Refused (409) while a pipeline still reads from it,

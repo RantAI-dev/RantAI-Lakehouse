@@ -23,7 +23,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # F4: a push to main must finish its run; cancelling it made its ci-required read as failed.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -109,6 +110,21 @@ jobs:
       - name: Check intra-package imports (Dagster)
         run: python3 ops/lint/check_intra_package_imports.py
 
+      # SRC-9 task 8 (decision 6): every connector type the migrations list as
+      # supported has a gate in ops/gates/coverage.json, with all four steps
+      # covered or an explicit, printed waiver. Fails on a migration that
+      # touches connector_type in a shape it cannot read, so a new supported
+      # type cannot slip in unnoticed. See ops/lint/check_connector_gate_coverage.py.
+      - name: Check connector gate coverage (SRC-9)
+        run: python3 ops/lint/check_connector_gate_coverage.py
+
+      # The unit tests of that check and of the gates' registry and result
+      # table module (no network, no containers; seconds).
+      - name: Unit-test the connector gate coverage tooling (SRC-9)
+        run: |
+          python3 -m unittest discover -s ops/lint -p 'test_*.py'
+          python3 -m unittest discover -s ops/gates -p 'test_*.py'
+
   # ── Frontend ────────────────────────────────────────────────────────
   verify:
     name: Frontend · Lint · Typecheck · Test · Build
@@ -171,8 +187,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install ./dagster pytest==8.3.4
 
+      # The `loader` marker (dagster/pyproject.toml) holds the tests that run a real
+      # dlt pipeline against a local Iceberg table; they run in `dagster-loader-tests`.
       - name: pytest
-        run: python -m pytest dispar_orchestrate -v
+        run: python -m pytest dispar_orchestrate -v -m "not loader"
+        working-directory: dagster
+
+  dagster-loader-tests:
+    name: Dagster · loader tests
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # `dagster/dispar_orchestrate/test_maintenance.py` existed and was run
+      # by nobody — it asserts, among other things, that Bronze maintenance
+      # skips `gold.*` tables, which is a regression guard for applied
+      # maintenance running against the Gold export's data. A test that no
+      # job executes is documentation, not a guard.
+      #
+      # Installs the code location's real pinned dependencies rather than a
+      # reduced set, so the test runs against the same `dagster` version the
+      # compose image builds. That costs install time but means a passing
+      # run actually says something about the shipped artifact.
+      - name: Install the code location and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./dagster pytest==8.3.4
+
+      - name: pytest (loader)
+        run: python -m pytest dispar_orchestrate -v -m loader
         working-directory: dagster
 
   # ── Rust: fast feedback ─────────────────────────────────────────────
@@ -738,44 +790,73 @@ jobs:
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
-        run: docker compose -p g4ci --profile dagster build oidc-mock
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster build oidc-mock
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
+        # SRC-9 task 6: the `-f` pair on every compose call of this job (the
+        # override adds the `file:` credential store and the internal-host
+        # flag the connect and discover steps of the gate need).
         run: >
-          docker compose -p g4ci --profile dagster up -d --no-build
+          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml
+          --profile dagster up -d --no-build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
           g4-source-init debezium-server
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the G4 acceptance test inside the compose network
-        run: docker compose -p g4ci --profile dagster run --rm g4-test-runner
+        # `tee` and `-T`: the gate prints its connector table between two
+        # marker lines and the next step copies it to the job summary (same
+        # as g6-ingest). `shell: bash` for pipefail.
+        shell: bash
+        run: |
+          docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml \
+            --profile dagster run --rm -T g4-test-runner 2>&1 | tee "$RUNNER_TEMP/g4-run.log"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g4-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g4-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Compose logs (on failure)
         if: failure()
-        run: docker compose -p g4ci logs
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster logs
 
       - name: Tear down
         if: always()
-        run: docker compose -p g4ci down -v
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster down -v
 
   # ── WS3 (G6) acceptance — the Tier 1 ingestion matrix: one connector
-  # per adapter (sql×mysql, sql×mssql, sql×postgres, files×csv, rest) is
-  # registered, given an ingest-spec, run, and its rows verified in Bronze
-  # through ClickHouse; plus the column gate, CDC's honest supported:false,
-  # and Sheets' honest supported:false. Same g1-rustfs/g3a-dagster/g4-cdc
-  # shape. A second, SEPARATE, override-free compose project proves the
-  # DEFAULT stack (INGEST_ALLOW_INTERNAL_HOSTS unset) still refuses a
-  # link-local target -- ops/g6/docker-compose.g6.override.yml's own
-  # comment explains why that variable is gate-only and never belongs in
-  # docker-compose.yml itself. See ops/g6/g6_ingest_matrix_test.py and
-  # ops/g6/g6_linklocal_test.py. ──
+  # per adapter is registered, given an ingest-spec, run, and its rows
+  # verified in Bronze through ClickHouse; plus the column gate, CDC's honest
+  # supported:false, and Sheets' honest supported:false. Same
+  # g1-rustfs/g3a-dagster/g4-cdc shape.
+  #
+  # SRC-9 decision 9: the gate is ONE script (ops/g6/g6_ingest_matrix_test.py)
+  # run by TWO jobs, selected by G6_GROUP, so each stays under 20 minutes.
+  # This job is G6_GROUP=sql: PostgreSQL, MySQL, MariaDB and SQL Server, the
+  # SRC-7 (wrong-password MySQL connector) and SRC-8 (schema drift on MySQL)
+  # steps, which use the MySQL fixture, and the column gate, the CDC refusal
+  # and the Sheets refusal, which need only the API and Dagster. Object
+  # storage, REST, MongoDB, Kafka and SFTP, and the link-local half (it
+  # needs a Kafka fixture), are in `g6-ingest-other`. Each job's table shows
+  # the other's types as `skipped`, "covered by job <name>". ──
   g6-ingest:
-    name: Rust · G6 ingest matrix
+    name: Rust · G6 ingest matrix (SQL sources)
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
+    # is the cut-off, not the target. Before the split this one job took
+    # 21m56s to 22m48s, 13 of them bringing the stack up (the API image build
+    # dominates). SRC-9 decision 9 split it so each half's TARGET is under 20
+    # minutes; the CI runs of the final commit are the measurement
+    # (docs/plans/SRC-9-RESULT.md).
+    timeout-minutes: 25
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
@@ -798,6 +879,14 @@ jobs:
           done
 
       - name: Write CI-only .env
+        # The same nine fixture secrets as `g6-ingest-other`, though this half
+        # starts only the SQL fixtures: ops/g6/docker-compose.g6.override.yml
+        # makes each fixture's password `${VAR:?}`, and compose interpolates
+        # that for every service in the files it loads, whatever the
+        # profile, so a smaller .env fails at `up` ("required variable ... is
+        # missing a value", checked with `docker compose config`). They are
+        # obviously fake values of a throwaway stack, not defaults in a
+        # compose file.
         run: |
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
@@ -805,23 +894,29 @@ jobs:
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
           MONGO_G6_ROOT_USER=ci-mongo-root-not-real
           MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      # `rest-stub-g6` is the other fixture with a `build:` and no shared
-      # image. Same `-f` pair and `--profile` flags as the "up" step below
-      # (it is in profile "g6", so it is invisible to `build` without them).
-      - name: Build the oidc-mock and rest-stub-g6 fixture images
+      # This half starts the SQL fixtures only (profile `g6-sql`), so
+      # `oidc-mock` is the only fixture with a `build:` block that it needs;
+      # `rest-stub-g6` is in the `g6`/`g6-other` profiles and is built by
+      # `g6-ingest-other`. Same `-f` pair and `--profile` flags as the "up"
+      # step below.
+      - name: Build the oidc-mock fixture image
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6 --profile dagster build oidc-mock rest-stub-g6
+          --profile g6-sql --profile dagster build oidc-mock
 
-      - name: Bring up the g6 matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+      - name: Bring up the g6 SQL matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, not a bare `up` on the activated
         # profiles: this project also activates "dagster" (for
         # dagster-webserver/-daemon, which g6_ingest_matrix_test.py polls
@@ -831,16 +926,16 @@ jobs:
         # unrepinned gap — a human decision, out of this job's scope). A
         # bare `up` with no service names starts every service in an
         # active profile, including that one, and fails the whole step;
-        # naming exactly what `ops/g6/g6_ingest_matrix_test.py` and
-        # `g6-test-runner`'s own depends_on chain need (docker-compose.yml)
-        # starts only those services' own dependency closures, which does
-        # not reach `debezium-server`.
+        # naming exactly what the SQL half of
+        # `ops/g6/g6_ingest_matrix_test.py` needs starts only those
+        # services' own dependency closures, which does not reach
+        # `debezium-server`. `--profile g6-sql`, not `g6`: the runner's
+        # `depends_on` then skips the fixtures of the other half.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6 --profile dagster up -d --no-build
+          --profile g6-sql --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
-          g3a-source-init mysql-g6 mssql-g6 mssql-g6-cert-init rest-stub-g6
-          mongo-g6 kafka-g6 kafka-g6-spoofed
+          g3a-source-init mysql-g6 mariadb-g6 mssql-g6 mssql-g6-cert-init
 
       - name: Run the G6 ingest matrix test inside the compose network
         # Same `-f` pair as the "up" step above -- `g6-test-runner`'s OWN
@@ -858,9 +953,30 @@ jobs:
         # same edge. `dagster-code-location` is already running from the
         # "up" step above; activating its profile for this `run` only
         # satisfies validation, it does not start anything new.
-        run: >
-          docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6 --profile dagster run --rm g6-test-runner
+        #
+        # SRC-9 task 1: the output is also written to a file, because the gate
+        # prints its coverage table between two marker lines and the next step
+        # copies it into the job summary (the gate runs in a container and
+        # cannot write the host's GITHUB_STEP_SUMMARY). `shell: bash` gives
+        # `pipefail`, so the gate's exit code still fails this step; `-T`
+        # stops compose allocating a pseudo-terminal, which would add carriage
+        # returns to every line.
+        shell: bash
+        run: |
+          docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-sql --profile dagster run --rm -T -e G6_GROUP=sql g6-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-run.log"
+
+      - name: Add the connector gate table to the job summary
+        # `always()`: a failed gate prints its table too, and that table is
+        # what says which type and step failed. Nothing is appended if the
+        # gate never reached the point where it prints it.
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g6-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Compose logs (on failure)
         if: failure()
@@ -869,6 +985,110 @@ jobs:
       - name: Tear down the g6 matrix project
         if: always()
         run: docker compose -p g6ci down -v
+
+  # ── SRC-9 decision 9: the second half of the G6 gate (G6_GROUP=other),
+  # in a job of its own so each half stays under 20 minutes: object storage,
+  # REST, MongoDB, Kafka and SFTP, the MongoDB Debezium-template check, and
+  # the SEPARATE, override-free link-local project (it needs a Kafka
+  # fixture). It brings up only the fixtures these need (profile `g6-other`,
+  # no MySQL, MariaDB, SQL Server or `g3a-source-init`). Same script, same
+  # override and same scope gate as `g6-ingest`. ──
+  g6-ingest-other:
+    name: Rust · G6 ingest matrix (files, APIs, streams)
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        # All nine fixture secrets although only the REST, MongoDB, Kafka and
+        # SFTP fixtures start here: see `g6-ingest`'s .env step for why a
+        # smaller file fails at `up`. Obviously fake, throwaway.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          EOF
+
+      # Fixture images, built here rather than shared; see `g3a-dagster`.
+      # `oidc-mock` (every stack that starts `lakehouse-api`) and
+      # `rest-stub-g6` (profile `g6-other`) are the two fixtures with a
+      # `build:` block and no `image:`. Same `-f` pair and `--profile` flags
+      # as the "up" step below (`rest-stub-g6` is invisible to `build`
+      # without them).
+      - name: Build the oidc-mock and rest-stub-g6 fixture images
+        run: >
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-other --profile dagster build oidc-mock rest-stub-g6
+
+      - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as `g6-ingest` explains (the dagster profile
+        # also holds debezium-server). `--profile g6-other`: the runner's
+        # `depends_on` skips the SQL fixtures.
+        run: >
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-other --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          sftp-g6 sftp-g6-hostkey-init rest-stub-g6 mongo-g6 kafka-g6
+
+      - name: Run the G6 ingest matrix test (files, APIs, streams) inside the compose network
+        # Same `-f` pair and profiles as the "up" step, and the same reasons
+        # for `tee`, `-T` and `shell: bash` as `g6-ingest`'s run step.
+        # `-e G6_GROUP=other` selects this half of the one gate script.
+        shell: bash
+        run: |
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-other --profile dagster run --rm -T -e G6_GROUP=other g6-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-other-run.log"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-other-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g6-other-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6otherci logs
+
+      - name: Tear down the g6 files, APIs and streams project
+        if: always()
+        run: docker compose -p g6otherci down -v
 
       # A separate compose project has its own image names, so the fixture
       # it needs is built again here (`oidc-mock` only: the link-local stack
@@ -914,6 +1134,305 @@ jobs:
       - name: Tear down the link-local project
         if: always()
         run: docker compose -p g6ci-linklocal down -v
+
+  # ── SRC-9 plan task 5 (decision 5): the Oracle connector gate, in a job of
+  # its own. Oracle Database Free is a ~1.3 GB image that needs about 2 GB of
+  # memory (a GitHub-hosted runner has 16 GB) and opens its pluggable database
+  # in a minute or two, and g6-ingest is already at 22 of its 25 minutes. It
+  # brings up only what ONE batch sql connector needs: the API, the Dagster
+  # code location that runs the ingest, and their dependencies, plus the
+  # Oracle fixture. See ops/g6/g6_oracle_test.py and
+  # ops/g6/docker-compose.g6-oracle.override.yml. Scope gate as g6-ingest. ──
+  g6-oracle:
+    name: Rust · G6 Oracle connector
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        # Alphanumeric on purpose: the Oracle image creates the application
+        # user from CONNECTOR_ORACLE_PASSWORD, and the SQLAlchemy URL the
+        # adapter builds carries it too. Obviously fake, a throwaway stack.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          ORACLE_G6_PASSWORD=CiOracleSysNotReal123
+          CONNECTOR_ORACLE_PASSWORD=CiOracleConnectorNotReal123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          EOF
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      # `oracle-g6` is a pinned upstream image (pulled, not built) and
+      # `g6-oracle-test-runner` uses the shared Dagster image (the override
+      # gives it the same `image:` key), so `oidc-mock` is the only build.
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
+          --profile g6-oracle --profile dagster build oidc-mock
+
+      - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as g6-ingest explains (the dagster profile
+        # also holds debezium-server). No mysql/mssql/mongo/kafka/mariadb/sftp
+        # fixtures and no g3a-source-init: this gate loads no other connector.
+        run: >
+          docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
+          --profile g6-oracle --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
+
+      - name: Run the G6 Oracle gate inside the compose network
+        # `shell: bash` for pipefail, `-T` for no pseudo-terminal: the same
+        # reasons as the g6-ingest run step. The gate prints its table
+        # between two marker lines and the next step copies it to the summary.
+        shell: bash
+        run: |
+          docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml \
+            --profile g6-oracle --profile dagster run --rm -T g6-oracle-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-oracle-run.log"
+
+      - name: Add the connector gate table to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-oracle-run.log" ]; then
+            awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
+              "$RUNNER_TEMP/g6-oracle-run.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml --profile g6-oracle --profile dagster logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml --profile g6-oracle --profile dagster down -v
+
+  # ── DATA-9 (G9) acceptance, in CI since SRC-9 plan task 7: the upload gate
+  # (ops/g9/upload_test.py) uploads a delimited file, a workbook and a
+  # Parquet file, previews and loads each through file_ingest_job into a raw
+  # table, loads again with append, deletes the upload, and reads the rows
+  # back through ClickHouse. Same condition as g6-ingest: the scope gate, so
+  # a documentation-only change skips it and anything under rust/, dagster/,
+  # ops/, scripts/ or compose runs it (scripts/ci/detect_change_scope.sh). ──
+  g9-upload:
+    name: Rust · G9 file upload
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # lakehouse-api has no default upload credential (unset, every
+          # upload answers 503 "Upload storage is not configured"). RustFS
+          # 1.0.0-rc.4 has no non-root S3 identity (docker-compose.yml, the
+          # CONNECTOR_S3_* note), so the gate hands the API RustFS's own root
+          # key, which this stack takes from the compose default
+          # (RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY unset here), the same
+          # value the Dagster services already default to. A throwaway CI
+          # stack, never a deployment value.
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          EOF
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g9ci --profile dagster build oidc-mock
+
+      - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
+        # Explicit service list, as g6-ingest explains: a bare `up` on the
+        # dagster profile would also start debezium-server. clickhouse-
+        # iceberg-init is named because nothing but the gate depends on it.
+        run: >
+          docker compose -p g9ci --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          clickhouse-iceberg-init
+
+      - name: Run the G9 upload test inside the compose network
+        run: docker compose -p g9ci --profile dagster run --rm g9-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g9ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g9ci down -v
+
+  # ── SRC-17 (finding F4, the delivery review of 2026-10-12): the alert
+  # delivery gate (ops/g6/src17_alert_delivery_test.py). A real failed
+  # connector run and a real failed upload each reach a webhook the gate
+  # receives within 5 minutes of the run's end (the seconds are printed), and
+  # a webhook that answers 500 is listed as not delivered with a fixed reason
+  # and none of the receiver's text. E-mail is not measured (the sender has no
+  # mode without verified TLS; the plan's D-d says why). It is a job of its own
+  # so no existing gate job grows: g6-ingest is at 19m54s of its 20 minutes.
+  # It brings up only the API, Dagster, the MySQL fixture (a wrong password
+  # makes a run fail in seconds) and the ClickHouse database an upload load
+  # asks about, with the same override as g6-ingest.
+  #
+  # SEC-10 (alert webhooks cannot reach internal addresses) is NOT built yet.
+  # The receiver is a listener in the gate's own container, on the compose
+  # network. When SEC-10 lands it will refuse that address by default and must
+  # give this gate its documented opt-in; the gate must not weaken the default.
+  # Scope gate as g6-ingest. ──
+  g6-alerts:
+    name: Rust · SRC-17 alert delivery
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        # The nine fixture secrets of g6-ingest, though only the MySQL
+        # fixture starts: ops/g6/docker-compose.g6.override.yml makes each
+        # `${VAR:?}`, which compose interpolates for every service in the
+        # files it loads. UPLOAD_S3_* as in g9-upload (the API has no default
+        # upload credential). PIPELINE_RUN_TOKEN is what lets the sensors
+        # report a failed run to the API, which is the path under test.
+        # Obviously fake values of a throwaway stack.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          EOF
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      # `mysql-g6` is a pinned upstream image and `g6-alerts-test-runner`
+      # uses the shared Dagster image (the override gives it the same
+      # `image:` key), so `oidc-mock` is the only build. Same `-f` pair and
+      # `--profile` flags as the "up" step below.
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock
+
+      - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, as g6-ingest explains (the dagster profile
+        # also holds debezium-server). `--profile g6-sql` makes `mysql-g6`
+        # a valid dependency of the runner; only the services named here start.
+        run: >
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile g6-alerts --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          mysql-g6 clickhouse-iceberg-init
+
+      - name: Run the SRC-17 alert delivery gate inside the compose network
+        # `shell: bash` for pipefail and `-T` for no pseudo-terminal, as the
+        # g6-ingest run step explains; the same `-f` pair as the "up" step.
+        shell: bash
+        # `--no-deps`: the "up" step above already started every service the
+        # runner depends on; without it `compose run` re-reconciles them while
+        # the gate starts (F3, run #127 job 115336951020: the code server went
+        # UNAVAILABLE right after the gate's wait passed).
+        run: |
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T --no-deps g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
+
+      - name: Add the measured seconds to the job summary
+        # `always()`: a failed gate prints its lines too. Only the gate's own
+        # `SRC-17` lines are copied.
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/g6-alerts-run.log" ]; then
+            {
+              echo '### SRC-17 alert delivery'
+              echo '```'
+              grep -E '^\[g6-alerts\]' "$RUNNER_TEMP/g6-alerts-run.log" | grep -E 'SRC-17|PASS|FAILED' || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster logs
+
+      - name: Tear down the alert delivery project
+        if: always()
+        run: docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster down -v
 
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
@@ -1101,6 +1620,74 @@ jobs:
         if: always()
         run: docker rm -f lakehouse-api || true
 
+  # ── DATA-16 (F2) — time travel keeps the policy. A Bronze table is
+  # loaded twice through bronze_ingest_job and read at its OLDER version:
+  # the admin gets clear text, a masked and row-filtered Analyst gets ***
+  # and only the allowed rows, also with the pin inside a subquery or CTE.
+  # See ops/g8/g8_time_travel_test.py. Needs the Bronze-ingest stack, so it
+  # is shaped like g3a-dagster above (same .env, same services) plus
+  # clickhouse-iceberg-init, which the runner's depends_on starts. ──
+  g8-time-travel:
+    name: Rust · G8 time travel keeps the policy
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # Same as g3a-dagster's .env: bronze_ingest_job dials this compose
+          # network's own `postgres`, which the dlt SSRF guard refuses unless
+          # the gate opts in for itself.
+          INGEST_ALLOW_INTERNAL_HOSTS=true
+          EOF
+
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g8ttci --profile dagster build oidc-mock
+
+      - name: Bring up lakehouse-api + Dagster + the demo source table + the Iceberg query database
+        run: >
+          docker compose -p g8ttci --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          g3a-source-init clickhouse-iceberg-init
+
+      - name: Run the time-travel acceptance test inside the compose network
+        run: docker compose -p g8ttci --profile dagster run --rm g8-time-travel-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g8ttci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g8ttci down -v
+
   # ── CI Required Gate ────────────────────────────────────────────────
   # The single gate job that evaluates the entire CI run and enforces that
   # all required jobs passed or were legitimately skipped based on the
@@ -1119,14 +1706,20 @@ jobs:
       - test
       - msrv
       - dagster-unit-tests
+      - dagster-loader-tests
       - g1-rustfs
       - g2-seaweedfs
       - g3a-dagster
       - g3-maintenance
       - g4-cdc
       - g6-ingest
+      - g6-ingest-other
+      - g6-oracle
+      - g9-upload
+      - g6-alerts
       - gold-export
       - g8-governance
+      - g8-time-travel
       - images
       - image-smoke
     timeout-minutes: 5
@@ -1155,14 +1748,20 @@ jobs:
           RUST_TEST_RESULT: ${{ needs.test.result }}
           RUST_MSRV_RESULT: ${{ needs.msrv.result }}
           DAGSTER_TESTS_RESULT: ${{ needs.dagster-unit-tests.result }}
+          DAGSTER_LOADER_TESTS_RESULT: ${{ needs.dagster-loader-tests.result }}
           G1_RUSTFS_RESULT: ${{ needs.g1-rustfs.result }}
           G2_SEAWEEDFS_RESULT: ${{ needs.g2-seaweedfs.result }}
           G3A_DAGSTER_RESULT: ${{ needs.g3a-dagster.result }}
           G3_MAINTENANCE_RESULT: ${{ needs.g3-maintenance.result }}
           G4_CDC_RESULT: ${{ needs.g4-cdc.result }}
           G6_INGEST_RESULT: ${{ needs.g6-ingest.result }}
+          G6_INGEST_OTHER_RESULT: ${{ needs.g6-ingest-other.result }}
+          G6_ORACLE_RESULT: ${{ needs.g6-oracle.result }}
+          G9_UPLOAD_RESULT: ${{ needs.g9-upload.result }}
+          G6_ALERTS_RESULT: ${{ needs.g6-alerts.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
+          G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}
           IMAGES_RESULT: ${{ needs.images.result }}
           IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh

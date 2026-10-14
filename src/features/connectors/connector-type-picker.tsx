@@ -17,7 +17,6 @@ import {
   SearchIcon,
   ServerIcon,
   SheetIcon,
-  TriangleAlertIcon,
   type LucideIcon,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -51,7 +50,9 @@ const ADAPTER_META: Record<IngestAdapter, { category: Category; icon: LucideIcon
 
 function metaFor(type: ConnectorType) {
   if (!type.supported || !type.adapter) {
-    return { category: "soon" as const, icon: PlugIcon, blurb: "Not available yet" }
+    // SRC-6 F5: the API says why (e.g. Google Sheets has no verified sign-in);
+    // the generic text is only for roadmap rows that have no specific reason.
+    return { category: "soon" as const, icon: PlugIcon, blurb: type.unsupportedReason ?? "Not available yet" }
   }
   return ADAPTER_META[type.adapter] ?? { category: "apps" as const, icon: PlugIcon, blurb: "" }
 }
@@ -160,18 +161,6 @@ export function ConnectorTypePicker({
         ))}
       </div>
 
-      {selected?.adapter === "sheets" ? (
-        // rust/migrations/0035_connector_type.sql seeds Google Sheets
-        // supported = true (the adapter and wizard exist), but this build's
-        // sheets ingest adapter reports unsupported for every run (WS3 item
-        // 23) -- said here so nobody picks it on the strength of the
-        // registry row alone and finds out only after clicking Run.
-        <p className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-          <TriangleAlertIcon className="mt-px size-3.5 shrink-0" />
-          Google Sheets connections can be configured and tested, but this build cannot move data for this type
-          yet. A triggered run reports that it is unsupported instead of failing silently.
-        </p>
-      ) : null}
       {selected?.docsUrl ? (
         <a
           href={selected.docsUrl}
@@ -204,7 +193,7 @@ function TypeCard({
       role="radio"
       aria-checked={checked}
       disabled={disabled}
-      title={disabled ? "Not yet supported" : undefined}
+      title={disabled ? meta.blurb : undefined}
       onClick={onSelect}
       className={cn(
         "group relative flex w-full items-start gap-3 rounded-lg border bg-card px-3 py-2.5 text-left transition-colors outline-none",
@@ -227,10 +216,6 @@ function TypeCard({
           {disabled ? (
             <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
               Soon
-            </Badge>
-          ) : type.adapter === "sheets" ? (
-            <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
-              Test only
             </Badge>
           ) : null}
         </span>

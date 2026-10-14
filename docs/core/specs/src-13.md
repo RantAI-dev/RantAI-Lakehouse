@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-13` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -35,9 +33,8 @@ Airbyte, Databricks and Snowflake discover schemas for every connector.
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] For each connector type, the table picker lists what exists at the source
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-13-AC1` For each connector type, the table picker lists what exists at the source
+- `SRC-13-AC2` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

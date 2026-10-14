@@ -23,14 +23,20 @@
 #   RUST_TEST_RESULT      result of `test` job (stable)
 #   RUST_MSRV_RESULT      result of `msrv` job (1.88.0)
 #   DAGSTER_TESTS_RESULT  result of `dagster-unit-tests` job
+#   DAGSTER_LOADER_TESTS_RESULT result of `dagster-loader-tests` job
 #   G1_RUSTFS_RESULT      result of `g1-rustfs` job
 #   G2_SEAWEEDFS_RESULT   result of `g2-seaweedfs` job
 #   G3A_DAGSTER_RESULT    result of `g3a-dagster` job
 #   G3_MAINTENANCE_RESULT result of `g3-maintenance` job
 #   G4_CDC_RESULT         result of `g4-cdc` job
 #   G6_INGEST_RESULT      result of `g6-ingest` job
+#   G6_INGEST_OTHER_RESULT result of `g6-ingest-other` job
+#   G6_ORACLE_RESULT      result of `g6-oracle` job
+#   G9_UPLOAD_RESULT      result of `g9-upload` job
+#   G6_ALERTS_RESULT      result of `g6-alerts` job (SRC-17 alert delivery)
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
+#   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
 #   IMAGES_RESULT         result of `images` job (builds the shared images)
 #   IMAGE_SMOKE_RESULT    result of `image-smoke` job (/health on the API image)
 set -euo pipefail
@@ -125,6 +131,7 @@ run_gate() {
 
   # Dagster
   check_job "dagster-unit-tests" "${DAGSTER_TESTS_RESULT:-skipped}" "$req_dagster"
+  check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
 
   # Acceptance
   check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_acceptance"
@@ -133,8 +140,13 @@ run_gate() {
   check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
 
   # Shared images and their smoke test. Required exactly when the acceptance
   # jobs are: `images` has the same `if:` as they do and is what they consume.

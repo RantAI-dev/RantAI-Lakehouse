@@ -79,6 +79,7 @@ AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 BRONZE_TABLE_NAME = os.environ.get("BRONZE_TABLE_NAME", "g3a_orders")
 FIXTURE_JOB_NAME = os.environ.get("G7_FIXTURE_JOB_NAME", "bronze_maintenance_job")
+DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 
 # One session for every `lakehouse-api` call after login, so the session
 # cookie `POST /api/auth/login` sets is carried on every subsequent
@@ -170,6 +171,38 @@ def step_create_and_activate_authored_pipeline() -> str:
     return pipeline_id
 
 
+def _dagster_job_is_loaded(job_name: str) -> bool:
+    """True once a loaded Dagster repository lists `job_name`. Twin of
+    `ops/g6/g6_ingest_matrix_test.py::_ingest_job_is_loaded` and of
+    `ops/g3/g3_test.py::_dagster_job_is_loaded` (the gate scripts share no
+    module)."""
+    query = (
+        "{ repositoriesOrError { ... on RepositoryConnection "
+        "{ nodes { jobs { name } } } } }"
+    )
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
+
+
+def _post_trigger(url: str, job_name: str) -> requests.Response:
+    """POST a trigger with a one-shot retry for the code-location start-up
+    race. SRC-9 F-c: `ops/g3/g3_test.py::_post_trigger` (its twin, and
+    `ops/g6/g6_ingest_matrix_test.py::_post_ingest_run`) hit
+    `422 {"error":"PipelineNotFoundError"}` when the first trigger came
+    before the code location had loaded. On that 422, wait up to 120 s for
+    Dagster to list `job_name` (here the fixture job, which lives in the
+    same code location as the authored pipeline's job) and POST once more. Any other failure is
+    returned unchanged for the caller's own assertion."""
+    resp = API.post(url, timeout=30)
+    if resp.ok or resp.status_code != 422 or "PipelineNotFoundError" not in resp.text:
+        return resp
+    print(f"[g7] trigger hit the code-location start-up window; waiting for {job_name} to load")
+    _wait_for(f"Dagster code location ({job_name} loaded)", lambda: _dagster_job_is_loaded(job_name), 120)
+    return API.post(url, timeout=30)
+
+
 def step_trigger_and_wait_for_real_row_materializations(pipeline_id: str) -> None:
     """`POST /api/pipelines/{id}/trigger` (already on this branch) is
     real; `GET /api/pipelines/{id}/runs/{runId}/steps` is WS4 phase C item
@@ -178,7 +211,7 @@ def step_trigger_and_wait_for_real_row_materializations(pipeline_id: str) -> Non
     a stack missing that route, `steps_are_terminal`'s `.raise_for_status()`
     below turns the resulting 404 into a loud `G7Failure` via `_wait_for`'s
     timeout, not a silent pass."""
-    trigger = API.post(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", timeout=30)
+    trigger = _post_trigger(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", FIXTURE_JOB_NAME)
     if not trigger.ok:
         raise G7Failure(f"POST .../trigger failed: {trigger.status_code} {trigger.text}")
     run_id = trigger.json().get("id") or trigger.json().get("runId")

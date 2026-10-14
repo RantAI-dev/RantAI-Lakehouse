@@ -3,7 +3,10 @@
 //!
 //! # What this module supports, and why only this much
 //!
-//! Five connector shapes can be genuinely dialed today:
+//! Five connector shapes can be genuinely dialed today (an object-storage
+//! connector is tested at the endpoint and bucket in its `dial`; the legacy
+//! `host` shape `<endpoint>|<bucket>` is read only for a row with no
+//! adapter):
 //!
 //! - **`PostgreSQL`** (`sqlx`, already a `lakehouse-api` dependency for
 //!   `lakehouse-store`) — opens a real connection and runs `SELECT 1`.
@@ -19,24 +22,26 @@
 //!   `lakehouse-api` dependency) — one bounded `GET` against the dial's
 //!   `baseUrl`, classified on status code only.
 //!
-//! The last two of those six are dispatched by `adapter`
-//! (`sql`/`cdc`/`files`/`rest`/`sheets`, `0033_connector_ingest_spec.sql`),
-//! not by the free-form `kind` label the first two still use — see
-//! [`probe`]'s doc comment for the `adapter`-first-then-legacy-`kind`
-//! dispatch rule.
+//! These are dispatched by `adapter` (`sql`/`cdc`/`files`/`rest`/`sheets`,
+//! `0033_connector_ingest_spec.sql`); the free-form `kind` label is used
+//! only for a pre-WS3 row with no adapter — see [`probe`]'s doc comment for
+//! the `adapter`-first-then-legacy-`kind` dispatch rule.
 //!
 //! A `sheets` adapter is registered (`connector_type`, `0035`) but ships
 //! **`supported: false` unconditionally** — see [`probe_sheets`]'s doc
 //! comment for why (no verified Google service-account token exchange
 //! exists in this workspace, WS3 plan review Z10 open question 4).
 //!
-//! Every other seeded/registered connector `type` (Kafka, MQTT, `MongoDB`,
-//! Oracle, SAP/ERP, SFTP, ...) has **no dial implementation in this
-//! build** — see [`probe_by_kind`]'s `_ =>` arm. Those report
-//! [`Outcome::unsupported`], never a fabricated latency or success. Adding
-//! a new supported type means adding both a real client dependency and a
-//! new arm here — never widening the `_` arm to claim more than this
-//! build can back up.
+//! Oracle, `MongoDB`, Kafka and SFTP connect only from the orchestrator
+//! (`dagster/dispar_orchestrate/adapters/`); this build has no client for
+//! them. They report [`Outcome::not_testable_here`] (`SRC-6` F3, F4):
+//! `supported: false`, no latency, so a credential change saves with
+//! `verified: false` and the connector's stored health is not touched. Any
+//! other type with no dial implementation and no adapter (MQTT, SAP/ERP,
+//! ...) reports [`Outcome::unsupported`]. Neither ever
+//! carries a fabricated latency or success. Adding a new supported type
+//! means adding both a real client dependency and a new arm here — never
+//! widening the `_` arm to claim more than this build can back up.
 //!
 //! # Credential handling
 //!
@@ -126,7 +131,9 @@ use std::time::{Duration, Instant};
 
 use lakehouse_core::secret::DynSecretResolver;
 use lakehouse_store::connectors::ConnectorDialInfo;
-use lakehouse_store::ingest_spec::{CdcDial, Dial, RestAuth, RestDial, SqlDial, SqlDriver};
+use lakehouse_store::ingest_spec::{
+    CdcDial, Dial, FilesProtocol, RestAuth, RestDial, SqlDial, SqlDriver,
+};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use sqlx::Connection;
@@ -171,10 +178,30 @@ impl Outcome {
             latency_ms: None,
             message: format!(
                 "This build cannot test a {kind:?} connector: no live-dial implementation \
-                 exists for this connector type yet. Supported today: PostgreSQL, \
-                 S3-compatible object storage."
+                 exists for this connector type yet."
             ),
         }
+    }
+
+    /// A type or setting this build declines to test, with its own reason
+    /// (`SRC-6`). Same shape as [`Outcome::unsupported`]: no dial, no latency.
+    fn not_testable_with(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            supported: false,
+            latency_ms: None,
+            message: message.into(),
+        }
+    }
+
+    /// A connector that connects only from the orchestrator (`SRC-6` F3, F4):
+    /// `supported: false`, so a credential change saves with `verified:
+    /// false` and the stored `health` is left alone.
+    fn not_testable_here(kind: &str) -> Self {
+        Self::not_testable_with(format!(
+            "A {kind} connector cannot be tested from the console: it connects from the \
+             orchestrator. A load reports whether the connection worked."
+        ))
     }
 
     fn success(elapsed: Duration, message: impl Into<String>) -> Self {
@@ -246,15 +273,16 @@ pub async fn probe(
         }
         Some("rest") => probe_rest_info(info, resolver, internal_hosts).await,
         Some("sheets") => probe_sheets(),
-        // A `files` adapter's `dial` names an object-storage protocol (S3
-        // today, per `lakehouse_store::ingest_spec::FilesProtocol`) — the
-        // SAME thing the pre-WS3 `kind`-string dispatch below already
-        // dials via `probe_s3`, which still reads `info.host`'s legacy
-        // `<endpoint>|<bucket>` shape (`0022_prune_connector_seed.sql`'s
-        // `conn-s3-warehouse` row keeps that shape after
-        // `0034_seed_connector_ingest_spec.sql` sets `adapter = 'files'`
-        // on it) — no second S3 client is added here.
-        Some("files") => probe_s3(info, resolver, internal_hosts).await,
+        // SRC-6 F4: these connect only from the orchestrator. Explicit arms,
+        // so the answer does not depend on falling through to the `kind`
+        // dispatch, whose label for an adapter row is free-form.
+        Some("mongodb") => Outcome::not_testable_here("MongoDB"),
+        Some("kafka") => Outcome::not_testable_here("Kafka"),
+        Some("sftp") => Outcome::not_testable_here("SFTP"),
+        // SRC-6 F1: a `files` connector is tested at the endpoint and bucket
+        // in its `dial`, the settings the load itself uses. `info.host` is a
+        // display value for it (the wizard stores the bucket name there).
+        Some("files") => probe_files(info, resolver, internal_hosts).await,
         _ => probe_by_kind(info, resolver, internal_hosts).await,
     }
 }
@@ -377,12 +405,10 @@ async fn probe_dial(
             ))
             .await
         }
-        SqlDriver::Oracle => Outcome::misconfigured(
-            "Oracle probes run through the Dagster sql adapter, not through this Rust-side \
-             probe; the connector's own health remains at whatever record_test_result has \
-             last stamped against it"
-                .to_owned(),
-        ),
+        // SRC-6 F3: the API has no Oracle client; only the orchestrator's
+        // `oracle.py` adapter dials it. `supported: false` lets a credential
+        // change save (`verified: false`) and leaves `health` alone.
+        SqlDriver::Oracle => Outcome::not_testable_here("Oracle"),
     }
 }
 
@@ -1328,6 +1354,45 @@ fn s3_client(
         .build()
 }
 
+/// Test a `files` adapter's connector at the endpoint and bucket in its
+/// `dial` (`SRC-6` F1, F2). The legacy `host` shape is not read here; a row
+/// with no adapter reaches [`probe_s3`] through [`probe_by_kind`] instead.
+async fn probe_files(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+) -> Outcome {
+    let dial = match Dial::parse("files", &info.dial) {
+        Ok(Dial::Files(dial)) => dial,
+        Ok(_) => {
+            return Outcome::misconfigured(
+                "connector is misconfigured: its dial does not match its own adapter \"files\"",
+            );
+        }
+        Err(err) => return Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
+    };
+    match dial.protocol {
+        FilesProtocol::S3 => match dial.endpoint.as_deref() {
+            Some(endpoint) if !endpoint.is_empty() => {
+                dial_s3(endpoint, &dial.bucket, info, resolver, internal_hosts).await
+            }
+            // D3: testing AWS S3 itself (no endpoint) is out of scope, and
+            // saying so is honest where a guessed success would not be.
+            _ => Outcome::not_testable_with(
+                "This connector has no endpoint, so it cannot be tested from the console. Set \
+                 an endpoint to test it.",
+            ),
+        },
+        FilesProtocol::Sftp => Outcome::not_testable_with(
+            "An SFTP connection cannot be tested from the console, and the object-storage \
+             connector type does not load over SFTP. Use the SFTP connector type.",
+        ),
+    }
+}
+
+/// The legacy S3 test for a row with no adapter: `host` is shaped
+/// `<endpoint>|<bucket>` (`0022_prune_connector_seed.sql`). Dials through
+/// [`dial_s3`], the one S3 dial both paths share.
 async fn probe_s3(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
@@ -1338,6 +1403,19 @@ async fn probe_s3(
             "connector is misconfigured: S3 host must be shaped \"<endpoint>|<bucket>\"",
         );
     };
+    dial_s3(endpoint, bucket, info, resolver, internal_hosts).await
+}
+
+/// Dial `bucket` at `endpoint` with the connector's two credentials: the
+/// address check, `url_names_target`, the pinned client and the listing
+/// (`SEC-15`), shared by [`probe_files`] and [`probe_s3`] (`SRC-6` F1).
+async fn dial_s3(
+    endpoint: &str,
+    bucket: &str,
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+) -> Outcome {
     let Some((endpoint_host, endpoint_port)) = parse_endpoint_host_port(endpoint) else {
         return Outcome::misconfigured(
             "connector is misconfigured: S3 endpoint must be an http(s):// URL",
@@ -1588,6 +1666,66 @@ mod tests {
         assert!(outcome.message.contains("PostgreSQL connection failed"));
     }
 
+    /// `SRC-6` F3, F4: the four orchestrator-only types answer the same way
+    /// when they arrive as an adapter row: not supported, no latency, a
+    /// message that names the type and no other product.
+    #[tokio::test]
+    async fn orchestrator_only_adapters_are_not_testable_here_with_no_latency() {
+        let resolver = EnvSecretResolver::with_map(std::collections::HashMap::new());
+        let cases = [
+            (
+                "sql",
+                "Oracle",
+                serde_json::json!({
+                    "driver": "oracle", "host": "db.invalid", "port": 1521,
+                    "database": "ORCL", "user": "u", "sslMode": "disable"
+                }),
+            ),
+            ("mongodb", "MongoDB", serde_json::json!({})),
+            ("kafka", "Kafka", serde_json::json!({})),
+            ("sftp", "SFTP", serde_json::json!({})),
+        ];
+        for (adapter, kind, dial) in cases {
+            let mut row = info(kind, "h", "env:X", None);
+            row.adapter = Some(adapter.to_owned());
+            row.dial = dial;
+            let outcome = probe(&row, &resolver, &InternalHosts::NONE).await;
+            assert!(!outcome.supported, "{kind} must be unsupported");
+            assert!(!outcome.ok, "{kind} must never report ok=true");
+            assert!(outcome.latency_ms.is_none(), "{kind} has no latency");
+            assert!(
+                outcome.message.starts_with(&format!(
+                    "A {kind} connector cannot be tested from the console"
+                )),
+                "{kind}: {}",
+                outcome.message
+            );
+            for other in ["PostgreSQL", "S3", "object storage", "MySQL"] {
+                assert!(
+                    !outcome.message.contains(other),
+                    "{kind} message names {other}: {}",
+                    outcome.message
+                );
+            }
+        }
+    }
+
+    /// `SRC-6` F4: the generic message no longer lists "supported today",
+    /// a list that left out `MySQL`, SQL Server and REST.
+    #[tokio::test]
+    async fn unsupported_message_does_not_list_what_is_supported() {
+        let resolver = EnvSecretResolver::with_map(std::collections::HashMap::new());
+        let outcome = probe(
+            &info("MQTT", "h", "env:X", None),
+            &resolver,
+            &InternalHosts::NONE,
+        )
+        .await;
+        assert!(!outcome.supported);
+        assert!(!outcome.message.contains("Supported today"));
+        assert!(!outcome.message.contains("PostgreSQL"));
+    }
+
     #[tokio::test]
     async fn s3_missing_secondary_secret_ref_is_misconfigured() {
         let resolver = EnvSecretResolver::with_map(std::collections::HashMap::new());
@@ -1670,6 +1808,142 @@ mod tests {
         .await;
         assert!(!outcome.ok);
         assert!(outcome.latency_ms.is_none());
+    }
+
+    /// A `files` row the way the wizard stores it: `host` is the bucket name
+    /// and the endpoint lives in `dial` (`SRC-6` F1).
+    fn files_info(host: &str, dial: serde_json::Value) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: "Object storage".to_owned(),
+            host: host.to_owned(),
+            secret_ref: "env:AK".to_owned(),
+            secret_ref_secondary: Some("env:SK".to_owned()),
+            adapter: Some("files".to_owned()),
+            dial,
+        }
+    }
+
+    fn s3_keys() -> EnvSecretResolver {
+        let mut map = std::collections::HashMap::new();
+        map.insert("AK".to_owned(), "ak".to_owned());
+        map.insert("SK".to_owned(), "sk".to_owned());
+        EnvSecretResolver::with_map(map)
+    }
+
+    /// `SRC-6` F1: the bucket-name `host` the wizard writes is not parsed;
+    /// the dial's endpoint is dialled, so the failure is a real one.
+    #[tokio::test]
+    async fn files_connector_is_tested_at_its_dial_endpoint_not_its_host() {
+        let outcome = probe(
+            &files_info(
+                "my-bucket",
+                serde_json::json!({
+                    "protocol": "s3", "endpoint": "http://127.0.0.1:1",
+                    "bucket": "my-bucket", "format": "csv"
+                }),
+            ),
+            &s3_keys(),
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_some(), "{}", outcome.message);
+        assert!(!outcome.message.contains("must be shaped"));
+    }
+
+    /// `SRC-6` F2: `set_credential` and `ingest_spec_put` probe a candidate
+    /// built with the request's new dial; the new endpoint is what is tested,
+    /// even when `host` still names an old one.
+    #[tokio::test]
+    async fn files_candidate_with_a_new_dial_endpoint_is_dialled_there_not_at_host() {
+        let outcome = probe(
+            &files_info(
+                "http://169.254.169.254|old-bucket",
+                serde_json::json!({
+                    "protocol": "s3", "endpoint": "http://127.0.0.1:1",
+                    "bucket": "new-bucket", "format": "csv"
+                }),
+            ),
+            &s3_keys(),
+            &InternalHosts::ALL,
+        )
+        .await;
+        // The old host would have been refused with no latency; the dial's
+        // unreachable endpoint was attempted and timed.
+        assert!(outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_some(), "{}", outcome.message);
+    }
+
+    #[tokio::test]
+    async fn files_dial_loopback_endpoint_is_blocked_by_default() {
+        let outcome = probe(
+            &files_info(
+                "my-bucket",
+                serde_json::json!({
+                    "protocol": "s3", "endpoint": "http://127.0.0.1:1",
+                    "bucket": "my-bucket", "format": "csv"
+                }),
+            ),
+            &s3_keys(),
+            &InternalHosts::NONE,
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+        assert!(outcome.message.contains("private/internal"));
+    }
+
+    #[tokio::test]
+    async fn files_dial_without_an_endpoint_is_unsupported_with_no_latency() {
+        let outcome = probe(
+            &files_info(
+                "my-bucket",
+                serde_json::json!({"protocol": "s3", "bucket": "my-bucket", "format": "csv"}),
+            ),
+            &s3_keys(),
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(!outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+        assert!(outcome.message.contains("no endpoint"));
+    }
+
+    #[tokio::test]
+    async fn files_dial_with_the_sftp_protocol_is_unsupported_with_no_latency() {
+        let outcome = probe(
+            &files_info(
+                "my-bucket",
+                serde_json::json!({
+                    "protocol": "sftp", "endpoint": "http://127.0.0.1:1",
+                    "bucket": "/", "format": "csv"
+                }),
+            ),
+            &s3_keys(),
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(!outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+        assert!(outcome.message.contains("SFTP connector type"));
+    }
+
+    #[tokio::test]
+    async fn files_connector_with_an_invalid_dial_is_misconfigured() {
+        let outcome = probe(
+            &files_info("my-bucket", serde_json::json!({})),
+            &s3_keys(),
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+        assert!(outcome.message.contains("dial is invalid"));
     }
 
     #[test]

@@ -30,9 +30,10 @@ function errorFor(status: number, message: string): ServiceError {
 /**
  * AssetService is real — the data catalog from the lakehouse (bronze_meta +
  * silver) via the server route `/api/catalog`. The free-text term (`q`) is
- * filtered server-side (`rust/crates/lakehouse-api/src/routes/catalog.rs`'s
- * `filter_assets_by_query`) rather than in the browser, so there is one
- * implementation of the term match, not two (WS2 §13). Facet filters
+ * matched server-side (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`,
+ * the one matcher the Data Explorer's `search` also uses, `DATA-11`) rather
+ * than in the browser, so there is one implementation of the term match, not
+ * two (WS2 §13). The server's rank order is kept. Facet filters
  * (`tier`/`layer`/`type`/`classification`) stay client-side, applied to the
  * returned list below.
  */
@@ -43,7 +44,18 @@ async function loadCatalog(
   const url = q ? `/api/catalog?q=${encodeURIComponent(q)}` : "/api/catalog";
   const res = await apiFetch(url, { signal });
   const json = await res.json();
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load catalog");
+  // DATA-11 review SHOULD-FIX 4: a refusal (`403`) keeps its own code so the
+  // ⌘K box can tell "no access" from an outage (`errorFor`, as the other
+  // methods of this file do).
+  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load catalog");
+  // DATA-11 review SHOULD-FIX 4: a search answered `supported: false` (the
+  // tenant refusal, `200`) carries a fixed `reason`. It is thrown with the
+  // status it came with, `200`, which no failed request has, so the palette
+  // can show it and nothing else. Only a search throws: the namespace and
+  // asset lists of other pages keep reading the empty answer as before.
+  if (q && json?.supported === false) {
+    throw new ServiceError("unavailable", json.reason ?? "Catalog search is unavailable", res.status);
+  }
   return json;
 }
 

@@ -114,7 +114,7 @@ use uuid::Uuid;
 use super::catalog::registered_slug;
 use super::catalog_source::{PresenceUnknown, iceberg_table_presence};
 use super::governance::{IngestRunRow, ingest_runs_or_empty};
-use super::lakehouse::is_unknown_table_error;
+use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -189,7 +189,7 @@ const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Dagster job that loads an uploaded file
 /// (`dagster/dispar_orchestrate/file_ingest.py`).
-const FILE_INGEST_JOB: &str = "file_ingest_job";
+pub(super) const FILE_INGEST_JOB: &str = "file_ingest_job";
 
 /// The longest raw table name accepted, in characters. The console's rule has
 /// no bound; this one keeps a name that is a path segment of the table's
@@ -1023,6 +1023,14 @@ impl<'a> Settler<'a> {
     }
 }
 
+/// Settle one upload that is `ingesting`, through the same recording path a
+/// reader's list or page uses ([`Settler`]), for the run-failed event
+/// (`SRC-7` F6): an upload nobody opens would otherwise stay `ingesting`
+/// after its run failed. Returns the row as it is afterwards.
+pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: Upload) -> Upload {
+    Settler::new(state, pool).settle(row).await
+}
+
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most
 /// [`LIST_LIMIT`]. A caller in no tenant gets an empty list, never another
 /// tenant's. A loading upload is settled first.
@@ -1432,8 +1440,15 @@ async fn table_exists(state: &AppState, table: &str) -> Result<bool, PresenceUnk
     match registered_slug(&state.clickhouse, table).await {
         Ok(Some(_)) => return Ok(true),
         Ok(None) => {}
-        // No registry table yet means nothing has ever been registered.
-        Err(ChError::Server(body)) if is_unknown_table_error(&body) => {}
+        // No registry table yet means nothing has ever been registered. On a
+        // fresh install the whole `lake` database is absent too (`Code: 81`):
+        // the orchestrator's `register_bronze_table` creates the database and
+        // both registry tables (`EXPECTED_SCHEMAS`, their single owner) before
+        // its first write, so an upload may be the first thing a tenant does.
+        // SRC-9 finding G4. An absent registry holds no name, so nothing is
+        // claimed here; the Iceberg half below still runs, and every other
+        // error stays `Unanswered`.
+        Err(ChError::Server(body)) if is_unknown_table_or_database_error(&body) => {}
         Err(err) => {
             tracing::warn!(%err, table, "the catalog registry could not be asked about a table name");
             return Err(PresenceUnknown::Unanswered);

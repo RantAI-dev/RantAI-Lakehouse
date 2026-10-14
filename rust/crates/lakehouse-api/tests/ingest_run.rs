@@ -66,11 +66,13 @@ async fn seed_sql_connector(pool: &sqlx::PgPool, id: &str) {
          name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
          ($1, '11111111-1111-4111-8111-000000000001', \
-         'sql ingest test', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
+         $2, 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
     .bind(id)
+    // `connector_name_unique`: a test that seeds two connectors needs two names.
+    .bind(format!("sql ingest test {id}"))
     .execute(pool)
     .await
     .expect("seed a sql-adapter connector");
@@ -82,12 +84,13 @@ async fn seed_cdc_connector(pool: &sqlx::PgPool, id: &str) {
          name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
          ($1, '11111111-1111-4111-8111-000000000001', \
-         'cdc ingest test', 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
+         $2, 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
          'production', 'meridian', 'cdc', 'cdc', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\",\
          \"slotName\":\"orders_slot\",\"publicationName\":\"orders_pub\"}'::jsonb)",
     )
     .bind(id)
+    .bind(format!("cdc ingest test {id}"))
     .execute(pool)
     .await
     .expect("seed a cdc-adapter connector");
@@ -400,7 +403,7 @@ async fn ingest_spec_put_refuses_a_load_mode_the_job_cannot_run() {
         ),
         (
             json!({ "name": "public.orders", "target": "orders", "loadMode": "merge" }),
-            "replace, append or incremental",
+            "replace, append, incremental, replace_dedup, incremental_dedup or history",
         ),
     ] {
         let body = json!({
@@ -438,4 +441,371 @@ async fn ingest_spec_put_refuses_a_load_mode_the_job_cannot_run() {
             .await
             .expect("read source objects");
     assert_eq!(stored, json!([]), "nothing was saved");
+}
+
+// --- SRC-10 decision 5: a run of ONE table with an action --------------------
+
+/// Give `id` two selected tables (`public.orders`, `public.items`).
+async fn select_two_tables(pool: &sqlx::PgPool, id: &str) {
+    sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+        .bind(id)
+        .bind(json!([
+            {"name": "public.orders", "target": "orders"},
+            {"name": "public.items", "target": "items"},
+        ]))
+        .execute(pool)
+        .await
+        .expect("selected tables");
+}
+
+async fn post_run(
+    app: &TestApp,
+    cookie: &str,
+    id: &str,
+    body: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/connectors/{id}/ingest/run"))
+        .header("cookie", cookie);
+    let payload = match body {
+        Some(text) => {
+            request = request.header("content-type", "application/json");
+            Body::from(text.to_owned())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .router
+        .clone()
+        .oneshot(request.body(payload).expect("build request"))
+        .await
+        .expect("router never fails a request outright");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A `Dagster` mock that answers the run list with `runs` and launches `run_id`.
+async fn dagster_that_launches(runs: Value, run_id: &str) -> MockServer {
+    let server = MockServer::start().await;
+    mount_recent_runs(&server, runs).await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": run_id } } }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The run config of every `launchRun` the mock received.
+async fn launched_configs(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .expect("request log")
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter(|body| {
+            body["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("launchRun"))
+        })
+        .map(|body| body["variables"]["cfg"].clone())
+        .collect()
+}
+
+/// `SRC-10` decision 5: each action reaches the orchestrator as `object` and
+/// `action` beside `connector_id` under the same op config key, the answer is the
+/// run id as before, and the audit event names the table and the action.
+#[tokio::test]
+async fn a_run_of_one_table_sends_object_and_action_to_the_orchestrator_and_is_audited() {
+    for action in ["refresh_keep", "refresh_remove", "clear"] {
+        let server = dagster_that_launches(json!([]), "run-one-table").await;
+        let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+        let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+        seed_sql_connector(&app.pool, "conn-one-table").await;
+        select_two_tables(&app.pool, "conn-one-table").await;
+
+        let body = json!({"object": "public.orders", "action": action}).to_string();
+        let (status, answer) = post_run(&app, &cookie, "conn-one-table", Some(&body)).await;
+
+        assert_eq!(status, StatusCode::OK, "{action}: {answer}");
+        assert_eq!(answer, json!({"runId": "run-one-table"}), "{action}");
+        assert_eq!(
+            launched_configs(&server).await,
+            vec![json!({"ops": {"run_ingest": {"config": {
+                "connector_id": "conn-one-table",
+                "object": "public.orders",
+                "action": action,
+            }}}})],
+            "{action}"
+        );
+        let (events, args): (i64, Option<Value>) = sqlx::query_as(
+            "SELECT count(*), max(args::text)::jsonb FROM audit_event \
+             WHERE resource_id = 'conn-one-table' AND action = $1",
+        )
+        .bind(format!("connector.ingest.{action}"))
+        .fetch_one(&app.pool)
+        .await
+        .expect("audit rows");
+        assert_eq!(events, 1, "{action}");
+        let args = args.expect("args");
+        assert_eq!(args["object"], "public.orders", "{action}");
+        assert_eq!(args["action"], action);
+    }
+}
+
+/// An empty body, and `{}`, are the run of every table: the config holds the
+/// connector id and nothing else, as before `SRC-10`, and nothing is audited.
+#[tokio::test]
+async fn a_run_without_a_body_sends_only_the_connector_id() {
+    for body in [None, Some(""), Some("{}")] {
+        let server = dagster_that_launches(json!([]), "run-all").await;
+        let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+        let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+        seed_sql_connector(&app.pool, "conn-all-tables").await;
+
+        let (status, answer) = post_run(&app, &cookie, "conn-all-tables", body).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}: {answer}");
+        assert_eq!(
+            launched_configs(&server).await,
+            vec![json!({"ops": {"run_ingest": {"config": {"connector_id": "conn-all-tables"}}}})],
+            "{body:?}"
+        );
+        let (events,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM audit_event WHERE resource_id = 'conn-all-tables' \
+             AND action LIKE 'connector.ingest.%'",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .expect("audit rows");
+        assert_eq!(events, 0, "{body:?}");
+    }
+}
+
+/// A bad body is a 400 and launches nothing: unknown fields, one of the two
+/// fields alone, an action that does not exist, a blank table.
+#[tokio::test]
+async fn a_bad_run_body_is_a_400_and_launches_nothing() {
+    let server = dagster_that_launches(json!([]), "never").await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-bad-body").await;
+    select_two_tables(&app.pool, "conn-bad-body").await;
+
+    for body in [
+        r#"{"object":"public.orders","action":"clear","extra":1}"#,
+        r#"{"object":"public.orders"}"#,
+        r#"{"action":"clear"}"#,
+        r#"{"object":"public.orders","action":"drop_everything"}"#,
+        r#"{"object":"  ","action":"clear"}"#,
+        r#"{"object":null,"action":"clear"}"#,
+        "not json",
+    ] {
+        let (status, answer) = post_run(&app, &cookie, "conn-bad-body", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
+    }
+    assert!(launched_configs(&server).await.is_empty());
+}
+
+/// A table the connector does not load is a 404 with a fixed text that repeats
+/// nothing from the request; nothing is launched.
+#[tokio::test]
+async fn a_table_the_connector_does_not_load_is_a_404_with_a_fixed_message() {
+    let server = dagster_that_launches(json!([]), "never").await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-no-such-table").await;
+    select_two_tables(&app.pool, "conn-no-such-table").await;
+
+    let body = json!({"object": "public.secret_payroll", "action": "clear"}).to_string();
+    let (status, answer) = post_run(&app, &cookie, "conn-no-such-table", Some(&body)).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(answer["error"], "This connector does not load that table.");
+    assert!(launched_configs(&server).await.is_empty());
+}
+
+/// `SRC-8` observation step: a table that waits for a schema decision cannot be
+/// refreshed or cleared, whichever the action; a table that does not wait can,
+/// and a waiting OTHER table does not block it.
+#[tokio::test]
+async fn a_table_that_waits_for_a_schema_decision_cannot_be_refreshed_or_cleared() {
+    let server = dagster_that_launches(json!([]), "run-ok").await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-waits").await;
+    select_two_tables(&app.pool, "conn-waits").await;
+    sqlx::query(
+        "INSERT INTO connector_schema_change \
+         (id, connector_id, object_name, kind, column_name, before_value, after_value, breaking, \
+          status, detected_at) \
+         VALUES ('chg-1', 'conn-waits', 'public.orders', 'column_removed', 'note', 'text', NULL, \
+                 true, 'pending', now())",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("a waiting change");
+
+    for action in ["refresh_keep", "refresh_remove", "clear"] {
+        let body = json!({"object": "public.orders", "action": action}).to_string();
+        let (status, answer) = post_run(&app, &cookie, "conn-waits", Some(&body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}");
+        assert_eq!(
+            answer["error"],
+            "This table is waiting for a schema decision, so it cannot be refreshed or cleared \
+             yet. Approve or resolve the change first.",
+            "{action}"
+        );
+    }
+    assert!(launched_configs(&server).await.is_empty());
+
+    let body = json!({"object": "public.items", "action": "clear"}).to_string();
+    let (status, answer) = post_run(&app, &cookie, "conn-waits", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// The existing 409s come first: a run already going is the answer even for a
+/// table the connector does not load, and a paused connector starts nothing.
+#[tokio::test]
+async fn the_409s_for_a_run_going_and_a_paused_connector_are_answered_before_the_body_is_judged() {
+    let server = dagster_that_launches(
+        json!([ingest_run_for(
+            "conn-busy-table",
+            "7bd3a0c4-busy",
+            "STARTED"
+        )]),
+        "never",
+    )
+    .await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-busy-table").await;
+    select_two_tables(&app.pool, "conn-busy-table").await;
+
+    let body = json!({"object": "public.not_selected", "action": "clear"}).to_string();
+    let (status, answer) = post_run(&app, &cookie, "conn-busy-table", Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("already running")
+    );
+
+    seed_sql_connector(&app.pool, "conn-paused-table").await;
+    select_two_tables(&app.pool, "conn-paused-table").await;
+    sqlx::query(
+        "UPDATE connector SET paused_reason = 'paused by a test', paused_at = now() WHERE id = $1",
+    )
+    .bind("conn-paused-table")
+    .execute(&app.pool)
+    .await
+    .expect("pause");
+    let (status, answer) = post_run(&app, &cookie, "conn-paused-table", Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(answer["error"].as_str().unwrap().contains("paused"));
+    assert!(launched_configs(&server).await.is_empty());
+}
+
+/// A `cdc` connector answers the honest `supported: false` also for a run of one
+/// table, and so does a stream connector; neither calls the orchestrator.
+#[tokio::test]
+async fn cdc_and_stream_connectors_answer_supported_false_for_a_run_of_one_table() {
+    let app = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_cdc_connector(&app.pool, "conn-cdc-table").await;
+    seed_sql_connector(&app.pool, "conn-stream-table").await;
+    sqlx::query("UPDATE connector SET ingest_mode = 'stream', source_objects = $2 WHERE id = $1")
+        .bind("conn-stream-table")
+        .bind(json!([{"name": "public.orders", "target": "orders"}]))
+        .execute(&app.pool)
+        .await
+        .expect("stream mode");
+
+    let body = json!({"object": "public.orders", "action": "clear"}).to_string();
+    for id in ["conn-cdc-table", "conn-stream-table"] {
+        let (status, answer) = post_run(&app, &cookie, id, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+        assert_eq!(answer["supported"], false, "{id}");
+        assert!(
+            answer["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "{id}"
+        );
+    }
+}
+
+/// Decision 7: the same permission as "Run now". A caller without
+/// `connector:manage` is refused before the body is read.
+#[tokio::test]
+async fn a_run_of_one_table_needs_connector_manage() {
+    let server = dagster_that_launches(json!([]), "never").await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    seed_sql_connector(&app.pool, "conn-no-permission").await;
+    select_two_tables(&app.pool, "conn-no-permission").await;
+    let user = common::create_principal_with_permissions(&app.pool, "ingest:read").await;
+    let cookie = common::session_cookie_for_user(&app.pool, user).await;
+
+    let body = json!({"object": "public.orders", "action": "clear"}).to_string();
+    let (status, _) = post_run(&app, &cookie, "conn-no-permission", Some(&body)).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(launched_configs(&server).await.is_empty());
+}
+
+/// `GET .../ingest/runs` names the table and the action of a run of one table,
+/// and `null` for a run of every table.
+#[tokio::test]
+async fn the_run_list_names_the_table_and_the_action_of_a_run_of_one_table() {
+    let server = MockServer::start().await;
+    mount_recent_runs(
+        &server,
+        json!([
+            {
+                "runId": "run-clear", "status": "SUCCESS", "startTime": 1_790_670_111.0,
+                "endTime": 1_790_670_153.0,
+                "runConfig": { "ops": { "run_ingest": { "config": {
+                    "connector_id": "conn-run-list", "object": "public.orders", "action": "clear"
+                } } } }
+            },
+            ingest_run_for("conn-run-list", "run-all", "SUCCESS"),
+        ]),
+    )
+    .await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    seed_sql_connector(&app.pool, "conn-run-list").await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/connectors/conn-run-list/ingest/runs")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let runs: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(runs[0]["runId"], "run-clear");
+    assert_eq!(runs[0]["object"], "public.orders");
+    assert_eq!(runs[0]["action"], "clear");
+    assert_eq!(runs[1]["runId"], "run-all");
+    assert_eq!(runs[1]["object"], Value::Null);
+    assert_eq!(runs[1]["action"], Value::Null);
 }

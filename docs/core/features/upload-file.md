@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Data (Sources) |
 | Backlog | `DATA-9` |
-| Status | In build. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 and Parquet files 2026-10-08 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions not yet signed) |
+| Status | In Acceptance for CSV and text (#71, #73); checklist not run. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 and Parquet files 2026-10-08 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions not yet signed) |
 | Plan | `docs/superpowers/plans/2026-10-02-upload-file.md` |
 
 ## Problem

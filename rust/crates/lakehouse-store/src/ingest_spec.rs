@@ -971,9 +971,10 @@ pub enum IngestSpecError {
 
 /// How one run's rows meet the Bronze table they land in. Mirrors
 /// `LOAD_MODES` in `dagster/dispar_orchestrate/adapters/sink.py`, which is
-/// what acts on it; the wire form is the lowercase name.
+/// what acts on it; the wire form is the snake-case name (`SRC-10`: the two
+/// deduplicating modes are `replace_dedup` and `incremental_dedup`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LoadMode {
     /// Overwrite the table with what the source returns now.
     Replace,
@@ -981,6 +982,40 @@ pub enum LoadMode {
     Append,
     /// Add only rows beyond the cursor column's last seen value.
     Incremental,
+    /// Overwrite the table with what the source returns now, keeping one
+    /// row per [`SourceObject::primary_key`] (`SRC-10`).
+    ReplaceDedup,
+    /// Merge the rows beyond the cursor column's last seen value into the
+    /// table on [`SourceObject::primary_key`] (`SRC-10`).
+    IncrementalDedup,
+    /// Keep every version of a row: a changed row is closed and a new
+    /// version added, each with the time of the load that saw it
+    /// (`SRC-10` decisions 1, 9 and 10). Reads the whole source on every
+    /// run, so it takes a key and no cursor.
+    History,
+}
+
+impl LoadMode {
+    /// Whether the mode keeps one row per key, and so needs a key.
+    #[must_use]
+    pub const fn is_dedup(self) -> bool {
+        matches!(self, Self::ReplaceDedup | Self::IncrementalDedup)
+    }
+
+    /// Whether the mode identifies rows by [`SourceObject::primary_key`]: the
+    /// deduplicating modes and `history`. A column of that key removed at the
+    /// source breaks the table under every one of them (`SRC-10` decision 6).
+    #[must_use]
+    pub const fn needs_key(self) -> bool {
+        self.is_dedup() || matches!(self, Self::History)
+    }
+
+    /// Whether the mode reads only rows beyond a cursor, and so needs a
+    /// cursor column and an adapter that can filter by one.
+    #[must_use]
+    pub const fn is_incremental(self) -> bool {
+        matches!(self, Self::Incremental | Self::IncrementalDedup)
+    }
 }
 
 /// One object (table, endpoint, sheet range) an ingest job targets.
@@ -996,6 +1031,11 @@ pub struct SourceObject {
     /// job then replaces.
     #[serde(default)]
     pub load_mode: Option<LoadMode>,
+    /// The columns that identify one row, for the deduplicating modes
+    /// (`SRC-10`). Kept on the object whatever the mode, so the console
+    /// can hold on to a detected key while the user switches modes.
+    #[serde(default)]
+    pub primary_key: Option<Vec<String>>,
     /// The Bronze target this object lands at.
     pub target: String,
 }
@@ -1004,34 +1044,107 @@ pub struct SourceObject {
 /// identifier (`PostgreSQL` 63, `MySQL` 64, SQL Server 128).
 const MAX_INCREMENTAL_KEY_LEN: usize = 128;
 
+/// The most columns a `primaryKey` may name (`SRC-10`).
+const MAX_PRIMARY_KEY_COLUMNS: usize = 16;
+
+/// The longest column name in a `primaryKey`, as for the cursor column.
+const MAX_PRIMARY_KEY_COLUMN_LEN: usize = 128;
+
+/// The columns a `history` table adds (`SRC-10` decision 1). Mirrors
+/// `HISTORY_COLUMNS` in `dagster/dispar_orchestrate/adapters/history.py`.
+const HISTORY_COLUMNS: [&str; 4] = ["_valid_from", "_valid_to", "_is_current", "_row_hash"];
+
 /// Why a spec's `sourceObjects` cannot be ingested as written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidLoadMode {
     /// `loadMode` is not a [`LoadMode`].
-    #[error("source object {name:?} has loadMode {mode:?}; use replace, append or incremental")]
+    #[error(
+        "source object {name:?} has loadMode {mode:?}; use replace, append, incremental, \
+         replace_dedup, incremental_dedup or history"
+    )]
     Unknown {
         /// The source object's name.
         name: String,
         /// The offending value, as sent.
         mode: String,
     },
-    /// `incremental` for an adapter the ingest job does not run it for.
+    /// `incremental` or `incremental_dedup` for an adapter the ingest job
+    /// does not run it for.
     #[error(
-        "source object {name:?} asks for loadMode incremental, which only SQL connectors support"
+        "source object {name:?} asks for an incremental loadMode, which only SQL connectors support"
     )]
     NotForAdapter {
         /// The source object's name.
         name: String,
     },
-    /// `incremental` without a usable cursor column.
+    /// `incremental` or `incremental_dedup` without a usable cursor column.
     #[error(
-        "source object {name:?} asks for loadMode incremental, which needs incrementalKey: the \
+        "source object {name:?} asks for an incremental loadMode, which needs incrementalKey: the \
          column that marks new rows"
     )]
     NoCursor {
         /// The source object's name.
         name: String,
     },
+    /// `replace_dedup` or `incremental_dedup` without a key (`SRC-10`).
+    #[error(
+        "source object {name:?} asks for a deduplicating loadMode, which needs primaryKey: the \
+         columns that identify one row"
+    )]
+    NoKey {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with an `incrementalKey` (`SRC-10` decision 10): this version
+    /// reads the whole source on every run.
+    #[error(
+        "source object {name:?} asks for loadMode history, which reads the whole source on every \
+         run and takes no incrementalKey"
+    )]
+    HistoryHasCursor {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with a key column named like one of the columns the mode adds
+    /// to the table (`SRC-10` decision 1).
+    #[error(
+        "source object {name:?} asks for loadMode history, whose primaryKey cannot name _valid_from, \
+         _valid_to, _is_current or _row_hash: the mode adds those columns"
+    )]
+    ReservedKeyColumn {
+        /// The source object's name.
+        name: String,
+    },
+    /// A `primaryKey` that is not a short list of plain, distinct column
+    /// names (`SRC-10`). Checked whatever the mode.
+    #[error(
+        "source object {name:?} has a primaryKey that is not a list of at most 16 distinct, \
+         non-blank column names of at most 128 characters without control characters"
+    )]
+    BadKey {
+        /// The source object's name.
+        name: String,
+    },
+}
+
+/// Whether `columns` is a key the loader can use: 1 to
+/// [`MAX_PRIMARY_KEY_COLUMNS`] distinct names, none blank, none longer than
+/// [`MAX_PRIMARY_KEY_COLUMN_LEN`], none with a control character. A name is
+/// compared and sent as written, so no trimming hides a difference between
+/// two columns.
+fn key_is_usable(columns: &[serde_json::Value]) -> bool {
+    if columns.is_empty() || columns.len() > MAX_PRIMARY_KEY_COLUMNS {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    columns.iter().all(|column| {
+        column.as_str().is_some_and(|name| {
+            !name.trim().is_empty()
+                && name.len() <= MAX_PRIMARY_KEY_COLUMN_LEN
+                && !name.chars().any(char::is_control)
+                && seen.insert(name)
+        })
+    })
 }
 
 /// Check each source object's load mode, the one part of `sourceObjects`
@@ -1042,8 +1155,10 @@ pub enum InvalidLoadMode {
 /// # Errors
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
-/// `loadMode`, or with `incremental` on a non-`sql` adapter or without a
-/// cursor column that is a plain name of sensible length.
+/// `loadMode`, with an incremental mode on a non-`sql` adapter or without a
+/// cursor column that is a plain name of sensible length, with a
+/// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
+/// not a usable key.
 pub fn validate_load_modes(
     adapter: &str,
     source_objects: &serde_json::Value,
@@ -1057,6 +1172,16 @@ pub fn validate_load_modes(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // SRC-10: a malformed `primaryKey` is refused whatever the mode, so a
+        // bad key cannot sit in a spec until the user switches to a mode that
+        // reads it. A well-formed one on a mode that does not use it is
+        // accepted and ignored: the console keeps the detected key on the
+        // table while the user switches modes.
+        let has_key = match object.get("primaryKey") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Array(columns)) if key_is_usable(columns) => true,
+            Some(_) => return Err(InvalidLoadMode::BadKey { name }),
+        };
         let mode = match object.get("loadMode") {
             None | Some(serde_json::Value::Null) => continue,
             Some(value) => match LoadMode::deserialize(value) {
@@ -1071,7 +1196,32 @@ pub fn validate_load_modes(
                 }
             },
         };
-        if mode != LoadMode::Incremental {
+        if mode.needs_key() && !has_key {
+            return Err(InvalidLoadMode::NoKey { name });
+        }
+        if mode == LoadMode::History {
+            // `SRC-10` decision 10: no cursor in this version. A blank cursor
+            // is what the console sends when the field is empty, so only a
+            // value is refused.
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .map_or("", str::trim);
+            if !cursor.is_empty() {
+                return Err(InvalidLoadMode::HistoryHasCursor { name });
+            }
+            let names_reserved = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|column| HISTORY_COLUMNS.contains(&column));
+            if names_reserved {
+                return Err(InvalidLoadMode::ReservedKeyColumn { name });
+            }
+        }
+        if !mode.is_incremental() {
             continue;
         }
         if adapter != "sql" {
@@ -1089,6 +1239,94 @@ pub fn validate_load_modes(
         }
     }
     Ok(())
+}
+
+/// The key columns of every object whose stored load mode has a key (the
+/// deduplicating modes and `history`, [`LoadMode::needs_key`]), by
+/// object name (`SRC-10` decision 6). Read by the schema-change code from the
+/// STORED spec, never from what the orchestrator reports, so a request cannot
+/// claim a table has no key. Lenient: an object [`validate_load_modes`] would
+/// refuse cannot be in a stored spec, and a malformed one simply has no entry
+/// (treated as non-deduplicating, as before `SRC-10`).
+#[must_use]
+pub fn dedup_keys(
+    source_objects: &serde_json::Value,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut keys = std::collections::HashMap::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let is_dedup = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(LoadMode::needs_key);
+        if !is_dedup {
+            continue;
+        }
+        let key: Vec<String> = object
+            .get("primaryKey")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|column| column.as_str().map(str::to_owned))
+            .collect();
+        keys.insert(name.to_owned(), key);
+    }
+    keys
+}
+
+/// `text` as a lower-case SQL-safe slug: every run of characters outside
+/// `[a-z0-9]` becomes one `_`, and leading and trailing `_` are dropped.
+fn bronze_slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut separator_pending = false;
+    for c in text.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if separator_pending && !out.is_empty() {
+                out.push('_');
+            }
+            separator_pending = false;
+            out.push(c);
+        } else {
+            separator_pending = true;
+        }
+    }
+    out
+}
+
+/// The Bronze table a source object lands in unless a person renames it:
+/// `<connector>_<table>` (`SRC-8` task 8, decision D2).
+///
+/// Every connector writes into the same flat `bronze` namespace, so two
+/// connectors that both have an `orders` table would otherwise append into
+/// one `bronze.orders`. `object_name` is `schema.table`; only its last
+/// dot-separated part is used.
+///
+/// THE SAME RULE AS THE CONSOLE'S TABLE PICKER: this is a port of
+/// `defaultTarget` in `src/features/connectors/connector-ingest-panel.tsx`.
+/// Keep both in step; each has a test that pins the same three examples
+/// (`northwind`/`public.orders`, `Northwind DB!`/`public.Order Details`,
+/// `2024 sales`/`t`).
+#[must_use]
+pub fn default_bronze_target(connector_name: &str, object_name: &str) -> String {
+    let table = bronze_slug(object_name.rsplit('.').next().unwrap_or(object_name));
+    let prefix = bronze_slug(connector_name);
+    let joined = [prefix, table]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let joined = if joined.is_empty() {
+        "table".to_owned()
+    } else {
+        joined
+    };
+    if joined.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("t_{joined}")
+    } else {
+        joined
+    }
 }
 
 /// This [`SourceObject`] failed application-level validation.
@@ -1346,6 +1584,35 @@ mod tests {
 
     use super::*;
 
+    /// The same examples `connector-ingest-panel.test.tsx` pins for
+    /// `defaultTarget` (the console's table picker): the two must agree.
+    #[test]
+    fn the_default_bronze_target_matches_the_console_pickers_examples() {
+        assert_eq!(
+            default_bronze_target("northwind", "public.orders"),
+            "northwind_orders"
+        );
+        assert_eq!(
+            default_bronze_target("Northwind DB!", "public.Order Details"),
+            "northwind_db_order_details"
+        );
+        assert_eq!(default_bronze_target("2024 sales", "t"), "t_2024_sales_t");
+    }
+
+    #[test]
+    fn the_default_bronze_target_falls_back_the_way_the_picker_does() {
+        // No usable connector name: the table alone.
+        assert_eq!(default_bronze_target("!!!", "dbo.Orders"), "orders");
+        // No usable table part: the connector alone.
+        assert_eq!(default_bronze_target("shop", "public."), "shop");
+        // Nothing usable at all.
+        assert_eq!(default_bronze_target("", "..."), "table");
+        // A name without a schema is its own table part.
+        assert_eq!(default_bronze_target("shop", "orders"), "shop_orders");
+        // Runs of separators collapse and edges are trimmed.
+        assert_eq!(default_bronze_target("  a--b  ", "s.__x__y__"), "a_b_x_y");
+    }
+
     #[test]
     fn sql_dial_parses_the_documented_shape() {
         let json = serde_json::json!({
@@ -1479,6 +1746,7 @@ mod tests {
             name: "public.orders".to_owned(),
             incremental_key: None,
             load_mode: None,
+            primary_key: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1491,6 +1759,7 @@ mod tests {
             name: "public.orders".to_owned(),
             incremental_key: Some("updated_at".to_owned()),
             load_mode: Some(LoadMode::Incremental),
+            primary_key: None,
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
@@ -1554,6 +1823,254 @@ mod tests {
             ),
             Err(InvalidLoadMode::NotForAdapter { .. })
         ));
+    }
+
+    /// `SRC-10` decision 6: only objects in a deduplicating mode have a key
+    /// entry; a key kept on a table in another mode is not one.
+    #[test]
+    fn dedup_keys_lists_only_the_deduplicating_objects() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+            {"name": "b", "target": "b", "loadMode": "incremental_dedup", "primaryKey": ["x", "y"],
+             "incrementalKey": "u"},
+            {"name": "c", "target": "c", "loadMode": "replace", "primaryKey": ["id"]},
+            {"name": "d", "target": "d", "primaryKey": ["id"]},
+            {"target": "e", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["a"], vec!["id".to_owned()]);
+        assert_eq!(keys["b"], vec!["x".to_owned(), "y".to_owned()]);
+        assert!(dedup_keys(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn source_object_reads_the_deduplicating_modes_and_a_primary_key() {
+        let object: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders", "loadMode": "incremental_dedup",
+            "incrementalKey": "updated_at", "primaryKey": ["id", "line"]
+        }))
+        .expect("valid");
+        assert_eq!(object.load_mode, Some(LoadMode::IncrementalDedup));
+        assert_eq!(
+            object.primary_key,
+            Some(vec!["id".to_owned(), "line".to_owned()])
+        );
+        let replace: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"]
+        }))
+        .expect("valid");
+        assert_eq!(replace.load_mode, Some(LoadMode::ReplaceDedup));
+        let none: SourceObject =
+            serde_json::from_value(serde_json::json!({ "name": "a", "target": "a" }))
+                .expect("valid");
+        assert_eq!(none.primary_key, None);
+    }
+
+    #[test]
+    fn validate_load_modes_accepts_a_deduplicating_mode_with_a_key() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"] },
+            { "name": "b", "target": "b", "loadMode": "incremental_dedup",
+              "incrementalKey": "updated_at", "primaryKey": ["id", "line"] },
+        ]);
+        assert_eq!(validate_load_modes("sql", &objects), Ok(()));
+        // `replace_dedup` runs on every batch adapter, `incremental_dedup` on `sql` only.
+        let replace = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"] },
+        ]);
+        assert_eq!(validate_load_modes("files", &replace), Ok(()));
+    }
+
+    #[test]
+    fn validate_load_modes_refuses_a_deduplicating_mode_without_a_key() {
+        for mode in ["replace_dedup", "incremental_dedup"] {
+            for object in [
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u" }),
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u", "primaryKey": [] }),
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u", "primaryKey": null }),
+            ] {
+                assert!(
+                    matches!(
+                        validate_load_modes("sql", &serde_json::json!([object])),
+                        Err(InvalidLoadMode::NoKey { .. } | InvalidLoadMode::BadKey { .. })
+                    ),
+                    "{mode} without a key must be refused"
+                );
+            }
+        }
+        assert!(matches!(
+            validate_load_modes(
+                "sql",
+                &serde_json::json!([{ "name": "a", "target": "a", "loadMode": "replace_dedup" }])
+            ),
+            Err(InvalidLoadMode::NoKey { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_load_modes_requires_sql_and_a_cursor_for_incremental_dedup_as_for_incremental() {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        assert!(matches!(
+            check(
+                "rest",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "incrementalKey": "id", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "incrementalKey": " ", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+    }
+
+    /// `SRC-10` sixth pass, decisions 1 and 10: `history` needs a key, runs on every
+    /// batch adapter, takes no cursor and cannot key on a column it adds.
+    #[test]
+    fn validate_load_modes_for_history_needs_a_key_takes_no_cursor_and_keeps_its_own_columns_free()
+    {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        let history = |extra: serde_json::Value| {
+            let mut object =
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" });
+            for (field, value) in extra.as_object().into_iter().flatten() {
+                object[field] = value.clone();
+            }
+            object
+        };
+        for adapter in ["sql", "files", "rest", "mongodb", "sftp"] {
+            assert_eq!(
+                check(
+                    adapter,
+                    history(serde_json::json!({ "primaryKey": ["id", "line"] }))
+                ),
+                Ok(()),
+                "history on {adapter}"
+            );
+        }
+        // A blank cursor is what an empty console field sends: not a cursor.
+        assert_eq!(
+            check(
+                "sql",
+                history(serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "  " }))
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            check("sql", history(serde_json::json!({}))),
+            Err(InvalidLoadMode::NoKey { .. })
+        ));
+        assert!(matches!(
+            check("sql", history(serde_json::json!({ "primaryKey": [] }))),
+            Err(InvalidLoadMode::BadKey { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                history(
+                    serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "updated_at" })
+                )
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        for reserved in ["_valid_from", "_valid_to", "_is_current", "_row_hash"] {
+            assert!(
+                matches!(
+                    check(
+                        "sql",
+                        history(serde_json::json!({ "primaryKey": ["id", reserved] }))
+                    ),
+                    Err(InvalidLoadMode::ReservedKeyColumn { .. })
+                ),
+                "{reserved} in the key"
+            );
+        }
+        // Another mode may keep such a name in its key: only `history` adds the columns.
+        assert_eq!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "replace_dedup",
+                    "primaryKey": ["_valid_from"] })
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-10` decision 6 for `history`: its key is read like a dedup table's, so a
+    /// removed key column waits and cannot be approved (the same code path).
+    #[test]
+    fn dedup_keys_lists_a_history_object_with_its_key() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]},
+            {"name": "r", "target": "r", "loadMode": "replace", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get("h"), Some(&vec!["id".to_owned()]));
+        let object = SourceObject::deserialize(&serde_json::json!({
+            "name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]
+        }))
+        .expect("valid");
+        assert_eq!(object.load_mode, Some(LoadMode::History));
+        assert!(LoadMode::History.needs_key() && !LoadMode::History.is_dedup());
+        assert!(!LoadMode::History.is_incremental());
+    }
+
+    #[test]
+    fn validate_load_modes_refuses_a_primary_key_that_is_not_a_short_list_of_plain_distinct_names()
+    {
+        let too_many: Vec<String> = (0..17).map(|n| format!("c{n}")).collect();
+        let sixteen: Vec<String> = (0..16).map(|n| format!("c{n}")).collect();
+        let long = "x".repeat(129);
+        let longest = "x".repeat(128);
+        let bad = |key: serde_json::Value| {
+            matches!(
+                validate_load_modes(
+                    "sql",
+                    &serde_json::json!([{ "name": "a", "target": "a", "primaryKey": key }])
+                ),
+                Err(InvalidLoadMode::BadKey { .. })
+            )
+        };
+        assert!(bad(serde_json::json!(too_many)), "17 columns");
+        assert!(bad(serde_json::json!([])), "no column");
+        assert!(bad(serde_json::json!([long])), "129 characters");
+        assert!(bad(serde_json::json!([""])), "empty");
+        assert!(bad(serde_json::json!(["  "])), "blank");
+        assert!(bad(serde_json::json!(["a\nb"])), "control character");
+        assert!(bad(serde_json::json!(["id", "id"])), "repeated");
+        assert!(bad(serde_json::json!(["id", 7])), "not a string");
+        assert!(bad(serde_json::json!("id")), "not a list");
+        assert!(!bad(serde_json::json!(sixteen)), "16 columns are allowed");
+        assert!(
+            !bad(serde_json::json!([longest])),
+            "128 characters are allowed"
+        );
+    }
+
+    #[test]
+    fn validate_load_modes_accepts_and_ignores_a_primary_key_on_a_mode_that_does_not_use_it() {
+        // The console keeps the key it detected while the user switches modes.
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "append", "primaryKey": ["id"] },
+            { "name": "b", "target": "b", "primaryKey": ["id"] },
+        ]);
+        assert_eq!(validate_load_modes("sql", &objects), Ok(()));
     }
 
     #[test]
