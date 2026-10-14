@@ -380,6 +380,39 @@ Only `src/` was touched. **Commit** (task 7): `0db25b17` `SRC-11 feat(frontend):
 
 **Things the reviewer may want to look at.** (1) The Resume button sits in the Runs card, not in a banner above the tabs; the page's header pill still shows the pause. (2) Column choice needs discovery in the same visit to list columns; a saved table opened without "Find tables" shows only what is already left out. (3) The six-hour bound is mine; the plan named none.
 
+### Fix round 1 (developer, 2026-10-14, branch `feat/phase-1-rest`)
+
+Review 1 of the planner, three items. One commit each, in this order.
+
+**Commits.**
+
+1. `046e68aa` `SRC-11 fix(api,store): make the SRC-11 Rust code compile and pass clippy` (BLOCKER 1).
+2. `35ba4395` `SRC-11 fix(api,store,dagster,frontend): the run record names the table of a refresh or clear` (BLOCKER 2).
+3. `9ed760dc` `SRC-11 fix(api,dagster): tag a person's ingest launch lakehouse/trigger: user` (SHOULD-FIX 1).
+
+**BLOCKER 1.** Fixed at: `ingest_spec.rs` (the `target_identity_tests` module now imports `validate_excluded_columns`, `InvalidExcludedColumns`, `SourceObject`, `supports_column_choice`, `inactive_exclusions`); `routes/load_alerts.rs` (the failed-run alerts moved to `deliver_failure_alerts`, `connector_run_event` is under 100 lines); `routes/mod.rs` (`connectors_router` split, the tenant-gated half is `per_connector_router`, as `pipelines_router` is split from its parent). One more clippy finding found by reading, not in the CI log: `tests/connector_run.rs` `fn failed<'a>(table: &'a str, ..) -> AttemptReport<'a>` (`needless_lifetimes`), now `AttemptReport<'_>`. I read every Rust file of `git diff --name-only dfb3048f..HEAD -- rust/` for the classes named (`&mut Transaction` to `&mut PgConnection` coercions, `Option<&str>` binds, INTEGER/BIGINT/TIMESTAMPTZ against `i32`/`i64`/`OffsetDateTime`, `doc_markdown`, `missing_const_for_fn`, `too_many_arguments`, `needless_pass_by_value`, unused imports) and found nothing else wrong: `record_run_once` has exactly 7 arguments (the limit), `insert_line` and `add_log_line` 7; visibility of `check_name`, `require_orchestrator`, `pool`, `parse_body` (all `pub(super)`) matches the new module; column types in `RunRow`/`AttemptRow`/`LineRow` match migration 0070. This was reading only; nothing was compiled.
+
+**BLOCKER 2.** Migration `0072_connector_run_table.sql` (0070 not edited): `connector_run.table_name TEXT NULL` with a CHECK that a table is only on a `refresh` or `clear` run. Store: `start_run(pool, connector, run, trigger, table: Option<&str>, at)` cleans the name like the other table names and returns `Validation` for a table on another trigger; `RunSummary.table` (`table`, null when none) is returned by `GET .../runs` and the run log. API: `StartBody.table` is checked with `check_name("table", .., MAX_TABLE_LEN)` (the attempt report's check) and answers 400 for a table on a trigger that is not `refresh`/`clear`. Orchestrator: `RunReporter.start(trigger, started_at=None, table=None)`; `run_ingest` sends the run config's `object` when the trigger is `refresh` or `clear`. Console: `ConnectorRun.table: string | null` (required, the API always sends it), the run row shows "Clear · public.orders" / "Refresh · public.customers" and just "Schedule" for a run without a table.
+
+**SHOULD-FIX 1.** `DgClient::launch_run_with_config_and_tags(job, config, &[(key, value)])` (tags in `executionMetadata.tags`, mutation declares `$tags: [ExecutionTag!]!`); `launch_run_with_config` delegates with no tags and sends the unchanged request, so `uploads.rs` and `pipelines.rs` callers are untouched. `routes/connectors.rs` `ingest_run_request` launches with `("lakehouse/trigger", "user")`. A refresh or clear launched this way is still reported as `refresh`/`clear` (the action wins over the tag in `_trigger_of`). Comments in `ingest_factory.py` that said the API sends no tag are corrected. *Not verified against a real Dagster:* the GraphQL input type names `ExecutionTag` and `executionMetadata.tags` are from the Dagster schema as I know it; the wiremock tests cannot check them (same caveat as the existing `RunConfigData!` test). The gate (task 8) is the place that would show a wrong name as a failed launch.
+
+**Commands and outcomes.**
+
+- `cargo fmt` (via `rustfmt --edition 2024 --check` on each touched `.rs` file): clean.
+- `cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q -m "not loader"`: 908 passed, 258 deselected.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings, none in files I changed.
+- `bun test src/features/connectors`: 268 pass, 0 fail (14 files). The whole suite was not run (killed by the machine's memory).
+
+**Not run.** `cargo check`, `cargo clippy`, `cargo test` and `sqlx::test`s of any crate: `/` had 8.2 GB free, under the 12 GB floor for compiling. So every Rust edit above, and the Rust tests added below, are *not verified*; the migration 0072 was not applied to any database.
+
+**Tests added or changed.**
+
+- Added (Rust, not run): `connector_run.rs` store test `a_refresh_or_clear_run_keeps_its_table_and_no_other_run_has_one`; API test `a_clear_run_lists_its_table_and_other_runs_have_none` (`routes/connector_runs.rs`); `lakehouse-dagster` test `launch_run_with_config_and_tags_sends_the_tags_as_execution_metadata`; route test `ingest_run_tags_the_launch_as_started_by_a_user` (`tests/ingest_run.rs`, the mock answers only a launch carrying the tag).
+- Added (run): Python `test_a_refresh_start_report_names_its_table_and_an_ordinary_one_sends_none`; console "names the table and the action in the run list" restored in `connector-ingest-panel.test.tsx`, adapted to run records.
+- Changed: every existing `start_run(..)` call gained the `None` table argument (store tests, `connector_runs.rs`, `load_alerts.rs` tests); `RecordingReporter.start` in `conftest.py` takes `table` and records `("start", trigger, table)` for a refresh or clear; the parametrized trigger test expects that tuple for `refresh`/`clear`; the console `record()` and overview `run()` fixtures gained `table: null`. No assertion was weakened.
+
+**Most likely to fail in CI next.** (1) Anything in the 3,900 added Rust lines that clippy `pedantic` flags and I could not see without compiling (`doc_markdown` on a CamelCase word in a doc comment, `unnecessary_wraps` on the `-> sqlx::Result<()>` tests, `uninlined_format_args`); (2) sqlx runtime type or SQL errors in the new queries, in particular `sync_excluded_columns_in` (`unnest($2::text[], $3::text[])` and the `ON CONFLICT (connector_id, object_name, column_name)` target, which depends on the primary key of 0064) and `RECORD_RUN_SQL` untouched; (3) the Dagster `ExecutionTag` input name (above); (4) `route_auth.rs` both-ways assertions for the seven new routes were not re-read against the policy table.
+
 ## Review
 
 *(planner)*
