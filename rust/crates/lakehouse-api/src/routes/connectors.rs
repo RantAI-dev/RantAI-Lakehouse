@@ -3197,14 +3197,18 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// (WS3 plan review Z9)
 ///
 /// [`lakehouse_dagster::DgClient::launch_run_with_config`] returns
-/// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`, for
-/// a GraphQL-level launch failure (a bad job name, a
+/// `Ok(LaunchOutcome { run_id: None, failure: Some(_) })`, NOT `Err`,
+/// for a GraphQL-level launch failure (a bad job name, a
 /// `RunConfigValidationInvalid`) — exactly the branching
-/// `routes::pipelines::trigger` (`pipelines.rs:184-207`) already proves
-/// out: `Err` is reserved for transport failures and malformed GraphQL
-/// responses. This handler branches the identical way: `outcome.error`
-/// present becomes a 422 with a fixed message and a reference (the launch
-/// message is only logged); `Err(err)` becomes a 503, see below.
+/// `routes::pipelines::trigger` already proves out: `Err` is reserved
+/// for transport failures and malformed GraphQL responses. This
+/// handler branches the identical way: `outcome.failure` present
+/// becomes a 422 with the fixed body string `"Dagster did not accept
+/// the ingest run"` (F2.7: Dagster's own text was logged at the
+/// dagster crate boundary), except that a job the orchestrator has not
+/// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
+/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// see below.
 ///
 /// # Errors
 ///
@@ -3367,16 +3371,21 @@ async fn launch_ingest(
         .await
     {
         Ok(outcome) => {
-            if let Some(error) = outcome.error {
+            if let Some(failure) = outcome.failure {
                 // `PR #105 CI fix` (SEC-11): "not loaded yet" is decided from
                 // Dagster's typed result, never from its text, and answered
                 // with a fixed sentence and a stable code the gates and the
-                // console retry on. The raw text goes to the log either way.
+                // console retry on.
                 if outcome.job_not_loaded {
-                    return Err(crate::upstream_error::job_not_loaded(&error).into());
+                    return Err(crate::upstream_error::job_not_loaded(&failure.as_str()).into());
                 }
-                // SEC-11: Dagster's launch message is the orchestrator's own text.
-                return Err(ApiError::Unprocessable(upstream_message(error)).into());
+                // F2.7: the 422 body is the FIXED classified string; Dagster's
+                // own `message` / `errors[].message` text was logged at the
+                // dagster crate boundary.
+                return Err(ApiError::Unprocessable(
+                    "Dagster did not accept the ingest run".to_owned(),
+                )
+                .into());
             }
             if let (Some((object, action)), Some(principal)) = (&request, principal) {
                 // The table's name and the action, never a row or a count.

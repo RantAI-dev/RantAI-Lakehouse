@@ -227,11 +227,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())",
         "StoreError's Display is fixed text and is the LateSource contract",
     ),
-    (
-        "pipelines.rs",
-        ".map_err(|err| ApiError::Unavailable(err.to_string()))?;",
-        "StoreError's Display is fixed text",
-    ),
     // pipeline_source::SourceError: written in this repository.
     (
         "pipelines.rs",
