@@ -10,9 +10,21 @@ on:
     # unverified.
     branches: [main, 'lakehouse/**']
 
+# Read-only token for every job. Nothing here writes to the repository, a
+# package registry or a PR: the image artifacts and the layer cache go
+# through the Actions runtime credentials, which a job gets whatever
+# `permissions:` says. Declaring it for the whole workflow means every run,
+# not only a fork PR's, uses the token a fork PR is handed, so a step that
+# quietly needs a write scope fails here instead of on the first fork PR
+# (CI-SPEED-PLAN §2 constraint 5). A job that ever needs more must say so
+# on its own `permissions:` block.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # F4: a push to main must finish its run; cancelling it made its ci-required read as failed.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -175,8 +187,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install ./dagster pytest==8.3.4
 
+      # The `loader` marker (dagster/pyproject.toml) holds the tests that run a real
+      # dlt pipeline against a local Iceberg table; they run in `dagster-loader-tests`.
       - name: pytest
-        run: python -m pytest dispar_orchestrate -v
+        run: python -m pytest dispar_orchestrate -v -m "not loader"
+        working-directory: dagster
+
+  dagster-loader-tests:
+    name: Dagster · loader tests
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # `dagster/dispar_orchestrate/test_maintenance.py` existed and was run
+      # by nobody — it asserts, among other things, that Bronze maintenance
+      # skips `gold.*` tables, which is a regression guard for applied
+      # maintenance running against the Gold export's data. A test that no
+      # job executes is documentation, not a guard.
+      #
+      # Installs the code location's real pinned dependencies rather than a
+      # reduced set, so the test runs against the same `dagster` version the
+      # compose image builds. That costs install time but means a passing
+      # run actually says something about the shipped artifact.
+      - name: Install the code location and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./dagster pytest==8.3.4
+
+      - name: pytest (loader)
+        run: python -m pytest dispar_orchestrate -v -m loader
         working-directory: dagster
 
   # ── Rust: fast feedback ─────────────────────────────────────────────
@@ -195,10 +243,9 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
+      # No `rust-cache` step: `cargo fmt --check` compiles nothing, so its
+      # cache held 107 MB per ref of an empty `target/` (measured 2026-10-09)
+      # while the repository's Actions cache sat at 9.9 GB of its 10 GB cap.
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -219,10 +266,17 @@ jobs:
         with:
           components: clippy
 
+      # Restore on every run, SAVE only on `main`. Measured 2026-10-09: PR #88
+      # stored its own 980 MB `build` cache next to `main`'s identical one,
+      # and the repository's Actions cache sat at 9.9 GB of its 10 GB cap,
+      # where eviction starts taking the image layer cache too (CI-SPEED-PLAN
+      # §4.2, §9). A PR still restores `main`'s cache; it just no longer adds
+      # its own copy.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -241,10 +295,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo build --locked
         run: cargo build --locked
@@ -264,10 +320,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: stable
 
       # Needed by lakehouse-bi's specs_match_typescript drift guard, which
@@ -304,10 +362,12 @@ jobs:
         with:
           toolchain: "1.88.0"
 
+      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv-1.88.0
 
       - name: cargo check --workspace --all-targets --locked
@@ -409,6 +469,107 @@ jobs:
         if: always()
         run: docker compose -p g2ci down -v
 
+  # ── Images: build each shared image ONCE per run ────────────────────
+  # CI-SPEED-PLAN §4.2. Before this job, six acceptance jobs and the Docker
+  # workflow each built `lakehouse-api` from source (a release build of
+  # ~500 crates, 8-12 minutes each) and four of them rebuilt the Dagster
+  # image too. Now they are built here and handed to every consumer as a
+  # workflow artifact; the consumers `docker load` it and start the stack
+  # with `up -d --no-build`, so a missing image fails the job instead of
+  # triggering a silent rebuild.
+  #
+  # Artifacts, not GHCR: publishing images is a separate decision
+  # (docs/CI.md), and an artifact needs no registry credential, so it works
+  # on a fork PR's read-only token too.
+  #
+  # Same `if:` as the acceptance jobs: it builds what they run.
+  images:
+    name: Images · build lakehouse-api + dagster once
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # `GIT_SHA` is deliberately NOT passed to either build, here or in the
+      # acceptance jobs' compose calls: `ARG GIT_SHA` sits near the top of
+      # `dagster/Dockerfile`, so a per-commit value would invalidate every
+      # layer below it and the cache would never hit. Both images are built
+      # with `GIT_SHA=unknown` exactly as the per-job builds were.
+      #
+      # Layer cache: READ on every run, WRITTEN only from a push to `main`.
+      # The repository's Actions cache is capped at 10 GB and was at 9.9 GB
+      # when this was written (2026-10-09, `gh api
+      # repos/.../actions/cache/usage`); a cache written by a PR is readable
+      # by that PR alone, so letting PRs write only evicts `main`'s entries.
+      # One `scope` per image so the two never overwrite each other.
+      #
+      # `CARGO_TARGET_DIR=/build/target-layer` moves cargo's `target/` out of
+      # the Dockerfile's cache mount (which this cache cannot store) and into
+      # the image layer (which it can): see the ARG comment in
+      # rust/Dockerfile. `pipeline_src` is the second build context
+      # docker-compose.yml's `additional_contexts` gives this build; without
+      # it buildx would look for an image of that name on Docker Hub.
+      - name: Build lakehouse-api image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+          tags: rantai-lakehouse-api:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-api.tar
+          cache-from: type=gha,scope=api-image
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=api-image' || '' }}
+
+      - name: Build dagster image
+        uses: docker/build-push-action@v7
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          tags: rantai-lakehouse-dagster:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-dagster.tar
+          cache-from: type=gha,scope=dagster-image
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=dagster-image' || '' }}
+
+      # zstd here, and `compression-level: 0` on the upload: the artifact
+      # service would otherwise deflate an already-compressed file a second
+      # time for nothing. The sizes are printed so a regression in artifact
+      # size (and so in every consumer's download time) is visible in the log.
+      - name: Compress image archives
+        run: |
+          cd "$RUNNER_TEMP"
+          zstd -T0 -3 --rm lakehouse-api.tar lakehouse-dagster.tar
+          ls -l lakehouse-api.tar.zst lakehouse-dagster.tar.zst
+
+      # One artifact per image, so Gold export and G8 (API image only) do
+      # not download the larger Dagster image. One-day retention: these are
+      # per-run scratch files, not build outputs anyone should fetch later.
+      - name: Upload lakehouse-api image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-lakehouse-api
+          path: ${{ runner.temp }}/lakehouse-api.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload dagster image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-lakehouse-dagster
+          path: ${{ runner.temp }}/lakehouse-dagster.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
   # ── G3a acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3) — dlt,
   # running inside Dagster, reads a real Postgres table and writes it to
   # Bronze Iceberg through Lakekeeper; the result is visible in the
@@ -417,13 +578,32 @@ jobs:
   # ops/g3a/g3a_test.py. ──
   g3a-dagster:
     name: Rust · G3a Dagster + dlt Bronze ingest
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images come from the `images` job, built once per run; this job
+      # never compiles them. `LAKEHOUSE_*_IMAGE` (job env) point compose at
+      # the loaded `:ci` tags.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -445,9 +625,17 @@ jobs:
           INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
 
+      # Fixture images are not shared artifacts: `oidc-mock` is a tiny
+      # image of its own, built from source in seconds. `up --no-build`
+      # would fail on any service that has a `build:` block and no local
+      # image, so it is built here, with the SAME `-p`/`--profile` flags as
+      # the `up` below, which is what names the image the `up` will look for.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g3aci --profile dagster build oidc-mock
+
       - name: Bring up lakehouse-api + Dagster + the G3a source table
         run: >
-          docker compose -p g3aci --profile dagster up -d --build
+          docker compose -p g3aci --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           g3a-source-init
 
@@ -470,13 +658,30 @@ jobs:
   # above; see ops/g3/g3_test.py. ──
   g3-maintenance:
     name: Rust · G3 Bronze maintenance job
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -492,9 +697,13 @@ jobs:
           INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g3ci --profile dagster build oidc-mock
+
       - name: Bring up lakehouse-api + Dagster + the G3a source table
         run: >
-          docker compose -p g3ci --profile dagster up -d --build
+          docker compose -p g3ci --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           g3a-source-init
 
@@ -525,13 +734,30 @@ jobs:
   # same reason. See ops/g4/g4_test.py. ──
   g4-cdc:
     name: Rust · G4 Debezium CDC into Bronze
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -562,13 +788,17 @@ jobs:
           OIDC_ROLE_MAP=lakehouse-analysts=Analyst
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster build oidc-mock
+
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
         # override adds the `file:` credential store and the internal-host
         # flag the connect and discover steps of the gate need).
         run: >
           docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml
-          --profile dagster up -d --build
+          --profile dagster up -d --no-build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
           g4-source-init debezium-server
@@ -617,7 +847,7 @@ jobs:
   # the other's types as `skipped`, "covered by job <name>". ──
   g6-ingest:
     name: Rust · G6 ingest matrix (SQL sources)
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
@@ -627,9 +857,26 @@ jobs:
     # minutes; the CI runs of the final commit are the measurement
     # (docs/plans/SRC-9-RESULT.md).
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         # The same nine fixture secrets as `g6-ingest-other`, though this half
@@ -658,6 +905,17 @@ jobs:
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      # This half starts the SQL fixtures only (profile `g6-sql`), so
+      # `oidc-mock` is the only fixture with a `build:` block that it needs;
+      # `rest-stub-g6` is in the `g6`/`g6-other` profiles and is built by
+      # `g6-ingest-other`. Same `-f` pair and `--profile` flags as the "up"
+      # step below.
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile dagster build oidc-mock
+
       - name: Bring up the g6 SQL matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, not a bare `up` on the activated
         # profiles: this project also activates "dagster" (for
@@ -675,7 +933,7 @@ jobs:
         # `depends_on` then skips the fixtures of the other half.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile dagster up -d --build
+          --profile g6-sql --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           g3a-source-init mysql-g6 mariadb-g6 mssql-g6 mssql-g6-cert-init
 
@@ -737,14 +995,31 @@ jobs:
   # override and same scope gate as `g6-ingest`. ──
   g6-ingest-other:
     name: Rust · G6 ingest matrix (files, APIs, streams)
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         # All nine fixture secrets although only the REST, MongoDB, Kafka and
@@ -768,13 +1043,24 @@ jobs:
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
+      # Fixture images, built here rather than shared; see `g3a-dagster`.
+      # `oidc-mock` (every stack that starts `lakehouse-api`) and
+      # `rest-stub-g6` (profile `g6-other`) are the two fixtures with a
+      # `build:` block and no `image:`. Same `-f` pair and `--profile` flags
+      # as the "up" step below (`rest-stub-g6` is invisible to `build`
+      # without them).
+      - name: Build the oidc-mock and rest-stub-g6 fixture images
+        run: >
+          docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-other --profile dagster build oidc-mock rest-stub-g6
+
       - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as `g6-ingest` explains (the dagster profile
         # also holds debezium-server). `--profile g6-other`: the runner's
         # `depends_on` skips the SQL fixtures.
         run: >
           docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-other --profile dagster up -d --build
+          --profile g6-other --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           sftp-g6 sftp-g6-hostkey-init rest-stub-g6 mongo-g6 kafka-g6
 
@@ -804,6 +1090,14 @@ jobs:
         if: always()
         run: docker compose -p g6otherci down -v
 
+      # A separate compose project has its own image names, so the fixture
+      # it needs is built again here (`oidc-mock` only: the link-local stack
+      # does not start `rest-stub-g6`).
+      - name: Build the oidc-mock fixture image for the link-local project
+        run: >
+          docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
+          --profile g6-linklocal --profile dagster build oidc-mock
+
       - name: Bring up a SEPARATE, override-free (for INGEST_ALLOW_INTERNAL_HOSTS) project for the link-local assertion
         # "Override-free" means no `ops/g6/docker-compose.g6.override.yml`
         # (that is the file that sets INGEST_ALLOW_INTERNAL_HOSTS=true —
@@ -825,7 +1119,7 @@ jobs:
         # assertion at all.
         run: >
           docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
-          --profile g6-linklocal --profile dagster up -d --build
+          --profile g6-linklocal --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon kafka-g6-spoofed
 
       - name: Run the link-local rejection test (default compose, flag unset)
@@ -851,13 +1145,30 @@ jobs:
   # ops/g6/docker-compose.g6-oracle.override.yml. Scope gate as g6-ingest. ──
   g6-oracle:
     name: Rust · G6 Oracle connector
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         # Alphanumeric on purpose: the Oracle image creates the application
@@ -875,13 +1186,22 @@ jobs:
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      # `oracle-g6` is a pinned upstream image (pulled, not built) and
+      # `g6-oracle-test-runner` uses the shared Dagster image (the override
+      # gives it the same `image:` key), so `oidc-mock` is the only build.
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
+          --profile g6-oracle --profile dagster build oidc-mock
+
       - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
         # also holds debezium-server). No mysql/mssql/mongo/kafka/mariadb/sftp
         # fixtures and no g3a-source-init: this gate loads no other connector.
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
-          --profile g6-oracle --profile dagster up -d --build
+          --profile g6-oracle --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
 
       - name: Run the G6 Oracle gate inside the compose network
@@ -919,13 +1239,30 @@ jobs:
   # ops/, scripts/ or compose runs it (scripts/ci/detect_change_scope.sh). ──
   g9-upload:
     name: Rust · G9 file upload
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -946,12 +1283,16 @@ jobs:
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g9ci --profile dagster build oidc-mock
+
       - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
         # Explicit service list, as g6-ingest explains: a bare `up` on the
         # dagster profile would also start debezium-server. clickhouse-
         # iceberg-init is named because nothing but the gate depends on it.
         run: >
-          docker compose -p g9ci --profile dagster up -d --build
+          docker compose -p g9ci --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           clickhouse-iceberg-init
 
@@ -985,13 +1326,30 @@ jobs:
   # Scope gate as g6-ingest. ──
   g6-alerts:
     name: Rust · SRC-17 alert delivery
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         # The nine fixture secrets of g6-ingest, though only the MySQL
@@ -1021,13 +1379,23 @@ jobs:
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      # `mysql-g6` is a pinned upstream image and `g6-alerts-test-runner`
+      # uses the shared Dagster image (the override gives it the same
+      # `image:` key), so `oidc-mock` is the only build. Same `-f` pair and
+      # `--profile` flags as the "up" step below.
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock
+
       - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
         # also holds debezium-server). `--profile g6-sql` makes `mysql-g6`
         # a valid dependency of the runner; only the services named here start.
         run: >
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile g6-alerts --profile dagster up -d --build
+          --profile g6-sql --profile g6-alerts --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           mysql-g6 clickhouse-iceberg-init
 
@@ -1035,9 +1403,13 @@ jobs:
         # `shell: bash` for pipefail and `-T` for no pseudo-terminal, as the
         # g6-ingest run step explains; the same `-f` pair as the "up" step.
         shell: bash
+        # `--no-deps`: the "up" step above already started every service the
+        # runner depends on; without it `compose run` re-reconciles them while
+        # the gate starts (F3, run #127 job 115336951020: the code server went
+        # UNAVAILABLE right after the gate's wait passed).
         run: |
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
-            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
+            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T --no-deps g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
 
       - name: Add the measured seconds to the job summary
         # `always()`: a failed gate prints its lines too. Only the gate's own
@@ -1074,13 +1446,30 @@ jobs:
   # ops/gold_export/gold_export_test.py. ──
   gold-export:
     name: Rust · Gold export to Iceberg (ADR 0010)
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # The API image comes from the `images` job, built once per run; this
+      # job never compiles it. This job starts no Dagster service, so it
+      # does not download the (larger) Dagster image.
+      - name: Download image artifact (lakehouse-api)
+        uses: actions/download-artifact@v8
+        with:
+          name: image-lakehouse-api
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -1091,8 +1480,12 @@ jobs:
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p goldci build oidc-mock
+
       - name: Bring up lakehouse-api (and its full Lakekeeper/authz chain)
-        run: docker compose -p goldci up -d --build lakehouse-api
+        run: docker compose -p goldci up -d --no-build lakehouse-api
 
       - name: Run the Gold export acceptance test inside the compose network
         run: docker compose -p goldci --profile test run --rm gold-export-test-runner
@@ -1115,13 +1508,30 @@ jobs:
   # CDC/dagster chain for unrelated reasons this gate has no part of). ──
   g8-governance:
     name: Rust · G8 governance masking
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # The API image comes from the `images` job, built once per run; this
+      # job never compiles it. This job starts no Dagster service, so it
+      # does not download the (larger) Dagster image.
+      - name: Download image artifact (lakehouse-api)
+        uses: actions/download-artifact@v8
+        with:
+          name: image-lakehouse-api
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -1130,8 +1540,12 @@ jobs:
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g8ci build oidc-mock
+
       - name: Bring up lakehouse-api (and postgres/clickhouse via its own depends_on)
-        run: docker compose -p g8ci up -d --build lakehouse-api
+        run: docker compose -p g8ci up -d --no-build lakehouse-api
 
       - name: Run the G8 governance acceptance test inside the compose network
         run: docker compose -p g8ci --profile test run --rm g8-test-runner
@@ -1144,6 +1558,68 @@ jobs:
         if: always()
         run: docker compose -p g8ci down -v
 
+  # ── Image smoke test (moved from docker.yml) ────────────────────────
+  # The container's own boot path, not the compose stack: does the image the
+  # acceptance jobs share start and answer /health? It used to be the Docker
+  # workflow's `build-and-smoke-test`, which built its OWN copy of the API
+  # image (702s of the Docker workflow's ~750s) on every PR. It now runs the
+  # image the `images` job built, so it costs seconds and still runs on
+  # every PR that can change the image (same `if:` as `images`).
+  image-smoke:
+    name: Image smoke test · lakehouse-api /health
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image artifact (lakehouse-api)
+        uses: actions/download-artifact@v8
+        with:
+          name: image-lakehouse-api
+          path: ${{ runner.temp }}/images
+
+      - name: Load image
+        run: zstd -dc "$RUNNER_TEMP"/images/lakehouse-api.tar.zst | docker load
+
+      # No DATABASE_URL: the entrypoint skips migrations when it's unset,
+      # and lakehouse-api is designed to boot and serve its
+      # Postgres/ClickHouse-independent routes (including /health) even
+      # without either dependency running — see entrypoint.api.sh and
+      # lakehouse_store::connect_lazy's doc comment. This intentionally
+      # smoke-tests the container's own boot path, not the full
+      # docker-compose stack.
+      - name: Run container
+        run: |
+          docker run -d --name lakehouse-api -p 8080:8080 rantai-lakehouse-api:ci
+          for i in $(seq 1 30); do
+            if docker inspect -f '{{.State.Running}}' lakehouse-api 2>/dev/null | grep -q true; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Wait for /health and assert 200
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/health || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "got 200 from /health"
+              exit 0
+            fi
+            echo "attempt $i: got $code, retrying..."
+            sleep 2
+          done
+          echo "::error::/health never returned 200"
+          exit 1
+
+      - name: Container logs (always, for debugging)
+        if: always()
+        run: docker logs lakehouse-api || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f lakehouse-api || true
+
   # ── DATA-16 (F2) — time travel keeps the policy. A Bronze table is
   # loaded twice through bronze_ingest_job and read at its OLDER version:
   # the admin gets clear text, a masked and row-filtered Analyst gets ***
@@ -1153,13 +1629,30 @@ jobs:
   # clickhouse-iceberg-init, which the runner's depends_on starts. ──
   g8-time-travel:
     name: Rust · G8 time travel keeps the policy
-    needs: changes
+    needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
 
       - name: Write CI-only .env
         run: |
@@ -1174,9 +1667,13 @@ jobs:
           INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
 
+      # Fixture image, built here rather than shared; see `g3a-dagster`.
+      - name: Build the oidc-mock fixture image
+        run: docker compose -p g8ttci --profile dagster build oidc-mock
+
       - name: Bring up lakehouse-api + Dagster + the demo source table + the Iceberg query database
         run: >
-          docker compose -p g8ttci --profile dagster up -d --build
+          docker compose -p g8ttci --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
           g3a-source-init clickhouse-iceberg-init
 
@@ -1209,6 +1706,7 @@ jobs:
       - test
       - msrv
       - dagster-unit-tests
+      - dagster-loader-tests
       - g1-rustfs
       - g2-seaweedfs
       - g3a-dagster
@@ -1222,6 +1720,8 @@ jobs:
       - gold-export
       - g8-governance
       - g8-time-travel
+      - images
+      - image-smoke
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -1248,6 +1748,7 @@ jobs:
           RUST_TEST_RESULT: ${{ needs.test.result }}
           RUST_MSRV_RESULT: ${{ needs.msrv.result }}
           DAGSTER_TESTS_RESULT: ${{ needs.dagster-unit-tests.result }}
+          DAGSTER_LOADER_TESTS_RESULT: ${{ needs.dagster-loader-tests.result }}
           G1_RUSTFS_RESULT: ${{ needs.g1-rustfs.result }}
           G2_SEAWEEDFS_RESULT: ${{ needs.g2-seaweedfs.result }}
           G3A_DAGSTER_RESULT: ${{ needs.g3a-dagster.result }}
@@ -1261,4 +1762,6 @@ jobs:
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
           G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}
+          IMAGES_RESULT: ${{ needs.images.result }}
+          IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh

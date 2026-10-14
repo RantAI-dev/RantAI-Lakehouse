@@ -116,6 +116,14 @@ impl Change {
         }
     }
 
+    /// Whether the change removes a column that `key` names (`SRC-10`
+    /// decision 6). Only a removal counts: a type change of a key column is
+    /// dealt with by the ordinary rules.
+    #[must_use]
+    pub fn removes_a_column_of(&self, key: &[String]) -> bool {
+        matches!(self, Self::ColumnRemoved { name, .. } if key.contains(name))
+    }
+
     /// The stored kind.
     #[must_use]
     pub fn kind(&self) -> ChangeKind {
@@ -274,6 +282,37 @@ pub fn decide(
     observed: &TableShape,
     changes: &[Change],
 ) -> Decision {
+    decide_for_key(policy, can_hold_back, previous, observed, changes, None)
+}
+
+/// [`decide`] for a table that may be in a deduplicating load mode
+/// (`SRC-10` decision 6). `key` is the table's `primaryKey` from the STORED
+/// spec when its mode deduplicates, `None` otherwise.
+///
+/// The removal of a column the key names is breaking under every policy and
+/// can NOT be approved while the key still names it: approving accepts the
+/// new shape, and every later load would then fail on a missing key column.
+/// So, like a type change the column cannot hold (`SRC-8 review BLOCKER 3a`),
+/// it makes the table wait without pausing the connector (a pause nobody
+/// could lift by approving would stick for good); the way out is to change
+/// the table's key or mode, after which the change can be approved.
+///
+/// The same holds after the load (`can_hold_back == false`, `SRC-16` F1): a
+/// removed key column is then recorded as applied and pauses nothing, because
+/// no approval could lift that pause.
+///
+/// This differs from a source primary-key change, which stays approvable
+/// (`SRC-8`): that one only says the SOURCE's uniqueness moved, while the
+/// table's declared key is still loadable; a removed key column is not.
+#[must_use]
+pub fn decide_for_key(
+    policy: SchemaChangePolicy,
+    can_hold_back: bool,
+    previous: Option<&TableShape>,
+    observed: &TableShape,
+    changes: &[Change],
+    key: Option<&[String]>,
+) -> Decision {
     let classify = |status: ChangeStatus| -> Vec<ClassifiedChange> {
         changes
             .iter()
@@ -294,6 +333,10 @@ pub fn decide(
     // hold is refused by Approve, so only the source putting the column back
     // clears it, and that is seen only by a connector that keeps running.
     // Pausing it would leave it stuck for good.
+    //
+    // `SRC-10`: a removed column of the table's deduplication key is refused
+    // by Approve too (`KeyStillNamed`), so it cannot hold a pause either.
+    // `SRC-16` F1 reads this below, for a connector that cannot hold back.
     let cannot_be_approved = changes.iter().any(|c| {
         matches!(
             c,
@@ -301,7 +344,7 @@ pub fn decide(
                 change: TypeChange::Other,
                 ..
             }
-        )
+        ) || key.is_some_and(|key| c.removes_a_column_of(key))
     });
     if !can_hold_back {
         // `SRC-16` F1 (delivery review 2026-10-12): see the function doc.
@@ -371,8 +414,20 @@ pub fn evaluate(
     previous: Option<&TableShape>,
     observed: &TableShape,
 ) -> Decision {
+    evaluate_for_key(policy, can_hold_back, previous, observed, None)
+}
+
+/// [`diff`] then [`decide_for_key`].
+#[must_use]
+pub fn evaluate_for_key(
+    policy: SchemaChangePolicy,
+    can_hold_back: bool,
+    previous: Option<&TableShape>,
+    observed: &TableShape,
+    key: Option<&[String]>,
+) -> Decision {
     let changes = diff(previous, observed);
-    decide(policy, can_hold_back, previous, observed, &changes)
+    decide_for_key(policy, can_hold_back, previous, observed, &changes, key)
 }
 
 // ---- type classification --------------------------------------------------
@@ -1012,6 +1067,119 @@ mod tests {
             let d = evaluate(SchemaChangePolicy::Pause, true, Some(&base()), &observed);
             assert_eq!(d.action, Action::Wait);
             assert!(d.pause_connector);
+        }
+    }
+
+    fn key_of(columns: &[&str]) -> Vec<String> {
+        columns.iter().map(|c| (*c).to_owned()).collect()
+    }
+
+    /// `SRC-10` decision 6: the removal of a column the table's key names
+    /// waits under every policy, loads nothing, and does not pause the
+    /// connector (Approve refuses it while the key names the column, so a
+    /// pause would stick), unlike the same removal of a column outside the key.
+    #[test]
+    fn removing_a_column_of_the_key_of_a_deduplicating_table_waits_without_pausing() {
+        let key = key_of(&["id"]);
+        // The source key stays `id`: only the column removal is under test.
+        let removed_key_same_pk = TableShape {
+            columns: vec![col("note", "text")],
+            primary_key: vec!["id".to_owned()],
+        };
+        for policy in POLICIES {
+            let d = evaluate_for_key(
+                policy,
+                true,
+                Some(&base()),
+                &removed_key_same_pk,
+                Some(&key),
+            );
+            assert_eq!(d.action, Action::Wait, "{policy:?}");
+            assert!(!d.pause_connector, "{policy:?}");
+            assert!(d.changes.iter().all(|c| c.status == ChangeStatus::Pending));
+            assert!(
+                d.changes.iter().any(|c| c.change.removes_a_column_of(&key)),
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// The same removal of a column OUTSIDE the key keeps the SRC-8 rules
+    /// (approvable, so `pause` pauses), and a table with no key (any other
+    /// mode) is as before.
+    #[test]
+    fn removing_a_column_outside_the_key_or_with_no_key_is_decided_as_before() {
+        let removed_note = shape(&[("id", "integer")], &["id"]);
+        let key = key_of(&["id"]);
+        for key in [Some(key.as_slice()), None] {
+            let d = evaluate_for_key(
+                SchemaChangePolicy::Pause,
+                true,
+                Some(&base()),
+                &removed_note,
+                key,
+            );
+            assert_eq!(d.action, Action::Wait);
+            assert!(d.pause_connector);
+        }
+        // No key given: removing "id" pauses as in SRC-8.
+        let removed_id = TableShape {
+            columns: vec![col("note", "text")],
+            primary_key: vec!["id".to_owned()],
+        };
+        let d = evaluate_for_key(
+            SchemaChangePolicy::Pause,
+            true,
+            Some(&base()),
+            &removed_id,
+            None,
+        );
+        assert!(d.pause_connector);
+        // `evaluate` is `evaluate_for_key` with no key.
+        assert_eq!(
+            evaluate(SchemaChangePolicy::Pause, true, Some(&base()), &removed_id),
+            d
+        );
+    }
+
+    /// A changed SOURCE primary key stays an approvable breaking change even
+    /// when the table deduplicates on a key of its own: the declared key is
+    /// still loadable. Only a removed key column is not.
+    #[test]
+    fn a_source_key_change_stays_approvable_for_a_deduplicating_table() {
+        let rekeyed = shape(&[("id", "integer"), ("note", "text")], &["note"]);
+        let key = key_of(&["id"]);
+        let d = evaluate_for_key(
+            SchemaChangePolicy::Pause,
+            true,
+            Some(&base()),
+            &rekeyed,
+            Some(&key),
+        );
+        assert_eq!(d.action, Action::Wait);
+        assert!(d.pause_connector, "approvable, so pause pauses");
+    }
+
+    /// Where the source cannot hold back, the change is already in the table:
+    /// recorded as applied and loaded, with or without a key.
+    #[test]
+    fn a_key_column_removed_after_the_load_is_recorded_applied() {
+        let key = key_of(&["id"]);
+        let removed = TableShape {
+            columns: vec![col("note", "text")],
+            primary_key: vec!["id".to_owned()],
+        };
+        // Under every policy, `pause` included: `SRC-16` F1 records an
+        // after-load change as pending only when Approve could take it, and
+        // Approve refuses a removed key column (`KeyStillNamed`).
+        for policy in POLICIES {
+            let d = evaluate_for_key(policy, false, Some(&base()), &removed, Some(&key));
+            assert_eq!(d.action, Action::Load, "{policy:?}");
+            assert!(!d.pause_connector, "{policy:?}");
+            assert!(
+                d.changes.iter().all(|c| c.status == ChangeStatus::Applied),
+                "{policy:?}"
+            );
         }
     }
 }

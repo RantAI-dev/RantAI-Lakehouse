@@ -1478,3 +1478,177 @@ async fn a_column_removed_after_an_added_column_keeps_its_loaded_name_through_ap
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0].0, "qty");
 }
+
+// --- SRC-21: the pause and a key column's pending removal (SRC-10 x SRC-16) ---
+
+/// Write a first observation of `object` as its baseline. [`baseline`] is the
+/// same for the one table the older tests use, `orders`.
+async fn baseline_of(pool: &PgPool, id: &str, object: &str, columns: &[ObservedColumn]) {
+    let mut tx = ObservationTx::begin(pool, id, object).await.unwrap();
+    tx.record(&ObservationWrite {
+        observed_columns: columns,
+        observed_primary_key: &[],
+        changes: &[],
+        accept_observed: true,
+        pause_connector: false,
+        run_id: None,
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// `object` is seen without `column`: a removal that waits, and the connector
+/// is paused (policy `pause`).
+async fn wait_for_removal_of(
+    pool: &PgPool,
+    id: &str,
+    object: &str,
+    observed: &[ObservedColumn],
+    column: &str,
+) {
+    let mut tx = ObservationTx::begin(pool, id, object).await.unwrap();
+    tx.record(&ObservationWrite {
+        observed_columns: observed,
+        observed_primary_key: &[],
+        changes: &[removed(column, ChangeStatus::Pending)],
+        accept_observed: false,
+        pause_connector: true,
+        run_id: Some("run-1"),
+        now: OffsetDateTime::now_utc(),
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// A paused connector with two tables. `public.orders` deduplicates on `id`
+/// and has a pending removal of `id` (Approve refuses it, `KeyStillNamed`).
+/// `public.items` appends and has a pending removal of `note` (Approve takes
+/// it).
+async fn paused_with_a_key_removal_and_an_approvable_change(pool: &PgPool) -> String {
+    let id = connector(pool).await;
+    set_ingest_spec(
+        pool,
+        &id,
+        &IngestSpecInput {
+            adapter: "sql".to_owned(),
+            ingest_mode: "batch".to_owned(),
+            dial: serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "shop", "user": "reader",
+            }),
+            source_objects: serde_json::json!([
+                {"name": "public.orders", "target": "src21_orders",
+                 "loadMode": "replace_dedup", "primaryKey": ["id"]},
+                {"name": "public.items", "target": "src21_items", "loadMode": "append"},
+            ]),
+            schedule_cron: None,
+        },
+    )
+    .await
+    .unwrap();
+    baseline_of(
+        pool,
+        &id,
+        "public.orders",
+        &[col("id", "integer"), col("qty", "integer")],
+    )
+    .await;
+    baseline_of(
+        pool,
+        &id,
+        "public.items",
+        &[col("id", "integer"), col("note", "text")],
+    )
+    .await;
+    wait_for_removal_of(pool, &id, "public.orders", &[col("qty", "integer")], "id").await;
+    wait_for_removal_of(pool, &id, "public.items", &[col("id", "integer")], "note").await;
+    id
+}
+
+/// `SRC-10` x `SRC-16` merge (`SHOULD-FIX`, no test covered this pair of
+/// tables): `lift_pause_if_nothing_waits` reads the deduplicating keys, so a
+/// pending removal of a key column, which Approve refuses, does not hold the
+/// pause. Approving the other table lifts it and the key removal stays
+/// pending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn approving_the_other_table_lifts_the_pause_though_a_key_column_removal_still_waits(
+    pool: PgPool,
+) {
+    let id = paused_with_a_key_removal_and_an_approvable_change(&pool).await;
+    let pending = list_pending(&pool, &id).await.unwrap();
+    let can_approve = |object: &str| {
+        pending
+            .iter()
+            .find(|c| c.object_name == object)
+            .unwrap()
+            .can_approve
+    };
+    assert!(
+        !can_approve("public.orders"),
+        "Approve refuses a key column"
+    );
+    assert!(can_approve("public.items"));
+
+    let approval = approve_object(
+        &pool,
+        &id,
+        "public.items",
+        Some("user-1"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap()
+    .into_approval()
+    .unwrap();
+
+    assert!(
+        approval.pause_lifted,
+        "only a change Approve would take holds the pause"
+    );
+    let connector = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(connector.paused_reason, None);
+    assert_eq!(connector.paused_at, None);
+    let still_pending = list_pending(&pool, &id).await.unwrap();
+    assert_eq!(still_pending.len(), 1, "{still_pending:?}");
+    assert_eq!(still_pending[0].object_name, "public.orders");
+    assert_eq!(still_pending[0].column_name, "id");
+    assert_eq!(
+        approve_object(&pool, &id, "public.orders", None, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        ApproveOutcome::KeyStillNamed,
+        "the key column's removal is still refused"
+    );
+}
+
+/// The opposite: while the other table's approvable change is pending the
+/// pause holds, and the refused approval of the key column's table does not
+/// lift it or change anything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_pause_holds_while_the_other_tables_approvable_change_is_pending(pool: PgPool) {
+    let id = paused_with_a_key_removal_and_an_approvable_change(&pool).await;
+
+    assert_eq!(
+        approve_object(
+            &pool,
+            &id,
+            "public.orders",
+            Some("user-1"),
+            OffsetDateTime::now_utc()
+        )
+        .await
+        .unwrap(),
+        ApproveOutcome::KeyStillNamed
+    );
+
+    let connector = get_connector(&pool, &id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        connector.paused_reason.as_deref(),
+        Some(SCHEMA_CHANGE_PAUSE_REASON)
+    );
+    assert!(connector.paused_at.is_some());
+    assert_eq!(list_pending(&pool, &id).await.unwrap().len(), 2);
+}

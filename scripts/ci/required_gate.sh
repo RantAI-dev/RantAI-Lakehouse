@@ -23,6 +23,7 @@
 #   RUST_TEST_RESULT      result of `test` job (stable)
 #   RUST_MSRV_RESULT      result of `msrv` job (1.88.0)
 #   DAGSTER_TESTS_RESULT  result of `dagster-unit-tests` job
+#   DAGSTER_LOADER_TESTS_RESULT result of `dagster-loader-tests` job
 #   G1_RUSTFS_RESULT      result of `g1-rustfs` job
 #   G2_SEAWEEDFS_RESULT   result of `g2-seaweedfs` job
 #   G3A_DAGSTER_RESULT    result of `g3a-dagster` job
@@ -36,6 +37,8 @@
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
 #   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
+#   IMAGES_RESULT         result of `images` job (builds the shared images)
+#   IMAGE_SMOKE_RESULT    result of `image-smoke` job (/health on the API image)
 set -euo pipefail
 
 run_gate() {
@@ -128,6 +131,7 @@ run_gate() {
 
   # Dagster
   check_job "dagster-unit-tests" "${DAGSTER_TESTS_RESULT:-skipped}" "$req_dagster"
+  check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
 
   # Acceptance
   check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_acceptance"
@@ -143,6 +147,15 @@ run_gate() {
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
+
+  # Shared images and their smoke test. Required exactly when the acceptance
+  # jobs are: `images` has the same `if:` as they do and is what they consume.
+  # This is also what keeps the gate red when `images` fails. Every job that
+  # `needs: images` is then SKIPPED, not failed, and a skip alone would read
+  # as "not required"; but each of them is required here, so a skip is an
+  # error on its own, and `images` failing is reported by name as well.
+  check_job "images" "${IMAGES_RESULT:-skipped}" "$req_acceptance"
+  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_acceptance"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."

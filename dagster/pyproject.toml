@@ -80,3 +80,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["dispar_orchestrate*"]
+
+[tool.pytest.ini_options]
+# `loader` splits the suite for CI (`.github/workflows/ci.yml`): the fast job
+# runs `-m "not loader"`, `dagster-loader-tests` runs `-m loader`.
+# --strict-markers so a misspelt marker fails collection instead of silently
+# dropping a file out of both jobs.
+addopts = "--strict-markers"
+markers = [
+    "loader: runs a real dlt pipeline against a local Iceberg table",
+]
