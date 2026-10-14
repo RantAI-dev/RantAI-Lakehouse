@@ -125,7 +125,90 @@ console's manual publish (D1), Silver (`DATA-4`).
 
 ## 7. Handoff
 
-(Developer appends here, task by task.)
+### Task T1: Spike & Gate Verification (Measured on Compose Stack)
+
+- **Status**: GATE STOP TRIGGERED.
+- **Gate Evaluation**:
+  - `gold-export` principal delete rows: **SUCCEEDED** (`table.delete(LessThan("_exported_at", cutoff_time))` executed and committed with `gold-export.jwt`).
+  - `gold-export` principal expire snapshots: **SUCCEEDED** (`table.maintenance.expire_snapshots().by_ids(...).commit()` executed and committed with `gold-export.jwt`).
+  - **Removed copies' data files in object store**: **FAILED / REMAIN IN OBJECT STORE**.
+    - Before delete: 9 parquet data files in `s3://lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/...`
+    - After delete: 9 parquet data files
+    - After snapshot expiry: 9 parquet data files
+    - The 2 removed copies' data files were **not deleted** and remain in the object store.
+  - **Gate Decision**: Per plan and task instructions ("if the gold-export principal cannot delete rows or expire snapshots, or the removed copies' data files remain in the object store, STOP after T1 and report in the handoff; do not build T2 to T6 on an assumption"), implementation is **STOPPED after T1**. Tasks T2 through T6 are not built.
+
+#### Exact Spike Measurements (from compose execution task-340)
+- **Stack environment**:
+  - Compose project: `data2`
+  - Services: `lakehouse-api` (image `rantai-lakehouse-api:local`), `lakekeeper` (image `quay.io/lakekeeper/catalog:v0.13.3`), `clickhouse` (`26.8`), `postgres` (`16`), `rustfs` (`1.0.0-rc.4`), `oidc-mock`, `openfga` (`v1.8`).
+  - Runner environment: Dagster image `rantai-lakehouse-dagster:bld3` (PyIceberg 0.12.0, Python 3.12.15).
+  - Credentials: `gold-export` principal (`/tokens/gold-export.jwt`).
+- **Wall Time**: 114s (1m 54s) from container startup to teardown.
+- **Seeded Mart**: `serving.gold_export_spike` with 7 rows, followed by 9 export cycles (`POST /api/gold/export/gold_export_spike`) with data changes between each cycle.
+- **Measurements BEFORE delete**:
+  - Table format version: 2
+  - Table location: `s3://lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9`
+  - Snapshots count: 9
+  - Row count: 108
+  - Total metadata & data files in table prefix: 37
+  - Data files (.parquet): 9
+  - Distinct `_exported_at` timestamps: 9
+    - Copy 1: 2026-10-14 17:21:58
+    - Copy 2: 2026-10-14 17:21:56
+    - Copy 3: 2026-10-14 17:21:55
+    - Copy 4: 2026-10-14 17:21:53
+    - Copy 5: 2026-10-14 17:21:52
+    - Copy 6: 2026-10-14 17:21:50
+    - Copy 7: 2026-10-14 17:21:48
+    - Copy 8: 2026-10-14 17:21:47
+    - Copy 9: 2026-10-14 17:21:45
+  - Cutoff timestamp (7th newest, keep 7): `2026-10-14 17:21:48`
+- **Measurements AFTER `Table.delete`**:
+  - Call: `table.delete(LessThan("_exported_at", cutoff_time))`
+  - Result: Call succeeded.
+  - Snapshots count: 10
+  - Row count: 91 (17 rows from copies 8 and 9 deleted)
+  - Current snapshot operation: `Operation.DELETE`
+  - Current snapshot summary: `operation=Operation.DELETE`
+  - Data files (.parquet): 9
+- **Measurements AFTER `expire_snapshots`**:
+  - Call: `table.maintenance.expire_snapshots().by_ids(older_snapshot_ids).commit()`
+  - Candidate snapshot IDs expired: `[7916467291502296230, 2426672640166623269, 1647797770984022157, 4227505631507552445, 3527832472415157674, 6557136499330190798, 3688427246795040507, 8110017500934333287, 4108079633062378361]`
+  - Result: Call succeeded.
+  - Snapshots count: 1 (only the current active snapshot remains)
+  - Row count: 91
+  - Data files (.parquet) before delete: 9
+  - Data files (.parquet) after expire: 9
+  - Parquet files listing:
+    1. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-2d8f0399-e1dd-41f2-b281-ce9673fb27e4.parquet`
+    2. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-34f69e2a-1612-4eb2-915e-ba1e055ceb6b.parquet`
+    3. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-372bccc3-daf2-4a0d-ae09-0b736ac0e723.parquet`
+    4. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-43ac3634-2810-480a-b0fb-1737c393de43.parquet`
+    5. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-467ae3d5-2664-4eb5-8a29-81ca27155d28.parquet`
+    6. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-5dc48ef9-8751-4a8e-9b45-befae5741676.parquet`
+    7. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-acf3acfa-e2c1-428d-af42-2f700382d131.parquet`
+    8. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-cc20e253-1d04-44bb-baba-b87870de956d.parquet`
+    9. `lakehouse-warehouse/01a13b6f-305f-7932-9604-d8294529a0d9/data/exported_date=2026-10-14/gold-00000-d0d33c8a-c22f-4c4c-bf04-595f8c0feb97.parquet`
+  - Result: All 9 data files remain in the object store. Zero data files were deleted.
+
+#### Answers to Section 6 Questions
+1. **Does `Table.delete` on a `day(_exported_at)` table drop whole files for whole-day partitions and rewrite only a partially kept day? Quote what PyIceberg did (new snapshot's summary).**
+   - In PyIceberg 0.12.0, `Table.delete` executes copy-on-write delete. If an entire partition matches the predicate, it drops the data files from the manifest (`delete_snapshot.delete_by_predicate`). If a partition partially matches, it reads the files, filters rows, and stages rewritten files via `overwrite()`.
+   - In our measured spike, all 9 exports occurred on the same day (`2026-10-14`), each producing an individual parquet data file. The new snapshot committed with `operation=Operation.DELETE`. It removed the manifest references to the 2 oldest files (17 records deleted, reducing table records from 108 to 91), leaving 7 data files referenced in the active manifest.
+2. **Which PyIceberg 0.12 call expires snapshots, and does it delete data files or only metadata? If only metadata, what deletes the files?**
+   - The PyIceberg 0.12 call is `table.maintenance.expire_snapshots().by_ids(snapshot_ids).commit()` or `.older_than(dt).commit()`.
+   - **It deletes only metadata, NOT data files.**
+   - In PyIceberg 0.12.0 (`pyiceberg/table/update/snapshot.py:1267` and `pyiceberg/table/update/__init__.py:515`), `ExpireSnapshots` creates a `RemoveSnapshotsUpdate` table update, which only removes snapshot records from `table_metadata.snapshots` and `table_metadata.snapshot_log` in the REST catalog. PyIceberg does not delete unreferenced data files during snapshot expiration.
+   - Lakekeeper does not delete data files either (it is a metadata catalog storing metadata JSON and Postgres records).
+   - What deletes the files: An engine-level table maintenance procedure with object-store deletion capability (e.g. Trino's `ALTER TABLE ... EXECUTE remove_orphan_files(...)` or Spark Iceberg maintenance). PyIceberg 0.12.0 and Lakekeeper alone cannot free storage.
+3. **Can the Rust export append to the table while a trim runs? The API's per-mart lock (`gold_lock`) does not cover Dagster; say what happens on a commit conflict and make the trim retry or fail cleanly, never corrupt.**
+   - If a Rust export appends while a trim runs, Lakekeeper/PyIceberg enforces optimistic concurrency control via commit requirements (`AssertRefSnapshotId`). When the second committer attempts to commit against a superseded snapshot ID, Lakekeeper rejects the commit with an HTTP 409 conflict, and PyIceberg raises `pyiceberg.exceptions.CommitFailedException`. The table is never corrupted.
+4. **Does an outside reader that filters on `max(_exported_at)` still see the same rows after a trim?**
+   - Yes. The newest export copy is retained (only copies strictly older than the 7th newest are trimmed). Any reader filtering on `max(_exported_at)` queries the latest snapshot copy, which is completely unchanged.
+
+#### What was not verified
+- Tasks T2-T6 were deliberately not built/verified because the GATE condition failed (data files remain in the object store, violating `DATA-2-AC2` and the core premise of storage reclamation).
 
 ## 8. Review
 
