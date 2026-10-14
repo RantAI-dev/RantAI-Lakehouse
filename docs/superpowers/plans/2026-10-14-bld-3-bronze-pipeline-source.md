@@ -545,4 +545,60 @@ a user's own SQL, or a catalog asset through the API's catalog database.
 
 ## 8. Review
 
-(Reviewer.)
+### Round 1 (planner/reviewer, Claude Opus), at `71648474`, PR #155
+
+Read: the whole diff (`authored_factory.py` and its tests, the Rust refusal
+and its tests, the assistant schema and fixture, `ops/g7`, the compose
+runner, the CI step) and the handoff. The design follows D1 to D7; the
+Bronze read reuses `connector_catalog.ensure_catalog_database` instead of a
+third `CREATE DATABASE ... DataLakeCatalog`; the refusal is one validator
+with one message in the job, the API and the assistant; the merge of PR #80
+kept both the tenant check and the refusal. The handoff's "Not verified"
+list is complete and honest.
+
+CI on PR #155 proves the fix itself: G3a then g7 in the `g3a-dagster` job
+printed `silver.g7_dedupe_select_out holds 2000 rows = the 2000 distinct ids
+of bronze.g3a_orders`.
+
+**BLOCKER 1. g7 cannot pass in CI: its source step needs a commit the CI
+images do not have.** The same CI run then failed at
+`GET /api/pipelines/bronze_maintenance_job/source`: `409 {"error":"source
+provenance is unavailable for this build"}`. That 409 is correct behaviour:
+`pipeline_source.rs` refuses with `UnverifiableProvenance` when the image's
+`GIT_SHA` is `unknown`, and `ci.yml`'s `images` job deliberately builds
+without `GIT_SHA` so the layer cache is shared (comment near line 499). The
+local run passed because the developer's `.local/build-images.sh` passed a
+real `GIT_SHA`. So the gate as written is green only where images carry a
+commit, and red in CI forever.
+
+Fix, without weakening the gate where it can be proven:
+- g7 reads a new env var `G7_SOURCE_PROVENANCE`, default `required`. With
+  `required` (local runs, real deployments) the source step is unchanged:
+  it must return the op's real source text.
+- With `unavailable`, the step instead asserts the honest refusal: status
+  `409` and the body exactly `{"error": "source provenance is unavailable
+  for this build"}`, and prints one line saying the source text was not
+  checked because this build has no `GIT_SHA`. Any other status or body
+  fails the gate. Proving the refusal is still a real assertion
+  (principle 3, fail closed).
+- `g7-test-runner` in `docker-compose.yml` passes
+  `G7_SOURCE_PROVENANCE: ${G7_SOURCE_PROVENANCE:-required}`; the
+  `g3a-dagster` job's CI-only `.env` sets `G7_SOURCE_PROVENANCE=unavailable`,
+  with a comment naming the `images` job's `GIT_SHA` choice as the reason.
+- Update g7's module doc and the handoff's "Not verified": CI checks the
+  refusal, not the source text; the source text is proven by the local run.
+
+Cite `BLD-3 review BLOCKER 1` at each site. Prove it twice from clean
+projects: once with images built WITHOUT `GIT_SHA` and
+`G7_SOURCE_PROVENANCE=unavailable` (the CI shape; must pass), once with
+`GIT_SHA` and the default (must pass, source text checked).
+
+**Recorded, not this PR's job.**
+- `cargo audit` and `cargo deny` are red on this PR because of advisories
+  published today (RUSTSEC-2026-0346 to 0349). This PR changes no
+  dependency; the reviewer re-ran `main`'s Security workflow to confirm and
+  will name it in the merge.
+- Reviewer's local `cargo test --workspace` first stopped at
+  `tests/lakehouse_maintenance.rs` (5 failures in the per-test database
+  setup, `tests/common/mod.rs:127,130`); the suite passed 5/0 when re-run
+  alone, and a `--no-fail-fast` workspace run is in progress.
