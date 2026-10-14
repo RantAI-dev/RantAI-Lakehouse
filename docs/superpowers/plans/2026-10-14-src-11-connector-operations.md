@@ -1,9 +1,8 @@
 # `SRC-11` Connector operations — Implementation Plan
 
-**Status:** drafted on the feature page's Default decisions, before they are
-signed. **Nothing is built until the product owner signs**
-`docs/core/features/connector-operations.md`; a decision changed there is
-changed here first. Written 2026-10-14 by the planner (Claude Opus) for
+**Status:** ready to build. The product owner signed the feature page's
+decisions on 2026-10-14 ("setuju semua"), unchanged from the defaults this
+plan was drafted on. Written 2026-10-14 by the planner (Claude Opus) for
 developer agents, under the role split in `AGENTS.md`.
 
 **Base and branch:** the Phase 1 branch `feat/phase-1-rest` (pull request

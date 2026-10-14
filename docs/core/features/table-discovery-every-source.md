@@ -6,7 +6,7 @@
 | Backlog | `SRC-13` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-13.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 9 |
-| Status | Planned. Decisions not signed |
+| Status | Planned. Decisions signed 2026-10-14 |
 | Plan | Not written; it waits for the signatures below |
 
 ## Problem
@@ -66,23 +66,23 @@ From the spec: not part of the dashboards assistant (`AI-16`).
 
 ## Decisions
 
-Not signed. Rows 1 to 6 and 9 settle how a spec row is met; the others are
+Signed by the product owner on 2026-10-14 ("setuju semua", on the planner's recommendation). Rows 1 to 6 and 9 settle how a spec row is met; the others are
 beyond the spec. The planner's recommendation is the Default.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Spec "every connector type": where the listing runs for the types the API cannot reach. | Object storage and REST are listed by the API, which already reaches them for the connection test. MongoDB, Kafka, SFTP and Oracle are listed by the orchestrator, which already holds their drivers and credentials for loads: "Find tables" starts a short listing job and the page shows its progress, then the result. No new database driver goes into the API. | |
-| 2 | Spec "files and buckets (by glob)". | The user types a glob (default: everything under the connector's prefix); the list shows each matching file with its size and last change. Each ticked file becomes a table, as a typed name does today. Up to 10,000 files per listing; more is cut with a message saying so. | |
-| 3 | Spec "REST (declared endpoints)". | The list is the endpoints declared on the connector. Picking an endpoint loads that endpoint only. Today every table of a REST connector loads every endpoint; that is fixed here, because a list to pick from means nothing otherwise. | |
-| 4 | Spec "Kafka (topics)". | The list is the broker's topics, internal ones hidden. Picking one sets the connector's topic; one topic per connector, as today. | |
-| 5 | Spec "MongoDB (collections)", "SFTP (paths)", "Oracle (schemas and tables)". | MongoDB: the collections of the connector's database. SFTP: files under the connector's path, narrowed by a glob as in decision 2. Oracle: the schemas the user can read, then that schema's tables with columns and primary keys, as for the other SQL sources. Oracle also gets the "add by name" field the other types have. | |
-| 6 | Spec "inferred columns and types shown before choosing". | SQL sources and Oracle: the columns and types the source declares. Files: from the header and the first 1,000 rows (CSV), or the file's own schema (Parquet). MongoDB: from a sample of 100 documents. Kafka: from the last 100 messages, read without moving the connector's position. REST: from the first page of the endpoint. An inferred type is marked "inferred from a sample" and is what the first load will create. | |
-| 7 | Beyond the spec: the schema of a SQL source. | Listed for every SQL type; the user picks it instead of typing it. Typing stays possible. | |
-| 8 | Beyond the spec: views. | Base tables only, as the loader lists them today. Today's API discovery also returns views, which may not load; that is corrected here. | |
-| 9 | Spec *(proposed)*: 10,000 tables within 2 minutes, searchable. | Accept. The list arrives with names first and each table's columns only when it is opened, so a large schema does not wait on every column. The console shows a search box and draws only the rows in view. Measured by a gate on a PostgreSQL schema of 10,000 tables and written into `docs/plans/SRC-13-RESULT.md`. | |
-| 10 | Beyond the spec: errors. | Every refusal and failure has its own fixed text: unreachable, sign-in refused, no permission at the source, timed out, too many objects. Never the driver's text (principle 4). The wrong "unknown adapter" text goes. | |
-| 11 | Beyond the spec: who may list. | A user with `connector:manage` on a connector of their own tenant, as today. | |
-| 12 | Beyond the spec: gates. | The "discover" step of each type's gate changes from "refused" to a real listing with a known object and its columns, and the coverage table follows. The 10,000-table measurement runs in a job of its own, so no existing job grows. | |
+| 1 | Spec "every connector type": where the listing runs for the types the API cannot reach. | Object storage and REST are listed by the API, which already reaches them for the connection test. MongoDB, Kafka, SFTP and Oracle are listed by the orchestrator, which already holds their drivers and credentials for loads: "Find tables" starts a short listing job and the page shows its progress, then the result. No new database driver goes into the API. || 2026-10-14 |
+| 2 | Spec "files and buckets (by glob)". | The user types a glob (default: everything under the connector's prefix); the list shows each matching file with its size and last change. Each ticked file becomes a table, as a typed name does today. Up to 10,000 files per listing; more is cut with a message saying so. || 2026-10-14 |
+| 3 | Spec "REST (declared endpoints)". | The list is the endpoints declared on the connector. Picking an endpoint loads that endpoint only. Today every table of a REST connector loads every endpoint; that is fixed here, because a list to pick from means nothing otherwise. || 2026-10-14 |
+| 4 | Spec "Kafka (topics)". | The list is the broker's topics, internal ones hidden. Picking one sets the connector's topic; one topic per connector, as today. || 2026-10-14 |
+| 5 | Spec "MongoDB (collections)", "SFTP (paths)", "Oracle (schemas and tables)". | MongoDB: the collections of the connector's database. SFTP: files under the connector's path, narrowed by a glob as in decision 2. Oracle: the schemas the user can read, then that schema's tables with columns and primary keys, as for the other SQL sources. Oracle also gets the "add by name" field the other types have. || 2026-10-14 |
+| 6 | Spec "inferred columns and types shown before choosing". | SQL sources and Oracle: the columns and types the source declares. Files: from the header and the first 1,000 rows (CSV), or the file's own schema (Parquet). MongoDB: from a sample of 100 documents. Kafka: from the last 100 messages, read without moving the connector's position. REST: from the first page of the endpoint. An inferred type is marked "inferred from a sample" and is what the first load will create. || 2026-10-14 |
+| 7 | Beyond the spec: the schema of a SQL source. | Listed for every SQL type; the user picks it instead of typing it. Typing stays possible. || 2026-10-14 |
+| 8 | Beyond the spec: views. | Base tables only, as the loader lists them today. Today's API discovery also returns views, which may not load; that is corrected here. || 2026-10-14 |
+| 9 | Spec *(proposed)*: 10,000 tables within 2 minutes, searchable. | Accept. The list arrives with names first and each table's columns only when it is opened, so a large schema does not wait on every column. The console shows a search box and draws only the rows in view. Measured by a gate on a PostgreSQL schema of 10,000 tables and written into `docs/plans/SRC-13-RESULT.md`. || 2026-10-14 |
+| 10 | Beyond the spec: errors. | Every refusal and failure has its own fixed text: unreachable, sign-in refused, no permission at the source, timed out, too many objects. Never the driver's text (principle 4). The wrong "unknown adapter" text goes. || 2026-10-14 |
+| 11 | Beyond the spec: who may list. | A user with `connector:manage` on a connector of their own tenant, as today. || 2026-10-14 |
+| 12 | Beyond the spec: gates. | The "discover" step of each type's gate changes from "refused" to a real listing with a known object and its columns, and the coverage table follows. The 10,000-table measurement runs in a job of its own, so no existing job grows. || 2026-10-14 |
 
 ## Limits to tell a customer
 
