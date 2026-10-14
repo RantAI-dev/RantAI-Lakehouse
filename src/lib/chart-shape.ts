@@ -38,6 +38,8 @@ export const MAX_STEPS = 2
 
 export type ShapeDefFields = {
   measures?: MeasureEntry[]
+  /** The aggregate of a measure written as a plain name (phase 2 QA R4: the form shows it on each such measure). */
+  aggregate?: string
   filters?: FilterDef[]
   sort?: SortSpec
   other?: boolean
@@ -104,10 +106,32 @@ export function resultName(row: MeasureRow, wholeMeasure: ReadonlySet<string>): 
   return `${row.aggregate}_${row.column}`
 }
 
-/** "avg of stay" for a measure with its own aggregate; the plain name otherwise. */
-export function measureLabel(row: MeasureRow, wholeMeasure: ReadonlySet<string>): string {
+/** The aggregate a row computes: its own, or the chart's (`sum` when the chart names none). */
+export function effectiveAggregate(row: MeasureRow, chartAggregate = "sum"): string {
+  return row.aggregate || chartAggregate || "sum"
+}
+
+/**
+ * What a row stores when an aggregate is picked on it: none when it is the chart's own, so the
+ * row keeps the column's name as a result (`visitors`) and not `sum_visitors`, as before.
+ */
+export function storedAggregate(picked: string, chartAggregate: string): string {
+  return picked === chartAggregate ? "" : picked
+}
+
+/**
+ * What a measure row reads as: "avg of stay" when it was computed with an
+ * aggregate that is not the column's plain sum, the column's name otherwise
+ * (phase 2 QA R7). A row that takes the chart's aggregate says that aggregate
+ * too, so a second measure left on a default of `avg` is no longer drawn as
+ * the bare column. `chartAggregate` is the aggregate of rows that name none.
+ */
+export function measureLabel(row: MeasureRow, wholeMeasure: ReadonlySet<string>, chartAggregate = "sum"): string {
   if (isMetricColumn(row.column)) return metricNameOf(row.column)
-  if (!row.aggregate || wholeMeasure.has(row.column)) return row.column
+  if (wholeMeasure.has(row.column)) return row.column
+  if (!row.aggregate) {
+    return chartAggregate && chartAggregate !== "sum" ? `${AGGREGATE_WORDS[chartAggregate] ?? chartAggregate} of ${row.column}` : row.column
+  }
   return `${AGGREGATE_WORDS[row.aggregate] ?? row.aggregate} of ${row.column}`
 }
 
@@ -345,9 +369,19 @@ export type ResultColumns = {
   groups: { name: string; kind: string }[]
   measures: string[]
   labels: Record<string, string>
+  /** The source column each measure was computed from, so a later step can name its output plainly (phase 2 QA R8). */
+  bases?: Record<string, string>
 }
 
-/** The columns after `steps`, each applied to the result before it; a step that names a column the result lacks keeps what it can. */
+/** How a step's aggregate reads in front of a column: "total visitors", not "sum of avg of visitors". */
+const STEP_WORDS: Record<string, string> = { sum: "total", avg: "average", max: "highest", min: "lowest", count: "count of" }
+
+/**
+ * The columns after `steps`, each applied to the result before it; a step that
+ * names a column the result lacks keeps what it can. An output reads as the
+ * aggregate in plain words and the original column ("total visitors"); two
+ * outputs that would read the same keep their result names.
+ */
 export function columnsAfterSteps(base: ResultColumns, steps: readonly StepDef[]): ResultColumns {
   let cur = base
   for (const step of steps) {
@@ -356,13 +390,18 @@ export function columnsAfterSteps(base: ResultColumns, steps: readonly StepDef[]
     const groups = sum.by.flatMap((b) => cur.groups.filter((g) => g.name === b))
     const measures: string[] = []
     const labels: Record<string, string> = {}
+    const bases: Record<string, string> = {}
     for (const m of sum.measures) {
       if (!m.column || !m.aggregate) continue
       const name = `${m.aggregate}_${m.column}`
       measures.push(name)
-      labels[name] = `${m.aggregate} of ${cur.labels[m.column] ?? m.column}`
+      bases[name] = cur.bases?.[m.column] ?? m.column
+      labels[name] = `${STEP_WORDS[m.aggregate] ?? m.aggregate} ${displayColumn(bases[name])}`
     }
-    cur = { groups, measures, labels }
+    const seen = new Map<string, number>()
+    for (const label of Object.values(labels)) seen.set(label, (seen.get(label) ?? 0) + 1)
+    for (const name of measures) if ((seen.get(labels[name]) ?? 0) > 1) labels[name] = name
+    cur = { groups, measures, labels, bases }
   }
   return cur
 }
@@ -432,12 +471,15 @@ export function withResolvedSlots<D extends { dimension?: string; breakdown?: st
  * tile's `y` names the result columns in the order of the definition's
  * measures, and a name that differs from its column is an own aggregate.
  * `metricLabels` is the tile payload's label of each metric by name.
+ * `chartAggregate` is the chart's own aggregate, which a measure written as a
+ * plain name takes: one that is not `sum` reads "avg of stay" too (phase 2 QA R7).
  */
 export function tileMeasureLabels(
   measures: readonly MeasureEntry[] | undefined,
   y: string | readonly string[],
   steps?: readonly StepDef[],
   metricLabels?: Readonly<Record<string, string>>,
+  chartAggregate?: string,
 ): Record<string, string> {
   const names = Array.isArray(y) ? y : [y as string]
   const out: Record<string, string> = {}
@@ -447,6 +489,7 @@ export function tileMeasureLabels(
       groups: [],
       measures: (measures ?? []).map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : `${m.aggregate}_${m.column}`)),
       labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${m.column}`]]))),
+      bases: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, m.column]]))),
     }
     const after = columnsAfterSteps({ ...base, groups: steps.flatMap((s) => (s.summarise?.by ?? []).map((name) => ({ name, kind: "text" }))) }, steps)
     for (const name of names) if (after.labels[name]) out[name] = after.labels[name]
@@ -462,6 +505,9 @@ export function tileMeasureLabels(
       out[name] = metricLabel
     } else if (entry && typeof entry !== "string" && !("metric" in entry) && name !== entry.column) {
       out[name] = `${AGGREGATE_WORDS[entry.aggregate] ?? entry.aggregate} of ${displayColumn(entry.column)}`
+    } else if (entry && typeof entry === "string" && chartAggregate && chartAggregate !== "sum" && name === entry) {
+      // Phase 2 QA R7: a plain name takes the chart's aggregate, which the label says.
+      out[name] = `${AGGREGATE_WORDS[chartAggregate] ?? chartAggregate} of ${displayColumn(entry)}`
     } else if (typeof name === "string" && displayColumn(name) !== name) {
       // BI-7: a measure from a joined table reads table.column.
       out[name] = displayColumn(name)

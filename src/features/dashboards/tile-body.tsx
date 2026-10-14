@@ -58,8 +58,8 @@ export function TileBody({
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
   const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields) | undefined, spec.resolved);
-  // BI-6: "avg of stay" for a measure with its own aggregate.
-  const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps, hasRows(cell) ? cell.metricLabels : undefined);
+  // BI-6: "avg of stay" for a measure with its own aggregate, or one that takes the chart's (phase 2 QA R7).
+  const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps, hasRows(cell) ? cell.metricLabels : undefined, def?.aggregate);
   // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
   const bins = hasRows(cell) ? binsOfTile(cell.bins, def) : {};
   if (spec.kind === "text") {

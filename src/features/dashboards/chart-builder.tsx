@@ -50,10 +50,10 @@ import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
   effectiveOrder, emptyShapeDraft, entriesFromRows, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
-  rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, takesOther, takesSteps, usesGroupings, columnsAfterSteps,
+  rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, usesGroupings, columnsAfterSteps,
   type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
-import { AUTO_BIN } from "@/lib/chart-bins";
+import { AUTO_BIN, binDraftFromDef, binPayload } from "@/lib/chart-bins";
 import { BinPicker, GridPicker } from "./bin-picker";
 import { ChartFilters, GroupingsEditor, MeasureRows, StepsEditor, PreviewRowsTable, type ColumnChoice } from "./chart-shape-section";
 import { withPreviewDef } from "@/lib/preview-spec";
@@ -69,6 +69,9 @@ import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { BuilderSection, FoldSection } from "./builder-sections";
+import { CustomFieldsMenu } from "./custom-fields-menu";
+import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
 import type { Hierarchy } from "@/services/contracts/hierarchies";
@@ -165,7 +168,6 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
     { value: "text", label: "Text / note" },
   ] },
 ];
-const AGGS = ["sum", "avg", "max", "min", "count"];
 /**
  * Value → label maps for the base-ui selects below. Without `items`, a
  * base-ui `Select.Value` renders the raw value (`hbar`, `b_54e05896`,
@@ -355,15 +357,6 @@ export function ChartBuilder({
   const measure = measureRows[0]?.column ?? "";
   const measure2 = measureRows[1]?.column ?? "";
   const measure3 = measureRows[2]?.column ?? "";
-  function setColumnAt(i: number, update: string | ((v: string) => string)) {
-    setMeasureRows((rows) => {
-      const next = [...rows];
-      while (next.length <= i) next.push({ column: "", aggregate: "" });
-      next[i] = { ...next[i], column: typeof update === "function" ? update(next[i].column) : update };
-      return next;
-    });
-  }
-  const setMeasure = (u: string | ((v: string) => string)) => setColumnAt(0, u);
   /** Keeps only the measures the source still offers (a re-run, a deleted field). */
   const keepMeasures = (offered: readonly string[]) => setMeasureRows((rows) => rows.map((r) => ({ ...r, column: keepIfOffered(r.column, offered) })));
   // BI-6: the chart's own filters, the sort (with the three orders a chart always had), "Other", and a table's groupings.
@@ -392,6 +385,8 @@ export function ChartBuilder({
   const [ownDraw, setOwnDraw] = React.useState("");
   const [ownAxis, setOwnAxis] = React.useState("");
   const [paramsOpen, setParamsOpen] = React.useState(false);
+  // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
+  const [moreOpen, setMoreOpen] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -476,6 +471,28 @@ export function ChartBuilder({
     if (grainRequired) { setGrain("day"); return; }
     setGrain((g) => (g && !grainOptions.includes(g) ? "" : g));
   }, [fields, grainOptions, grainRequired]);
+  /**
+   * Phase 2 QA R6: switching the kind keeps what still fits. A chart becoming a grouped table
+   * makes its dimension (and breakdown) the first groupings; a grouped table becoming a chart
+   * makes its first grouping the dimension. A kind that takes one chart-wide aggregate keeps the
+   * first measure's.
+   */
+  function pickKind(next: ChartKind) {
+    if (next === kind) return;
+    const patch = carryOverOnKindSwitch({
+      from: kind, to: next, rowsMode, dimension, breakdown, grain: grain && grainOptions.includes(grain) ? grain : "",
+      dimensionBin: binPayload(shape.bin), breakdownBin: binPayload(shape.breakdownBin), groupings: shape.groupings,
+    });
+    if (patch.groupings) setShape((d) => ({ ...d, groupings: patch.groupings ?? d.groupings }));
+    if (patch.dimension !== undefined) setDimension(patch.dimension);
+    if (patch.grain !== undefined) setGrain(isGrain(patch.grain) ? patch.grain : "");
+    if (patch.bin !== undefined) setShape((d) => ({ ...d, bin: binDraftFromDef(patch.bin) }));
+    if (!measureLimits(next).own && measureRows[0]?.aggregate) {
+      setAggregate(measureRows[0].aggregate);
+      setMeasureRows((rows) => rows.map((r) => ({ ...r, aggregate: "" })));
+    }
+    setKind(next);
+  }
   function pickGrain(next: Grain | "") {
     // A grouped chart reads best in date order; the editor can still change it.
     if (next && !grain && shape.sortChoice === "order:desc") setSortChoice("order:none");
@@ -498,7 +515,15 @@ export function ChartBuilder({
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
-  const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot;
+  // Phase 2 QA R5: what applies to this kind and to what is already set, from one function (lib/builder-rules).
+  const rules = builderRules({
+    kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: canBreakdown && !!breakdown,
+    other: shape.other, steps: shape.steps.length, layers: layers.length,
+    multiGrouped: isGroupedTable && shape.groupings.length > 1,
+    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order),
+    hasSource: !!choice || source === NEW_SQL_CHOICE,
+  });
+  const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot && rules.bins;
   const numberColumns = React.useMemo(
     () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
     [fields, wholeMeasure],
@@ -689,6 +714,7 @@ export function ChartBuilder({
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
+      // Phase 2 QA R4: a measure that stores no aggregate shows this one; saving it back sends the same `aggregate`.
       setAggregate(initial.aggregate ?? "sum");
       setSpan(initial.span === 2 ? 2 : 1);
       setBreakdown(initial.breakdown ?? "");
@@ -713,6 +739,12 @@ export function ChartBuilder({
       setOwnDraw(initial.draw ?? "");
       setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
+      setMoreOpen(moreOptionsUsed({
+        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0, referenceLines: initial.referenceLines?.length ?? 0,
+        click: !!initial.click,
+        columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
+        compare: initial.kind === "kpi" && !!initial.compare,
+      }));
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
       setGrain(isGrain(initial.grain) ? initial.grain : "");
@@ -728,6 +760,7 @@ export function ChartBuilder({
       }
     } else {
       setTargetBoard(board);
+      setMoreOpen(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -737,7 +770,7 @@ export function ChartBuilder({
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
-    setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
   }
@@ -791,8 +824,10 @@ export function ChartBuilder({
     measures: resultNames,
     labels: Object.fromEntries(measureRows.filter((r) => r.column).map((r) => {
       const row = limits.own ? r : { ...r, aggregate: "" };
-      return [resultName(row, wholeMeasure), measureLabel(row, wholeMeasure)];
+      return [resultName(row, wholeMeasure), measureLabel(row, wholeMeasure, aggregate)];
     })),
+    // Phase 2 QA R8: a later step names its output from the column it was computed from.
+    bases: Object.fromEntries(measureRows.filter((r) => r.column).map((r) => [resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure), r.column])),
   };
   const stepsOn = stepsApply(shape, shapeContext);
   const finalResult = stepsOn ? columnsAfterSteps(baseResult, shape.steps) : baseResult;
@@ -807,7 +842,6 @@ export function ChartBuilder({
     if (shape.sortChoice.startsWith("by:") && !sortChoices.some((o) => o.value === shape.sortChoice)) setSortChoice("order:desc");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `sortChoices` is rebuilt every render; its content is what matters
   }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
-  const showOther = takesOther(kind, rowsMode) && !grain && shape.steps.length === 0 && !(isGroupedTable && shape.groupings.length > 1) && limitHasEffect(grain, order);
 
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
@@ -1014,7 +1048,7 @@ export function ChartBuilder({
   ) : null;
 
   const formFields = (
-    <div className="grid content-start gap-4 px-5 pt-1 pb-5">
+    <div className="grid content-start gap-5 px-5 pt-1 pb-5">
       <div className="grid gap-1.5">
         <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
         <Input
@@ -1050,6 +1084,7 @@ export function ChartBuilder({
         </div>
       </div>
 
+
       {isText ? (
         <div className="grid gap-1.5">
           <Label>Content (markdown) <Req /></Label>
@@ -1057,7 +1092,9 @@ export function ChartBuilder({
         </div>
       ) : (
         <>
-          <div className="grid gap-1.5">
+          {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
+          <BuilderSection number={1} title="Data">
+            <div className="grid gap-1.5">
             <Label>Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
               <SelectTrigger className="w-full"><SelectValue placeholder={canWriteSql ? "pick a mart or SQL source, or write SQL" : "pick a mart or SQL source"} /></SelectTrigger>
@@ -1121,38 +1158,21 @@ export function ChartBuilder({
               )
             ) : null}
             {sqlActive ? <SqlSourcePanel draft={draft} onCancelEdit={cancelSqlEdit} /> : null}
-            {fields?.columns && !isNewSql && !isText && choice ? (
-              <div className="flex flex-wrap items-center gap-1.5">
-                {(fields.calculated ?? []).map((f) => (
-                  <Button
-                    key={f.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 font-mono text-xs"
-                    title={isValueGroup(f) ? "Value group" : f.formula}
-                    onClick={() => (isValueGroup(f) ? (setEditingGroup(f), setGroupOpen(true)) : (setEditing(f), setFormulaOpen(true)))}
-                  >
-                    <span className="text-muted-foreground">{isValueGroup(f) ? "grp" : "fx"}</span>{f.name}
-                  </Button>
-                ))}
-                {(fields.hierarchies ?? []).map((h) => (
-                  <Button
-                    key={h.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 text-xs"
-                    title={h.levels.join(" > ")} onClick={() => { setEditingHierarchy(h); setHierarchyOpen(true); }}
-                  >
-                    <span className="text-muted-foreground">{">"}</span>{h.name}
-                  </Button>
-                ))}
-                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditing(undefined); setFormulaOpen(true); }}>
-                  <Plus className="size-3" aria-hidden /> New calculated field
-                </Button>
-                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditingGroup(undefined); setGroupOpen(true); }}>
-                  <Plus className="size-3" aria-hidden /> New value group
-                </Button>
-                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditingHierarchy(undefined); setHierarchyOpen(true); }}>
-                  <Plus className="size-3" aria-hidden /> New hierarchy
-                </Button>
-              </div>
-            ) : null}
-          </div>
+              {fields?.columns && !isNewSql && !isText && choice ? (
+                <CustomFieldsMenu
+                  calculated={fields.calculated ?? []} hierarchies={fields.hierarchies ?? []}
+                  onEditField={(f) => { setEditing(f); setFormulaOpen(true); }}
+                  onEditGroup={(f) => { setEditingGroup(f); setGroupOpen(true); }}
+                  onEditHierarchy={(h) => { setEditingHierarchy(h); setHierarchyOpen(true); }}
+                  onNewField={() => { setEditing(undefined); setFormulaOpen(true); }}
+                  onNewGroup={() => { setEditingGroup(undefined); setGroupOpen(true); }}
+                  onNewHierarchy={() => { setEditingHierarchy(undefined); setHierarchyOpen(true); }}
+                />
+              ) : null}
+            </div>
+          </BuilderSection>
 
+          <BuilderSection number={2} title="What to show">
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
@@ -1167,7 +1187,7 @@ export function ChartBuilder({
             </div>
           ) : null}
 
-          {/* Dimensions together, then the measure next to how it is aggregated. */}
+          {kind === "table" ? <TableSection part="shape" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {!isSingle && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {isGroupedTable ? (
@@ -1207,13 +1227,14 @@ export function ChartBuilder({
               {canBreakdown ? (
                 <div className="grid gap-1.5">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
-                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
                     <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                       {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
+                  {rules.breakdownLocked ? <p className="text-xs text-muted-foreground">{rules.breakdownLocked}</p> : null}
                   {binKind && breakdown && isNumber(breakdown) ? (
                     <BinPicker label="Group in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
                       onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
@@ -1245,54 +1266,24 @@ export function ChartBuilder({
             <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
 
-          {ownColumns ? null : limits.max <= 1 ? <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label>{mLabels[0]} <Req /></Label>
-              <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                <SelectContent>{measureColumns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-            {isBoxplot ? (
-              <div className="grid gap-1.5">
-                <Label>Aggregation</Label>
-                <p className="flex h-8 items-center text-xs text-muted-foreground">Distribution: min, quartiles, max</p>
-              </div>
-            ) : (
-              <div className="grid gap-1.5">
-                <Label>Aggregation</Label>
-                <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
-            )}
-          </div> : (
-            // BI-6: several measures, each with the chart's aggregate or one of its own.
-            <div className="grid gap-3">
-              <div className="grid max-w-xs gap-1.5">
-                <Label>Aggregation <span className="font-normal text-muted-foreground">(default)</span></Label>
-                <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
-              <MeasureRows
-                rows={measureRows} onChange={setMeasureRows} labels={measureTitle}
-                min={limits.min} max={limits.max} own={limits.own} columns={measureColumns} defaultAggregate={aggregate}
-                disabled={!fields} placeholder={fields ? "pick a column" : noFieldsHint} wholeMeasure={wholeMeasure} fieldLabel={fieldLabel}
-              />
-            </div>
-          )}
+          {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
+          {isCalendar ? (
+            <p className="text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
+          ) : null}
 
+          {ownColumns ? null : (
+            <MeasureRows
+              rows={measureRows} onChange={setMeasureRows} labels={measureTitle}
+              min={limits.min} max={limits.max} own={limits.own} columns={measureColumns} defaultAggregate={aggregate}
+              onDefaultAggregate={limits.own || isBoxplot ? undefined : setAggregate} fixedNote={isBoxplot ? "min, quartiles, max" : undefined}
+              disabled={!fields} placeholder={fields ? "pick a column" : noFieldsHint} wholeMeasure={wholeMeasure} fieldLabel={fieldLabel}
+            />
+          )}
           {ownColumns ? null : isKpi ? (
-            <>
-              <div className="grid gap-1.5">
-                <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
-                <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
-              </div>
-              <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} />
-            </>
+            <div className="grid gap-1.5">
+              <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
+              <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
+            </div>
           ) : isGauge ? (
             <div className="grid gap-1.5">
               <Label>Target / max <span className="font-normal text-muted-foreground">(optional)</span></Label>
@@ -1303,76 +1294,7 @@ export function ChartBuilder({
               Up to {pointLimit(choice?.kind === "sql" ? choice.id : undefined).toLocaleString("en-US")} points, largest values first.
               One point per distinct latitude and longitude{dimension ? " and label" : ""}.
             </p>
-          ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {isBoxplot || isCalendar ? (
-                <div className="grid gap-1.5">
-                  <Label>Sort</Label>
-                  <p className="flex h-8 items-center text-xs text-muted-foreground">{isCalendar ? "By date" : "By category"}</p>
-                </div>
-              ) : (
-                <div className="grid gap-1.5">
-                  <Label>Sort</Label>
-                  <Select value={shape.sortChoice} items={sortLabels} onValueChange={(v) => setSortChoice(v ?? "order:desc")}>
-                    <SelectTrigger className="w-full" aria-label="Sort"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {sortChoices.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-              {limitHasEffect(grain, isCalendar ? "none" : order) ? <div className="grid gap-1.5">
-                <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                {limitParamName ? null : (
-                  <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
-                )}
-                {numberParamDefs.length ? (
-                  <Select value={limitParamName || FIXED_LIMIT} items={{ [FIXED_LIMIT]: "A fixed number", ...Object.fromEntries(numberParamDefs.map((p) => [p.name, p.label || p.name])) }}
-                    onValueChange={(v) => setLimitParamName(v && v !== FIXED_LIMIT ? v : "")}>
-                    <SelectTrigger className="w-full" aria-label="Limit from a parameter"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={FIXED_LIMIT}>A fixed number</SelectItem>
-                      {numberParamDefs.map((p) => <SelectItem key={p.name} value={p.name}>{p.label || p.name}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                ) : null}
-              </div> : null}
-            </div>
-          )}
-
-          {takesLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} /> : null}
-          <div>
-            <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
-              <SlidersHorizontal className="size-3" aria-hidden /> Parameters
-            </Button>
-          </div>
-          {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
-
-          {showOther ? (
-            <Label className="gap-2 text-sm font-normal">
-              <Switch size="sm" checked={shape.other} onCheckedChange={(c) => setShape((d) => ({ ...d, other: c === true }))} aria-label="Group the rest as Other" />
-              Group the rest as “Other”
-            </Label>
           ) : null}
-
-          <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} />
-
-          {takesLayers(kind) && !rowsMode && (choice || isNewSql) ? (
-            <LayersSection
-              layers={layers} onChange={setLayers}
-              baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
-              marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
-              ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
-              blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
-              disabled={!fields}
-            />
-          ) : null}
-
-          {takesSteps(kind, rowsMode) && !grain && !shapeContext.breakdown && !shape.other ? (
-            <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} />
-          ) : null}
-
-          {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {isPivot ? (
             <>
               <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
@@ -1383,8 +1305,86 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
+          </BuilderSection>
 
-          {kindHasClickValue(kind) ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+          <BuilderSection number={3} title="Sort and filter">
+            {rules.sort !== "none" ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {rules.sort === "by-date" || rules.sort === "by-category" ? (
+                  <div className="grid gap-1.5">
+                    <Label>Sort</Label>
+                    <p className="flex h-8 items-center text-xs text-muted-foreground">{rules.sort === "by-date" ? "By date" : "By category"}</p>
+                  </div>
+                ) : (
+                  <div className="grid gap-1.5">
+                    <Label>Sort</Label>
+                    <Select value={shape.sortChoice} items={sortLabels} onValueChange={(v) => setSortChoice(v ?? "order:desc")}>
+                      <SelectTrigger className="w-full" aria-label="Sort"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {sortChoices.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+                {rules.limit ? <div className="grid gap-1.5">
+                  <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                  {limitParamName ? null : (
+                    <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+                  )}
+                  {numberParamDefs.length ? (
+                    <Select value={limitParamName || FIXED_LIMIT} items={{ [FIXED_LIMIT]: "A fixed number", ...Object.fromEntries(numberParamDefs.map((p) => [p.name, p.label || p.name])) }}
+                      onValueChange={(v) => setLimitParamName(v && v !== FIXED_LIMIT ? v : "")}>
+                      <SelectTrigger className="w-full" aria-label="Limit from a parameter"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={FIXED_LIMIT}>A fixed number</SelectItem>
+                        {numberParamDefs.map((p) => <SelectItem key={p.name} value={p.name}>{p.label || p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  ) : null}
+                </div> : null}
+              </div>
+            ) : null}
+
+            {rules.other.shown ? (
+              <div className="grid gap-1">
+                <Label className="gap-2 text-sm font-normal">
+                  <Switch size="sm" checked={shape.other} disabled={rules.other.disabled} onCheckedChange={(c) => setShape((d) => ({ ...d, other: c === true }))} aria-label="Group the rest as Other" />
+                  Group the rest as “Other”
+                </Label>
+                {rules.other.hint ? <p className="text-xs text-muted-foreground">{rules.other.hint}</p> : null}
+              </div>
+            ) : null}
+
+            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
+          </BuilderSection>
+
+          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen}>
+            {rules.steps ? <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} /> : null}
+
+            {rules.layers ? (
+              <LayersSection
+                layers={layers} onChange={setLayers}
+                baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
+                marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
+                ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
+                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
+                disabled={!fields}
+              />
+            ) : null}
+
+            {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} /> : null}
+            {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
+            {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
+            {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+            {rules.parameters ? (
+              <div>
+                <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
+                  <SlidersHorizontal className="size-3" aria-hidden /> Parameters
+                </Button>
+              </div>
+            ) : null}
+            {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
+          </FoldSection>
         </>
       )}
     </div>
@@ -1465,7 +1465,7 @@ export function ChartBuilder({
                 onKeyDown={(e) => {
                   // Enter picks the first match, so "sank⏎" is enough.
                   const first = kindGroups[0]?.items[0];
-                  if (e.key === "Enter" && first) { e.preventDefault(); setKind(first.value); }
+                  if (e.key === "Enter" && first) { e.preventDefault(); pickKind(first.value); }
                 }}
                 placeholder="Search chart types"
                 aria-label="Search chart types"
@@ -1490,7 +1490,7 @@ export function ChartBuilder({
                       type="button"
                       aria-pressed={active}
                       title={KIND_DESCRIPTIONS[item.value]}
-                      onClick={() => setKind(item.value)}
+                      onClick={() => pickKind(item.value)}
                       className={cn(
                         "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                         active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
