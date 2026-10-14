@@ -752,6 +752,28 @@ fn parse_content_fingerprint_row(row: &serde_json::Map<String, Value>) -> Option
 /// The response body shared by the publication detail `GET` and `PUT`:
 /// the stored switch plus the two measured freshness facts the console's
 /// "Up to date"/"Out of date" line compares.
+/// DATA-10 D4: Compare the current mart fingerprint with the last recorded
+/// successful export's fingerprint.
+///
+/// Returns:
+/// - `Some(false)` when both fingerprints are non-empty and identical (Up to date).
+/// - `Some(true)` when both fingerprints are non-empty and differ (Out of date).
+/// - `None` when either fingerprint is missing or empty (Not measured / Never published).
+#[must_use]
+pub fn compute_changed_since_export(
+    current_fp: Option<&str>,
+    last_fp: Option<&str>,
+) -> Option<bool> {
+    let current = current_fp?;
+    let last = last_fp?;
+    if current.is_empty() || last.is_empty() {
+        return None;
+    }
+    Some(current != last)
+}
+
+/// The response body shared by the publication detail `GET` and `PUT`:
+/// the stored switch plus the freshness facts the console compares.
 async fn publication_body(
     state: &AppState,
     mart: &str,
@@ -763,15 +785,25 @@ async fn publication_body(
         mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
             .await
             .map_err(ApiError::from)?;
-    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+    let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
         .map_err(ApiError::from)?;
+    let current_fingerprint =
+        mart_content_fingerprint(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(ApiError::from)?;
+    let changed_since_export = compute_changed_since_export(
+        current_fingerprint.as_deref(),
+        last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
+    );
+    let last_exported_at = last_export.as_ref().and_then(|e| e.started_at_ms);
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
         "updatedAt": updated_at,
         "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
         "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
+        "changedSinceExport": changed_since_export,
         "canEdit": can_edit,
     }))
 }
@@ -1117,6 +1149,35 @@ mod tests {
         assert!(
             matches!(err, ApiError::Unauthorized(_)) || err.to_string().contains("unauthorized")
         );
+    }
+
+    // ── compute_changed_since_export (DATA-10 T3 / D4) ──────────────────
+
+    #[test]
+    fn compute_changed_since_export_reports_false_on_match() {
+        let changed = compute_changed_since_export(Some("10:111:222"), Some("10:111:222"));
+        assert_eq!(changed, Some(false));
+    }
+
+    #[test]
+    fn compute_changed_since_export_reports_true_on_difference() {
+        let changed = compute_changed_since_export(Some("10:111:222"), Some("10:333:222"));
+        assert_eq!(changed, Some(true));
+    }
+
+    #[test]
+    fn compute_changed_since_export_reports_none_when_unmeasured() {
+        assert_eq!(compute_changed_since_export(None, Some("10:111:222")), None);
+        assert_eq!(compute_changed_since_export(Some("10:111:222"), None), None);
+        assert_eq!(
+            compute_changed_since_export(Some(""), Some("10:111:222")),
+            None
+        );
+        assert_eq!(
+            compute_changed_since_export(Some("10:111:222"), Some("")),
+            None
+        );
+        assert_eq!(compute_changed_since_export(None, None), None);
     }
 
     // ── if_changed_skip_reason (DATA-10 T2 / DATA-1 task 4) ─────────────

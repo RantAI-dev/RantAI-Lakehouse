@@ -333,6 +333,10 @@ async fn enabling_lists_a_mart_and_disabling_removes_it_from_the_list() {
         body["lastExportedAt"].is_null(),
         "never exported -> null, never a guessed time: {body}"
     );
+    assert!(
+        body["changedSinceExport"].is_null(),
+        "never exported -> changedSinceExport null: {body}"
+    );
 }
 
 /// A mart that exists but was never switched on reports the OFF default:
@@ -359,11 +363,70 @@ async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     assert_eq!(body["enabled"], Value::Bool(false), "{body}");
     assert!(body["updatedAt"].is_null(), "{body}");
     assert!(body["lastExportedAt"].is_null(), "{body}");
+    assert!(body["changedSinceExport"].is_null(), "{body}");
     assert!(body["lastChangedAt"].is_string(), "{body}");
     assert_eq!(body["canEdit"], Value::Bool(false), "{body}");
 }
 
 // ── T4: POST /api/gold/export/{mart}?ifChanged=true ─────────────────────
+
+#[tokio::test]
+async fn publication_detail_reports_changed_since_export_accurately() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "fp_status_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    // 1. Never exported -> changedSinceExport is null.
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["changedSinceExport"].is_null(), "{body}");
+
+    // 2. Exported with current fingerprint -> changedSinceExport is false (Up to date).
+    let fp =
+        lakehouse_api::routes::gold::mart_content_fingerprint(&ch, "serving", "fp_status_mart")
+            .await
+            .expect("fingerprint read")
+            .expect("fingerprint present");
+    seed_success_run_with_fingerprint(&ch, "fp_status_mart", unix_ms(-10), &fp).await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changedSinceExport"], Value::Bool(false), "{body}");
+
+    // 3. Mutate table -> changedSinceExport is true (Out of date).
+    ch.exec(
+        "INSERT INTO serving.fp_status_mart (n) VALUES (999)",
+        None,
+    )
+    .await
+    .expect("insert new row");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changedSinceExport"], Value::Bool(true), "{body}");
+}
 
 use lakehouse_api::gold_export_history;
 

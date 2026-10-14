@@ -312,6 +312,7 @@ pub async fn last_success_export(
 /// # Errors
 ///
 /// Returns [`ChError`] if the table cannot be ensured or the query fails.
+#[allow(dead_code)]
 pub async fn last_success_started_at(ch: &ChClient, mart: &str) -> Result<Option<i64>, ChError> {
     Ok(last_success_export(ch, mart)
         .await?
