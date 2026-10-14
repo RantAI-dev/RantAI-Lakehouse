@@ -54,6 +54,22 @@ requires TLS: if it is missing, `build_source` refuses BEFORE calling
 server's identity cannot be verified when connecting by a checked IP
 literal. Plaintext (`sslMode` unset/`"disable"`) sets no DN check at
 all -- stated, not silently dropped.
+
+**The dial's `database` is a SERVICE NAME (`SRC-9` finding G3).** The console
+labels the field "Database (service name)" (`oracle-dial-form.tsx`) and a
+pluggable database is reached only by service name. SQLAlchemy's
+`oracle+oracledb` dialect turns the URL path (`url.database`) into a SID
+(`makedsn(sid=...)`) and `?service_name=` into a service name, so passing
+`database` as the path made the g6 Oracle gate fail on its first run with
+`DPY-6003: SID "FREEPDB1" is not registered with the listener` (ORA-12505).
+The dial's `database` is therefore sent as `query={"service_name": ...}`,
+and the URL path stays empty (the dialect rejects both together). Only the
+descriptor changes: the host is still the checked IP literal. No deployment
+could have relied on the SID reading: the type was never loaded by a gate
+before `SRC-9` and the picker names the field a service name. Limit: a
+database reachable only by SID (a container database with no service
+registered, or a legacy listener) is not supported; it would need a separate
+dial field, for example `sid`, which does not exist.
 """
 from __future__ import annotations
 
@@ -83,7 +99,13 @@ def build_source(
     source_objects: list[dict],
     *,
     resolve_checked=ssrf_guard.resolve_checked,
+    table_adapter_callback=None,
 ) -> AdapterBuildResult:
+    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
+    calls it with each reflected table while the source is built, which is
+    below, inside `checking_resolver()` and over the checked IP literal -- the
+    observation reads the columns from that reflection and opens no
+    connection of its own."""
     resolved = resolve_checked(spec["host"], spec["port"])
     table_names = [obj["name"].split(".")[-1] for obj in source_objects]
 
@@ -114,8 +136,13 @@ def build_source(
         "password": secrets["password"],
         "host": resolved.ip,  # the CHECKED literal IP -- never spec["host"]
         "port": spec["port"],
-        "database": spec["database"],
+        # SERVICE NAME, not SID (SRC-9 finding G3): see the module docstring.
+        # `database` stays unset because the dialect refuses both together.
+        "query": {"service_name": spec["database"]},
     }
     with ssrf_guard.checking_resolver():
-        source = sql_database(credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs)
+        extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+        source = sql_database(
+            credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs, **extra
+        )
     return AdapterBuildResult(source=source, resolved=resolved)

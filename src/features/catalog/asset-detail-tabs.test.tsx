@@ -27,6 +27,8 @@ import { formatDate } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
+import type { MeaningState } from "./asset-meaning"
+import type { SemanticEntry } from "@/services/contracts/semantic"
 import { relatedTables } from "./asset-lineage"
 
 afterEach(() => {
@@ -217,15 +219,16 @@ function stubApi({
     if (path.includes("/api/governance/lineage")) return json(lineage)
     if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
+    if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
 }
 
-function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}) {
+function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}, meanings?: MeaningState) {
   return render(
     <AuthProvider>
-      <AssetDetailTabs asset={asset} onAssetChanged={onAssetChanged} />
+      <AssetDetailTabs asset={asset} onAssetChanged={onAssetChanged} meanings={meanings} />
     </AuthProvider>
   )
 }
@@ -357,6 +360,16 @@ describe("Activity tab", () => {
     expect(decodeURIComponent(href)).toContain("iceberg_snapshot_id+=+248842615326512766")
   })
 
+  it("says how far back versions go from the list itself, with no day count (DATA-16 D2)", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs()
+
+    await screen.findByText("append")
+    expect(screen.getByText(/1 version, from /)).toBeTruthy()
+    expect(screen.queryByText(/\bdays?\b/i)).toBeNull()
+  })
+
   it("says a ClickHouse table keeps no snapshots, rather than that it has none", () => {
     stubApi()
     url.search = "tab=activity"
@@ -474,7 +487,8 @@ describe("Quality tab", () => {
     url.search = "tab=quality"
     renderTabs(BRONZE, reloaded)
 
-    fireEvent.click(screen.getByText("Add rule"))
+    // The button waits for the session: it shows only with governance:write (SEC-23).
+    fireEvent.click(await screen.findByText("Add rule"))
     fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
     expect(screen.getByText("id unique")).toBeTruthy()
@@ -691,7 +705,8 @@ describe("Health and classification", () => {
 
     const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
     expect(within(card).getByText(/The default level/)).toBeTruthy()
-    fireEvent.click(within(card).getByText("Classify"))
+    // The button waits for the session: it shows only with governance:write (SEC-23).
+    fireEvent.click(await within(card).findByText("Classify"))
     fireEvent.change(screen.getByLabelText("Applies to"), { target: { value: "amount" } })
     fireEvent.change(screen.getByLabelText("Classification"), { target: { value: "confidential" } })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
@@ -732,6 +747,49 @@ describe("Quality tab: deleting a rule", () => {
 
     await screen.findByText("email_complete")
     await waitFor(() => expect(screen.queryByLabelText("Delete rule email_complete")).toBeNull())
+  })
+})
+
+// SEC-23 (F4): the API refuses adding a rule without governance:write, so the
+// buttons that add one show only with it, as Edit and Delete beside them do.
+describe("Quality and Access tabs: adding a rule needs governance:write", () => {
+  const without = ["catalog:read", "query:read", "policy:read"]
+  const runnableRule: AssetDetail["qualityChecks"] = [
+    { id: "q2", name: "email_complete", dimension: "completeness", status: null, lastRun: null, threshold: "email not null", origin: "rule", evaluable: true },
+  ]
+
+  it("hides Add rule on the Quality tab without governance:write, and shows it with", async () => {
+    stubApi({ permissions: without })
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: runnableRule })
+
+    // Run checks needs query:read, so it appearing proves the session loaded.
+    await screen.findByRole("button", { name: "Run checks" })
+    expect(screen.queryByRole("button", { name: "Add rule" })).toBeNull()
+    cleanup()
+    mock.restore()
+
+    stubApi({ permissions: [...without, "governance:write"] })
+    renderTabs({ ...BRONZE, qualityChecks: runnableRule })
+    expect(await screen.findByRole("button", { name: "Add rule" })).toBeTruthy()
+  })
+
+  it("hides Classify on the Access tab without governance:write, and shows it with", async () => {
+    stubApi({ permissions: without })
+    url.search = "tab=access"
+    renderTabs(BRONZE)
+
+    // "Your access" reads the same session, so a Granted pill proves it loaded.
+    await screen.findAllByText("Granted")
+    const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).queryByText("Classify")).toBeNull()
+    cleanup()
+    mock.restore()
+
+    stubApi({ permissions: [...without, "governance:write"] })
+    renderTabs(BRONZE)
+    const again = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(await within(again).findByText("Classify")).toBeTruthy()
   })
 })
 
@@ -2050,5 +2108,35 @@ describe("Schema versions of a Silver or Gold table", () => {
 
     expect(await screen.findByText("No schema history available")).toBeTruthy()
     expect(screen.queryByText("No schema version recorded yet")).toBeNull()
+  })
+})
+
+describe("Schema tab: the meaning the page passes in", () => {
+  it("shows the Meaning card of the state the page holds, without a request of its own", () => {
+    const fetchSpy = stubApi()
+    const table: SemanticEntry = {
+      asset: "bronze.demo_orders",
+      column: null,
+      description: "Orders as confirmed by a person",
+      synonyms: [],
+      role: null,
+      status: "confirmed",
+      writtenBy: null,
+      model: null,
+      updatedAt: new Date().toISOString(),
+    }
+    const meanings: MeaningState = {
+      kind: "ready",
+      table,
+      byColumn: new Map(),
+      canEdit: false,
+      save: async () => {},
+      reload: () => {},
+    }
+    renderTabs(BRONZE, () => {}, meanings)
+    fireEvent.click(screen.getByRole("tab", { name: /Schema/ }))
+
+    expect(screen.getByText("Orders as confirmed by a person")).toBeTruthy()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/semantic/"))).toBe(false)
   })
 })

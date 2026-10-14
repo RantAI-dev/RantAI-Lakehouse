@@ -7,7 +7,13 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { readDraft, writeDraft } from "@/lib/query-draft"
 import { hasStatement } from "@/lib/sql-text"
 import { assetService, queryService } from "@/services"
-import type { NlAnswer, QueryEngine, SaveQueryInput } from "@/services/contracts/queries"
+import { toServiceError, type ServiceError } from "@/services/errors"
+import type {
+  NlAnswer,
+  QueryEngine,
+  SaveQueryInput,
+  SqlFixOutcome,
+} from "@/services/contracts/queries"
 
 /** What the editor holds before anyone types. */
 export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
@@ -32,8 +38,21 @@ export type StudioTab = "nl" | "sql"
 export function useQueryStudio() {
   const [tab, setTab] = React.useState<StudioTab>("nl")
   const [question, setQuestion] = React.useState("")
-  const [sql, setSql] = React.useState(STARTER_SQL)
+  const [sql, setSqlState] = React.useState(STARTER_SQL)
   const [engine, setEngine] = React.useState<QueryEngine>("clickhouse")
+
+  // A proposal is a diff against the editor as it was when it came back.
+  // Once the editor changes, the diff describes something else, so it goes.
+  const [fixResult, setFixResult] = React.useState<SqlFixOutcome | null>(null)
+  const [fixBusy, setFixBusy] = React.useState(false)
+  const [fixError, setFixError] = React.useState<ServiceError | null>(null)
+  const [explainResult, setExplainResult] = React.useState<string | null>(null)
+  const [explainBusy, setExplainBusy] = React.useState(false)
+  const [explainError, setExplainError] = React.useState<ServiceError | null>(null)
+  const setSql = React.useCallback((next: string) => {
+    setSqlState(next)
+    setFixResult(null)
+  }, [])
 
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
@@ -98,7 +117,7 @@ export function useQueryStudio() {
     if (draft.sql) setSql(draft.sql)
     if (draft.question) setQuestion(draft.question)
     setTab(draft.tab)
-  }, [])
+  }, [setSql])
 
   const persistDraft = useDebouncedCallback(
     (next: { sql: string; question: string; tab: StudioTab }) => {
@@ -125,10 +144,13 @@ export function useQueryStudio() {
   }, [sql, estimatable, estimateDebounced])
 
   // ── Actions ──────────────────────────────────────────────────────────
-  const loadSql = React.useCallback((next: string) => {
-    setSql(next)
-    setTab("sql")
-  }, [])
+  const loadSql = React.useCallback(
+    (next: string) => {
+      setSql(next)
+      setTab("sql")
+    },
+    [setSql]
+  )
 
   const generate = React.useCallback(async () => {
     const out = await generateAct.run(question)
@@ -137,6 +159,8 @@ export function useQueryStudio() {
 
   const runQuery = React.useCallback(async () => {
     if (!hasStatement(sql)) return
+    // A run means the person has moved on from the proposal; its diff is stale.
+    setFixResult(null)
     await runAct.run(sql, engine)
     // Every run is recorded, including the ones that failed, so the rail
     // has to catch up — otherwise the query you just ran is missing from
@@ -175,7 +199,46 @@ export function useQueryStudio() {
     } finally {
       setAgentBusy(false)
     }
-  }, [question])
+  }, [question, setSql])
+
+  // Explain: the chat reads the statement in words and runs nothing.
+  const explainRun = React.useCallback(async () => {
+    if (!hasStatement(sql)) return
+    setExplainBusy(true)
+    setExplainError(null)
+    setExplainResult(null)
+    try {
+      setExplainResult(await queryService.explainSql(sql, engine))
+    } catch (e) {
+      setExplainError(toServiceError(e))
+    } finally {
+      setExplainBusy(false)
+    }
+  }, [sql, engine])
+
+  // Fix: the chat proposes a corrected statement for the failed one. The
+  // proposal waits in `fixResult` until the person accepts or rejects it.
+  const fixRun = React.useCallback(
+    async (error: string) => {
+      setFixBusy(true)
+      setFixError(null)
+      setFixResult(null)
+      try {
+        setFixResult(await queryService.proposeFix(sql, engine, error))
+      } catch (e) {
+        setFixError(toServiceError(e))
+      } finally {
+        setFixBusy(false)
+      }
+    },
+    [sql, engine]
+  )
+  // Accept puts the proposal in the editor. It does not run it: the person
+  // presses "Run query" to see its rows, as with any statement they typed.
+  const fixAccept = React.useCallback(() => {
+    if (fixResult && "sql" in fixResult) setSql(fixResult.sql)
+  }, [fixResult, setSql])
+  const fixReject = React.useCallback(() => setFixResult(null), [])
 
   // Handoff from Saved Queries: /query-studio?saved=<id> loads that SQL.
   // Read from window.location to avoid a useSearchParams Suspense boundary.
@@ -207,6 +270,20 @@ export function useQueryStudio() {
     savedState,
     historyState,
     agent: { busy: agentBusy, result: agentResult, error: agentError, ask },
+    explain: {
+      busy: explainBusy,
+      result: explainResult,
+      error: explainError,
+      run: explainRun,
+    },
+    fix: {
+      busy: fixBusy,
+      result: fixResult,
+      error: fixError,
+      run: fixRun,
+      accept: fixAccept,
+      reject: fixReject,
+    },
     loadSql,
     generate,
     runQuery,

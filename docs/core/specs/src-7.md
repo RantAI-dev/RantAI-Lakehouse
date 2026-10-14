@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-7` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -36,11 +34,10 @@ Airbyte notifications: failed sync, successful sync, schema change, action requi
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Break a connector's password; the next run fails and an email and a webhook arrive within 5 minutes
-- [ ] The connector list shows the failure without a manual test
-- [ ] Success alerts are off unless switched on
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-7-AC1` Break a connector's password; the next run fails and an email and a webhook arrive within 5 minutes
+- `SRC-7-AC2` The connector list shows the failure without a manual test
+- `SRC-7-AC3` Success alerts are off unless switched on
+- `SRC-7-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

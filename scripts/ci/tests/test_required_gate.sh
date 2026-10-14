@@ -37,9 +37,9 @@ expect() {
     # Clean subshell environment
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
-          RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT \
+          RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
-          G4_CDC_RESULT G6_INGEST_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT
+          G4_CDC_RESULT G6_INGEST_RESULT G6_INGEST_OTHER_RESULT G6_ORACLE_RESULT G9_UPLOAD_RESULT G6_ALERTS_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT G8_TIME_TRAVEL_RESULT
     export "$@"
     bash "$SCRIPT" >/dev/null 2>&1
   ) || got=$?
@@ -59,69 +59,69 @@ base_docs_green=(
   CHANGES_RESULT=success REPO_LINTS_RESULT=success
   FRONTEND_RESULT=skipped RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped
   RUST_BUILD_RESULT=skipped RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
-  DAGSTER_TESTS_RESULT=skipped G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped
+  DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped
   G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped
-  G6_INGEST_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 )
 
 base_frontend_green=(
   EVENT_NAME=pull_request SCOPE_FRONTEND=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
   RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
-  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
-  G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G6_INGEST_RESULT=skipped
-  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped
+  G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped
+  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 )
 
 base_rust_green=(
   EVENT_NAME=pull_request SCOPE_RUST=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
   RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
-  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped
+  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
-  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_dagster_green=(
   EVENT_NAME=pull_request SCOPE_DAGSTER=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
   RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
-  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=success
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
-  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_stack_green=(
   EVENT_NAME=pull_request SCOPE_STACK=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
   RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
-  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
-  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_all_green=(
   EVENT_NAME=pull_request SCOPE_ALL=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
   RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
-  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success
+  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
-  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 base_push_green=(
   EVENT_NAME=push
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
   RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
-  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success
+  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
-  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success
-  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success
+  G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success
+  GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
 )
 
 # 1. Happy path cases
@@ -146,9 +146,16 @@ expect 1 "Failing clippy blocks rust PR" "${base_rust_green[@]}" RUST_CLIPPY_RES
 expect 1 "Failing fmt blocks rust PR" "${base_rust_green[@]}" RUST_FMT_RESULT=failure
 expect 1 "Failing build blocks rust PR" "${base_rust_green[@]}" RUST_BUILD_RESULT=failure
 expect 1 "Failing acceptance blocks rust PR" "${base_rust_green[@]}" G6_INGEST_RESULT=failure
+expect 1 "Failing second half of the ingest gate blocks rust PR" "${base_rust_green[@]}" G6_INGEST_OTHER_RESULT=failure
+expect 1 "Failing Oracle gate blocks rust PR" "${base_rust_green[@]}" G6_ORACLE_RESULT=failure
+expect 1 "Failing upload gate blocks rust PR" "${base_rust_green[@]}" G9_UPLOAD_RESULT=failure
+expect 1 "Failing alert delivery gate blocks rust PR" "${base_rust_green[@]}" G6_ALERTS_RESULT=failure
+expect 1 "Failing time-travel acceptance blocks rust PR" "${base_rust_green[@]}" G8_TIME_TRAVEL_RESULT=failure
 expect 1 "Skipped acceptance blocks rust PR" "${base_rust_green[@]}" G1_RUSTFS_RESULT=skipped
 expect 1 "Failing dagster unit test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_TESTS_RESULT=failure
+expect 1 "Failing dagster loader test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_LOADER_TESTS_RESULT=failure
 expect 1 "Skipped dagster unit test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_TESTS_RESULT=skipped
+expect 1 "Skipped dagster loader test blocks dagster PR" "${base_dagster_green[@]}" DAGSTER_LOADER_TESTS_RESULT=skipped
 expect 1 "Failing acceptance blocks stack PR" "${base_stack_green[@]}" G4_CDC_RESULT=failure
 expect 1 "Cancelled job blocks gate" "${base_rust_green[@]}" RUST_TEST_RESULT=cancelled
 expect 1 "Skipped job on push blocks gate" "${base_push_green[@]}" RUST_TEST_RESULT=skipped

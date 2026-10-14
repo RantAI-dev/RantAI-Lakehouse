@@ -3,12 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `QS-3` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Query Studio |
-| Who builds it | Query Studio |
-| When | Next |
+| Module | Query Studio |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Waits for | [`SEC-20`](sec-20.md) (security fix) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -38,11 +36,10 @@ Databricks: folders, sharing CAN VIEW / CAN RUN / CAN EDIT / CAN MANAGE. Metabas
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A query shared as 'run' can be run but not changed
-- [ ] Reverting to version 3 restores its SQL
-- [ ] A deleted query is restored from the trash
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `QS-3-AC1` A query shared as 'run' can be run but not changed
+- `QS-3-AC2` Reverting to version 3 restores its SQL
+- `QS-3-AC3` A deleted query is restored from the trash
+- `QS-3-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
