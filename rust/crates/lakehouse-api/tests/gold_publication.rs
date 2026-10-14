@@ -391,6 +391,7 @@ async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
             snapshot_id: None,
             error: None,
             triggered_by: "user:test",
+            content_fingerprint: "",
             started_at_ms: started_ms,
             finished_at_ms: started_ms,
         },

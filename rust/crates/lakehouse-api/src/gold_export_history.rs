@@ -62,9 +62,15 @@ async fn ensure_gold_export_run_table_uncached(ch: &ChClient) -> Result<(), ChEr
            snapshot_id Nullable(Int64),\n\
            error Nullable(String),\n\
            triggered_by String,\n\
+           content_fingerprint String DEFAULT '',\n\
            started_at DateTime64(3),\n\
            finished_at DateTime64(3)\n\
          ) ENGINE = MergeTree ORDER BY (mart, started_at)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.gold_export_run ADD COLUMN IF NOT EXISTS content_fingerprint String DEFAULT ''",
         None,
     )
     .await?;
@@ -100,6 +106,10 @@ pub struct NewGoldExportRun<'a> {
     /// `routes::gold::export`'s call site for how this is built from a
     /// `Principal`.
     pub triggered_by: &'a str,
+    /// DATA-10: The content fingerprint of the mart before the export ran,
+    /// formatted as `"<count>:<sum>:<schemaHash>"`, or an empty string if
+    /// unavailable or not measured.
+    pub content_fingerprint: &'a str,
     /// Unix-millisecond timestamp when the export attempt began.
     pub started_at_ms: i64,
     /// Unix-millisecond timestamp when the export attempt finished
@@ -124,9 +134,9 @@ fn insert_sql(row: &NewGoldExportRun<'_>) -> String {
     format!(
         "INSERT INTO console.gold_export_run \
          (id, mart, status, rows_exported, format_version, snapshot_id, error, \
-          triggered_by, started_at, finished_at) VALUES \
+          triggered_by, content_fingerprint, started_at, finished_at) VALUES \
          ({id}, {mart}, {status}, {rows_exported}, {format_version}, {snapshot_id}, {error}, \
-          {triggered_by}, {started_at}, {finished_at})",
+          {triggered_by}, {content_fingerprint}, {started_at}, {finished_at})",
         id = SqlLiteral::from(uuid::Uuid::new_v4().to_string()),
         mart = SqlLiteral::from(row.mart),
         status = SqlLiteral::from(row.status),
@@ -135,6 +145,7 @@ fn insert_sql(row: &NewGoldExportRun<'_>) -> String {
         snapshot_id = opt_num(row.snapshot_id),
         error = opt_str(row.error),
         triggered_by = SqlLiteral::from(row.triggered_by),
+        content_fingerprint = SqlLiteral::from(row.content_fingerprint),
         started_at = datetime64_literal(row.started_at_ms),
         finished_at = datetime64_literal(row.finished_at_ms),
     )
@@ -158,6 +169,7 @@ pub async fn record_export_run(ch: &ChClient, row: &NewGoldExportRun<'_>) -> Res
 fn list_sql(mart: &str, limit: u32) -> String {
     format!(
         "SELECT id, status, rows_exported, format_version, snapshot_id, error, triggered_by, \
+          content_fingerprint, \
           toString(started_at) AS started_at, toString(finished_at) AS finished_at \
           FROM console.gold_export_run WHERE mart = {mart} \
           ORDER BY started_at DESC LIMIT {limit} FORMAT JSON",
@@ -167,7 +179,8 @@ fn list_sql(mart: &str, limit: u32) -> String {
 
 fn last_success_sql(mart: &str) -> String {
     format!(
-        "SELECT toString(toUnixTimestamp64Milli(started_at)) AS started_ms \
+        "SELECT toString(toUnixTimestamp64Milli(started_at)) AS started_ms, \
+                content_fingerprint \
           FROM console.gold_export_run \
           WHERE mart = {mart} AND status = 'success' \
           ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
@@ -195,6 +208,8 @@ pub struct GoldExportRunRow {
     pub error: Option<String>,
     /// Mirrors [`NewGoldExportRun::triggered_by`].
     pub triggered_by: String,
+    /// DATA-10: Stored content fingerprint of the mart before the export.
+    pub content_fingerprint: String,
     /// `ClickHouse`'s `toString(started_at)` rendering — a plain UTC
     /// datetime string, not yet RFC 3339 (the console formats this for
     /// display; this route reports it verbatim).
@@ -226,6 +241,7 @@ fn row_to_export_run(row: &serde_json::Map<String, Value>) -> GoldExportRunRow {
             .and_then(Value::as_str)
             .map(str::to_owned),
         triggered_by: str_field("triggered_by"),
+        content_fingerprint: str_field("content_fingerprint"),
         started_at: str_field("started_at"),
         finished_at: str_field("finished_at"),
     }
@@ -267,6 +283,31 @@ pub async fn last_success_started_at(ch: &ChClient, mart: &str) -> Result<Option
         .and_then(|ms| ms.parse::<i64>().ok()))
 }
 
+/// DATA-10: Read the stored content fingerprint of `mart`'s newest
+/// `status = 'success'` export run, or `None` if it has never exported
+/// successfully or has an empty stored fingerprint.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+#[allow(
+    dead_code,
+    reason = "DATA-10 T1 introduces the history reader; T2 uses it for the skip comparison"
+)]
+pub async fn last_success_fingerprint(
+    ch: &ChClient,
+    mart: &str,
+) -> Result<Option<String>, ChError> {
+    ensure_gold_export_run_table(ch).await?;
+    let rows = ch.rows(&last_success_sql(mart), None).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("content_fingerprint"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -283,6 +324,7 @@ mod tests {
             snapshot_id: Some(123),
             error: None,
             triggered_by: "user:o'brien",
+            content_fingerprint: "10:12345:67890",
             started_at_ms: 1_700_000_000_000,
             finished_at_ms: 1_700_000_001_000,
         };
@@ -299,6 +341,7 @@ mod tests {
         // since escaping is not redaction).
         assert!(sql.contains("sales''; DROP TABLE x; --"), "{sql}");
         assert!(sql.contains("user:o''brien"), "{sql}");
+        assert!(sql.contains("'10:12345:67890'"), "{sql}");
     }
 
     #[test]
@@ -311,6 +354,7 @@ mod tests {
             snapshot_id: None,
             error: Some("row cap exceeded"),
             triggered_by: "service:gold-export-scheduler",
+            content_fingerprint: "",
             started_at_ms: 1_700_000_000_000,
             finished_at_ms: 1_700_000_000_500,
         };
@@ -333,6 +377,7 @@ mod tests {
         assert!(sql.contains("status = 'success'"), "{sql}");
         assert!(sql.contains("ORDER BY started_at DESC LIMIT 1"), "{sql}");
         assert!(sql.contains("toUnixTimestamp64Milli"), "{sql}");
+        assert!(sql.contains("content_fingerprint"), "{sql}");
         assert!(sql.contains("'sales'"), "{sql}");
     }
 
@@ -345,12 +390,14 @@ mod tests {
         let as_numbers = serde_json::json!({
             "id": "r1", "status": "success", "rows_exported": 7,
             "format_version": 2, "snapshot_id": 123, "error": null,
-            "triggered_by": "t", "started_at": "s", "finished_at": "f"
+            "triggered_by": "t", "content_fingerprint": "7:999:111",
+            "started_at": "s", "finished_at": "f"
         });
         let row = row_to_export_run(as_numbers.as_object().expect("object"));
         assert_eq!(row.rows_exported, Some(7));
         assert_eq!(row.format_version, Some(2));
         assert_eq!(row.snapshot_id, Some(123));
+        assert_eq!(row.content_fingerprint, "7:999:111");
 
         let as_strings = serde_json::json!({
             "id": "r2", "status": "success", "rows_exported": "7",
