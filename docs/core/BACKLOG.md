@@ -167,7 +167,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
 | `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | Todo |  | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
 | `SRC-20` | Task | The pipeline gate `ops/g7` is run by no CI job | Data | P3 | Todo |  | `plans/SRC-9-RESULT.md` |
-| `SRC-21` | Task | Load-mode follow-ups from `SRC-10`: the assistant's `set_ingest_spec` schema does not know `loadMode` or `primaryKey`, so a spec it saves drops each table's mode and key (the job then replaces); no test covers a pending removal of a key column next to an approvable change when the pause is lifted | Data | P2 | Todo |  | PR #115 review; `superpowers/plans/2026-10-14-src-21-load-modes-followups.md` |
+| `SRC-21` | Task | Load-mode follow-ups from `SRC-10`: the assistant's `set_ingest_spec` schema does not know `loadMode` or `primaryKey`, so a spec it saves drops each table's mode and key (the job then replaces); no test covers a pending removal of a key column next to an approvable change when the pause is lifted | Data | P2 | Done | #145 | PR #115 review; `superpowers/plans/2026-10-14-src-21-load-modes-followups.md` |
 | `DATA-24` | Task | Catalog search follow-ups: measure the 500 ms target on 10,000 tables (`DATA-11-RESULT.md`); keep the Owner and Tags filters reachable on a laptop-width window; read column rows with `FINAL`; run acceptance rows 10, 11 and 13 | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`DATA-11`) |
 | `AI-19` | Task | The AI team's plans for `AI-16` and `AI-17` in `docs/superpowers/plans/` (`AI-16-AC1`, `AGENTS.md` step 1); the feature pages say plans are not kept in the repository | AI Copilot | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 
@@ -225,6 +225,7 @@ set by the product owner and are left empty until they are.
 | `SRC-9` | 2026-10-10 | 2026-10-13 | |
 | `AI-12` | 2026-10-13 | | |
 | `SRC-10` | 2026-10-12 | 2026-10-14 | |
+| `SRC-21` | 2026-10-14 | 2026-10-14 | |
 
 ## Decide
 
