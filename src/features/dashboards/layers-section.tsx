@@ -25,7 +25,6 @@ import { ChartFilters, MeasureRows, type ColumnChoice } from "./chart-shape-sect
 const DRAW_ITEMS: Record<string, string> = { bar: "Bars", line: "Line" };
 const AXIS_ITEMS: Record<string, string> = { left: "Left axis", right: "Right axis" };
 const OWN_DEFAULT = "__default__";
-const AGGREGATES = ["sum", "avg", "max", "min", "count"];
 
 /** The columns of one question's source, as the builder's fields route describes them. */
 type SourceFields = { columns: ColumnChoice[]; measures: string[] };
@@ -166,13 +165,6 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
                   disabled={disabled || !fields} placeholder={fields ? "pick a column" : "loading"} wholeMeasure={new Set<string>()}
                   fieldLabel={(name) => displayColumn(name)}
                 />
-                <div className="grid gap-1.5">
-                  <Label>Default aggregate</Label>
-                  <Select value={layer.aggregate} onValueChange={(v) => v && set(i, { aggregate: v })} disabled={disabled}>
-                    <SelectTrigger className="w-full" aria-label={`Question ${n} aggregate`}><SelectValue /></SelectTrigger>
-                    <SelectContent>{AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                  </Select>
-                </div>
                 <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} />
               </>
             ) : null}

@@ -9,7 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { RowsTable } from "@/components/patterns/rows-table";
 import { filterLabel, isActiveFilter } from "@/lib/dashboard-filter-state";
 import {
-  MEASURE_AGGREGATES, MAX_GROUPINGS, MAX_STEPS, columnsAfterSteps, visibleColumns,
+  MEASURE_AGGREGATES, MAX_GROUPINGS, MAX_STEPS, columnsAfterSteps, isMetricColumn, storedAggregate, visibleColumns,
   type Grouping, type MeasureRow, type ResultColumns, type StepCondition, type StepDef,
 } from "@/lib/chart-shape";
 import { binDraftFromDef, binPayload, type BinDef } from "@/lib/chart-bins";
@@ -27,13 +27,20 @@ import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } f
  * and the payload.
  */
 
-const DEFAULT_AGGREGATE = "__default__";
-
 export type ColumnChoice = { name: string; kind: ColumnKind };
 
-/** The measures: one row each, with its column, its aggregate, and move / remove. */
+/**
+ * The measures: one row each, with its column, its aggregation, and move / remove.
+ * Every row shows the aggregation it is computed with (phase 2 QA R4), so there is no
+ * second, chart-wide control to reconcile: a row that stores none shows the chart's
+ * (`defaultAggregate`), and choosing that same aggregate again stores none, which
+ * keeps the result name a chart saved without an aggregate of its own always had.
+ * A kind that takes the chart's one aggregate (`aggregateMode: "chart"`) writes it
+ * through `onDefaultAggregate`; a box plot has a fixed one (`"fixed"`).
+ */
 export function MeasureRows({
   rows, onChange, labels, min, max, own, columns, defaultAggregate, disabled, placeholder, wholeMeasure, fieldLabel,
+  onDefaultAggregate, fixedNote,
 }: {
   readonly rows: readonly MeasureRow[];
   readonly onChange: (next: MeasureRow[]) => void;
@@ -44,16 +51,21 @@ export function MeasureRows({
   /** Whether a row may carry an aggregate of its own. */
   readonly own: boolean;
   readonly columns: readonly string[];
-  /** The chart's aggregate, shown as the default of each row. */
+  /** The aggregate of a row that stores none: the chart's. */
   readonly defaultAggregate: string;
   readonly disabled: boolean;
   readonly placeholder: string;
   /** Calculated fields that are the whole measure (aggregate or table level): they take no aggregate. */
   readonly wholeMeasure: ReadonlySet<string>;
   readonly fieldLabel: (name: string) => React.ReactNode;
+  /** For a kind with one chart-wide aggregate and no aggregate per row: where the pick goes. */
+  readonly onDefaultAggregate?: (aggregate: string) => void;
+  /** For a kind whose aggregation is fixed: the words that say so, in place of the control. */
+  readonly fixedNote?: string;
 }) {
   const set = (i: number, patch: Partial<MeasureRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const flexible = max > min;
+  const aggregateItems = Object.fromEntries(MEASURE_AGGREGATES.map((a) => [a, a]));
   return (
     <div className="grid gap-2">
       {rows.map((row, i) => (
@@ -64,16 +76,21 @@ export function MeasureRows({
               <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
-            {own && max > 1 ? (
+            {fixedNote ? (
+              <span className="shrink-0 text-xs text-muted-foreground">{fixedNote}</span>
+            ) : (own || onDefaultAggregate) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? (
               <Select
-                value={row.aggregate || DEFAULT_AGGREGATE}
-                items={{ [DEFAULT_AGGREGATE]: `Default (${defaultAggregate})` }}
-                onValueChange={(v) => set(i, { aggregate: v === DEFAULT_AGGREGATE || v === null ? "" : v })}
-                disabled={disabled || wholeMeasure.has(row.column)}
+                value={row.aggregate || defaultAggregate}
+                items={aggregateItems}
+                onValueChange={(v) => {
+                  if (v === null) return;
+                  if (own) set(i, { aggregate: storedAggregate(v, defaultAggregate) });
+                  else onDefaultAggregate?.(v);
+                }}
+                disabled={disabled}
               >
-                <SelectTrigger className="w-36 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-28 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={DEFAULT_AGGREGATE}>Default ({defaultAggregate})</SelectItem>
                   {MEASURE_AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
                 </SelectContent>
               </Select>
@@ -320,7 +337,7 @@ export function StepsEditor({
   });
   return (
     <div className="grid gap-2">
-      <Label>Steps <span className="font-normal text-muted-foreground">(optional)</span></Label>
+      <Label>Steps</Label>
       {value.map((step, i) => {
         const cols = before(i);
         const names = [...cols.groups.map((g) => g.name), ...cols.measures];
@@ -344,10 +361,15 @@ export function StepsEditor({
             </div>
             {step.summarise ? (
               <>
-                <ColumnList
-                  label="Keep" value={step.summarise.by} options={cols.groups.map((g) => g.name)} max={MAX_GROUPINGS}
-                  onChange={(by) => set(i, { summarise: { ...step.summarise!, by } })} placeholder="Add a column"
-                />
+                {cols.groups.length ? (
+                  <ColumnList
+                    label="Keep" value={step.summarise.by} options={cols.groups.map((g) => g.name)} max={MAX_GROUPINGS}
+                    onChange={(by) => set(i, { summarise: { ...step.summarise!, by } })} placeholder="Add a column"
+                  />
+                ) : (
+                  // Phase 2 QA R8: nothing to keep is said once, with no empty list to open.
+                  <p className="text-xs text-muted-foreground">There is no grouping to keep: group the chart by a column first.</p>
+                )}
                 <MeasureRows
                   rows={step.summarise.measures.map((m) => ({ column: m.column, aggregate: m.aggregate }))}
                   onChange={(rows) => set(i, { summarise: { ...step.summarise!, measures: rows.map((r) => ({ column: r.column, aggregate: r.aggregate || "sum" })) } })}
