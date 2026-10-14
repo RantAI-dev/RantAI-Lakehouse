@@ -375,3 +375,30 @@ Stage 6 passed for R17, R19, R20 (type menu closes outside and on Escape; no Nex
 - `SHOULD-FIX` R22 — The metric editor shows "Value now" only after a label is typed (the validate route refuses an empty label). The live value must appear as soon as the source and formula check out; name and label rules are reported at Create. Prefer a console-only change (for example a provisional label used only for the live check, commented), or say why the route must change.
 
 You may read and screenshot the running dev console with headless Chrome for R21 (log in with the dev admin account; the password is `DEV_ADMIN_PASSWORD` in `.env.api.local` of `/home/hv/lakehouse-uiux`, read it with `set -a; . ./.env.api.local; set +a` and never print it). Do not create, save or delete anything there, and do not restart it.
+
+### Handoff — builder round 5 (developer, 2026-10-15, on top of `a90ba380`)
+
+**R21 (BLOCKER) — root cause found, fixed in `src/components/app-shell/react-grab-dev.tsx`.** Not the dialog, not the units, not the builder. Reproduced on the dev console (headless Chrome, CDP `Input.dispatchMouseEvent`: move to the separator centre, press, ten moves with the button held, release; Map demo, "New chart"). `ResizablePanelGroup` is used only by the chart builder, so no second group exists to compare; a standalone page was tried and abandoned (the bundler broke the library's `addEventListener` helper), so "global or local" was settled by instrumenting the library on the real page instead.
+
+- Library: `react-resizable-panels` 4.14.4 listens on `document` (capture `pointerdown`/`pointerup`, bubble `pointermove`/`pointerleave`) and arms with `ownerDocument = e.currentTarget`; each move runs `nt(state, e.currentTarget, e)`, which needs `state.ownerDocument === e.currentTarget`.
+- Measured at the move handler: state `active`, buttons 1, pointer ids equal, but `e.currentTarget` was `<html>`, not `document`, so every move returned before computing a layout (the layout code ran once, at pointer up, for the commit, which is a no-op in the default `panel` preview mode). Cursor and highlight come from the hover/active state, which is why they worked.
+- Who set it: React Grab (`react-grab`, dev-only, loaded by `ReactGrabDev`). Its UI is Solid, whose delegated event handler does `Object.defineProperty(event, "currentTarget", { get() { return t || document } })` on the shared native event; the override outlives Solid's listener, so later `document` listeners of other libraries read `<html>`. Keyboard resize never reads `currentTarget`, so it worked.
+- Proof of cause: with every listener registered from a `react-grab` stack frame withheld (an init script on the CDP page, nothing changed in the app), the same drag resizes.
+- Scope: global to every document-level listener that reads `currentTarget` after Solid's, but dev-only (a production build never imports React Grab) and the builder is the only user of the library.
+- Fix: React Grab is loaded only when `NEXT_PUBLIC_REACT_GRAB=1` (reason in the module doc). The dev console at :3100 needs that env unset (the default) and a restart to pick it up; I did not restart it.
+
+Widths (form, preview) in px, group 926 wide:
+
+| Step | Before (React Grab on) | After (React Grab listeners withheld) |
+|---|---|---|
+| initial | 463, 463 | 463, 463 |
+| pointer drag -100 px | 463, 463 | 363, 562 |
+| pointer drag +150 / +200 px | 463, 463 | 563, 362 |
+| ArrowLeft x5 | 278, 648 | 331, 594 (after the drags above) |
+| ArrowRight x5 | 648, 278 | 563, 362 |
+
+The "after" column is the same CDP drag with React Grab's listeners withheld, which is the state the opt-in default produces; the edited module itself was *not verified* running (the dev console serves the other worktree and was not restarted). The keyboard rows differ in starting point only: the "before" ones start at 463/463 (+5 steps of 10% hit the 30% minimum), the "after" ones follow the drags.
+
+**R22 (SHOULD-FIX) — console-only, `src/lib/metric-form.ts` and `src/features/dashboards/metric-dialog.tsx`.** The live check no longer waits for a label: `draftForCheck` sends the real label, or the provisional `PROVISIONAL_LABEL` ("Preview") when the field is empty, for the check only; it is never saved or shown, so its own validation never appears. Create still blocks on an empty label through `formProblems` ("Label"). A malformed name is not sent to the live check (it stays the form's message). The route did not need to change. One unit test added. Not verified in a browser (needs a source and a formula on the running console, which I may not create).
+
+Commands (worktree `/home/hv/lakehouse-phase2-build`): `bun run typecheck` clean; `bun run lint` 0 errors, 6 warnings, none in touched files; `bun test src/lib` 724 tests / 80 files, 0 fail, 1 skip; `bun test src/components` 27 pass; `bun test src/features/dashboards` 228 pass. No `bun install`, no cargo. Nothing created, saved or deleted on the dev console; my headless Chrome (port 9411, own profile) was stopped.
