@@ -14,6 +14,7 @@
 //! | publisher -> dataset | `bronze_meta.dataset_sync.author` |
 //! | dataset -> Gold table | `bronze_meta.dataset_catalog.table_name` (the catalog registry) |
 //! | connector -> Bronze table | the connector's ingest spec (`source_objects[].target`) |
+//! | upload -> Bronze table | `upload_table_claim` (who owns the raw table name, `DATA-19`) |
 //! | source -> target of an authored pipeline | `pipeline_definition.source`/`target` |
 //! | table -> view | the view's own `SELECT` in `system.tables.as_select` |
 //! | Gold table -> Gold Iceberg table | a successful row in `console.gold_export_run` |
@@ -24,9 +25,10 @@
 //!
 //! # Tenancy
 //!
-//! Connectors and authored pipelines are read for the caller's own tenant
-//! only (`tenant_scope::resolve`), exactly like their list routes. The
-//! catalog, the `ClickHouse` tables and the Gold export history are one per
+//! Connectors, authored pipelines and uploaded tables are read for the
+//! caller's own tenant only (`tenant_scope::resolve`), exactly like their
+//! list routes. The catalog, the `ClickHouse` tables and the Gold export
+//! history are one per
 //! deployment with no tenant column; they are included only when
 //! `catalog::catalog_tenant_refusal` allows this caller to read the shared
 //! catalog, the same single rule the catalog route applies.
@@ -277,6 +279,60 @@ async fn add_exports(ch: &lakehouse_clickhouse::ChClient, g: &mut Graph) {
     }
 }
 
+/// The label of an upload whose `file_upload` row is gone (DATA-19 / D5).
+/// The claim outlives the upload — deleting an upload deletes its row for
+/// real, the claim on the table name is never released — so lineage keeps
+/// the origin visible and says plainly that the file behind it is gone. The
+/// name is NEVER guessed back: `original_filename` is the only source, and
+/// a missing row has none.
+const DELETED_UPLOAD_LABEL: &str = "deleted upload";
+
+/// The edge kind of an upload, and the record every such edge names.
+const UPLOAD: &str = "upload";
+const UPLOAD_EVIDENCE: &str = "upload table claim (upload_table_claim)";
+
+/// Draws `upload_table_claim`'s rows: an edge from the upload that asked
+/// for a raw table name into the Bronze table that name became.
+///
+/// [`lakehouse_store::uploads::list_claims`] has already applied the
+/// caller's tenant (`ConnectorFilter`'s rule: a claim whose tenant was
+/// deleted is invisible to every tenant-scoped caller), so another tenant's
+/// claim never reaches this function and can never become an edge.
+fn add_claim_rows(g: &mut Graph, claims: &[lakehouse_store::uploads::ClaimedTable]) {
+    for claim in claims {
+        let upload = format!("upload:{}", claim.upload_id);
+        let label = claim
+            .original_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DELETED_UPLOAD_LABEL);
+        g.node(&upload, label, UPLOAD);
+        let bronze = format!("bronze:{}", claim.bronze_table);
+        g.node(&bronze, &format!("bronze.{}", claim.bronze_table), "bronze");
+        g.edge(&upload, &bronze, UPLOAD, UPLOAD_EVIDENCE);
+    }
+}
+
+/// [`add_claim_rows`] over the caller's own claims. A claim table this
+/// build cannot read costs a `coverage` note rather than a failed request:
+/// the rest of the graph is still an honest answer.
+async fn add_upload_claims(
+    pool: &lakehouse_store::PgPool,
+    tenant: Option<uuid::Uuid>,
+    g: &mut Graph,
+) {
+    match lakehouse_store::uploads::list_claims(pool, tenant).await {
+        Ok(claims) => add_claim_rows(g, &claims),
+        Err(err) => {
+            tracing::warn!(?err, "lineage: the upload table claims could not be read");
+            g.coverage.push(
+                "uploaded tables are not shown: their table claims could not be read".to_owned(),
+            );
+        }
+    }
+}
+
 async fn add_tenant_owned(state: &AppState, tenant: Option<uuid::Uuid>, g: &mut Graph) {
     let Some(pool) = state.pg.as_deref() else {
         g.coverage.push(
@@ -284,6 +340,7 @@ async fn add_tenant_owned(state: &AppState, tenant: Option<uuid::Uuid>, g: &mut 
         );
         return;
     };
+    add_upload_claims(pool, tenant, g).await;
     let connectors = lakehouse_store::connectors::list_connectors(
         pool,
         &lakehouse_store::connectors::ConnectorFilter { tenant_id: tenant },
@@ -473,6 +530,8 @@ pub(crate) async fn build(
 
 #[cfg(test)]
 mod tests {
+    use lakehouse_store::uploads::ClaimedTable;
+
     use super::*;
 
     fn graph() -> Graph {
@@ -569,5 +628,98 @@ mod tests {
             Some("table:serving.m".to_owned())
         );
         assert_eq!(zone_node("orders"), None);
+    }
+
+    fn claim(table: &str, upload_id: &str, filename: Option<&str>) -> ClaimedTable {
+        ClaimedTable {
+            bronze_table: table.to_owned(),
+            upload_id: upload_id.to_owned(),
+            original_filename: filename.map(str::to_owned),
+        }
+    }
+
+    /// DATA-19 / D5: an uploaded table's origin is drawn from the record
+    /// that owns its name, with the file name the upload carried while the
+    /// upload still exists. This is the answer to "where did this Bronze
+    /// table come from" for a table nothing but an upload ever wrote.
+    #[test]
+    fn an_upload_draws_an_edge_into_the_bronze_table_it_claimed() {
+        let mut g = Graph::default();
+        add_claim_rows(
+            &mut g,
+            &[
+                claim("stock_raw", "up-1", Some("stock.csv")),
+                claim("orders_raw", "up-2", Some("orders.tsv")),
+            ],
+        );
+
+        assert_eq!(
+            g.edges
+                .iter()
+                .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("upload:up-1", "bronze:stock_raw", "upload"),
+                ("upload:up-2", "bronze:orders_raw", "upload"),
+            ]
+        );
+        assert_eq!(
+            g.edges[0].3, "upload table claim (upload_table_claim)",
+            "an edge must name the record it is drawn from"
+        );
+        assert_eq!(
+            g.nodes.get("upload:up-1").map(|n| (n.0.as_str(), n.1)),
+            Some(("stock.csv", "upload"))
+        );
+        // The Bronze table becomes a node the graph can walk on from, and
+        // an upload's origin is reached by focusing the table it loaded.
+        assert_eq!(
+            g.nodes.get("bronze:stock_raw").map(|n| (n.0.as_str(), n.1)),
+            Some(("bronze.stock_raw", "bronze"))
+        );
+        let keep = reachable(&g, &["bronze:stock_raw".to_owned()]);
+        assert!(keep.contains("upload:up-1"));
+        assert!(
+            !keep.contains("upload:up-2"),
+            "another table's upload is not lineage"
+        );
+    }
+
+    /// A claim outlives the upload that made it (deleting an upload
+    /// deletes its row for real and releases nothing), so the origin stays
+    /// visible after the file is gone — and says so. The name is never
+    /// guessed back: an empty or absent `original_filename` is the same
+    /// case, because there is nothing to show but the fact.
+    #[test]
+    fn an_upload_that_was_deleted_is_labelled_as_such_and_still_drawn() {
+        let mut g = Graph::default();
+        add_claim_rows(
+            &mut g,
+            &[
+                claim("stock_raw", "up-1", None),
+                claim("other_raw", "up-2", Some("  ")),
+            ],
+        );
+
+        assert_eq!(
+            g.nodes.get("upload:up-1").map(|n| (n.0.as_str(), n.1)),
+            Some((DELETED_UPLOAD_LABEL, "upload"))
+        );
+        assert_eq!(
+            g.nodes.get("upload:up-2").map(|n| n.0.as_str()),
+            Some(DELETED_UPLOAD_LABEL),
+            "a blank file name says no more than a missing one"
+        );
+        assert_eq!(
+            g.edges
+                .iter()
+                .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("upload:up-1", "bronze:stock_raw", "upload"),
+                ("upload:up-2", "bronze:other_raw", "upload"),
+            ],
+            "a deleted upload still explains where its table came from"
+        );
     }
 }
