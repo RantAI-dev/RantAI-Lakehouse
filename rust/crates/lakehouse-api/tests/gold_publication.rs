@@ -409,12 +409,9 @@ async fn publication_detail_reports_changed_since_export_accurately() {
     assert_eq!(body["changedSinceExport"], Value::Bool(false), "{body}");
 
     // 3. Mutate table -> changedSinceExport is true (Out of date).
-    ch.exec(
-        "INSERT INTO serving.fp_status_mart (n) VALUES (999)",
-        None,
-    )
-    .await
-    .expect("insert new row");
+    ch.exec("INSERT INTO serving.fp_status_mart (n) VALUES (999)", None)
+        .await
+        .expect("insert new row");
 
     let (status, body) = send(
         &sessions.app.router,
