@@ -282,3 +282,15 @@ The owner's first QA pass stopped at the builder: it shows every control of phas
 - `SHOULD-FIX` R8 — Steps editor wording: columns of an earlier step read as plain labels ("total visitors", "average visitors"), not stacked names ("sum of avg of visitors"); a summarise step whose "Keep" list is empty because the chart has no groupings says so in one line and offers none.
 
 Verify with the headless browser on the dev console after rebuilding it (see the developer's brief): one screenshot of a new bar chart with nothing opened, one with "More options" open, one of a data table with two steps.
+
+### Chart builder rework, round 2 — owner's QA stage 1 (reviewer, 2026-10-14)
+
+Stage 1 passed functionally (two aggregations with honest labels, top 5 with `Other`, chart filter, dimension carried to a data table, two steps). The owner still finds the dialog crowded. Console only, no change to a definition's shape or to any route.
+
+- `BLOCKER` R9 — The chart-type list on the left is always open and takes a third of the dialog. Make it collapsible: after a kind is chosen (new chart) or when editing, it collapses to a slim rail or a single "Bar ▾ Change type" control in the header; opening it shows the full list again. Remember the choice per browser.
+- `BLOCKER` R10 — Sections 1 to 3 are all open at once. Make them an accordion: the section being worked on is open; a completed section folds to a one-line summary ("Data · mart_demo_map_points · 1 join", "Show · provinsi · visitors (sum), visitors (avg)", "Sort & filter · highest first · top 5 · 1 filter") that opens on click. A new chart opens with section 1 open; an edited chart opens with all folded to their summaries. Required fields still block saving and open their section when missing.
+- `SHOULD-FIX` R11 — Header density: title, dashboard and width on one compact row (title wide, the other two narrow), or dashboard and width moved next to the Create button; the helper line under the title goes.
+- `SHOULD-FIX` R12 — The step filter's value input is a few pixels wide; give it a sensible minimum width (it held "1000" and showed only a fragment).
+- `SHOULD-FIX` R13 — The preview's "Rows" panel labels columns with raw result names ("sum_visitors") while the table above says "total visitors"; use the same labels.
+
+Visual check after the console is rebuilt: a new bar chart with nothing done (type list collapsed after choosing, only section 1 open), the same chart with all three sections done (three summary lines), and an edited saved chart.
