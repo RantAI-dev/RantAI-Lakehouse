@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
+import { decimalsFor, formatNumber } from "@/lib/chart-axis"
 import { applySuggestion, callAtCaret, suggest } from "@/lib/formula-assist"
 import { draftFromForm, emptyMetricForm, formFromMetric, formProblems, usageSentence, MAX_DESCRIPTION } from "@/lib/metric-form"
 import { cn } from "@/lib/utils"
@@ -16,11 +17,18 @@ import type { FormulaFunction } from "@/services/contracts/calc-fields"
 import type { Metric, MetricCheck, MetricSource, Segment } from "@/services/contracts/metrics"
 import type { FilterDef } from "@/services/clients/bi-store"
 import { ChartFilters } from "./chart-shape-section"
+import { SourceChoiceLabel, sourceChoiceItems } from "./source-choice-label"
 import { useSourceChoices, useSourceColumns } from "./use-source-columns"
 
 const CHECK_DELAY_MS = 600
 const NO_VALUE = "__none__"
 const GRAINS = ["day", "week", "month", "quarter", "year"] as const
+
+/** A value as the console writes numbers (thousands separated, decimals by size); text and other values as they are. */
+function shownText(v: unknown): string {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN
+  return Number.isFinite(n) ? formatNumber(n, decimalsFor([n])) : String(v)
+}
 
 /**
  * Define or change a metric (BI-2): a name and source (kept for good once saved), a label and description,
@@ -151,9 +159,9 @@ export function MetricDialog({ open, onOpenChange, existing, onChanged }: {
           {existing ? null : (
             <div className="grid gap-1.5">
               <Label>Source</Label>
-              <Select value={sourceValue} onValueChange={(v) => setSourceValue(v ?? "")}>
+              <Select value={sourceValue} items={sourceChoiceItems(choices)} onValueChange={(v) => setSourceValue(v ?? "")}>
                 <SelectTrigger className="w-full" aria-label="Source"><SelectValue placeholder="pick a table" /></SelectTrigger>
-                <SelectContent>{choices.map((c) => <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>)}</SelectContent>
+                <SelectContent>{choices.map((c) => <SelectItem key={c.value} value={c.value}><SourceChoiceLabel choice={c} /></SelectItem>)}</SelectContent>
               </Select>
             </div>
           )}
@@ -237,7 +245,7 @@ export function MetricDialog({ open, onOpenChange, existing, onChanged }: {
           {check === "pending" ? <p className="text-xs text-muted-foreground">Checking…</p> : null}
           {check && check !== "pending" && !check.ok ? <p role="alert" className="text-sm text-destructive">{check.error.message}</p> : null}
           {value && !value.error && shown !== undefined ? (
-            <p className="text-sm" aria-label="Value now">Value now: <span className="font-semibold tabular-nums">{String(shown)}</span></p>
+            <p className="text-sm" aria-label="Value now">Value now: <span className="font-semibold tabular-nums">{shownText(shown)}</span></p>
           ) : null}
           {value?.error ? <p role="alert" className="text-sm text-destructive">{value.error}{value.errorId ? ` (${value.errorId})` : ""}</p> : null}
           {confirm ? (

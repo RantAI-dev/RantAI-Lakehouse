@@ -13,6 +13,7 @@ import { metricService } from "@/services"
 import type { FilterDef } from "@/services/clients/bi-store"
 import type { Segment } from "@/services/contracts/metrics"
 import { ChartFilters } from "./chart-shape-section"
+import { SourceChoiceLabel, sourceChoiceItems } from "./source-choice-label"
 import { useSourceChoices, useSourceColumns } from "./use-source-columns"
 
 /**
@@ -103,9 +104,9 @@ export function SegmentsDialog({ open, onOpenChange }: { readonly open: boolean;
             {existing ? null : (
               <div className="grid gap-1.5">
                 <Label>Source</Label>
-                <Select value={sourceValue} onValueChange={(v) => { setSourceValue(v ?? ""); setFilters([]) }}>
+                <Select value={sourceValue} items={sourceChoiceItems(choices)} onValueChange={(v) => { setSourceValue(v ?? ""); setFilters([]) }}>
                   <SelectTrigger className="w-full" aria-label="Source"><SelectValue placeholder="pick a table" /></SelectTrigger>
-                  <SelectContent>{choices.map((c) => <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>)}</SelectContent>
+                  <SelectContent>{choices.map((c) => <SelectItem key={c.value} value={c.value}><SourceChoiceLabel choice={c} /></SelectItem>)}</SelectContent>
                 </Select>
               </div>
             )}
