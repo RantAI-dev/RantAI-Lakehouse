@@ -117,22 +117,27 @@ pub struct ExportQuery {
 /// skipping it would leave the open copy stale while the console says
 /// "Up to date". The cost of the strict comparison is one extra export
 /// for that same-second case, which is the safe direction. Any unknown
-/// (`None` either side — no active parts yet, no successful export yet,
-/// or an unparseable timestamp) exports: a stale open-format copy is the
-/// worse outcome, so uncertainty fails toward publishing.
+/// DATA-10 / DATA-1: `?ifChanged=true` skip decision.
+///
+/// Skips when the current fingerprint equals the fingerprint on the newest
+/// successful export run. Anything unknown (no successful export yet, empty
+/// stored fingerprint from a pre-DATA-10 run, no active mart fingerprint)
+/// exports: a stale open-format copy is the worse outcome, so uncertainty fails
+/// toward publishing.
 fn if_changed_skip_reason(
-    last_changed_ms: Option<i64>,
+    current_fp: Option<&str>,
+    last_fp: Option<&str>,
     last_exported_ms: Option<i64>,
 ) -> Option<String> {
-    let changed_ms = last_changed_ms?;
-    let exported_ms = last_exported_ms?;
-    if changed_ms >= exported_ms {
+    let current = current_fp?;
+    let last = last_fp?;
+    if current.is_empty() || last.is_empty() || current != last {
         return None;
     }
-    // The exported timestamp is always a real epoch-millisecond from the
-    // history row; the epoch-ms fallback keeps the reason honest even for
-    // an out-of-range value instead of printing a fabricated date.
-    let since = millis_to_rfc3339(exported_ms).unwrap_or_else(|| format!("unix ms {exported_ms}"));
+    let since = last_exported_ms
+        .and_then(millis_to_rfc3339)
+        .or_else(|| last_exported_ms.map(|ms| format!("unix ms {ms}")))
+        .unwrap_or_else(|| "last export".to_string());
     Some(format!("unchanged since {since}"))
 }
 
@@ -144,22 +149,24 @@ fn skipped_body(reason: &str) -> Value {
     json!({ "skipped": true, "reason": reason })
 }
 
-/// The two freshness reads behind `?ifChanged=true`, in one place for
-/// both call-shaped uses: `Some(reason)` to skip with, `None` to export.
-/// A failed read is a classified [`ApiError`], not a silent skip — a
-/// scheduler that cannot MEASURE must not treat the mart as quiet.
+/// The freshness reads behind `?ifChanged=true`: `Some(reason)` to skip with,
+/// `None` to export. A failed read is a classified [`ApiError`], not a silent
+/// skip — a scheduler that cannot MEASURE must not treat the mart as quiet.
 async fn unchanged_since_last_export_reason(
     state: &AppState,
     mart: &str,
+    current_fingerprint: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    let last_changed_at =
-        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
-            .await
-            .map_err(ApiError::from)?;
-    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+    let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
         .map_err(ApiError::from)?;
-    Ok(if_changed_skip_reason(last_changed_at, last_exported_at))
+    let last_fp = last_export.as_ref().map(|e| e.content_fingerprint.as_str());
+    let last_started_ms = last_export.as_ref().and_then(|e| e.started_at_ms);
+    Ok(if_changed_skip_reason(
+        current_fingerprint,
+        last_fp,
+        last_started_ms,
+    ))
 }
 
 /// See the module doc comment's "Auth" section. Two independent ways to
@@ -304,16 +311,28 @@ pub async fn export(
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
-    // DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
+    // DATA-10 D2: The fingerprint is computed before the export reads rows,
+    // and written on the history row of that export.
+    let current_fingerprint = mart_content_fingerprint(
+        &state.clickhouse,
+        &state.config.gold_source_schema,
+        mart_ident.as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    // DATA-10 / DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
     // skipped BEFORE the single-flight lock is taken (a skip holds
     // nothing, writes no `console.gold_export_run` row, and commits no
-    // snapshot — the response is the only trace). The two facts cost two
-    // cheap `system.parts`/history reads and are computed only when the
-    // parameter is actually set, so the manual path gains nothing extra.
-    // Unknown facts export, per [`if_changed_skip_reason`].
+    // snapshot — the response is the only trace). Unknown facts export, per
+    // [`if_changed_skip_reason`].
     if query.if_changed.as_deref() == Some("true")
-        && let Some(reason) =
-            unchanged_since_last_export_reason(&state, mart_ident.as_str()).await?
+        && let Some(reason) = unchanged_since_last_export_reason(
+            &state,
+            mart_ident.as_str(),
+            current_fingerprint.as_deref(),
+        )
+        .await?
     {
         return Ok(ApiJson(skipped_body(&reason)));
     }
@@ -399,6 +418,7 @@ pub async fn export(
         &triggered_by,
         started_at,
         finished_at,
+        current_fingerprint.as_deref().unwrap_or(""),
         &export_result,
     )
     .await;
@@ -431,6 +451,7 @@ async fn record_export_history(
     triggered_by: &str,
     started_at: time::OffsetDateTime,
     finished_at: time::OffsetDateTime,
+    content_fingerprint: &str,
     export_result: &Result<gold_export::GoldExportResult, GoldExportError>,
 ) {
     let error_message = export_result.as_ref().err().map(ToString::to_string);
@@ -446,7 +467,7 @@ async fn record_export_history(
         snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
         error: error_message.as_deref(),
         triggered_by,
-        content_fingerprint: "",
+        content_fingerprint,
         started_at_ms: started_at.unix_timestamp() * 1000,
         finished_at_ms: finished_at.unix_timestamp() * 1000,
     };
@@ -682,14 +703,13 @@ async fn mart_last_changed_at(
 /// list from `system.columns`. Returns `Some("<count>:<sum>:<schemaHash>")`,
 /// or `None` if the mart does not exist in `system.tables`.
 ///
+/// DATA-10: Computes the content fingerprint for `mart` in `schema`.
+/// Returns `None` if the mart does not exist.
+///
 /// # Errors
 ///
 /// Returns [`ChError`] if a `ClickHouse` query fails.
-#[allow(
-    dead_code,
-    reason = "DATA-10 T1 introduces the reader; T2 hooks it into export and T3 into publication_body"
-)]
-async fn mart_content_fingerprint(
+pub async fn mart_content_fingerprint(
     ch: &ChClient,
     schema: &str,
     mart: &str,
@@ -705,10 +725,6 @@ async fn mart_content_fingerprint(
     Ok(parse_content_fingerprint_row(row))
 }
 
-#[allow(
-    dead_code,
-    reason = "DATA-10 T1 introduces the SQL builder; used by mart_content_fingerprint and unit tests"
-)]
 fn content_fingerprint_sql(schema: &str, mart: &str) -> String {
     format!(
         "SELECT             toString(count()) AS row_count,             toString(ifNull(sum(cityHash64(*)), toUInt64(0))) AS content_sum,             (                 SELECT toString(cityHash64(groupArray(concat(name, ':', type))))                 FROM (                     SELECT name, type                     FROM system.columns                     WHERE database = {schema_lit} AND table = {mart_lit}                     ORDER BY position                 )             ) AS schema_hash          FROM `{clean_schema}`.`{clean_mart}` FORMAT JSON",
@@ -719,10 +735,6 @@ fn content_fingerprint_sql(schema: &str, mart: &str) -> String {
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "DATA-10 T1 introduces the row parser; used by mart_content_fingerprint and unit tests"
-)]
 fn parse_content_fingerprint_row(row: &serde_json::Map<String, Value>) -> Option<String> {
     let str_val = |key: &str| -> Option<String> {
         row.get(key).and_then(|v| match v {
@@ -1107,39 +1119,71 @@ mod tests {
         );
     }
 
-    // ── if_changed_skip_reason (DATA-1 task 4) ──────────────────────────
+    // ── if_changed_skip_reason (DATA-10 T2 / DATA-1 task 4) ─────────────
 
     #[test]
-    fn unchanged_mart_since_the_last_export_is_skipped_with_a_reason() {
-        // Strictly older mart than the export: the copy is fresh.
-        // An export does not write the mart, so the comparison must be
-        // strict — see the equal case in
-        // `equal_timestamps_export_fail_toward_a_fresh_copy`.
-        let skip = if_changed_skip_reason(Some(1_699_999_000_000), Some(1_700_000_000_000))
-            .expect("unchanged must skip");
+    fn unchanged_mart_matching_fingerprint_is_skipped_with_a_reason() {
+        let skip = if_changed_skip_reason(
+            Some("10:11129132029957349367:16812361877011020269"),
+            Some("10:11129132029957349367:16812361877011020269"),
+            Some(1_700_000_000_000),
+        )
+        .expect("matching fingerprint must skip");
         assert!(skip.starts_with("unchanged since "), "{skip}");
     }
 
     #[test]
-    fn equal_timestamps_export_fail_toward_a_fresh_copy() {
-        // PR slice B review B1: both sides are whole seconds, so a write
-        // landing in the same second its last export started — after
-        // that export read the mart — compares equal and must EXPORT;
-        // skipping it would leave the open copy stale while the console
-        // says "Up to date".
-        assert!(if_changed_skip_reason(Some(1_700_000_000_000), Some(1_700_000_000_000)).is_none());
+    fn differing_fingerprints_export_fail_toward_publishing() {
+        assert!(
+            if_changed_skip_reason(
+                Some("10:111:222"),
+                Some("10:333:222"),
+                Some(1_700_000_000_000),
+            )
+            .is_none()
+        );
     }
 
     #[test]
-    fn a_mart_newer_than_its_last_export_is_exported_not_skipped() {
-        assert!(if_changed_skip_reason(Some(1_700_000_500_000), Some(1_700_000_000_000)).is_none());
+    fn no_success_row_exports() {
+        assert!(if_changed_skip_reason(Some("10:111:222"), None, None).is_none());
     }
 
     #[test]
-    fn an_unknown_fact_never_skips_fail_toward_publishing() {
-        assert!(if_changed_skip_reason(None, Some(1_700_000_000_000)).is_none());
-        assert!(if_changed_skip_reason(Some(1_700_000_000_000), None).is_none());
-        assert!(if_changed_skip_reason(None, None).is_none());
+    fn empty_stored_fingerprint_exports() {
+        assert!(
+            if_changed_skip_reason(Some("10:111:222"), Some(""), Some(1_700_000_000_000),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_current_fingerprint_exports() {
+        assert!(
+            if_changed_skip_reason(Some(""), Some("10:111:222"), Some(1_700_000_000_000),)
+                .is_none()
+        );
+        assert!(
+            if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000),).is_none()
+        );
+        assert!(if_changed_skip_reason(None, None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_since_last_export_reason_fails_closed_on_read_error() {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert("CLICKHOUSE_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        let state = AppState::new(Config::from_map(&env).unwrap());
+        let result = unchanged_since_last_export_reason(&state, "orders", Some("10:1:2")).await;
+        assert!(
+            result.is_err(),
+            "ClickHouse failure must surface as an error, never a silent skip"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ApiError::Unprocessable(_)),
+            "ClickHouse read error is classified as Unprocessable"
+        );
     }
 
     // ── content_fingerprint (DATA-10 T1) ────────────────────────────────

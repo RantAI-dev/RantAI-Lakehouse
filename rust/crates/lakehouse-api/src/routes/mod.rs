@@ -21,7 +21,7 @@ mod dashboard;
 mod dashboard_folders;
 mod dashboard_sources;
 mod embed;
-mod gold;
+pub mod gold;
 mod governance;
 mod home;
 mod identity;

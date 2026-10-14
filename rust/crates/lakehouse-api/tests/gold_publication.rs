@@ -380,7 +380,12 @@ fn unix_ms(offset_secs: i64) -> i64 {
     now_secs * 1000 + offset_secs * 1000
 }
 
-async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
+async fn seed_success_run_with_fingerprint(
+    ch: &ChClient,
+    mart: &str,
+    started_ms: i64,
+    content_fingerprint: &str,
+) {
     gold_export_history::record_export_run(
         ch,
         &gold_export_history::NewGoldExportRun {
@@ -391,13 +396,18 @@ async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
             snapshot_id: None,
             error: None,
             triggered_by: "user:test",
-            content_fingerprint: "",
+            content_fingerprint,
             started_at_ms: started_ms,
             finished_at_ms: started_ms,
         },
     )
     .await
     .expect("seed a successful export history row");
+}
+
+#[allow(dead_code)]
+async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
+    seed_success_run_with_fingerprint(ch, mart, started_ms, "").await;
 }
 
 async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
@@ -418,7 +428,7 @@ async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
         .expect("a row count")
 }
 
-/// The skip case: the mart's last write is OLDER than its last
+/// The skip case: the mart's content fingerprint MATCHES its last
 /// successful export, so `?ifChanged=true` must answer 200 with
 /// `skipped: true` and write NOTHING — the history row count is still
 /// exactly the one seeded row, and no export was attempted (the dead
@@ -428,10 +438,11 @@ async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
 async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "quiet_mart").await;
-    // The copy was refreshed "after" the mart's last write: a future
-    // started_at makes lastExportedAt strictly newer than
-    // lastChangedAt regardless of test timing.
-    seed_success_run(&ch, "quiet_mart", unix_ms(3_600)).await;
+    let fp = lakehouse_api::routes::gold::mart_content_fingerprint(&ch, "serving", "quiet_mart")
+        .await
+        .expect("read fingerprint")
+        .expect("quiet_mart has a fingerprint");
+    seed_success_run_with_fingerprint(&ch, "quiet_mart", unix_ms(-3_600), &fp).await;
     let sessions = Sessions { app };
     let cookie = sessions.with("gold:export").await;
 
@@ -458,19 +469,16 @@ async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
     );
 }
 
-/// A mart rewritten after its last export must NOT skip: the handler
-/// proceeds into the export path, which with no Lakekeeper provisioned
+/// A mart whose content fingerprint differs from its last export must NOT skip:
+/// the handler proceeds into the export path, which with no Lakekeeper provisioned
 /// stops deterministically at `read_catalog_token` (503 Unavailable,
-/// fixed text) — proof it got past the skip gate and attempted the
-/// export. The failed attempt records one history row ("failed"), as
-/// every POST does.
+/// fixed text) — proof it got past the skip gate and attempted the export.
 #[tokio::test]
-async fn if_changed_exports_a_mart_newer_than_its_last_export() {
+async fn if_changed_exports_a_mart_with_differing_fingerprint() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "busy_mart").await;
-    // The last copy predates the mart's last write (seed_mart's INSERT
-    // happened after this row's started_at).
-    seed_success_run(&ch, "busy_mart", unix_ms(-3_600)).await;
+    // The last export has a differing fingerprint.
+    seed_success_run_with_fingerprint(&ch, "busy_mart", unix_ms(-3_600), "0:0:differing").await;
     let sessions = Sessions { app };
     let cookie = sessions.with("gold:export").await;
 
@@ -487,9 +495,30 @@ async fn if_changed_exports_a_mart_newer_than_its_last_export() {
     assert_eq!(
         history_row_count(&ch, "busy_mart").await,
         1,
-        "still exactly the seeded row: the 503 at read_catalog_token \
-         happens before export_mart, so nothing new was recorded"
+        "still exactly the seeded row: the 503 at read_catalog_token          happens before export_mart, so nothing new was recorded"
     );
+}
+
+/// A pre-DATA-10 export row has `content_fingerprint`: "" -> empty stored fingerprint
+/// must NOT skip: fails toward publishing (503 at `read_catalog_token`).
+#[tokio::test]
+async fn if_changed_exports_when_stored_fingerprint_is_empty() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "legacy_mart").await;
+    seed_success_run_with_fingerprint(&ch, "legacy_mart", unix_ms(-3_600), "").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/legacy_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("skipped").is_none(), "{body}");
 }
 
 /// No successful export ever recorded -> lastExportedAt is unknown ->

@@ -262,6 +262,45 @@ pub async fn list_export_runs(
     Ok(result.data.iter().map(row_to_export_run).collect())
 }
 
+/// The latest successful export run's start timestamp and content fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSuccessExport {
+    /// Milliseconds since Unix epoch when the export started, or `None` if unparseable.
+    pub started_at_ms: Option<i64>,
+    /// Stored content fingerprint of the mart before the export.
+    pub content_fingerprint: String,
+}
+
+/// DATA-10: Read `mart`'s newest `status = 'success'` export run, or `None` if it
+/// has never exported successfully.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_success_export(
+    ch: &ChClient,
+    mart: &str,
+) -> Result<Option<LastSuccessExport>, ChError> {
+    ensure_gold_export_run_table(ch).await?;
+    let rows = ch.rows(&last_success_sql(mart), None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let started_at_ms = row
+        .get("started_ms")
+        .and_then(Value::as_str)
+        .and_then(|ms| ms.parse::<i64>().ok());
+    let content_fingerprint = row
+        .get("content_fingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Ok(Some(LastSuccessExport {
+        started_at_ms,
+        content_fingerprint,
+    }))
+}
+
 /// Unix-millisecond `started_at` of `mart`'s newest `status = 'success'`
 /// run, or `None` when it has never exported successfully. DATA-1's
 /// publication detail route and `?ifChanged=true` both need "when was
@@ -274,13 +313,9 @@ pub async fn list_export_runs(
 ///
 /// Returns [`ChError`] if the table cannot be ensured or the query fails.
 pub async fn last_success_started_at(ch: &ChClient, mart: &str) -> Result<Option<i64>, ChError> {
-    ensure_gold_export_run_table(ch).await?;
-    let rows = ch.rows(&last_success_sql(mart), None).await?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.get("started_ms"))
-        .and_then(Value::as_str)
-        .and_then(|ms| ms.parse::<i64>().ok()))
+    Ok(last_success_export(ch, mart)
+        .await?
+        .and_then(|e| e.started_at_ms))
 }
 
 /// DATA-10: Read the stored content fingerprint of `mart`'s newest
@@ -292,20 +327,16 @@ pub async fn last_success_started_at(ch: &ChClient, mart: &str) -> Result<Option
 /// Returns [`ChError`] if the table cannot be ensured or the query fails.
 #[allow(
     dead_code,
-    reason = "DATA-10 T1 introduces the history reader; T2 uses it for the skip comparison"
+    reason = "convenience helper for callers wanting only the fingerprint"
 )]
 pub async fn last_success_fingerprint(
     ch: &ChClient,
     mart: &str,
 ) -> Result<Option<String>, ChError> {
-    ensure_gold_export_run_table(ch).await?;
-    let rows = ch.rows(&last_success_sql(mart), None).await?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.get("content_fingerprint"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned))
+    Ok(last_success_export(ch, mart)
+        .await?
+        .map(|e| e.content_fingerprint)
+        .filter(|s| !s.is_empty()))
 }
 
 #[cfg(test)]
