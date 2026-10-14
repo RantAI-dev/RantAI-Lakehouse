@@ -161,6 +161,27 @@ Clean docker compose run (`-p data10`) verified:
 [gate] SUCCESS
 ```
 
+### Fix round 1
+
+Verification on the merged commit incorporating fixes for SHOULD-FIX 1, SHOULD-FIX 2, and the Nit:
+
+- `cd rust && cargo fmt --check`:
+  **Verified:** clean, 0 diff (exit code 0).
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  **Verified:** clean, 0 errors, 0 warnings (completed in 2m 11s, exit code 0).
+- `python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py`:
+  **Verified:** clean (exit code 0).
+  - Intra-package imports: OK (all intra-package `dispar_orchestrate` imports resolve).
+  - Bare Iceberg count check: OK (R11 guard: no bare `count()` against a Bronze Iceberg table found).
+- Scoped Rust tests:
+  - `cargo test -p lakehouse-api --lib gold_export_history`: 8 passed, 0 failed, 0 ignored.
+  - `cargo test -p lakehouse-api --lib routes::gold`: 16 passed, 0 failed, 0 ignored.
+  - `cargo clippy -p lakehouse-api --test gold_publication -- -D warnings`: clean (completed in 1.17s).
+- `cd rust && cargo test --workspace`:
+  **Not verified:** The full workspace test suite (3500+ tests across all crates and integration test containers) exceeded the harness per-command timeout threshold of 600s, while the shared heavy lock (`/home/shiro/rantai/.heavy.lock`) was contested by another concurrent sub-agent running builds on this 7.9 GB RAM host.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)`:
+  **Not verified:** Executed with venv `/home/shiro/rantai/venv-bld3` (`PATH=/home/shiro/rantai/venv-bld3/bin:$PATH python -m pytest dispar_orchestrate -q`). The run reached 83% completion (860+ tests passing) before exceeding the harness per-command timeout of 600s (a full pass requires ~909s / 15 minutes on this host). Lock was subsequently held by another agent's compose build.
+
 ## 8. Review
 
 ### Round 1 (planner/reviewer, Claude Opus), at `8983c8c8`
