@@ -297,6 +297,68 @@ def step_consumers_route_is_honest_about_being_unsupported() -> None:
     print(f"[gold-export] consumers route honestly reports unsupported: {body.get('reason')}")
 
 
+def step_optimize_final_with_if_changed_skips() -> None:
+    """DATA-10: OPTIMIZE TABLE FINAL changes modification_time on MergeTree
+    parts but does not change table contents. Calling export with ?ifChanged=true
+    must skip."""
+    ch_query(f"OPTIMIZE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` FINAL")
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after OPTIMIZE failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after OPTIMIZE FINAL: {body}")
+    if body.get("skipped") is not True:
+        raise GoldExportFailure(f"expected skipped: true after OPTIMIZE FINAL, got {body}")
+
+
+def step_exchange_tables_same_rows_with_if_changed_skips() -> None:
+    """DATA-10: Rewriting the mart with identical rows via staging and EXCHANGE TABLES
+    changes all part files and modification times, but content fingerprint remains identical.
+    Calling export with ?ifChanged=true must skip."""
+    staging_mart = f"{MART_NAME}_staging"
+    ch_query(f"DROP TABLE IF EXISTS {GOLD_SOURCE_SCHEMA}.`{staging_mart}`")
+    ch_query(
+        f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{staging_mart}` AS {GOLD_SOURCE_SCHEMA}.`{MART_NAME}`"
+    )
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{staging_mart}` "
+        f"SELECT * FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}`"
+    )
+    ch_query(
+        f"EXCHANGE TABLES {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` AND {GOLD_SOURCE_SCHEMA}.`{staging_mart}`"
+    )
+    ch_query(f"DROP TABLE IF EXISTS {GOLD_SOURCE_SCHEMA}.`{staging_mart}`")
+
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after EXCHANGE TABLES failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after EXCHANGE TABLES: {body}")
+    if body.get("skipped") is not True:
+        raise GoldExportFailure(f"expected skipped: true after EXCHANGE TABLES, got {body}")
+
+
+def step_insert_row_with_if_changed_exports() -> None:
+    """DATA-10: Inserting a single new row changes the content fingerprint.
+    Calling export with ?ifChanged=true must export instead of skipping."""
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` (region, total_sales, order_count, updated_at) "
+        "VALUES ('region-new-row', 123.45, 99, now())"
+    )
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after insert failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after insert row: {body}")
+    if body.get("skipped") is True:
+        raise GoldExportFailure(f"expected export after INSERT, but was skipped: {body}")
+    expected_rows = ROW_COUNT + 1
+    if body.get("rowsExported") != expected_rows:
+        raise GoldExportFailure(
+            f"rowsExported mismatch after insert: wanted {expected_rows}, got {body.get('rowsExported')}"
+        )
+
+
 def main() -> int:
     try:
         step_wait_for_services()
@@ -308,6 +370,9 @@ def main() -> int:
         step_read_back_reports_snapshot_fields()
         step_history_lists_this_run()
         step_consumers_route_is_honest_about_being_unsupported()
+        step_optimize_final_with_if_changed_skips()
+        step_exchange_tables_same_rows_with_if_changed_skips()
+        step_insert_row_with_if_changed_exports()
     except GoldExportFailure as exc:
         print(f"[gold-export] FAILED: {exc}", file=sys.stderr)
         return 1

@@ -399,6 +399,45 @@ pub async fn collect_authored_depends_on(
     Ok(rows)
 }
 
+/// The one refusal a `bronze` target gets everywhere (BLD-3 / D4): the
+/// API's create/update/restore routes, and — as wording — the
+/// orchestrator's own op
+/// (`dagster/dispar_orchestrate/authored_factory.py::BRONZE_TARGET_REFUSED_REASON`,
+/// the non-retryable `Failure` a stored pre-refusal pipeline now fails
+/// its run with).
+///
+/// Bronze is written by ingestion and by nothing else. A pipeline
+/// targeting `bronze` would otherwise have the job run `CREATE DATABASE
+/// IF NOT EXISTS bronze` in `ClickHouse` and fill a `MergeTree` table
+/// that is not Bronze
+/// (not Iceberg, not in Lakekeeper, read by nobody) — a silent wrong
+/// answer, which is worse than a refusal (AGENTS.md principle 3, fail
+/// closed). Reads FROM `bronze` are a different question and are
+/// supported: the source is read through a `DataLakeCatalog` database.
+pub const BRONZE_TARGET_REFUSED: &str =
+    "a pipeline cannot write to bronze; bronze is written by ingestion";
+
+/// Whether `target_zone` is a zone a pipeline may write to.
+///
+/// One rule — `bronze` is not one — and it is the same rule the
+/// orchestrator's op applies, so a stored pipeline that predates this
+/// refusal (or that arrives from a client the assistant never
+/// validated) fails loudly at run time instead of writing somewhere
+/// meaningless. `silver`, `gold`, `serving`, `lake`, and anything else the
+/// store's column accepts is left alone here: narrowing the set is the
+/// catalog's job, not this route's.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (the route maps it to 400) carrying
+/// [`BRONZE_TARGET_REFUSED`] verbatim when `target_zone` is `bronze`.
+pub fn validate_target_zone(target_zone: &str) -> Result<(), ApiRejection> {
+    if target_zone == "bronze" {
+        return Err(ApiError::BadRequest(BRONZE_TARGET_REFUSED.to_owned()).into());
+    }
+    Ok(())
+}
+
 /// F2.2 (PR #59 review): every per-id route that touches
 /// `depends_on` has to scope its view of the authored graph by tenant,
 /// or a tenant-A caller can name tenant-B's pipeline ids. This is the
@@ -946,13 +985,17 @@ pub async fn update(
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
     let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
-    // F2.8 (PR #59 review): transform grammar, `max_retries` range,
-    // and `depends_on` validation share ONE helper with
-    // [`restore_version`] — every edit path runs the same gate,
-    // including a stored snapshot replayed by restore. The pre-F2.8
-    // body had these three calls duplicated in the two routes, with
-    // `restore_version` skipping the grammar / `max_retries` checks —
-    // F2.8 closes that gap.
+    // BLD-3 / D4: a `bronze` target is refused with the same message
+    // `create` and `restore_version` use, before the store is touched.
+    //
+    // Order against the tenant scope check is deliberate: this runs
+    // AFTER `in_scope` (F2.1), so an out-of-scope id answers 404
+    // whatever the body says — the existence answer never depends on
+    // the caller's payload. The transform grammar, the `max_retries`
+    // range and the `depends_on` walk are NOT repeated here: F2.8
+    // (PR #59 review) moved them into the shared `validate_pipeline_input`
+    // that this route and `restore_version` both call below.
+    validate_target_zone(&body.target_zone)?;
     let pool = crate::routes::pipelines::pool(&state)?;
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
@@ -1154,19 +1197,17 @@ pub async fn restore_version(
     let snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
-    // F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
-    // f2-tenant-scope-and-run-config.md` Part D): the snapshot replay
-    // used to validate only `depends_on` — a stored snapshot whose
-    // `transform` the current grammar would refuse slipped through and
-    // persisted unparseable state. `validate_pipeline_input` runs the
-    // SAME grammar + `max_retries` + `depends_on` checks `update`
-    // runs, so a replay can never persist state a fresh edit would
-    // refuse. Dagster unreachable degrades to "no Dagster upstreams
-    // accepted" (empty list), the same fallback `update` already
-    // exercises; cross-tenant `pl-` ids in the snapshot read as
-    // "unknown" via the F2.2 scoped-`others` rule. `Some(deps)` is
-    // passed unconditionally because restore is an authoritative
-    // replay (the snapshot's chain always replaces the stored one).
+    // BLD-3 / D4: a stored snapshot can predate the Bronze-target refusal,
+    // so a restore is refused on the same rule `update` and `create`
+    // apply — replaying such a version would write the Bronze target
+    // straight back into the row the refusal exists to keep clean. It
+    // runs AFTER `in_scope` (F2.1), like `update`, so an out-of-scope
+    // id answers 404 whatever the snapshot holds. The snapshot's
+    // `depends_on`, transform grammar and `max_retries` are NOT
+    // validated here inline: F2.8 (PR #59 review) moved all three into
+    // the shared `validate_pipeline_input` this route calls below,
+    // which also takes the tenant-scoped `others`.
+    validate_target_zone(&snapshot.target_zone)?;
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -2459,6 +2500,156 @@ mod tests {
                 pl_a_after.depends_on,
                 vec![pl_b.id.clone()],
                 "A's stored chain must not have changed"
+            );
+        }
+    }
+
+    /// BLD-3 / D4: the pure rule, and the message every refusal carries
+    /// (the orchestrator's op fails a stored pre-refusal pipeline with
+    /// this same wording).
+    #[test]
+    fn validate_target_zone_refuses_bronze_and_nothing_else() {
+        assert_eq!(
+            validate_target_zone("bronze").unwrap_err().0.to_string(),
+            BRONZE_TARGET_REFUSED
+        );
+        assert_eq!(
+            BRONZE_TARGET_REFUSED,
+            "a pipeline cannot write to bronze; bronze is written by ingestion"
+        );
+        for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
+            validate_target_zone(zone).expect("a ClickHouse zone stays writable");
+        }
+    }
+
+    /// BLD-3 / D4: the same refusal on `PUT /api/pipelines/{id}` and on
+    /// `POST /api/pipelines/{id}/versions/{version}/restore`.
+    ///
+    /// Both routes run the F2.1 tenant scope check (PR #80) FIRST, so
+    /// both tests seed a real row and call as a `*:*` principal that
+    /// passes it. What is pinned here is the ORDER that keeps the
+    /// existence answer independent of the payload: an out-of-scope id
+    /// still answers 404 whatever the body says (see
+    /// `update_checks_scope_before_the_transform_validator`, which is
+    /// the 404 half), and the Bronze refusal is the next answer for an
+    /// in-scope id. Each test also reads the stored row back, which is
+    /// D4's "refused before any write".
+    mod bronze_target_is_refused {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A row seeded THROUGH THE STORE, because the create route now
+        /// refuses a `bronze` target -- a stored pre-refusal row is the
+        /// case D4 exists for, and `tenant_id` is left at the column
+        /// default (`NULL`) so the `*:*` principal passes `in_scope`.
+        fn pipeline_input(name: &str, target_zone: &str) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "s".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: target_zone.to_owned(),
+                target_table: "t".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: None,
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_a_bronze_target_before_writing(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-update", "silver"), None)
+                    .await
+                    .expect("seed the row the refused update would rewrite");
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"bronze","targetTable":"t","schedule":"manual","transforms":[]}"#,
+            );
+            let err = update(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(created.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("a bronze target must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
+
+            let after = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                after.target, "silver.t",
+                "the refused update must not have written the bronze target"
+            );
+        }
+
+        /// A stored version can predate the refusal (the rule is new;
+        /// rows are not migrated), so restoring one must be refused on
+        /// the snapshot's own `target_zone` rather than replaying the
+        /// Bronze target straight back into the live row. Asserted
+        /// through the version table: a refused restore writes no
+        /// `restored` row.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_of_a_bronze_target_version_returns_400(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-restore", "bronze"), None)
+                    .await
+                    .expect("seed the pre-refusal row the create route would now refuse");
+
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((created.id.clone(), 1)),
+            )
+            .await
+            .expect_err("restoring a stored bronze target must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
+
+            let versions: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pipeline_definition_version WHERE pipeline_id = $1",
+            )
+            .bind(&created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count the version rows");
+            assert_eq!(
+                versions.0, 1,
+                "the refused restore must not have written a `restored` version row"
             );
         }
     }
