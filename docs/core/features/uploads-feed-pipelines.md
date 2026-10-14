@@ -10,7 +10,7 @@
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `BLD-3`**. |
+| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` |
 | Started | |
 | Shipped | |
 | Evidence | |
@@ -42,6 +42,7 @@ team's (`AI-16`).
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Who builds it | The Build lane, with `BLD-3` | Product owner, 2026-10-14 |
+| 2 | Re-upload trigger | Only a re-upload of the pipeline's own source table, behind a switch shown for Bronze sources, ON by default | Planner, plan 2026-10-14 D1 and D3 |
 
 ## Limits to tell a customer
 
@@ -54,8 +55,10 @@ team's (`AI-16`).
 | `DATA-19-AC1` | Upload a file; build a Silver table from it; build a Gold table from that; chart it | All from the console; the chart shows the file's data | Not run |
 | `DATA-19-AC2` | Re-upload the file with one row changed | The downstream pipeline runs; the chart shows the change | Not run |
 | `DATA-19-AC3` | Open lineage for the Gold table | The upload is shown as the origin | Not run |
-| `DATA-19-AC4` | Delete the upload while a pipeline reads it | Refused while the pipeline depends on it, with a clear message | Not run |
-| `DATA-19-AC5` | As a user without the permission, pick the uploaded table as a source | Refused with an honest message | Not run |
+| `DATA-19-AC4` | Delete the upload (the file), then run the pipeline | The table and the pipeline keep working; lineage shows the origin as "deleted upload" | Not run |
+| `DATA-19-AC5` | Upload a file into a different table | The pipeline does not run again | Not run |
+| `DATA-19-AC6` | Switch "Run again after this table is re-uploaded" off; re-upload | The pipeline does not run | Not run |
+| `DATA-19-AC7` | As a user without the permission, pick the uploaded table as a source | Refused with an honest message | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

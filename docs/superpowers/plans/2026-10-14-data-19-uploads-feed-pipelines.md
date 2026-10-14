@@ -1,0 +1,143 @@
+# `DATA-19`: an uploaded table feeds a pipeline, re-runs it on re-upload, and shows in lineage
+
+Planner and reviewer: Claude Opus. Developer: a non-Opus agent (`AGENTS.md`).
+Base: `origin/main` at `caf5784b` (after `BLD-3`, PR #155, and `DATA-10`,
+PR #156). Branch: `feat/data-19-uploads-feed-pipelines`. One PR slice.
+Spec: `docs/core/specs/data-19.md`. Feature page:
+`docs/core/features/uploads-feed-pipelines.md`.
+
+## 1. What is already true, and what is missing
+
+Verified by reading `main` at `caf5784b`:
+
+- **Already works since `BLD-3`:** an upload lands in a Bronze Iceberg table
+  (`file_ingest.py`, `bronze_table_name`), and a console pipeline reads a
+  Bronze source through its own `DataLakeCatalog` database. The console's
+  "Source table" is a free-text field (`pipeline-create-page.tsx`, the
+  `Source zone` / `Source table` fields), so a user who types the upload's
+  table name already gets a working pipeline. Spec row 1 ("selectable as a
+  pipeline source") is met for typing, not for picking.
+- **Missing 1, re-upload trigger.** A pipeline can name Dagster jobs in
+  `dependsOn` (`authored_pipelines::validate_depends_on`, `dagster_jobs`), and
+  its `authored__<id>_after` sensor fires after ANY success of that job
+  (`authored_factory.build_authored_dependency_sensor`). So `dependsOn:
+  ["file_ingest_job"]` would re-run every such pipeline after every upload
+  of any table. The console has no `dependsOn` control at all.
+- **Missing 2, lineage.** `routes/lineage.rs` draws connector → Bronze from
+  the ingest spec and pipeline source → target, but nothing for an upload.
+  The record exists: `upload_table_claim (bronze_table, tenant_id,
+  upload_id)` (migration `0058`), which is never released, even after the
+  upload is deleted.
+- **Correction to the feature page.** Its AC4 ("deleting the upload is
+  refused while a pipeline reads it") is wrong: `DELETE /api/uploads/{id}`
+  removes the file and the upload row, never the table
+  (`routes/uploads.rs::delete` doc). The pipeline keeps working. The planner
+  replaces AC4 in this PR (task T6).
+
+## 2. Decisions (planner)
+
+- **D1. Re-upload trigger = `dependsOn: ["file_ingest_job"]`, filtered to
+  the pipeline's own source table.** When a pipeline's `dependsOn` names
+  `file_ingest_job`, its sensor counts only those `file_ingest_job` SUCCESS
+  runs whose run config `ops.ingest_uploaded_file.config.bronze_table_name`
+  equals the pipeline's `sourceTable` (and its `sourceZone` is `bronze`). A
+  run for another table never triggers it. Read the config from the run
+  (`DagsterRun.run_config`); do not add tags unless reading the config is
+  impossible, and say which in the handoff.
+  Other upstreams (`ingest_job`, authored pipelines) keep today's behaviour
+  exactly; `ingest_job`'s coarse "any connector" firing is a separate gap,
+  recorded below, not fixed here.
+- **D2. The API keeps `file_ingest_job` honest.** On create, update and
+  restore, `dependsOn` containing `file_ingest_job` is refused with 400
+  `"file_ingest_job can only be an upstream of a pipeline whose source is a
+  bronze table"` unless `sourceZone == "bronze"`. One validator, called from
+  the three places `validate_target_zone` is called (`BLD-3`).
+- **D3. Console: one switch, shown only for a Bronze source.** In the
+  pipeline form's source step, a checkbox "Run again after this table is
+  re-uploaded", visible only when `sourceZone` is `bronze`, default ON for a
+  new pipeline. ON adds `file_ingest_job` to `dependsOn`, OFF removes it;
+  every other `dependsOn` entry is kept as it was. The edit page shows the
+  stored state. No other `dependsOn` UI.
+- **D4. "Selectable" (spec row 1):** the "Source table" field gets the
+  zone's table names as suggestions (a `datalist`, typing still allowed),
+  read from the catalog list the console already calls through `@/services`.
+  If no existing client returns table names per zone, keep the free-text
+  field and say so in the handoff; do not add an API route for this.
+- **D5. Lineage edge upload → Bronze table**, kind `"upload"`, evidence
+  `upload_table_claim`, from every claim row in the caller's tenant (same
+  tenant rule as connectors in `lineage.rs`). The node for the upload is
+  `upload:<upload_id>` with the upload's file name as its label when the
+  `file_upload` row still exists, and `"deleted upload"` when it does not.
+  Never a guessed name.
+- **D6. No assistant change.** `DATA-19` is not a BI feature. The
+  assistant's `create_pipeline` already accepts a Bronze source; it has no
+  `dependsOn` field today and does not get one here (AI team's call,
+  `AI-16`).
+
+## 3. Anchors (`main` at `caf5784b`)
+
+- `dagster/dispar_orchestrate/authored_factory.py`:
+  `build_authored_dependency_sensor` (the per-upstream `get_runs` walk),
+  `_upstream_job_selector`.
+- `dagster/dispar_orchestrate/file_ingest.py`: `FileIngestParams`,
+  `bronze_table_name`, the op name `ingest_uploaded_file`.
+- `rust/crates/lakehouse-api/src/routes/authored_pipelines.rs`:
+  `validate_depends_on`, `validate_target_zone`, `update`, `restore_version`;
+  `routes/pipelines.rs::create`.
+- `rust/crates/lakehouse-api/src/routes/lineage.rs`: `Graph::edge`, the
+  connector edges (`source_objects`), the module's edge table.
+- `rust/migrations/0058_upload_tenant_mode.sql`: `upload_table_claim`.
+- `src/features/pipelines/pipeline-create-page.tsx`: source step fields.
+- `ops/g9/upload_test.py` and the `g9-upload` CI job.
+
+## 4. Tasks (one commit each, in order; Rust tasks together)
+
+- **T1. D2 in the API** with tests for create, update and restore (refused
+  for a `silver` source, accepted for `bronze`). Scoped Rust checks.
+- **T2. D5 lineage edge** with tests: claim → edge; deleted upload →
+  `"deleted upload"` label; another tenant's claim → no edge. Update the
+  module doc's edge table. Scoped Rust checks.
+- **T3. D1 in the sensor** with unit tests in `test_authored_factory.py`
+  (no network): a `file_ingest_job` success for the source table counts; one
+  for another table does not; an authored or `ingest_job` upstream behaves as
+  before. `pytest` for that file, the two `ops/lint` scripts.
+- **T4. D3 and D4 in the console** with tests next to the page. Typecheck,
+  lint, and the frontend tests of `src/features/pipelines/` only (one whole
+  `bun test src` process is OOM-killed on this machine).
+- **T5. The gate proves it.** Extend `ops/g9/upload_test.py`: upload a file
+  into table T, create a Bronze-to-Silver pipeline over T with the switch ON,
+  load it once and wait for the pipeline's run; re-upload T with one row
+  changed; the pipeline runs again and the Silver table shows the change;
+  upload a file into another table U; the pipeline does NOT run again; the
+  lineage route shows `upload:<id> → bronze.T → silver.<out>`. Run the
+  `g9-upload` CI job's sequence locally from a clean project and quote the
+  gate's output and wall time. If the `g9-upload` job's `timeout-minutes`
+  must rise, raise it by the measured time plus 5 minutes and say so.
+- **T6. Docs.** `CHANGELOG.md`; the module docs above. Do NOT edit
+  `docs/core/` (the planner does).
+
+## 5. Out of scope
+
+- `ingest_job` (connectors) firing every dependent on any connector run.
+  Recorded by the planner as its own backlog item.
+- A `dependsOn` editor for anything but the one switch.
+- The assistant (D6).
+
+## 6. Verify, do not assume
+
+1. Does a `file_ingest_job` run's `run_config` reach the sensor through
+   `context.instance.get_runs(...)` with `bronze_table_name` readable? Quote
+   what the sensor sees.
+2. Does the existing ALL-upstreams rule still hold when one upstream is
+   `file_ingest_job` filtered by table and another is an authored pipeline?
+3. Which catalog client (if any) gives table names per zone for D4?
+4. What does the lineage route return for a claim whose `tenant_id` is NULL
+   (a claim from before `0058`)? Follow the connectors' rule and say which.
+
+## 7. Handoff
+
+(Developer appends here, task by task.)
+
+## 8. Review
+
+(Reviewer.)
