@@ -155,3 +155,21 @@ session, `postgres:16-alpine`), so the database tests ran.
   and `lakehouse-store` test suites were not run either, only the filters
   above. CI runs the workspace.
 - No TypeScript, Python or compose file changed; their checks were not run.
+
+## Review (planner)
+
+Read the diff of `2a334b8`, `3d77e75` and `325ad58` against this plan and
+`AGENTS.md`.
+
+- **Task 1.**
+  - The enum matches `LoadMode`'s `snake_case` names.
+  - The description sentence is as decided.
+  - The fixture was regenerated with the ignored writer test its doc comment names.
+  - The new test goes through `POST /api/ai/tool` and reads the stored spec.
+  - As the handoff says, that test would also pass on the old schema, because the tool forwards objects as given. The fixture test is what pins the schema change. Accepted.
+- **Task 2.**
+  - The two cases cover both directions.
+  - The developer showed the first one fails when `lift_pause_if_nothing_waits` ignores the keys, then restored the source.
+- No `unwrap`/`expect` outside tests, and no product behaviour change beyond the schema.
+- No `BLOCKER`, no `SHOULD-FIX`.
+- The full workspace block is left to CI (disk), as recorded in the handoff.
