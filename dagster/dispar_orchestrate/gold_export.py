@@ -44,16 +44,17 @@ API's enabled publications (`GET /api/gold/publications`, what the
 console's switches write — the database is the source of truth) and the
 env override (an operator's escape hatch, default empty), deduplicated
 by mart name; two DISTINCT marts that would collapse into one Dagster
-step key are still refused. Every scheduled POST sends `ifChanged=true`
-(T4), so a mart whose `max(modification_time)` last moved strictly
-before its last successful export comes back `{skipped: true}` —
-strictly before, not "not after" (PR slice B review B1: both sides are
-whole seconds, so equal timestamps export rather than risk a stale copy
-the console calls up to date) — recorded as
-`skipped_verbs=["unchanged"]` with no `AssetMaterialization`, since
-nothing was written — and the empty union runs a zero-step job that
-still succeeds, which is the honest shape of "nothing is published."
-"""
+step key are still refused. Every scheduled POST sends `ifChanged=true`, so a mart whose ClickHouse
+content fingerprint (row count, wrapping 64-bit sum of cityHash64(*), and
+schema hash from system.columns) matches the fingerprint recorded on its last
+successful export comes back `{skipped: true}` (DATA-10). Background merges
+(`OPTIMIZE TABLE ... FINAL`) and atomic full rewrites via staging + `EXCHANGE
+TABLES` alter part modification times without changing table contents; the
+content fingerprint distinguishes genuine data changes from storage churn,
+preventing spurious re-exports — recorded as `skipped_verbs=["unchanged"]`
+with no `AssetMaterialization`, since nothing was written — and the empty union
+runs a zero-step job that still succeeds, which is the honest shape of
+"nothing is published." """
 
 from __future__ import annotations
 
