@@ -3618,9 +3618,10 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// The helper returns a `Response` so the caller can `return rejection;`
 /// directly. A `RunNotFoundError` (or `__typename != "Run"`) becomes the
 /// same "run not found" body the routes' other branches produce, so a
-/// caller cannot tell "out of scope" from "no such run". A transport
-/// failure surfaces as 503 with the classified error string (AGENTS.md
-/// rule 4).
+/// caller cannot tell "out of scope" from "no such run". A failed
+/// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
+/// `{"error": "orchestrator error"}` and the detail only to `tracing`
+/// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,
@@ -3637,9 +3638,26 @@ async fn enforce_run_id_pipeline_scope(
                 .into_response());
         }
         Err(err) => {
+            // PR #80 review BLOCKER 1: this branch answered
+            // `js_error(err)`, i.e. it rendered the orchestrator-side
+            // failure into the caller's 503 body — upstream text in a
+            // response (AGENTS.md principle 4), added by this PR on all
+            // four runId routes. `pipeline_run_pipeline_name` can only
+            // fail two ways (see `lakehouse_dagster::DgClient::
+            // pipeline_run_pipeline_name`): a transport failure
+            // (`DgError::Transport`, whose `Display` is the fixed
+            // "fetch failed"; the real `reqwest` error, URL included,
+            // stays its `#[source]`) or a response body that is not
+            // valid JSON (`DgError::Server`, carrying the parse error).
+            // Neither is a caller-facing message, and the body must not
+            // depend on which variant arrived, so it is FIXED here and
+            // the detail goes to `tracing` — the same treatment this
+            // PR's other F2.7 sites use (e.g. the `run_config_schema`
+            // arm, `pipeline config-schema: orchestrator unreachable`).
+            tracing::warn!(%err, "pipeline run scope: orchestrator lookup failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": "orchestrator error" })),
             )
                 .into_response());
         }
@@ -6655,6 +6673,61 @@ mod tests {
             assert_eq!(
                 parsed["error"], "orchestrator refused the mutation",
                 "cancel not-found body MUST be the fixed classified string",
+            );
+        }
+
+        /// PR #80 review BLOCKER 1: the runId scope check's own error
+        /// branch answered `js_error(err)`. This pins the fixed body.
+        ///
+        /// The upstream failure is produced by a body that is not valid
+        /// JSON (carrying a distinctive upstream-only text), NOT by a
+        /// top-level GraphQL `errors` array: `pipeline_run_pipeline_name`
+        /// reads `/data/pipelineRunOrError` and returns `Ok(None)` when
+        /// it is absent, so a GraphQL `errors` array takes the helper's
+        /// "run not found" 404 branch
+        /// (`lakehouse_dagster/src/lib.rs`, `pipeline_run_pipeline_name`).
+        /// An unparsable body is the only way to reach the 503 branch,
+        /// and it is also the branch whose detail is a class of upstream
+        /// text the caller must never see.
+        #[tokio::test]
+        async fn cancel_returns_503_with_fixed_body_when_the_scope_lookup_body_is_unparsable() {
+            const SENTINEL: &str = "SECRET-UPSTREAM-TEXT";
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string(format!("<html>gateway said {SENTINEL}</html>")),
+                )
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = cancel_run(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path("r1".to_owned()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a failed run-scope lookup MUST be a 503",
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let body_text = std::str::from_utf8(&body).expect("utf-8");
+            assert!(
+                !body_text.contains(SENTINEL),
+                "the orchestrator's own text MUST NOT be forwarded anywhere in the body, got {body_text}"
+            );
+            let parsed: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(
+                parsed,
+                json!({ "error": "orchestrator error" }),
+                "the scope-lookup 503 body MUST be exactly the fixed classified object, got {parsed}",
             );
         }
     }
