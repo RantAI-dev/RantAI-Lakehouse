@@ -203,6 +203,30 @@ past `in_scope` at all, so both now seed a row and call as
 
 (Each entry is appended as the command finishes.)
 
+1. **Rust block, on `f85b7a72` (the branch head when it ran).**
+
+   ```
+   cd rust && cargo fmt --check                    # rc 0, no output
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+                                                    # rc 0, "Finished dev profile" after 37.93s
+   cargo test --workspace                           # rc 0
+   ```
+
+   `cargo test --workspace`: **97 suites, 4742 passed, 0 failed, 0
+   ignored** (full log in the session's `.local/logs/bld3-cargo-test.log`;
+   no suite reported a non-zero failure count). `RUST_TEST_THREADS=4`,
+   shared `CARGO_TARGET_DIR`, under `flock .heavy.lock`, no `cargo
+   clean`.
+
+   Before this, on the merge commit and the test commit separately:
+   `cargo check -p lakehouse-api --all-targets` rc 0, and
+   `cargo clippy -p lakehouse-api --all-targets -- -D warnings` rc 0.
+   Targeted run of this slice's own tests,
+   `cargo test -p lakehouse-api --lib -- bronze_target_is_refused
+   validate_target_zone`: **4 passed, 0 failed, 0 ignored** (1643
+   filtered out) — the `create`, `update` and `restore_version`
+   refusals plus the pure rule.
+
 ### Section 6 answers
 
 (Appended after the run.)
