@@ -1166,10 +1166,10 @@ def _trigger_of(context: Any, action: Any) -> str:
     A run of one table carries its action in the run config, which says
     `refresh` or `clear` whoever pressed the button. Otherwise the run's
     `lakehouse/trigger` tag, which `ingest_schedule_sensor` sets to `schedule`.
-    A run launched through `POST .../ingest/run` carries no tag today, and
-    neither does one launched from the orchestrator's own screen, so both are
-    reported as `other` until the API tags its launches `user`: this function
-    already honours that tag, and invents nothing.
+    A run launched through `POST .../ingest/run` carries `user` (the API tags
+    its launches, SRC-11 review 1 SHOULD-FIX 1); one launched from the
+    orchestrator's own screen carries no tag and is reported as `other`: this
+    function invents nothing.
     """
     if action == ACTION_CLEAR:
         return "clear"
@@ -1539,7 +1539,8 @@ def _fetch_due_connectors(cfg: IngestFactoryConfig, after: datetime, until: date
 def _busy_connector_ids(instance: Any) -> set[str]:
     """Every connector with an `ingest_job` run still queued or going,
     read from each run's own `connector_id` config (a run launched by
-    `POST .../ingest/run` carries no tag, only that config)."""
+    `POST .../ingest/run` carries only the `user` trigger tag, not the
+    connector's id)."""
     busy: set[str] = set()
     for run in instance.get_runs(filters=RunsFilter(job_name=ingest_job.name, statuses=_IN_PROGRESS)):
         config = (run.run_config or {}).get("ops", {}).get("run_ingest", {}).get("config", {})

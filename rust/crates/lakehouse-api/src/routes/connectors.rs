@@ -3362,9 +3362,12 @@ async fn launch_ingest(
         op_config["action"] = json!(action.as_str());
     }
     let run_config = json!({"ops": {"run_ingest": {"config": op_config}}});
+    // `SRC-11` review 1 SHOULD-FIX 1: a launch through this route is a
+    // person's ("Run now", refresh, clear); the orchestrator's start report
+    // reads this tag, and a run with no tag is recorded as `other`.
     match state
         .dagster
-        .launch_run_with_config(INGEST_JOB, &run_config)
+        .launch_run_with_config_and_tags(INGEST_JOB, &run_config, &[("lakehouse/trigger", "user")])
         .await
     {
         Ok(outcome) => {
