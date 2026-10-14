@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  effectiveOrder, entriesFromRows, isOtherRow, labelOtherRows, measureLabel, measureLimits, parseSortChoice,
+  columnRef, metricColumn, effectiveOrder, entriesFromRows, isOtherRow, labelOtherRows, measureLabel, measureLimits, parseSortChoice,
   resultName, rowsFromEntries, shapeDraftFromDef, shapePayload, shapeProblems, sortChoiceOf, sortOptions,
   tileMeasureLabels, usesGroupings, emptyShapeDraft, effectiveAggregate, storedAggregate, type MeasureEntry,
 } from "./chart-shape"
@@ -237,11 +237,11 @@ test("internal columns are left out of every list a person reads", () => {
   assert.deepEqual(visibleColumns(["kab", "visitors", "__other", "__n"]), ["kab", "visitors"])
 })
 
-test("a joined column is labelled table.column in a tile's legend, including an own aggregate (BI-7)", () => {
-  assert.deepEqual(tileMeasureLabels(["visitors", "capacity__hotels"], ["visitors", "capacity__hotels"]), { capacity__hotels: "capacity.hotels" })
+test("a joined column is labelled by its own name in a tile's legend, including an own aggregate (BI-7)", () => {
+  assert.deepEqual(tileMeasureLabels(["visitors", "capacity__hotels"], ["visitors", "capacity__hotels"]), { capacity__hotels: "hotels" })
   assert.deepEqual(
     tileMeasureLabels(["visitors", { column: "capacity__rooms", aggregate: "max" }], ["visitors", "max_capacity__rooms"]),
-    { max_capacity__rooms: "max of capacity.rooms" },
+    { max_capacity__rooms: "max of rooms" },
   )
 })
 
@@ -343,4 +343,22 @@ test("a measure row that picks the chart's aggregate again stores none, so the r
   assert.equal(storedAggregate("sum", "sum"), "")
   assert.equal(resultName({ column: "visitors", aggregate: storedAggregate("sum", "sum") }, new Set()), "visitors")
   assert.equal(resultName({ column: "visitors", aggregate: storedAggregate("avg", "sum") }, new Set()), "avg_visitors")
+})
+
+test("columnRef: one reading of a column for pickers, summaries and labels (phase 2 QA R14)", () => {
+  assert.deepEqual(columnRef("provinsi"), { text: "provinsi", tag: null, full: "provinsi" })
+  assert.deepEqual(columnRef("mart_demo_province_capacity__rooms"), { text: "rooms", tag: "capacity", full: "mart_demo_province_capacity.rooms" })
+  // A second join of the same table keeps its number, so the two stay apart.
+  assert.deepEqual(columnRef("mart_demo_province_capacity2__rooms"), { text: "rooms", tag: "capacity2", full: "mart_demo_province_capacity2.rooms" })
+  assert.deepEqual(columnRef("occupancy", { calculated: new Set(["occupancy"]) }), { text: "occupancy", tag: "fx", full: "occupancy" })
+  assert.deepEqual(columnRef("band", { groups: new Set(["band"]) }), { text: "band", tag: "group", full: "band" })
+  assert.deepEqual(columnRef("limit_n", { isParam: (n) => n === "limit_n" }), { text: "limit_n", tag: "param", full: "limit_n" })
+  assert.deepEqual(columnRef(metricColumn("visitors_total"), { metricLabels: { visitors_total: "Total visitors" } }), { text: "Total visitors", tag: "metric", full: "Total visitors" })
+  assert.equal(columnRef(metricColumn("visitors_total")).text, "visitors_total")
+})
+
+test("a measure row with a joined column reads 'max of rooms' (phase 2 QA R14, R16)", () => {
+  assert.equal(measureLabel({ column: "mart_demo_province_capacity__rooms", aggregate: "max" }, new Set()), "max of rooms")
+  assert.equal(measureLabel({ column: "mart_demo_province_capacity__rooms", aggregate: "" }, new Set()), "rooms")
+  assert.equal(measureLabel({ column: "mart_demo_province_capacity__rooms", aggregate: "" }, new Set(), "avg"), "avg of rooms")
 })

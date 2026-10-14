@@ -83,20 +83,42 @@ export function flatName(alias: string, column: string): string {
   return `${alias}__${column}`
 }
 
-/**
- * A flat column name as a person reads it: `table.column` for a joined
- * column, the name itself for any other (a result column that starts with two
- * underscores is the server's own and is left alone).
- */
-export function displayColumn(name: string): string {
-  if (name.startsWith("__")) return name
+/** Splits a flat column name into the column and the alias of its joined table (none for any other name). */
+function splitJoined(name: string): { column: string; alias: string } | null {
+  // A result column that starts with two underscores is the server's own and is left alone.
+  if (name.startsWith("__")) return null
   const at = name.indexOf("__")
-  return at > 0 && at + 2 < name.length ? `${name.slice(0, at)}.${name.slice(at + 2)}` : name
+  return at > 0 && at + 2 < name.length ? { alias: name.slice(0, at), column: name.slice(at + 2) } : null
 }
 
 /**
- * `displayColumn` applied inside a longer label ("avg of mart_a__rooms" reads
- * "avg of mart_a.rooms"): each word that is a joined column is replaced.
+ * A flat column name as a person reads it: the column's own name for a joined
+ * column (`mart_demo_province_capacity__rooms` reads "rooms"; the table is
+ * named by `columnSource` and `displayColumnFull`), the name itself for any
+ * other. Every place that shows a column (pickers, summaries, legend, axis,
+ * tooltip, table headers) goes through this one function (phase 2 QA R14).
+ */
+export function displayColumn(name: string): string {
+  return splitJoined(name)?.column ?? name
+}
+
+/** The short tag of the table a joined column comes from ("capacity", "capacity2" for a second join of it), or null. */
+export function columnSource(name: string): string | null {
+  const alias = splitJoined(name)?.alias
+  if (!alias) return null
+  // The last word of the alias: `mart_demo_province_capacity` is "capacity", a numbered `capacity2` keeps its number.
+  return alias.split("_").filter(Boolean).pop() ?? alias
+}
+
+/** The whole reference, `table.column`, for a hover title where the short label hides the table. */
+export function displayColumnFull(name: string): string {
+  const parts = splitJoined(name)
+  return parts ? `${parts.alias}.${parts.column}` : name
+}
+
+/**
+ * `displayColumn` applied inside a longer label ("max of mart_a__rooms" reads
+ * "max of rooms"): each word that is a joined column is replaced.
  */
 export function displayLabel(label: string): string {
   return label.replace(/[A-Za-z_][A-Za-z0-9_]*/g, (word) => displayColumn(word))

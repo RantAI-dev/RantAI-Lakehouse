@@ -14,7 +14,8 @@ import {
 } from "@/lib/chart-shape";
 import { binDraftFromDef, binPayload, type BinDef } from "@/lib/chart-bins";
 import { moveItem } from "@/lib/table-draft";
-import { displayColumn } from "@/lib/chart-joins";
+import { displayColumn, displayColumnFull } from "@/lib/chart-joins";
+import { columnItems } from "./builder-sections";
 import { GRAIN_LABELS, grainChoices, type ColumnKind } from "@/lib/time-grain";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { BinPicker } from "./bin-picker";
@@ -73,8 +74,8 @@ export function MeasureRows({
         <div key={i} className="grid gap-1.5">
           <Label>{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
           <div className="flex items-center gap-1.5">
-            <Select value={row.column} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)}><SelectValue placeholder={placeholder} /></SelectTrigger>
+            <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
+              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (

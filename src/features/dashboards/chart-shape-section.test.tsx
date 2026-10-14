@@ -262,10 +262,10 @@ describe("PreviewRowsTable and the internal columns", () => {
     expect(screen.getByText("Bali")).toBeTruthy()
   })
 
-  it("heads each column as the chart's table does, and a joined column as table.column (phase 2 QA R13)", () => {
+  it("heads each column as the chart's table does, and a joined column by its own name (phase 2 QA R13, R14)", () => {
     render(<PreviewRowsTable open labels={{ sum_visitors: "total visitors" }} data={{ columns: ["regions__name", "sum_visitors", "other"], rows: [{ regions__name: "Bali", sum_visitors: 3, other: 1 }], truncated: false, limit: 2000 }} />)
     expect(screen.getByRole("columnheader", { name: "total visitors" })).toBeTruthy()
-    expect(screen.getByRole("columnheader", { name: "regions.name" })).toBeTruthy()
+    expect(screen.getByRole("columnheader", { name: "name" })).toBeTruthy()
     expect(screen.getByRole("columnheader", { name: "other" })).toBeTruthy()
     expect(screen.queryByText("sum_visitors")).toBeNull()
   })

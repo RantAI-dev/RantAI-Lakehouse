@@ -6,9 +6,11 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
-  JOIN_OPS, JOIN_TYPES, MAX_JOINS, MAX_PAIRS, displayColumn, emptyJoin, leftChoices, multiplyWarning,
+  JOIN_OPS, JOIN_TYPES, MAX_JOINS, MAX_PAIRS, displayColumnFull, emptyJoin, leftChoices, multiplyWarning,
   type JoinDraft, type JoinPairDef,
 } from "@/lib/chart-joins";
+import { columnRef } from "@/lib/chart-shape";
+import { ColumnLabel, columnItems } from "./builder-sections";
 
 /**
  * The chart builder's "Joins" section (`BI-7`): add up to four tables to the
@@ -20,6 +22,8 @@ import {
 
 /** What the builder knows about a table picked as a join: its columns and its sorting key. */
 export type JoinTableInfo = { columns: readonly string[]; rightKey: readonly string[] };
+
+const leftLabel = (name: string) => <ColumnLabel reference={columnRef(name)} />;
 
 export function JoinsSection({
   baseMart, baseColumns, marts, joins, onChange, onPickTable, infoOf, disabled,
@@ -65,9 +69,9 @@ export function JoinsSection({
               <div className="grid gap-1.5">
                 {j.on.map((pair, p) => (
                   <div key={p} className="flex items-center gap-1.5">
-                    <Select value={pair.left} onValueChange={(v) => setPair(i, p, { left: v ?? "" })} disabled={disabled}>
-                      <SelectTrigger className="w-full min-w-0 flex-1" aria-label={`Join ${i + 1} pair ${p + 1} left`}><SelectValue placeholder="column" /></SelectTrigger>
-                      <SelectContent>{left.map((c) => <SelectItem key={c} value={c}>{displayColumn(c)}</SelectItem>)}</SelectContent>
+                    <Select value={pair.left} items={columnItems(left, leftLabel, pair.left)} onValueChange={(v) => setPair(i, p, { left: v ?? "" })} disabled={disabled}>
+                      <SelectTrigger className="w-full min-w-0 flex-1" aria-label={`Join ${i + 1} pair ${p + 1} left`} title={pair.left ? displayColumnFull(pair.left) : undefined}><SelectValue placeholder="column" /></SelectTrigger>
+                      <SelectContent>{left.map((c) => <SelectItem key={c} value={c}>{leftLabel(c)}</SelectItem>)}</SelectContent>
                     </Select>
                     <Select value={pair.op} onValueChange={(v) => setPair(i, p, { op: v ?? "=" })} disabled={disabled} items={Object.fromEntries(JOIN_OPS.map((o) => [o.value, o.label]))}>
                       <SelectTrigger className="w-32 shrink-0" aria-label={`Join ${i + 1} pair ${p + 1} comparison`}><SelectValue /></SelectTrigger>

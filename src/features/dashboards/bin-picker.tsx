@@ -25,7 +25,7 @@ export function BinPicker({
 }) {
   const choices = binChoicesFor(sqlSource);
   return (
-    <div className="mt-1 grid gap-1.5">
+    <div className="grid gap-1.5">
       {label ? <Label>{label}</Label> : null}
       <div className="flex items-center gap-1.5">
         <Select value={binChoiceOf(value)} items={BIN_CHOICES} onValueChange={(v) => onChange(binDraftFromChoice(v ?? "none", value))} disabled={disabled}>

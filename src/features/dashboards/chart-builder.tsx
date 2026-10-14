@@ -49,7 +49,7 @@ import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
-  effectiveOrder, emptyShapeDraft, entriesFromRows, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
+  effectiveOrder, emptyShapeDraft, entriesFromRows, columnRef, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
   rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, usesGroupings, columnsAfterSteps,
   type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
@@ -68,8 +68,8 @@ import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
-import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
-import { AccordionSection, FoldSection, focusFirstEmpty } from "./builder-sections";
+import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
 import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
@@ -328,20 +328,16 @@ export function ChartBuilder({
   const [editingGroup, setEditingGroup] = React.useState<CalcField | undefined>(undefined);
   const [hierarchyOpen, setHierarchyOpen] = React.useState(false);
   const [editingHierarchy, setEditingHierarchy] = React.useState<Hierarchy | undefined>(undefined);
-  /** A calculated field is marked "fx" wherever a column is picked. */
-  // A joined column (`table__column`, BI-7) reads `table.column`.
-  const fieldLabel = (name: string) => isMetricColumn(name)
-    ? (() => {
-        const m = (fields?.metrics ?? []).find((x) => x.name === metricNameOf(name));
-        return <span className="flex items-center gap-1.5" title={m?.description || undefined}>{m?.label || metricNameOf(name)}<span className="rounded bg-primary/10 px-1 text-[10px] font-medium text-primary">metric</span></span>;
-      })()
-    : slotParam(name)
-    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">param</span></span>
-    : calcNames.has(name)
-    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
-    : groupNames.has(name)
-      ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">group</span></span>
-      : displayColumn(name);
+  // Phase 2 QA R14: every column picked or shown in the form reads through `columnRef` (a joined
+  // column is its own name with the table as a small tag), and truncates inside its control.
+  const fieldLabel = (name: string) => {
+    const metric = isMetricColumn(name) ? (fields?.metrics ?? []).find((x) => x.name === metricNameOf(name)) : undefined;
+    const ref = columnRef(name, {
+      metricLabels: Object.fromEntries((fields?.metrics ?? []).map((m) => [m.name, m.label])),
+      calculated: calcNames, groups: groupNames, isParam: (n) => !!slotParam(n),
+    });
+    return <ColumnLabel reference={ref} title={metric?.description || undefined} />;
+  };
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -1096,7 +1092,7 @@ export function ChartBuilder({
   }
 
   const grainPicker = grainOptions.length > 0 ? (
-    <div className="mt-1 grid gap-1.5">
+    <div className="grid gap-1.5">
       <Label>Group by</Label>
       <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
         <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
@@ -1108,8 +1104,17 @@ export function ChartBuilder({
     </div>
   ) : null;
 
+  // Phase 2 QA R15: which conditional controls the dimension and the breakdown bring (they sit in a row below the fields).
+  const binDimension = !isGroupedTable && !!binKind && isNumber(dimension);
+  const dimensionExtras = !isGroupedTable && (!!grainPicker || binDimension);
+  const breakdownExtras = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+
   const formFields = (
-    <div className="grid content-start gap-5 px-5 pt-1 pb-5">
+    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
+    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
+    // one long column name widened the whole form. Every grid of the form without columns of its own
+    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 pt-1 pb-5 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
       {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
         <div className="grid gap-1.5">
@@ -1247,7 +1252,7 @@ export function ChartBuilder({
 
           {kind === "table" ? <TableSection part="shape" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {!isSingle && !ownColumns ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
               {isGroupedTable ? (
                 <GroupingsEditor
                   value={shape.groupings}
@@ -1259,62 +1264,80 @@ export function ChartBuilder({
                   sqlSource={onSqlSource}
                 />
               ) : (
-              <div className="grid gap-1.5">
+              <div className="grid content-start gap-1.5" data-slot="dimension-field">
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
                 {isPoints ? (
-                  <Select value={dimension || NO_BREAKDOWN} items={NO_LABEL_ITEMS} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
+                  <Select value={dimension || NO_BREAKDOWN} items={{ ...NO_LABEL_ITEMS, ...columnItems(fields?.dimensions ?? [], fieldLabel, dimension) }} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 ) : (
-                  <Select value={dimension} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <Select value={dimension} items={columnItems(dimensionChoices, fieldLabel, dimension)} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>{dimensionChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
-                {grainPicker}
-                {binKind && isNumber(dimension) ? (
-                  <BinPicker label="Group in" value={shape.bin} sqlSource={onSqlSource} aria="Group in bins"
-                    onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
-                ) : null}
               </div>
               )}
               {canBreakdown ? (
-                <div className="grid gap-1.5">
+                <div className="grid content-start gap-1.5" data-slot="breakdown-field">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
-                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                  <Select value={breakdown || NO_BREAKDOWN} items={{ ...breakdownLabels, ...columnItems(breakdownChoices, fieldLabel, breakdown) }} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
+                    <SelectTrigger className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                       {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                   {rules.breakdownLocked ? <p className="text-xs text-muted-foreground">{rules.breakdownLocked}</p> : null}
-                  {binKind && breakdown && isNumber(breakdown) ? (
-                    <BinPicker label="Group in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
-                      onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                </div>
+              ) : null}
+              {/*
+                Phase 2 QA R15: a control that exists only for some columns (the bin of a number, the
+                grain of a date) is never inside the field it belongs to, since it made that column
+                taller than its neighbour and the neighbour's select drifted out of line with it. It
+                sits in a row of its own below both fields, in its parent's column (the breakdown's
+                in the second), and the fields above keep `content-start` so a taller neighbour
+                cannot stretch them.
+              */}
+              {dimensionExtras || breakdownExtras ? (
+                <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2" data-slot="conditional-row">
+                  {dimensionExtras ? (
+                    <div className="grid content-start gap-3">
+                      {grainPicker}
+                      {binDimension ? (
+                        <BinPicker label="Group in" value={shape.bin} sqlSource={onSqlSource} aria="Group in bins"
+                          onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {breakdownExtras ? (
+                    <div className="grid content-start gap-3 sm:col-start-2">
+                      <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                        onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                    </div>
                   ) : null}
                 </div>
               ) : null}
             </div>
           ) : null}
           {isPoints ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>Latitude <Req /></Label>
-                <Select value={lat} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
+                <Select value={lat} items={columnItems(coordinateColumns, fieldLabel, lat)} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                  <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                  <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5">
                 <Label>Longitude <Req /></Label>
-                <Select value={lon} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
+                <Select value={lon} items={columnItems(coordinateColumns, fieldLabel, lon)} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                  <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                  <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
             </div>
@@ -1368,7 +1391,7 @@ export function ChartBuilder({
 
           <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
             {rules.sort !== "none" ? (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
                 {rules.sort === "by-date" || rules.sort === "by-category" ? (
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
@@ -1628,7 +1651,7 @@ export function ChartBuilder({
             {wide ? (
               <ResizablePanelGroup className="min-h-0 flex-1">
                 <ResizablePanel defaultSize="50" minSize="30">
-                  <div className="h-full overflow-y-auto">{formFields}</div>
+                  <div className="h-full min-w-0 overflow-y-auto">{formFields}</div>
                 </ResizablePanel>
                 <ResizableHandle withHandle />
                 <ResizablePanel defaultSize="50" minSize="30">{previewPane}</ResizablePanel>

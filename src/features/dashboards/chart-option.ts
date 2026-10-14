@@ -4,6 +4,12 @@ import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
+/**
+ * Phase 2 QA R16: a long series name folds with an ellipsis in the legend and is read in full
+ * from the legend's tooltip (which every legend turns on beside this), so the legend stays one line.
+ */
+export const LEGEND_TEXT = { width: 140, overflow: "truncate" as const };
+
 // The map kinds (`geomap`, `pointmap`, `geoheat`) are built in geo-option.ts:
 // they need the registered map's feature names and report what they leave
 // out, which a plain `(spec, rows, dark) => option` cannot.
@@ -86,7 +92,7 @@ export function buildOption(
         const o = p as { name: string; value: number; percent: number };
         return `${o.name}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`;
       } },
-      legend: { bottom: 0, textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { bottom: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [
         {
           type: "pie",
@@ -129,7 +135,7 @@ export function buildOption(
   if (spec.kind === "rose") {
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`; } },
-      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [{ type: "pie", roseType: "area", radius: ["15%", "72%"], center: ["50%", "44%"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, borderRadius: 4 },
         label: { show: false }, data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[y0]) })) }],
@@ -139,7 +145,7 @@ export function buildOption(
   if (spec.kind === "funnel") {
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b>`; } },
-      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [{ type: "funnel", left: "8%", right: "8%", top: 10, bottom: 28, sort: "descending", gap: 2,
         label: { show: true, position: "inside", color: "#fff", fontSize: 11, formatter: "{b}" },
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1 },
@@ -206,7 +212,7 @@ export function buildOption(
     const m1 = yArr[0], m2 = yArr[1] ?? yArr[0];
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: "cross" } },
-      legend: { top: 0, textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { top: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       grid: { ...base.grid, top: 34 },
       xAxis: catAxis(cat),
       // alignTicks off — the two metrics have different scales (e.g. millions vs thousands).
@@ -393,7 +399,7 @@ export function buildOption(
     return {
       ...base,
       tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: isLine ? "line" : "shadow" } },
-      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       grid: { ...base.grid, top: 34 },
       xAxis: horizontal ? valueAxis : { ...categoryAxis, data: orderedCats },
       yAxis: horizontal ? { ...categoryAxis, data: orderedCats } : valueAxis,
@@ -406,7 +412,7 @@ export function buildOption(
     return {
       ...base,
       tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: "shadow" } },
-      legend: { top: 0, right: 0, textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { top: 0, right: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       grid: { ...base.grid, top: 32 },
       xAxis: horizontal ? valueAxis : categoryAxis,
       yAxis: horizontal ? categoryAxis : valueAxis,
@@ -429,7 +435,7 @@ export function buildOption(
     return {
       ...base,
       tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: isLine ? "line" : "shadow" } },
-      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       grid: { ...base.grid, top: 34 },
       xAxis: horizontal ? valueAxis : categoryAxis,
       yAxis: horizontal ? categoryAxis : valueAxis,

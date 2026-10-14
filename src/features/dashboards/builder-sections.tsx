@@ -8,6 +8,7 @@
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { ColumnRef } from "@/lib/chart-shape";
 
 /**
  * Sections 1 to 3 as an accordion (phase 2 QA R10): the heading is a button
@@ -28,7 +29,7 @@ export function AccordionSection({ number, title, summary, open, onOpenChange, p
   const id = React.useId();
   const panel = `${id}-panel`;
   return (
-    <section aria-labelledby={id} className="grid gap-3 border-t border-border pt-3">
+    <section aria-labelledby={id} className="grid grid-cols-[minmax(0,1fr)] gap-3 border-t border-border pt-3">
       <h3 id={id} className="text-sm font-semibold">
         <button
           type="button" aria-expanded={open} aria-controls={panel} onClick={() => onOpenChange(!open)}
@@ -40,7 +41,7 @@ export function AccordionSection({ number, title, summary, open, onOpenChange, p
           <ChevronRight aria-hidden className={cn("ml-auto size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
         </button>
       </h3>
-      <div id={panel} ref={panelRef} hidden={!open} className="grid gap-3">{children}</div>
+      <div id={panel} ref={panelRef} hidden={!open} className="grid grid-cols-[minmax(0,1fr)] gap-3">{children}</div>
     </section>
   );
 }
@@ -84,5 +85,26 @@ export function FoldSection({ number, title, open, onOpenChange, panelRef, child
       </h3>
       {open ? <div id={panel} ref={panelRef} className="grid gap-4">{children}</div> : null}
     </section>
+  );
+}
+
+/** The `items` of a column select: every name with its label, so the closed trigger reads like the list (phase 2 QA R14). */
+export function columnItems(names: readonly string[], label: (name: string) => React.ReactNode, current?: string): Record<string, React.ReactNode> {
+  const all = current && !names.includes(current) ? [...names, current] : names;
+  return Object.fromEntries(all.map((n) => [n, label(n)]));
+}
+
+/**
+ * A column as the pickers show it (phase 2 QA R14): its readable text, truncated with an
+ * ellipsis inside whatever holds it, and a small tag after it (the joined table, "fx",
+ * "metric"). The full reference is the hover title, so a long name is never lost, only folded.
+ */
+export function ColumnLabel({ reference, title }: { readonly reference: ColumnRef; readonly title?: string }) {
+  const tagClass = reference.tag === "metric" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground";
+  return (
+    <span className="flex min-w-0 items-center gap-1.5" title={title ?? reference.full}>
+      <span className="min-w-0 truncate">{reference.text}</span>
+      {reference.tag ? <span className={cn("max-w-24 shrink-0 truncate rounded px-1 text-[10px] font-medium", tagClass)}>{reference.tag}</span> : null}
+    </span>
   );
 }

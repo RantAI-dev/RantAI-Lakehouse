@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  coversKey, displayColumn, displayLabel, emptyJoin, joinAliases, joinComplete, joinDraftsFromDef, joinProblems,
+  coversKey, columnSource, displayColumn, displayColumnFull, displayLabel, emptyJoin, joinAliases, joinComplete, joinDraftsFromDef, joinProblems,
   joinsPayload, leftChoices, multiplyWarning, pairsFromSuggestions, type JoinDraft,
 } from "./chart-joins"
 import { emptyShapeDraft, shapePayload, shapeProblems } from "./chart-shape"
@@ -10,13 +10,20 @@ import { emptyShapeDraft, shapePayload, shapeProblems } from "./chart-shape"
 const pair = (left: string, op: string, right: string) => ({ left, op, right })
 const done = (mart: string, on = [pair("provinsi", "=", "provinsi")]): JoinDraft => ({ mart, type: "left", on })
 
-test("a joined column reads table.column and a result column of the server's own is left alone", () => {
-  assert.equal(displayColumn("capacity__rooms"), "capacity.rooms")
-  assert.equal(displayColumn("capacity2__hotel_count"), "capacity2.hotel_count")
+test("a joined column reads as its own name, its table is the tag and the title, and a result column of the server's own is left alone", () => {
+  assert.equal(displayColumn("capacity__rooms"), "rooms")
+  assert.equal(displayColumn("mart_demo_province_capacity__rooms"), "rooms")
+  assert.equal(displayColumn("capacity2__hotel_count"), "hotel_count")
+  assert.equal(columnSource("mart_demo_province_capacity__rooms"), "capacity")
+  assert.equal(columnSource("capacity2__hotel_count"), "capacity2")
+  assert.equal(columnSource("provinsi"), null)
+  assert.equal(columnSource("__other"), null)
+  assert.equal(displayColumnFull("mart_demo_province_capacity__rooms"), "mart_demo_province_capacity.rooms")
+  assert.equal(displayColumnFull("provinsi"), "provinsi")
   assert.equal(displayColumn("provinsi"), "provinsi")
   assert.equal(displayColumn("__other"), "__other")
   assert.equal(displayColumn("trailing__"), "trailing__")
-  assert.equal(displayLabel("avg of capacity__rooms"), "avg of capacity.rooms")
+  assert.equal(displayLabel("avg of capacity__rooms"), "avg of rooms")
 })
 
 test("a join is sent only when every join has a table and complete pairs with one equals", () => {

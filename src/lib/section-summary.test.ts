@@ -24,9 +24,9 @@ describe("sectionSummaries: What to show", () => {
     expect(sum({ dimension: "provinsi", measures: ["visitors", "avg of stay"] }).show).toBe("provinsi · visitors, avg of stay")
     expect(sum({ dimension: "provinsi", breakdown: "category", measures: ["visitors"] }).show).toBe("provinsi · split by category · visitors")
   })
-  it("says the grain of a date dimension and writes a joined column as table.column", () => {
+  it("says the grain of a date dimension and writes a joined column as its own name", () => {
     expect(sum({ dimension: "visit_date", grain: "month", measures: ["visitors"] }).show).toBe("visit_date by month · visitors")
-    expect(sum({ dimension: "regions__name", measures: ["total visitors"] }).show).toBe("regions.name · total visitors")
+    expect(sum({ dimension: "regions__name", measures: ["total visitors"] }).show).toBe("name · total visitors")
   })
   it("lists a grouped data table's groupings, then its measures", () => {
     expect(sum({ kind: "table", groupings: ["provinsi", "category"], measures: ["visitors"] }).show).toBe("provinsi, category · visitors")

@@ -22,8 +22,8 @@ beforeEach(() => {
     }
     if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
       return json({
-        dimensions: ["provinsi", "category"], measures: ["visitors", "stay"], calculated: [], hierarchies: [],
-        columns: [{ name: "provinsi", type: "String" }, { name: "category", type: "String" }, { name: "visitors", type: "UInt64" }, { name: "stay", type: "Float64" }],
+        dimensions: ["provinsi", "category"], measures: ["visitors", "stay", "mart_demo_province_capacity__rooms"], calculated: [], hierarchies: [],
+        columns: [{ name: "provinsi", type: "String" }, { name: "category", type: "String" }, { name: "visitors", type: "UInt64" }, { name: "stay", type: "Float64" }, { name: "mart_demo_province_capacity__rooms", type: "Float64" }],
       })
     }
     if (url.includes("/api/dashboard/fields")) return json({ marts: [{ name: "mart_visits", rows: 10 }] })
@@ -267,5 +267,58 @@ describe("ChartBuilder header (phase 2 QA R11)", () => {
     expect(row.textContent).toContain("Dashboard")
     expect(row.textContent).toContain("Width")
     expect(screen.queryByText(/Left empty, the chart is saved as/)).toBeNull()
+  })
+})
+
+describe("ChartBuilder long column names (phase 2 QA R14)", () => {
+  it("shows a picked joined measure by its own name with the table as a tag, and the full reference on hover", async () => {
+    renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const trigger = await screen.findByRole("combobox", { name: /^Measure/ })
+    await waitFor(() => expect(trigger.textContent).toContain("rooms"))
+    expect(trigger.textContent).toContain("capacity")
+    expect(trigger.textContent).not.toContain("__")
+    expect(trigger.getAttribute("title")).toBe("mart_demo_province_capacity.rooms")
+    // The label folds inside the trigger instead of widening it.
+    expect(trigger.querySelector(".truncate")?.textContent).toBe("rooms")
+  })
+
+  it("gives every grid of the form a column the container sizes, so no long name can scroll the form sideways", async () => {
+    renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
+    const section = (await screen.findByRole("button", { name: /What to show/ })).closest("section") as HTMLElement
+    expect(section.className).toContain("grid-cols-[minmax(0,1fr)]")
+    expect(section.querySelector("[id$=-panel]")?.className).toContain("grid-cols-[minmax(0,1fr)]")
+    const form = section.parentElement as HTMLElement
+    expect(form.className).toContain("grid-cols-[minmax(0,1fr)]")
+    expect(form.className).toContain("min-w-0")
+    expect(form.className).toContain("[&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]")
+  })
+})
+
+describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
+  it("puts the bin of a number dimension in a row of its own, so Dimension and Breakdown stay in one row", async () => {
+    renderBuilder({ ...barDef, dimension: "visitors", measures: ["stay"] })
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const bin = await screen.findByLabelText("Group in bins")
+    const dimension = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    const breakdown = document.querySelector("[data-slot=breakdown-field]") as HTMLElement
+    const row = document.querySelector("[data-slot=conditional-row]") as HTMLElement
+    // Both fields hold only their label and select, are siblings in one grid, and do not stretch.
+    expect(dimension.contains(bin)).toBe(false)
+    expect(breakdown.contains(bin)).toBe(false)
+    expect(row.contains(bin)).toBe(true)
+    expect(dimension.parentElement).toBe(breakdown.parentElement)
+    expect(row.parentElement).toBe(dimension.parentElement)
+    expect(dimension.className).toContain("content-start")
+    expect(breakdown.className).toContain("content-start")
+    expect(dimension.parentElement?.className).toContain("items-start")
+    expect(row.className).toContain("sm:col-span-2")
+  })
+
+  it("draws no extra row when the dimension needs no bin or grain", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    await screen.findByText(/Dimension \(X\)/)
+    expect(document.querySelector("[data-slot=conditional-row]")).toBeNull()
   })
 })
