@@ -97,3 +97,15 @@ Mismatches with the plan (not fixed here, for the planner to decide):
 
 Not verified: that the CI history job turns green after merge (see 1); a CI
 run of the changed workflow (YAML was only parsed with `yaml.safe_load`).
+
+### Handoff addendum (planner decision on mismatch 1)
+
+The four root-commit `6c3a7ff` `rantai-internal-lan-host` fingerprints are now
+baselined too (same private LAN addresses reached through a root commit that
+is an ancestor of `main`; not secrets), so `.gitleaksignore` holds 19 entries
+and `docs/CI.md` lists them. Re-run with gitleaks 8.30.1, all branches plus
+the four by-SHA commits fetched:
+- `gitleaks detect --source . --config .gitleaks.toml --redact`: no leaks
+  found, 1008 commits scanned.
+- `gitleaks detect --no-git --source . --config .gitleaks.toml --redact`:
+  7 leaks (`.env.staging`, unchanged; mismatch 2 stands until #130 merges).

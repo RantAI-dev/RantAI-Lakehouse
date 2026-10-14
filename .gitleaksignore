@@ -31,6 +31,12 @@ c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rant
 7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/services/clients/dagster.ts:rantai-internal-lan-host:6
 7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/app/api/ops/[kind]/route.ts:rantai-internal-lan-host:108
 27d1e2b03051809ce87b55c4a288b9e26f614e1d:src/app/api/ai/build-status/route.ts:rantai-internal-lan-host:5
+# The same addresses reached through the root commit 6c3a7ff, an ancestor of
+# `main`, so a scan can report them through that path too. SEC-1.
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/app/api/ai/build-status/route.ts:rantai-internal-lan-host:5
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/app/api/ops/[kind]/route.ts:rantai-internal-lan-host:108
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/services/clients/clickhouse.ts:rantai-internal-lan-host:11
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/services/clients/dagster.ts:rantai-internal-lan-host:6
 
 # False positive: a test token literal, gone since #129. SEC-1.
 31ec837b57ed05740727360c1a64fb3cf3d2dedc:dagster/dispar_orchestrate/test_schema_observer.py:generic-api-key:26

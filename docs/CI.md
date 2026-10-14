@@ -162,7 +162,9 @@ than no scan at all: it tells a reviewer history is clean when it is not.
 `rantai-internal-lan-host`) matching the key prefix and host range.
 
 With those rules and the default ones, the scan of `main` at `a13e5ea`
-(CI job 115776111835) reported 15 findings. The product owner confirmed on
+(CI job 115776111835) reported 15 findings; a scan that reaches the root
+commit `6c3a7ff` reports four more hits for the same addresses, so 19
+entries are baselined. The product owner confirmed on
 2026-10-14 that every real secret among them is rotated, and a history
 rewrite would break every open branch, so they are **baselined, not
 rewritten** (SEC-1, plan
@@ -174,7 +176,7 @@ fingerprint (commit, file, rule, line):
 | --- | --- | --- |
 | 7 lines of `.env.staging` in `1d2c45c` | Staging tokens and secret | Rotated; SEC-13 (#130) moves them to repository secrets `STAGING_*` |
 | `llm.ts:9` in `8ac6ee2` | Internal LLM node key | Rotated |
-| 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b` | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
+| 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b`, and the same 4 files in the root commit `6c3a7ff` (an ancestor of `main`) | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
 | `test_schema_observer.py:26` in `31ec837` | Test token literal | False positive; the literal is gone since #129 |
 | `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant. The history scan reads every branch |
 
