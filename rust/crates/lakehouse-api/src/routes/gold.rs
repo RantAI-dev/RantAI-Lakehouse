@@ -114,20 +114,9 @@ pub struct ExportQuery {
     if_changed: Option<String>,
 }
 
-/// DATA-1 task 4: the skip decision for `?ifChanged=true`, as a pure
-/// function so the three outcomes are unit-tested without any server.
+/// DATA-10 review SHOULD-FIX 2 / DATA-10 / DATA-1: `?ifChanged=true` skip decision.
 ///
-/// Returns `Some(reason)` — skip — only when BOTH facts are measured and
-/// the mart's last write is STRICTLY before its last successful export.
-/// Equal timestamps export (PR slice B review B1): both sides are whole
-/// seconds (`modification_time` is a `DateTime`, the history row stores
-/// `started_at` in unix ms), so a write landing in the same second an
-/// export started — after that export read the mart — compares equal;
-/// skipping it would leave the open copy stale while the console says
-/// "Up to date". The cost of the strict comparison is one extra export
-/// for that same-second case, which is the safe direction. Any unknown
-/// DATA-10 / DATA-1: `?ifChanged=true` skip decision.
-///
+/// Pure function so the outcomes are unit-tested without any server.
 /// Skips when the current fingerprint equals the fingerprint on the newest
 /// successful export run. Anything unknown (no successful export yet, empty
 /// stored fingerprint from a pre-DATA-10 run, no active mart fingerprint)
@@ -268,18 +257,19 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
-/// # Skip: `?ifChanged=true` (DATA-1 task 4)
+/// # Skip: `?ifChanged=true` (DATA-1 task 4, DATA-10)
 ///
-/// With that parameter, a mart whose measured last write
-/// (`max(modification_time)` over active parts) is strictly before its
-/// last successful export is skipped: `200` with `{"skipped": true,
+/// DATA-10 review SHOULD-FIX 2: With that parameter, a mart whose current
+/// content fingerprint (`count()`, wrapping 64-bit sum of `cityHash64(*)`,
+/// and column schema hash) matches the fingerprint stored on its last
+/// successful export is skipped: `200` with `{"skipped": true,
 /// "reason": "unchanged since <rfc3339>"}`, and NOTHING else happens —
 /// no export, no `console.gold_export_run` row, no Iceberg snapshot.
-/// Strictly before, not "not after" (PR slice B review B1): equal
-/// timestamps export, because both sides are whole seconds and a write
-/// in the same second its last export began may have landed after that
-/// export read the mart. This is what the scheduler (task 5/6) sends so
-/// a quiet mart costs two cheap `ClickHouse` reads. Unknown facts never
+/// Unlike the earlier part-modification timestamp check, the content
+/// fingerprint does not false-export on table rewrites that leave row
+/// content identical (such as `OPTIMIZE TABLE FINAL` or `EXCHANGE TABLES`).
+/// This is what the scheduler sends so a quiet mart costs reading the
+/// last export history and one fingerprint query. Unknown facts never
 /// skip (see [`if_changed_skip_reason`]); the console's manual trigger
 /// does not send the parameter at all.
 ///
@@ -658,12 +648,14 @@ async fn mart_exists(ch: &ChClient, schema: &str, mart: &str) -> Result<bool, Ch
 /// `{schema}.{mart}`, or `None` when it has no active parts (a view, or
 /// an engine without parts) — "not measured", never a guessed time.
 ///
-/// Measured, not assumed, on the compose file's own `ClickHouse` 26.8
-/// (plan §6): every INSERT creates a part whose `modification_time` is
-/// the write time, and a zero-row INSERT creates no part — so this value
-/// moves exactly when a pipeline actually rewrote the mart, which is the
-/// semantics `?ifChanged=true`'s skip needs. The count guard is what
-/// makes a parts-less table `None` rather than the epoch.
+/// DATA-10 review SHOULD-FIX 2: Measured, not assumed, on the compose
+/// file's own `ClickHouse` 26.8 (plan §6): every INSERT creates a part
+/// whose `modification_time` is the write time. This timestamp is still
+/// queried for `lastChangedAt` in [`publication_body`] for console
+/// display, but it is no longer used for any export or skip decision
+/// (DATA-10 replaced timestamp-based skip with content fingerprinting).
+/// The count guard is what makes a parts-less table `None` rather than
+/// the epoch.
 ///
 /// # Errors
 ///
