@@ -2504,6 +2504,156 @@ mod tests {
         }
     }
 
+    /// BLD-3 / D4: the pure rule, and the message every refusal carries
+    /// (the orchestrator's op fails a stored pre-refusal pipeline with
+    /// this same wording).
+    #[test]
+    fn validate_target_zone_refuses_bronze_and_nothing_else() {
+        assert_eq!(
+            validate_target_zone("bronze").unwrap_err().0.to_string(),
+            BRONZE_TARGET_REFUSED
+        );
+        assert_eq!(
+            BRONZE_TARGET_REFUSED,
+            "a pipeline cannot write to bronze; bronze is written by ingestion"
+        );
+        for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
+            validate_target_zone(zone).expect("a ClickHouse zone stays writable");
+        }
+    }
+
+    /// BLD-3 / D4: the same refusal on `PUT /api/pipelines/{id}` and on
+    /// `POST /api/pipelines/{id}/versions/{version}/restore`.
+    ///
+    /// Both routes run the F2.1 tenant scope check (PR #80) FIRST, so
+    /// both tests seed a real row and call as a `*:*` principal that
+    /// passes it. What is pinned here is the ORDER that keeps the
+    /// existence answer independent of the payload: an out-of-scope id
+    /// still answers 404 whatever the body says (see
+    /// `update_checks_scope_before_the_transform_validator`, which is
+    /// the 404 half), and the Bronze refusal is the next answer for an
+    /// in-scope id. Each test also reads the stored row back, which is
+    /// D4's "refused before any write".
+    mod bronze_target_is_refused {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A row seeded THROUGH THE STORE, because the create route now
+        /// refuses a `bronze` target -- a stored pre-refusal row is the
+        /// case D4 exists for, and `tenant_id` is left at the column
+        /// default (`NULL`) so the `*:*` principal passes `in_scope`.
+        fn pipeline_input(name: &str, target_zone: &str) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "s".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: target_zone.to_owned(),
+                target_table: "t".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: None,
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_refuses_a_bronze_target_before_writing(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-update", "silver"), None)
+                    .await
+                    .expect("seed the row the refused update would rewrite");
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"bronze","targetTable":"t","schedule":"manual","transforms":[]}"#,
+            );
+            let err = update(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(created.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("a bronze target must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
+
+            let after = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(
+                after.target, "silver.t",
+                "the refused update must not have written the bronze target"
+            );
+        }
+
+        /// A stored version can predate the refusal (the rule is new;
+        /// rows are not migrated), so restoring one must be refused on
+        /// the snapshot's own `target_zone` rather than replaying the
+        /// Bronze target straight back into the live row. Asserted
+        /// through the version table: a refused restore writes no
+        /// `restored` row.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_of_a_bronze_target_version_returns_400(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-restore", "bronze"), None)
+                    .await
+                    .expect("seed the pre-refusal row the create route would now refuse");
+
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((created.id.clone(), 1)),
+            )
+            .await
+            .expect_err("restoring a stored bronze target must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
+
+            let versions: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pipeline_definition_version WHERE pipeline_id = $1",
+            )
+            .bind(&created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count the version rows");
+            assert_eq!(
+                versions.0, 1,
+                "the refused restore must not have written a `restored` version row"
+            );
+        }
+    }
+
     /// F2.8 (PR #59 review, `plans/pipelines/day-1-fixes/
     /// f2-tenant-scope-and-run-config.md` Part D): pin the transform
     /// grammar INSIDE `update`, against a real pool, with the scope
