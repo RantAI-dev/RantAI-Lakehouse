@@ -39,6 +39,12 @@
 //!   [`TableClaim::Ours`] or [`TableClaim::Theirs`].
 //! - [`table_claimed`] asks whether anyone holds it, for the one caller with
 //!   no tenant to ask on behalf of (a connector's ingest spec, plan task T8).
+//! - [`list_claims`] lists a tenant's claims with the upload each one came
+//!   from and that upload's file name while it exists. It is the record the
+//!   lineage graph draws an `upload -> bronze.<table>` edge from (`DATA-19`),
+//!   which is why a claim outliving its upload matters outside the ownership
+//!   rules above: the origin of a table stays drawable after the file is
+//!   gone.
 //!
 //! A claim is NEVER RELEASED. Not when the upload that made it is deleted
 //! ([`delete`] removes the upload's row and nothing else), not when the load

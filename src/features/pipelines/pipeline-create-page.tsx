@@ -89,6 +89,15 @@ export function PipelineCreatePage() {
  * (its transforms parsed back into drafts) and saves with
  * `PUT /api/pipelines/{id}`; the name is shown but fixed, because the id
  * and the orchestrator job name derive from it.
+ *
+ * Its source step is where an uploaded table becomes a pipeline's source
+ * (`DATA-19`): the Source table field suggests the zone's real table
+ * names without narrowing what can be typed, and a Bronze source carries
+ * the one `dependsOn` control the console offers — "Run again after this
+ * table is re-uploaded", which adds or removes `file_ingest_job` and
+ * leaves every other upstream alone. Both rules live in
+ * `pipeline-reupload-trigger.ts`, where they are unit-tested; this
+ * component holds the state and the two widgets.
  */
 export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   const router = useRouter()

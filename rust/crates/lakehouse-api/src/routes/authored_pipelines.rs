@@ -30,6 +30,19 @@
 //! traceback). It is logged and never returned; the response says only
 //! whether the orchestrator picked the change up (AGENTS.md principle 4).
 
+//! # The two rules every write here is refused by (DATA-19)
+//!
+//! `validate_target_zone` and [`validate_file_ingest_upstream`] are the
+//! two rules a write is checked against before anything is stored, and
+//! both run from the same three call sites (create, update, restore) so
+//! the message a reader gets is the same whichever route they used. The
+//! first refuses a `bronze` TARGET: Bronze is written by ingestion and by
+//! nothing else. The second refuses a `file_ingest_job` upstream on a
+//! source that is not `bronze`, because that job loads one uploaded file
+//! into one Bronze table and the sensor behind the chain counts only the
+//! runs that loaded the pipeline's own table -- so the chain would be
+//! wired and would never fire.
+
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
