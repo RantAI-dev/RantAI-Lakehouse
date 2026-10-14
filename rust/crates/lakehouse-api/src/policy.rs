@@ -586,6 +586,22 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // schema the connector loads from (policy `apply_all` only). Same gate and
     // the same handler-side service check as the route above.
     ("POST", "/api/connectors/{id}/schema-observations/tables", Policy::RequiresPermission("ingest:read")),
+    // `SRC-11`: the run history, a run's log (JSON or a text download) and
+    // Resume, for a person (decision D8); the tenant gate is the route layer.
+    // Resume lifts only the pause an auto-disable set.
+    ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
+    // the closed log list, and the run's end. `ingest:read`, the one
+    // permission its service identity holds; a user can hold it too (Data
+    // Engineer), so each handler adds `schema_changes::require_orchestrator`
+    // (a service identity or an unrestricted administrator only), as the two
+    // `schema-observations` routes above do.
+    ("POST", "/api/connectors/{id}/run-reports", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/attempts", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/log", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/end", Policy::RequiresPermission("ingest:read")),
     // A person reads what changed at the source and approves what waits
     // (`SRC-8` decision D6). The tenant gate is the route layer.
     ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),

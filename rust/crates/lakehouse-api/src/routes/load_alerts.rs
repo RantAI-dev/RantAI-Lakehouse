@@ -22,6 +22,12 @@
 //!    the run produced, so a sensor retry can neither count a failure twice
 //!    (the streak that drives the "3 in a row" rule) nor lose a count to a
 //!    failure between the two writes.
+//!    (`SRC-11`) The same transaction pauses the connector when this failure
+//!    is the one that reaches `CONNECTOR_AUTO_DISABLE_AFTER` in a row, and
+//!    the report then also delivers `connector_disabled`; a run the
+//!    orchestrator ended as "paused" is not counted at all, and the run
+//!    record (`lakehouse_store::connector_run`) is closed from the confirmed
+//!    status when no end report arrived.
 //! 4. Hand the alerts over once. The rules are read AFTER the run is counted
 //!    and BEFORE a second row `(run_id, "<kind>_alerted")` is written; the
 //!    delivery follows that row. So a rule-store failure answers 503 with the
@@ -63,6 +69,7 @@ use lakehouse_alerts::{AlertKind, AlertRule, RuleDelivery, SilenceSource};
 use lakehouse_core::ApiError;
 use lakehouse_notify::{DeliverResult, EmailSender};
 use lakehouse_store::PgPool;
+use lakehouse_store::connector_run;
 use lakehouse_store::connectors::{self, REPEATED_FAILURE_STREAK};
 use lakehouse_store::overview::{self, DeliveryRecord, FiredRule};
 use lakehouse_store::pipelines;
@@ -370,7 +377,30 @@ pub(super) async fn connector_run_event(
         Found::This(connector) => connector,
         Found::Skip(reason) => return Ok(skipped(reason)),
     };
+    // `SRC-11` D13: a run that ended as "paused" loaded nothing (the connector
+    // was paused when it started). It is neither a success nor a failure of a
+    // load, and counting it would reset the failure streak of a connector that
+    // was just paused because of it.
+    if connector_run::run_status(pool, &connector.id, &req.run_id)
+        .await?
+        .as_deref()
+        == Some(connector_run::RunStatus::Paused.as_str())
+    {
+        return Ok(skipped("a paused run loads nothing"));
+    }
     let info = confirm_status(state, &req.run_id, outcome).await?;
+    // `SRC-11` D7: close the run record from the orchestrator's own final
+    // status when its end report never came (a killed run, an orchestrator
+    // that could not reach this API). Idempotent, and a no-op for a run with
+    // no record or one that already ended.
+    connector_run::settle_run(
+        pool,
+        &connector.id,
+        &req.run_id,
+        outcome == Outcome::Success,
+        run_end(info.end_time),
+    )
+    .await?;
     // Count the run once, with its streak kept for a retry (`SRC-17` F2).
     let recorded = connectors::record_run_once(
         pool,
@@ -428,6 +458,28 @@ pub(super) async fn connector_run_event(
                     &rules,
                     (AlertKind::ConnectorRepeatedFailure, &connector.id),
                     "Connector failing repeatedly",
+                    &text,
+                    Some(CONNECTOR_SOURCE),
+                )
+                .await;
+            }
+            // `SRC-11` D3: the run whose failure paused the connector raises
+            // `connector_disabled`, once. `auto_disabled` is the run's own
+            // fact (kept for its retries, like the streak above), so a
+            // rule-store failure on this report still delivers on the retry,
+            // and no other run delivers it.
+            if recorded.auto_disabled {
+                let text = format!(
+                    "{who} was paused after {} failed runs in a row; the latest is run {}. \
+                     Resume it from its page once the cause is fixed. View: {link}",
+                    state.config.connector_auto_disable_after, req.run_id
+                );
+                matched += deliver_with_rules(
+                    state,
+                    pool,
+                    &rules,
+                    (AlertKind::ConnectorDisabled, &connector.id),
+                    "Connector paused",
                     &text,
                     Some(CONNECTOR_SOURCE),
                 )
@@ -593,6 +645,16 @@ mod tests {
     /// `rules` are `(id, kind, connector)` rows the rule store answers with;
     /// each rule's webhook is `/<id>` on the webhook mock.
     async fn harness(pool: &sqlx::PgPool, rules: &[(&str, &str, &str)]) -> Harness {
+        harness_with(pool, rules, &[]).await
+    }
+
+    /// [`harness`] with extra environment settings (`SRC-11`: a low
+    /// `CONNECTOR_AUTO_DISABLE_AFTER`).
+    async fn harness_with(
+        pool: &sqlx::PgPool,
+        rules: &[(&str, &str, &str)],
+        extra_env: &[(&str, &str)],
+    ) -> Harness {
         let dagster = MockServer::start().await;
         let ch = MockServer::start().await;
         let webhook = MockServer::start().await;
@@ -611,6 +673,9 @@ mod tests {
             format!("{}/graphql", dagster.uri()),
         );
         env.insert("CH_URL".to_owned(), ch.uri());
+        for (key, value) in extra_env {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
         let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
         let data: Vec<Value> = rules
             .iter()
@@ -1419,5 +1484,163 @@ mod tests {
         assert_eq!(resp["matched"], 0);
         assert!(resp["reason"].is_string());
         assert!(h.webhook.received_requests().await.unwrap().is_empty());
+    }
+
+    async fn paused_reason(pool: &sqlx::PgPool) -> Option<String> {
+        sqlx::query_scalar("SELECT paused_reason FROM connector WHERE id = $1")
+            .bind(CONNECTOR)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `SRC-11` D3: the failed run that reaches the threshold pauses the
+    /// connector and delivers `connector_disabled` once; its retry and the
+    /// next failure deliver nothing more. The text names the connector, the
+    /// run and the number, and links to the console.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_run_that_reaches_the_threshold_pauses_the_connector_and_raises_connector_disabled_once(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness_with(
+            &pool,
+            &[
+                ("al-d", "connector_disabled", CONNECTOR),
+                ("al-f", "connector_failure", CONNECTOR),
+            ],
+            &[("CONNECTOR_AUTO_DISABLE_AFTER", "3")],
+        )
+        .await;
+        for run in ["run-1", "run-2", "run-3", "run-4"] {
+            h.knows_run(run, Some(CONNECTOR), "FAILURE").await;
+        }
+        h.failed("run-1").await;
+        h.failed("run-2").await;
+        assert_eq!(paused_reason(&pool).await, None);
+        assert!(h.posts_to("al-d").await.is_empty());
+
+        let third = h.failed("run-3").await;
+        assert_eq!(
+            third["matched"], 2,
+            "the failure rule and connector_disabled"
+        );
+        assert_eq!(
+            paused_reason(&pool).await.as_deref(),
+            Some("Paused after 3 failed runs in a row")
+        );
+        let posts = h.posts_to("al-d").await;
+        assert_eq!(posts.len(), 1);
+        for needle in [
+            "run-3",
+            CONNECTOR,
+            "3 failed runs",
+            "/connectors/conn-pg-lakehouse",
+        ] {
+            assert!(
+                posts[0].contains(needle),
+                "{needle} missing from {}",
+                posts[0]
+            );
+        }
+
+        assert_eq!(h.failed("run-3").await["matched"], 0, "a sensor retry");
+        h.failed("run-4").await;
+        assert_eq!(h.posts_to("al-d").await.len(), 1);
+        assert_eq!(h.posts_to("al-f").await.len(), 4);
+    }
+
+    /// `SRC-11` D3 x `SRC-17` F2: when the pausing run's first report meets a
+    /// rule-store failure, the connector is already paused and counted, and
+    /// the retry delivers `connector_disabled` once.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rule_store_failure_on_the_pausing_report_still_delivers_connector_disabled_on_the_retry(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness_with(
+            &pool,
+            &[("al-d", "connector_disabled", CONNECTOR)],
+            &[("CONNECTOR_AUTO_DISABLE_AFTER", "2")],
+        )
+        .await;
+        for run in ["run-1", "run-2"] {
+            h.knows_run(run, Some(CONNECTOR), "FAILURE").await;
+        }
+        h.failed("run-1").await;
+        rule_store_fails_once(&h).await;
+        assert_eq!(
+            failed_status(&h, "run-2").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(paused_reason(&pool).await.is_some());
+        assert!(h.posts_to("al-d").await.is_empty());
+
+        assert_eq!(h.failed("run-2").await["matched"], 1);
+        assert_eq!(h.failed("run-2").await["matched"], 0);
+        assert_eq!(h.posts_to("al-d").await.len(), 1);
+    }
+
+    /// `SRC-11` D13: a run the orchestrator ended as "paused" is not counted
+    /// as a success (it would reset the streak of the connector it just
+    /// found paused) and delivers nothing. A run still `running` in the
+    /// record is closed from the confirmed status.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_paused_run_is_not_counted_and_an_unclosed_run_is_settled(pool: sqlx::PgPool) {
+        use lakehouse_store::connector_run::{
+            EndReason, RunStatus, RunTrigger, end_run, run_status, start_run,
+        };
+        let h = harness(&pool, &[("al-s", "connector_success", CONNECTOR)]).await;
+        for run in ["run-1", "run-2"] {
+            h.knows_run(run, Some(CONNECTOR), "FAILURE").await;
+            h.failed(run).await;
+        }
+        assert_eq!(streak(&pool).await.1, 2);
+
+        let now = OffsetDateTime::now_utc();
+        start_run(&pool, CONNECTOR, "run-p", RunTrigger::Other, now)
+            .await
+            .unwrap();
+        end_run(
+            &pool,
+            CONNECTOR,
+            "run-p",
+            RunStatus::Paused,
+            EndReason::ConnectorPaused,
+            now,
+        )
+        .await
+        .unwrap();
+        h.knows_run("run-p", Some(CONNECTOR), "SUCCESS").await;
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-p", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 0);
+        assert_eq!(streak(&pool).await.1, 2, "the streak was not reset");
+        assert!(h.posts_to("al-s").await.is_empty());
+        assert_eq!(
+            run_status(&pool, CONNECTOR, "run-p")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("paused")
+        );
+
+        // A run the orchestrator never closed.
+        start_run(&pool, CONNECTOR, "run-u", RunTrigger::Schedule, now)
+            .await
+            .unwrap();
+        h.knows_run("run-u", Some(CONNECTOR), "FAILURE").await;
+        h.failed("run-u").await;
+        assert_eq!(
+            run_status(&pool, CONNECTOR, "run-u")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
     }
 }

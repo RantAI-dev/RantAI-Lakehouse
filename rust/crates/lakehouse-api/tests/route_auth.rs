@@ -649,6 +649,139 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
     assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
+/// with a 422 for a source type that cannot list its columns (Oracle) and for a
+/// key column of a deduplicating table, and a malformed list is a 400. All
+/// three are refused before the address check or any write, so no connection
+/// is made and nothing is stored.
+#[tokio::test]
+async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) \
+         VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("join the connector's tenant");
+
+    let body = |driver: &str, objects: serde_json::Value| {
+        serde_json::json!({
+            "adapter": "sql",
+            "ingestMode": "batch",
+            "dial": {
+                "driver": driver, "host": "db.example", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            },
+            "sourceObjects": objects,
+        })
+    };
+    let cases = [
+        (
+            "oracle",
+            serde_json::json!([{
+                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+            }]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "postgres",
+            serde_json::json!([{
+                "name": "public.orders", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["id"], "excludedColumns": ["id"]
+            }]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "postgres",
+            serde_json::json!([{
+                "name": "public.orders", "target": "orders", "excludedColumns": "note"
+            }]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (driver, objects, expected) in cases {
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/connectors/conn-pg-lakehouse/ingest-spec")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body(driver, objects.clone())).expect("serialize body"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(response.status(), expected, "{driver} {objects}");
+    }
+}
+
+/// `SRC-11`: the run history, a run's log and Resume are a person's routes
+/// (`connector:manage`); the four run reports are the orchestrator's
+/// (`ingest:read`, then the handler's service-identity check). Each direction
+/// is asserted: a `connector:manage`-only principal passes the gate of the
+/// person's routes and is refused by the gate on the reports; an
+/// `ingest:read`-only principal is refused by the gate on the person's routes
+/// and, on the reports, passes the gate and is refused by the handler (it is a
+/// user, not the service identity). The table-driven loops above cover the
+/// zero-permission and Platform-Admin directions for all seven entries.
+#[tokio::test]
+async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let person_routes = [
+        ("GET", format!("{base}/runs")),
+        ("GET", format!("{base}/runs/run-1/log")),
+        ("POST", format!("{base}/resume")),
+    ];
+    let report_routes = [
+        ("POST", format!("{base}/run-reports")),
+        ("POST", format!("{base}/run-reports/run-1/attempts")),
+        ("POST", format!("{base}/run-reports/run-1/log")),
+        ("POST", format!("{base}/run-reports/run-1/end")),
+    ];
+    for (method, path) in &person_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    for (method, path) in &report_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .into_owned();
+        assert!(
+            text.contains("ingest:read"),
+            "the gate names the permission: {text}"
+        );
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .into_owned();
+        assert!(
+            text.contains("service identity"),
+            "passed the gate, refused by the handler: {text}"
+        );
+    }
+}
+
 /// The six upload routes (ADR 0014, decision 6) are gated by the existing
 /// `connector:manage`, with no new permission: a seeded Data Engineer
 /// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst

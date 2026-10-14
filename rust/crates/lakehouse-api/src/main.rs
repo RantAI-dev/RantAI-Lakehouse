@@ -138,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
     // hour). Without a Postgres pool it logs once and spawns nothing —
     // cleanup depends on the database being reachable.
     spawn_auth_cleanup(&state);
+    // SRC-11 D5/D6: the daily removal of run log lines and attempts older
+    // than 30 days.
+    spawn_run_log_cleanup(&state);
 
     let app = routes::router(state);
 
@@ -745,6 +748,42 @@ fn spawn_auth_cleanup(state: &AppState) {
         loop {
             interval.tick().await;
             run().await;
+        }
+    });
+}
+
+/// Spawn the daily job that removes connector run log lines and attempts older
+/// than [`lakehouse_store::connector_run::LOG_RETENTION_DAYS`] days (`SRC-11`
+/// decisions D5 and D6). It runs once at start (the first tick is immediate)
+/// and then every 24 hours, missed ticks skipped. Only the lines and the
+/// attempts go: the run rows and every per-table result stay. An error is
+/// logged at `warn` and never takes the process down; the next pass removes
+/// what this one missed. Without a Postgres pool, logs once and spawns
+/// nothing.
+fn spawn_run_log_cleanup(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; run-log cleanup background task will not run");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86_400));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cutoff = time::OffsetDateTime::now_utc()
+                - time::Duration::days(lakehouse_store::connector_run::LOG_RETENTION_DAYS);
+            match lakehouse_store::connector_run::purge_older_than(&pool, cutoff).await {
+                Ok(purged) => {
+                    tracing::info!(
+                        log_lines = purged.lines,
+                        attempts = purged.attempts,
+                        "connector run-log cleanup complete",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "connector run-log cleanup failed");
+                }
+            }
         }
     });
 }

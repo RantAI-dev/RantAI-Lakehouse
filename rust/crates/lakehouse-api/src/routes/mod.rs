@@ -16,6 +16,7 @@ mod catalog_profile;
 mod catalog_query;
 mod catalog_search;
 mod catalog_source;
+mod connector_runs;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
@@ -503,6 +504,18 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/ingest/runs",
             get(connectors::ingest_run_history),
         )
+        // `SRC-11` decisions D4, D5, D7, D8: the run history, a run's log and
+        // Resume, for a person with `connector:manage` on a connector of their
+        // own tenant.
+        .route("/api/connectors/{id}/runs", get(connector_runs::list))
+        .route(
+            "/api/connectors/{id}/runs/{runId}/log",
+            get(connector_runs::log),
+        )
+        .route(
+            "/api/connectors/{id}/resume",
+            axum::routing::post(connector_runs::resume),
+        )
         // `SRC-8` decision D6: a person with `connector:manage` on a
         // connector of their own tenant reads and approves schema changes.
         .route(
@@ -558,6 +571,25 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/schema-observations/tables",
             axum::routing::post(schema_changes::new_tables),
+        )
+        // `SRC-11`: the orchestrator's run reports. Outside the tenant gate for
+        // the same reason (its caller is a service identity); each handler
+        // checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/run-reports",
+            axum::routing::post(connector_runs::report_start),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/attempts",
+            axum::routing::post(connector_runs::report_attempt),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/log",
+            axum::routing::post(connector_runs::report_log),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/end",
+            axum::routing::post(connector_runs::report_end),
         )
         .merge(per_connector)
 }
