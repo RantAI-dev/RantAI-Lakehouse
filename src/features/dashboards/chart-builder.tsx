@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
@@ -221,14 +222,6 @@ function useMinWidth(px: number): boolean {
   );
 }
 
-/** Moves on to the next section once the open one has what it needs (phase 2 QA R10). */
-function NextButton({ onClick }: { onClick: () => void }) {
-  return (
-    <Button type="button" size="sm" variant="ghost" className="justify-self-end" onClick={onClick}>
-      Next <ChevronRight className="size-3.5" aria-hidden />
-    </Button>
-  );
-}
 /** Marks a field the chart cannot be drawn without. */
 function Req() {
   return <span aria-hidden className="text-destructive">*</span>;
@@ -562,10 +555,16 @@ export function ChartBuilder({
   const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
   const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : "Dimension (X)";
   const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
+  // joined column's own name), never the stored reference (`metric:name`, `table__column`).
+  const titleText = (name: string) => (name ? columnRef(name, {
+    metricLabels: Object.fromEntries((fields?.metrics ?? []).map((m) => [m.name, m.label])),
+    calculated: calcNames, groups: groupNames, isParam: (n) => !!slotParam(n),
+  }).text : name);
   const suggestedTitle = suggestChartTitle({
-    kind, dimension: isSingle ? undefined : dimension,
-    measures: measureRows.slice(0, Math.max(limits.min, 1)).map((r) => r.column),
-    breakdown: canBreakdown ? breakdown : undefined,
+    kind, dimension: isSingle ? undefined : titleText(dimension),
+    measures: measureRows.slice(0, Math.max(limits.min, 1)).map((r) => titleText(r.column)),
+    breakdown: canBreakdown ? titleText(breakdown) : undefined,
   });
   const canWriteSql = useAuth().hasPermission("dashboard:sql");
   const isNewSql = source === NEW_SQL_CHOICE;
@@ -870,7 +869,6 @@ export function ChartBuilder({
     limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
   });
-  const missingIn = (n: SectionNumber) => missing.some((m) => missingSection(m) === n);
   /** Opens the section that holds a missing field and moves focus to that field. */
   function revealSection(n: SectionNumber) {
     if (n === 4) setMoreOpen(true); else setActive(n);
@@ -1232,7 +1230,6 @@ export function ChartBuilder({
                 />
               ) : null}
             </div>
-            {active === 1 && !missingIn(1) ? <NextButton onClick={() => setActive(2)} /> : null}
           </AccordionSection>
 
           <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
@@ -1386,7 +1383,6 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
-          {active === 2 && !missingIn(2) ? <NextButton onClick={() => setActive(3)} /> : null}
           </AccordionSection>
 
           <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
@@ -1609,33 +1605,43 @@ export function ChartBuilder({
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-1.5 text-base">
                   <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
-                  <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
-                  {listOpen ? <span>{KIND_LABELS[kind]}</span> : null}
+                  {/* Phase 2 QA R20: the chevron only when the kind follows it (folded, the kind is on the menu button). */}
+                  {listOpen ? (
+                    <>
+                      <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
+                      <span>{KIND_LABELS[kind]}</span>
+                    </>
+                  ) : null}
                 </DialogTitle>
                 <DialogDescription className="sr-only">{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
               </DialogHeader>
               {listOpen ? null : (
                 // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
                 <div className="mt-2 flex items-center gap-1.5">
-                  <div className="relative">
-                    <Button
-                      type="button" size="sm" variant="outline" aria-expanded={kindMenu} aria-label={`Change chart type, now ${KIND_LABELS[kind]}`}
-                      onClick={() => setKindMenu((o) => !o)}
+                  {/*
+                    Phase 2 QA R17: a popover of the base-ui family the dialog is made of, so it nests in the
+                    dialog's layer stack: an outside press and Escape close only the popover, and focus
+                    returns to the trigger. (The hand-made inline panel closed on neither.)
+                  */}
+                  <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
+                    <PopoverPrimitive.Trigger
+                      render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
                     >
                       {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
                       {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
-                    </Button>
-                    {kindMenu ? (
-                      <div
-                        role="group" aria-label="Chart type"
-                        className="absolute top-full left-0 z-30 mt-1 flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md"
-                        onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); setKindMenu(false); } }}
-                      >
-                        <div className="relative">{kindSearch}</div>
-                        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
-                      </div>
-                    ) : null}
-                  </div>
+                    </PopoverPrimitive.Trigger>
+                    <PopoverPrimitive.Portal>
+                      <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
+                        <PopoverPrimitive.Popup
+                          role="group" aria-label="Chart type"
+                          className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
+                        >
+                          <div className="relative">{kindSearch}</div>
+                          <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
+                        </PopoverPrimitive.Popup>
+                      </PopoverPrimitive.Positioner>
+                    </PopoverPrimitive.Portal>
+                  </PopoverPrimitive.Root>
                   <Button type="button" size="icon-sm" variant="ghost" aria-label="Show the chart type list" title="Show the chart type list" onClick={toggleList}>
                     <PanelLeftOpen aria-hidden />
                   </Button>

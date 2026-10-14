@@ -28,7 +28,10 @@ beforeEach(() => {
     }
     if (url.includes("/api/dashboard/fields")) return json({ marts: [{ name: "mart_visits", rows: 10 }] })
     if (url.includes("/api/dashboard/sources")) return json({ sources: [] })
-    // Metrics, segments and parameters: the builder carries on without them.
+    if (url.includes("/api/dashboard/metrics") && !url.includes("usage")) {
+      return json({ metrics: [{ id: "m1", name: "coba_metrik", label: "Coba metrik", description: "", sourceKind: "mart", sourceId: "mart_visits", formula: "sum(visitors)" }] })
+    }
+    // Segments and parameters: the builder carries on without them.
     return json({ error: "not in this test" }, 500)
   }) as unknown as typeof fetch
 })
@@ -180,8 +183,29 @@ describe("ChartBuilder type list (phase 2 QA R9)", () => {
     expect(screen.queryByRole("button", { name: "Line" })).toBeNull()
     fireEvent.keyDown(search, { key: "Enter" })
     // The first match was picked and the menu closed.
-    expect(screen.queryByLabelText("Search chart types")).toBeNull()
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
     expect(screen.getByRole("button", { name: /Change chart type, now Sankey/ })).toBeTruthy()
+  })
+
+  it("closes the folded type menu on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+    renderBuilder(barDef)
+    const trigger = () => screen.getByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(trigger())
+    const search = await screen.findByLabelText("Search chart types")
+    fireEvent.keyDown(search, { key: "Escape" })
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
+    // A boolean, not the element: a failing match would print the whole dialog on every retry.
+    await waitFor(() => expect(document.activeElement === trigger()).toBe(true))
+    // The dialog itself stays open after the Escape.
+    expect(screen.getByText("Edit chart")).toBeTruthy()
+    fireEvent.click(trigger())
+    await screen.findByLabelText("Search chart types")
+    const heading = screen.getByText("Edit chart")
+    fireEvent.pointerDown(heading)
+    fireEvent.mouseDown(heading)
+    fireEvent.click(heading)
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
+    expect(screen.getByText("Edit chart")).toBeTruthy()
   })
 
   it("works when the browser refuses storage", async () => {
@@ -206,19 +230,20 @@ describe("ChartBuilder accordion (phase 2 QA R10)", () => {
     expect(expanded(/^Data(?! table)/)).toBe("true")
     expect(expanded(/What to show/)).toBe("false")
     expect(expanded(/Sort and filter/)).toBe("false")
-    expect(screen.queryByRole("button", { name: /^Next/ })).toBeNull()
     // Opening another section folds the open one.
     fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
     expect(expanded(/What to show/)).toBe("true")
     expect(expanded(/^Data(?! table)/)).toBe("false")
   })
 
-  it("offers Next once the source is picked, and Next opens the following section", async () => {
+  it("has no Next button, even once the source is picked (phase 2 QA R19)", async () => {
     renderBuilder()
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
-    const next = await screen.findByRole("button", { name: /^Next/ })
-    fireEvent.click(next)
+    await screen.findByText("Data source")
+    expect(screen.queryByRole("button", { name: /^Next/ })).toBeNull()
+    // Opening a section by its heading still folds the open one.
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
     expect(expanded(/What to show/)).toBe("true")
     expect(expanded(/^Data(?! table)/)).toBe("false")
   })
@@ -320,5 +345,51 @@ describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
     await screen.findByText(/Dimension \(X\)/)
     expect(document.querySelector("[data-slot=conditional-row]")).toBeNull()
+  })
+})
+
+describe("ChartBuilder labels (phase 2 QA R20)", () => {
+  it("suggests a title from the metric's label, not its stored reference", async () => {
+    renderBuilder({ title: "", kind: "bar", mart: "mart_visits", dimension: "category", measures: [{ metric: "coba_metrik" }] as never })
+    const field = await screen.findByLabelText("Title")
+    await waitFor(() => expect(field.getAttribute("placeholder")).toBe("Coba metrik by category"))
+  })
+
+  it("shows the kind after the chevron of the breadcrumb, and no chevron when the list is folded", async () => {
+    const { unmount } = renderBuilder()
+    const title = screen.getByText("New chart").parentElement as HTMLElement
+    expect(title.textContent).toContain("Horizontal bar")
+    expect(title.querySelector("svg")).not.toBeNull()
+    unmount()
+    cleanup()
+    renderBuilder(barDef)
+    const folded = screen.getByText("Edit chart").parentElement as HTMLElement
+    expect(folded.querySelector("svg")).toBeNull()
+  })
+})
+
+describe("ChartBuilder resizable split (phase 2 QA R18)", () => {
+  it("draws a focusable separator between the form panel and the preview panel at a wide screen", async () => {
+    const original = window.matchMedia
+    window.matchMedia = ((query: string) => ({
+      matches: true, media: query, onchange: null,
+      addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia
+    try {
+      renderBuilder(barDef)
+      await screen.findByLabelText("Aggregation of visitors")
+      const handle = document.querySelector('[data-slot="resizable-handle"]') as HTMLElement
+      expect(handle).not.toBeNull()
+      expect(handle.getAttribute("role")).toBe("separator")
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical")
+      expect(handle.getAttribute("tabindex")).toBe("0")
+      const panels = Array.from(document.querySelectorAll('[data-slot="resizable-panel"]'))
+      expect(panels.length).toBe(2)
+      // The form panel holds the form (its own scroller) and the preview panel the preview.
+      expect(panels[0].querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
+      expect(panels[1].querySelector('section[aria-label="Preview"]')).not.toBeNull()
+    } finally {
+      window.matchMedia = original
+    }
   })
 })
