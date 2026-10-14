@@ -1318,6 +1318,13 @@ jobs:
           # stack, never a deployment value.
           UPLOAD_S3_ACCESS_KEY=rustfsadmin
           UPLOAD_S3_SECRET_KEY=rustfsadmin
+          # DATA-19 step 10: the gate authors a pipeline over an uploaded
+          # table, so the code location must build an authored job and its
+          # chain sensor. Unset, `authored_factory` loads zero of both
+          # (docker-compose.yml's `PIPELINE_RUN_TOKEN` note) and the gate
+          # would fail with "the orchestrator never built the job". Same
+          # single-.env-value reasoning as g6-ingest's copy of this token.
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
