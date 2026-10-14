@@ -443,6 +443,87 @@ async fn ingest_spec_put_refuses_a_load_mode_the_job_cannot_run() {
     assert_eq!(stored, json!([]), "nothing was saved");
 }
 
+/// `SRC-21`: the assistant's `set_ingest_spec` tool carries `loadMode` and
+/// `primaryKey` through to the saved spec. Before, the schema did not list
+/// them, so a model re-sending a connector's tables dropped every mode back to
+/// replace. The tool forwards `sourceObjects` as given; this proves nothing on
+/// the way strips the two keys.
+#[tokio::test]
+async fn the_assistants_set_ingest_spec_saves_load_mode_and_primary_key() {
+    // The saved dial names a loopback address, which the save-time SSRF check
+    // refuses unless the block is off; what is proved here is the objects.
+    let app = spin_up_with_env(&HashMap::from([(
+        "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+        "true".to_owned(),
+    )]))
+    .await;
+    seed_sql_connector(&app.pool, "conn-ingest-tool-mode").await;
+    // Saved dial must equal the stored one, or the save is a re-point (SEC-14)
+    // and ends in a 409; the seeded host `pg-src` does not resolve here.
+    sqlx::query(
+        "UPDATE connector SET dial = \
+         '{\"driver\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb \
+         WHERE id = 'conn-ingest-tool-mode'",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("point the seeded dial at loopback");
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/tool")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tool": "set_ingest_spec",
+                        "mode": "build",
+                        "args": {
+                            "id": "conn-ingest-tool-mode",
+                            "adapter": "sql",
+                            "ingestMode": "batch",
+                            "dial": {
+                                "driver": "postgres", "host": "127.0.0.1", "port": 5432,
+                                "database": "d", "user": "u",
+                            },
+                            "sourceObjects": [{
+                                "name": "public.orders",
+                                "target": "orders",
+                                "incrementalKey": "updated_at",
+                                "loadMode": "incremental_dedup",
+                                "primaryKey": ["id"],
+                            }],
+                            "confirmed": true,
+                        },
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert!(body["result"].get("error").is_none(), "{body}");
+
+    let stored: Value = sqlx::query_scalar(
+        "SELECT source_objects FROM connector WHERE id = 'conn-ingest-tool-mode'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("read source objects");
+    assert_eq!(stored[0]["loadMode"], "incremental_dedup", "{stored}");
+    assert_eq!(stored[0]["primaryKey"], json!(["id"]), "{stored}");
+}
+
 // --- SRC-10 decision 5: a run of ONE table with an action --------------------
 
 /// Give `id` two selected tables (`public.orders`, `public.items`).
