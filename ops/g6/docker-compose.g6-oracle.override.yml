@@ -96,9 +96,19 @@ services:
   # shared registry and summary module (SRC-9 task 1).
   g6-oracle-test-runner:
     profiles: ["g6-oracle"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location` in docker-compose.yml. Without this key the
+    # service would get a name of its own and `docker compose run` would
+    # build the whole Dagster image again in CI, where the `images` job
+    # already built it once. The same `GIT_SHA` arg keeps the `build:`
+    # block identical to the others, so a local `--build` cannot retag the
+    # shared image with `GIT_SHA=unknown`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     working_dir: /work
     volumes:
       - ./ops/g6:/work:ro
