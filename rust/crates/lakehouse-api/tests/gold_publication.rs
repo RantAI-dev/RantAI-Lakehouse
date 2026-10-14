@@ -333,6 +333,10 @@ async fn enabling_lists_a_mart_and_disabling_removes_it_from_the_list() {
         body["lastExportedAt"].is_null(),
         "never exported -> null, never a guessed time: {body}"
     );
+    assert!(
+        body["changedSinceExport"].is_null(),
+        "never exported -> changedSinceExport null: {body}"
+    );
 }
 
 /// A mart that exists but was never switched on reports the OFF default:
@@ -359,11 +363,68 @@ async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     assert_eq!(body["enabled"], Value::Bool(false), "{body}");
     assert!(body["updatedAt"].is_null(), "{body}");
     assert!(body["lastExportedAt"].is_null(), "{body}");
+    assert!(body["changedSinceExport"].is_null(), "{body}");
     assert!(body["lastChangedAt"].is_string(), "{body}");
     assert_eq!(body["canEdit"], Value::Bool(false), "{body}");
 }
 
 // ── T4: POST /api/gold/export/{mart}?ifChanged=true ─────────────────────
+
+#[tokio::test]
+async fn publication_detail_reports_changed_since_export_accurately() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "fp_status_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    // 1. Never exported -> changedSinceExport is null.
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["changedSinceExport"].is_null(), "{body}");
+
+    // 2. Exported with current fingerprint -> changedSinceExport is false (Up to date).
+    let fp =
+// DATA-10 review SHOULD-FIX 1: mart_content_fingerprint in gold_export_history
+        lakehouse_api::gold_export_history::mart_content_fingerprint(&ch, "serving", "fp_status_mart")
+            .await
+            .expect("fingerprint read")
+            .expect("fingerprint present");
+    seed_success_run_with_fingerprint(&ch, "fp_status_mart", unix_ms(-10), &fp).await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changedSinceExport"], Value::Bool(false), "{body}");
+
+    // 3. Mutate table -> changedSinceExport is true (Out of date).
+    ch.exec("INSERT INTO serving.fp_status_mart (n) VALUES (999)", None)
+        .await
+        .expect("insert new row");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fp_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changedSinceExport"], Value::Bool(true), "{body}");
+}
 
 use lakehouse_api::gold_export_history;
 
@@ -380,7 +441,12 @@ fn unix_ms(offset_secs: i64) -> i64 {
     now_secs * 1000 + offset_secs * 1000
 }
 
-async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
+async fn seed_success_run_with_fingerprint(
+    ch: &ChClient,
+    mart: &str,
+    started_ms: i64,
+    content_fingerprint: &str,
+) {
     gold_export_history::record_export_run(
         ch,
         &gold_export_history::NewGoldExportRun {
@@ -391,12 +457,18 @@ async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
             snapshot_id: None,
             error: None,
             triggered_by: "user:test",
+            content_fingerprint,
             started_at_ms: started_ms,
             finished_at_ms: started_ms,
         },
     )
     .await
     .expect("seed a successful export history row");
+}
+
+#[allow(dead_code)]
+async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
+    seed_success_run_with_fingerprint(ch, mart, started_ms, "").await;
 }
 
 async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
@@ -417,7 +489,7 @@ async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
         .expect("a row count")
 }
 
-/// The skip case: the mart's last write is OLDER than its last
+/// The skip case: the mart's content fingerprint MATCHES its last
 /// successful export, so `?ifChanged=true` must answer 200 with
 /// `skipped: true` and write NOTHING — the history row count is still
 /// exactly the one seeded row, and no export was attempted (the dead
@@ -427,10 +499,13 @@ async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
 async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "quiet_mart").await;
-    // The copy was refreshed "after" the mart's last write: a future
-    // started_at makes lastExportedAt strictly newer than
-    // lastChangedAt regardless of test timing.
-    seed_success_run(&ch, "quiet_mart", unix_ms(3_600)).await;
+    // DATA-10 review SHOULD-FIX 1: mart_content_fingerprint in gold_export_history
+    let fp =
+        lakehouse_api::gold_export_history::mart_content_fingerprint(&ch, "serving", "quiet_mart")
+            .await
+            .expect("read fingerprint")
+            .expect("quiet_mart has a fingerprint");
+    seed_success_run_with_fingerprint(&ch, "quiet_mart", unix_ms(-3_600), &fp).await;
     let sessions = Sessions { app };
     let cookie = sessions.with("gold:export").await;
 
@@ -457,19 +532,16 @@ async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
     );
 }
 
-/// A mart rewritten after its last export must NOT skip: the handler
-/// proceeds into the export path, which with no Lakekeeper provisioned
+/// A mart whose content fingerprint differs from its last export must NOT skip:
+/// the handler proceeds into the export path, which with no Lakekeeper provisioned
 /// stops deterministically at `read_catalog_token` (503 Unavailable,
-/// fixed text) — proof it got past the skip gate and attempted the
-/// export. The failed attempt records one history row ("failed"), as
-/// every POST does.
+/// fixed text) — proof it got past the skip gate and attempted the export.
 #[tokio::test]
-async fn if_changed_exports_a_mart_newer_than_its_last_export() {
+async fn if_changed_exports_a_mart_with_differing_fingerprint() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "busy_mart").await;
-    // The last copy predates the mart's last write (seed_mart's INSERT
-    // happened after this row's started_at).
-    seed_success_run(&ch, "busy_mart", unix_ms(-3_600)).await;
+    // The last export has a differing fingerprint.
+    seed_success_run_with_fingerprint(&ch, "busy_mart", unix_ms(-3_600), "0:0:differing").await;
     let sessions = Sessions { app };
     let cookie = sessions.with("gold:export").await;
 
@@ -486,9 +558,30 @@ async fn if_changed_exports_a_mart_newer_than_its_last_export() {
     assert_eq!(
         history_row_count(&ch, "busy_mart").await,
         1,
-        "still exactly the seeded row: the 503 at read_catalog_token \
-         happens before export_mart, so nothing new was recorded"
+        "still exactly the seeded row: the 503 at read_catalog_token          happens before export_mart, so nothing new was recorded"
     );
+}
+
+/// A pre-DATA-10 export row has `content_fingerprint`: "" -> empty stored fingerprint
+/// must NOT skip: fails toward publishing (503 at `read_catalog_token`).
+#[tokio::test]
+async fn if_changed_exports_when_stored_fingerprint_is_empty() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "legacy_mart").await;
+    seed_success_run_with_fingerprint(&ch, "legacy_mart", unix_ms(-3_600), "").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/legacy_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("skipped").is_none(), "{body}");
 }
 
 /// No successful export ever recorded -> lastExportedAt is unknown ->

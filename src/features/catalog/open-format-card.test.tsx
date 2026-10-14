@@ -21,6 +21,7 @@ const publicationBody: Record<string, unknown> = {
   updatedAt: "2026-10-02T04:00:00Z",
   lastChangedAt: "2026-10-02T03:30:00Z",
   lastExportedAt: "2026-10-02T04:00:00Z",
+  changedSinceExport: false,
   canEdit: true,
 }
 
@@ -42,14 +43,13 @@ const emptyRunsBody = { mart: "mart_a", runs: [] satisfies GoldExportRun[] }
 import type { GoldExportRun } from "@/services/contracts/gold"
 
 describe("OpenFormatCard", () => {
-  it("shows Up to date when lastChangedAt is strictly before lastExportedAt", async () => {
+  it("shows Up to date when changedSinceExport is false", async () => {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastChangedAt: "2026-10-02T03:30:00Z",
-          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
@@ -65,14 +65,13 @@ describe("OpenFormatCard", () => {
     await waitFor(() => expect(screen.getByText("Up to date")).toBeDefined())
   })
 
-  it("shows Out of date when lastChangedAt is equal to lastExportedAt", async () => {
+  it("shows Out of date when changedSinceExport is true", async () => {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastChangedAt: "2026-10-02T04:00:00Z",
-          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: true,
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
@@ -88,14 +87,13 @@ describe("OpenFormatCard", () => {
     await waitFor(() => expect(screen.getByText("Out of date")).toBeDefined())
   })
 
-  it("shows Not measured when lastChangedAt is null", async () => {
+  it("shows Not measured when changedSinceExport is null", async () => {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastChangedAt: null,
-          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: null,
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
