@@ -200,6 +200,50 @@ never true. That is `ConnectorFilter`'s rule verbatim, and it fails
 closed — a claim whose tenant is gone is nobody's, never everybody's.
 Asserted in the store test above.
 
+### T3 — D1 in the sensor (`c44edc3e`, `28942870`)
+
+`authored_factory._run_config_value` + `_latest_run_for_table` +
+`FILE_INGEST_OP_CONFIG` + `FILE_INGEST_SCAN_LIMIT`. Only the
+`file_ingest_job` entry of the freshness walk is filtered; every other
+upstream keeps `limit=1` and the unfiltered rule byte for byte. A
+stored row whose source is not `bronze` but names `file_ingest_job`
+(pre-dating the API's D2 refusal) matches nothing and ends the tick with
+a reason that names the source.
+
+| Check | Result |
+| --- | --- |
+| `python -m pytest dispar_orchestrate/test_authored_factory.py -q` | 63 passed, 0 failed |
+| `python3 ops/lint/check_intra_package_imports.py` | OK: all intra-package imports resolve |
+| `python3 ops/lint/check_bare_iceberg_count.py` | R11 guard: no bare count() against a Bronze Iceberg table |
+
+**Section 6, question 1 (answer).** Yes — `bronze_table_name` is
+readable on the run, so NO tag was added. Proven on a real run, not a
+stub: `execute_in_process` against a temp instance with
+`routes::uploads::run_config`'s launch shape verbatim, then
+`instance.get_runs(RunsFilter(job_name="file_ingest_job"), limit=1)` —
+the very call the sensor makes. The stored `run_config` is a `dict` and
+resolves to
+
+```json
+{"ops": {"ingest_uploaded_file": {"config": {
+  "bronze_table_name": "stock_raw", "delimiter": ",", "encoding": "utf-8",
+  "header_row": 0, "load_mode": "replace",
+  "storage_key": "uploads/t/up-1.csv", "upload_id": "up-1"}}}}
+```
+
+so the key is the OP name (`ingest_uploaded_file`), not the job name,
+and every launch key survives resolution. Pinned by
+`a_real_runs_config_resolves_to_the_table_the_load_wrote`.
+
+**Section 6, question 2 (answer).** Yes, the ALL rule is unchanged.
+The loop shape is identical: each upstream contributes either its
+newest SUCCESS run id or ends the tick with its own `SkipReason`, and
+one round asks for one run keyed on the sorted ids. Only WHICH run of
+the filtered upstream is eligible changes. Pinned both ways by
+`the_all_upstreams_rule_holds_with_a_filtered_and_an_authored_upstream`
+(fires with `authored-deps:ours,upstream-a-1`; with the authored
+upstream behind, the tick ends naming `pl-up-a` and asks for nothing).
+
 ## 8. Review
 
 (Reviewer.)
