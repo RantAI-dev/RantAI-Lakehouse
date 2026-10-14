@@ -28,7 +28,7 @@
 //! (`silver_catalog_row`), `"serving.<name>"` for Gold (`gold_catalog_row`)
 //! — never a re-derived table name.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1525,6 +1525,47 @@ async fn apply_annotations(state: &AppState, body: &mut Value) {
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
+    apply_annotation_rows(pool, body).await;
+    apply_governed_tag_rows(pool, body).await;
+}
+
+/// The governed-tag half of [`apply_annotations`] (`DATA-12` part 2): one
+/// batch read for every row of the list, never a query per table. It does
+/// not depend on the annotation overlay finding a row, and a failed read is
+/// logged and leaves the rows without tags: they decorate the list, they
+/// never gate it.
+async fn apply_governed_tag_rows(pool: &lakehouse_store::PgPool, body: &mut Value) {
+    let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let ids: Vec<String> = assets
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let rows = match lakehouse_store::governed_tag::list_for_assets(pool, &ids).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "governed tag lookup failed; the catalog list shows no governed tags");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let mut by_asset: HashMap<&str, Vec<&lakehouse_store::governed_tag::AssetTagRow>> =
+        HashMap::new();
+    for row in &rows {
+        by_asset.entry(row.asset_id.as_str()).or_default().push(row);
+    }
+    for asset in assets {
+        let id = asset.get("id").and_then(Value::as_str).unwrap_or_default();
+        if let Some(tags) = by_asset.get(id) {
+            apply_governed_tags(asset, tags);
+        }
+    }
+}
+
+async fn apply_annotation_rows(pool: &lakehouse_store::PgPool, body: &mut Value) {
     let annotations = match lakehouse_store::annotation::list_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -1607,18 +1648,44 @@ async fn mark_annotation_and_history(
     let mut keys = vec![id.to_owned()];
     keys.extend(tables.iter().cloned());
     let history = catalog_governance::change_history(state, &keys).await;
+    // DATA-12 part 2: the detail carries `governedTags` on the body (the
+    // overlay) and in `annotation` (what the edit form holds). A failed read
+    // is logged and shows none, as the annotation read above does.
+    let governed_rows = match state.pg.as_deref() {
+        Some(pool) => lakehouse_store::governed_tag::list_for_asset(pool, id)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "governed tag lookup failed; the detail shows no governed tags");
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    apply_governed_tags(body, &governed_rows.iter().collect::<Vec<_>>());
+    let governed = governed_tags_object(&governed_rows);
     if let Some(o) = body.as_object_mut() {
         o.insert("registry".to_owned(), registry);
         o.insert(
             "annotation".to_owned(),
-            annotation.map_or(Value::Null, |a| {
-                json!({
-                    "owner": a.owner,
-                    "steward": a.steward,
-                    "tags": a.tags,
-                    "description": a.description,
-                })
-            }),
+            annotation.map_or_else(
+                // A table with governed tags and no details row still has an
+                // annotation for the form to hold.
+                || {
+                    if governed_rows.is_empty() {
+                        Value::Null
+                    } else {
+                        json!({ "governedTags": governed })
+                    }
+                },
+                |a| {
+                    json!({
+                        "owner": a.owner,
+                        "steward": a.steward,
+                        "tags": a.tags,
+                        "description": a.description,
+                        "governedTags": governed,
+                    })
+                },
+            ),
         );
         o.insert("changeHistory".to_owned(), Value::Array(history));
     }
@@ -2554,6 +2621,14 @@ struct AnnotationBody {
     tags: Vec<String>,
     #[serde(default)]
     description: Option<String>,
+    /// `DATA-12` part 2: `{"data_domain": "finance"}`. `None` (absent) leaves
+    /// the table's governed tags alone; `Some` replaces the whole set, as
+    /// `tags` does, and `Some({})` clears it. The one place this differs from
+    /// `tags`: an absent `tags` is an empty list, because the form always
+    /// sends it, whereas a caller that never heard of governed tags must not
+    /// wipe them by saving a description.
+    #[serde(default, rename = "governedTags")]
+    governed_tags: Option<BTreeMap<String, String>>,
 }
 
 const ANNOTATION_ID_MAX_LEN: usize = 200;
@@ -2641,6 +2716,26 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
             )));
         }
     }
+    // The shape and the cap are checked here so the refusal names the field
+    // without a database round trip; whether a value is one its key allows is
+    // the store's, inside the write (it needs the key's row lock).
+    if let Some(governed) = &body.governed_tags {
+        let max = lakehouse_store::governed_tag::MAX_TAGS_PER_ASSET;
+        if governed.len() > max {
+            return Err(ApiError::BadRequest(format!(
+                "governedTags must have at most {max} entries"
+            )));
+        }
+        for (key, value) in governed {
+            for (what, word) in [("key", key), ("value", value)] {
+                if !lakehouse_store::governed_tag::is_valid_word(word) {
+                    return Err(ApiError::BadRequest(format!(
+                        "governedTags: {what} \"{word}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2659,6 +2754,8 @@ pub async fn get_annotation(
 ) -> ApiResult<ApiJson<Value>> {
     let pool = annotation_pool(&state)?;
     let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
+    let governed =
+        governed_tags_object(&lakehouse_store::governed_tag::list_for_asset(pool, &id).await?);
     Ok(ApiJson(row.map_or_else(
         || {
             json!({
@@ -2666,6 +2763,7 @@ pub async fn get_annotation(
                 "steward": Value::Null,
                 "tags": Value::Array(vec![]),
                 "description": Value::Null,
+                "governedTags": governed,
             })
         },
         |r| {
@@ -2674,6 +2772,7 @@ pub async fn get_annotation(
                 "steward": r.steward,
                 "tags": r.tags,
                 "description": r.description,
+                "governedTags": governed,
             })
         },
     )))
@@ -2721,18 +2820,40 @@ pub async fn put_annotation(
     validate_annotation_body(&parsed)?;
     let pool = annotation_pool(&state)?;
     let before = lakehouse_store::annotation::get_annotation(pool, &id).await?;
-    let changed = changed_annotation_fields(before.as_ref(), &parsed);
-    lakehouse_store::annotation::upsert_annotation(
-        pool,
-        &lakehouse_store::annotation::AnnotationInput {
-            asset_id: id.clone(),
-            owner: parsed.owner,
-            steward: parsed.steward,
-            tags: parsed.tags,
-            description: parsed.description,
-        },
-    )
-    .await?;
+    let mut changed = changed_annotation_fields(before.as_ref(), &parsed);
+    let input = lakehouse_store::annotation::AnnotationInput {
+        asset_id: id.clone(),
+        owner: parsed.owner,
+        steward: parsed.steward,
+        tags: parsed.tags,
+        description: parsed.description,
+    };
+    if let Some(governed) = &parsed.governed_tags {
+        let stored = lakehouse_store::governed_tag::list_for_asset(pool, &id).await?;
+        if governed_tags_differ(&stored, governed) {
+            changed.push("governedTags");
+        }
+        // Details and governed tags in one transaction: a refused value
+        // (not allowed for its key, or a key nobody defined) saves neither.
+        // The store's sentence names the key and the allowed values.
+        let pairs: Vec<(String, String)> = governed
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let set_by: String = principal
+            .display_name
+            .chars()
+            .take(CERTIFIED_BY_MAX_LEN)
+            .collect();
+        lakehouse_store::annotation::upsert_annotation_with_governed_tags(
+            pool, &input, &pairs, &set_by,
+        )
+        .await?;
+    } else {
+        // No `governedTags` in the body: the plain upsert, which names no
+        // governed column or table, so the set is untouched.
+        lakehouse_store::annotation::upsert_annotation(pool, &input).await?;
+    }
     // DATA-11 D2: a search must show the edit at once, not after the copy's
     // age. Dropped only after the write succeeded.
     state.catalog_search_cache.invalidate().await;
@@ -2757,6 +2878,49 @@ pub async fn put_annotation(
         .await;
     }
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+/// `true` if `after` is not the set `stored` already holds. Compared as
+/// pairs, so a re-save of the same values is not a change and records no
+/// audit entry.
+fn governed_tags_differ(
+    stored: &[lakehouse_store::governed_tag::AssetTagRow],
+    after: &BTreeMap<String, String>,
+) -> bool {
+    stored.len() != after.len()
+        || stored
+            .iter()
+            .any(|row| after.get(&row.tag_key) != Some(&row.value))
+}
+
+/// A table's governed tags as the JSON object the rows, the detail and the
+/// annotation routes carry: `{ "data_domain": "finance" }`, built from rows
+/// the store returns ordered by key, `{}` when there are none.
+fn governed_tags_object(rows: &[lakehouse_store::governed_tag::AssetTagRow]) -> Value {
+    Value::Object(
+        rows.iter()
+            .map(|r| (r.tag_key.clone(), json!(r.value)))
+            .collect(),
+    )
+}
+
+/// Puts a table's governed tags on its row or detail body as `governedTags`;
+/// absent, not `{}`, when it has none, as `tags` is.
+fn apply_governed_tags(row: &mut Value, tags: &[&lakehouse_store::governed_tag::AssetTagRow]) {
+    if tags.is_empty() {
+        return;
+    }
+    let Some(o) = row.as_object_mut() else {
+        return;
+    };
+    o.insert(
+        "governedTags".to_owned(),
+        Value::Object(
+            tags.iter()
+                .map(|r| (r.tag_key.clone(), json!(r.value)))
+                .collect(),
+        ),
+    );
 }
 
 /// Which annotation fields a `PUT` body changes from the stored row —
@@ -3580,6 +3744,76 @@ mod tests {
         assert_eq!(asset_name_in(&assets, "silver.gone"), None);
     }
 
+    fn tag_row(asset: &str, key: &str, value: &str) -> lakehouse_store::governed_tag::AssetTagRow {
+        lakehouse_store::governed_tag::AssetTagRow {
+            asset_id: asset.to_owned(),
+            tag_key: key.to_owned(),
+            value: value.to_owned(),
+            set_by: "Rina".to_owned(),
+            set_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// `DATA-12` part 2: governed tags sit beside `tags` as an object, and a
+    /// row with none has no `governedTags` at all.
+    #[test]
+    fn governed_tags_are_overlaid_as_an_object_and_an_untagged_row_has_none() {
+        let mut untagged = silver_catalog_row("orders", "MergeTree", 0, None);
+        apply_governed_tags(&mut untagged, &[]);
+        assert!(untagged.get("governedTags").is_none());
+
+        let mut tagged = silver_catalog_row("orders", "MergeTree", 0, None);
+        let a = tag_row("silver.orders", "data_domain", "finance");
+        let b = tag_row("silver.orders", "tier", "gold");
+        apply_governed_tags(&mut tagged, &[&a, &b]);
+        assert_eq!(
+            tagged["governedTags"],
+            json!({ "data_domain": "finance", "tier": "gold" })
+        );
+        assert_eq!(governed_tags_object(&[]), json!({}));
+    }
+
+    #[test]
+    fn governed_tags_differ_only_when_a_pair_or_the_count_changes() {
+        let stored = [tag_row("a", "data_domain", "finance")];
+        let same = BTreeMap::from([("data_domain".to_owned(), "finance".to_owned())]);
+        let other_value = BTreeMap::from([("data_domain".to_owned(), "ops".to_owned())]);
+        let extra = BTreeMap::from([
+            ("data_domain".to_owned(), "finance".to_owned()),
+            ("tier".to_owned(), "gold".to_owned()),
+        ]);
+        assert!(!governed_tags_differ(&stored, &same));
+        assert!(governed_tags_differ(&stored, &other_value));
+        assert!(governed_tags_differ(&stored, &extra));
+        assert!(governed_tags_differ(&stored, &BTreeMap::new()));
+        assert!(!governed_tags_differ(&[], &BTreeMap::new()));
+    }
+
+    #[test]
+    fn validate_annotation_body_bounds_governed_tags() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut body = valid_body();
+            body.governed_tags = Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            );
+            body
+        };
+        assert!(validate_annotation_body(&with(&[("data_domain", "finance")])).is_ok());
+        assert!(validate_annotation_body(&with(&[])).is_ok());
+        let err = validate_annotation_body(&with(&[("Data Domain", "finance")])).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: key")));
+        let err = validate_annotation_body(&with(&[("data_domain", "")])).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: value")));
+        let many: Vec<(String, String)> =
+            (0..21).map(|i| (format!("k{i}"), "v".to_owned())).collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let err = validate_annotation_body(&with(&pairs)).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("at most 20")));
+    }
+
     /// The audit trail names the fields an edit changed, and a save that
     /// changes nothing names none.
     #[test]
@@ -3590,6 +3824,7 @@ mod tests {
             steward: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             description: Some(description.to_owned()),
+            governed_tags: None,
         };
         assert!(
             changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"]))
@@ -3996,6 +4231,7 @@ mod tests {
             steward: Some("bayu".to_owned()),
             tags: vec!["pii".to_owned()],
             description: Some("Order events".to_owned()),
+            governed_tags: None,
         }
     }
 
@@ -4024,6 +4260,7 @@ mod tests {
             steward: None,
             tags: vec![],
             description: None,
+            governed_tags: None,
         };
         assert!(validate_annotation_body(&body).is_ok());
     }
@@ -4799,6 +5036,215 @@ mod tests {
                 !next_read_rebuilds(&state).await,
                 "a write that stored nothing must not drop the copy"
             );
+        }
+
+        // ── DATA-12 part 2: governed tags on the annotation route ──────
+
+        async fn define_key(pool: &lakehouse_store::PgPool) {
+            lakehouse_store::governed_tag::create_key(
+                pool,
+                "data_domain",
+                &["finance".to_owned(), "ops".to_owned()],
+                "Rina",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn put_body(
+            state: &AppState,
+            id: &str,
+            body: &'static str,
+        ) -> Result<(), (StatusCode, String)> {
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+            let result = put_annotation(
+                State(state.clone()),
+                Path(id.to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(body.as_bytes()),
+            )
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(rejection) => {
+                    let (status, body) = response_json(rejection.into_response()).await;
+                    Err((
+                        status,
+                        body["error"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                }
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn governed_tags_are_saved_with_the_details_and_cleared_by_an_empty_object(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"description":"visits","governedTags":{"data_domain":"finance"}}"#,
+            )
+            .await
+            .unwrap();
+            let rows = lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].value, "finance");
+            assert_eq!(rows[0].set_by, "Test Principal");
+
+            put_body(&state, "serving.mart_x", r#"{"governedTags":{}}"#)
+                .await
+                .unwrap();
+            assert!(
+                lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let audited: Vec<Value> = sqlx::query_scalar(
+                "SELECT args FROM audit_event WHERE action = 'catalog.annotate' \
+                 AND resource_id = 'serving.mart_x' ORDER BY at",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(audited.len(), 2);
+            assert!(
+                audited[0]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("governedTags"))
+            );
+            assert!(
+                audited[1]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("governedTags"))
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_governed_value_outside_the_list_is_refused_naming_the_key_and_saves_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"description":"visits","governedTags":{"data_domain":"revenue"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("\"data_domain\""), "{message}");
+            assert!(message.contains("\"revenue\""), "{message}");
+            assert!(message.contains("finance, ops"), "{message}");
+            assert_eq!(
+                annotation_rows(&pool, "serving.mart_x").await,
+                0,
+                "a refused governed tag must not save the details either"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_undefined_governed_key_and_a_malformed_pair_are_refused(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"governedTags":{"no_such_key":"x"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("\"no_such_key\""), "{message}");
+
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"governedTags":{"data_domain":"Finance"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                message.contains("governedTags: value \"Finance\""),
+                "{message}"
+            );
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        /// The regression guard beside part 1's "saving details never changes
+        /// a mark": a body with no `governedTags` leaves the set alone, however
+        /// the free tags and the description change.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn saving_details_without_governed_tags_never_changes_them(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"tags":["pii"],"governedTags":{"data_domain":"ops"}}"#,
+            )
+            .await
+            .unwrap();
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"tags":["finance"],"description":"edited"}"#,
+            )
+            .await
+            .unwrap();
+            let rows = lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].value, "ops");
+            let details = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(details.tags, vec!["finance".to_owned()]);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_list_overlay_carries_governed_tags_from_one_batch_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // A governed tag with no annotation row: the overlay must not
+            // depend on the details overlay finding one.
+            lakehouse_store::governed_tag::set_asset_tags(
+                &pool,
+                "silver.orders",
+                &[("data_domain".to_owned(), "finance".to_owned())],
+                "Rina",
+            )
+            .await
+            .unwrap();
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let mut body = json!({ "assets": [
+                { "id": "silver.orders", "name": "orders" },
+                { "id": "silver.other", "name": "other" },
+            ]});
+            apply_annotations(&state, &mut body).await;
+            assert_eq!(
+                body["assets"][0]["governedTags"],
+                json!({ "data_domain": "finance" })
+            );
+            assert!(body["assets"][1].get("governedTags").is_none());
         }
     }
 

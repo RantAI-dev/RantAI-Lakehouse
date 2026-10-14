@@ -9,6 +9,9 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
+use lakehouse_store::annotation::{
+    AnnotationInput, get_annotation, upsert_annotation, upsert_annotation_with_governed_tags,
+};
 use lakehouse_store::governed_tag::{
     create_key, delete_key, list_for_asset, list_for_assets, list_keys, set_asset_tags,
     update_key_values,
@@ -376,5 +379,76 @@ async fn the_batch_read_returns_each_requested_table_and_no_other(
     let ids: Vec<_> = rows.iter().map(|r| r.asset_id.as_str()).collect();
     assert_eq!(ids, vec!["silver.a", "silver.c"]);
     assert!(list_for_assets(&pool, &[]).await.expect("empty").is_empty());
+    Ok(())
+}
+
+fn details(description: &str) -> AnnotationInput {
+    AnnotationInput {
+        asset_id: "silver.a".to_owned(),
+        owner: None,
+        steward: None,
+        tags: vec!["pii".to_owned()],
+        description: Some(description.to_owned()),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn details_and_governed_tags_are_written_together_or_not_at_all(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    domain_key(&pool).await;
+    upsert_annotation_with_governed_tags(
+        &pool,
+        &details("first"),
+        &pairs(&[("data_domain", "finance")]),
+        "Rina",
+    )
+    .await
+    .expect("both written");
+    assert_eq!(
+        list_for_asset(&pool, "silver.a").await.expect("list").len(),
+        1
+    );
+
+    let refused = refusal(
+        upsert_annotation_with_governed_tags(
+            &pool,
+            &details("second"),
+            &pairs(&[("data_domain", "revenue")]),
+            "Rina",
+        )
+        .await,
+    );
+    assert!(refused.contains("\"revenue\""), "{refused}");
+    let kept = get_annotation(&pool, "silver.a")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        kept.description.as_deref(),
+        Some("first"),
+        "a refused governed tag rolls the details back too"
+    );
+    assert_eq!(
+        list_for_asset(&pool, "silver.a").await.expect("list")[0].value,
+        "finance"
+    );
+    Ok(())
+}
+
+/// The regression guard beside part 1's "saving details never changes a
+/// mark": the plain details save names no governed column or table.
+#[sqlx::test(migrations = "../../migrations")]
+async fn saving_details_alone_never_changes_the_governed_tags(pool: PgPool) -> sqlx::Result<()> {
+    domain_key(&pool).await;
+    set_asset_tags(&pool, "silver.a", &pairs(&[("data_domain", "ops")]), "Rina")
+        .await
+        .expect("tag");
+    upsert_annotation(&pool, &details("edited"))
+        .await
+        .expect("details");
+    let tags = list_for_asset(&pool, "silver.a").await.expect("list");
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].value, "ops");
     Ok(())
 }

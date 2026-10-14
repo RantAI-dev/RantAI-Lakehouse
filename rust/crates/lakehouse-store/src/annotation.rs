@@ -90,6 +90,40 @@ pub struct CertificationInput {
 /// oversized field, too many tags, or a tag that doesn't match
 /// `^[a-z0-9][a-z0-9_-]*$`).
 pub async fn upsert_annotation(pool: &PgPool, input: &AnnotationInput) -> Result<(), StoreError> {
+    upsert_annotation_in(&mut *pool.acquire().await?, input).await
+}
+
+/// [`upsert_annotation`], and the table's whole governed-tag set in the same
+/// transaction (`DATA-12` part 2): either both are written or neither, so a
+/// refused governed value never leaves the details half-saved.
+///
+/// `governed_tags` replaces the set exactly as
+/// [`crate::governed_tag::set_asset_tags_in`] does; a caller that is not
+/// sending governed tags calls [`upsert_annotation`], which never touches
+/// them.
+///
+/// # Errors
+///
+/// As [`upsert_annotation`], plus [`StoreError::Validation`] naming the key
+/// when a governed tag is refused (see
+/// [`crate::governed_tag::set_asset_tags_in`]); nothing is written then.
+pub async fn upsert_annotation_with_governed_tags(
+    pool: &PgPool,
+    input: &AnnotationInput,
+    governed_tags: &[(String, String)],
+    set_by: &str,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    upsert_annotation_in(&mut tx, input).await?;
+    crate::governed_tag::set_asset_tags_in(&mut tx, &input.asset_id, governed_tags, set_by).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_annotation_in(
+    conn: &mut sqlx::PgConnection,
+    input: &AnnotationInput,
+) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO asset_annotation \
          (asset_id, owner, steward, tags, description, updated_at) \
@@ -106,7 +140,7 @@ pub async fn upsert_annotation(pool: &PgPool, input: &AnnotationInput) -> Result
     .bind(&input.steward)
     .bind(&input.tags)
     .bind(&input.description)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
