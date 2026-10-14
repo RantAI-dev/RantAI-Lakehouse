@@ -131,7 +131,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Pipelines with schedules, dependencies, retries, alerts, version history | **Have** | Yes | — |
+| Pipelines with schedules, dependencies, retries, alerts, version history | **Have**, except a pipeline cannot read a Bronze (Iceberg) table yet: found by reading the code, not yet reproduced | Yes | `BLD-3` |
 | Transformations authored in the console | **Partial.** Five operations: dedupe, filter, rename, cast, select. Joins and aggregations are written as SQL outside the builder | Yes: full SQL, visual and code | Richer transformations |
 | Tables that refresh themselves when their inputs change | **Missing.** Not found; pipelines that run after their upstreams are the nearest thing | Yes (Dynamic Tables, materialized views) | Yes |
 | Notebooks, Python, Spark | **Missing** | Yes, all three | Large; decide if wanted |

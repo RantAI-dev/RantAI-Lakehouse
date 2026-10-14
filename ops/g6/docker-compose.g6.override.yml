@@ -269,9 +269,19 @@ services:
   # interpolated for every service it loads.
   g6-alerts-test-runner:
     profiles: ["g6-alerts"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location` in docker-compose.yml. Without this key the
+    # service would get a name of its own and `docker compose run` would
+    # build the whole Dagster image again in CI, where the `images` job
+    # already built it once. The same `GIT_SHA` arg keeps the `build:`
+    # block identical to the others, so a local `--build` cannot retag the
+    # shared image with `GIT_SHA=unknown`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     working_dir: /work
     volumes:
       - ./ops/g6:/work:ro
@@ -325,9 +335,17 @@ services:
   # first must equal the value the API container gets from the same `.env`.
   g6-ops-test-runner:
     profiles: ["g6-ops"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `g6-alerts-test-runner` and on `dagster-code-location` in
+    # docker-compose.yml (same `image:` key and `GIT_SHA` arg, so the
+    # `images` job's single build is reused and a local `--build` cannot
+    # retag it).
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     working_dir: /work
     volumes:
       - ./ops/g6:/work:ro
