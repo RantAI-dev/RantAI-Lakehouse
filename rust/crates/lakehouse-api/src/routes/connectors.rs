@@ -3210,16 +3210,59 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown or has no ingest spec set (`adapter IS NULL`);
-/// 409 if the connector is paused (`SRC-8`, [`CONNECTOR_PAUSED`]) or if a
-/// run for this connector is still queued or running (see
-/// [`ingest_run_history`]); 422 if `Dagster` reports a launch-time
-/// failure; 503 on a `Dagster` transport failure; 503/500 as above for the
-/// database pool.
+/// 404 if `id` is unknown or has no ingest spec set (`adapter IS NULL`),
+/// or the body names a table the connector does not load; 400 for a body that
+/// is not `{object, action}` together (see below); 409 if the connector is
+/// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
+/// queued or running (see [`ingest_run_history`]), or if the table named waits
+/// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
+/// on a `Dagster` transport failure; 503/500 as above for the database pool.
+///
+/// # A run of one table (`SRC-10` decision 5)
+///
+/// An optional JSON body `{"object": "<source object name>", "action":
+/// "refresh_keep" | "refresh_remove" | "clear"}` (unknown fields refused; both
+/// or neither) runs ONE table. The 409s above are answered first; a `cdc` or
+/// stream connector answers `supported: false` as before. The run config gets
+/// `object` and `action` beside `connector_id`, and an audit event
+/// `connector.ingest.<action>` names the table and the action, never row data.
+/// An empty body behaves exactly as it always did.
+pub async fn ingest_run_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // `SRC-10` decision 5: an empty body is the run of every table, exactly as
+    // before; a body names ONE table and what to do with it.
+    let request = parse_ingest_run_body(&body)?;
+    launch_ingest(&state, &id, request, Some(&principal)).await
+}
+
+/// [`ingest_run_request`] for a caller inside the API that has no request body
+/// and no principal of its own (the assistant's tools): the run of every table,
+/// as before `SRC-10`.
+///
+/// # Errors
+///
+/// As [`ingest_run_request`] with an empty body.
 pub async fn ingest_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    launch_ingest(&state, &id, None, None).await
+}
+
+/// The run itself; see [`ingest_run_request`] for the order of the answers.
+/// `principal` is the caller, for the audit event of a run of one table.
+async fn launch_ingest(
+    state: &AppState,
+    id: &str,
+    request: Option<(String, IngestAction)>,
+    principal: Option<&Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let state = state.clone();
+    let id = id.to_owned();
     // `SRC-8` F6: a paused connector starts nothing, and this is answered
     // before Dagster is asked anything. Unknown ids stay a 404.
     match schema_change::is_paused(pool(&state)?, &id).await? {
@@ -3238,6 +3281,14 @@ pub async fn ingest_run(
         return Ok(ApiJson(json!({
             "supported": false,
             "reason": cdc_ingest_run_unsupported_reason(&id),
+        })));
+    }
+    // A stream connector (Kafka) has no per-table batch to refresh or clear: its
+    // consumer owns the rows. Said honestly instead of ignoring the body.
+    if request.is_some() && spec.ingest_mode.as_deref() == Some("stream") {
+        return Ok(ApiJson(json!({
+            "supported": false,
+            "reason": STREAM_TABLE_ACTION_UNSUPPORTED,
         })));
     }
 
@@ -3265,11 +3316,37 @@ pub async fn ingest_run(
         .into());
     }
 
+    // The two refusals of a run of one table come after the 409s above, which
+    // are the existing, stated answers for "not now".
+    if let Some((object, _)) = &request {
+        let selected = spec
+            .source_objects
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| entry.get("name").and_then(Value::as_str) == Some(object.as_str()));
+        if !selected {
+            return Err(ApiError::NotFound(INGEST_OBJECT_NOT_SELECTED.to_owned()).into());
+        }
+        // `SRC-8` observation step: a table that waits for a schema decision
+        // would load (or be emptied and loaded) past that decision.
+        if schema_change::object_waits(pool(&state)?, &id, object).await? {
+            return Err(ApiError::Conflict(INGEST_OBJECT_WAITS.to_owned()).into());
+        }
+    }
+
     // Mirrors `agent_runs.py`'s `_employee_run_config` shape: one static
-    // job (`ingest_job`), the launched run's only per-run input is this
+    // job (`ingest_job`), the launched run's per-run input is this
     // connector's id, which `run_ingest`'s Dagster op re-fetches the
-    // connector row by (`dagster/dispar_orchestrate/ingest_factory.py`).
-    let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": id}}}});
+    // connector row by (`dagster/dispar_orchestrate/ingest_factory.py`). A run
+    // of one table adds `object` and `action` beside it, under the same op
+    // config key; `run_ingest`'s schema takes both as OPTIONAL fields.
+    let mut op_config = json!({"connector_id": id});
+    if let Some((object, action)) = &request {
+        op_config["object"] = json!(object);
+        op_config["action"] = json!(action.as_str());
+    }
+    let run_config = json!({"ops": {"run_ingest": {"config": op_config}}});
     match state
         .dagster
         .launch_run_with_config(INGEST_JOB, &run_config)
@@ -3279,9 +3356,102 @@ pub async fn ingest_run(
             if let Some(error) = outcome.error {
                 return Err(ApiError::Unprocessable(error).into());
             }
+            if let (Some((object, action)), Some(principal)) = (&request, principal) {
+                // The table's name and the action, never a row or a count.
+                let event = connector_audit_event(
+                    principal,
+                    &format!("connector.ingest.{}", action.as_str()),
+                    &id,
+                    json!({"object": object, "action": action.as_str(), "runId": outcome.run_id}),
+                    "executed",
+                );
+                if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+                    tracing::warn!(%err, connector_id = %id, "failed to record the connector table action audit event");
+                }
+            }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
         Err(err) => Err(ApiError::Unavailable(js_error(err)).into()),
+    }
+}
+
+/// What a run of one table does (`SRC-10` decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum IngestAction {
+    /// Forget the table's cursor, then load by its mode.
+    RefreshKeep,
+    /// Empty the table, forget the cursor, then load.
+    RefreshRemove,
+    /// Empty the table, forget the cursor, load nothing.
+    Clear,
+}
+
+impl IngestAction {
+    /// The wire and run-config spelling.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RefreshKeep => "refresh_keep",
+            Self::RefreshRemove => "refresh_remove",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// The optional body of `POST .../ingest/run`. Both fields or neither.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestRunBody {
+    object: Option<String>,
+    action: Option<IngestAction>,
+}
+
+/// The longest source object name accepted in a run body (as for a schema
+/// observation).
+const MAX_INGEST_OBJECT_LEN: usize = 256;
+
+/// Fixed 400 text: `object` and `action` come together.
+const INGEST_RUN_NEEDS_BOTH: &str =
+    "a run of one table needs both \"object\" and \"action\", or neither";
+
+/// Fixed 404 text: the connector does not load the table asked for. No name from
+/// the request is repeated.
+const INGEST_OBJECT_NOT_SELECTED: &str = "This connector does not load that table.";
+
+/// Fixed 409 text: the table waits for a schema decision (`SRC-8`).
+const INGEST_OBJECT_WAITS: &str = "This table is waiting for a schema decision, so it cannot be \
+     refreshed or cleared yet. Approve or resolve the change first.";
+
+/// Fixed `supported: false` reason for a stream connector.
+const STREAM_TABLE_ACTION_UNSUPPORTED: &str = "A streaming connector reads its topic continuously \
+     and has no per-table batch to refresh or clear.";
+
+/// Read the body of `POST .../ingest/run`: an empty body (or `{}`) is the run of
+/// every table, `None`.
+///
+/// # Errors
+///
+/// 400 for a body that is not the documented JSON, for one of `object` and
+/// `action` without the other, and for a blank or oversize `object`.
+fn parse_ingest_run_body(body: &Bytes) -> Result<Option<(String, IngestAction)>, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let parsed: IngestRunBody = parse_body(body)?;
+    match (parsed.object, parsed.action) {
+        (None, None) => Ok(None),
+        (Some(object), Some(action)) => {
+            if object.trim().is_empty()
+                || object.len() > MAX_INGEST_OBJECT_LEN
+                || object.chars().any(char::is_control)
+            {
+                return Err(ApiError::BadRequest(
+                    "object must be a table name of at most 256 characters".to_owned(),
+                ));
+            }
+            Ok(Some((object, action)))
+        }
+        _ => Err(ApiError::BadRequest(INGEST_RUN_NEEDS_BOTH.to_owned())),
     }
 }
 
@@ -3314,6 +3484,11 @@ pub struct ConnectorIngestRun {
     pub started_at: Option<String>,
     /// ISO-8601, `None` until the run ends.
     pub ended_at: Option<String>,
+    /// The one table a run of a single table named (`SRC-10` decision 5), from
+    /// the run's config; `None` for a run of every table.
+    pub object: Option<String>,
+    /// `refresh_keep | refresh_remove | clear` for such a run, else `None`.
+    pub action: Option<String>,
 }
 
 impl ConnectorIngestRun {
@@ -3321,6 +3496,14 @@ impl ConnectorIngestRun {
     fn is_active(&self) -> bool {
         matches!(self.status, "queued" | "running")
     }
+}
+
+/// A text field of a run's `ops.run_ingest.config`, or `None`.
+fn run_config_text(run: &DgConfiguredRun, field: &str) -> Option<String> {
+    run.run_config
+        .pointer(&format!("/ops/run_ingest/config/{field}"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
@@ -3340,6 +3523,8 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
             status: map_run_status(&run.status),
             started_at: run.start_time.map(iso_from_unix_seconds),
             ended_at: run.end_time.map(iso_from_unix_seconds),
+            object: run_config_text(run, "object"),
+            action: run_config_text(run, "action"),
         })
         .collect()
 }

@@ -1599,6 +1599,287 @@ def step_source_schema_changes() -> None:
     print(f"[g6] SRC-8 step 4: catalog detail of {slug} marks qty inactiveSince {qty_marks[0]}, no other column")
 
 
+# SRC-10 task 8: the load modes on a real stack. Tables and a connector of
+# their own (as SRC-8 above), so no existing step sees them.
+SRC10_DB = "g6_ingest"
+SRC10_TABLES = {  # source table -> Bronze table
+    "src10_dedup": "g6_mysql_src10_dedup",
+    "src10_hist": "g6_mysql_src10_hist",
+    "src10_other": "g6_mysql_src10_other",
+}
+
+
+def _src10_spec(hist_mode: str) -> dict:
+    """The connector's ingest spec. `hist_mode` is the only thing that varies:
+    part e puts `src10_hist` in `replace` and back."""
+    return {
+        "adapter": "sql", "ingestMode": "batch",
+        "dial": {"driver": "mysql", "host": "mysql-g6", "port": 3306, "database": SRC10_DB, "user": "g6_reader"},
+        "sourceObjects": [
+            {"name": "src10_dedup", "target": SRC10_TABLES["src10_dedup"], "loadMode": "incremental_dedup",
+             "primaryKey": ["id"], "incrementalKey": "updated_at"},
+            {"name": "src10_hist", "target": SRC10_TABLES["src10_hist"], "loadMode": hist_mode, "primaryKey": ["id"]},
+            {"name": "src10_other", "target": SRC10_TABLES["src10_other"], "loadMode": "replace"},
+        ],
+    }
+
+
+def _src10_poll(part: str, what: str, read, ok, timeout_s: int = 60):
+    """Read until `ok(observed)`; a failure names the part and what was last
+    seen (never a bare timeout). `read` errors (a table ClickHouse cannot see
+    yet) count as 'not yet' and are reported if they persist."""
+    deadline = time.time() + timeout_s
+    observed, error = None, None
+    while True:
+        try:
+            observed, error = read(), None
+            if ok(observed):
+                return observed
+        except G6Failure as exc:
+            error = str(exc)[:300]
+        if time.time() >= deadline:
+            raise G6Failure(f"SRC-10 {part}: {what}; last saw {observed!r}" + (f" (last read error: {error})" if error else ""))
+        time.sleep(3.0)
+
+
+def _src10_rows(table: str, columns: str) -> list[dict]:
+    """The rows of `bronze.<Bronze table of table>` through ClickHouse, ordered
+    by key. Always under a `WHERE` (R11). `_bronze_row_count` runs first only
+    to create the catalog database."""
+    _bronze_row_count(SRC10_TABLES[table])
+    text = ch_query(
+        f"SELECT {columns} FROM {CATALOG_DB}.`bronze.{SRC10_TABLES[table]}` WHERE 1 "
+        "ORDER BY id, _valid_from SETTINGS allow_database_iceberg = 1 FORMAT JSONEachRow"
+        if table == "src10_hist" else
+        f"SELECT {columns} FROM {CATALOG_DB}.`bronze.{SRC10_TABLES[table]}` WHERE 1 "
+        "ORDER BY id SETTINGS allow_database_iceberg = 1 FORMAT JSONEachRow"
+    )
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _src10_plain(table: str) -> list[tuple]:
+    """(id, name[, updated_at]) of a table that holds one row per key."""
+    columns = "id, name, updated_at" if table == "src10_dedup" else "id, name"
+    return [
+        tuple(int(r[c]) if c in ("id", "updated_at") else r[c] for c in (x.strip() for x in columns.split(",")))
+        for r in _src10_rows(table, columns)
+    ]
+
+
+def _src10_history(table: str = "src10_hist") -> list[tuple]:
+    """(id, name, is_current, valid_to) of every version, oldest first per key.
+    `_is_current` is read as ClickHouse hands it over and normalised; what it
+    returned is part of every failure text."""
+    out = []
+    for r in _src10_rows(table, "id, name, _is_current, _valid_to"):
+        current = r["_is_current"]
+        out.append((int(r["id"]), r["name"], current in (True, 1, "1", "true"), r["_valid_to"]))
+    return out
+
+
+def _src10_runs_of(connector_id: str, table: str) -> list[dict]:
+    resp = API.get(f"{API_URL}/api/governance/ingest-runs?connectorId={connector_id}", timeout=10)
+    if not resp.ok:
+        raise G6Failure(f"GET ingest-runs for {connector_id!r} failed: {resp.status_code} {resp.text[:300]}")
+    return [r for r in resp.json() if r["object"] == table]  # newest first
+
+
+def _src10_latest(connector_id: str, table: str) -> tuple | None:
+    runs = _src10_runs_of(connector_id, table)
+    return (runs[0]["startedAt"], runs[0]["status"], runs[0]["rows"]) if runs else None
+
+
+def _src10_run(connector_id: str, label: str, body: dict | None = None) -> None:
+    if body is None:
+        run_id = _post_ingest_run(connector_id).json().get("runId")
+    else:
+        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", json=body, timeout=10)
+        if not resp.ok:
+            raise G6Failure(f"SRC-10 {label}: ingest/run {body} answered {resp.status_code} {resp.text[:300]}")
+        run_id = resp.json().get("runId")
+    if not run_id:
+        raise G6Failure(f"SRC-10 {label}: ingest/run returned no runId")
+    print(f"[g6] SRC-10 {label}: launched run {run_id}")
+    step_wait_for_run_success(run_id)
+
+
+def step_load_modes() -> None:
+    """SRC-10 task 8, acceptance rows 2, 3, 8, 9, 10, 11 and 12: three MySQL
+    tables on one connector, each in a different load mode. Parts a to e are
+    in `docs/superpowers/plans/2026-10-12-src-10-load-modes.md`; every part
+    prints a `[g6] SRC-10 <part>` line and every failure names its part.
+    Parts b and c share the runs (a run loads every table), so the step
+    makes six runs, not eight.
+
+    The tables are read through ClickHouse's catalog database, the path this
+    gate's other steps use (`_bronze_row_count`), not `POST /api/query/run`:
+    the gate has no `ICEBERG_QUERY_DB` of its own, and the engine behind both
+    is the same ClickHouse over the same Lakekeeper catalog. Always under a
+    `WHERE` (R11)."""
+    dedup = {1: ("a", 100), 2: ("b", 100), 3: ("c", 100)}
+    hist = {1: "h1", 2: "h2", 3: "h3"}
+    other = {1: "o1", 2: "o2"}
+    _src8_mysql(
+        *(f"DROP TABLE IF EXISTS {t}" for t in SRC10_TABLES),
+        "CREATE TABLE src10_dedup (id INT PRIMARY KEY, name VARCHAR(50), updated_at INT)",
+        "CREATE TABLE src10_hist (id INT PRIMARY KEY, name VARCHAR(50))",
+        "CREATE TABLE src10_other (id INT PRIMARY KEY, name VARCHAR(50))",
+        "INSERT INTO src10_dedup (id, name, updated_at) VALUES (1, 'a', 100), (2, 'b', 100), (3, 'c', 100)",
+        "INSERT INTO src10_hist (id, name) VALUES (1, 'h1'), (2, 'h2'), (3, 'h3')",
+        "INSERT INTO src10_other (id, name) VALUES (1, 'o1'), (2, 'o2')",
+    )
+    body = _create_connector(
+        name="g6-mysql-load-modes", kind="MySQL", host="mysql-g6:3306",
+        credential={"source": "file", "primary": "password"},
+    )
+    connector_id = body["id"]
+    derived = (body.get("credential") or {}).get("primary")
+    if not derived:
+        raise G6Failure(f"create response for g6-mysql-load-modes carried no derived credential name: {body}")
+    _write_credential_file(derived, CONNECTOR_MYSQL_PASSWORD)
+
+    def put_spec(hist_mode: str) -> None:
+        resp = API.put(f"{API_URL}/api/connectors/{connector_id}/ingest-spec", json=_src10_spec(hist_mode), timeout=10)
+        if not resp.ok:
+            raise G6Failure(f"SRC-10: set ingest-spec ({hist_mode}) failed: {resp.status_code} {resp.text[:300]}")
+
+    put_spec("history")
+
+    # a. key detection (decision 3): the MySQL primary-key query, against a real MySQL.
+    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params={"schema": SRC10_DB}, timeout=30)
+    if not resp.ok:
+        raise G6Failure(f"SRC-10 a (key detection): discover answered {resp.status_code} {resp.text[:300]}")
+    listed = {o.get("name"): o for o in resp.json().get("objects") or []}
+    keys = {t: (listed.get(f"{SRC10_DB}.{t}") or {}).get("primaryKey") for t in SRC10_TABLES}
+    if any(k != ["id"] for k in keys.values()):
+        raise G6Failure(f"SRC-10 a (key detection): expected primaryKey ['id'] for all three tables, got {keys!r}")
+    print(f"[g6] SRC-10 a (key detection): discover reports primaryKey {keys}")
+
+    # b/c, first run
+    _src10_run(connector_id, "run 1 (baseline)")
+    want = sorted((k, v[0], v[1]) for k, v in dedup.items())
+    got = _src10_poll("b (dedup)", f"run 1: expected one row per id {want}", lambda: _src10_plain("src10_dedup"), lambda r: r == want)
+    print(f"[g6] SRC-10 b (dedup): run 1 loaded {len(got)} rows, one per id: {got}")
+    current = _src10_poll(
+        "c (history)", "run 1: expected one current row per key with _valid_to null",
+        lambda: _src10_history(), lambda r: len(r) == 3 and all(x[2] and x[3] is None for x in r),
+    )
+    print(f"[g6] SRC-10 c (history): run 1 loaded {len(current)} current rows (id, name, _is_current, _valid_to): {current}")
+    if [(x[0], x[1]) for x in current] != sorted(hist.items()):
+        raise G6Failure(f"SRC-10 c (history): run 1 values differ from the source {sorted(hist.items())}: {current!r}")
+
+    # the source changes: an update and an insert for dedup, an update for history
+    _src8_mysql(
+        "UPDATE src10_dedup SET name = 'b2', updated_at = 200 WHERE id = 2",
+        "INSERT INTO src10_dedup (id, name, updated_at) VALUES (4, 'd', 200)",
+        "UPDATE src10_hist SET name = 'h2b' WHERE id = 2",
+        "INSERT INTO src10_other (id, name) VALUES (3, 'o3')",
+    )
+    dedup[2], dedup[4] = ("b2", 200), ("d", 200)
+    hist_after = {1: "h1", 2: "h2b", 3: "h3"}
+    other[3] = "o3"
+    _src10_run(connector_id, "run 2 (source changed)")
+    want = sorted((k, v[0], v[1]) for k, v in dedup.items())
+    got = _src10_poll("b (dedup)", f"run 2: expected one row per id {want}", lambda: _src10_plain("src10_dedup"), lambda r: r == want)
+    print(f"[g6] SRC-10 b (dedup): run 2 updated id 2 and added id 4, {len(got)} rows, one per id: {got}")
+
+    def history_ok(rows: list[tuple]) -> bool:
+        closed = [r for r in rows if not r[2]]
+        now = [r for r in rows if r[2]]
+        return (
+            len(rows) == 4 and len(closed) == 1 and closed[0][0] == 2 and closed[0][1] == "h2" and closed[0][3] is not None
+            and sorted((r[0], r[1]) for r in now) == sorted(hist_after.items()) and all(r[3] is None for r in now)
+        )
+
+    versions = _src10_poll(
+        "c (history)", "run 2: expected one closed row (id 2, 'h2', _valid_to set) and one current row per key with the new value",
+        lambda: _src10_history(), history_ok,
+    )
+    print(f"[g6] SRC-10 c (history): run 2 versions (id, name, _is_current, _valid_to): {versions}")
+
+    # run 3, the source unchanged: nothing moves
+    _src10_run(connector_id, "run 3 (unchanged)")
+    again = _src10_poll("b (dedup)", "run 3: expected the rows of run 2 unchanged", lambda: _src10_plain("src10_dedup"), lambda r: r == want)
+    versions_again = _src10_poll(
+        "c (history)", "run 3: expected the same versions, the closed row's _valid_to unmoved",
+        lambda: _src10_history(), lambda r: r == versions,
+    )
+    print(f"[g6] SRC-10 b (dedup): run 3 unchanged, {len(again)} rows")
+    print(f"[g6] SRC-10 c (history): run 3 unchanged, {len(versions_again)} versions, closed row _valid_to still {[v[3] for v in versions_again if not v[2]]}")
+
+    # d. one table (decision 5)
+    other_rows = sorted(other.items())
+    other_before = _src10_poll(
+        "d (one table)", f"before: expected src10_other to hold {other_rows}", lambda: _src10_plain("src10_other"), lambda r: r == other_rows,
+    )
+    other_latest = _src10_latest(connector_id, "src10_other")
+    dedup_latest = _src10_latest(connector_id, "src10_dedup")
+    hist_count = len(versions)
+    _src10_run(connector_id, "d refresh_remove of src10_dedup", {"object": "src10_dedup", "action": "refresh_remove"})
+    now_dedup = _src10_poll(
+        "d (one table)", f"after refresh_remove: expected src10_dedup to hold exactly the source's rows {want}",
+        lambda: _src10_plain("src10_dedup"), lambda r: r == want,
+    )
+    new_dedup_latest = _src10_poll(
+        "d (one table)", "expected a new succeeded ingest-runs row for src10_dedup",
+        lambda: _src10_latest(connector_id, "src10_dedup"), lambda r: r is not None and r != dedup_latest and r[1] == "succeeded",
+    )
+    if _src10_plain("src10_other") != other_before or _src10_latest(connector_id, "src10_other") != other_latest:
+        raise G6Failure(
+            "SRC-10 d (one table): refreshing src10_dedup changed src10_other: "
+            f"rows {_src10_plain('src10_other')!r} (was {other_before!r}), latest run {_src10_latest(connector_id, 'src10_other')!r} (was {other_latest!r})"
+        )
+    if len(_src10_history()) != hist_count:
+        raise G6Failure(f"SRC-10 d (one table): refreshing src10_dedup changed src10_hist: {len(_src10_history())} versions, was {hist_count}")
+    print(
+        f"[g6] SRC-10 d (one table): refresh_remove of src10_dedup left {len(now_dedup)} rows (the source's), "
+        f"latest run {new_dedup_latest}; src10_other ({len(other_before)} rows, latest run {other_latest}) and src10_hist ({hist_count} versions) unchanged"
+    )
+    health_before = API.get(f"{API_URL}/api/connectors/{connector_id}", timeout=10).json()
+    _src10_run(connector_id, "d clear of src10_other", {"object": "src10_other", "action": "clear"})
+    _src10_poll("d (one table)", "after clear: expected src10_other empty", lambda: _src10_plain("src10_other"), lambda r: r == [])
+    cleared = _src10_poll(
+        "d (one table)", "expected a `cleared` ingest-runs row with rows 0 for src10_other",
+        lambda: _src10_latest(connector_id, "src10_other"), lambda r: r is not None and r[1] == "cleared" and r[2] == 0,
+    )
+    health_after = API.get(f"{API_URL}/api/connectors/{connector_id}", timeout=10).json()
+    streak = (health_before.get("failureStreak"), health_before.get("health"))
+    if (health_after.get("failureStreak"), health_after.get("health")) != streak:
+        raise G6Failure(
+            f"SRC-10 d (one table): clear changed the connector's failureStreak/health: {streak!r} -> "
+            f"{(health_after.get('failureStreak'), health_after.get('health'))!r}"
+        )
+    if _src10_plain("src10_dedup") != want or len(_src10_history()) != hist_count:
+        raise G6Failure("SRC-10 d (one table): clearing src10_other changed src10_dedup or src10_hist")
+    print(
+        f"[g6] SRC-10 d (one table): clear of src10_other left it empty, ingest-runs row {cleared}; "
+        f"src10_dedup and src10_hist unchanged; failureStreak/health still {streak}"
+    )
+
+    # e. the guard (review BLOCKER 5): history rows are not overwritten by another mode
+    put_spec("replace")
+    run_id = _post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise G6Failure("SRC-10 e (guard): ingest/run returned no runId")
+    print(f"[g6] SRC-10 e (guard): launched run {run_id} with src10_hist in replace (it must FAIL, one table rejected)")
+    step_wait_for_run_failure(run_id)
+    rejected = _src10_poll(
+        "e (guard)", "expected a `rejected` ingest-runs row for src10_hist naming 'holds history rows'",
+        lambda: (_src10_runs_of(connector_id, "src10_hist") or [{}])[0],
+        lambda r: r.get("status") == "rejected" and "holds history rows" in (r.get("error") or ""),
+    )
+    if _src10_history() != versions:
+        raise G6Failure(f"SRC-10 e (guard): src10_hist changed although its load was rejected: {_src10_history()!r} (was {versions!r})")
+    put_spec("history")
+    detail = API.get(f"{API_URL}/api/connectors/{connector_id}", timeout=10).json()
+    if detail.get("pausedReason") is not None:
+        raise G6Failure(f"SRC-10 e (guard): the connector is paused after the rejected run: {detail.get('pausedReason')!r}")
+    print(
+        f"[g6] SRC-10 e (guard): replace over history rejected ({rejected['status']}: {rejected['error']}); "
+        f"{len(versions)} versions unchanged; spec put back to history, connector not paused"
+    )
+
+
 # SRC-16: a table of its own for the pause step, on a bucket key no other step reads.
 SRC16_KEY = "landing/src16_pause.csv"
 SRC16_BRONZE = "g6_files_pause"
@@ -1913,6 +2194,7 @@ def main() -> int:
         if _group_runs("sql"):
             step_failed_run_updates_connector_health()
             step_source_schema_changes()
+            step_load_modes()
             step_column_gate_rejects_an_unsupported_column()
             step_cdc_reports_unsupported_not_a_launch()
             step_sheets_reports_unsupported()

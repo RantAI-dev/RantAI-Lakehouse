@@ -197,6 +197,10 @@ class _FakePipeline:
         # What an earlier incremental run would have left behind.
         self.state: dict = {}
         self.synced = False
+        # The real pipeline's flag; `load_via_sink` asks it before every run (SRC-10 R3).
+        self.has_pending_data = False
+        # SRC-10 review BLOCKER 5: the history check looks at the schemas dlt holds (none here).
+        self.schemas: dict = {}
 
     def sync_destination(self) -> None:
         self.synced = True
@@ -344,8 +348,10 @@ def test_load_via_sink_appends_by_default_and_replaces_when_asked(monkeypatch) -
     load_via_sink([{"id": 1}], "orders", _sink_config())
     load_via_sink(_orders_resource(), "orders", _sink_config(), LoadPlan(mode="replace"))
     assert [p.write_disposition for p in pipelines] == ["append", "replace"]
-    # Neither looks for a cursor to continue from.
-    assert [p.synced for p in pipelines] == [False, False]
+    # Neither looks for a cursor to continue from. Changed in SRC-10 review BLOCKER 5: both
+    # sync the pipeline once, for `history.refuse_history_rows` (a table that holds history
+    # takes no other mode); this was `[False, False]` ("no read of the bucket").
+    assert [p.synced for p in pipelines] == [True, True]
 
 
 def test_first_incremental_run_replaces_and_later_ones_append(monkeypatch) -> None:
