@@ -25,6 +25,7 @@ import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, pa
 import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
+import { TableActionsMenu, tableActionLabel } from "./connector-table-actions"
 import type {
   Dial,
   IngestJobRun,
@@ -49,6 +50,11 @@ function slug(text: string): string {
  * `<connector>_<table>`. Every connector writes into the same flat `bronze`
  * namespace, so two connectors that both have an `orders` table would
  * otherwise append into one `bronze.orders`.
+ *
+ * Rust has the same rule: `default_bronze_target` in
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs` names the target of a table
+ * `lakehouse-api` adds on its own (`SRC-8`, policy "apply all"). Change one,
+ * change the other; both tests pin the same examples.
  */
 export function defaultTarget(connectorName: string, objectName: string): string {
   const table = slug(objectName.split(".").pop() ?? objectName)
@@ -103,12 +109,22 @@ export function scheduleLabel(cron: string | null): string {
 
 const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"> = {
   succeeded: "success",
+  // SRC-10: a clear loads nothing and says so; it did what it was asked.
+  cleared: "success",
   failed: "destructive",
   rejected: "warning",
   unsupported: "neutral",
 }
 
-type Selected = { name: string; target: string; loadMode: LoadMode; incrementalKey?: string }
+type Selected = {
+  name: string
+  target: string
+  loadMode: LoadMode
+  incrementalKey?: string
+  /** SRC-10: the columns that identify one row, for the two deduplicating modes. Kept whatever the mode, so a key
+   * filled from discovery survives a switch to a mode that does not use it (the API ignores it there). */
+  primaryKey?: string[]
+}
 type Selection = Selected[]
 
 /** What a table gets when it is ticked: one copy of the source per run. */
@@ -118,31 +134,81 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace: "Replace all rows",
   incremental: "Add only new rows",
   append: "Add all rows again",
+  replace_dedup: "Replace all rows, one per key",
+  incremental_dedup: "Add only new rows, one per key",
+  history: "Keep history",
 }
 
-/** What a mode does on each run, in one line under the choice. */
+/** What a mode does on each run, in one line under the choice, including what happens to the rows already there. */
 function loadModeHint(mode: LoadMode, cursor: string): string {
   switch (mode) {
     case "replace":
-      return "The table always holds one copy of the source."
+      return "Each run replaces the rows already in the table with a fresh copy of the source."
     case "incremental":
-      return `The first run copies everything; later runs add rows whose ${
+      return `The first run replaces the table's rows with a copy of the source; later runs add rows whose ${
         cursor || "column"
-      } is higher than the last one seen. A changed row is added again as a new version.`
+      } is higher than the last one seen and keep the rows already there. A changed row is added again as a new version.`
     case "append":
-      return "Every run adds the whole source on top of earlier loads, so the table grows by a full copy each time."
+      return "Each run adds the whole source below the rows already in the table, so the table grows by a full copy each time."
+    case "replace_dedup":
+      return "Each run replaces the rows already in the table with a fresh copy of the source, one row per key: the one with the highest value of the cursor column, or the last one read."
+    case "incremental_dedup":
+      return `The first run replaces the table's rows with a copy of the source, one row per key; later runs merge rows whose ${
+        cursor || "column"
+      } is higher than the last one seen into the rows already there, updating the row of a key it already holds.`
+    case "history":
+      return "Every version of a row is kept, with the time a load first saw it (_valid_from), the time it was replaced (_valid_to) and a mark on the current one (_is_current). Each run reads the whole table."
   }
 }
 
-/** `incremental` is pushed into a SQL query; no other adapter runs it. */
+/**
+ * The modes a source offers. Replace, append, replace-and-deduplicate and history run on
+ * every batch source (history reads the whole table, so it needs no cursor); the two incremental ones are pushed into a SQL query, so
+ * no other adapter runs them (SRC-10 decision 2).
+ */
 function loadModesFor(adapter: string): LoadMode[] {
-  return adapter === "sql" ? ["replace", "incremental", "append"] : ["replace", "append"]
+  return adapter === "sql"
+    ? ["replace", "incremental", "append", "replace_dedup", "incremental_dedup", "history"]
+    : ["replace", "append", "replace_dedup", "history"]
 }
 
+/** Why a source cannot offer the incremental modes, or `null` when it can. */
+function missingModesNote(modes: LoadMode[]): string | null {
+  return modes.includes("incremental")
+    ? null
+    : "Adding only new rows, with or without one row per key, is offered for SQL sources only: they can ask the source for just the new rows."
+}
+
+const isDedup = (mode: LoadMode) => mode === "replace_dedup" || mode === "incremental_dedup"
+/** The modes that identify a row by its key: the deduplicating ones, and history (SRC-10 decisions 1 and 3). */
+const needsKey = (mode: LoadMode) => isDedup(mode) || mode === "history"
+
+/**
+ * Said under the mode when the chosen mode and the saved one are on different sides of the history boundary
+ * (SRC-10 decision 1). The console cannot know whether the table has rows, so it says what to do either way: a
+ * history table's rows cannot be kept as another mode's, nor the reverse.
+ */
+const HISTORY_BOUNDARY_NOTE =
+  "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
+const crossesHistoryBoundary = (saved: LoadMode | null, chosen: LoadMode) =>
+  saved !== null && (saved === "history") !== (chosen === "history")
+
 /** Why a table's load mode cannot be saved, or `null`. */
-export function loadModeProblem(selected: { loadMode: LoadMode; incrementalKey?: string }): string | null {
-  if (selected.loadMode === "incremental" && !(selected.incrementalKey ?? "").trim()) {
+export function loadModeProblem(selected: {
+  loadMode: LoadMode
+  incrementalKey?: string
+  primaryKey?: string[]
+}): string | null {
+  // The API refuses both (`validate_load_modes`), so they are shown before saving (SRC-10 decision 3). One at a
+  // time, the cursor first: it is the one the field next to the mode asks for.
+  if (
+    (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
+    !(selected.incrementalKey ?? "").trim()
+  ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
+  }
+  if (needsKey(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
+    return "Name the column, or the columns together, that identify one row. A mode with one row per key cannot be saved without a key."
   }
   return null
 }
@@ -154,6 +220,7 @@ function fromSpec(spec: IngestSpec): Selection {
     // Saved before load modes existed: the ingest job replaces.
     loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
     incrementalKey: o.incrementalKey,
+    primaryKey: o.primaryKey,
   }))
 }
 
@@ -163,9 +230,10 @@ function toSourceObjects(selection: Selection, withModes: boolean): SourceObject
     name: s.name,
     target: s.target,
     ...(withModes ? { loadMode: s.loadMode } : {}),
-    ...(withModes && s.loadMode === "incremental" && s.incrementalKey?.trim()
+    ...(withModes && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
+    ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
   }))
 }
 
@@ -191,11 +259,17 @@ export function ConnectorIngestPanel({
   connectorName,
   layout = "embedded",
   onTableCount,
+  pausedReason = null,
+  waitingTables,
 }: {
   connectorId: string
   connectorName: string
   layout?: "page" | "embedded"
   onTableCount?: (count: number) => void
+  /** Why the connector is paused (`SRC-8`); the API refuses a run meanwhile. */
+  pausedReason?: string | null
+  /** Source tables that wait for a schema decision (`SRC-8`), from the Schema changes tab's one list. */
+  waitingTables?: ReadonlySet<string>
 }) {
   const spec = useService((s) => connectorService.getIngestSpec(connectorId, s), [connectorId])
   // The spec a save returned, so saving does not refetch (and unmount the
@@ -231,6 +305,8 @@ export function ConnectorIngestPanel({
       spec={current}
       layout={layout}
       onSaved={setSavedSpec}
+      pausedReason={pausedReason}
+      waitingTables={waitingTables}
     />
   )
 }
@@ -241,17 +317,23 @@ function IngestEditor({
   spec,
   layout,
   onSaved,
+  pausedReason,
+  waitingTables,
 }: {
   connectorId: string
   connectorName: string
   spec: IngestSpec
   layout: "page" | "embedded"
   onSaved: (spec: IngestSpec) => void
+  pausedReason: string | null
+  waitingTables?: ReadonlySet<string>
 }) {
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
   const isStream = adapter === "kafka"
   const canDiscover = adapter === "sql" || adapter === "cdc"
+  // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
+  const runState = useIngestRunState(connectorId)
 
   const saved = React.useMemo(() => fromSpec(spec), [spec])
   const [selection, setSelection] = React.useState<Selection>(saved)
@@ -302,34 +384,68 @@ function IngestEditor({
   const canSave =
     dirty && problems.every((p) => p === null) && modeProblems.every((p) => p === null) && scheduleProblem === null
 
+  const found = discover.data?.supported ? discover.data.objects : []
+  // The columns of the tables found so far, to pick a cursor column from.
+  const columnsOf = new Map(found.map((o) => [o.name, o.columns.map((c) => c.name)]))
+  // The key each found table declares at the source (SQL drivers); absent when it declares none.
+  const keysOf = new Map(found.filter((o) => (o.primaryKey ?? []).length > 0).map((o) => [o.name, o.primaryKey]))
+
   function toggle(name: string) {
     setSelection((current) =>
       current.some((s) => s.name === name)
         ? current.filter((s) => s.name !== name)
-        : [...current, { name, target: defaultTarget(connectorName, name), loadMode: DEFAULT_LOAD_MODE }]
+        : [...current, newTable(name)]
     )
   }
 
+  /** A ticked table: one copy of the source per run, with the key the source declares when it declares one. */
+  function newTable(name: string): Selected {
+    const detected = keysOf.get(name)
+    return {
+      name,
+      target: defaultTarget(connectorName, name),
+      loadMode: DEFAULT_LOAD_MODE,
+      ...(detected ? { primaryKey: detected } : {}),
+    }
+  }
+
   function change(name: string, patch: Partial<Selected>) {
-    setSelection((current) => current.map((s) => (s.name === name ? { ...s, ...patch } : s)))
+    setSelection((current) =>
+      current.map((s) => {
+        if (s.name !== name) return s
+        const next = { ...s, ...patch }
+        // Switching to a mode with one row per key fills the key from the source's own, when it has one and
+        // none is set (SRC-10 decision 3). The user's own choice is never overwritten.
+        const detected = keysOf.get(name)
+        if (patch.loadMode && needsKey(patch.loadMode) && (next.primaryKey ?? []).length === 0 && detected) {
+          next.primaryKey = detected
+        }
+        return next
+      })
+    )
   }
 
   function addManual() {
     const name = manualName.trim()
     if (!name || selectedNames.has(name)) return
-    setSelection((current) => [
-      ...current,
-      { name, target: defaultTarget(connectorName, name), loadMode: DEFAULT_LOAD_MODE },
-    ])
+    setSelection((current) => [...current, newTable(name)])
     setManualName("")
   }
 
-  const found = discover.data?.supported ? discover.data.objects : []
-  // The columns of the tables found so far, to pick a cursor column from.
-  const columnsOf = new Map(found.map((o) => [o.name, o.columns.map((c) => c.name)]))
   const needle = filter.trim().toLowerCase()
   const shown = needle ? found.filter((o) => o.name.toLowerCase().includes(needle)) : found
   const allShownSelected = shown.length > 0 && shown.every((o) => selectedNames.has(o.name))
+
+  /** Why a table cannot be refreshed or cleared now, or `null` (SRC-10 decision 5). */
+  function tableActionBlock(name: string): string | null {
+    if (!saved.some((t) => t.name === name) || dirty) return "Save your changes before refreshing or clearing a table."
+    if (pausedReason) return `Paused: ${pausedReason}`
+    if (runState.watching) return "A run of this connector is going; wait for it to finish."
+    if (waitingTables?.has(name)) {
+      return "This table waits for a schema decision; approve or resolve the change on the Schema changes tab first."
+    }
+    return null
+  }
 
   const page = layout === "page"
   const tablesIntro = isStream
@@ -366,6 +482,26 @@ function IngestEditor({
                   <span className="min-w-0 flex-1 truncate font-mono text-xs" title={s.name}>
                     {s.name}
                   </span>
+                  {waitingTables?.has(s.name) ? (
+                    <Pill
+                      tone="warning"
+                      title="A change at the source waits for approval; see Schema changes"
+                    >
+                      Waiting for a decision
+                    </Pill>
+                  ) : null}
+                  {!isCdc ? (
+                    <TableActionsMenu
+                      connectorId={connectorId}
+                      table={s.name}
+                      target={s.target}
+                      disabledReason={tableActionBlock(s.name)}
+                      onStarted={(runId) => {
+                        runState.launch(runId)
+                        runState.refreshRuns()
+                      }}
+                    />
+                  ) : null}
                   <button
                     type="button"
                     aria-label={`Remove ${s.name}`}
@@ -391,7 +527,9 @@ function IngestEditor({
                   <LoadModeFields
                     selected={s}
                     modes={loadModesFor(adapter)}
+                    savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
                     columns={columnsOf.get(s.name) ?? null}
+                    detectedKey={keysOf.get(s.name) ?? null}
                     problem={modeProblems[i]}
                     onChange={(patch) => change(s.name, patch)}
                   />
@@ -464,11 +602,7 @@ function IngestEditor({
                       const missing = shown.filter((o) => !current.some((s) => s.name === o.name))
                       return [
                         ...current,
-                        ...missing.map((o) => ({
-                          name: o.name,
-                          target: defaultTarget(connectorName, o.name),
-                          loadMode: DEFAULT_LOAD_MODE,
-                        })),
+                        ...missing.map((o) => newTable(o.name)),
                       ]
                     })
                   }
@@ -614,13 +748,16 @@ function IngestEditor({
     <IngestRuns
       layout={layout}
       connectorId={connectorId}
+      state={runState}
       tableCount={saved.length}
       blockedReason={
-        dirty
-          ? "Save your changes before running."
-          : !isStream && saved.length === 0
-            ? "Save at least one table to run."
-            : null
+        pausedReason
+          ? `Paused: ${pausedReason}`
+          : dirty
+            ? "Save your changes before running."
+            : !isStream && saved.length === 0
+              ? "Save at least one table to run."
+              : null
       }
     />
   )
@@ -675,19 +812,26 @@ function IngestEditor({
 
 /**
  * What a run does with one table's rows: replace them, add only new ones
- * (by a cursor column), or add everything again. The cursor is picked from
- * the table's columns once it has been found, and typed otherwise.
+ * (by a cursor column), add everything again, and for the two deduplicating
+ * modes keep one row per key. The cursor and the key are picked from the
+ * table's columns once it has been found, and typed otherwise.
  */
 function LoadModeFields({
   selected,
   modes,
+  savedMode,
   columns,
+  detectedKey,
   problem,
   onChange,
 }: {
   selected: Selected
   modes: LoadMode[]
+  /** The mode this table is saved with, or null for a table not saved yet. */
+  savedMode: LoadMode | null
   columns: string[] | null
+  /** The key the source declares for this table, when it was found and declares one. */
+  detectedKey: string[] | null
   problem: string | null
   onChange: (patch: Partial<Selected>) => void
 }) {
@@ -696,6 +840,7 @@ function LoadModeFields({
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
   const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
+  const note = missingModesNote(modes)
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -712,7 +857,7 @@ function LoadModeFields({
             </option>
           ))}
         </select>
-        {selected.loadMode === "incremental" ? (
+        {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
           <>
             <span className="shrink-0 text-xs text-muted-foreground">by</span>
             {columns && columns.length > 0 ? (
@@ -744,11 +889,104 @@ function LoadModeFields({
           </>
         ) : null}
       </div>
+      {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
+      {needsKey(selected.loadMode) ? (
+        <KeyFields
+          name={selected.name}
+          value={selected.primaryKey ?? []}
+          columns={columns}
+          detected={detectedKey}
+          invalid={problem !== null && (selected.primaryKey ?? []).length === 0}
+          onChange={(primaryKey) => onChange({ primaryKey })}
+        />
+      ) : null}
       <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
         {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
       </p>
+      {crossesHistoryBoundary(savedMode, selected.loadMode) ? (
+        <p className="text-xs text-muted-foreground">{HISTORY_BOUNDARY_NOTE}</p>
+      ) : null}
     </div>
   )
+}
+
+/**
+ * The columns that identify one row of a deduplicating table (SRC-10 decision 3).
+ * A table found by discovery lists its columns to tick, with the source's own key
+ * already ticked; a table typed by hand takes the names, separated by commas.
+ */
+function KeyFields({
+  name,
+  value,
+  columns,
+  detected,
+  invalid,
+  onChange,
+}: {
+  name: string
+  value: string[]
+  columns: string[] | null
+  detected: string[] | null
+  invalid: boolean
+  onChange: (key: string[]) => void
+}) {
+  const [typed, setTyped] = React.useState(value.join(", "))
+  const origin =
+    detected && detected.length > 0
+      ? sameColumns(value, detected)
+        ? `Filled in from the source, which declares ${detected.join(", ")} as this table's key.`
+        : `The source declares ${detected.join(", ")} as this table's key; this table uses another.`
+      : null
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="shrink-0 text-xs text-muted-foreground">Key</span>
+        {columns && columns.length > 0 ? (
+          <fieldset aria-label={`Key columns for ${name}`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
+            {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
+              (column) => (
+                <label key={column} className="flex items-center gap-1 font-mono text-xs">
+                  <input
+                    type="checkbox"
+                    aria-label={`${column} is part of the key of ${name}`}
+                    checked={value.includes(column)}
+                    onChange={(e) =>
+                      onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
+                    }
+                  />
+                  {column}
+                </label>
+              )
+            )}
+          </fieldset>
+        ) : (
+          <Input
+            aria-label={`Key columns for ${name}`}
+            value={typed}
+            onChange={(e) => {
+              setTyped(e.target.value)
+              onChange(
+                e.target.value
+                  .split(",")
+                  .map((c) => c.trim())
+                  .filter((c) => c !== "")
+              )
+            }}
+            placeholder="id, or id, region"
+            className="h-7 min-w-0 flex-1 font-mono text-xs"
+            aria-invalid={invalid}
+            autoComplete="off"
+          />
+        )}
+      </div>
+      {origin ? <p className="text-xs text-muted-foreground">{origin}</p> : null}
+    </div>
+  )
+}
+
+/** Whether two column lists name the same columns, in any order. */
+function sameColumns(a: string[], b: string[]): boolean {
+  return a.length === b.length && [...a].sort().join("\u0000") === [...b].sort().join("\u0000")
 }
 
 /** How often a run in progress is checked on. */
@@ -820,25 +1058,14 @@ export function groupResultsByRun(runs: IngestJobRun[], results: IngestRun[]): R
 }
 
 /**
- * The connector's runs, each with the tables it loaded, and a Run now
- * that stays disabled while a run is going: Bronze is append-only, so a
- * second run would copy every table in again. While a run is going, both
- * lists are checked every few seconds.
+ * The two run lists of a connector and what is known from them: whether a run is
+ * going, including one just launched that Dagster does not list yet. Checked every
+ * few seconds while a run is going. Used by the editor (the per-table actions are
+ * disabled meanwhile) and handed to the Runs card.
  */
-function IngestRuns({
-  layout,
-  connectorId,
-  tableCount,
-  blockedReason,
-}: {
-  layout: "page" | "embedded"
-  connectorId: string
-  tableCount: number
-  blockedReason: string | null
-}) {
+function useIngestRunState(connectorId: string) {
   const jobRuns = useRefreshable((s) => connectorService.listIngestJobRuns(connectorId, s), connectorId)
   const results = useRefreshable((s) => connectorService.listIngestRuns(connectorId, s), connectorId)
-  const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
   // A run just launched, until Dagster lists it.
   const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
 
@@ -872,6 +1099,43 @@ function IngestRuns({
     wasWatching.current = watching
   }, [watching, refreshResults])
 
+  return {
+    jobRuns,
+    results,
+    runs,
+    activeRun,
+    awaitingLaunch,
+    launchedRunId,
+    watching,
+    launch: setLaunchedRunId,
+    refreshRuns,
+    refreshResults,
+  }
+}
+
+type IngestRunState = ReturnType<typeof useIngestRunState>
+
+/**
+ * The connector's runs, each with the tables it loaded, and a Run now
+ * that stays disabled while a run is going: Bronze is append-only, so a
+ * second run would copy every table in again.
+ */
+function IngestRuns({
+  layout,
+  connectorId,
+  state,
+  tableCount,
+  blockedReason,
+}: {
+  layout: "page" | "embedded"
+  connectorId: string
+  state: IngestRunState
+  tableCount: number
+  blockedReason: string | null
+}) {
+  const { jobRuns, results, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
+  const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
+
   const groups = groupResultsByRun(runs, results.data ?? [])
 
   const runNowButton = (
@@ -882,7 +1146,7 @@ function IngestRuns({
       disabled={runNow.status === "pending" || watching || blockedReason !== null}
       onClick={async () => {
         const result = await runNow.run(connectorId)
-        if (result?.runId) setLaunchedRunId(result.runId)
+        if (result?.runId) state.launch(result.runId)
         refreshRuns()
       }}
     >
@@ -972,11 +1236,17 @@ function RunGroupCard({
   const start = toMillis(run?.startedAt ?? null)
   const end = toMillis(run?.endedAt ?? null)
 
+  // SRC-10 decision 5: a run of one table says which table and what it was asked to do.
+  const scope = run?.object ? `${run.action ? `${tableActionLabel(run.action)} · ` : ""}${run.object}` : null
   const summary = !run
     ? `${results.length} older ${results.length === 1 ? "result" : "results"}`
     : isActive(run)
-      ? `${results.length} of ${tableCount} tables so far`
-      : results.length === 0
+      ? run.object
+        ? `${results.length} of 1 table so far`
+        : `${results.length} of ${tableCount} tables so far`
+      : run.action === "clear" && results.length > 0
+        ? "Table emptied · nothing loaded"
+        : results.length === 0
         ? "No table reached"
         : `${loaded.length} of ${results.length} tables · ${rows.toLocaleString()} rows${
             notLoaded > 0 ? ` · ${notLoaded} not loaded` : ""
@@ -987,7 +1257,16 @@ function RunGroupCard({
   ) : (
     <Pill tone="neutral">Earlier</Pill>
   )
-  const runId = run ? <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span> : null
+  const runId = run ? (
+    <>
+      <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>
+      {scope ? (
+        <span className="max-w-full truncate text-xs font-medium" title={scope}>
+          {scope}
+        </span>
+      ) : null}
+    </>
+  ) : null
   const when = run ? (
     <>
       {formatRelativeTime(run.startedAt)}

@@ -99,6 +99,17 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// What a late `ask_user` gets back (plan 14). The model reads it on its
+/// next round, so it asks the model to answer with the reading it used.
+const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+
+/// What a call gets back when the console's allowlist did not offer the tool
+/// (plan 17). The model reads it on its next round, so it is told to answer
+/// without the tool.
+fn not_offered_refusal(name: &str) -> String {
+    format!("{name} is not available in this chat. Answer without it.")
+}
+
 /// A single incoming `{role, content}` chat turn (only `user`/`assistant`
 /// are kept, matching the `TypeScript`'s `.filter`).
 #[derive(Debug, Deserialize)]
@@ -188,6 +199,10 @@ struct PreparedChat {
     messages: Vec<LlmMessage>,
     tools: Vec<Value>,
     is_build: bool,
+    /// `true` when the request carried a non-empty `tools` list. Then a call
+    /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
+    /// with no allowlist dispatches as before.
+    allowlisted: bool,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -312,6 +327,7 @@ async fn system_prompt(
     context: &str,
     user_messages: &[&str],
     asking: bool,
+    sql_help: bool,
 ) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
     let withheld = withheld_by_policy(state).await;
@@ -356,6 +372,9 @@ async fn system_prompt(
     if state.config.ai_ask_back && asking {
         rules.push_str(prompt::ASK_BACK_RULES);
     }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
+    }
     // Read from the switch alone, in both modes: a count that overlaps
     // between rows is a fact about the data, not about asking back. With
     // the switch off the text is what it was before the block existed.
@@ -373,6 +392,22 @@ async fn system_prompt(
     } + &words
         + &ctx_line
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
+}
+
+/// Plan 17: an Explain turn offers no tool. The console's Explain sends the
+/// statement with the sentence [`prompt::EXPLAIN_REQUEST`] first, and the
+/// model is told in the rules to call no tool. A Fix message keeps every tool
+/// it was offered, and so does a message that holds the sentence only inside
+/// the statement.
+fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<Value> {
+    let explain = newest_user.is_some_and(|m| m.trim_start().starts_with(prompt::EXPLAIN_REQUEST));
+    if !explain {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|t| t["function"]["name"].as_str() != Some(registry::PROPOSE_SQL))
+        .collect()
 }
 
 /// Validates the body and assembles the system prompt, history and the tool
@@ -435,6 +470,10 @@ async fn prepare_chat(
             if name == registry::ASK_USER && !state.config.ai_ask_back {
                 return false;
             }
+            // Same for the SQL help: the switch decides, whatever the list says.
+            if name == registry::PROPOSE_SQL && !state.config.ai_sql_help {
+                return false;
+            }
             if let Some(allow) = &allow {
                 // An explicit allowlist from the console's Tools menu is
                 // the user's own choice and wins over the per-turn
@@ -446,10 +485,17 @@ async fn prepare_chat(
         .collect();
 
     // The rules for asking are written only for a chat that can ask: one
-    // whose tool list holds `ask_user`.
+    // whose tool list holds `ask_user`. The SQL help rules follow the same
+    // rule for `propose_sql`.
     let asking = tools
         .iter()
         .any(|t| t["function"]["name"].as_str() == Some(registry::ASK_USER));
+    let sql_help = tools
+        .iter()
+        .any(|t| t["function"]["name"].as_str() == Some(registry::PROPOSE_SQL));
+    // plan 17: `sql_help` was read above, before this, so the SQL help rules
+    // stay in the prompt while the tool is taken out of an Explain turn.
+    let tools = without_tool_in_explain(tools, recent_user.last().copied());
     let sys = system_prompt(
         state,
         principal,
@@ -458,6 +504,7 @@ async fn prepare_chat(
         parsed.context.as_deref().unwrap_or_default(),
         &recent_user,
         asking,
+        sql_help,
     )
     .await;
 
@@ -473,6 +520,7 @@ async fn prepare_chat(
         messages,
         tools,
         is_build,
+        allowlisted: allow.is_some(),
     })
 }
 
@@ -615,6 +663,7 @@ async fn run_chat(
         mut messages,
         tools,
         is_build,
+        allowlisted,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
@@ -735,6 +784,14 @@ async fn run_chat(
             }
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // plan 14: an ask after any tool that ran in this turn is refused
+            // before the gate. The prompt asks the model to ask first; this
+            // is the check that holds when it does not.
+            let late_ask = call.function.name == registry::ASK_USER
+                && tool_trace.iter().any(|step| {
+                    step["tool"].as_str() != Some(registry::ASK_USER)
+                        && step["ok"].as_bool() == Some(true)
+                });
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
@@ -750,7 +807,18 @@ async fn run_chat(
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
-            let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
+            // plan 17: with an allowlist, the tools the console named are the
+            // only ones a call may reach. The check is against the offered
+            // list, not the request's strings, so a tool the switch removed,
+            // or that the Explain filter kept out, stays refused here too; a
+            // tool the permission removed never reaches this arm.
+            let not_offered = allowlisted
+                && !tools
+                    .iter()
+                    .any(|t| t["function"]["name"].as_str() == Some(call.function.name.as_str()));
+            let (result, outcome, run_id, approval_id) = if late_ask {
+                (json!({ "error": LATE_ASK_REFUSAL }), "failed", None, None)
+            } else if let Some(refusal) = gate_result {
                 if gate::is_write_high_pending(&refusal) {
                     let Some(spec) = registry::find(&call.function.name) else {
                         unreachable!("is_write_high_pending only set for a registered tool")
@@ -791,6 +859,9 @@ async fn run_chat(
                     let outcome = gate::outcome_of(&refusal);
                     (refusal, outcome, None, None)
                 }
+            } else if not_offered {
+                let error = not_offered_refusal(&call.function.name);
+                (json!({ "error": error }), "failed", None, None)
             } else {
                 let clean_args = gate::strip_confirmed(&args);
                 let result =
@@ -818,6 +889,37 @@ async fn run_chat(
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
             }));
+            // plan 14: an accepted ask ends the turn. The question is the
+            // reply, so the reader sees it above the option buttons; calls
+            // after it in this round are neither run nor recorded.
+            if call.function.name == registry::ASK_USER
+                && let Value::Object(m) = &result
+                && m.get("asked") == Some(&Value::Bool(true))
+            {
+                let question = m.get("question").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    question,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
+            // plan 15: an accepted proposal ends the turn the same way. The
+            // reason is the reply; the console shows the proposed statement.
+            if call.function.name == registry::PROPOSE_SQL
+                && let Value::Object(m) = &result
+                && m.get("proposed") == Some(&Value::Bool(true))
+            {
+                let reason = m.get("reason").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    reason,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
             if let Value::Object(m) = &result
                 && let Some(Value::String(rid)) = m.get("runId")
             {
@@ -1967,8 +2069,17 @@ mod tests {
         let state = state_with_ask_back_and_layer("false", "false");
         let headers = axum::http::HeaderMap::new();
         for asking in [false, true] {
-            let ask =
-                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], asking).await;
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 ask,
                 format!(
@@ -1977,8 +2088,17 @@ mod tests {
                     prompt::SYSTEM_ASK_SUFFIX
                 )
             );
-            let build =
-                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], asking).await;
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 build,
                 format!(
@@ -1994,7 +2114,17 @@ mod tests {
     async fn with_ask_back_on_the_rules_come_after_the_mode_text_and_before_the_data_map() {
         let state = state_with_ask_back_and_layer("true", "false");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert_eq!(
             text,
             format!(
@@ -2019,8 +2149,17 @@ mod tests {
             } else {
                 ""
             };
-            let ask =
-                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
             assert_eq!(
                 ask,
                 format!(
@@ -2029,8 +2168,17 @@ mod tests {
                     prompt::SYSTEM_ASK_SUFFIX
                 )
             );
-            let build =
-                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], true).await;
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
             assert_eq!(
                 build,
                 format!(
@@ -2050,7 +2198,17 @@ mod tests {
             ("AI_ASK_BACK", "false"),
             ("DATABASE_URL", "not a postgres url"),
         ]);
-        let ask = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        let ask = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             ask,
             format!(
@@ -2060,7 +2218,17 @@ mod tests {
                 prompt::DISTINCT_COUNT_RULES
             )
         );
-        let build = system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], false).await;
+        let build = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             build,
             format!(
@@ -2076,7 +2244,17 @@ mod tests {
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert_eq!(
             text,
             format!(
@@ -2095,7 +2273,17 @@ mod tests {
         // Studio's allowlist, for one) must not be told to call it.
         let state = state_with_ask_back("true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert!(!text.contains("ask_user"), "{text}");
     }
 
@@ -2249,6 +2437,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(
@@ -2263,12 +2452,22 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!his.contains("lodging"), "{his}");
         assert!(!his.contains(WORDS_HEADER), "{his}");
-        let nobody =
-            system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let nobody = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert!(!nobody.contains("lodging"), "{nobody}");
     }
 
@@ -2287,6 +2486,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let map = text.find("\n\nDATA MAP\n").expect("a data map section");
@@ -2308,6 +2508,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains("lodging"), "{text}");
@@ -2335,6 +2536,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let words = text.split(WORDS_HEADER).nth(1).expect("a words section");
@@ -2387,6 +2589,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains(WORDS_HEADER), "{text}");
