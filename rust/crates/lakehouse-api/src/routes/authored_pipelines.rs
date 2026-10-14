@@ -130,6 +130,45 @@ pub async fn collect_authored_depends_on(
     Ok(rows)
 }
 
+/// The one refusal a `bronze` target gets everywhere (BLD-3 / D4): the
+/// API's create/update/restore routes, and — as wording — the
+/// orchestrator's own op
+/// (`dagster/dispar_orchestrate/authored_factory.py::BRONZE_TARGET_REFUSED_REASON`,
+/// the non-retryable `Failure` a stored pre-refusal pipeline now fails
+/// its run with).
+///
+/// Bronze is written by ingestion and by nothing else. A pipeline
+/// targeting `bronze` would otherwise have the job run `CREATE DATABASE
+/// IF NOT EXISTS bronze` in `ClickHouse` and fill a `MergeTree` table
+/// that is not Bronze
+/// (not Iceberg, not in Lakekeeper, read by nobody) — a silent wrong
+/// answer, which is worse than a refusal (AGENTS.md principle 3, fail
+/// closed). Reads FROM `bronze` are a different question and are
+/// supported: the source is read through a `DataLakeCatalog` database.
+pub const BRONZE_TARGET_REFUSED: &str =
+    "a pipeline cannot write to bronze; bronze is written by ingestion";
+
+/// Whether `target_zone` is a zone a pipeline may write to.
+///
+/// One rule — `bronze` is not one — and it is the same rule the
+/// orchestrator's op applies, so a stored pipeline that predates this
+/// refusal (or that arrives from a client the assistant never
+/// validated) fails loudly at run time instead of writing somewhere
+/// meaningless. `silver`, `gold`, `serving`, `lake`, and anything else the
+/// store's column accepts is left alone here: narrowing the set is the
+/// catalog's job, not this route's.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (the route maps it to 400) carrying
+/// [`BRONZE_TARGET_REFUSED`] verbatim when `target_zone` is `bronze`.
+pub fn validate_target_zone(target_zone: &str) -> Result<(), ApiRejection> {
+    if target_zone == "bronze" {
+        return Err(ApiError::BadRequest(BRONZE_TARGET_REFUSED.to_owned()).into());
+    }
+    Ok(())
+}
+
 /// Validate `new_depends_on` for pipeline `this_id` against the existing
 /// authored graph and the orchestrator's live Dagster jobs. Pure
 /// function — every input is passed in by the caller, no I/O here.
@@ -508,6 +547,9 @@ pub async fn update(
 ) -> ApiResult<ApiJson<Value>> {
     authored_only(&id)?;
     let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
+    // BLD-3 / D4: a `bronze` target is refused with the same message
+    // `create` and `restore_version` use, before the store is touched.
+    validate_target_zone(&body.target_zone)?;
     for (index, transform) in body.transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
@@ -682,6 +724,11 @@ pub async fn restore_version(
     let snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    // BLD-3 / D4: a stored snapshot can predate the Bronze-target refusal,
+    // so a restore is refused on the same rule `update` and `create`
+    // apply -- replaying such a version would write the Bronze target
+    // straight back into the row the refusal exists to keep clean.
+    validate_target_zone(&snapshot.target_zone)?;
     // Validate the snapshot's `depends_on` against the live authored
     // graph and the orchestrator's `Dagster` job list — the same
     // `validate_depends_on` call `update` runs (final-review
@@ -1606,6 +1653,112 @@ mod tests {
                 vec![pl_b.id.clone()],
                 "A's stored chain must not have changed"
             );
+        }
+    }
+
+    /// BLD-3 / D4: the pure rule, and the message every refusal carries
+    /// (the orchestrator's op fails a stored pre-refusal pipeline with
+    /// this same wording).
+    #[test]
+    fn validate_target_zone_refuses_bronze_and_nothing_else() {
+        assert_eq!(
+            validate_target_zone("bronze").unwrap_err().0.to_string(),
+            BRONZE_TARGET_REFUSED
+        );
+        assert_eq!(
+            BRONZE_TARGET_REFUSED,
+            "a pipeline cannot write to bronze; bronze is written by ingestion"
+        );
+        for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
+            validate_target_zone(zone).expect("a ClickHouse zone stays writable");
+        }
+    }
+
+    /// BLD-3 / D4: the same refusal on `PUT /api/pipelines/{id}`, before
+    /// the store is touched. `state_without_pool` proves it needs no
+    /// database: the guard fires on the parsed body.
+    #[tokio::test]
+    async fn update_refuses_a_bronze_target_before_reaching_the_store() {
+        let body = Bytes::from_static(
+            br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"bronze","targetTable":"t","schedule":"manual","transforms":[]}"#,
+        );
+        let err = update(
+            State(state_without_pool()),
+            Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+            Path("pl-x-1".to_owned()),
+            body,
+        )
+        .await
+        .expect_err("a bronze target must be refused");
+        assert_eq!(err.0.status(), 400);
+        assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
+    }
+
+    /// BLD-3 / D4: a stored version can predate the refusal (the rule is
+    /// new; rows are not migrated), so restoring one must be refused on the
+    /// snapshot's own `target_zone` rather than replaying the Bronze
+    /// target straight back into the live row. Seeded through the STORE,
+    /// not through `POST /api/pipelines`, because the create route now
+    /// refuses this exact row -- that pre-refusal row is the case.
+    mod restore_refuses_a_stored_bronze_target {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_of_a_bronze_target_version_returns_400(pool: sqlx::PgPool) {
+            let input = CreatePipelineInput {
+                name: "pre-refusal-bronze-target".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "s".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "bronze".to_owned(),
+                target_table: "t".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: None,
+            };
+            let created = pipelines::create_pipeline(&pool, &input, None)
+                .await
+                .expect("seed the pre-refusal row the create route would now refuse");
+
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Path((created.id.clone(), 1)),
+            )
+            .await
+            .expect_err("restoring a stored bronze target must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), BRONZE_TARGET_REFUSED);
         }
     }
 

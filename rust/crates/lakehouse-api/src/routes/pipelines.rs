@@ -2206,6 +2206,12 @@ pub async fn create(
     // used to be inserted unassigned, which no tenant-scoped read shows.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: CreatePipelineBody = parse_body(&body)?;
+    // BLD-3 / D4: refuse a `bronze` target before anything is written.
+    // Same validator (and same message) as `authored_pipelines::update`
+    // and `authored_pipelines::restore_version` run; the assistant's
+    // `create_pipeline` tool lands here too, so it is refused with the
+    // same wording its schema enum no longer offers.
+    crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
     for (index, transform) in body.transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
@@ -3452,6 +3458,33 @@ mod tests {
         let headers = headers_with_x_tenant(Uuid::from_u128(2)); // not a member
         let resp = list(State(state), Some(Extension(principal)), headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// BLD-3 / D4: `POST /api/pipelines` refuses a `bronze` target with the
+    /// message `PUT`, the restore route and the orchestrator's own op all
+    /// use. Checked against `state_without_pool()` on purpose: the guard
+    /// is on the parsed body, so it must refuse before any store,
+    /// orchestrator or tenant lookup decides anything. The assistant's
+    /// `create_pipeline` tool calls this same handler, so the assistant
+    /// gets the refusal too even if its own schema enum is bypassed.
+    #[tokio::test]
+    async fn create_with_a_bronze_target_is_refused() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-bronze-target","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"bronze","targetTable":"t","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("a bronze target must be refused");
+        assert_eq!(err.0.status(), 400);
+        assert_eq!(
+            err.0.to_string(),
+            crate::routes::authored_pipelines::BRONZE_TARGET_REFUSED
+        );
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not
