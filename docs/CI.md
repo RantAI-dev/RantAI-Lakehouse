@@ -9,8 +9,9 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   that need them, and gates merges with a single summary gate (`ci-required`).
 - **`security.yml`** — `cargo audit`, `cargo deny check all`, a working-tree
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
-  full-git-history `history-scan` job, which is currently **RED for a real
-  reason** (see below) and is deliberately excluded from required checks.
+  full-git-history `history-scan` job, which reports only findings outside
+  the `.gitleaksignore` baseline (see below) and is deliberately excluded from
+  required checks.
 - **`docker.yml`** — runs on `v*` tag pushes only: builds `rust/Dockerfile`
   to check that a release tag still builds. A GHCR push job exists but is
   gated on tag pushes and is currently inert (no registry login
@@ -147,7 +148,7 @@ file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
 with; the MSRV check job exists specifically to catch MSRV regressions that the
 day-to-day toolchain wouldn't.
 
-## `history-scan`: currently RED, and correctly so
+## `history-scan`: baselined, red only on a new finding
 
 A Phase 1 audit found a real internal LLM API key leaked in git history, on 2 commits
 reachable from both `main` and `feat/rust-backend`, together with two
@@ -157,42 +158,51 @@ here — see the rule definitions in `.gitleaks.toml`.
 **gitleaks' default ruleset does not match either pattern.** Scanned with
 defaults, `history-scan` came back green — a false negative. That is worse
 than no scan at all: it tells a reviewer history is clean when it is not.
-
 `.gitleaks.toml` therefore adds two custom rules (`rantai-llm-node-api-key`,
-`rantai-internal-lan-host`) matching the key prefix and host range. With
-them, the scan reports the truth:
+`rantai-internal-lan-host`) matching the key prefix and host range.
 
-```
-$ gitleaks detect --config .gitleaks.toml
-leaks found: 6
-  rantai-llm-node-api-key: 1
-  rantai-internal-lan-host: 5
-```
+With those rules and the default ones, the scan of `main` at `a13e5ea`
+(CI job 115776111835) reported 15 findings. The product owner confirmed on
+2026-10-14 that every real secret among them is rotated, and a history
+rewrite would break every open branch, so they are **baselined, not
+rewritten** (SEC-1, plan
+[`2026-10-14-sec-1-gitleaks-baseline.md`](superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md)).
+`.gitleaksignore` at the repository root lists each one by its exact
+fingerprint (commit, file, rule, line):
 
-**This job is expected to fail until the history is rewritten.** Clearing it
-requires `git filter-repo` (or equivalent) plus a force-push, which rewrites
-published history — a human decision that has deliberately not been taken.
-The leaked key should also be rotated at its source, independently of any
-rewrite; removing it from git does not un-leak it.
+| Baselined | What | Why it may be ignored |
+| --- | --- | --- |
+| 7 lines of `.env.staging` in `1d2c45c` | Staging tokens and secret | Rotated; SEC-13 (#130) moves them to repository secrets `STAGING_*` |
+| `llm.ts:9` in `8ac6ee2` | Internal LLM node key | Rotated |
+| 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b` | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
+| `test_schema_observer.py:26` in `31ec837` | Test token literal | False positive; the literal is gone since #129 |
+| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant. The history scan reads every branch |
 
-The working-tree `gitleaks` job uses the same config and **is** green, because
-the key is no longer present in any tracked file (the file that held it was
-deleted during the Rust port). `.env.local` does contain live values and is
-flagged on a local scan, but it is gitignored and never checked out in CI.
+Because the entries are full fingerprints, they match nothing else: the same
+secret in a new commit, or any new secret, is **not** baselined and turns
+`history-scan` red. A red run is therefore a new finding. Rotate the secret
+first; only then decide whether it may be added to `.gitleaksignore` (with a
+comment saying why, the date, and the item ID).
+
+`.gitleaksignore` is read from `--source` (and the working directory);
+blank lines and full-line `#` comments are skipped (gitleaks v8.30.1,
+`detect/detect.go`, `AddGitleaksIgnore`).
+
+The working-tree `gitleaks` job uses the same config and is a separate
+check. `.env.local` does contain live values and is flagged on a local scan,
+but it is gitignored and never checked out in CI.
 
 `history-scan` stays a **separate job**, not folded into the working-tree
 `gitleaks` job and not wrapped in `continue-on-error`, precisely so that
 whichever way it goes (red or green) is independently visible in the
 Actions UI on every run, rather than being averaged into another job's
 status. It is **excluded from required status checks** (see below) so that
-if a future run does turn red — a real regression, a rule update, or new
-evidence — that alone cannot silently block a merge; a human needs to look
-at it.
+a red run — a real regression, a rule update, or new evidence — cannot
+silently block a merge; a human needs to look at it.
 
-If the Phase 1 leak is confirmed for real (e.g. by locating the exact commit
-by other means), resolving it requires:
+Removing the leaked values from history itself would still require:
 
-1. Rotating the exposed key at the provider.
+1. Rotating the exposed key at the provider (done for the findings above).
 2. Rewriting history (`git filter-repo` or BFG) to purge the blob from every
    affected commit.
 3. Force-pushing every affected ref, which invalidates every existing clone
@@ -201,7 +211,8 @@ by other means), resolving it requires:
 That is a destructive, cross-cutting, and irreversible-for-clones operation,
 deliberately not undertaken as a side effect of a CI-hardening pass — it
 needs a human to explicitly decide to take it on and coordinate with anyone
-holding a local clone.
+holding a local clone. The baseline makes it unnecessary for keeping the
+scan useful.
 
 ## Docker
 
@@ -285,11 +296,11 @@ Why each choice:
   all scope-required CI jobs), `Repo lints`, `cargo audit`, `cargo deny`,
   and `gitleaks (working tree)` are the jobs that are expected to actually pass
   on a healthy `main`.
-- **`gitleaks (full git history)` is deliberately NOT in this list.** It is
-  expected to stay red (see "Known exposure" in
-  [SECURITY.md](../SECURITY.md) and the `history-scan`/history section
-  above). Requiring it would either block every future merge forever, or
-  pressure someone into silencing a real finding — neither is acceptable.
+- **`gitleaks (full git history)` is deliberately NOT in this list.** It now
+  reports only findings outside the `.gitleaksignore` baseline (see
+  [SECURITY.md](../SECURITY.md) "Known exposure" and the `history-scan`
+  section above). Requiring it would let one new finding block every merge,
+  or pressure someone into baselining a real one — neither is acceptable.
   It stays present and visible in the Actions UI, not gating.
 - **`Dependency review (PR only)` is also NOT in this list**, even though
   it can now pass on a public repo (GHAS dependency review is free for
