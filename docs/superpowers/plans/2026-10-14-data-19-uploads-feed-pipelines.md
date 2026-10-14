@@ -276,6 +276,162 @@ checks the zone against the namespaces the same service lists before
 asking for tables, so a `silver` zone never fires a listing that would
 answer 404.
 
+### T5 — the gate proves it (`63e72e02`)
+
+`ops/g9/upload_test.py` step 10, plus the `g9-upload` CI job's
+`PIPELINE_RUN_TOKEN` and the `g9-test-runner` compose block that says
+why. Run locally as the CI job's sequence, from a clean project
+(`down -v`, build, `up -d --no-build`, `run --rm g9-test-runner`,
+`down -v`) with `.env` exactly as the job writes it:
+
+| Phase | Wall time |
+| --- | --- |
+| clean + build the two images (layers cached from this branch) | 6 m 01 s |
+| `up` (API, code location, webserver, daemon, iceberg-init) | 23 s |
+| **the gate itself** | **333 s (5 m 33 s)** |
+| whole sequence, clean project to `down -v` | 11 m 57 s |
+
+The gate's own last lines:
+
+```
+[g9] pipeline pl-g9-pipeline-…: bronze.g9_upload_900fe7d2 -> silver.g9_upload_900fe7d2_clean, depends on file_ingest_job
+[g9] ready: the orchestrator built authored__pl_g9_pipeline_…
+[g9] pipeline: triggered run …
+[g9] ready: the authored pipeline run succeeded
+[g9] pipeline: silver.g9_upload_900fe7d2_clean holds 4 rows, read from its Bronze source
+[g9] re-upload: up-… into g9_upload_900fe7d2 (one row changed)
+[g9] ready: the pipeline ran again after the re-upload
+[g9] the pipeline ran again without being triggered (1 -> 2 successful runs)
+[g9] ready: silver.g9_upload_900fe7d2_clean shows the changed row (9001)
+[g9] other table: g9_upload_900fe7d2_other loaded; watching 180s for a run that must not come
+[g9] other table: the pipeline did not run again (2 successful runs, unchanged)
+[g9] lineage: upload:up-… -> bronze.g9_upload_900fe7d2 -> silver.g9_upload_900fe7d2_clean ('deleted upload')
+[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it, another upload did not)
+[g9] PASS
+=== gate exit=0 wall=333s
+```
+
+`timeout-minutes` **did not have to rise**: the gate is 5 m 33 s of a
+25-minute job, and the whole local sequence (build included, which CI
+does not pay) was under 12 minutes. Stated here rather than changed.
+
+**Two bugs the gate found — one in itself, one pre-existing and
+blocking.**
+
+1. The gate's own first version waited for `status == "SUCCESS"` on
+   `GET /api/pipelines/{id}/runs`. That route speaks the API's own
+   vocabulary — `lakehouse_dagster::map_run_status` renders a
+   successful run as `completed` and a failure as `failed` — so the
+   first authored run, which had *succeeded*, was never seen. Fixed to
+   match the API's words, and a wait that ends with the pipeline's runs
+   still not completed now reports the statuses it saw.
+2. **Pre-existing, and the reason D1 could not have worked as written:**
+   `authored_factory.build_authored_dependency_sensor` read
+   `start_time`/`end_time` off what `instance.get_runs(...)` returns.
+   In Dagster 1.13.20 a run's times live on the storage RECORD
+   (`RunRecord.start_time`/`end_time`); `DagsterRun.__new__` takes no
+   `start_time` at all. Every tick of a real chain raised
+   `AttributeError: 'DagsterRun' object has no attribute 'start_time'`
+   and Dagster recorded the tick as a FAILURE, so **no authored chain
+   has fired on any deployed stack since the Dagster upgrade** — for
+   any upstream, not only the new one. The gate found it because
+   `GET /api/pipelines/{id}/schedule-ticks` reported `failed: true`;
+   reading the tick back through Dagster's own GraphQL
+   `instigationState.ticks` gave the message above. Fixed in `c273ba92`
+   (records, not runs) and pinned by a test that asserts the run has no
+   `start_time` while the record carries both times. `R3 plan 2a`'s
+   unit tests could not have caught it: their stub defined the
+   attributes the storage no longer puts there, so the stub no longer
+   offers `get_runs` at all.
+
+### T6 — docs (`cc6eb071`)
+
+`CHANGELOG.md` (customer-readable, limits included) and the module docs
+the change lives in: `routes::authored_pipelines` (the two rules every
+write is refused by, from the same three call sites),
+`lakehouse_store::uploads` (why a claim outliving its upload matters
+outside ownership), `authored_factory` (the per-table
+`file_ingest_job` upstream), `routes::lineage` (the edge-table row and
+the tenancy paragraph), `PipelineEditor` (the source step, and where the
+rules it delegates live), `ops/g9/upload_test.py` and the
+`g9-test-runner` compose block. `docs/core/` untouched — the planner's.
+
+### The full verification block, on the final commit
+
+Every heavy line ran under `/home/shiro/rantai/.heavy.lock`, from a
+warm shared `CARGO_TARGET_DIR`, in the foreground of one script each.
+
+| Line | Result |
+| --- | --- |
+| `cd rust && cargo fmt --check` | clean |
+| `cd rust && cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean, exit 0 |
+| `cd rust && cargo test --workspace --no-fail-fast` | **passed=4775 failed=0 ignored=8**, exit 0 |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 6 warnings (all pre-existing, none in a file this branch touches) |
+| frontend tests, per folder (`bun test <dir>/` for every directory holding a test; one whole-process `bun test src` reaches 7.2 GB and is OOM-killed on this machine) | **pass=1306 fail=0 skip=2** |
+| `python3 ops/lint/check_intra_package_imports.py` | OK: all intra-package imports resolve |
+| `python3 ops/lint/check_bare_iceberg_count.py` | R11 guard: no bare count() against a Bronze Iceberg table found |
+| `cd dagster && python -m pytest dispar_orchestrate -q` | **1051 passed, 0 failed**, 874 warnings, 15 m 24 s |
+| `docker compose --profile '*' config --quiet` | exit 0 |
+| the g9 gate, from a clean project | `[g9] PASS`, exit 0, 333 s (T5 above) |
+| `git status --short` | clean apart from this plan file |
+
+**One thing the reviewer should know about the first attempt.** The
+first full run failed for a reason that had nothing to do with this
+branch: the machine's disk was at 100% (`/dev/mapper/ubuntu--vg-ubuntu--lv`,
+502 G, 0 available), so every `lakehouse-store` test binary died with
+`failed to connect to setup test database: ... Connection reset by
+peer` (its testcontainer could not be created) and five
+`test_history_write_measurement.py` cases errored the same way. After
+reclaiming 56.69 GB of orphaned Docker volumes — no running container
+was touched; `docker volume prune` only removes volumes no container
+uses — both lines were re-run from scratch and are the results above.
+`test_history_write_measurement.py` on its own: 13 passed. No test,
+lint or threshold was changed to get there.
+
+### Commits, in plan order
+
+| # | Commit | What |
+| --- | --- | --- |
+| T1 | `1c9dc5b6` | D2 in the API: `validate_file_ingest_upstream` on create/update/restore |
+| T1 | `fcf64b6f` | the T1 checks into this handoff |
+| T2 | `1bfc5a70` | D5: `upload -> bronze` lineage edge from `upload_table_claim` |
+| T2 | `ef7bb7c8` | the T2 checks and the NULL-tenant answer |
+| T3 | `c44edc3e` | D1: the `file_ingest_job` upstream filtered by the table it loaded |
+| T3 | `28942870` | the run-config path proven on a real Dagster run |
+| T4 | `d2241ef0` | D3/D4: the re-upload switch and the source-table suggestions |
+| T4 | `897d8d84` | the T4 checks and the catalog-client answer |
+| T5 | `c273ba92` | T3 fix, found by the gate: run times live on the storage record |
+| T5 | `63e72e02` | the gate's step 10, the CI token, the compose note |
+| T6 | `cc6eb071` | CHANGELOG and the module docs |
+
+### Not verified, and what is left to the reviewer
+
+- **`ingest_job`'s coarse firing is untouched**, as the plan's section 5
+  requires: a connector run still fires every dependent that names it.
+  It is the planner's own backlog item, not this PR's.
+- **`D6` (no assistant change) is honoured**: `create_pipeline` still
+  takes no `dependsOn` and the tool schema was not regenerated. The
+  assistant can name an uploaded table as a source, as before.
+- **The switch's accepted direction is proven at the validator level,
+  not end to end through a live save** for the API's create/update
+  path: a route-level "accepted" test cannot exist without a live
+  Dagster job list, because `validate_depends_on` refuses `file_ingest_job`
+  as an unknown job when the orchestrator is unreachable. What is proven
+  is that the guard PASSES on a `bronze` source (the route then reaches
+  the store and answers 503, not the 400), and the g9 gate proves the
+  whole thing end to end on a real stack.
+- **The console is not covered by an end-to-end test**: the switch's
+  rules are unit-tested and its wiring is rendered in
+  `pipeline-create-page.test.tsx` against the real service clients with
+  only `fetch` stubbed. No browser or console CI gate exists for it.
+- **Suggestions cover Bronze only** (D4's answer in section 6). A
+  ClickHouse zone has no Iceberg namespace to list, so its field stays
+  free text with no suggestions; no API route was added for it.
+- **The `sensor skip reasons` a user sees** are asserted as text in the
+  unit tests and observed in the gate's tick history; no console page
+  renders them yet.
+
 ## 8. Review
 
 (Reviewer.)
