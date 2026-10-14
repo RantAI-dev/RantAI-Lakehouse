@@ -732,3 +732,18 @@ projects: once with images built WITHOUT `GIT_SHA` and
   `tests/lakehouse_maintenance.rs` (5 failures in the per-test database
   setup, `tests/common/mod.rs:127,130`); the suite passed 5/0 when re-run
   alone, and a `--no-fail-fast` workspace run is in progress.
+
+### Round 2 (planner/reviewer), at `ee0d663d`
+
+BLOCKER 1 fixed (`367f304c`) and proven on two clean stacks: without
+`GIT_SHA` and `G7_SOURCE_PROVENANCE=unavailable` the gate asserts the exact
+409 refusal and passes; with `GIT_SHA` and the default it checks the source
+text and passes. Reviewer re-ran the full block on the branch: Rust 97
+suites, 4752 passed, 0 failed, 8 ignored; frontend per folder 1284 / 0 / 2;
+`pytest` 1039 passed; lints and `compose config` pass. CI passed every
+check, including G3a then g7 and `ci-required`, except four also red on
+`main`: both `gitleaks` scans (`SEC-13`) and `cargo audit` / `cargo deny`
+(`rustls` advisories published 2026-10-14, now `SEC-30`). Nit for the next
+change to g7: its doc names `.local/build-images.sh`, which is not in the
+repo. No open BLOCKER; merged as PR #155 (`e2663378`).
+
