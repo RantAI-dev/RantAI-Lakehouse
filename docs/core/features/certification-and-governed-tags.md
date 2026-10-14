@@ -13,7 +13,7 @@
 | Started | 2026-10-09; also in `BACKLOG.md` Dates |
 | Shipped | Not yet |
 | Evidence | The pull request of each part |
-| Plan | Part 1: `docs/superpowers/plans/2026-10-09-data-12-part-1-certification.md`. Parts 2 and 3 get their own plans |
+| Plan | Part 1: `docs/superpowers/plans/2026-10-09-data-12-part-1-certification.md`. Parts 2 and 3: `docs/superpowers/plans/2026-10-14-data-12-parts-2-3-governed-tags-and-picker-marks.md` |
 
 ## Problem
 
@@ -102,13 +102,22 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | `DATA-12-AC7` | As a user with `catalog:write` but not `governance:write`, open a table | No control to set a mark; the description and tags can still be edited, and editing them does not change the mark | Not run |
 | `DATA-12-AC8` | (operator) As that user, call the certification route | 403; nothing is saved | Not run |
 | `DATA-12-AC9` | As a user without `catalog:read`, search | No tables and no marks | Not run |
+| `DATA-12-AC10` | As a user with `governance:write`, define a tag key `data_domain` with allowed values `finance` and `ops` | The key appears on the Tag keys page with its values | Not run |
+| `DATA-12-AC11` | As a user with `catalog:write` but not `governance:write`, give a table `data_domain: finance` from its page | Saved; the About card shows `data_domain: finance` beside the free tags | Not run |
+| `DATA-12-AC12` | Give that table `data_domain: revenue`, which is not an allowed value | Refused with a plain sentence naming the allowed values; nothing is saved | Not run |
+| `DATA-12-AC13` | Search `finance` in the ⌘K box and in the Data Explorer; also filter the Tags column by it | The table is found (reason line says tag `data_domain: finance`); the column shows the pair; the filter finds it | Not run |
+| `DATA-12-AC14` | On the same table, edit the free tags | Free tags still work beside the governed one; the governed pair is unchanged | Not run |
+| `DATA-12-AC15` | As a user with `governance:write`, delete the key `data_domain` while a table still uses it | Refused with the number of tables using it; after the value is removed from the table, the delete succeeds | Not run |
+| `DATA-12-AC16` | (operator) Without `governance:write`, call `POST /api/governance/tag-keys`; without `catalog:write`, send `governedTags` on the annotation route | Both 403; nothing is saved | Not run |
+| `DATA-12-AC17` | In the chart builder's picker, a certified Gold mart shows its mark, and choosing a deprecated one warns with the note and a link to its replacement; in Query Studio, a ClickHouse query reading a deprecated table marks it in its sources list | As described | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
 The product owner checked `DATA-12-AC1` to `AC6` on 2026-10-11 on a separate
 instance of this branch and reported them as expected. `AC7` to `AC9` need a
 user without `governance:write`; the planner ran `AC8` through the API (403).
-Not yet accepted: parts 2 and 3 add their rows.
+Rows `AC10` to `AC17` are parts 2 and 3 (planned
+2026-10-14); they are run after those parts are built.
 
 Exceptions, each with an owner and a date:
 

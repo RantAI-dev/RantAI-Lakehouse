@@ -1,0 +1,186 @@
+# `DATA-12` parts 2 and 3 — governed tags, and marks where tables are picked
+
+| | |
+| --- | --- |
+| Item | `DATA-12` (parts 2 and 3; part 1 is built and QA-checked) |
+| Branch / PR | `feat/data-12-certification-governed-tags`, PR #106 (Phase 2 master plan `2026-10-14-data-phase-2.md`) |
+| Base verified at | `bfed22fc` (2026-10-14): branch with `origin/main` at `07c76324` merged |
+| Decisions | Signed by the product owner 2026-10-09, feature page `docs/core/features/certification-and-governed-tags.md` rows 2–4; spec `docs/core/specs/data-12.md` marks **no** numbers *(proposed)* for these parts |
+| Developer | The non-Opus coding agent (per `AGENTS.md`); planner wrote this plan and reviews |
+
+## Decisions already made (signed 2026-10-09)
+
+- **Part 2.** Governed tags are added *beside* free tags. An admin defines tag
+  keys and the values each may take; a table gets `key = value` pairs that are
+  checked; free one-word tags stay and keep working (decision 2).
+- **Part 2 out.** A tag on a namespace applying to its tables is **not** built
+  (`DATA-22`, decision 3).
+- **Part 3.** Marks appear on Gold marts in the chart builder's data-source
+  picker, and on the sources Query Studio lists for a ClickHouse query. SQL
+  sources and the autocomplete are not marked (decision 4). On a deprecated
+  choice the user sees the warning (feature page items 8–9).
+- **Permissions, by analogy with part 1 (decision 1).** Defining keys is a
+  governance act → `governance:write`. Giving a table a value is an edit of the
+  table's annotation → `catalog:write`, riding today's annotation route.
+- **Spec targets.** `DATA-12-AC2` (a value outside the allowed list is refused),
+  tags visible "in search results, the Data Explorer list, the asset page, the
+  chart builder's table picker and Query Studio" (spec, Where tags show).
+
+## Planner decisions (not owner-signed; the reviewer may veto at review)
+
+- **Storage** — two tables in one migration `0070_governed_tags.sql`:
+  - `governed_tag_key(key TEXT PRIMARY KEY, allowed_values TEXT[] NOT NULL,
+    created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at
+    TIMESTAMPTZ NOT NULL)`.
+  - `asset_governed_tag(asset_id TEXT NOT NULL, tag_key TEXT NOT NULL REFERENCES
+    governed_tag_key(key) ON DELETE RESTRICT, value TEXT NOT NULL, set_by TEXT
+    NOT NULL, set_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (asset_id, tag_key))`.
+  - Bounds mirror the free-tag conventions (`annotation.rs:12-16`): key and
+    value match `^[a-z0-9][a-z0-9_-]*$`, 1–64 chars; at most 50 values per key;
+    at most 20 governed tags per table; `asset_id` ≤ 200; `created_by`/`set_by`
+    ≤ 128. Shape bounds go in CHECK constraints (defense in depth, `0062`
+    pattern); "value is in the key's allowed list" cannot be a CHECK — the
+    handler validates and the migration header says so.
+  - `ON DELETE RESTRICT` + a handler check that refuses deleting a key still in
+    use, with the count in the message: no silent tag loss.
+- **Routes** — `/api/governance/tag-keys`:
+  `GET` → `catalog:read` (editors need the list to render pickers; definitions
+  are not sensitive); `POST` and `PUT /{key}` and `DELETE /{key}` →
+  `governance:write`. `PUT` may change `allowed_values` only — a key is never
+  renamed; removing a value still assigned to any table is refused with the
+  count. Every row goes into `POLICY_TABLE` and is asserted both ways in
+  `tests/route_auth.rs`.
+- **Setting values on a table** — the body of `PUT /api/catalog/{id}/annotation`
+  (`catalog:write`, `policy.rs:194`) gains an optional `governedTags` object
+  (`{"data_domain": "finance"}`). Sending it replaces the table's full governed
+  set (same semantics as `tags`); omitting it changes nothing. The handler
+  validates: key exists, value allowed, ≤ 20 pairs — refusal names the offending
+  key and the allowed values. Store side: one statement replaces the table's
+  rows in the same transaction as the annotation upsert.
+- **Catalog overlay** — rows and detail carry `governedTags` (object, keys
+  sorted) next to `tags`, via the annotation overlay in
+  `routes/catalog.rs:1481-1490`; absent when empty, like part 1's fields.
+- **Search** — the matcher (`routes/catalog_search.rs:155-160`) indexes
+  governed pairs as `key: value`: matches on the key, the value, or the pair;
+  `matchedOn.field` stays `"tag"`, `matchedOn.value` is `"key: value"`. The
+  Data Explorer's existing `tags` filter (`filter_assets_by_query_matches`) and
+  the Tags column match governed pairs too.
+- **Part 3 surfaces** — `GET /api/dashboard/fields` (`dashboard.rs:678`) adds
+  the part-1 certification fields to each mart, read from the annotation
+  overlay (`list_all`); the chart builder shows the mark in the picker row and
+  a warning banner when the chosen mart is deprecated (note + link to the
+  replacement). The ClickHouse estimate transparency payload
+  (`routes/query.rs:745`, `sources_out`) enriches each source with the same
+  fields; `query-transparency-panel.tsx:174` renders mark + warning.
+- **Assistant parity (part 3)** — the `describe_mart` tool's answer includes
+  the certification fields, so the assistant can say a mart is deprecated;
+  `tests/fixtures/tool_schemas.json` is regenerated; the AI team reviews this
+  part (master plan).
+
+## Anchors (verified at `bfed22fc`)
+
+| Anchor | What |
+| --- | --- |
+| `rust/crates/lakehouse-store/src/annotation.rs:92` | `upsert_annotation` — the annotation write to extend |
+| `rust/crates/lakehouse-store/src/annotation.rs:167,200` | `set_certification` / `clear_certification` — the part-1 statement pattern to follow |
+| `rust/crates/lakehouse-api/src/routes/catalog.rs:1481-1490` | annotation overlay onto catalog rows (`tags`, then part-1 fields) |
+| `rust/crates/lakehouse-api/src/routes/catalog.rs:2785` | part-1 route section header (`PUT /api/catalog/{id}/certification`) — model for the tag-keys section |
+| `rust/crates/lakehouse-api/src/policy.rs:193-198` | annotation and certification policy rows — neighbours for the new rows |
+| `rust/crates/lakehouse-api/src/routes/catalog_search.rs:155-160` | tag indexing in the search matcher |
+| `rust/crates/lakehouse-api/src/routes/mod.rs:729-730` | annotation route registration |
+| `rust/crates/lakehouse-api/src/routes/dashboard.rs:678` | `fields` handler (marts list) |
+| `rust/crates/lakehouse-api/src/routes/query.rs:745` | `"sources": sources_out` in the estimate transparency payload |
+| `src/features/catalog/asset-about.tsx:36,66` | `parseTags` and the free-tags editor on the About card |
+| `src/features/catalog/data-explorer-columns.tsx:61,116,178-200` | certification filter options, certification cell, tags column and filter |
+| `src/features/dashboards/chart-builder.tsx:221,358,378` | marts state, picker options, `/api/dashboard/fields` fetch |
+| `src/features/queries/query-transparency-panel.tsx:174` | the sources list render |
+| `src/services/contracts/queries.ts:73` | `sources: string[]` contract |
+| `src/app/(governance)/governance/policies` | route under which the Tag keys page is added as a sibling (`tag-keys`) |
+| `rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json` | tool schemas fixture to regenerate |
+
+## Tasks (one commit each, in order)
+
+Each task names its scoped check (master plan: only what changed). A task whose
+acceptance check fails stops the developer; mismatches between plan and code
+are reported, not improvised (`AGENTS.md`, developer role).
+
+1. **Migration and store.** `rust/migrations/0070_governed_tags.sql` (why-header
+   citing spec and this plan); store statements in a new
+   `rust/crates/lakehouse-store/src/governed_tag.rs`: `create_key`, `list_keys`,
+   `update_key_values`, `delete_key` (refused when in use, count returned),
+   `set_asset_tags` (replace-one-transaction), `list_for_asset`,
+   `list_for_assets` (batch for overlays). No `unwrap`/`expect`; `# Errors` on
+   every `Result` fn. Check: `cargo fmt --check` then
+   `cargo clippy -p lakehouse-store --all-targets -- -D warnings` then
+   `cargo test -p lakehouse-store`. Acceptance: store tests cover the value
+   bounds, the in-use delete refusal, and replace semantics.
+2. **Tag-keys routes.** Handlers in the governance routes module;
+   `POLICY_TABLE` rows; `tests/route_auth.rs` asserts all four both ways;
+   validation (pattern, lengths, ≤ 50 values) with 400s naming the field;
+   audit events `governance.tag_key_create`, `..._update`, `..._delete`.
+   Check: `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+   `cargo test -p lakehouse-api tag_key`. Acceptance: 403 without
+   `governance:write` on the three writes; `GET` works with `catalog:read`.
+3. **Governed tags on the annotation route and overlay.** `governedTags` in the
+   annotation PUT body + validation; overlay onto rows and detail; store tests
+   and handler tests; the deprecation notice copy stays untouched. Check:
+   `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+   `cargo test -p lakehouse-api governed`. Acceptance: value not in the
+   allowed list → 400 naming key and allowed values; unknown key → 400;
+   omitting `governedTags` changes nothing (regression test beside the part-1
+   "saving details never changes a mark" one).
+4. **Search and the Data Explorer filter.** Matcher indexes governed pairs;
+   `matchedOn` value `"key: value"`; the server-side `tags` filter matches
+   governed pairs; tests beside `a_tag_finds_its_table`
+   (`catalog_search.rs:411`). Check: `cargo test -p lakehouse-api search` +
+   clippy. Acceptance: a search on the value alone, the key alone, and the pair
+   each find the table; `matchedOn` shows `data_domain: finance`.
+5. **Frontend contracts and Tag keys page.** `assets.ts` gains `governedTags`
+   (`type`, camelCase); a `tagKeys` client in `services` (imports `@/services`
+   only from features); governance feature page `tag-keys-page.tsx` (list,
+   create, edit values, delete with the in-use refusal shown) mounted at
+   `src/app/(governance)/governance/tag-keys`; sidebar entry beside Policies.
+   Check: `bun run typecheck && bun run lint && bun run test`. Acceptance:
+   create/edit/delete flows refuse what the API refuses, with the API's
+   sentence.
+6. **About card display and editor.** Governed pairs shown beside free tags as
+   `key: value` chips; in the editor, one select per key (allowed values +
+   "none") beside the free-tags input; free-tag editing unchanged. Check: bun
+   trio. Acceptance: a `catalog:write` user picks a value outside the list —
+   impossible in the UI — and sees the API's refusal if the list changed under
+   them (stale-allowed-values case shows the 400 sentence).
+7. **Data Explorer column and filter.** Tags cell renders governed pairs as
+   `key: value` chips beside free tags; the tags filter matches them. Check:
+   bun trio. Acceptance: filter `finance` finds the table; the column shows
+   both tag kinds.
+8. **Part 3, API.** Certification fields on `fields` marts and on transparency
+   `sources`; handler tests for both; batch annotation read, no N+1 per source.
+   Check: `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+   `cargo test -p lakehouse-api`. Acceptance: a deprecated mart reaches the
+   picker payload with note and replacement id; a Trino query's sources are
+   unchanged (ClickHouse only — spec, Not included).
+9. **Part 3, console.** Picker rows show the mark; choosing a deprecated mart
+   shows the warning banner (note + link); transparency panel renders marks and
+   the warning. Check: bun trio. Acceptance: feature page items 8–9 doable.
+10. **Assistant parity.** `describe_mart` includes the fields; regenerate
+    `tests/fixtures/tool_schemas.json`; note for the AI-team review in the
+    handoff. Check: `cargo test -p lakehouse-api describe_mart` + fixture
+    regeneration command quoted in the handoff. Acceptance: the fixture diff
+    shows only the intended schema change.
+11. **Handoff.** Full verification block (master plan; languages touched:
+    Rust, TS) in the foreground; append the Handoff entry to this plan
+    (commits, commands with counts, anything *not verified* and why); push so
+    CI runs on #106.
+
+## Out of scope
+
+- Namespace inheritance (`DATA-22`); tag-based masking; ranking certified
+  tables higher in search; marks on dashboard SQL sources, on Trino sources and
+  in autocomplete (feature page, Not included).
+- A tag on a Gold mart *as a governed-tag example* is not staged by this work;
+  the acceptance steps use whatever tables the console already has.
+
+## Acceptance rows this part adds to the feature page
+
+`DATA-12-AC10` … `AC17` (drafted by the planner on the feature page in the same
+commit as this plan; the owner runs them after QA).
