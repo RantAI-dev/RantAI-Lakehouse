@@ -1,0 +1,41 @@
+# gitleaks baseline for the full-history scan (`history-scan` in
+# .github/workflows/security.yml). SEC-1, plan:
+# docs/superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md
+#
+# Each entry is one exact fingerprint (commit:file:rule:line), so the same
+# secret in a new commit, or any new secret, still turns the scan red. Never
+# add a wildcard or a file-wide entry here. gitleaks reads this file from
+# `--source` (and from the working directory); full-line `#` comments and
+# blank lines are skipped (gitleaks v8.30.1, detect/detect.go
+# AddGitleaksIgnore).
+
+# Staging tokens and a staging secret once committed in `.env.staging`.
+# Rotated (product owner, 2026-10-14); SEC-13 (#130) moves the values to
+# repository secrets `STAGING_*`. SEC-1, SEC-13.
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:21
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:22
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:23
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:24
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:25
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:26
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:35
+
+# Internal LLM node API key once in `src/services/clients/llm.ts`.
+# Rotated (product owner, 2026-10-14). SEC-1, SEC-13.
+8ac6ee2a016e40212576ec7bc878b8776023acd6:src/services/clients/llm.ts:rantai-llm-node-api-key:9
+
+# Private LAN addresses in old commits. Not secrets; none of these files
+# holds them today. SEC-1.
+8ac6ee2a016e40212576ec7bc878b8776023acd6:src/services/clients/llm.ts:rantai-internal-lan-host:7
+c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rantai-internal-lan-host:11
+7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/services/clients/dagster.ts:rantai-internal-lan-host:6
+7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/app/api/ops/[kind]/route.ts:rantai-internal-lan-host:108
+27d1e2b03051809ce87b55c4a288b9e26f614e1d:src/app/api/ai/build-status/route.ts:rantai-internal-lan-host:5
+
+# False positive: a test token literal, gone since #129. SEC-1.
+31ec837b57ed05740727360c1a64fb3cf3d2dedc:dagster/dispar_orchestrate/test_schema_observer.py:generic-api-key:26
+
+# False positive on branch `feat/phase-1-rest` (#144):
+# `password=matrix.CONNECTOR_MYSQL_PASSWORD` is a reference to a CI fixture
+# constant, not a value. The history scan reads every branch. SEC-1.
+4ae1bcdda704797129801f537899cf527035c6ba:ops/g6/src11_connector_operations_test.py:generic-api-key:576
