@@ -2950,7 +2950,9 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// name uploads have reserved, or the save re-points the connector without
 /// every credential slot ([`REPOINT_NEEDS_CREDENTIALS`]); 401 if
 /// credentials arrive without a principal; 422 if the probe dialled and the
-/// source rejected the credentials; 503/500 as above.
+/// source rejected the credentials, or if `excludedColumns` is set for a
+/// source type that cannot list its columns or names a key or cursor column
+/// (`SRC-11`; a malformed `excludedColumns` is a 400); 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -2978,6 +2980,19 @@ pub async fn ingest_spec_put(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-11` decisions D9 to D11: columns left out of a load. A malformed
+    // list is a 400; a source that cannot list its columns, and a key or
+    // cursor column, are well-formed requests the product refuses: 422, with
+    // the fixed text of the error (it names only the object and a column the
+    // request itself named).
+    lakehouse_store::ingest_spec::validate_excluded_columns(&dial, &body.source_objects).map_err(
+        |err| match err {
+            lakehouse_store::ingest_spec::InvalidExcludedColumns::BadList { .. } => {
+                ApiError::BadRequest(err.to_string())
+            }
+            _ => ApiError::Unprocessable(err.to_string()),
+        },
+    )?;
 
     // SEC-14: decide whether this save re-points the connector BEFORE the
     // address check below, which resolves the new host. A re-point without

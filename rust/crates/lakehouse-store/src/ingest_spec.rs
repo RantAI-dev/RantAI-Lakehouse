@@ -1036,6 +1036,13 @@ pub struct SourceObject {
     /// can hold on to a detected key while the user switches modes.
     #[serde(default)]
     pub primary_key: Option<Vec<String>>,
+    /// The columns of the source table the load leaves out (`SRC-11`
+    /// decisions D9 to D12). Stored as what is left OUT, not what is kept, so
+    /// a column that appears at the source later follows the connector's
+    /// schema-change policy instead of being left out silently. Absent or
+    /// empty: nothing is left out. See [`validate_excluded_columns`].
+    #[serde(default)]
+    pub excluded_columns: Option<Vec<String>>,
     /// The Bronze target this object lands at.
     pub target: String,
 }
@@ -1239,6 +1246,198 @@ pub fn validate_load_modes(
         }
     }
     Ok(())
+}
+
+/// The most columns an object may leave out (`SRC-11`); generous for any
+/// table.
+const MAX_EXCLUDED_COLUMNS: usize = 2000;
+
+/// Why a source object's `excludedColumns` cannot be saved (`SRC-11`
+/// decisions D9 and D11). The route answers [`Self::BadList`] with 400 and the
+/// others with 422; every text is fixed, and names only the object and a
+/// column the request itself named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidExcludedColumns {
+    /// Not a list of at most 2,000 distinct, non-blank column names of at
+    /// most 128 characters without control characters.
+    #[error(
+        "source object {name:?} has an excludedColumns that is not a list of distinct, \
+         non-blank column names of at most 128 characters without control characters"
+    )]
+    BadList {
+        /// The source object's name.
+        name: String,
+    },
+    /// The source cannot list its columns before loading (`SRC-11` decision
+    /// D9): only `PostgreSQL`, `MySQL`, `MariaDB` and SQL Server can.
+    #[error(
+        "source object {name:?} leaves columns out, which is not available for this source type"
+    )]
+    NotForSource {
+        /// The source object's name.
+        name: String,
+    },
+    /// A key column of a deduplicating or history table (`SRC-11` decision
+    /// D11): the table cannot identify its rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is part of the table's key")]
+    NamesKeyColumn {
+        /// The source object's name.
+        name: String,
+        /// The key column that was named.
+        column: String,
+    },
+    /// The cursor column of an incremental table (`SRC-11` decision D11): the
+    /// load cannot find new rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is the cursor column")]
+    NamesCursorColumn {
+        /// The source object's name.
+        name: String,
+        /// The cursor column that was named.
+        column: String,
+    },
+}
+
+/// Whether the dial's source can list its columns before loading, so that
+/// column choice is offered for it (`SRC-11` decision D9): the `sql` adapter
+/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver. Oracle
+/// follows with `SRC-13`; change-capture and every other adapter are out.
+#[must_use]
+pub const fn supports_column_choice(dial: &Dial) -> bool {
+    matches!(
+        dial,
+        Dial::Sql(SqlDial {
+            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
+            ..
+        })
+    )
+}
+
+/// `object`'s `excludedColumns` as names, `Ok(None)` when absent, null or
+/// empty (nothing left out).
+fn excluded_names(
+    object: &serde_json::Value,
+    name: &str,
+) -> Result<Option<Vec<String>>, InvalidExcludedColumns> {
+    let bad = || InvalidExcludedColumns::BadList {
+        name: name.to_owned(),
+    };
+    let list = match object.get("excludedColumns") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(list)) => list,
+        Some(_) => return Err(bad()),
+    };
+    if list.len() > MAX_EXCLUDED_COLUMNS {
+        return Err(bad());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::with_capacity(list.len());
+    for column in list {
+        let Some(column) = column.as_str() else {
+            return Err(bad());
+        };
+        if column.trim().is_empty()
+            || column.len() > MAX_PRIMARY_KEY_COLUMN_LEN
+            || column.chars().any(char::is_control)
+            || !seen.insert(column)
+        {
+            return Err(bad());
+        }
+        names.push(column.to_owned());
+    }
+    Ok((!names.is_empty()).then_some(names))
+}
+
+/// Check each source object's `excludedColumns` at save time (`SRC-11`
+/// decisions D9 to D11): well-formed, only for a source that can list its
+/// columns ([`supports_column_choice`]), and never naming a key column of a
+/// deduplicating or history table or the cursor column of an incremental one.
+///
+/// What this cannot check is that a named column exists: the columns are
+/// read from the source at load time, and a name the source does not have
+/// simply leaves nothing out.
+///
+/// # Errors
+///
+/// Returns [`InvalidExcludedColumns`] for the first object that breaks a rule.
+pub fn validate_excluded_columns(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidExcludedColumns> {
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(excluded) = excluded_names(object, name)? else {
+            continue;
+        };
+        if !supports_column_choice(dial) {
+            return Err(InvalidExcludedColumns::NotForSource {
+                name: name.to_owned(),
+            });
+        }
+        let mode = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok());
+        if mode.is_some_and(LoadMode::needs_key) {
+            let key = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str);
+            for column in key {
+                if excluded.iter().any(|e| e == column) {
+                    return Err(InvalidExcludedColumns::NamesKeyColumn {
+                        name: name.to_owned(),
+                        column: column.to_owned(),
+                    });
+                }
+            }
+        }
+        if mode.is_some_and(LoadMode::is_incremental) {
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if excluded.iter().any(|e| e == cursor) {
+                return Err(InvalidExcludedColumns::NamesCursorColumn {
+                    name: name.to_owned(),
+                    column: cursor.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `(object, column)` pairs that are to be marked inactive: the columns
+/// left out of a table that KEEPS its rows (`append`, `incremental`,
+/// `incremental_dedup`, `history`), where a left-out column stays in the
+/// Bronze table with no new values (`SRC-11` decision D10). In a table the
+/// next load replaces (`replace`, `replace_dedup`, or no mode) the column is
+/// gone after the load and nothing is marked. Lenient like [`dedup_keys`]:
+/// a stored spec has passed [`validate_excluded_columns`].
+#[must_use]
+pub fn inactive_exclusions(source_objects: &serde_json::Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let keeps_rows = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(|mode| !matches!(mode, LoadMode::Replace | LoadMode::ReplaceDedup));
+        if !keeps_rows {
+            continue;
+        }
+        let Ok(Some(excluded)) = excluded_names(object, name) else {
+            continue;
+        };
+        pairs.extend(excluded.into_iter().map(|column| (name.to_owned(), column)));
+    }
+    pairs
 }
 
 /// The key columns of every object whose stored load mode has a key (the
@@ -1747,6 +1946,7 @@ mod tests {
             incremental_key: None,
             load_mode: None,
             primary_key: None,
+            excluded_columns: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1760,6 +1960,7 @@ mod tests {
             incremental_key: Some("updated_at".to_owned()),
             load_mode: Some(LoadMode::Incremental),
             primary_key: None,
+            excluded_columns: None,
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
@@ -2886,5 +3087,195 @@ mod target_identity_tests {
             &with("sql", &stored, "host", json!("other.internal"))
         ));
         assert!(is_repoint(Some("sql"), &stored, &parse("rest", &rest())));
+    }
+
+    fn sql_dial_of(driver: &str) -> Dial {
+        Dial::parse(
+            "sql",
+            &serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            }),
+        )
+        .expect("valid sql dial")
+    }
+
+    /// `SRC-11` D9: column choice for the four sources that list columns
+    /// before loading; a refusal for Oracle, change capture and the rest.
+    #[test]
+    fn excluded_columns_are_accepted_only_for_sources_that_list_their_columns() {
+        let objects = serde_json::json!([
+            { "name": "public.orders", "target": "orders", "excludedColumns": ["note"] }
+        ]);
+        for driver in ["postgres", "mysql", "mssql"] {
+            assert_eq!(
+                validate_excluded_columns(&sql_dial_of(driver), &objects),
+                Ok(()),
+                "{driver}"
+            );
+        }
+        let refused = Err(InvalidExcludedColumns::NotForSource {
+            name: "public.orders".to_owned(),
+        });
+        assert_eq!(
+            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
+            refused
+        );
+        let cdc = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader",
+                "slotName": "orders_slot", "publicationName": "orders_pub"
+            }),
+        )
+        .expect("valid cdc dial");
+        assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
+        assert!(supports_column_choice(&sql_dial_of("postgres")));
+        assert!(!supports_column_choice(&cdc));
+    }
+
+    /// An object that leaves nothing out is fine for every source: the field
+    /// absent, null and an empty list all mean "nothing".
+    #[test]
+    fn leaving_nothing_out_is_accepted_for_every_source() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a" },
+            { "name": "b", "target": "b", "excludedColumns": null },
+            { "name": "c", "target": "c", "excludedColumns": [] },
+        ]);
+        assert_eq!(
+            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
+            Ok(())
+        );
+        assert!(inactive_exclusions(&objects).is_empty());
+    }
+
+    /// `SRC-11` D11: a key column of a deduplicating or history table and the
+    /// cursor column cannot be left out; other columns can.
+    #[test]
+    fn excluded_columns_refuse_the_key_and_the_cursor() {
+        let dial = sql_dial_of("postgres");
+        let refuse = |object: serde_json::Value| {
+            validate_excluded_columns(&dial, &serde_json::json!([object]))
+        };
+        for mode in ["replace_dedup", "incremental_dedup", "history"] {
+            let mut object = serde_json::json!({
+                "name": "t", "target": "t", "loadMode": mode,
+                "primaryKey": ["id"], "excludedColumns": ["note", "id"]
+            });
+            if mode == "incremental_dedup" {
+                object["incrementalKey"] = serde_json::json!("updated_at");
+            }
+            assert_eq!(
+                refuse(object),
+                Err(InvalidExcludedColumns::NamesKeyColumn {
+                    name: "t".to_owned(),
+                    column: "id".to_owned()
+                }),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+            })),
+            Err(InvalidExcludedColumns::NamesCursorColumn {
+                name: "t".to_owned(),
+                column: "updated_at".to_owned()
+            })
+        );
+        // A key is only a key in a mode that reads it: a plain replace may
+        // leave out the column the console remembered as a detected key.
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "replace",
+                "primaryKey": ["id"], "excludedColumns": ["id"]
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["note"]
+            })),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn excluded_columns_must_be_a_short_list_of_plain_distinct_names() {
+        let dial = sql_dial_of("mysql");
+        let long = "x".repeat(129);
+        let many: Vec<String> = (0..2001).map(|n| format!("c{n}")).collect();
+        for bad in [
+            serde_json::json!("note"),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!(["a", "a"]),
+            serde_json::json!(["a\nb"]),
+            serde_json::json!([long]),
+            serde_json::json!(many),
+        ] {
+            assert!(
+                matches!(
+                    validate_excluded_columns(
+                        &dial,
+                        &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": bad }])
+                    ),
+                    Err(InvalidExcludedColumns::BadList { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // Names are compared as written: a case difference is two columns.
+        assert_eq!(
+            validate_excluded_columns(
+                &dial,
+                &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": ["a", "A"] }])
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-11` D10: only a table that keeps its rows gets the inactive mark.
+    #[test]
+    fn only_a_table_that_keeps_its_rows_marks_a_left_out_column_inactive() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "append", "excludedColumns": ["x"] },
+            { "name": "b", "target": "b", "loadMode": "replace", "excludedColumns": ["x"] },
+            { "name": "c", "target": "c", "excludedColumns": ["x"] },
+            { "name": "d", "target": "d", "loadMode": "replace_dedup",
+              "primaryKey": ["id"], "excludedColumns": ["x"] },
+            { "name": "e", "target": "e", "loadMode": "history",
+              "primaryKey": ["id"], "excludedColumns": ["x", "y"] },
+            { "name": "f", "target": "f", "loadMode": "incremental_dedup",
+              "primaryKey": ["id"], "incrementalKey": "u", "excludedColumns": ["z"] },
+        ]);
+        assert_eq!(
+            inactive_exclusions(&objects),
+            vec![
+                ("a".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "y".to_owned()),
+                ("f".to_owned(), "z".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_object_reads_excluded_columns_and_defaults_to_none() {
+        let with: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders", "excludedColumns": ["note"]
+        }))
+        .expect("valid");
+        assert_eq!(with.excluded_columns, Some(vec!["note".to_owned()]));
+        let without: SourceObject = serde_json::from_value(
+            serde_json::json!({ "name": "public.orders", "target": "orders" }),
+        )
+        .expect("valid");
+        assert_eq!(without.excluded_columns, None);
     }
 }

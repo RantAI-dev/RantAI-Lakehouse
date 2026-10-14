@@ -1306,6 +1306,16 @@ async fn save_ingest_spec_in(
     // the tables that just left it are cleared in the same transaction.
     let removed = removed_object_names(&stored_objects, &spec.source_objects);
     crate::schema_change::clear_removed_tables_in(tx, id, &removed).await?;
+    // `SRC-11` D10: the columns left out of a table that keeps its rows are
+    // marked inactive, and a column ticked again is cleared, in the same
+    // transaction as the spec that says so.
+    crate::schema_change::sync_excluded_columns_in(
+        tx,
+        id,
+        &crate::ingest_spec::inactive_exclusions(&spec.source_objects),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
     Ok(ingest_spec_from_row(row))
 }
 
