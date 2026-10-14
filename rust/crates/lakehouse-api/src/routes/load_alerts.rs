@@ -432,59 +432,9 @@ pub(super) async fn connector_run_event(
     let mut matched = 0;
     match outcome {
         Outcome::Failure => {
-            let text = format!("{who} run {} failed. View: {link}", req.run_id);
-            matched += deliver_with_rules(
-                state,
-                pool,
-                &rules,
-                (AlertKind::ConnectorFailure, &connector.id),
-                "Connector run failed",
-                &text,
-                Some(CONNECTOR_SOURCE),
-            )
-            .await;
-            // The run's own streak (kept on its dedupe row), not the
-            // connector's current one: a retry of the third run's report
-            // still fires "3 in a row", once, and a later run's streak
-            // never fires it for this one.
-            if recorded.failure_streak == Some(REPEATED_FAILURE_STREAK) {
-                let text = format!(
-                    "{who} has failed {REPEATED_FAILURE_STREAK} runs in a row; the latest is run {}. View: {link}",
-                    req.run_id
-                );
-                matched += deliver_with_rules(
-                    state,
-                    pool,
-                    &rules,
-                    (AlertKind::ConnectorRepeatedFailure, &connector.id),
-                    "Connector failing repeatedly",
-                    &text,
-                    Some(CONNECTOR_SOURCE),
-                )
-                .await;
-            }
-            // `SRC-11` D3: the run whose failure paused the connector raises
-            // `connector_disabled`, once. `auto_disabled` is the run's own
-            // fact (kept for its retries, like the streak above), so a
-            // rule-store failure on this report still delivers on the retry,
-            // and no other run delivers it.
-            if recorded.auto_disabled {
-                let text = format!(
-                    "{who} was paused after {} failed runs in a row; the latest is run {}. \
-                     Resume it from its page once the cause is fixed. View: {link}",
-                    state.config.connector_auto_disable_after, req.run_id
-                );
-                matched += deliver_with_rules(
-                    state,
-                    pool,
-                    &rules,
-                    (AlertKind::ConnectorDisabled, &connector.id),
-                    "Connector paused",
-                    &text,
-                    Some(CONNECTOR_SOURCE),
-                )
-                .await;
-            }
+            matched +=
+                deliver_failure_alerts(state, pool, &rules, &connector, &recorded, &req.run_id)
+                    .await;
         }
         Outcome::Success => {
             let text = format!("{who} run {} succeeded. View: {link}", req.run_id);
@@ -501,6 +451,77 @@ pub(super) async fn connector_run_event(
         }
     }
     Ok(json!({ "matched": matched }))
+}
+
+/// The alerts of a failed connector run: `connector_failure`, then
+/// `connector_repeated_failure` on the run that makes the streak three, then
+/// `connector_disabled` on the run that paused the connector. Split out of
+/// [`connector_run_event`] (`SRC-11` review 1 BLOCKER 1, `too_many_lines`);
+/// returns the number of matched rules.
+async fn deliver_failure_alerts(
+    state: &AppState,
+    pool: &PgPool,
+    rules: &[AlertRule],
+    connector: &ConnectorRef,
+    recorded: &connectors::RunRecord,
+    run_id: &str,
+) -> usize {
+    let link = format!("/connectors/{}", connector.id);
+    let who = format!("Connector {} ({})", connector.name, connector.id);
+    let mut matched = 0;
+    let text = format!("{who} run {run_id} failed. View: {link}");
+    matched += deliver_with_rules(
+        state,
+        pool,
+        rules,
+        (AlertKind::ConnectorFailure, &connector.id),
+        "Connector run failed",
+        &text,
+        Some(CONNECTOR_SOURCE),
+    )
+    .await;
+    // The run's own streak (kept on its dedupe row), not the
+    // connector's current one: a retry of the third run's report
+    // still fires "3 in a row", once, and a later run's streak
+    // never fires it for this one.
+    if recorded.failure_streak == Some(REPEATED_FAILURE_STREAK) {
+        let text = format!(
+            "{who} has failed {REPEATED_FAILURE_STREAK} runs in a row; the latest is run {run_id}. View: {link}"
+        );
+        matched += deliver_with_rules(
+            state,
+            pool,
+            rules,
+            (AlertKind::ConnectorRepeatedFailure, &connector.id),
+            "Connector failing repeatedly",
+            &text,
+            Some(CONNECTOR_SOURCE),
+        )
+        .await;
+    }
+    // `SRC-11` D3: the run whose failure paused the connector raises
+    // `connector_disabled`, once. `auto_disabled` is the run's own
+    // fact (kept for its retries, like the streak above), so a
+    // rule-store failure on this report still delivers on the retry,
+    // and no other run delivers it.
+    if recorded.auto_disabled {
+        let text = format!(
+            "{who} was paused after {} failed runs in a row; the latest is run {}. \
+             Resume it from its page once the cause is fixed. View: {link}",
+            state.config.connector_auto_disable_after, run_id
+        );
+        matched += deliver_with_rules(
+            state,
+            pool,
+            rules,
+            (AlertKind::ConnectorDisabled, &connector.id),
+            "Connector paused",
+            &text,
+            Some(CONNECTOR_SOURCE),
+        )
+        .await;
+    }
+    matched
 }
 
 /// A failed `file_ingest_job` run: settle the upload as failed (nobody has to

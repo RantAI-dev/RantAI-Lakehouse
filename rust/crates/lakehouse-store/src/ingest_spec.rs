@@ -2657,7 +2657,10 @@ mod target_identity_tests {
 
     use serde_json::{Value, json};
 
-    use super::{Dial, is_repoint};
+    use super::{
+        Dial, InvalidExcludedColumns, SourceObject, inactive_exclusions, is_repoint,
+        supports_column_choice, validate_excluded_columns,
+    };
 
     fn parse(adapter: &str, dial: &Value) -> Dial {
         Dial::parse(adapter, dial).expect("a valid dial")

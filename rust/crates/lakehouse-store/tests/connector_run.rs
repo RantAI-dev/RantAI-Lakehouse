@@ -17,12 +17,7 @@ use time::{Duration, OffsetDateTime};
 const PG: &str = "conn-pg-lakehouse";
 const S3: &str = "conn-s3-warehouse";
 
-fn failed<'a>(
-    table: &'a str,
-    attempt: i32,
-    at: OffsetDateTime,
-    wait: Option<i32>,
-) -> AttemptReport<'a> {
+fn failed(table: &str, attempt: i32, at: OffsetDateTime, wait: Option<i32>) -> AttemptReport<'_> {
     AttemptReport {
         table,
         attempt,

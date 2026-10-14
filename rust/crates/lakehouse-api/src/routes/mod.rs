@@ -452,16 +452,11 @@ fn overview_alerts_router() -> Router<AppState> {
         )
 }
 
-/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
-/// `clippy::too_many_lines` reason as [`pipelines_router`].
-///
-/// Every `/api/connectors/{id}/*` route sits behind
-/// [`connectors::require_connector_in_tenants`]: the caller must belong to
-/// the connector's tenant. `PUT .../tenant` stays outside it — it is
-/// identity administration (`identity:write`), and the only way a
-/// connector with no tenant gets one.
-fn connectors_router(state: &AppState) -> Router<AppState> {
-    let per_connector = Router::new()
+/// The tenant-gated half of [`connectors_router`], split out of it for
+/// `clippy::too_many_lines` (`SRC-11` review 1 BLOCKER 1), the same way
+/// [`pipelines_router`] is split from its parent.
+fn per_connector_router(state: &AppState) -> Router<AppState> {
+    Router::new()
         .route(
             "/api/connectors/{id}",
             get(connectors::detail)
@@ -529,7 +524,19 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route_layer(from_fn_with_state(
             state.clone(),
             connectors::require_connector_in_tenants,
-        ));
+        ))
+}
+
+/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+///
+/// Every `/api/connectors/{id}/*` route sits behind
+/// [`connectors::require_connector_in_tenants`]: the caller must belong to
+/// the connector's tenant. `PUT .../tenant` stays outside it — it is
+/// identity administration (`identity:write`), and the only way a
+/// connector with no tenant gets one.
+fn connectors_router(state: &AppState) -> Router<AppState> {
+    let per_connector = per_connector_router(state);
     Router::new()
         .route(
             "/api/connectors",
