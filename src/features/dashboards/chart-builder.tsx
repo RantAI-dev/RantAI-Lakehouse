@@ -3,8 +3,8 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
-  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
+  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
+  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
@@ -49,7 +50,7 @@ import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
-  effectiveOrder, emptyShapeDraft, entriesFromRows, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
+  effectiveOrder, emptyShapeDraft, entriesFromRows, columnRef, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
   rowsFromEntries, shapeDraftFromDef, takesBin, shapePayload, shapeProblems, sortOptions, stepsApply, usesGroupings, columnsAfterSteps,
   type MeasureRow, type ResultColumns, type ShapeDefFields, type ShapeDraft,
 } from "@/lib/chart-shape";
@@ -68,8 +69,10 @@ import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
-import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
-import { BuilderSection, FoldSection } from "./builder-sections";
+import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
+import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
+import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import { FormulaEditorDialog } from "./formula-editor";
@@ -320,20 +323,16 @@ export function ChartBuilder({
   const [editingGroup, setEditingGroup] = React.useState<CalcField | undefined>(undefined);
   const [hierarchyOpen, setHierarchyOpen] = React.useState(false);
   const [editingHierarchy, setEditingHierarchy] = React.useState<Hierarchy | undefined>(undefined);
-  /** A calculated field is marked "fx" wherever a column is picked. */
-  // A joined column (`table__column`, BI-7) reads `table.column`.
-  const fieldLabel = (name: string) => isMetricColumn(name)
-    ? (() => {
-        const m = (fields?.metrics ?? []).find((x) => x.name === metricNameOf(name));
-        return <span className="flex items-center gap-1.5" title={m?.description || undefined}>{m?.label || metricNameOf(name)}<span className="rounded bg-primary/10 px-1 text-[10px] font-medium text-primary">metric</span></span>;
-      })()
-    : slotParam(name)
-    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">param</span></span>
-    : calcNames.has(name)
-    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
-    : groupNames.has(name)
-      ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">group</span></span>
-      : displayColumn(name);
+  // Phase 2 QA R14: every column picked or shown in the form reads through `columnRef` (a joined
+  // column is its own name with the table as a small tag), and truncates inside its control.
+  const fieldLabel = (name: string) => {
+    const metric = isMetricColumn(name) ? (fields?.metrics ?? []).find((x) => x.name === metricNameOf(name)) : undefined;
+    const ref = columnRef(name, {
+      metricLabels: Object.fromEntries((fields?.metrics ?? []).map((m) => [m.name, m.label])),
+      calculated: calcNames, groups: groupNames, isParam: (n) => !!slotParam(n),
+    });
+    return <ColumnLabel reference={ref} title={metric?.description || undefined} />;
+  };
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -387,6 +386,13 @@ export function ChartBuilder({
   const [paramsOpen, setParamsOpen] = React.useState(false);
   // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
   const [moreOpen, setMoreOpen] = React.useState(false);
+  // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
+  const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
+  const panelRefs = React.useRef<Partial<Record<SectionNumber, HTMLElement | null>>>({});
+  const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
+  // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
+  const [listOpen, setListOpen] = React.useState(true);
+  const [kindMenu, setKindMenu] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -551,10 +557,16 @@ export function ChartBuilder({
   const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
   const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : "Dimension (X)";
   const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
+  // joined column's own name), never the stored reference (`metric:name`, `table__column`).
+  const titleText = (name: string) => (name ? columnRef(name, {
+    metricLabels: Object.fromEntries((fields?.metrics ?? []).map((m) => [m.name, m.label])),
+    calculated: calcNames, groups: groupNames, isParam: (n) => !!slotParam(n),
+  }).text : name);
   const suggestedTitle = suggestChartTitle({
-    kind, dimension: isSingle ? undefined : dimension,
-    measures: measureRows.slice(0, Math.max(limits.min, 1)).map((r) => r.column),
-    breakdown: canBreakdown ? breakdown : undefined,
+    kind, dimension: isSingle ? undefined : titleText(dimension),
+    measures: measureRows.slice(0, Math.max(limits.min, 1)).map((r) => titleText(r.column)),
+    breakdown: canBreakdown ? titleText(breakdown) : undefined,
   });
   const canWriteSql = useAuth().hasPermission("dashboard:sql");
   const isNewSql = source === NEW_SQL_CHOICE;
@@ -711,6 +723,10 @@ export function ChartBuilder({
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
+    const pref = readKindListPref();
+    setListOpen(pref ? pref === "expanded" : !editId);
+    setKindMenu(false);
+    setActive(editId ? null : 1);
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -770,7 +786,7 @@ export function ChartBuilder({
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
-    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
   }
@@ -842,6 +858,41 @@ export function ChartBuilder({
     if (shape.sortChoice.startsWith("by:") && !sortChoices.some((o) => o.value === shape.sortChoice)) setSortChoice("order:desc");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `sortChoices` is rebuilt every render; its content is what matters
   }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
+
+  // Phase 2 QA R10: the one-line summaries a folded section shows (lib/section-summary), in the labels used everywhere else.
+  const summaries = sectionSummaries({
+    kind, rowsMode, source: sourceLabels[source] ?? "", joins: shape.joins.length,
+    dimension, grain: grain && grainOptions.includes(grain) ? grain : "", breakdown: canBreakdown ? breakdown : "",
+    groupings: shape.groupings.map((g) => g.column), rowColumns: tableDraft.columns,
+    pivot: { rows: tableDraft.pivotRows, columns: tableDraft.pivotColumns, values: tableDraft.pivotValues.filter((v) => v.column).map((v) => v.column) },
+    measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
+    mapLabel: isMap ? MAP_LABELS[effectiveMap] ?? "" : "", lat, lon,
+    sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
+    limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
+    filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
+  });
+  /** Opens the section that holds a missing field and moves focus to that field. */
+  function revealSection(n: SectionNumber) {
+    if (n === 4) setMoreOpen(true); else setActive(n);
+    setFocusAsk({ section: n, n: Date.now() });
+  }
+  React.useEffect(() => {
+    if (!focusAsk) return;
+    focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
+    setFocusAsk(null);
+  }, [focusAsk]);
+  /** A type was chosen from the list or the menu; with no remembered choice the list folds away. */
+  function chooseKind(next: ChartKind) {
+    pickKind(next);
+    setKindMenu(false);
+    if (!readKindListPref()) setListOpen(false);
+  }
+  function toggleList() {
+    const next = !listOpen;
+    setListOpen(next);
+    setKindMenu(false);
+    writeKindListPref(next ? "expanded" : "collapsed");
+  }
 
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
@@ -972,6 +1023,12 @@ export function ChartBuilder({
   async function save() {
     setError(null);
     if (sqlActive && draft.blocker) { draft.markSaveAttempted(); setError(draft.blocker); return; }
+    // Phase 2 QA R10: a required field that is missing opens its section and takes focus.
+    if (missing.length) {
+      revealSection(missing.map(missingSection).reduce((a, b) => (b < a ? b : a)));
+      setError(`Still needed: ${missing.join(", ")}.`);
+      return;
+    }
     let payload: Record<string, unknown>;
     // A new source has no id yet; a placeholder lets the same checks run
     // before anything is written, and the real id replaces it below.
@@ -1035,7 +1092,7 @@ export function ChartBuilder({
   }
 
   const grainPicker = grainOptions.length > 0 ? (
-    <div className="mt-1 grid gap-1.5">
+    <div className="grid gap-1.5">
       <Label>Group by</Label>
       <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
         <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
@@ -1047,20 +1104,26 @@ export function ChartBuilder({
     </div>
   ) : null;
 
-  const formFields = (
-    <div className="grid content-start gap-5 px-5 pt-1 pb-5">
-      <div className="grid gap-1.5">
-        <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
-        <Input
-          id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
-          placeholder={suggestedTitle || "e.g. Visitors by Region"}
-        />
-        {!title.trim() && suggestedTitle ? (
-          <p className="text-xs text-muted-foreground">Left empty, the chart is saved as “{suggestedTitle}”.</p>
-        ) : null}
-      </div>
+  // Phase 2 QA R15: which conditional controls the dimension and the breakdown bring (they sit in a row below the fields).
+  const binDimension = !isGroupedTable && !!binKind && isNumber(dimension);
+  const dimensionExtras = !isGroupedTable && (!!grainPicker || binDimension);
+  const breakdownExtras = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+  const formFields = (
+    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
+    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
+    // one long column name widened the whole form. Every grid of the form without columns of its own
+    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 pt-1 pb-5 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
+      {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
+        <div className="grid gap-1.5">
+          <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
+          <Input
+            id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
+            placeholder={suggestedTitle || "e.g. Visitors by Region"}
+          />
+        </div>
         <div className="grid gap-1.5">
           <Label>Dashboard</Label>
           <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
@@ -1084,7 +1147,6 @@ export function ChartBuilder({
         </div>
       </div>
 
-
       {isText ? (
         <div className="grid gap-1.5">
           <Label>Content (markdown) <Req /></Label>
@@ -1093,7 +1155,7 @@ export function ChartBuilder({
       ) : (
         <>
           {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
-          <BuilderSection number={1} title="Data">
+          <AccordionSection number={1} title="Data" summary={summaries.data} open={active === 1} onOpenChange={(o) => setActive(o ? 1 : null)} panelRef={(n) => { panelRefs.current[1] = n; }}>
             <div className="grid gap-1.5">
             <Label>Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
@@ -1170,9 +1232,9 @@ export function ChartBuilder({
                 />
               ) : null}
             </div>
-          </BuilderSection>
+          </AccordionSection>
 
-          <BuilderSection number={2} title="What to show">
+          <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
@@ -1189,7 +1251,7 @@ export function ChartBuilder({
 
           {kind === "table" ? <TableSection part="shape" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {!isSingle && !ownColumns ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
               {isGroupedTable ? (
                 <GroupingsEditor
                   value={shape.groupings}
@@ -1201,62 +1263,80 @@ export function ChartBuilder({
                   sqlSource={onSqlSource}
                 />
               ) : (
-              <div className="grid gap-1.5">
+              <div className="grid content-start gap-1.5" data-slot="dimension-field">
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
                 {isPoints ? (
-                  <Select value={dimension || NO_BREAKDOWN} items={NO_LABEL_ITEMS} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
+                  <Select value={dimension || NO_BREAKDOWN} items={{ ...NO_LABEL_ITEMS, ...columnItems(fields?.dimensions ?? [], fieldLabel, dimension) }} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 ) : (
-                  <Select value={dimension} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <Select value={dimension} items={columnItems(dimensionChoices, fieldLabel, dimension)} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>{dimensionChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
-                {grainPicker}
-                {binKind && isNumber(dimension) ? (
-                  <BinPicker label="Group in" value={shape.bin} sqlSource={onSqlSource} aria="Group in bins"
-                    onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
-                ) : null}
               </div>
               )}
               {canBreakdown ? (
-                <div className="grid gap-1.5">
+                <div className="grid content-start gap-1.5" data-slot="breakdown-field">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
-                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                  <Select value={breakdown || NO_BREAKDOWN} items={{ ...breakdownLabels, ...columnItems(breakdownChoices, fieldLabel, breakdown) }} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
+                    <SelectTrigger className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                       {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                   {rules.breakdownLocked ? <p className="text-xs text-muted-foreground">{rules.breakdownLocked}</p> : null}
-                  {binKind && breakdown && isNumber(breakdown) ? (
-                    <BinPicker label="Group in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
-                      onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                </div>
+              ) : null}
+              {/*
+                Phase 2 QA R15: a control that exists only for some columns (the bin of a number, the
+                grain of a date) is never inside the field it belongs to, since it made that column
+                taller than its neighbour and the neighbour's select drifted out of line with it. It
+                sits in a row of its own below both fields, in its parent's column (the breakdown's
+                in the second), and the fields above keep `content-start` so a taller neighbour
+                cannot stretch them.
+              */}
+              {dimensionExtras || breakdownExtras ? (
+                <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2" data-slot="conditional-row">
+                  {dimensionExtras ? (
+                    <div className="grid content-start gap-3">
+                      {grainPicker}
+                      {binDimension ? (
+                        <BinPicker label="Group in" value={shape.bin} sqlSource={onSqlSource} aria="Group in bins"
+                          onChange={(bin) => setShape((d) => ({ ...d, bin }))} />
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {breakdownExtras ? (
+                    <div className="grid content-start gap-3 sm:col-start-2">
+                      <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                        onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                    </div>
                   ) : null}
                 </div>
               ) : null}
             </div>
           ) : null}
           {isPoints ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>Latitude <Req /></Label>
-                <Select value={lat} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
+                <Select value={lat} items={columnItems(coordinateColumns, fieldLabel, lat)} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                  <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                  <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5">
                 <Label>Longitude <Req /></Label>
-                <Select value={lon} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
+                <Select value={lon} items={columnItems(coordinateColumns, fieldLabel, lon)} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                  <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                  <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
             </div>
@@ -1305,11 +1385,11 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
-          </BuilderSection>
+          </AccordionSection>
 
-          <BuilderSection number={3} title="Sort and filter">
+          <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
             {rules.sort !== "none" ? (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
                 {rules.sort === "by-date" || rules.sort === "by-category" ? (
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
@@ -1356,9 +1436,9 @@ export function ChartBuilder({
             ) : null}
 
             {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
-          </BuilderSection>
+          </AccordionSection>
 
-          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen}>
+          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
             {rules.steps ? <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} /> : null}
 
             {rules.layers ? (
@@ -1388,6 +1468,58 @@ export function ChartBuilder({
         </>
       )}
     </div>
+  );
+  /** The type search and the grouped type buttons, shared by the open list and the menu of the folded one (phase 2 QA R9). */
+  const kindSearch = (
+    <>
+      <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+      <Input
+        value={kindQuery}
+        onChange={(e) => setKindQuery(e.target.value)}
+        onKeyDown={(e) => {
+          // Enter picks the first match, so "sank⏎" is enough.
+          const first = kindGroups[0]?.items[0];
+          if (e.key === "Enter" && first) { e.preventDefault(); chooseKind(first.value); }
+        }}
+        placeholder="Search chart types"
+        aria-label="Search chart types"
+        className="h-8 bg-background pl-8"
+      />
+    </>
+  );
+  const kindList = (direction: string) => (
+    <>
+      {kindGroups.length === 0 ? (
+        <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
+      ) : null}
+      {kindGroups.map((group) => (
+        <div key={group.group} className={cn("flex shrink-0 gap-1", direction)}>
+          <p className={cn("px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground", direction === "md:flex-col" && "hidden md:block")}>
+            {group.group}
+          </p>
+          {group.items.map((item) => {
+            const Icon = kindIcon(item.value);
+            const active = item.value === kind;
+            return (
+              <button
+                key={item.value}
+                type="button"
+                aria-pressed={active}
+                title={KIND_DESCRIPTIONS[item.value]}
+                onClick={() => chooseKind(item.value)}
+                className={cn(
+                  "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                )}
+              >
+                <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
+                <span className="md:truncate">{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </>
   );
   const previewPane = (
     <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
@@ -1424,7 +1556,7 @@ export function ChartBuilder({
               <div className="min-h-0 flex-1">
                 <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
               </div>
-              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
+              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
             </div>
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
@@ -1455,67 +1587,68 @@ export function ChartBuilder({
           The dialog has a fixed height so the actions stay at the bottom
           edge whatever the form's length.
         */}
-        <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1">
+        <div className={cn("grid h-full min-h-0", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
+          {listOpen ? (
           <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
-            <div className="relative p-2 md:p-3 md:pb-2">
-              <Search className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-muted-foreground md:left-5" aria-hidden />
-              <Input
-                value={kindQuery}
-                onChange={(e) => setKindQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  // Enter picks the first match, so "sank⏎" is enough.
-                  const first = kindGroups[0]?.items[0];
-                  if (e.key === "Enter" && first) { e.preventDefault(); pickKind(first.value); }
-                }}
-                placeholder="Search chart types"
-                aria-label="Search chart types"
-                className="h-8 bg-background pl-8"
-              />
+            <div className="flex items-center gap-1 p-2 md:p-3 md:pb-2">
+              <div className="relative min-w-0 flex-1">{kindSearch}</div>
+              <Button type="button" size="icon-sm" variant="ghost" className="shrink-0" aria-label="Fold the chart type list" title="Fold the chart type list" onClick={toggleList}>
+                <PanelLeftClose aria-hidden />
+              </Button>
             </div>
             <div className="flex min-h-0 gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:gap-3 md:overflow-y-auto md:px-3 md:pb-3">
-            {kindGroups.length === 0 ? (
-              <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
-            ) : null}
-            {kindGroups.map((group) => (
-              <div key={group.group} className="flex shrink-0 gap-1 md:flex-col">
-                <p className="hidden px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground md:block">
-                  {group.group}
-                </p>
-                {group.items.map((item) => {
-                  const Icon = kindIcon(item.value);
-                  const active = item.value === kind;
-                  return (
-                    <button
-                      key={item.value}
-                      type="button"
-                      aria-pressed={active}
-                      title={KIND_DESCRIPTIONS[item.value]}
-                      onClick={() => pickKind(item.value)}
-                      className={cn(
-                        "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                        active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                      )}
-                    >
-                      <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
-                      <span className="md:truncate">{item.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))}
+              {kindList("md:flex-col")}
             </div>
           </nav>
+          ) : null}
 
           <div className="flex min-h-0 flex-col">
             <div className="px-5 pt-5 pb-4">
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-1.5 text-base">
                   <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
-                  <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
-                  <span>{KIND_LABELS[kind]}</span>
+                  {/* Phase 2 QA R20: the chevron only when the kind follows it (folded, the kind is on the menu button). */}
+                  {listOpen ? (
+                    <>
+                      <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
+                      <span>{KIND_LABELS[kind]}</span>
+                    </>
+                  ) : null}
                 </DialogTitle>
-                <DialogDescription>{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
+                <DialogDescription className="sr-only">{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
               </DialogHeader>
+              {listOpen ? null : (
+                // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
+                <div className="mt-2 flex items-center gap-1.5">
+                  {/*
+                    Phase 2 QA R17: a popover of the base-ui family the dialog is made of, so it nests in the
+                    dialog's layer stack: an outside press and Escape close only the popover, and focus
+                    returns to the trigger. (The hand-made inline panel closed on neither.)
+                  */}
+                  <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
+                    <PopoverPrimitive.Trigger
+                      render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
+                    >
+                      {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
+                      {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
+                    </PopoverPrimitive.Trigger>
+                    <PopoverPrimitive.Portal>
+                      <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
+                        <PopoverPrimitive.Popup
+                          role="group" aria-label="Chart type"
+                          className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
+                        >
+                          <div className="relative">{kindSearch}</div>
+                          <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
+                        </PopoverPrimitive.Popup>
+                      </PopoverPrimitive.Positioner>
+                    </PopoverPrimitive.Portal>
+                  </PopoverPrimitive.Root>
+                  <Button type="button" size="icon-sm" variant="ghost" aria-label="Show the chart type list" title="Show the chart type list" onClick={toggleList}>
+                    <PanelLeftOpen aria-hidden />
+                  </Button>
+                </div>
+              )}
             </div>
             {/*
               Form and preview are split by a divider rather than a card
@@ -1526,7 +1659,7 @@ export function ChartBuilder({
             {wide ? (
               <ResizablePanelGroup className="min-h-0 flex-1">
                 <ResizablePanel defaultSize="50" minSize="30">
-                  <div className="h-full overflow-y-auto">{formFields}</div>
+                  <div className="h-full min-w-0 overflow-y-auto">{formFields}</div>
                 </ResizablePanel>
                 <ResizableHandle withHandle />
                 <ResizablePanel defaultSize="50" minSize="30">{previewPane}</ResizablePanel>

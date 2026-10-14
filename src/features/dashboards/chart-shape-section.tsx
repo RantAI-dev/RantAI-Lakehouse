@@ -14,6 +14,8 @@ import {
 } from "@/lib/chart-shape";
 import { binDraftFromDef, binPayload, type BinDef } from "@/lib/chart-bins";
 import { moveItem } from "@/lib/table-draft";
+import { displayColumn, displayColumnFull } from "@/lib/chart-joins";
+import { columnItems } from "./builder-sections";
 import { GRAIN_LABELS, grainChoices, type ColumnKind } from "@/lib/time-grain";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { BinPicker } from "./bin-picker";
@@ -72,8 +74,8 @@ export function MeasureRows({
         <div key={i} className="grid gap-1.5">
           <Label>{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
           <div className="flex items-center gap-1.5">
-            <Select value={row.column} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)}><SelectValue placeholder={placeholder} /></SelectTrigger>
+            <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
+              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (
@@ -291,12 +293,12 @@ function ConditionRow({
   const type = kind === "number" ? "number" : kind === "date" || kind === "datetime" ? "date" : "text";
   const ops = type === "text" ? ["eq", "ne"] : Object.keys(STEP_OPS);
   const input = (v: string | undefined, set: (v: string) => void, aria: string) => (
-    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="min-w-0 flex-1" />
+    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="min-w-28 flex-1" />
   );
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       <Select value={value.column} items={Object.fromEntries(columns.map((c) => [c, label(c)]))} onValueChange={(v) => onChange({ ...value, column: v ?? "" })}>
-        <SelectTrigger className="w-40 shrink-0" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
+        <SelectTrigger className="w-40 max-w-full shrink-0" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
         <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{label(c)}</SelectItem>)}</SelectContent>
       </Select>
       <Select value={ops.includes(value.op) ? value.op : ops[0]} items={STEP_OPS} onValueChange={(v) => onChange({ ...value, op: v ?? "eq" })}>
@@ -418,12 +420,15 @@ export function StepsEditor({
  * listed.
  */
 export function PreviewRowsTable({
-  data, open,
+  data, open, labels,
 }: {
+  /** Phase 2 QA R13: the headers read as the chart's table does ("total visitors", not "sum_visitors"); a joined column reads `table.column`. */
+  readonly labels?: Readonly<Record<string, string>>;
   readonly data: { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; limit: number };
   readonly open: boolean;
 }) {
   const columns = visibleColumns(data.columns);
+  const headers = Object.fromEntries(columns.map((c) => [c, labels?.[c] ?? displayColumn(c)]));
   return (
     <details open={open} className="rounded-md border border-border text-xs">
       <summary className="cursor-pointer px-2 py-1.5 font-medium">
@@ -431,7 +436,7 @@ export function PreviewRowsTable({
       </summary>
       {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {data.limit.toLocaleString("en-US")} rows are shown.</p> : null}
       <div className="max-h-56 overflow-auto">
-        <RowsTable columns={columns} rows={data.rows} />
+        <RowsTable columns={columns} labels={headers} rows={data.rows} />
       </div>
     </details>
   );

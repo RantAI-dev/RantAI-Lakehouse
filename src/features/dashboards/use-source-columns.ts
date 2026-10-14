@@ -9,7 +9,7 @@ import type { MetricSource } from "@/services/contracts/metrics"
 import { apiFetch } from "@/services/http"
 
 /** A source a metric or a segment can be defined on. */
-export type SourceChoice = { value: string; label: string; source: MetricSource }
+export type SourceChoice = { value: string; label: string; /** "SQL" for a saved SQL source, else none. */ tag: "SQL" | null; source: MetricSource }
 
 /** The columns of one source, with their kinds, and its calculated fields (for a formula's suggestions). */
 export type SourceColumns = { columns: { name: string; kind: ColumnKind }[]; calculated: CalcField[] }
@@ -26,8 +26,8 @@ export function useSourceChoices(open: boolean): SourceChoice[] {
     ]).then(([marts, sources]) => {
       if (!live) return
       setChoices([
-        ...marts.map((m) => ({ value: `mart:${m.name}`, label: m.name, source: { mart: m.name } as MetricSource })),
-        ...sources.map((s) => ({ value: `sql:${s.id}`, label: `SQL · ${s.title}`, source: { source: s.id } as MetricSource })),
+        ...marts.map((m) => ({ value: `mart:${m.name}`, label: m.name, tag: null, source: { mart: m.name } as MetricSource })),
+        ...sources.map((s) => ({ value: `sql:${s.id}`, label: s.title, tag: "SQL" as const, source: { source: s.id } as MetricSource })),
       ])
     })
     return () => { live = false }

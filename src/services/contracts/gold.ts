@@ -87,6 +87,7 @@ export type GoldPublication = {
   updatedAt: string | null
   lastChangedAt: string | null
   lastExportedAt: string | null
+  changedSinceExport: boolean | null
   canEdit: boolean
 }
 

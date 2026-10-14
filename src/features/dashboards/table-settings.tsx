@@ -283,7 +283,7 @@ export function KpiCompareSection({ draft, onChange, columns, metric }: {
         </Select>
       </div>
       {byPeriod ? (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 items-start gap-3">
           <div className="grid gap-1.5">
             <Label>Date column {defaultNote ? null : <span aria-hidden className="text-destructive">*</span>}</Label>
             <Select value={draft.compareColumn} onValueChange={(v) => onChange({ ...draft, compareColumn: v ?? "" })}>

@@ -262,6 +262,23 @@ describe("PreviewRowsTable and the internal columns", () => {
     expect(screen.getByText("Bali")).toBeTruthy()
   })
 
+  it("heads each column as the chart's table does, and a joined column by its own name (phase 2 QA R13, R14)", () => {
+    render(<PreviewRowsTable open labels={{ sum_visitors: "total visitors" }} data={{ columns: ["regions__name", "sum_visitors", "other"], rows: [{ regions__name: "Bali", sum_visitors: 3, other: 1 }], truncated: false, limit: 2000 }} />)
+    expect(screen.getByRole("columnheader", { name: "total visitors" })).toBeTruthy()
+    expect(screen.getByRole("columnheader", { name: "name" })).toBeTruthy()
+    expect(screen.getByRole("columnheader", { name: "other" })).toBeTruthy()
+    expect(screen.queryByText("sum_visitors")).toBeNull()
+  })
+
+  it("gives a step filter's value input room to show a few digits (phase 2 QA R12)", () => {
+    const base = { columns: ["provinsi"], groups: [{ name: "provinsi", kind: "text" as const }], measures: ["visitors"], labels: { visitors: "visitors" } }
+    render(<StepsEditor value={[{ filter: [{ column: "visitors", op: "gt", value: "1000" }] }]} onChange={() => {}} base={base as never} disabled={false} />)
+    const input = screen.getByLabelText("Value") as HTMLInputElement
+    expect(input.value).toBe("1000")
+    expect(input.className).toContain("min-w-28")
+    expect(input.className).not.toContain("min-w-0")
+  })
+
   it("keeps the internal columns out of View data's file", async () => {
     const saved: string[] = []
     const { downloadRowsCsv } = await import("./tile-dialogs")

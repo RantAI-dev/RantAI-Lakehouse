@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { draftFromForm, emptyMetricForm, formFromMetric, formProblems, usageSentence } from "./metric-form"
+import { draftForCheck, draftFromForm, emptyMetricForm, formFromMetric, formProblems, usageSentence } from "./metric-form"
 
 test("a metric's filters split into plain filters and segment names and join back with segments first", () => {
   const form = formFromMetric({
@@ -37,4 +37,12 @@ test("the usage sentence names the charts and dashboards a change reaches, and i
   })
   assert.match(s, /2 charts on 2 dashboards/)
   assert.match(s, /"Visitors" on Main/)
+})
+
+test("the live check sends a provisional label while the field is empty, and the real one once typed (R22)", () => {
+  const empty = { ...emptyMetricForm(), formula: "Count()" }
+  assert.notEqual(draftForCheck(empty).label, "")
+  assert.equal(draftFromForm(empty).label, "")
+  assert.deepEqual(formProblems(empty, false, ""), ["Label"])
+  assert.equal(draftForCheck({ ...empty, label: " Visitors " }).label, "Visitors")
 })

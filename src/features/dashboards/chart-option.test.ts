@@ -138,3 +138,17 @@ test("a chart of metrics names its series and axes by the metric's label, and by
   const bare = tileMeasureLabels(["total_visitors"], ["total_visitors"], undefined, { total_visitors: "Total visitors" })
   assert.deepEqual(bare, { total_visitors: "Total visitors" })
 })
+
+// Phase 2 QA R14, R16: a joined measure is named by its column in the legend, and a long legend entry folds with its full text in a tooltip.
+test("a legend names a joined measure by its column and truncates long entries with a tooltip", () => {
+  const labels = tileMeasureLabels([{ column: "mart_demo_province_capacity__rooms", aggregate: "max" }, "visitors"], ["max_mart_demo_province_capacity__rooms", "visitors"])
+  assert.equal(labels.max_mart_demo_province_capacity__rooms, "max of rooms")
+  const rows = [{ x: "a", max_mart_demo_province_capacity__rooms: 1, visitors: 2 }]
+  const option = buildOption({ kind: "line", x: "x", y: ["max_mart_demo_province_capacity__rooms", "visitors"], measureLabels: labels }, rows, false)
+  const legend = option.legend as { tooltip?: { show?: boolean }; textStyle?: { overflow?: string; width?: number } }
+  assert.equal(legend.tooltip?.show, true)
+  assert.equal(legend.textStyle?.overflow, "truncate")
+  assert.ok((legend.textStyle?.width ?? 0) > 0)
+  const names = (option.series as { name?: string }[]).map((s) => s.name)
+  assert.deepEqual(names, ["max of rooms", "visitors"])
+})

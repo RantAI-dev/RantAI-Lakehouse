@@ -1,6 +1,6 @@
 import type { FilterDef } from "@/services/clients/bi-store"
 import { type BinDef, type BinDraft, type GridDef, binDraftFromDef, binPayload, binProblem, gridChoiceOf, gridPayload } from "./chart-bins"
-import { type JoinDef, type JoinDraft, displayColumn, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
+import { type JoinDef, type JoinDraft, columnSource, displayColumn, displayColumnFull, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
 import type { LayerDef } from "./chart-layers"
 
 /**
@@ -24,6 +24,36 @@ export const METRIC_PREFIX = "metric:"
 export const metricColumn = (name: string) => `${METRIC_PREFIX}${name}`
 export const isMetricColumn = (column: string) => column.startsWith(METRIC_PREFIX)
 export const metricNameOf = (column: string) => column.slice(METRIC_PREFIX.length)
+
+/** What the builder knows about a column name that its spelling does not say. */
+export type ColumnRefContext = {
+  /** Label of a metric by its name (the server's catalogue). */
+  readonly metricLabels?: Readonly<Record<string, string>>
+  readonly calculated?: ReadonlySet<string>
+  readonly groups?: ReadonlySet<string>
+  readonly isParam?: (name: string) => boolean
+}
+
+/** A column reference as shown: the text, the small tag after it (where it comes from or what it is), and the full name for a hover title. */
+export type ColumnRef = { text: string; tag: string | null; full: string }
+
+/**
+ * The one place that says how a column reference reads, for the pickers (list
+ * and closed state), the section summaries and the labels of a chart (phase 2
+ * QA R14). A joined column is its own name with its table as the tag
+ * (`rooms` · capacity), a metric its label (tag "metric"), a calculated field
+ * "fx", a value group "group", a parameter "param"; any other column is its name.
+ */
+export function columnRef(name: string, ctx: ColumnRefContext = {}): ColumnRef {
+  if (isMetricColumn(name)) {
+    const text = ctx.metricLabels?.[metricNameOf(name)] || metricNameOf(name)
+    return { text, tag: "metric", full: text }
+  }
+  if (ctx.isParam?.(name)) return { text: name, tag: "param", full: name }
+  if (ctx.calculated?.has(name)) return { text: name, tag: "fx", full: name }
+  if (ctx.groups?.has(name)) return { text: name, tag: "group", full: name }
+  return { text: displayColumn(name), tag: columnSource(name), full: displayColumnFull(name) }
+}
 export type SortDir = "asc" | "desc"
 export type SortSpec = { by: string; dir: SortDir }
 export type Grouping = { column: string; grain?: string; bin?: BinDef }
@@ -128,11 +158,11 @@ export function storedAggregate(picked: string, chartAggregate: string): string 
  */
 export function measureLabel(row: MeasureRow, wholeMeasure: ReadonlySet<string>, chartAggregate = "sum"): string {
   if (isMetricColumn(row.column)) return metricNameOf(row.column)
-  if (wholeMeasure.has(row.column)) return row.column
+  if (wholeMeasure.has(row.column)) return displayColumn(row.column)
   if (!row.aggregate) {
-    return chartAggregate && chartAggregate !== "sum" ? `${AGGREGATE_WORDS[chartAggregate] ?? chartAggregate} of ${row.column}` : row.column
+    return chartAggregate && chartAggregate !== "sum" ? `${AGGREGATE_WORDS[chartAggregate] ?? chartAggregate} of ${displayColumn(row.column)}` : displayColumn(row.column)
   }
-  return `${AGGREGATE_WORDS[row.aggregate] ?? row.aggregate} of ${row.column}`
+  return `${AGGREGATE_WORDS[row.aggregate] ?? row.aggregate} of ${displayColumn(row.column)}`
 }
 
 /**
@@ -488,7 +518,7 @@ export function tileMeasureLabels(
     const base: ResultColumns = {
       groups: [],
       measures: (measures ?? []).map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : `${m.aggregate}_${m.column}`)),
-      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${m.column}`]]))),
+      labels: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, `${m.aggregate} of ${displayColumn(m.column)}`]]))),
       bases: Object.fromEntries((measures ?? []).flatMap((m) => (typeof m === "string" || "metric" in m ? [] : [[`${m.aggregate}_${m.column}`, m.column]]))),
     }
     const after = columnsAfterSteps({ ...base, groups: steps.flatMap((s) => (s.summarise?.by ?? []).map((name) => ({ name, kind: "text" }))) }, steps)

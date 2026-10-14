@@ -4,7 +4,7 @@ import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from
 import { tileMeasureLabels, type MeasureEntry } from "@/lib/chart-shape";
 import type { LayerAxis, LayerDraw } from "@/lib/chart-layers";
 import { bucketLabel, type Grain } from "@/lib/time-grain";
-import { PALETTE, showsPointMarkers } from "./chart-option";
+import { LEGEND_TEXT, PALETTE, showsPointMarkers } from "./chart-option";
 
 /**
  * A chart with more questions on it (`BI-13`): the base chart's series and the
@@ -150,7 +150,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
       textStyle: { color: dark ? "#e4e4e7" : "#18181b", fontSize: 12 },
       trigger: "axis", axisPointer: { type: "cross" },
     },
-    legend: { top: 0, type: "scroll", textStyle: { color: ink, fontSize: 11 }, icon: "circle" },
+    legend: { top: 0, type: "scroll", textStyle: { color: ink, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
     grid: { left: 8, right: 16, top: 34, bottom: 8, containLabel: true },
     xAxis: {
       type: "category", data: labels,

@@ -8,7 +8,8 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { MAX_LAYERS, emptyLayer, matchingDimensions, noMatchNote, type LayerAxis, type LayerDraft, type LayerDraw } from "@/lib/chart-layers";
 import { decodeSourceChoice, encodeSourceChoice, fieldsQuery } from "@/lib/chart-source";
-import { displayColumn } from "@/lib/chart-joins";
+import { columnRef } from "@/lib/chart-shape";
+import { ColumnLabel, columnItems } from "./builder-sections";
 import { moveItem } from "@/lib/table-draft";
 import { columnKindOfType, type ColumnKind } from "@/lib/time-grain";
 import { apiFetch } from "@/services/http";
@@ -45,6 +46,8 @@ type Props = {
   readonly blocked?: string;
   readonly disabled: boolean;
 };
+
+const columnLabel = (name: string) => <ColumnLabel reference={columnRef(name)} />;
 
 export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlSources, ownDraw, ownAxis, onOwnChange, blocked, disabled }: Props) {
   const [loaded, setLoaded] = React.useState<Record<string, SourceFields>>({});
@@ -153,9 +156,9 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
               <>
                 <div className="grid gap-1.5">
                   <Label>Lined up on</Label>
-                  <Select value={choices.has(layer.dimension) ? layer.dimension : ""} onValueChange={(v) => set(i, { dimension: v ?? "" })} disabled={disabled || !fields}>
+                  <Select value={choices.has(layer.dimension) ? layer.dimension : ""} items={columnItems(dimensions.map((d) => d.name), columnLabel)} onValueChange={(v) => set(i, { dimension: v ?? "" })} disabled={disabled || !fields}>
                     <SelectTrigger className="w-full" aria-label={`Question ${n} dimension`}><SelectValue placeholder={fields ? "pick a column" : "loading"} /></SelectTrigger>
-                    <SelectContent>{dimensions.map((d) => <SelectItem key={d.name} value={d.name}>{displayColumn(d.name)}</SelectItem>)}</SelectContent>
+                    <SelectContent>{dimensions.map((d) => <SelectItem key={d.name} value={d.name}>{columnLabel(d.name)}</SelectItem>)}</SelectContent>
                   </Select>
                   {fields && !dimensions.length ? <p className="text-xs text-muted-foreground">{noMatchNote(baseKind)}</p> : null}
                 </div>
@@ -163,7 +166,7 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
                   rows={layer.measures} onChange={(measures) => set(i, { measures })} labels={(k) => (k === 0 ? "Measure" : `Measure ${k + 1}`)}
                   min={1} max={6} own columns={fields?.measures ?? []} defaultAggregate={layer.aggregate}
                   disabled={disabled || !fields} placeholder={fields ? "pick a column" : "loading"} wholeMeasure={new Set<string>()}
-                  fieldLabel={(name) => displayColumn(name)}
+                  fieldLabel={columnLabel}
                 />
                 <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} />
               </>

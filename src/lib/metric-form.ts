@@ -52,6 +52,22 @@ export function draftFromForm(f: MetricForm): MetricDraft {
   }
 }
 
+/**
+ * The label the live check sends while the field is still empty. `POST
+ * /api/dashboard/metrics/validate` refuses an empty label ("a label is 1 to
+ * 100 characters."), but the value only depends on the source and the formula,
+ * so "Value now" must not wait for a label (phase 2 QA R22). It is never
+ * saved and never shown: Create still blocks on the empty label through
+ * `formProblems`, with its own message.
+ */
+export const PROVISIONAL_LABEL = "Preview"
+
+/** The draft the live check sends: the real one, with a provisional label if none is typed yet. */
+export function draftForCheck(f: MetricForm): MetricDraft {
+  const draft = draftFromForm(f)
+  return draft.label ? draft : { ...draft, label: PROVISIONAL_LABEL }
+}
+
 /** What is still missing, in the editor's own words; empty when the form can be checked and saved. */
 export function formProblems(f: MetricForm, isNew: boolean, name: string): string[] {
   const out: string[] = []

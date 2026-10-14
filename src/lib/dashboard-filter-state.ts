@@ -9,7 +9,7 @@
  */
 
 import type { FilterDef, FilterKind, FilterOp, RelativeUnit } from "@/services/clients/bi-store"
-import { displayColumn } from "./chart-joins"
+import { displayColumnFull as displayColumn } from "./chart-joins"
 
 /** Query parameter holding the encoded filters. */
 export const FILTER_PARAM = "f"
