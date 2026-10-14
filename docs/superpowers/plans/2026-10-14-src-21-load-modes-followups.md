@@ -98,3 +98,60 @@ Run them with a shared `CARGO_TARGET_DIR` outside the repo. Disk is limited
 - Console changes.
 - Moving the gate step.
 - The owner's acceptance run of `features/load-modes.md`.
+
+## Handoff
+
+Developer, 2026-10-14. Branch `fix/src-21-load-modes-followups`, off
+`origin/claude/gracious-albattani-vw5wsb` (`cb7c63a`). One PR slice.
+
+### Commits
+
+| Task | Commit | What |
+|---|---|---|
+| 1 | `2a334b8` | `set_ingest_spec` schema gains `loadMode` (enum) and `primaryKey`; the tool description gains the keep-as-returned sentence; `tool_schemas.json` regenerated; route-level test `the_assistants_set_ingest_spec_saves_load_mode_and_primary_key` in `tests/ingest_run.rs` |
+| 2 | `3d77e75` | two `sqlx::test` cases in `lakehouse-store/tests/schema_change.rs` |
+| 3 | this entry | handoff |
+
+### Notes against the plan
+
+- The enum list matches `LoadMode` in `ingest_spec.rs` (six `snake_case`
+  names); no mismatch.
+- Fixture: rewritten by the ignored test `write_tool_schema_fixture`
+  (`cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored`),
+  the way the doc comment on that test says. The diff is the description line
+  and the two new properties, nothing else.
+- Task 1 test is in `tests/ingest_run.rs`, beside the `ingest-spec` PUT test;
+  it is the closest test that already reaches the tool through
+  `POST /api/ai/tool`. It sets the seeded dial to loopback and turns the
+  `SEC-15` block off, because the save must not be a re-point (`SEC-14`) and
+  `pg-src` does not resolve. The tool already forwarded `sourceObjects`
+  untouched, so this test passes on the old schema too: it pins the
+  pass-through, the schema change is pinned by the fixture test.
+- Task 2: the test calls `approve_object` on `public.items` after a refused
+  `approve_object` on `public.orders` (`KeyStillNamed`). Run with the lift
+  reverted to `mark_approvable` (no keys) the first test fails; the source was
+  restored and is not part of the diff.
+
+### Commands run (from `rust/`, `CARGO_TARGET_DIR=/home/user/cargo-target`)
+
+Postgres came from the repo's testcontainers set-up (`dockerd` started in the
+session, `postgres:16-alpine`), so the database tests ran.
+
+- `cargo fmt --check`: clean after each commit.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lakehouse-store --all-targets -- -D warnings`: clean.
+- `cargo test -p lakehouse-api --lib tool_schemas`: 5 passed (includes
+  `tool_schemas_snapshot_is_byte_identical`).
+- `cargo test -p lakehouse-api --lib set_ingest_spec`: 1 passed.
+- `cargo test -p lakehouse-api --test ingest_run`: 18 passed, 0 failed.
+- `cargo test -p lakehouse-store --test schema_change`: 34 passed, 0 failed
+  (includes the two new tests).
+
+### Not verified
+
+- The full workspace block (`cargo clippy --workspace ...`,
+  `cargo test --workspace`) was not run: disk is limited here, so only
+  `lakehouse-api` and `lakehouse-store` were built. The full `lakehouse-api`
+  and `lakehouse-store` test suites were not run either, only the filters
+  above. CI runs the workspace.
+- No TypeScript, Python or compose file changed; their checks were not run.
