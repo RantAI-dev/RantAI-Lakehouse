@@ -48,3 +48,52 @@ new commit, or any new secret, still turns the scan red.
 - A history rewrite.
 - Changing gitleaks rules.
 - The `CONNECTOR_*`/storage defaults that staging still takes from `.env.example` (`SEC-18`, PR #83).
+
+## Handoff
+
+Developer, 2026-10-14. Branch `fix/sec-1-gitleaks-baseline`, base
+`72e0df7` (plan commit on `a13e5ea`). One PR slice.
+
+Commits:
+- `27877d7b` SEC-1 ci(security): `.gitleaksignore` with the 15 fingerprints (task 1).
+- `4094e97f` SEC-1 docs(ci): `security.yml` history-scan comments and step
+  summary, and the "history-scan" section of `docs/CI.md` (task 2).
+- This handoff entry (docs only).
+
+Task 1 check: comments are allowed. gitleaks v8.30.1
+`detect/detect.go` `AddGitleaksIgnore` skips blank lines and lines starting
+with `#`; `cmd/root.go` reads `.gitleaksignore` from `--source`, from the
+working directory and from `--gitleaks-ignore-path`. Only full-line comments
+work (a trailing `# …` would break the fingerprint). All 15 fingerprints
+were copied from the CI log of job 115776111835.
+
+Task 3, gitleaks 8.30.1 (linux_x64, downloaded to a temp dir), run in the
+worktree after `git fetch origin '+refs/heads/*:refs/remotes/origin/*'`:
+- `gitleaks detect --source . --config .gitleaks.toml --redact`: 4 leaks,
+  1007 commits scanned. NOT 0. See mismatch 1.
+- `gitleaks detect --no-git --source . --config .gitleaks.toml --redact`:
+  7 leaks (`.env.staging` lines 39-44 and 53, `generic-api-key`). See
+  mismatch 2. This is the same 7 the CI working-tree job reports on `main`
+  (job 115776111925).
+- All 15 baselined fingerprints match: without `.gitleaksignore` the local
+  history scan reports each of them (four of their commits, `27d1e2b`,
+  `7075682`, `8ac6ee2`, `c5954ca`, are on no branch of `origin` any more;
+  they had to be fetched by SHA and given temporary local refs to be scanned).
+
+Mismatches with the plan (not fixed here, for the planner to decide):
+1. Four extra history findings, all `rantai-internal-lan-host` in the root
+   commit `6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3` (an ancestor of `main`,
+   `feat(brand)`): `src/app/api/ai/build-status/route.ts:5`,
+   `src/app/api/ops/[kind]/route.ts:108`, `src/services/clients/clickhouse.ts:11`,
+   `src/services/clients/dagster.ts:6`. The CI log of job 115776111835 does
+   not list them (1414 commits scanned there, 1007 here), and I could not
+   explain the difference. They are not baselined, because the plan lists
+   only what CI reported. If the first CI run after merge is red on them,
+   add those four lines as private-LAN-address entries.
+2. The plan says `.env.staging` "holds none since #130". On `a13e5ea` it
+   still holds seven token-shaped values, and the working-tree job is red on
+   `main` for that reason. #130 (SEC-13) is not in this base. The docs and
+   `.gitleaksignore` comments say "SEC-13 (#130) moves them", not "holds none".
+
+Not verified: that the CI history job turns green after merge (see 1); a CI
+run of the changed workflow (YAML was only parsed with `yaml.safe_load`).
