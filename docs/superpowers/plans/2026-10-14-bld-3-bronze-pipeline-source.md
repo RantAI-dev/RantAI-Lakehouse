@@ -227,6 +227,23 @@ past `in_scope` at all, so both now seed a row and call as
    filtered out) — the `create`, `update` and `restore_version`
    refusals plus the pure rule.
 
+2. **TypeScript block, same commit.**
+
+   ```
+   bun run typecheck        # rc 0, no output
+   bun run lint             # rc 0 — 6 warnings, 0 errors (pre-existing,
+                            # none in a file this slice touched)
+   bun test, per folder     # pass=1284 fail=0 skip=2, no folder exited
+                            # non-zero (printed as `nonzero:` with nothing
+                            # after it)
+   ```
+
+   The frontend tests were run per folder (`bun test <dir>/` for each
+   directory holding a `*.test.ts*`), under `.heavy.lock`, because a
+   single `bun run test` process is what reaches 7.2 GB and gets
+   killed on this machine. `skip=2` is the same two skips the full run
+   reports; no test folder failed.
+
 ### Section 6 answers
 
 (Appended after the run.)
