@@ -44,6 +44,19 @@ location, answering (3).
 
 Authenticates the same way `agent_runs.py`/`gold_export.py` do: a bearer
 token from `PIPELINE_RUN_TOKEN`.
+
+# Reading a Bronze source
+
+A Bronze table is Iceberg in Lakekeeper, not a ClickHouse database: this
+stack's ClickHouse has `serving`, `silver` and `lake` only, so a Bronze
+source cannot be read as `` bronze.`orders` ``. It is read through a
+`DataLakeCatalog` database, where the table is named ``bronze.<table>``,
+exactly as `connector_catalog.register_loaded_table` and
+`maintenance.discover_bronze_tables` already read one. `_resolve_source`
+picks the source (and ensures this job's own `DataLakeCatalog` database
+`CATALOG_DB`) and `_reading` attaches `allow_database_iceberg = 1` to
+every statement that reads it; `_resolve_source`'s own docstring and
+`_reading`'s carry the details.
 """
 
 from __future__ import annotations
@@ -72,6 +85,7 @@ DagsterRunStatus,
 
 from dispar_orchestrate import authored_transforms, op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
+from dispar_orchestrate.connector_catalog import ensure_catalog_database
 
 
 def _env(name: str, default: str) -> str:
@@ -234,6 +248,84 @@ def _is_safe_ch_identifier(name: str) -> bool:
     return bool(name) and not name[0].isdigit() and all(c.isascii() and (c.isalnum() or c == "_") for c in name)
 
 
+# ── Where a pipeline reads FROM: BLD-3 / D1, D2 ────────────────────────
+
+# Bronze is not a ClickHouse database on this stack: `scripts/seed-clickhouse.sql`
+# creates `serving`, `silver` and `lake` only. A Bronze table is Iceberg in
+# Lakekeeper and is readable from ClickHouse ONLY through a
+# `DataLakeCatalog` database, where the table's name is the catalog's own
+# flat `bronze.<table>` (ADR 0004) -- `` <catalog db>.`bronze.<table>` ``.
+# Reading it as a plain `` bronze.`orders` `` is the 404 this module's
+# Bronze source used to raise (plan `2026-10-14-bld-3-bronze-pipeline-source`,
+# T1's reproduced trace).
+#
+# Each job owns its own catalog database (`icecat_maintenance`,
+# `icecat_ingest`, `ops/g3a`'s `icecat_g3a`), so a pipeline never depends on
+# another job having created one first.
+CATALOG_DB = "icecat_authored"
+
+# Every statement that READS the catalog database needs this setting;
+# ClickHouse refuses an Iceberg read without it. `maintenance.py` sends it
+# on `SHOW TABLES` (`SETTINGS allow_database_iceberg=1`) and on its own
+# `CREATE DATABASE ... DataLakeCatalog`, which is the precedent this
+# module follows. It is attached per statement rather than as a session
+# setting because `_ch_exec` is a stateless `requests.post` per statement:
+# there is no session to set it on.
+ICEBERG_READ_SETTINGS = "allow_database_iceberg = 1"
+
+
+@dataclass(frozen=True)
+class _PipelineSource:
+    """One authored pipeline's ClickHouse source: the name to read, and
+    whether reading it is an Iceberg read (which decides whether the
+    statements that touch it carry `ICEBERG_READ_SETTINGS`).
+
+    `clickhouse_name` is a ClickHouse identifier expression, never a bare
+    zone: for a Bronze source it is the catalog database plus the
+    catalog's own ``bronze.<table>`` name inside one pair of backticks.
+    """
+    clickhouse_name: str
+    reads_iceberg: bool = False
+
+
+def _resolve_source(ch: ClickHouseTarget, source_zone: str, source_table: str) -> _PipelineSource:
+    """The source an authored pipeline reads from, and the catalog
+    database it may need first.
+
+    `silver`/`gold` (and every other ClickHouse zone) are read as
+    `<zone>.<table>`, exactly as before. A `bronze` source is read through
+    this job's own `DataLakeCatalog` database `CATALOG_DB`, ensured HERE --
+    before the first statement that reads it -- so the run never depends on
+    another job's database existing. `connector_catalog.ensure_catalog_database`
+    is CALLED, never copied here: a second `CREATE DATABASE ... DataLakeCatalog`
+    in this module would be a third copy of the same statement
+    (`maintenance.py` already owns one) and would drift from it.
+
+    # Errors
+
+    Whatever `requests` raises if ClickHouse refuses the `CREATE DATABASE`
+    (propagates out of the op and is retried by its retry policy, as a
+    genuine infrastructure failure should be).
+    """
+    if source_zone == "bronze":
+        ensure_catalog_database(ch, CATALOG_DB)
+        return _PipelineSource(
+            f"{CATALOG_DB}.`bronze.{source_table}`", reads_iceberg=True
+        )
+    return _PipelineSource(f"{source_zone}.`{source_table}`")
+
+
+def _reading(source: _PipelineSource, statement: str) -> str:
+    """`statement`, plus `SETTINGS allow_database_iceberg = 1` when it
+    reads the catalog database (D2). ClickHouse reads `SETTINGS` as the
+    last clause of the `SELECT` it belongs to, so this is appended to the
+    WHOLE statement -- after its `LIMIT 0`, after its `FORMAT`, never in
+    the middle of a `FROM`."""
+    if not source.reads_iceberg:
+        return statement
+    return f"{statement} SETTINGS {ICEBERG_READ_SETTINGS}"
+
+
 def _build_select_sql(source: str, transforms: list[authored_transforms.Transform]) -> str:
     """Compose the whole `transforms` list into ONE `SELECT ... FROM
     source [WHERE ...] [ORDER BY ... LIMIT 1 BY ...]` statement -- see
@@ -282,22 +374,41 @@ def _build_select_sql(source: str, transforms: list[authored_transforms.Transfor
     return sql
 
 
-def _ensure_target_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> None:
+def _ensure_target_table(
+    target: ClickHouseTarget,
+    target_zone: str,
+    target_table: str,
+    select_sql: str,
+    source: _PipelineSource,
+) -> None:
     """Schema-on-write for an authored pipeline's target: create the
     database and (if it does not already exist) the table, inferring
     columns from `select_sql` via ClickHouse's own `CREATE TABLE ... AS
     SELECT ...` (`LIMIT 0` so this never inserts rows itself -- inserting
     is `_write_clickhouse_table`'s job, run every time this job runs, not
-    only on first creation)."""
+    only on first creation).
+
+    `SELECT ... AS ... LIMIT 0` is the FIRST statement that reads a Bronze
+    source, so it carries `source`'s read setting (`_reading`); the
+    `CREATE DATABASE` above it writes only and never carries one."""
     _ch_exec(target, f"CREATE DATABASE IF NOT EXISTS {target_zone}")
     _ch_exec(
         target,
-        f"CREATE TABLE IF NOT EXISTS {target_zone}.`{target_table}` "
-        f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        _reading(
+            source,
+            f"CREATE TABLE IF NOT EXISTS {target_zone}.`{target_table}` "
+            f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        ),
     )
 
 
-def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> int:
+def _write_clickhouse_table(
+    target: ClickHouseTarget,
+    target_zone: str,
+    target_table: str,
+    select_sql: str,
+    source: _PipelineSource,
+) -> int:
     """REPLACE `target_zone.target_table` with `select_sql`'s rows,
     atomically, and return the REAL row-count DELTA between before and
     after the swap -- what the caller records as rows written -- not
@@ -332,7 +443,7 @@ def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_t
     run is retryable because no committed write happened to the live
     target.
     """
-    _ensure_target_table(target, target_zone, target_table, select_sql)
+    _ensure_target_table(target, target_zone, target_table, select_sql, source)
     staging_table = f"__staging_{target_table}"
     # Idempotency under retry: drop any staging table left behind from
     # a prior attempt that failed between `INSERT INTO staging` and
@@ -341,11 +452,14 @@ def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_t
     _ch_exec(target, f"DROP TABLE IF EXISTS {target_zone}.`{staging_table}`")
     _ch_exec(
         target,
-        f"CREATE TABLE {target_zone}.`{staging_table}` "
-        f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        _reading(
+            source,
+            f"CREATE TABLE {target_zone}.`{staging_table}` "
+            f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        ),
     )
     before = _ch_query_json(target, f"SELECT count() AS n FROM {target_zone}.`{target_table}`")
-    _ch_exec(target, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}")
+    _ch_exec(target, _reading(source, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}"))
     # ClickHouse `EXCHANGE TABLES` is the atomic-swap primitive: both
     # tables must exist in the same database, and the swap is a single
     # mutation step (no transactional gap where readers see a
@@ -438,9 +552,9 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
             ) from exc
 
         ch = ClickHouseTarget.from_env()
-        source = f"{source_zone}.`{source_table}`"
-        select_sql = _build_select_sql(source, transforms)
-        written = _write_clickhouse_table(ch, target_zone, target_table, select_sql)
+        source = _resolve_source(ch, source_zone, source_table)
+        select_sql = _build_select_sql(source.clickhouse_name, transforms)
+        written = _write_clickhouse_table(ch, target_zone, target_table, select_sql, source)
 
         if definition.get("fbicEnabled"):
             context.log.info(FBIC_UNSUPPORTED_REASON)

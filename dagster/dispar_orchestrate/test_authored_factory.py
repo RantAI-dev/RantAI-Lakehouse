@@ -189,6 +189,167 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(sql, "SELECT * FROM silver.`orders`")
 
 
+class BronzeSourceTest(unittest.TestCase):
+    """BLD-3 / D1 + D2: a `bronze` source is Iceberg in Lakekeeper, not a
+    ClickHouse database, so it is read through this job's own
+    `DataLakeCatalog` database (`CATALOG_DB`) as
+    ``icecat_authored.`bronze.<table>` ``, and every statement that reads
+    that database carries `SETTINGS allow_database_iceberg = 1`.
+
+    No network and no ClickHouse: `_ch_exec`/`_ch_query_json` are
+    monkeypatched exactly as `OpForPipelineTest` does, and
+    `ensure_catalog_database` is monkeypatched on THIS module (it
+    `POST`s through `connector_catalog.ch_exec`, which
+    `authored_factory._ch_exec` never sees) so the test can also assert
+    it ran BEFORE the first read. Calls are recorded in order, because
+    "before the first read" is half of what D1 requires.
+    """
+
+    def _run_op(self, **definition_overrides: object) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        pipeline = _ready_pipeline(**definition_overrides)
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        calls: list[tuple[str, str]] = []
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        with mock.patch.object(
+            authored_factory,
+            "_ch_exec",
+            side_effect=lambda target, statement: calls.append(("sql", statement)),
+        ), mock.patch.object(
+            authored_factory,
+            "_ch_query_json",
+            side_effect=lambda target, statement: next(counts),
+        ), mock.patch.object(
+            authored_factory,
+            "ensure_catalog_database",
+            side_effect=lambda target, database: calls.append(("ensure", database)),
+        ), mock.patch.object(
+            authored_factory.ClickHouseTarget,
+            "from_env",
+            return_value=ClickHouseTarget("http://ch", "default", ""),
+        ):
+            result = run_fn(build_op_context())
+        return result, calls
+
+    @staticmethod
+    def _statements(calls: list[tuple[str, str]]) -> list[str]:
+        """The SQL statements the op sent, in order (the `ensure` entries
+        record the catalog database name in the same slot, so they are
+        filtered out here rather than matching the catalog's own name)."""
+        return [statement for kind, statement in calls if kind == "sql"]
+
+    @staticmethod
+    def _ensured_databases(calls: list[tuple[str, str]]) -> list[str]:
+        return [database for kind, database in calls if kind == "ensure"]
+
+    @staticmethod
+    def _bronze_pipeline(**overrides: object) -> dict[str, object]:
+        """`_ready_pipeline` DEFINITION overrides for a Bronze-to-Silver
+        pipeline, the shape `ops/g7/g7_pipeline_test.py` authors."""
+        return {
+            "sourceZone": "bronze",
+            "sourceTable": "g3a_orders",
+            "transforms": ["dedupe(id)", "select(id,name)"],
+            "targetZone": "silver",
+            "targetTable": "bronze_out",
+            **overrides,
+        }
+
+    def test_a_bronze_source_is_read_through_the_jobs_own_catalog_database(self) -> None:
+        """D1: the source is ``icecat_authored.`bronze.g3a_orders` `` -- the
+        job's own `DataLakeCatalog` database plus the catalog's own flat
+        `bronze.<table>` name -- never the ClickHouse database `bronze`
+        that does not exist on this stack (the 404 T1 reproduced)."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        self.assertEqual(self._ensured_databases(calls), [authored_factory.CATALOG_DB])
+        self.assertEqual(authored_factory.CATALOG_DB, "icecat_authored")
+        selects = [s for s in self._statements(calls) if "icecat_authored" in s]
+        self.assertTrue(selects, f"no statement read the catalog database: {calls}")
+        for statement in selects:
+            self.assertIn(
+                "FROM icecat_authored.`bronze.g3a_orders`",
+                statement,
+                f"bronze source not read through the catalog database: {statement}",
+            )
+        # The Bronze source is never spelled as a ClickHouse database.
+        self.assertFalse(
+            [s for s in self._statements(calls) if "`g3a_orders`" in s and "icecat_authored" not in s]
+        )
+
+    def test_the_catalog_database_is_ensured_before_the_first_statement_that_reads_it(self) -> None:
+        """D1: ensured here, by `_resolve_source`, so the run never depends on
+        another job's catalog database having been created first."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        ensure_index = next(i for i, (kind, _) in enumerate(calls) if kind == "ensure")
+        first_read_index = next(
+            i
+            for i, (kind, statement) in enumerate(calls)
+            if kind == "sql" and "icecat_authored" in statement
+        )
+        self.assertLess(ensure_index, first_read_index, f"{calls}")
+
+    def test_every_statement_reading_the_catalog_database_carries_allow_database_iceberg(self) -> None:
+        """D2: ClickHouse refuses an Iceberg read without the setting, so it
+        rides on the `CREATE TABLE ... AS SELECT ... LIMIT 0`, on the
+        staging table's own `CREATE`, and on the staging `INSERT ... SELECT`
+        -- the three statements that read the source. It rides LAST in each
+        statement (ClickHouse parses `SETTINGS` as the SELECT's final
+        clause), which is why `_reading` appends it rather than building it
+        into `_build_select_sql`'s `FROM` clause."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        reads = [s for s in self._statements(calls) if "icecat_authored" in s]
+        self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
+        for statement in reads:
+            self.assertTrue(
+                statement.endswith("SETTINGS allow_database_iceberg = 1"),
+                f"statement does not carry the Iceberg read setting: {statement}",
+            )
+        kinds = [
+            "staging CREATE" if statement.startswith("CREATE TABLE silver.`__staging") else
+            "INSERT" if statement.startswith("INSERT INTO") else "target CREATE"
+            for statement in reads
+        ]
+        self.assertEqual(
+            sorted(kinds),
+            ["INSERT", "staging CREATE", "target CREATE"],
+        )
+
+    def test_a_silver_source_is_read_exactly_as_before(self) -> None:
+        """D3: a `silver` (or `gold`, or any ClickHouse zone) source is still
+        ``silver.`orders` ``, no catalog database is ensured, and no
+        statement grows a setting it did not have before."""
+        result, calls = self._run_op()
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(self._ensured_databases(calls), [])
+        statements = self._statements(calls)
+        self.assertFalse([s for s in statements if "icecat_authored" in s])
+        self.assertFalse([s for s in statements if "allow_database_iceberg" in s])
+        self.assertTrue(
+            any(
+                "ENGINE = MergeTree ORDER BY tuple() AS SELECT id, name FROM silver.`orders` LIMIT 0" in s
+                for s in statements
+            ),
+            statements,
+        )
+        self.assertTrue(
+            any("INSERT INTO serving.`__staging_orders_clean` SELECT id, name FROM silver.`orders`" == s for s in statements),
+            statements,
+        )
+
+    def test_resolve_source_marks_only_bronze_as_an_iceberg_read(self) -> None:
+        """`_PipelineSource.reads_iceberg` is what makes `_reading` attach the
+        setting, so it must be true for `bronze` alone."""
+        target = ClickHouseTarget("http://ch", "default", "")
+        with mock.patch.object(authored_factory, "ensure_catalog_database") as ensured:
+            bronze = authored_factory._resolve_source(target, "bronze", "orders")
+        ensured.assert_called_once_with(target, authored_factory.CATALOG_DB)
+        self.assertEqual(bronze.clickhouse_name, "icecat_authored.`bronze.orders`")
+        self.assertTrue(bronze.reads_iceberg)
+        for zone in ("silver", "gold", "serving"):
+            source = authored_factory._resolve_source(target, zone, "orders")
+            self.assertEqual(source.clickhouse_name, f"{zone}.`orders`")
+            self.assertFalse(source.reads_iceberg)
+
+
 class OpForPipelineTest(unittest.TestCase):
     """Executes the built op's own function directly (not through a full
     Dagster job run) -- same level `test_maintenance.py` exercises its ops
