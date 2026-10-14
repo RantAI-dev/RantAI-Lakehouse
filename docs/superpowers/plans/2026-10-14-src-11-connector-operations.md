@@ -413,6 +413,76 @@ Review 1 of the planner, three items. One commit each, in this order.
 
 **Most likely to fail in CI next.** (1) Anything in the 3,900 added Rust lines that clippy `pedantic` flags and I could not see without compiling (`doc_markdown` on a CamelCase word in a doc comment, `unnecessary_wraps` on the `-> sqlx::Result<()>` tests, `uninlined_format_args`); (2) sqlx runtime type or SQL errors in the new queries, in particular `sync_excluded_columns_in` (`unnest($2::text[], $3::text[])` and the `ON CONFLICT (connector_id, object_name, column_name)` target, which depends on the primary key of 0064) and `RECORD_RUN_SQL` untouched; (3) the Dagster `ExecutionTag` input name (above); (4) `route_auth.rs` both-ways assertions for the seven new routes were not re-read against the policy table.
 
+### Task 8, the gate (developer, 2026-10-14, branch `feat/phase-1-rest`)
+
+Only `docker-compose.yml`, `.env.example`, `ops/`, `.github/workflows/ci.yml`, `scripts/ci/` and `docs/CI.md` were touched. No product change was needed in `rust/`, `dagster/` or `src/`, and the gate does reach a forwarder it controls (see "How it reaches the forwarder").
+
+**Commits.**
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| 8a | `27e5a69b` | `SRC-11 feat(compose): pass the retry delays and the auto-disable threshold` |
+| 8b | `4ae1bcdd` | `SRC-11 test(gate): connector operations in a job of its own (g6-ops)` |
+
+(The handoff commit that adds this entry follows them.)
+
+**What was built.**
+
+- 8a. `INGEST_RETRY_DELAYS_SECONDS: ${INGEST_RETRY_DELAYS_SECONDS:-}` on `dagster-code-location` (the service whose run process executes an ingest run; the daemon only runs sensors, so it gets none) and `CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}` on `lakehouse-api`, each with a why-comment, and both (empty, commented) in `.env.example`. Empty or unset falls back to the code (`RetrySettings.from_env` treats blank as default; `parse_positive_u32_or_default` treats empty as unparseable, so 30). Keys are unique (counted); no credential has a default.
+- 8b. `ops/g6/src11_connector_operations_test.py` (steps a to g as in the task), runner service `g6-ops-test-runner` (profile `g6-ops`) in `ops/g6/docker-compose.g6.override.yml`, job `g6-ops` ("Rust · SRC-11 connector operations") in `ci.yml` with `INGEST_RETRY_DELAYS_SECONDS=5,10,20` and `CONNECTOR_AUTO_DISABLE_AFTER=3` in the job's `.env`, with a comment at the job, in the step and in the script's docstring that the numbers are lowered and why (checklist row 6). `ci-required` `needs` + `G6_OPS_RESULT`, `required_gate.sh`, two self-test cases (failure and skipped), `docs/CI.md`. The job copies `g6-alerts`: `--no-deps`, an explicit service list, `step_wait_for_services` (which waits for `ingest_job` to be loaded; the gate launches only `ingest_job`, so `g6-alerts`' extra `file_ingest_job` wait is not needed), `always()` summary, logs on failure, `down -v`.
+
+**How it reaches the forwarder (the stop condition).** The gate process starts `Forwarder` (a thread, `0.0.0.0:13306`, `SRC11_FORWARDER_PORT`) and finds its own address with `src17.own_address("lakehouse-api")` (the UDP route probe of `SRC-17`, imported, not copied). The connector's host is that address and port. The API's address check and Dagster's dial guard both accept it through the gate-only `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` and `INGEST_ALLOW_INTERNAL_HOSTS` that `ops/g6/docker-compose.g6.override.yml` already sets for every g6 fixture, so no new opt-in and no product change. "OFF" closes the listening socket (the port refuses at once, which a driver reports as MySQL error 2003, class `unreachable`); "ON" binds it again.
+
+**Steps, as built (each prints `[g6-ops] SRC-11 ...`; a failure is `OpsGateFailure` with the step in the message).**
+
+- a. MySQL connector via the forwarder (OFF); run; polls the run log until an attempt `failed` / `unreachable` with a `waitSeconds`; forwarder ON; Dagster SUCCESS; log has >= 2 attempts, first failed, last succeeded; Bronze has 3 rows; the run record ends `succeeded` with >= 2 attempts. Prints the attempts.
+- b. PostgreSQL connector (`postgres:5432`, user `lakehouse`) with a wrong password; Dagster FAILURE; exactly one attempt, `sign_in_refused`, no wait.
+- f. `?format=text` of b's run: 200, `text/plain`, has `attempt 1`, `the source refused the sign-in` and the run id; none of the password, `password authentication failed`, `psycopg2`, `operationalerror`, `traceback`.
+- c. MySQL connector with a leap-day cron (`0 2 29 2 *`, so the stack's real schedule sensor never launches it; the due window is `2028-02-29T01:59:00Z` to `02:00:00Z`), in the due list; a `connector_disabled` rule for it to the gate's receiver; one good load (2 rows); password made wrong; 3 failing runs; polls the connector until `pausedAt`; `pausedReason == "Paused after 3 failed runs in a row"`; the webhook arrives and names the connector and "3 failed runs"; the due list leaves it out and the unfiltered list carries `paused: true`.
+- d. Password made right again; run launched through Dagster `launchRun` (the API mutation shape, no tag); the run record ends `paused`, `endReason connector_paused`, trigger `other`, 0 rows; Bronze row count unchanged (the table is `append`, so a load would have doubled it); the webhook count is still exactly 1.
+- c (second half). `POST .../resume` -> `resumed: true`; `pausedAt` null and `failureStreak` 0; back in the due list; a second resume answers 409; the next run succeeds and Bronze gains rows.
+- e. MySQL table with `secret_note`; first load (append) carries it; a row is added; `PUT ingest-spec` with `excludedColumns: ["secret_note"]`; the schema-changes list has it in `inactiveColumns` with `reason: "excluded"`; second load: Bronze grows, the count of rows with a `secret_note` value is still the first load's 2; nothing pending, not paused, the mark still there.
+- g. For every run the gate launched through `POST .../ingest/run`, `GET .../runs` has it with `trigger: "user"`.
+
+**API calls, traced against the Rust** (`rust/crates/lakehouse-api/src/`; permission is for the bootstrap administrator's session unless said):
+
+| Call in the gate | Route registered | Policy | Handler | Fields and statuses used |
+| --- | --- | --- | --- | --- |
+| `POST /api/connectors` (`matrix._create_connector`) | `routes/mod.rs:542` | `policy.rs:522` `connector:manage` | `routes/connectors.rs:699` | body as the matrix gate sends it; 200 (`ok`); `id`, `credential.primary` |
+| `PUT /api/connectors/{id}/ingest-spec` | `routes/mod.rs:491` | `policy.rs:566` `connector:manage` | `routes/connectors.rs:2956`, body `IngestSpecBody` `:2764` | `adapter`, `ingestMode`, `dial`, `sourceObjects[].{name,target,loadMode,excludedColumns}`, `scheduleCron`; 200; 422/400 for `excludedColumns` (not hit) |
+| `POST /api/connectors/{id}/ingest/run` | `routes/mod.rs:495` | `policy.rs:573` `connector:manage` | `routes/connectors.rs:3245` -> `launch_ingest` `:3264`+ | no body; 200 `{"runId"}`; 409 paused/active (the gate waits for each run to end first) |
+| `GET /api/connectors/{id}` | `routes/mod.rs:461` | `policy.rs:523` `connector:manage` | `routes/connectors.rs:286` | `pausedAt`, `pausedReason`, `failureStreak` (`lakehouse-store/src/connectors.rs:113-123`, camelCase) |
+| `GET /api/connectors/{id}/runs` | `routes/mod.rs:505` | `policy.rs:592` `connector:manage` | `routes/connector_runs.rs:102` | `{"runs":[{runId,trigger,status,endReason,rowsLoaded,attempts,...}]}` |
+| `GET /api/connectors/{id}/runs/{runId}/log` (JSON, 404 until the start report arrives) | `routes/mod.rs:507` | `policy.rs:593` | `routes/connector_runs.rs:144` | `attempts[].{table,attempt,result,errorClass,waitSeconds,rowsLoaded}` |
+| same with `?format=text` | same | same | same, text branch | `200`, `Content-Type: text/plain; charset=utf-8`; heading `run <id> (<trigger>), <status>`, lines `table T, attempt N: failed, <phrase>` (`lakehouse-store/src/connector_run.rs:451-460, 812-827`) |
+| `POST /api/connectors/{id}/resume` | `routes/mod.rs:511` | `policy.rs:594` | `routes/connector_runs.rs:200` | no body; 200 `{"resumed": true}`; 409 when not paused |
+| `GET /api/connectors/{id}/schema-changes` (`matrix._schema_changes`) | `routes/mod.rs:517` | `policy.rs:607` | `routes/schema_changes.rs:634` | `pending`, `inactiveColumns[].{objectName,columnName,reason}` |
+| `GET /api/connectors/ingestible[?dueAfter&dueUntil]` with `Authorization: Bearer $INGEST_SERVICE_TOKEN` | `routes/mod.rs:553` | `policy.rs:515` `ingest:read` | `routes/connectors.rs:202`, `is_due` `:243` | both bounds RFC 3339; entries `id`, `paused` (`lakehouse-store/src/connectors.rs:2065`) |
+| `POST /api/alerts` (`src17.create_rule`), `DELETE /api/alerts?id=` (`src17.delete_rule`) | `routes/mod.rs:800` | `policy.rs:305, 307` `alert:write` | `routes/alerts.rs:314` | `type: connector_disabled`, `channel: webhook`, `target`, `connector`; 200 `rule.id`; the rule scope check needs an administrator (the bootstrap account) for `*`, not for one connector |
+| Dagster `launchRun` (GraphQL, not the API) | n/a | n/a | `rust/crates/lakehouse-dagster/src/lib.rs:1198-1241` (the same selector `__repository__` / `dispar_orchestrate.definitions` / `ingest_job` and `RunConfigData` object) | `LaunchRunSuccess.run.runId` |
+
+**Commands run (all from `/home/hv/lakehouse-sec27`) and outcomes.**
+
+- `~/.cache/rantai-dagster-venv/bin/python -m py_compile ops/g6/src11_connector_operations_test.py`: no output, exit 0 (the `__pycache__` it wrote was removed).
+- A local, stackless run of the gate's helpers (a scratch script outside the repo, `g6_ingest_matrix_test` replaced by an empty stub): `Forwarder` against a local server that answers `hello`: OFF -> `ConnectionRefusedError`, ON -> `b'hello'` twice, OFF again -> refused, ON again -> `hello`, `off()` twice is harmless; `src17.Receiver` on port 18099 received a POST, `wait_for` and `arrivals` returned it (1), `src17.check_webhook_body` accepted a body naming the connector and "3 failed runs"; `attempts_phrase`, `check_log_text` (accepts an honest log; rejects the password, `psycopg2`, `Traceback`), `poll` (times out with the step text) and `auto_disable_after` behaved as written. This ran no HTTP call to the API, Dagster or ClickHouse.
+- `bash scripts/ci/tests/test_required_gate.sh`: `=== Results: 35 passed, 0 failed ===` (it includes the check that every job in `ci.yml` is in `ci-required` needs and has a result variable in `required_gate.sh`).
+- `python3 -c "import yaml; yaml.safe_load(open(...))"` for `.github/workflows/ci.yml`, `docker-compose.yml`, `ops/g6/docker-compose.g6.override.yml`: ok for all three; `g6-ops` is in `ci-required` `needs`, `G6_OPS_RESULT` is in its env; the new keys were counted once each in `docker-compose.yml`, and the runner service key once in the override.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK. `python3 ops/lint/check_compose_init_readiness.py`: exit 0. `python3 ops/lint/check_connector_gate_coverage.py`: OK (11 types covered, 0 waived).
+
+**Not verified.** `docker compose config` and `up` (no docker here): the new compose blocks were re-read for unique keys, `$` escaping (none needed) and `${X:-}` versus `${X:?}` (the two new runner variables that every g6 job would otherwise have to define are `:-`; `MYSQL_ROOT_PASSWORD` and `CONNECTOR_MYSQL_PASSWORD` are `:?` as in the rest of the file). The whole gate against a real stack, including every endpoint answer above (read from the Rust, not run), the Dagster 1.x behaviour that `RetryRequested.seconds_to_wait` is honoured by the real executor (the Python handoff noted this too), and the `ExecutionTag` input name (the tag path is exercised by step g: a wrong name would show as a failed `POST ingest/run` in every step, not only g).
+
+**Job duration estimate.** The stack bring-up with `--build` costs what `g6-alerts` costs (the API image build dominates). The gate itself about 9 to 11 minutes: a about 1.5 min (5 s wait after the first attempt, run start-up), b + f about 0.5 min, c about 4 min (a good load, 3 failing runs of about 20 s, then up to 30 s for the run sensor to report the last failure and up to 90 s of waiting for the webhook), d about 0.5 min, resume + next run about 0.7 min, e about 1.5 min, g under 0.5 min. `timeout-minutes: 30`.
+
+**What I think is most likely to fail in CI.**
+
+1. The sensor path. Auto-disable counts a failed run when the run sensor reports it (up to 30 s per tick); if `PIPELINE_RUN_TOKEN` or the daemon is not effective, step c times out at "the connector to be paused" after 150 s (the `.env` has the token and the daemon is in the service list, as in `g6-alerts`).
+2. Step a's timing: attempt 2 starts 5 s after attempt 1 failed. The gate polls the log every second, so it switches the forwarder ON well within that; if the first poll lands late, attempt 3 (10 s later) still succeeds, but a very slow poll could burn all three retries and fail the run (the failure would say so in the step).
+3. Step b: that PostgreSQL's server really refuses the password (`pg_hba` for the Docker network is `scram-sha-256` by default), that the type `PostgreSQL` takes a `file` credential with a `password` slot as MySQL does, and that the batch Postgres path reports through the same `ingest_source_object` classification (`dlt_pipeline` path) the Python handoff tested only with hand-built errors.
+4. Step c's leap-day cron: `croner` must accept `0 2 29 2 *` and find the 2028 occurrence from `2028-02-29T01:59:00Z`; if it did not, "the connector is not in the due list before it is paused" is the failure.
+5. Step d: the run record `trigger` for a Dagster-launched run is `other` by the Python handoff (no tag); if the daemon or the run launcher adds a tag the assertion names it. The end report of a paused run is the orchestrator's (`paused` / `connector_paused`).
+6. Step e: the second `append` load of a table whose Iceberg table still has `secret_note` but the incoming batch does not; if the sink refuses a batch with fewer columns the run fails and the step says so (a product finding, not a gate defect).
+7. `INGEST_SERVICE_TOKEN` inside the runner: only for the due list; empty -> the gate's own message.
+
 ## Review
 
 *(planner)*
