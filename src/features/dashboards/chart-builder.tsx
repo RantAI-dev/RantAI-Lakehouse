@@ -3,8 +3,8 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
-  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
+  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
+  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
@@ -69,7 +69,9 @@ import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumn, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
-import { BuilderSection, FoldSection } from "./builder-sections";
+import { AccordionSection, FoldSection, focusFirstEmpty } from "./builder-sections";
+import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
+import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import { FormulaEditorDialog } from "./formula-editor";
@@ -219,6 +221,14 @@ function useMinWidth(px: number): boolean {
   );
 }
 
+/** Moves on to the next section once the open one has what it needs (phase 2 QA R10). */
+function NextButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button type="button" size="sm" variant="ghost" className="justify-self-end" onClick={onClick}>
+      Next <ChevronRight className="size-3.5" aria-hidden />
+    </Button>
+  );
+}
 /** Marks a field the chart cannot be drawn without. */
 function Req() {
   return <span aria-hidden className="text-destructive">*</span>;
@@ -385,6 +395,13 @@ export function ChartBuilder({
   const [paramsOpen, setParamsOpen] = React.useState(false);
   // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
   const [moreOpen, setMoreOpen] = React.useState(false);
+  // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
+  const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
+  const panelRefs = React.useRef<Partial<Record<SectionNumber, HTMLElement | null>>>({});
+  const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
+  // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
+  const [listOpen, setListOpen] = React.useState(true);
+  const [kindMenu, setKindMenu] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -709,6 +726,10 @@ export function ChartBuilder({
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
+    const pref = readKindListPref();
+    setListOpen(pref ? pref === "expanded" : !editId);
+    setKindMenu(false);
+    setActive(editId ? null : 1);
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -768,7 +789,7 @@ export function ChartBuilder({
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
-    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
   }
@@ -840,6 +861,42 @@ export function ChartBuilder({
     if (shape.sortChoice.startsWith("by:") && !sortChoices.some((o) => o.value === shape.sortChoice)) setSortChoice("order:desc");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `sortChoices` is rebuilt every render; its content is what matters
   }, [fields, shape.sortChoice, JSON.stringify(sortChoices)]);
+
+  // Phase 2 QA R10: the one-line summaries a folded section shows (lib/section-summary), in the labels used everywhere else.
+  const summaries = sectionSummaries({
+    kind, rowsMode, source: sourceLabels[source] ?? "", joins: shape.joins.length,
+    dimension, grain: grain && grainOptions.includes(grain) ? grain : "", breakdown: canBreakdown ? breakdown : "",
+    groupings: shape.groupings.map((g) => g.column), rowColumns: tableDraft.columns,
+    pivot: { rows: tableDraft.pivotRows, columns: tableDraft.pivotColumns, values: tableDraft.pivotValues.filter((v) => v.column).map((v) => v.column) },
+    measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
+    mapLabel: isMap ? MAP_LABELS[effectiveMap] ?? "" : "", lat, lon,
+    sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
+    limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
+    filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
+  });
+  const missingIn = (n: SectionNumber) => missing.some((m) => missingSection(m) === n);
+  /** Opens the section that holds a missing field and moves focus to that field. */
+  function revealSection(n: SectionNumber) {
+    if (n === 4) setMoreOpen(true); else setActive(n);
+    setFocusAsk({ section: n, n: Date.now() });
+  }
+  React.useEffect(() => {
+    if (!focusAsk) return;
+    focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
+    setFocusAsk(null);
+  }, [focusAsk]);
+  /** A type was chosen from the list or the menu; with no remembered choice the list folds away. */
+  function chooseKind(next: ChartKind) {
+    pickKind(next);
+    setKindMenu(false);
+    if (!readKindListPref()) setListOpen(false);
+  }
+  function toggleList() {
+    const next = !listOpen;
+    setListOpen(next);
+    setKindMenu(false);
+    writeKindListPref(next ? "expanded" : "collapsed");
+  }
 
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
@@ -970,6 +1027,12 @@ export function ChartBuilder({
   async function save() {
     setError(null);
     if (sqlActive && draft.blocker) { draft.markSaveAttempted(); setError(draft.blocker); return; }
+    // Phase 2 QA R10: a required field that is missing opens its section and takes focus.
+    if (missing.length) {
+      revealSection(missing.map(missingSection).reduce((a, b) => (b < a ? b : a)));
+      setError(`Still needed: ${missing.join(", ")}.`);
+      return;
+    }
     let payload: Record<string, unknown>;
     // A new source has no id yet; a placeholder lets the same checks run
     // before anything is written, and the real id replaces it below.
@@ -1047,18 +1110,15 @@ export function ChartBuilder({
 
   const formFields = (
     <div className="grid content-start gap-5 px-5 pt-1 pb-5">
-      <div className="grid gap-1.5">
-        <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
-        <Input
-          id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
-          placeholder={suggestedTitle || "e.g. Visitors by Region"}
-        />
-        {!title.trim() && suggestedTitle ? (
-          <p className="text-xs text-muted-foreground">Left empty, the chart is saved as “{suggestedTitle}”.</p>
-        ) : null}
-      </div>
-
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
+        <div className="grid gap-1.5">
+          <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
+          <Input
+            id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
+            placeholder={suggestedTitle || "e.g. Visitors by Region"}
+          />
+        </div>
         <div className="grid gap-1.5">
           <Label>Dashboard</Label>
           <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
@@ -1082,7 +1142,6 @@ export function ChartBuilder({
         </div>
       </div>
 
-
       {isText ? (
         <div className="grid gap-1.5">
           <Label>Content (markdown) <Req /></Label>
@@ -1091,7 +1150,7 @@ export function ChartBuilder({
       ) : (
         <>
           {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
-          <BuilderSection number={1} title="Data">
+          <AccordionSection number={1} title="Data" summary={summaries.data} open={active === 1} onOpenChange={(o) => setActive(o ? 1 : null)} panelRef={(n) => { panelRefs.current[1] = n; }}>
             <div className="grid gap-1.5">
             <Label>Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
@@ -1168,9 +1227,10 @@ export function ChartBuilder({
                 />
               ) : null}
             </div>
-          </BuilderSection>
+            {active === 1 && !missingIn(1) ? <NextButton onClick={() => setActive(2)} /> : null}
+          </AccordionSection>
 
-          <BuilderSection number={2} title="What to show">
+          <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
@@ -1303,9 +1363,10 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
-          </BuilderSection>
+          {active === 2 && !missingIn(2) ? <NextButton onClick={() => setActive(3)} /> : null}
+          </AccordionSection>
 
-          <BuilderSection number={3} title="Sort and filter">
+          <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
             {rules.sort !== "none" ? (
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {rules.sort === "by-date" || rules.sort === "by-category" ? (
@@ -1354,9 +1415,9 @@ export function ChartBuilder({
             ) : null}
 
             {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
-          </BuilderSection>
+          </AccordionSection>
 
-          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen}>
+          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
             {rules.steps ? <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} /> : null}
 
             {rules.layers ? (
@@ -1386,6 +1447,58 @@ export function ChartBuilder({
         </>
       )}
     </div>
+  );
+  /** The type search and the grouped type buttons, shared by the open list and the menu of the folded one (phase 2 QA R9). */
+  const kindSearch = (
+    <>
+      <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+      <Input
+        value={kindQuery}
+        onChange={(e) => setKindQuery(e.target.value)}
+        onKeyDown={(e) => {
+          // Enter picks the first match, so "sank⏎" is enough.
+          const first = kindGroups[0]?.items[0];
+          if (e.key === "Enter" && first) { e.preventDefault(); chooseKind(first.value); }
+        }}
+        placeholder="Search chart types"
+        aria-label="Search chart types"
+        className="h-8 bg-background pl-8"
+      />
+    </>
+  );
+  const kindList = (direction: string) => (
+    <>
+      {kindGroups.length === 0 ? (
+        <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
+      ) : null}
+      {kindGroups.map((group) => (
+        <div key={group.group} className={cn("flex shrink-0 gap-1", direction)}>
+          <p className={cn("px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground", direction === "md:flex-col" && "hidden md:block")}>
+            {group.group}
+          </p>
+          {group.items.map((item) => {
+            const Icon = kindIcon(item.value);
+            const active = item.value === kind;
+            return (
+              <button
+                key={item.value}
+                type="button"
+                aria-pressed={active}
+                title={KIND_DESCRIPTIONS[item.value]}
+                onClick={() => chooseKind(item.value)}
+                className={cn(
+                  "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                )}
+              >
+                <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
+                <span className="md:truncate">{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </>
   );
   const previewPane = (
     <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
@@ -1422,7 +1535,7 @@ export function ChartBuilder({
               <div className="min-h-0 flex-1">
                 <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
               </div>
-              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
+              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
             </div>
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
@@ -1453,56 +1566,20 @@ export function ChartBuilder({
           The dialog has a fixed height so the actions stay at the bottom
           edge whatever the form's length.
         */}
-        <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1">
+        <div className={cn("grid h-full min-h-0", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
+          {listOpen ? (
           <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
-            <div className="relative p-2 md:p-3 md:pb-2">
-              <Search className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-muted-foreground md:left-5" aria-hidden />
-              <Input
-                value={kindQuery}
-                onChange={(e) => setKindQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  // Enter picks the first match, so "sank⏎" is enough.
-                  const first = kindGroups[0]?.items[0];
-                  if (e.key === "Enter" && first) { e.preventDefault(); pickKind(first.value); }
-                }}
-                placeholder="Search chart types"
-                aria-label="Search chart types"
-                className="h-8 bg-background pl-8"
-              />
+            <div className="flex items-center gap-1 p-2 md:p-3 md:pb-2">
+              <div className="relative min-w-0 flex-1">{kindSearch}</div>
+              <Button type="button" size="icon-sm" variant="ghost" className="shrink-0" aria-label="Fold the chart type list" title="Fold the chart type list" onClick={toggleList}>
+                <PanelLeftClose aria-hidden />
+              </Button>
             </div>
             <div className="flex min-h-0 gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:gap-3 md:overflow-y-auto md:px-3 md:pb-3">
-            {kindGroups.length === 0 ? (
-              <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
-            ) : null}
-            {kindGroups.map((group) => (
-              <div key={group.group} className="flex shrink-0 gap-1 md:flex-col">
-                <p className="hidden px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground md:block">
-                  {group.group}
-                </p>
-                {group.items.map((item) => {
-                  const Icon = kindIcon(item.value);
-                  const active = item.value === kind;
-                  return (
-                    <button
-                      key={item.value}
-                      type="button"
-                      aria-pressed={active}
-                      title={KIND_DESCRIPTIONS[item.value]}
-                      onClick={() => pickKind(item.value)}
-                      className={cn(
-                        "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                        active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                      )}
-                    >
-                      <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
-                      <span className="md:truncate">{item.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))}
+              {kindList("md:flex-col")}
             </div>
           </nav>
+          ) : null}
 
           <div className="flex min-h-0 flex-col">
             <div className="px-5 pt-5 pb-4">
@@ -1510,10 +1587,37 @@ export function ChartBuilder({
                 <DialogTitle className="flex items-center gap-1.5 text-base">
                   <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
                   <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
-                  <span>{KIND_LABELS[kind]}</span>
+                  {listOpen ? <span>{KIND_LABELS[kind]}</span> : null}
                 </DialogTitle>
-                <DialogDescription>{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
+                <DialogDescription className="sr-only">{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
               </DialogHeader>
+              {listOpen ? null : (
+                // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
+                <div className="mt-2 flex items-center gap-1.5">
+                  <div className="relative">
+                    <Button
+                      type="button" size="sm" variant="outline" aria-expanded={kindMenu} aria-label={`Change chart type, now ${KIND_LABELS[kind]}`}
+                      onClick={() => setKindMenu((o) => !o)}
+                    >
+                      {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
+                      {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
+                    </Button>
+                    {kindMenu ? (
+                      <div
+                        role="group" aria-label="Chart type"
+                        className="absolute top-full left-0 z-30 mt-1 flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md"
+                        onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); setKindMenu(false); } }}
+                      >
+                        <div className="relative">{kindSearch}</div>
+                        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
+                      </div>
+                    ) : null}
+                  </div>
+                  <Button type="button" size="icon-sm" variant="ghost" aria-label="Show the chart type list" title="Show the chart type list" onClick={toggleList}>
+                    <PanelLeftOpen aria-hidden />
+                  </Button>
+                </div>
+              )}
             </div>
             {/*
               Form and preview are split by a divider rather than a card
