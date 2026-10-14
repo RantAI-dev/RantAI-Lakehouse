@@ -505,6 +505,18 @@ a user's own SQL, or a catalog asset through the API's catalog database.
 
 ### Not verified
 
+- **CI checks the refusal, not the source text (BLD-3 review BLOCKER 1,
+  fixed in `367f304c`).** `ci.yml`'s `images` job builds both images
+  without `GIT_SHA` so the layer cache is shared across commits, and
+  `pipelines::source` refuses such a build by design, so the `g3a-dagster`
+  job now sets `G7_SOURCE_PROVENANCE=unavailable` and g7 asserts that
+  refusal (409, exactly `{"error": "source provenance is unavailable for
+  this build"}`). The source TEXT is therefore proven by the LOCAL run
+  with a real commit (`GIT_SHA=$(git rev-parse HEAD)`, run B of the
+  "Fix round 1" entry below), not by CI. Both shapes were measured
+  locally at that commit; CI itself is still unobserved here (next
+  bullet).
+
 - **`bun run test` as one process was deliberately not run.** On this
   machine that single process reaches 7.2 GB and is killed (the machine
   rule this session was given). The same files were run per folder:
@@ -542,6 +554,124 @@ a user's own SQL, or a catalog asset through the API's catalog database.
   earlier measurement did not answer it (see section 6, Q3). Nothing in
   the merge of #80 or in the g7 reword touched any statement those two
   probes sent, and the g7/g3a run at this head exercises the same reads.
+
+### Fix round 1 (developer), after review round 1's BLOCKER 1
+
+Commit **`367f304c`** "BLD-3 review BLOCKER 1: g7 checks the honest refusal
+where the build has no `GIT_SHA"`, three files, no Rust touched (the
+reviewer had the Rust suite running on this worktree):
+
+- `ops/g7/g7_pipeline_test.py` -- `G7_SOURCE_PROVENANCE`, default
+  `required`. `required` leaves the source step byte-for-byte as it was
+  (must return the op's real source text). `unavailable` runs
+  `_assert_source_refused`: 409 and a body that parses to exactly
+  `{"error": "source provenance is unavailable for this build"}`, then
+  prints the one line saying the source text was NOT checked and why. The
+  GRAPH half is asserted in both modes (it does not depend on the
+  build's commit). An unrecognised mode fails before the first HTTP call.
+- `docker-compose.yml` -- `g7-test-runner` gains
+  `G7_SOURCE_PROVENANCE: ${G7_SOURCE_PROVENANCE:-required}`, so every
+  deployment that sets nothing keeps `required`.
+- `.github/workflows/ci.yml` -- the `g3a-dagster` job's CI-only `.env` sets
+  `G7_SOURCE_PROVENANCE=unavailable`, its comment naming the `images`
+  job's `GIT_SHA` choice as the reason.
+
+**Proof, one locked run, two whole up -> G3a -> g7 -> `down -v`
+sequences** (`.local/blocker1-two-runs.sh`, one
+`sg docker -c "flock /home/shiro/rantai/.heavy.lock bash ..."`, project
+`bld3`, profile `dagster`, `down -v` first and last in each run; it waited
+~14.5 min for the reviewer's Rust run to release the lock. Each run built
+its own image TAGS so neither could reuse the other's image, and printed
+what the images actually carry rather than trusting the flag). Whole
+script: 15:04:05 -> 15:35:48 (31 min 43 s, 14.5 min of it waiting for
+the lock).
+
+Run A -- the CI shape: `GIT_SHA` UNSET in the environment, so compose's
+`${GIT_SHA:-unknown}` bakes `unknown` into both images, and
+`G7_SOURCE_PROVENANCE=unavailable` in the CI-only `.env`:
+
+```
+GIT_SHA is unset (CI shape -> bakes 'unknown')
+api image GIT_SHA      = unknown
+code-location GIT_SHA = unknown
+build rc=0 in 605s
+up rc=0 in 22s
+g3a rc=0 in 41s
+g7  rc=0 in 29s
+```
+
+g7's output, verbatim (`.local/logs/blocker1-run-a-no-git-sha.log`):
+
+```
+[g7] logged in as bootstrap admin
+[g7] authored pipeline 'pl-g7-dedupe-select-mv89nfym' created and activated
+[g7] ready: run bbc0642d-3975-47e5-9dd2-e8b56ad83c46 terminal
+[g7] run bbc0642d-3975-47e5-9dd2-e8b56ad83c46 reports real row materializations
+[g7] silver.g7_dedupe_select_out holds 2000 rows = the 2000 distinct ids of bronze.g3a_orders
+[g7] 'bronze_maintenance_job' graph checked; source text NOT checked because this build has no GIT_SHA -- the API refused with 409 'source provenance is unavailable for this build', which is the honest answer
+[g7] PASS
+```
+
+That is the assertion CI could not make before this fix, made on the same
+build shape CI builds.
+
+Run B -- `GIT_SHA=$(git rev-parse HEAD)` at `367f304c`, and the compose
+DEFAULT (`required`, nothing in the `.env`):
+
+```
+GIT_SHA=367f304c1db0c147d063e69d2853d63c1bc86ab0
+api image GIT_SHA      = 367f304c1db0c147d063e69d2853d63c1bc86ab0
+code-location GIT_SHA = 367f304c1db0c147d063e69d2853d63c1bc86ab0
+build rc=0 in 193s
+up rc=0 in 22s
+g3a rc=0 in 37s
+g7  rc=0 in 38s
+```
+
+g7's source line, verbatim (`.local/logs/blocker1-run-b-with-git-sha.log`):
+
+```
+[g7] 'bronze_maintenance_job' graph has 3 op(s); source contains 'list_bronze_tables'
+[g7] PASS
+```
+
+The default is unchanged, and it still checks the source TEXT.
+
+The fail-closed check on an unrecognised mode, run directly (no stack):
+`G7_SOURCE_PROVENANCE=requird python3 -c "import g7_pipeline_test as m; m.main()"`
+-> `[g7] FAILED: G7_SOURCE_PROVENANCE='requird' is not one of ['required',
+'unavailable']`, rc 1.
+
+Light checks on the final commit:
+
+```
+python3 ops/lint/check_intra_package_imports.py   # rc 0, "OK: all intra-package dispar_orchestrate imports resolve"
+python3 ops/lint/check_bare_iceberg_count.py      # rc 0, "R11 guard: no bare count() against a Bronze Iceberg table found."
+docker compose --profile '*' config --quiet       # rc 0, no output
+python3 -m py_compile ops/g7/g7_pipeline_test.py  # rc 0
+```
+
+Both runs ended in `down -v`: `docker ps -a --filter name=bld3` counts 0
+containers, `.env` is gone, `git status` shows only the untracked
+`.local/`.
+
+**Not verified in this round.**
+- **CI itself.** Still unobserved: no run of PR #155 was read here. What
+  is measured is the CI job's steps replayed by hand on the CI image
+  shape; the reviewer should read the next CI run's g7 line to see the
+  refusal path in the job itself.
+- **Rust was not re-run by me.** The reviewer had `cargo test --workspace`
+  running on this worktree, and this commit touches no Rust file, so
+  per the plan's "keep build time down" rule this round paid for no
+  cargo command. Nothing Rust-side changed, so the reviewer's own run at
+  this head is the number that stands.
+- **The other profiles were not brought up.** Only `dagster` (the profile
+  `g7-test-runner` belongs to) was really run; everything else was
+  `config --quiet`, as in the previous round.
+- **A wrong refusal would be caught, an absent one would too, but only
+  for THIS fixture op.** `_assert_source_refused` checks one request; it
+  does not sweep the other `sourceRef`s of `bronze_maintenance_job`. That
+  matches the `required` branch, which also checks one op.
 
 ## 8. Review
 
