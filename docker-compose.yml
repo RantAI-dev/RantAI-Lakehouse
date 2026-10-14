@@ -335,6 +335,12 @@ services:
       # effect when the flag above is not `true`. Never opens loopback,
       # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      # SRC-11 D3: this many failed runs in a row pause a connector and raise
+      # `connector_disabled` once. Unset or empty keeps the code's default,
+      # 30 (the spec's number); zero, negative or garbage does too. A
+      # gate sets a small number so it need not run 30 failures
+      # (`ops/g6/src11_connector_operations_test.py`). Not a credential.
+      CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
@@ -1728,6 +1734,13 @@ services:
       # this compose network and the host stay refused. Empty by default
       # (`ssrf_guard.py`'s module docstring).
       INGEST_ALLOWED_CIDRS: ${INGEST_ALLOWED_CIDRS:-}
+      # SRC-11 D1: the wait before each retry of a failing table, in seconds,
+      # one to three whole numbers. Unset or empty keeps the code's default,
+      # `60,300,900` (1, 5 and 15 minutes, the spec's); a malformed value
+      # does too (`ingest_errors.RetrySettings.from_env`). Read by the run
+      # process, which this service launches, so the daemon needs none. A
+      # gate shortens it (`ops/g6/src11_connector_operations_test.py`).
+      INGEST_RETRY_DELAYS_SECONDS: ${INGEST_RETRY_DELAYS_SECONDS:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
