@@ -29,9 +29,10 @@ import {
   type TransformDraft,
 } from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
-import { connectorService, pipelineService } from "@/services"
+import { connectorService, lakehouseService, pipelineService } from "@/services"
 import type { Pipeline, PipelineDetail, PipelineKind } from "@/services/contracts/pipelines"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
+import { reuploadTriggerOn, showsReuploadSwitch, withReuploadTrigger } from "./pipeline-reupload-trigger"
 
 const STEPS: FormStep[] = [
   { id: "source", label: "Source", description: "Name and source table" },
@@ -122,6 +123,33 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     (signal) => connectorService.listConnectors(signal),
     []
   )
+  // DATA-19 D3: the one `dependsOn` control, shown only for a Bronze
+  // source. The stored chain is `existing.dependsOn` — it may hold
+  // upstreams this switch knows nothing about, and they are carried
+  // through untouched by `withReuploadTrigger`.
+  const [reuploadOn, setReuploadOn] = React.useState(() =>
+    reuploadTriggerOn(existing?.dependsOn, existing?.definition?.sourceZone ?? "bronze", Boolean(existing))
+  )
+  // DATA-19 D4: "selectable" source tables, as SUGGESTIONS only. The
+  // field stays free text (`silver.<table>` is typed today and a
+  // ClickHouse zone has no Iceberg namespace to list), so this never
+  // narrows what can be entered. Which zones CAN be listed is a fact of
+  // the lakehouse client, not of this form: `listTables` answers for an
+  // Iceberg namespace (`bronze`, where an uploaded table lives) and not
+  // for a ClickHouse database, so the zone is checked against the
+  // namespaces the same service lists before it is asked for tables.
+  const sourceZoneForLookup = sourceZone.trim()
+  const namespaces = useService((signal) => lakehouseService.listNamespaces(undefined, signal), [])
+  const zoneIsIceberg =
+    namespaces.status === "success" &&
+    (namespaces.data ?? []).some((ns) => ns.name === sourceZoneForLookup)
+  const sourceTables = useService(
+    (signal) =>
+      zoneIsIceberg
+        ? lakehouseService.listTables(sourceZoneForLookup, undefined, signal)
+        : Promise.resolve([]),
+    [sourceZoneForLookup, zoneIsIceberg]
+  )
   const [description, setDescription] = React.useState(existing?.description ?? "")
   const create = useServiceAction(
     withNotify(
@@ -143,6 +171,11 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 targetTable: input.targetTable,
                 schedule: input.schedule,
                 description: input.description,
+                // DATA-19 D3: the switch, resolved into the chain. Sent
+                // on every save, so switching it off CLEARS a stored
+                // `file_ingest_job` instead of leaving it behind (an
+                // omitted field would have kept the stored chain).
+                dependsOn: withReuploadTrigger(existing.dependsOn, input.sourceZone, reuploadOn),
               },
               signal
             )
@@ -155,6 +188,15 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   // only the page-level generic message.
   const failedTransformIndex =
     create.status === "error" ? transformErrorRowIndex(create.error.message) : null
+
+  const [sourceTableOptions, setSourceTableOptions] = React.useState<string[]>([])
+  React.useEffect(() => {
+    if (sourceTables.status !== "success") {
+      setSourceTableOptions([])
+      return
+    }
+    setSourceTableOptions((sourceTables.data ?? []).map((t) => t.name).sort())
+  }, [sourceTables.status, sourceTables.data])
 
   const canProceed = React.useMemo(() => {
     if (step === 0) {
@@ -201,6 +243,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       schedule: schedule.trim(),
       connectorId: connectorId || undefined,
       description: description.trim() || undefined,
+      // DATA-19 D3: ON adds the upload job to the chain, OFF takes it
+      // out; every other upstream the pipeline already had is kept.
+      dependsOn: withReuploadTrigger(existing?.dependsOn, sourceZone.trim(), reuploadOn),
     })
     // Straight to the pipeline's own page, where it can be marked ready
     // and run; the list is one click away.
@@ -313,13 +358,48 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 </select>
               )}
             </Field>
-            <Field label="Source table">
+            <Field label="Source table" className="sm:col-span-2">
+              {/* DATA-19 D4: the zone's real table names as suggestions,
+                  typing still allowed. A `datalist` (not a picker) so a
+                  table this deployment's Iceberg namespace listing has
+                  not caught up with can still be named by hand. */}
               <Input
                 value={sourceTable}
                 onChange={(e) => setSourceTable(e.target.value)}
                 placeholder="orders_events"
+                list={sourceTableOptions.length > 0 ? "source-table-options" : undefined}
+                title={
+                  sourceTableOptions.length > 0
+                    ? `Suggestions from ${sourceZoneForLookup}; any other name can be typed.`
+                    : undefined
+                }
               />
+              <datalist id="source-table-options">
+                {sourceTableOptions.map((name) => (
+                  <option key={name} value={name} />
+                ))}
+              </datalist>
             </Field>
+            {showsReuploadSwitch(sourceZone) ? (
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2 sm:col-span-2">
+                <div>
+                  <p className="text-sm font-medium">Run again after this table is re-uploaded</p>
+                  <p className="text-xs text-muted-foreground">
+                    Uploads load into <span className="font-mono">{sourceZone.trim()}.{sourceTable.trim() || "…"}</span>;
+                    with this on, uploading it again runs this pipeline.
+                  </p>
+                </div>
+                {/* `aria-label` rather than a `<label htmlFor>`: the text
+                    beside the toggle is a description, not a caption, and a
+                    toggle with no accessible name is unreachable by voice
+                    control and invisible to a screen reader. */}
+                <Switch
+                  checked={reuploadOn}
+                  onCheckedChange={setReuploadOn}
+                  aria-label="Run again after this table is re-uploaded"
+                />
+              </div>
+            ) : null}
           </div>
         ) : null}
 
@@ -542,6 +622,14 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   { label: "Source", value: `${sourceZone}.${sourceTable}` },
                   { label: "Incremental column", value: incrementalColumn },
                   { label: "Connector", value: connectorId || "None" },
+                  ...(showsReuploadSwitch(sourceZone)
+                    ? [
+                        {
+                          label: "Re-upload triggers this pipeline",
+                          value: reuploadOn ? "Yes" : "No",
+                        },
+                      ]
+                    : []),
                 ],
               },
               {
