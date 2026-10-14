@@ -71,6 +71,10 @@ from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.sources.sql_database import sql_database, sql_table
 from pyiceberg.table import StaticTable
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 DISPOSITIONS = ["append", "replace"]
 TABLE = "src"
 

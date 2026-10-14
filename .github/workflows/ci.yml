@@ -12,7 +12,8 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # F4: a push to main must finish its run; cancelling it made its ci-required read as failed.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -175,8 +176,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install ./dagster pytest==8.3.4
 
+      # The `loader` marker (dagster/pyproject.toml) holds the tests that run a real
+      # dlt pipeline against a local Iceberg table; they run in `dagster-loader-tests`.
       - name: pytest
-        run: python -m pytest dispar_orchestrate -v
+        run: python -m pytest dispar_orchestrate -v -m "not loader"
+        working-directory: dagster
+
+  dagster-loader-tests:
+    name: Dagster · loader tests
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # `dagster/dispar_orchestrate/test_maintenance.py` existed and was run
+      # by nobody — it asserts, among other things, that Bronze maintenance
+      # skips `gold.*` tables, which is a regression guard for applied
+      # maintenance running against the Gold export's data. A test that no
+      # job executes is documentation, not a guard.
+      #
+      # Installs the code location's real pinned dependencies rather than a
+      # reduced set, so the test runs against the same `dagster` version the
+      # compose image builds. That costs install time but means a passing
+      # run actually says something about the shipped artifact.
+      - name: Install the code location and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./dagster pytest==8.3.4
+
+      - name: pytest (loader)
+        run: python -m pytest dispar_orchestrate -v -m loader
         working-directory: dagster
 
   # ── Rust: fast feedback ─────────────────────────────────────────────
@@ -1056,9 +1093,13 @@ jobs:
         # `shell: bash` for pipefail and `-T` for no pseudo-terminal, as the
         # g6-ingest run step explains; the same `-f` pair as the "up" step.
         shell: bash
+        # `--no-deps`: the "up" step above already started every service the
+        # runner depends on; without it `compose run` re-reconciles them while
+        # the gate starts (F3, run #127 job 115336951020: the code server went
+        # UNAVAILABLE right after the gate's wait passed).
         run: |
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
-            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
+            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T --no-deps g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
 
       - name: Add the measured seconds to the job summary
         # `always()`: a failed gate prints its lines too. Only the gate's own
@@ -1237,6 +1278,7 @@ jobs:
       - test
       - msrv
       - dagster-unit-tests
+      - dagster-loader-tests
       - g1-rustfs
       - g2-seaweedfs
       - g3a-dagster
@@ -1276,6 +1318,7 @@ jobs:
           RUST_TEST_RESULT: ${{ needs.test.result }}
           RUST_MSRV_RESULT: ${{ needs.msrv.result }}
           DAGSTER_TESTS_RESULT: ${{ needs.dagster-unit-tests.result }}
+          DAGSTER_LOADER_TESTS_RESULT: ${{ needs.dagster-loader-tests.result }}
           G1_RUSTFS_RESULT: ${{ needs.g1-rustfs.result }}
           G2_SEAWEEDFS_RESULT: ${{ needs.g2-seaweedfs.result }}
           G3A_DAGSTER_RESULT: ${{ needs.g3a-dagster.result }}

@@ -544,6 +544,11 @@ export type SourceObject = {
   /** How a run's rows meet the Bronze table. Absent on an object saved
    * before load modes existed, which the ingest job runs as `replace`. */
   loadMode?: LoadMode
+  /** The columns that identify one row, for the deduplicating modes and
+   * `history` (`SRC-10`). Kept on the object whatever the mode, so a key the console
+   * detected survives a switch of mode; the API ignores it for a mode that
+   * does not use it. */
+  primaryKey?: string[]
   target: string
 }
 
@@ -552,9 +557,21 @@ export type SourceObject = {
  * `dagster/dispar_orchestrate/adapters/sink.py`, which acts on it:
  * `replace` overwrites the table with what the source returns now,
  * `append` adds every row again, `incremental` adds only rows beyond the
- * cursor column's last seen value (SQL connectors only).
+ * cursor column's last seen value (SQL connectors only), `replace_dedup`
+ * is `replace` keeping one row per `primaryKey`, and `incremental_dedup` is
+ * `incremental` merging into the table on `primaryKey` (SQL connectors only),
+ * and `history` keeps every version of a row, closing the old one and adding a
+ * new one when a run sees it changed. The deduplicating modes and `history` need
+ * a `primaryKey`; `history` reads the whole source every run and takes no
+ * `incrementalKey` (`SRC-10`, decision 10).
  */
-export type LoadMode = "replace" | "append" | "incremental"
+export type LoadMode =
+  | "replace"
+  | "append"
+  | "incremental"
+  | "replace_dedup"
+  | "incremental_dedup"
+  | "history"
 
 /**
  * Credential reference NAMES only (`env:FOO`, `file:/…`), never a
@@ -681,6 +698,12 @@ export type DiscoveredColumn = {
 export type DiscoveredObject = {
   name: string
   columns: DiscoveredColumn[]
+  /**
+   * `SRC-10`: the columns of the table's primary key as the source declares it,
+   * in key order; `[]` when the source declares none. SQL drivers only; read from
+   * the source's own catalog views, so it is the source's word, not a guess.
+   */
+  primaryKey: string[]
 }
 
 /**
@@ -717,6 +740,21 @@ export type IngestRunResult = {
 }
 
 /**
+ * What a run of ONE table does (`SRC-10` decision 5), the body of
+ * `POST /api/connectors/{id}/ingest/run`: refresh keeping the rows already
+ * there, refresh after removing them, or clear the table and load nothing.
+ * Mirrors Rust `IngestAction` (`routes/connectors.rs`).
+ */
+export type IngestTableAction = "refresh_keep" | "refresh_remove" | "clear"
+
+/** The optional body of `POST .../ingest/run`: both fields, or no body at all. */
+export type IngestTableRequest = {
+  /** The source object's name, as listed in the ingest spec. */
+  object: string
+  action: IngestTableAction
+}
+
+/**
  * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
  * returned by `GET /api/governance/ingest-runs?connectorId=`.
  */
@@ -748,6 +786,13 @@ export type IngestJobRun = {
   startedAt: string | null
   /** ISO 8601; `null` until the run ends. */
   endedAt: string | null
+  /**
+   * `SRC-10`: the one table a run of a single table named (from the run's
+   * config), `null` for a run of every table.
+   */
+  object: string | null
+  /** `refresh_keep | refresh_remove | clear` for such a run, else `null`. Widened: a newer API may add actions. */
+  action: IngestTableAction | string | null
 }
 
 /**
@@ -806,7 +851,8 @@ export interface ConnectorService {
   /** `schema` is required for a `sql`/`cdc` connector: the server lists
    * only that schema's tables (bound, never interpolated). */
   discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
-  runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
+  /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
+  runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
   listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
   /**
