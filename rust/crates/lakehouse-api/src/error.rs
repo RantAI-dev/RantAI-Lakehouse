@@ -3,7 +3,8 @@
 //! Every route handler returns [`ApiResult<T>`], and the `?` operator
 //! converts any `Into<ApiError>` failure (a `ClickHouse` `ChError`, for
 //! instance) into an [`ApiRejection`] automatically. The wire contract is
-//! `{"error": "<message>"}` at the error's status code — verified against
+//! `{"error": "<message>"}` at the error's status code (plus a `code` field
+//! for [`ApiError::NotReady`] only) — verified against
 //! `src/app/api/query/run/route.ts:78` and
 //! `src/app/api/embed/data/route.ts:43`.
 
@@ -35,6 +36,11 @@ impl<E: Into<ApiError>> From<E> for ApiRejection {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+    /// Stable machine-readable condition, present only for the errors that
+    /// have one ([`lakehouse_core::ApiError::NotReady`]). Clients and gates
+    /// branch on this, never on `error`'s text (`PR #105 CI fix`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl IntoResponse for ApiRejection {
@@ -48,10 +54,17 @@ impl IntoResponse for ApiRejection {
             StatusCode::from_u16(self.0.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = ErrorBody {
             error: self.0.to_string(),
+            code: match &self.0 {
+                lakehouse_core::ApiError::NotReady { code, .. } => Some(code),
+                _ => None,
+            },
         };
         // login throttling (SEC-2): a 429 carries an integer Retry-After
         // header so the browser and the console can show how long to wait.
         if let lakehouse_core::ApiError::TooManyRequests {
+            retry_after_secs, ..
+        }
+        | lakehouse_core::ApiError::NotReady {
             retry_after_secs, ..
         } = &self.0
         {
@@ -243,6 +256,27 @@ mod tests {
         assert_eq!(
             body_json(resp).await,
             json!({"error": "Too many failed sign-in attempts. Try again later."})
+        );
+    }
+
+    /// `PR #105 CI fix`: a not-ready error is a 503 whose body carries the
+    /// stable `code` beside the fixed message, with a `Retry-After`.
+    #[tokio::test]
+    async fn not_ready_renders_503_with_a_code_and_retry_after() {
+        let resp = ApiRejection(ApiError::NotReady {
+            message: "later".to_owned(),
+            code: "orchestrator_job_not_loaded",
+            retry_after_secs: 5,
+        })
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "5"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "later", "code": "orchestrator_job_not_loaded"})
         );
     }
 

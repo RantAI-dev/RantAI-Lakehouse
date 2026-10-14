@@ -51,6 +51,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::upstream_message;
 use crate::state::AppState;
+use crate::upstream_error::orchestrator_unreachable;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::pipelines::pool`.
@@ -3202,11 +3203,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// `routes::pipelines::trigger` (`pipelines.rs:184-207`) already proves
 /// out: `Err` is reserved for transport failures and malformed GraphQL
 /// responses. This handler branches the identical way: `outcome.error`
-/// present becomes a 422 naming that error; `Err(err)` becomes a 503,
-/// classified through [`upstream_message`] the same way `trigger`'s own 503
-/// branch is (`DgError`'s `Display` is already sanitized — see that
-/// type's doc comment — so this is not a fourteenth Phase-1
-/// `ApiError::Internal(err.to_string())` leak).
+/// present becomes a 422 with a fixed message and a reference (the launch
+/// message is only logged); `Err(err)` becomes a 503, see below.
 ///
 /// # Errors
 ///
@@ -3214,8 +3212,23 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// 409 if the connector is paused (`SRC-8`, [`CONNECTOR_PAUSED`]) or if a
 /// run for this connector is still queued or running (see
 /// [`ingest_run_history`]); 422 if `Dagster` reports a launch-time
-/// failure; 503 on a `Dagster` transport failure; 503/500 as above for the
-/// database pool.
+/// failure; 503/500 as above for the database pool.
+///
+/// Two `503` answers carry a stable `code` beside the fixed `error`
+/// sentence and a `Retry-After`, so a client retries on the code and never
+/// on text (`PR #105 CI fix`; the G6 gates used to match `Dagster`'s own
+/// `PipelineNotFoundError` text, which `SEC-11` rightly removed):
+///
+/// - `orchestrator_job_not_loaded`: the launch result is `Dagster`'s typed
+///   "job not found" (or an unreachable user-code server), i.e. the code
+///   location is still loading. It was a `422` before; `503` is the
+///   route's status for "backing service not ready", the console treats
+///   any non-2xx the same, and nothing else depends on the `422`.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
+///   with a protocol failure, on the run list or the launch.
+///
+/// Every other launch failure stays the generic `422` with a reference id
+/// and no code.
 pub async fn ingest_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3251,7 +3264,7 @@ pub async fn ingest_run(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
+        .map_err(|err| orchestrator_unreachable(&err))?;
     if let Some(active) = connector_runs(&recent, &id)
         .into_iter()
         .find(ConnectorIngestRun::is_active)
@@ -3277,12 +3290,19 @@ pub async fn ingest_run(
     {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
+                // `PR #105 CI fix` (SEC-11): "not loaded yet" is decided from
+                // Dagster's typed result, never from its text, and answered
+                // with a fixed sentence and a stable code the gates and the
+                // console retry on. The raw text goes to the log either way.
+                if outcome.job_not_loaded {
+                    return Err(crate::upstream_error::job_not_loaded(&error).into());
+                }
                 // SEC-11: Dagster's launch message is the orchestrator's own text.
                 return Err(ApiError::Unprocessable(upstream_message(error)).into());
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
-        Err(err) => Err(ApiError::Unavailable(upstream_message(err)).into()),
+        Err(err) => Err(orchestrator_unreachable(&err).into()),
     }
 }
 

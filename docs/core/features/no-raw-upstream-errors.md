@@ -49,6 +49,7 @@ text it was never given.
 
 - A failed chart says that it failed and gives a reference id; it does not say why. The reason is in the server log.
 - Messages written by the product itself (a bad filter, a missing permission) are unchanged.
+- A condition a client must act on is told by a stable `code` field beside `error`, never by the message text. Today: `orchestrator_job_not_loaded` and `orchestrator_unreachable` (HTTP 503 with `Retry-After`, from `POST /api/connectors/{id}/ingest/run`; the first also from `POST /api/pipelines/{id}/trigger`). The acceptance gates retry on these codes only (PR #105 CI fix).
 - In Query Studio the author sees the database's own description of what is wrong with their statement. That text can name tables and columns the author asked about; it never includes the server version or an address.
 
 ## Acceptance checklist
