@@ -51,7 +51,7 @@ describe("the dashboard capability against the server's tool list", () => {
   // BI-18 part C / AI-9: the tab tools, named here or they never reach the model.
   it("lists every tab tool the server has", () => {
     const wanted = serverTools.filter((n) => /_tabs?(_|$)|_to_tab$/.test(n))
-    expect(wanted.sort()).toEqual(["create_tab", "delete_tab", "move_charts_to_tab", "rename_tab"])
+    expect(wanted.sort()).toEqual(["create_tab", "delete_tab", "move_charts_to_tab", "move_tab", "rename_tab"])
     const offered = toolsFromCaps(new Set(["dashboard"]), "build")
     for (const name of wanted) expect(offered).toContain(name)
     for (const name of wanted) expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(name)

@@ -1,5 +1,5 @@
 //! Tab tools (`BI-18` part C, with `AI-9`): `create_tab`, `rename_tab`,
-//! `move_charts_to_tab` and `delete_tab`.
+//! `move_charts_to_tab`, `move_tab` and `delete_tab`.
 //!
 //! # Posture
 //!
@@ -33,11 +33,11 @@ use crate::upstream_error;
 pub(super) fn handles(name: &str) -> bool {
     matches!(
         name,
-        "create_tab" | "rename_tab" | "move_charts_to_tab" | "delete_tab"
+        "create_tab" | "rename_tab" | "move_charts_to_tab" | "move_tab" | "delete_tab"
     )
 }
 
-/// Dispatch one of the four tools by name.
+/// Dispatch one of the five tools by name.
 pub(super) async fn run(state: &AppState, name: &str, args: &Map<String, Value>) -> Value {
     let board = match load_board(state, args).await {
         Ok(board) => board,
@@ -47,6 +47,7 @@ pub(super) async fn run(state: &AppState, name: &str, args: &Map<String, Value>)
         "create_tab" => create_tab(state, board, args).await,
         "rename_tab" => rename_tab(state, board, args).await,
         "move_charts_to_tab" => move_charts_to_tab(state, board, args).await,
+        "move_tab" => move_tab(state, board, args).await,
         "delete_tab" => delete_tab(state, board, args).await,
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
@@ -188,6 +189,52 @@ async fn move_charts_to_tab(state: &AppState, board: Board, args: &Map<String, V
         "moved": true, "board": board.id, "tab": tab.id, "title": tab.title, "chartIds": wanted,
     });
     save(state, &board.id, json!({ "layout": moved }), ok).await
+}
+
+/// Reorder the tabs: `tabs` lists every tab in the new order, or `tab` goes to
+/// `position` (1 is first). Both end in `layout::reorder_tabs`, the check
+/// `PUT /api/dashboard/boards` runs again on save.
+async fn move_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+    let tabs = tabs_of(&board);
+    let listed: Vec<String> = args
+        .get("tabs")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = if listed.is_empty() {
+        let key = arg_str(args, "tab");
+        let Some(tab) = layout::find_tab(&tabs, &key) else {
+            return no_such_tab(&board, &key);
+        };
+        let Some(position) = args
+            .get("position")
+            .and_then(Value::as_u64)
+            .and_then(|p| usize::try_from(p).ok())
+        else {
+            return json!({ "error": "give either tabs (every tab, in the new order) or tab with position (1 is first)." });
+        };
+        layout::move_tab(&tabs, &tab.id, position)
+    } else {
+        let mut order = Vec::with_capacity(listed.len());
+        for key in &listed {
+            let Some(tab) = layout::find_tab(&tabs, key) else {
+                return no_such_tab(&board, key);
+            };
+            order.push(tab.id.clone());
+        }
+        layout::reorder_tabs(&tabs, &order)
+    };
+    let next = match next {
+        Ok(next) => next,
+        Err(message) => return json!({ "error": message }),
+    };
+    let ok = json!({ "moved": true, "board": board.id, "tabs": next });
+    save(state, &board.id, json!({ "tabs": next }), ok).await
 }
 
 async fn delete_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {

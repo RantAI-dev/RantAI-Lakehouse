@@ -309,6 +309,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("tab"),
             s("board")
         ),
+        "move_tab" => format!("Mengubah urutan tab pada dashboard {}.", s("board")),
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),

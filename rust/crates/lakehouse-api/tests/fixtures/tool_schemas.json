@@ -2596,6 +2596,40 @@
   {
     "type": "function",
     "function": {
+      "name": "move_tab",
+      "description": "Change the order of a dashboard's tabs. Give `tabs` (every tab, in the new order) or `tab` with `position` (1 is first). Tab ids, titles and the charts on each stay as they are.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tabs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "every tab's id or title, in the new order"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title, to move to `position`"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "where the tab goes, 1 for first"
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "delete_tab",
       "description": "Delete a tab of a dashboard. Its charts move to the first remaining tab (none are deleted); a filter tied to it is tied to that tab instead. Needs human approval before it runs.",
       "parameters": {

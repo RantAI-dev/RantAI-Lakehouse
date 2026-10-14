@@ -122,7 +122,7 @@ pub fn resource_for(
         "create_chart" | "update_chart" | "delete_chart" => (Some("chart"), str_field("id")),
         "create_board" => (Some("board"), str_field("id")),
         // The tab tools change a board: the audit names the board, not the tab.
-        "create_tab" | "rename_tab" | "move_charts_to_tab" | "delete_tab" => {
+        "create_tab" | "rename_tab" | "move_charts_to_tab" | "move_tab" | "delete_tab" => {
             (Some("board"), str_field("board"))
         }
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {

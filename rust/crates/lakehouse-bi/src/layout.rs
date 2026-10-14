@@ -310,6 +310,52 @@ pub fn rename_tab(tabs: &[Tab], id: &str, title: &str) -> Result<Vec<Tab>, Strin
     Ok(clean_tabs(&next))
 }
 
+/// Put the tabs in a new order. `order` names every tab id exactly once.
+///
+/// The ids, titles and the tiles' tabs are unchanged, so nothing but the order
+/// of the tab bar moves (`BI-18` part C, planner answer 6).
+///
+/// # Errors
+///
+/// A message for the caller when `order` leaves a tab out, repeats one or
+/// names one the board does not have.
+pub fn reorder_tabs(tabs: &[Tab], order: &[String]) -> Result<Vec<Tab>, String> {
+    let mut seen = HashSet::new();
+    let mut next = Vec::with_capacity(order.len());
+    for id in order {
+        let Some(tab) = tabs.iter().find(|t| &t.id == id) else {
+            return Err("that order names a tab the dashboard does not have.".to_owned());
+        };
+        if !seen.insert(id.as_str()) {
+            return Err("that order names a tab twice.".to_owned());
+        }
+        next.push(tab.clone());
+    }
+    if next.len() != tabs.len() {
+        return Err("that order must name every tab once.".to_owned());
+    }
+    validate_tabs(&next)?;
+    Ok(clean_tabs(&next))
+}
+
+/// Move one tab to `position` (1 is first; past the end means last).
+///
+/// # Errors
+///
+/// A message for the caller when the tab does not exist or `position` is 0.
+pub fn move_tab(tabs: &[Tab], id: &str, position: usize) -> Result<Vec<Tab>, String> {
+    if position == 0 {
+        return Err("position starts at 1 (the first tab).".to_owned());
+    }
+    let Some(from) = tabs.iter().position(|t| t.id == id) else {
+        return Err("that tab does not exist.".to_owned());
+    };
+    let mut order: Vec<String> = tabs.iter().map(|t| t.id.clone()).collect();
+    let moved = order.remove(from);
+    order.insert((position - 1).min(order.len()), moved);
+    reorder_tabs(tabs, &order)
+}
+
 /// Put charts on `tab`, in the order given, below what is already there. A
 /// chart with no tile yet gets a half-width one.
 ///
@@ -668,6 +714,30 @@ mod tests {
         assert!(left.is_empty());
         assert_eq!(moved["a"].tab, None);
         assert_eq!(filters[0].tabs, None);
+    }
+
+    #[test]
+    fn tabs_are_reordered_by_a_full_list_or_moved_to_a_position() {
+        let tabs = vec![tab("a", "A"), tab("b", "B"), tab("c", "C")];
+        let ids = |t: &[Tab]| t.iter().map(|x| x.id.as_str()).collect::<String>();
+        let order = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&reorder_tabs(&tabs, &order(&["c", "a", "b"])).unwrap()),
+            "cab"
+        );
+        // Titles travel with their ids.
+        assert_eq!(
+            reorder_tabs(&tabs, &order(&["b", "a", "c"])).unwrap()[0].title,
+            "B"
+        );
+        assert!(reorder_tabs(&tabs, &order(&["a", "b"])).is_err());
+        assert!(reorder_tabs(&tabs, &order(&["a", "a", "b"])).is_err());
+        assert!(reorder_tabs(&tabs, &order(&["a", "b", "zz"])).is_err());
+        assert_eq!(ids(&move_tab(&tabs, "c", 1).unwrap()), "cab");
+        assert_eq!(ids(&move_tab(&tabs, "a", 2).unwrap()), "bac");
+        assert_eq!(ids(&move_tab(&tabs, "a", 99).unwrap()), "bca");
+        assert!(move_tab(&tabs, "a", 0).is_err());
+        assert!(move_tab(&tabs, "zz", 1).is_err());
     }
 
     #[test]

@@ -531,6 +531,17 @@ fn move_charts_to_tab_schema() -> Value {
             "required": ["board", "tab", "chartIds"] } } })
 }
 
+fn move_tab_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "move_tab",
+        "description": "Change the order of a dashboard's tabs. Give `tabs` (every tab, in the new order) or `tab` with `position` (1 is first). Tab ids, titles and the charts on each stay as they are.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tabs": { "type": "array", "items": { "type": "string" }, "description": "every tab's id or title, in the new order" },
+            "tab": { "type": "string", "description": "the tab's id or its title, to move to `position`" },
+            "position": { "type": "integer", "minimum": 1, "description": "where the tab goes, 1 for first" } },
+            "required": ["board"] } } })
+}
+
 fn delete_tab_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_tab",
         "description": "Delete a tab of a dashboard. Its charts move to the first remaining tab (none are deleted); a filter tied to it is tied to that tab instead. Needs human approval before it runs.",
@@ -1396,6 +1407,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "dashboard:write",
     },
     ToolSpec {
+        name: "move_tab",
+        schema: move_tab_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
         name: "delete_tab",
         schema: delete_tab_schema,
         risk: Risk::WriteHigh,
@@ -1929,8 +1946,8 @@ mod tests {
         // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
         // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
         // (`AI-12`, plan 15; merged from main) + `create_tab`, `rename_tab`,
-        // `move_charts_to_tab` and `delete_tab` (`BI-18` part C, `AI-9`).
-        assert_eq!(tool_schemas().len(), 90);
+        // `move_charts_to_tab`, `move_tab` and `delete_tab` (`BI-18` part C, `AI-9`).
+        assert_eq!(tool_schemas().len(), 91);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
@@ -1976,6 +1993,7 @@ mod tests {
             ("create_tab", Risk::WriteLow),
             ("rename_tab", Risk::WriteLow),
             ("move_charts_to_tab", Risk::WriteLow),
+            ("move_tab", Risk::WriteLow),
             ("delete_tab", Risk::WriteHigh),
         ] {
             let spec = find(name).expect("registered tool");
