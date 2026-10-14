@@ -14,6 +14,7 @@ mod catalog;
 mod catalog_governance;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_search;
 mod catalog_source;
 mod connectors;
 mod dashboard;
@@ -27,12 +28,14 @@ mod identity;
 mod knowledge;
 mod lakehouse;
 mod lineage;
+mod load_alerts;
 mod notifications;
 mod ops;
 mod overview;
 mod pipelines;
 mod quality;
 mod query;
+mod schema_changes;
 pub(crate) mod schema_versions;
 mod storage;
 pub(crate) mod support;
@@ -494,11 +497,21 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/connectors/{id}/ingest/run",
-            axum::routing::post(connectors::ingest_run),
+            axum::routing::post(connectors::ingest_run_request),
         )
         .route(
             "/api/connectors/{id}/ingest/runs",
             get(connectors::ingest_run_history),
+        )
+        // `SRC-8` decision D6: a person with `connector:manage` on a
+        // connector of their own tenant reads and approves schema changes.
+        .route(
+            "/api/connectors/{id}/schema-changes",
+            get(schema_changes::list),
+        )
+        .route(
+            "/api/connectors/{id}/schema-changes/approve",
+            axum::routing::post(schema_changes::approve),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -534,6 +547,17 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/tenant",
             axum::routing::put(connectors::assign_connector_tenant),
+        )
+        // `SRC-8`: the orchestrator's observation. Outside the tenant gate on
+        // purpose: its only caller is a service identity, which belongs to no
+        // tenant (see `schema_changes`' module doc).
+        .route(
+            "/api/connectors/{id}/schema-observations",
+            axum::routing::post(schema_changes::observe),
+        )
+        .route(
+            "/api/connectors/{id}/schema-observations/tables",
+            axum::routing::post(schema_changes::new_tables),
         )
         .merge(per_connector)
 }
@@ -740,6 +764,7 @@ pub fn router(state: AppState) -> Router {
                 .put(alerts::update)
                 .delete(alerts::delete),
         )
+        .route("/api/alerts/status", get(alerts::status))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",
@@ -822,6 +847,13 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
+        // The caller's own remembered words for the chat; see `routes::ai::terms`.
+        .route(
+            "/api/ai/terms",
+            get(ai::terms::list_terms)
+                .put(ai::terms::put_term)
+                .delete(ai::terms::delete_term),
+        )
         // WS5 item F1: navbar bell — real, honest open-alert/pending-approval
         // lists (never a fabricated `unreadCount`, never a zero that reads
         // as "genuinely nothing" without Postgres — see `routes::notifications`).

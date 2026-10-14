@@ -70,6 +70,11 @@ The loop, per feature:
    dependencies must not merge with a dependency check red. The developer never opens or merges a PR. Nobody
    pushes to `main` directly or force-pushes it; `main` only moves through
    a merged PR.
+   After merging, the reviewer sets the item's **Status**, **PR** and
+   Shipped date in `BACKLOG.md` (a Feature becomes In Acceptance, never
+   Released, until the owner's checklist passes; a Task becomes Done) and
+   updates the base row to match. The base mirrors the repo; it is never the only place a
+   status, PR or module changes.
 7. **Done.** Merged is not Done. The product owner runs the acceptance
    checklist on the feature page, and the planner updates
    `docs/core/PRODUCT.md` and `docs/core/BACKLOG.md`.

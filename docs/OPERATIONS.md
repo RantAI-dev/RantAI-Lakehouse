@@ -600,6 +600,51 @@ the versions itself, in a `ClickHouse` table it creates on first use:
   why that statement carries a test on its text. Not run: more than 2,000
   tables, two APIs against one engine, an install without the orchestrator.
 
+### Connection tests and internal addresses (`SEC-15`)
+
+A connector's **Test connection**, **Discover** and the clean-up that runs
+when a change-capture connector is deleted dial the host the connector was
+registered with. That host is chosen by whoever may manage connectors, so the
+API refuses to dial an internal address unless the operator allows it:
+
+- **A fresh install blocks every internal address.** That is loopback,
+  RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`,
+  where cloud instance metadata lives), carrier-grade NAT (`100.64/10`),
+  multicast, `0/8`, the reserved `240/4` block and their IPv6 counterparts,
+  including IPv4 wrapped in an IPv6 address. A name is resolved once; if any
+  address it resolves to is blocked the whole name is refused, and the
+  address that was checked is the address that is dialled.
+- **The seeded demo connectors are refused too.** `conn-pg-lakehouse` and
+  `conn-s3-warehouse` point at `postgres:5432` and `http://rustfs:9000`
+  inside the compose network, so on a fresh install their "Test" says the
+  host "resolves to a private/internal address". That is the intended
+  outcome, not a fault.
+- **To allow a network**, set `CONNECTOR_PROBE_ALLOWED_CIDRS` to the networks
+  the sources live on (comma-separated, e.g. `192.168.18.0/24`; a bare address
+  is one host) and restart `lakehouse-api`. This can open private ranges and
+  carrier-grade NAT, never loopback, link-local, multicast or `0/8`.
+- **To allow every internal address** (a trusted development stack only), set
+  `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`. Only the exact string `true`
+  counts. It also opens loopback and link-local, so a connection test can then
+  reach the API's own host and a cloud metadata service.
+- **An existing `.env` keeps what it has.** `.env.example` used to set the
+  variable to `true`; a `.env` copied from it still does. Check it.
+- **Redirects are not followed** by the REST and S3 tests, and these two
+  tests do not use a system proxy: a redirect is reported as one, with its
+  HTTP status.
+- **Deleting a change-capture connector** whose source is refused is a 409
+  with a fixed message and the row stays; `?force=true` removes the row
+  without dialling the source, and the replication slot and publication then
+  have to be dropped by hand.
+- The orchestrator's own dials are a separate guard with their own settings
+  (`INGEST_ALLOW_INTERNAL_HOSTS`, `INGEST_ALLOWED_CIDRS`).
+- **Not hidden by this:** with an address allowed, "connection refused" and
+  "timed out" still differ in a test result, so a person who may test
+  connectors can tell an open port from a closed one on that network.
+
+The CI gates that save ingest specs aimed at compose-network fixtures set the
+variable themselves, in their own override (`ops/g6/`), marked gate-only.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

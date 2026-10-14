@@ -27,6 +27,7 @@ export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unkno
 
 export const TOOL_LABEL: Record<string, string> = {
   run_sql: "SQL query",
+  ask_user: "Ask the user",
   list_datasets: "Search datasets",
   lakehouse_overview: "Lakehouse overview",
   get_ingest_spec: "Ingest spec",

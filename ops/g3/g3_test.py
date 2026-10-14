@@ -91,6 +91,14 @@ def step_wait_for_services() -> None:
         == 200,
         90,
     )
+    # SRC-9 task 0: the webserver answering is not the code location having
+    # loaded (see `_post_trigger`). Wait for the first job this gate
+    # triggers; `_post_trigger` still guards the race that lands after it.
+    _wait_for(
+        f"Dagster code location ({INGEST_JOB_NAME} loaded)",
+        lambda: _dagster_job_is_loaded(INGEST_JOB_NAME),
+        120,
+    )
 
 
 def step_login() -> None:
@@ -117,10 +125,45 @@ def step_login() -> None:
     print("[g3] logged in as bootstrap admin")
 
 
-def trigger_and_wait(job_name: str, timeout_s: int) -> str:
-    resp = API.post(f"{API_URL}/api/pipelines/{job_name}/trigger", timeout=10)
-    if not resp.ok:
+def _dagster_job_is_loaded(job_name: str) -> bool:
+    """True once a loaded Dagster repository lists `job_name`. Same query as
+    `ops/g6/g6_ingest_matrix_test.py::_ingest_job_is_loaded` (its twin; the
+    gate scripts share no module, see that file's docstring), with the job
+    name as a parameter."""
+    query = (
+        "{ repositoriesOrError { ... on RepositoryConnection "
+        "{ nodes { jobs { name } } } } }"
+    )
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
+
+
+def _post_trigger(job_name: str) -> requests.Response:
+    """POST /api/pipelines/{job}/trigger with a one-shot retry for the
+    code-location start-up race. SRC-9 task 0 (seen on PR #101: the first
+    trigger of `bronze_ingest_job` got `422 {"error":"PipelineNotFoundError"}`
+    because the webserver answered before the code location had loaded; a
+    re-run passed). Twin of `ops/g6/g6_ingest_matrix_test.py::_post_ingest_run`:
+    on a 422 naming `PipelineNotFoundError`, wait up to 120 s for Dagster to
+    list the job and POST once more. Any other failure raises at once."""
+    url = f"{API_URL}/api/pipelines/{job_name}/trigger"
+    resp = API.post(url, timeout=10)
+    if resp.ok:
+        return resp
+    if resp.status_code != 422 or "PipelineNotFoundError" not in resp.text:
         raise G3Failure(f"trigger {job_name} failed: {resp.status_code} {resp.text}")
+    print(f"[g3] trigger of {job_name} hit the code-location start-up window; waiting for it to load")
+    _wait_for(f"Dagster code location ({job_name} loaded)", lambda: _dagster_job_is_loaded(job_name), 120)
+    retry = API.post(url, timeout=10)
+    if retry.ok:
+        return retry
+    raise G3Failure(f"trigger {job_name} failed (post-load retry): {retry.status_code} {retry.text}")
+
+
+def trigger_and_wait(job_name: str, timeout_s: int) -> str:
+    resp = _post_trigger(job_name)
     run_id = resp.json().get("id") or resp.json().get("runId") or resp.json().get("run_id")
     if not run_id:
         raise G3Failure(f"trigger response had no runId: {resp.json()}")

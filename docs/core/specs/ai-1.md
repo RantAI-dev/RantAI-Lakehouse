@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `AI-1` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Assistant for dashboards |
-| Who builds it | AI team |
-| When | Next, ready now |
+| Module | AI Copilot |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -43,10 +41,9 @@ Assistant parity rule; BI-18 C will add tabs (AI-9).
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] The quoted request does exactly that
-- [ ] Deleting asks for approval and does nothing on 'no'
-- [ ] A user without edit rights is told they cannot
+- `AI-1-AC1` The quoted request does exactly that
+- `AI-1-AC2` Deleting asks for approval and does nothing on 'no'
+- `AI-1-AC3` A user without edit rights is told they cannot
 
 ## Not included
 

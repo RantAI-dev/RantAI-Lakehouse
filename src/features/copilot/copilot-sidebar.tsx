@@ -159,6 +159,7 @@ export function CopilotSidebar() {
             onCancelTool={c.cancelTool}
             onCompleteTool={c.completeToolStep}
             confirmingKey={c.confirmingKey}
+            onAnswerAsk={c.answerAskOption} askNotice={c.askNotice}
           />
         )}
       </div>

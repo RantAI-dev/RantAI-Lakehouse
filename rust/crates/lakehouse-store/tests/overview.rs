@@ -24,7 +24,8 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::overview::{
-    FiredRule, insert_from_fired_rule, is_rule_silenced, silence_alert,
+    DeliveryRecord, FiredRule, insert_from_fired_rule, insert_from_fired_rule_with_delivery,
+    is_rule_silenced, list_alerts, silence_alert,
 };
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -203,5 +204,53 @@ async fn a_silenced_rule_produces_no_new_instance_after_its_dedup_window_lapses(
         later.is_some(),
         "insert_from_fired_rule alone still dedups only on time, not silence"
     );
+    Ok(())
+}
+
+/// `SRC-17` F1: an instance keeps how its delivery ended. A failed delivery
+/// stores its fixed reason and lists as `delivered: false`; a delivered one
+/// lists as `true` with no reason; one written without an outcome (every
+/// older caller, every row before `0068`) lists as unknown, never `false`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_instance_records_whether_its_delivery_arrived(pool: PgPool) -> sqlx::Result<()> {
+    let reason = "the webhook server answered with an error";
+    let bad = insert_from_fired_rule_with_delivery(
+        &pool,
+        &fired("rule-del-bad"),
+        Some(DeliveryRecord::NotDelivered(reason)),
+        fixed_now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(bad.delivered, Some(false));
+    assert_eq!(bad.delivery_reason.as_deref(), Some(reason));
+
+    let good = insert_from_fired_rule_with_delivery(
+        &pool,
+        &fired("rule-del-ok"),
+        Some(DeliveryRecord::Delivered),
+        fixed_now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(good.delivered, Some(true));
+    assert_eq!(good.delivery_reason, None);
+
+    let unknown = insert_from_fired_rule(&pool, &fired("rule-del-unknown"), fixed_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unknown.delivered, None);
+    assert_eq!(unknown.delivery_reason, None);
+
+    // The list route reads the same columns.
+    let listed = list_alerts(&pool).await.unwrap();
+    let find = |id: &str| listed.iter().find(|a| a.id == id).unwrap().clone();
+    assert_eq!(find(&bad.id).delivered, Some(false));
+    assert_eq!(find(&bad.id).delivery_reason.as_deref(), Some(reason));
+    assert_eq!(find(&good.id).delivered, Some(true));
+    assert_eq!(find(&unknown.id).delivered, None);
     Ok(())
 }

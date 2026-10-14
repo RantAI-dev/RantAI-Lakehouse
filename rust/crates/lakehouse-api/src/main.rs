@@ -10,6 +10,7 @@
 mod auth;
 mod bounded;
 mod bronze_stats_cache;
+mod catalog_search_cache;
 mod config;
 mod connector_deprovision;
 mod connector_discover;
@@ -36,8 +37,10 @@ mod state;
 mod tenant;
 mod tenant_scope;
 mod transform_grammar;
+mod upload_parquet;
 mod upload_parse;
 mod upload_store;
+mod upload_workbook;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;

@@ -23,7 +23,7 @@ export const CAPABILITIES: Capability[] = [
     label: "Query Data",
     desc: "Query & explore catalog, lineage, quality",
     icon: Database,
-    tools: ["run_sql", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart"],
+    tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart"],
   },
   {
     key: "dashboard",

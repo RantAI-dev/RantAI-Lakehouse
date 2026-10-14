@@ -53,6 +53,12 @@ const CONNECTORS = [
     tenant: "Acme Co",
     lastTestAt: null,
     lastActivityAt: null,
+    lastRunSuccessAt: null,
+    lastRunFailureAt: null,
+    failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
     capabilities: [],
     owner: "admin",
   },
@@ -66,6 +72,12 @@ const CONNECTORS = [
     tenant: "Acme Co",
     lastTestAt: null,
     lastActivityAt: null,
+    lastRunSuccessAt: null,
+    lastRunFailureAt: null,
+    failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
     capabilities: [],
     owner: "admin",
   },
@@ -92,6 +104,18 @@ function renderPage() {
 }
 
 describe("ConnectorsPage tabs", () => {
+  it("describes only what the picker offers, with no SaaS or federation promise (SRC-6 F7)", async () => {
+    stubFetch()
+    renderPage()
+    expect(
+      await screen.findByText(
+        "Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+      )
+    ).toBeDefined()
+    expect(screen.queryByText(/SaaS/)).toBeNull()
+    expect(screen.queryByText(/federation/)).toBeNull()
+  })
+
   it("opens on Connectors, offers Upload file before New Connector, and does not read the uploads", async () => {
     const urls = stubFetch()
     renderPage()
@@ -176,5 +200,62 @@ describe("ConnectorsPage list", () => {
     )
     fireEvent.click(details)
     expect(pushed).toEqual([])
+  })
+})
+
+// SRC-7 task 9: run health from the run reports, not from a manual Test.
+describe("ConnectorsPage run health", () => {
+  function rowOf(name: string): HTMLElement {
+    return screen.getByRole("link", { name }).closest("tr") as HTMLElement
+  }
+
+  const failing = {
+    ...CONNECTORS[0],
+    health: "degraded",
+    lastRunSuccessAt: "2026-10-01T02:00:00Z",
+    lastRunFailureAt: "2026-10-02T02:00:00Z",
+    failureStreak: 2,
+  }
+  const recovered = {
+    ...CONNECTORS[1],
+    health: "healthy",
+    lastRunSuccessAt: "2026-10-03T02:00:00Z",
+    lastRunFailureAt: "2026-10-02T02:00:00Z",
+    failureStreak: 0,
+    schemaChangePolicy: "apply_non_breaking",
+    pausedReason: null,
+    pausedAt: null,
+  }
+
+  it("shows the later of the last success and the last failure, and how many failed in a row", async () => {
+    stubFetch([failing, recovered])
+    renderPage()
+    await screen.findByRole("link", { name: "db demo" })
+    const bad = within(rowOf("db demo"))
+    expect(bad.getByText("Failed")).toBeDefined()
+    expect(bad.getByText("2 failed in a row")).toBeDefined()
+    const good = within(rowOf("events"))
+    expect(good.getByText("Succeeded")).toBeDefined()
+    expect(good.queryByText(/failed in a row/)).toBeNull()
+  })
+
+  it("says there are no runs yet when a connector has neither a success nor a failure", async () => {
+    stubFetch([CONNECTORS[0]])
+    renderPage()
+    await screen.findByRole("link", { name: "db demo" })
+    expect(within(rowOf("db demo")).getByText("No runs yet")).toBeDefined()
+  })
+})
+
+// SRC-8 task 10: a paused connector says so in the list, with the reason.
+describe("ConnectorsPage paused connectors", () => {
+  it("marks a paused connector's row with the reason and no other row", async () => {
+    const reason = "A schema change at the source is waiting for approval."
+    stubFetch([{ ...CONNECTORS[0], pausedReason: reason, pausedAt: "2026-10-09T01:00:00Z" }, CONNECTORS[1]])
+    renderPage()
+    const row = (await screen.findByRole("link", { name: "db demo" })).closest("tr") as HTMLElement
+    expect(within(row).getByText(`Paused: ${reason}`)).toBeDefined()
+    const other = screen.getByRole("link", { name: "events" }).closest("tr") as HTMLElement
+    expect(within(other).queryByText(/Paused/)).toBeNull()
   })
 })

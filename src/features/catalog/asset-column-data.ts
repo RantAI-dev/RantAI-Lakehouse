@@ -8,10 +8,13 @@
  */
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
-import { assetService } from "@/services"
-import type { AssetColumn } from "@/services/contracts/assets"
+import { assetService, semanticService } from "@/services"
+import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
+import type { SemanticEntryInput } from "@/services/contracts/semantic"
 import type { ProfileState, SchemaRow } from "./asset-columns"
+import { lineageKey } from "./asset-lineage"
+import { semanticAsset, splitEntries, type MeaningState } from "./asset-meaning"
 
 /**
  * The catalog's columns in the table's own order, each with whether it can
@@ -71,4 +74,36 @@ export function useProfile(assetId: string): ProfileState {
   if (p === null) return { kind: "restricted" }
   if (!p.supported) return { kind: "unsupported", reason: p.reason }
   return { kind: "ready", profile: p, byName: new Map(p.columns.map((c) => [c.name, c])) }
+}
+
+/**
+ * The meanings a person reads and corrects on the Schema tab and in the page
+ * header. A table the semantic route never serves gets `none` and no request,
+ * and so does `null`, the asset while it is still loading. Otherwise the
+ * entries are read through `useService` with `keepDataOnReload`, so the list
+ * stays on screen while it reloads after a save.
+ */
+export function useMeanings(a: AssetDetail | null): MeaningState {
+  const { hasPermission } = useAuth()
+  const asset = a === null ? null : semanticAsset(lineageKey(a))
+  const canEdit = hasPermission("catalog:write")
+  // The fetcher is the same for `none` and for a served table: a `null` asset
+  // resolves without a request, so the hook's call order never changes.
+  const state = useService(
+    (s) => {
+      if (asset === null) return Promise.resolve(null)
+      return semanticService.getEntries(asset, s)
+    },
+    [asset],
+    { keepDataOnReload: true }
+  )
+  if (asset === null) return { kind: "none" }
+  if (state.status === "loading") return { kind: "loading" }
+  if (state.status === "error") return { kind: "error", message: state.error.message, retry: state.reload }
+  const p = state.data
+  if (p === null) return { kind: "none" }
+  if (!p.supported) return { kind: "unsupported", reason: p.reason }
+  const { table, byColumn } = splitEntries(p.entries)
+  const save = (input: SemanticEntryInput, signal?: AbortSignal) => semanticService.saveEntry(asset, input, signal)
+  return { kind: "ready", table, byColumn, canEdit, save, reload: state.reload }
 }

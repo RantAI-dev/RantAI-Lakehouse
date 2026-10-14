@@ -26,6 +26,7 @@
 pub mod auth;
 pub mod bounded;
 pub mod bronze_stats_cache;
+pub mod catalog_search_cache;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_discover;
@@ -52,5 +53,7 @@ pub mod state;
 pub mod tenant;
 pub mod tenant_scope;
 pub mod transform_grammar;
+pub mod upload_parquet;
 pub mod upload_parse;
 pub mod upload_store;
+pub mod upload_workbook;

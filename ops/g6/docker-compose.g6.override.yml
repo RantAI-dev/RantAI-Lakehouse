@@ -40,8 +40,18 @@
 # gap); it is "gate-only" here only in the sense that no OTHER compose
 # profile references `g6_secrets`, not because the mechanism itself is a
 # test-only shortcut.
+# SRC-9 decision 9: the gate runs as two CI jobs. Fixtures carry the profile
+# `g6-sql` (mysql-g6, mariadb-g6, mssql-g6) or `g6-other` (sftp-g6, rest-stub-g6,
+# mongo-g6, kafka-g6) next to `g6`; a job activates its half's profile and the
+# runner's `depends_on` (`required: false`) skips the other half. `--profile g6`
+# starts everything, as before. Every fixture password stays `${VAR:?}`, which
+# compose interpolates for all services, so both jobs write the full set of
+# fake values into their `.env`.
 volumes:
   g6_secrets:
+  # SRC-9 task 4: the SFTP fixture's host key, minted once by
+  # `sftp-g6-hostkey-init`; read-only in `sftp-g6` and in `g6-test-runner`.
+  sftp_g6_hostkey:
 
 services:
   dagster-code-location:
@@ -66,6 +76,16 @@ services:
         read_only: true
 
   lakehouse-api:
+    environment:
+      # SEC-15, GATE-ONLY: the default docker-compose.yml now blocks
+      # internal addresses for the API's connection test, discovery and
+      # delete clean-up, and `PUT .../ingest-spec` runs the same address
+      # check at save time. This gate saves ingest specs that point at its
+      # own mysql-g6/mssql-g6/rest-stub-g6/mongo-g6/kafka-g6 fixtures inside
+      # the compose network, so the API must be allowed to reach them, the
+      # same way INGEST_ALLOW_INTERNAL_HOSTS is set for Dagster above. Not
+      # for a real deployment.
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
     volumes:
       - type: volume
         source: g6_secrets
@@ -78,6 +98,87 @@ services:
       MYSQL_PASSWORD: ${CONNECTOR_MYSQL_PASSWORD:?}
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:?}"]
+
+  # SRC-9 task 3: the MariaDB fixture, defined here and not in
+  # docker-compose.yml for the reason the header gives (`${VAR:?}` is
+  # interpolated for every service, so a gate-only credential in the default
+  # file breaks `docker compose --profile '*' config --quiet`). Same shape as
+  # `mysql-g6`: one database, a database-scoped reader user the connector
+  # dials, root for the gate's seeding only. `11.4` is MariaDB's current
+  # long-term-support series (supported to 2029), pinned by series tag like
+  # the other fixtures. The healthcheck dials 127.0.0.1 over TCP, never the
+  # socket: the image's entrypoint runs a temporary server with networking
+  # off while it creates the database and users, and a socket ping would
+  # report healthy during it (the same restart-after-ready trap as Postgres).
+  mariadb-g6:
+    image: mariadb:11.4
+    profiles: ["g6", "g6-sql"]
+    restart: "no"
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
+      MARIADB_DATABASE: g6_ingest
+      MARIADB_USER: g6_reader
+      MARIADB_PASSWORD: ${CONNECTOR_MARIADB_PASSWORD:?}
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping --protocol=tcp -h 127.0.0.1 -u root -p\"$$MARIADB_ROOT_PASSWORD\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # SRC-9 task 4: the SFTP fixture. The connector's `hostKeyFingerprint` must
+  # be the fixture's OWN key, never one read off the first connection
+  # (`ssrf_guard_sftp.PinnedHostKeyPolicy` exists to refuse exactly that
+  # trust-on-first-use). So the key is minted by an init step into a named
+  # volume before the server starts, the server installs that key, and the
+  # gate computes the fingerprint from the public half in the same volume.
+  # Idempotent: `docker compose run --rm g6-test-runner` re-walks this
+  # dependency graph, and a second unconditional `ssh-keygen` would replace
+  # the key under an already-running server (the failure
+  # `mssql-g6-cert-init` documents). `apk add` is retried for the same
+  # one-off mirror errors that comment names.
+  sftp-g6-hostkey-init:
+    image: alpine:3.20
+    profiles: ["g6", "g6-other"]
+    restart: "no"
+    volumes:
+      - sftp_g6_hostkey:/out
+    entrypoint: ["/bin/sh", "-c"]
+    # The last file written is the install script, so its presence means the
+    # whole set is complete. `atmoz/sftp` runs every executable file in
+    # /etc/sftp.d before starting sshd; the script copies the key into the
+    # place sshd reads (the key file itself, not executable, is skipped).
+    command:
+      - >
+        test -f /out/00-install-hostkey.sh ||
+        { for i in 1 2 3 4 5; do apk add --no-cache openssh-keygen >/dev/null && break; sleep 3; done;
+        command -v ssh-keygen >/dev/null &&
+        ssh-keygen -q -t ed25519 -N "" -C "g6-fixture" -f /out/ssh_host_ed25519_key &&
+        chmod 600 /out/ssh_host_ed25519_key && chmod 644 /out/ssh_host_ed25519_key.pub &&
+        printf '#!/bin/sh\ncp /etc/sftp.d/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key\nchmod 600 /etc/ssh/ssh_host_ed25519_key\n' > /out/00-install-hostkey.sh &&
+        chmod 755 /out/00-install-hostkey.sh; }
+
+  # `atmoz/sftp:alpine`, pinned by digest (the image publishes only moving
+  # tags besides 2018 ones): the widely used small OpenSSH-based SFTP server,
+  # about 9 MB. One user, chrooted, with a writable `upload` directory; the
+  # gate puts the CSV there as that user. The password comes from the
+  # environment as the image requires (`user:password:uid:gid:dir`), so it
+  # must not contain a colon. Healthcheck on the TCP port: the image starts
+  # sshd only after its setup scripts have run, with no temporary server.
+  sftp-g6:
+    image: atmoz/sftp:alpine@sha256:7e439fabeae536fa254340724c042e11999924d906417dbb5c73602ad518813f
+    profiles: ["g6", "g6-other"]
+    restart: "no"
+    depends_on:
+      sftp-g6-hostkey-init:
+        condition: service_completed_successfully
+    command: ["g6_sftp:${SFTP_G6_PASSWORD:?}:1001:100:upload"]
+    volumes:
+      - sftp_g6_hostkey:/etc/sftp.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   mssql-g6:
     environment:
@@ -97,8 +198,24 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
 
   g6-test-runner:
+    # SRC-9 task 3: the runner seeds and dials mariadb-g6, so it waits for it.
+    # `required: false`: see g6-test-runner in docker-compose.yml (SRC-9
+    # decision 9, one fixture set per CI job).
+    depends_on:
+      mariadb-g6:
+        condition: service_healthy
+        required: false
+      sftp-g6:
+        condition: service_healthy
+        required: false
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      # SRC-9 task 3: root (seeding) and the connector's reader password for
+      # mariadb-g6, provisioned by its own block above.
+      MARIADB_G6_ROOT_PASSWORD: ${MARIADB_G6_ROOT_PASSWORD:?}
+      CONNECTOR_MARIADB_PASSWORD: ${CONNECTOR_MARIADB_PASSWORD:?}
+      # SRC-9 task 4: the SFTP user's password, the same value sftp-g6 gets.
+      SFTP_G6_PASSWORD: ${SFTP_G6_PASSWORD:?}
       # The mysql-g6/mssql-g6 dial CONNECTOR credentials (not root/sa) --
       # g6-test-runner needs the real values to write into each
       # connector's derived `file:` credential (ADR 0002 Addendum 3), the
@@ -108,7 +225,81 @@ services:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
       MONGO_G6_ROOT_USER: ${MONGO_G6_ROOT_USER:?}
       MONGO_G6_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
+      # SRC-9 task 1: `ops/gates/gate_summary.py` and `coverage.json` are
+      # shared by the connector gates but live outside `ops/g6` (the only
+      # directory this runner mounts at /work). They are mounted at
+      # /opt/gates, not under /work: a bind mount nested inside another one
+      # makes Docker create the mount point on the host (see the comment on
+      # `g4-test-runner`'s deprovision script). Read-only and
+      # PYTHONDONTWRITEBYTECODE, so the root-owned runner leaves no
+      # `__pycache__` in the checkout for the next `git clean`.
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
+      - ./ops/gates:/opt/gates:ro
+      # SRC-9 task 4: the SFTP fixture's public host key, to compute the
+      # connector's pinned fingerprint from the fixture itself.
+      - type: volume
+        source: sftp_g6_hostkey
+        target: /sftp-hostkey
+        read_only: true
       - type: volume
         source: g6_secrets
         target: /gate-secrets
+
+  # SRC-17 task 5 (finding F4, the delivery review of 2026-10-12): the alert
+  # delivery gate, `ops/g6/src17_alert_delivery_test.py`, in a job of its own
+  # (`g6-alerts`). It reuses this file for what a failing MySQL connector
+  # needs (the gate-only `INGEST_ALLOW_INTERNAL_HOSTS` and
+  # `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` above, the `g6_secrets` volume, the
+  # `mysql-g6` fixture), so nothing here is duplicated. Profile `g6-alerts`
+  # only: a job activates it together with `g6-sql` (for `mysql-g6`) and
+  # `dagster`, and names the services it starts, so no other fixture runs.
+  #
+  # The gate starts its own webhook receiver in this container, on a port the
+  # API reaches over the compose network (nothing is published). `SEC-10`
+  # (alert webhooks cannot reach internal addresses) is not built yet; when it
+  # lands it will refuse this receiver's address by default and must give this
+  # gate its documented opt-in.
+  #
+  # `clickhouse-iceberg-init`: an upload load asks ClickHouse whether the
+  # table name is free (`ICEBERG_QUERY_DB`), as `g9-test-runner` does.
+  # `MYSQL_ROOT_PASSWORD` and the other fixture secrets are not read by this
+  # gate; the job's `.env` carries them because this file's `${VAR:?}` is
+  # interpolated for every service it loads.
+  g6-alerts-test-runner:
+    profiles: ["g6-alerts"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+      mysql-g6:
+        condition: service_healthy
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python src17_alert_delivery_test.py"]

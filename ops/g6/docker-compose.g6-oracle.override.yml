@@ -1,0 +1,131 @@
+# ops/g6/docker-compose.g6-oracle.override.yml -- SRC-9 plan task 5, decision
+# 5 of docs/core/features/connector-gates.md: the Oracle connector gate, in a
+# job of its own (`g6-oracle` in .github/workflows/ci.yml) because Oracle
+# Database Free is a ~1.3 GB image that needs about 2 GB of memory and a
+# minute or two to open its pluggable database, and the g6 job is already at
+# 22 minutes of 25.
+#
+# Used as
+#   docker compose -p g6oracleci -f docker-compose.yml \
+#     -f ops/g6/docker-compose.g6-oracle.override.yml \
+#     --profile g6-oracle --profile dagster up -d --build \
+#     lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
+# It does NOT combine with ops/g6/docker-compose.g6.override.yml: that file
+# makes the passwords of mysql, mssql, mongo, kafka, mariadb and sftp `:?`,
+# which compose interpolates for every service whatever the profile, so
+# adding it here would demand six secrets this job has no use for. The few
+# gate-only settings it shares are repeated below (the `g6_secrets` volume,
+# and the two flags that let the API and Dagster dial a fixture inside the
+# compose network). Like those, none of them is set by the default
+# docker-compose.yml, so a real deployment keeps refusing internal hosts.
+#
+# Passwords: `ORACLE_G6_PASSWORD` (SYS, SYSTEM and PDBADMIN of the container)
+# and `CONNECTOR_ORACLE_PASSWORD` (the application user the connector dials)
+# are `${VAR:?}` and never have a default; the CI job writes obviously-fake
+# values into its own `.env`.
+volumes:
+  g6_secrets:
+
+services:
+  dagster-code-location:
+    environment:
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
+    volumes:
+      - type: volume
+        source: g6_secrets
+        target: /run/secrets
+        read_only: true
+
+  lakehouse-api:
+    environment:
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
+    volumes:
+      - type: volume
+        source: g6_secrets
+        target: /run/secrets
+        read_only: true
+
+  # Oracle Database Free, `slim-faststart`: the smallest variant that still
+  # opens quickly (`slim` drops the optional components, `faststart` ships the
+  # database already unpacked, so the first start is not a multi-minute
+  # extraction). Pinned by tag AND digest: the tag names the release
+  # (23.26.2, which runs Oracle AI Database 26ai Free), the digest keeps it
+  # immutable. The digest is the multi-architecture index, read from the
+  # Docker Hub registry API on 2026-10-12. The image's build scripts are
+  # Apache-2.0; the database inside is under Oracle's Free Use Terms and
+  # Conditions, which need no interactive acceptance (no `ACCEPT_LICENSE`
+  # variable exists), but that is the licence decision 5 of the feature page
+  # asks the product owner to be content with.
+  #
+  # `APP_USER` is created in the default pluggable database `FREEPDB1` with
+  # CONNECT, RESOURCE and an unlimited quota on its own tablespace, so the
+  # gate seeds `G6_INGEST.ORDERS` as that user and the connector reads it as
+  # that user: no SYS credential ever leaves this service.
+  #
+  # Healthcheck: the image ships `/opt/oracle/healthcheck.sh` (read from the
+  # image's layer, not assumed). It exits non-zero while the container is
+  # still initialising, creating the PDB or running setup scripts, and then
+  # only exits 0 when `FREEPDB1` and the container database are `READ WRITE`
+  # (it queries `v$pdbs`). The gate still polls a real `oracledb` login before
+  # it seeds, because "open" and "the application user can sign in" are not
+  # the same moment. `start_period` and the retry budget (about 11 minutes)
+  # are generous on purpose: a runner under memory pressure opens the
+  # database slowly, and a gate that gives up early would report a slow
+  # start as a broken connector.
+  oracle-g6:
+    image: gvenzl/oracle-free:23.26.2-slim-faststart@sha256:5e340d72c5cd93b5ce8bab6c128b8f37a5ec485d5d9d98dc2cdc5353fe640f96
+    profiles: ["g6-oracle"]
+    restart: "no"
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_G6_PASSWORD:?}
+      APP_USER: g6_ingest
+      APP_USER_PASSWORD: ${CONNECTOR_ORACLE_PASSWORD:?}
+    healthcheck:
+      test: ["CMD", "/opt/oracle/healthcheck.sh"]
+      interval: 10s
+      timeout: 15s
+      retries: 60
+      start_period: 60s
+
+  # Same image, mounts and credentials-handling as `g6-test-runner` (the
+  # dagster image carries `oracledb==2.5.1`, pinned in dagster/pyproject.toml,
+  # and `requests`), with only Oracle to wait for. Defined here and not in
+  # docker-compose.yml for the reason the header gives: its password is
+  # `${VAR:?}`. `ops/g6` is read-only: the gate writes nothing there (the
+  # connector's credential goes to /gate-secrets), and `ops/gates` is the
+  # shared registry and summary module (SRC-9 task 1).
+  g6-oracle-test-runner:
+    profiles: ["g6-oracle"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+      oracle-g6:
+        condition: service_healthy
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      CONNECTOR_ORACLE_PASSWORD: ${CONNECTOR_ORACLE_PASSWORD:?}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python g6_oracle_test.py"]

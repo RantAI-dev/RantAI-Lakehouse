@@ -968,6 +968,31 @@ fn headless_system_prompt(is_build: bool) -> String {
     }
 }
 
+/// The tool list a headless run is offered: every tool the employee's
+/// permissions allow, less the writes outside build mode, and never
+/// `ask_user`. A run has nobody to answer a question, so a model that asked
+/// would only stall.
+fn headless_tools(perms: &PermissionSet, is_build: bool) -> Vec<Value> {
+    ai_registry::tool_schemas_for(Some(perms))
+        .into_iter()
+        .filter(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            let is_write =
+                ai_registry::find(name).is_some_and(|spec| spec.risk != ai_registry::Risk::Read);
+            name != ai_registry::ASK_USER && (is_build || !is_write)
+        })
+        .collect()
+}
+
+/// Why a headless run refuses the tool call `name` before running it, or
+/// `None` when this check lets it through. Today that is `ask_user` alone: a
+/// run has nobody to answer. PR review fix (SHOULD-FIX): the decision sat
+/// inline in the loop, where no test could reach it without a model.
+fn headless_refusal(name: &str) -> Option<String> {
+    (name == ai_registry::ASK_USER)
+        .then(|| format!("refused: a headless run has nobody to answer ({name})"))
+}
+
 /// The headless tool-calling loop shared by every `POST
 /// /api/agents/employees/{id}/run` call — see [`run_employee`]'s doc
 /// comment for the full picture. Never panics: an LLM failure, a refused
@@ -1030,15 +1055,7 @@ async fn run_headless_loop(
             name: None,
         },
     ];
-    let tools: Vec<Value> = ai_registry::tool_schemas_for(Some(perms))
-        .into_iter()
-        .filter(|t| {
-            let name = t["function"]["name"].as_str().unwrap_or("");
-            let is_write =
-                ai_registry::find(name).is_some_and(|spec| spec.risk != ai_registry::Risk::Read);
-            is_build || !is_write
-        })
-        .collect();
+    let tools = headless_tools(perms, is_build);
 
     // `principal` is the SAME `Principal` `run_employee`'s auth guard
     // already built for this request (`principal_for_run_auth`) — passed
@@ -1189,6 +1206,43 @@ async fn run_headless_loop(
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
             let spec = ai_registry::find(&call.function.name);
             let is_write = spec.is_some_and(|s| s.risk != ai_registry::Risk::Read);
+
+            // A run is not offered `ask_user` ([`headless_tools`]), but a model
+            // can name a tool it was not given, and `run_tool` would run it:
+            // refuse it here, since nobody is there to answer.
+            if let Some(detail) = headless_refusal(&call.function.name) {
+                step_no += 1;
+                append_step(
+                    pg,
+                    run_id,
+                    &format!("step-{step_no}"),
+                    &call.function.name,
+                    "refused",
+                    &detail,
+                )
+                .await;
+                write_headless_audit(
+                    pg,
+                    principal_id.clone(),
+                    principal_kind,
+                    actor_label,
+                    &call.function.name,
+                    None,
+                    None,
+                    &Value::Object(args.clone()),
+                    "refused",
+                    Some(&detail),
+                    run_id,
+                    None,
+                )
+                .await;
+                push_tool_result(
+                    &mut messages,
+                    call,
+                    &json!({ "error": detail, "refused": true }),
+                );
+                continue;
+            }
 
             // Ask-mode gate: identical semantics to `routes::ai::gate::decide`'s
             // first check, reimplemented here rather than called there — see
@@ -1867,6 +1921,40 @@ mod tests {
 
     fn admin_perms() -> PermissionSet {
         PermissionSet::parse("*:*")
+    }
+
+    fn names_of(tools: &[Value]) -> Vec<&str> {
+        tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_headless_run_is_never_offered_ask_user() {
+        // The registry holds the tool and the admin may use every tool, so
+        // only the run's own filter keeps it out, in either mode.
+        assert!(ai_registry::find(ai_registry::ASK_USER).is_some());
+        for is_build in [false, true] {
+            let tools = headless_tools(&admin_perms(), is_build);
+            let names = names_of(&tools);
+            assert!(!names.contains(&ai_registry::ASK_USER), "{names:?}");
+            assert!(names.contains(&"run_sql"), "{names:?}");
+        }
+        let none = headless_tools(&PermissionSet::default(), true);
+        assert!(!names_of(&none).contains(&ai_registry::ASK_USER));
+    }
+
+    // PR review fix (SHOULD-FIX): the in-loop refusal had no test; only the
+    // tool list was covered.
+    #[test]
+    fn a_headless_run_refuses_a_call_to_ask_user_and_lets_a_read_tool_through() {
+        let refusal = headless_refusal(ai_registry::ASK_USER);
+        assert_eq!(
+            refusal.as_deref(),
+            Some("refused: a headless run has nobody to answer (ask_user)")
+        );
+        assert_eq!(headless_refusal("run_sql"), None);
     }
 
     fn platform_admin_principal() -> Principal {

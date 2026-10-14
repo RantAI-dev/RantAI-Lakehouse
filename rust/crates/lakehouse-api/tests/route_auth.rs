@@ -370,8 +370,18 @@ async fn a_seeded_analyst_is_denied_catalog_annotation_write() {
 }
 
 /// A seeded Data Engineer (`catalog:write`, among others) is not denied
-/// `PUT /api/catalog/{id}/annotation` (WS2 §13, WS2 plan review W8) — the
-/// matching allowed-with-the-permission half of the test above.
+/// `PUT /api/catalog/{id}/annotation` by the permission middleware (WS2 §13,
+/// WS2 plan review W8) — the matching allowed-with-the-permission half of
+/// the test above.
+///
+/// PR #79 review, SEC-16: the handler now also runs the catalog tenant gate,
+/// and the seeded app has several tenants and no `CATALOG_TENANT_ID`, so the
+/// write still answers 403. That is a different 403 from the middleware's:
+/// the middleware's body names the missing permission
+/// (`permission_denied: catalog:write`), the tenant gate's body carries its
+/// fixed `CATALOG_TENANT_REFUSAL_UNCONFIGURED` reason. The assertion
+/// therefore accepts a 403 only with that reason, so it still fails if the
+/// middleware denies the Data Engineer.
 #[tokio::test]
 async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     let TestApp { router, pool } = spin_up().await;
@@ -386,14 +396,25 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     .await;
     assert_ne!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "a seeded Data Engineer holding catalog:write must not be denied"
-    );
-    assert_ne!(
-        resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "a seeded Data Engineer holding catalog:write must not be denied by the permission \
+             middleware; the only 403 allowed here is the tenant gate's, got {error:?}"
+        );
+    }
 }
 
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
@@ -709,6 +730,12 @@ async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
             "endpoints": [],
         },
         "sourceObjects": [],
+        // SEC-14: this body moves `conn-pg-lakehouse` from `sql` to `rest`,
+        // which is a re-point and so needs its credential in the same
+        // request; without it the answer would be the 409 of that rule
+        // (tests/connector_repoint.rs), not the address check's 400 this
+        // test is about. The credential is a throwaway bearer token.
+        "credential": { "primary": { "kind": "token", "value": "throwaway-token" } },
     });
 
     let response = router
@@ -798,6 +825,82 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+}
+
+/// SEC-23 (F1/F2): a principal holding other write permissions but NOT
+/// `governance:write` is refused (403) when it adds a quality,
+/// classification or residency rule, and nothing is stored. The bodies are
+/// valid, so a 403 can only come from the permission gate, and the row
+/// counts prove the handler never ran.
+#[tokio::test]
+async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(
+        &pool,
+        "catalog:read,catalog:write,policy:read,policy:write,query:read,pipeline:write",
+    )
+    .await;
+
+    let cases = [
+        (
+            "quality",
+            "quality_rule",
+            serde_json::json!({
+                "name": "sec23-no-write", "asset": "gold.orders", "dimension": "completeness",
+                "threshold": "99%", "severity": "high",
+            }),
+        ),
+        (
+            "classification",
+            "classification_rule",
+            serde_json::json!({
+                "asset": "gold.orders", "column": "email", "classification": "PII",
+                "maskingRule": "hash",
+            }),
+        ),
+        (
+            "residency",
+            "residency_rule",
+            serde_json::json!({
+                "tenant": "sec23", "classification": "PII", "approvedSites": ["site-a"],
+                "crossSiteAllowed": false, "allowedOutput": "none",
+            }),
+        ),
+    ];
+    for (kind, table, body) in cases {
+        // `table` is a constant from the array above, never user input.
+        let count_sql = format!("SELECT count(*) FROM {table}");
+        let before: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules before");
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/governance/{kind}"))
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("serialize body"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "adding a {kind} rule without governance:write must be refused"
+        );
+        let after: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules after");
+        assert_eq!(before, after, "a refused {kind} rule must store nothing");
+    }
 }
 
 /// # Input validation: `expectedIntervalMinutes: 0` is refused at the
