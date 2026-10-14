@@ -133,6 +133,60 @@ pub const SERVICE: Context = Context::new(
     "A backing service is unavailable.",
 );
 
+/// The orchestrator, when a launch hit a job or code location that is not
+/// loaded yet (`PR #105 CI fix`). Only `unavailable` is ever shown, through
+/// [`UpstreamFailure::into_not_ready`].
+pub const ORCHESTRATOR_JOB_NOT_LOADED: Context = Context::new(
+    "orchestrator job not loaded",
+    "The orchestrator has not loaded this job yet. Try again shortly.",
+    "The orchestrator has not loaded this job yet. Try again shortly.",
+);
+
+/// The orchestrator could not be reached at all (`PR #105 CI fix`): a
+/// restarting webserver looks the same from here as an outage, and both are
+/// answered "try again" with a code.
+pub const ORCHESTRATOR_UNREACHABLE: Context = Context::new(
+    "orchestrator request",
+    "The orchestrator did not accept the request.",
+    "The orchestrator is not reachable. Try again shortly.",
+);
+
+/// Stable `code` of [`ORCHESTRATOR_JOB_NOT_LOADED`] responses.
+pub const CODE_JOB_NOT_LOADED: &str = "orchestrator_job_not_loaded";
+
+/// Stable `code` of [`ORCHESTRATOR_UNREACHABLE`] responses.
+pub const CODE_ORCHESTRATOR_UNREACHABLE: &str = "orchestrator_unreachable";
+
+/// Seconds a not-ready response tells the caller to wait. A code location
+/// reload takes a few seconds to a minute.
+const NOT_READY_RETRY_AFTER_SECS: u64 = 5;
+
+/// The `503` for a launch that met a job or code location the orchestrator
+/// has not loaded yet: the fixed sentence, a reference, and
+/// [`CODE_JOB_NOT_LOADED`]. `raw` (the orchestrator's own text) only reaches
+/// the log. Callers decide "not loaded" from `Dagster`'s typed result
+/// (`LaunchOutcome::job_not_loaded`), never from `raw`.
+pub fn job_not_loaded(raw: &dyn Display) -> ApiError {
+    report(&ORCHESTRATOR_JOB_NOT_LOADED, Class::Unavailable, raw)
+        .into_not_ready(CODE_JOB_NOT_LOADED)
+}
+
+/// A `Dagster` transport or protocol failure as a `503` with
+/// `code: orchestrator_unreachable` (`PR #105 CI fix`). While the code
+/// location reloads, the webserver can refuse or garble a request, which from
+/// here is indistinguishable from an outage; both mean "retry". The raw error
+/// and its source chain (`DgError::Transport`'s `Display` is the fixed "fetch
+/// failed"; the cause is its source) go to the log only.
+#[must_use]
+pub fn orchestrator_unreachable(err: &lakehouse_dagster::DgError) -> ApiError {
+    let raw = match std::error::Error::source(err) {
+        Some(source) => format!("{err}: {source}"),
+        None => err.to_string(),
+    };
+    report(&ORCHESTRATOR_UNREACHABLE, Class::Unavailable, &raw)
+        .into_not_ready(CODE_ORCHESTRATOR_UNREACHABLE)
+}
+
 /// A reported upstream error: our fixed message and the reference id the raw
 /// text was logged under.
 #[derive(Debug, Clone)]
@@ -160,6 +214,17 @@ impl UpstreamFailure {
     #[must_use]
     pub fn to_json(&self) -> Value {
         json!({ "error": self.message, "errorId": self.reference })
+    }
+
+    /// A `503` [`ApiError::NotReady`]: the fixed text and reference as the
+    /// message, `code` as the stable machine-readable condition.
+    #[must_use]
+    pub fn into_not_ready(self, code: &'static str) -> ApiError {
+        ApiError::NotReady {
+            message: self.to_string(),
+            code,
+            retry_after_secs: NOT_READY_RETRY_AFTER_SECS,
+        }
     }
 
     /// An [`ApiError`] whose message is the fixed text followed by the
