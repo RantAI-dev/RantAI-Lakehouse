@@ -675,28 +675,51 @@ class _FakeDagsterRun:
         self.run_config = run_config
 
 
+class _FakeRunRecord:
+    """Drop-in for `dagster._core.storage.dagster_run.RunRecord`.
+
+    In Dagster 1.13.20 the run's `start_time`/`end_time` live HERE and not
+    on the `DagsterRun` (`DATA-19` gate finding, `authored_factory`'s
+    "Why RECORDS and not runs"), so the stub is faithful to that shape
+    rather than to what an older Dagster returned. A stub with the times
+    on the run itself is what let `R3 plan 2a`'s sensor pass its unit
+    tests and fail on every real tick."""
+
+    def __init__(self, run: _FakeDagsterRun) -> None:
+        self.dagster_run = run
+        self.start_time = run.start_time
+        self.end_time = run.end_time
+
+
 class _StubInstance:
     """Drop-in for `context.instance`. Records every `(filter, limit)`
-    pair the sensor asks for and returns the run list the test set up
-    for that pair. Indexed by `RunsFilter.job_name` so the sensor's
-    per-upstream query and per-downstream query can be answered
-    independently."""
+    pair the sensor asks for and returns the record list the test set up
+    for that pair, newest first, honouring the `limit` the sensor chose.
+    Indexed by `RunsFilter.job_name` so the sensor's per-upstream query
+    and per-downstream query can be answered independently.
+
+    Only `get_run_records` exists here on purpose: a sensor that went
+    back to `get_runs` would raise `AttributeError` in every test rather
+    than quietly reading times off an object that no longer has them."""
 
     def __init__(self, runs_by_job: dict[str, list[_FakeDagsterRun]]) -> None:
         self._runs_by_job = runs_by_job
         self.calls: list[tuple[RunsFilter | None, int | None]] = []
 
-    def get_runs(
+    def get_run_records(
         self,
         filters: RunsFilter | None = None,
         cursor: str | None = None,
         limit: int | None = None,
         bucket_by: Any = None,
         ascending: bool = False,
-    ) -> Sequence[_FakeDagsterRun]:
+    ) -> Sequence[_FakeRunRecord]:
         self.calls.append((filters, limit))
         job_name = filters.job_name if filters else None
-        return list(self._runs_by_job.get(job_name, []))
+        runs = list(self._runs_by_job.get(job_name, []))
+        if limit is not None:
+            runs = runs[:limit]
+        return [_FakeRunRecord(run) for run in runs]
 
 
 class _StubContext:
@@ -1463,10 +1486,11 @@ class TestFileIngestRunConfigReader:
                 is None
             ), config
 
-    def test_an_empty_table_name_matches_no_run(self) -> None:
-        runs = [_file_ingest_run("r", "orders")]
-        assert authored_factory._latest_run_for_table(runs, "orders") is runs[0]
-        assert authored_factory._latest_run_for_table(runs, "") is None
+    def test_an_empty_table_name_matches_no_record(self) -> None:
+        records = [_FakeRunRecord(_file_ingest_run("r", "orders"))]
+        assert authored_factory._latest_record_for_table(records, "orders") is records[0]
+        assert authored_factory._latest_record_for_table(records, "") is None
+        assert authored_factory._latest_record_for_table(records, "invoices") is None
 
     def test_a_real_runs_config_resolves_to_the_table_the_load_wrote(self) -> None:
         """The assumption D1 rests on, proven on a REAL run instead of a
@@ -1516,17 +1540,40 @@ class TestFileIngestRunConfigReader:
             )
             assert result.success
             runs = instance.get_runs(RunsFilter(job_name="file_ingest_job"), limit=1)
+            assert len(runs) == 1
+            stored = runs[0]
+            assert (
+                authored_factory._run_config_value(
+                    stored, authored_factory.FILE_INGEST_OP_CONFIG
+                )
+                == "stock_raw"
+            ), f"the stored run config resolved to {stored.run_config!r}"
 
-        assert len(runs) == 1
-        stored = runs[0]
-        assert (
-            authored_factory._run_config_value(
-                stored, authored_factory.FILE_INGEST_OP_CONFIG
+            # And the record the SENSOR reads carries the times and the
+            # run whose config this is: `get_run_records` is what the
+            # sensor asks for, since Dagster 1.13 moved `start_time` /
+            # `end_time` off the run and onto the record.
+            records = instance.get_run_records(
+                RunsFilter(job_name="file_ingest_job"), limit=1
             )
-            == "stock_raw"
-        ), f"the stored run config resolved to {stored.run_config!r}"
-        assert authored_factory._latest_run_for_table([stored], "stock_raw") is stored
-        assert authored_factory._latest_run_for_table([stored], "invoices_raw") is None
+            assert len(records) == 1
+            record = records[0]
+            assert record.dagster_run.run_id == stored.run_id
+            # THE finding this gate's step 10 caught, pinned so it cannot
+            # come back: the run carries no times and the record does.
+            assert not hasattr(stored, "start_time")
+            assert not hasattr(stored, "end_time")
+            assert isinstance(record.start_time, float)
+            assert isinstance(record.end_time, float)
+            assert record.start_time < record.end_time
+            assert (
+                authored_factory._latest_record_for_table([record], "stock_raw")
+                is record
+            )
+            assert (
+                authored_factory._latest_record_for_table([record], "invoices_raw")
+                is None
+            )
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

@@ -777,20 +777,22 @@ def _run_config_value(run: Any, path: tuple[str, ...]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _latest_run_for_table(runs: Sequence[Any], table: str) -> Any | None:
-    """The newest of `runs` that loaded `table`, or `None`.
+def _latest_record_for_table(records: Sequence[Any], table: str) -> Any | None:
+    """The newest of `records` whose run loaded `table`, or `None`.
 
-    `instance.get_runs` returns newest first, so this is the first match.
-    An empty `table` matches nothing: a pipeline whose source zone is not
-    `bronze` has no Bronze table to filter on, and fail-closed here means
-    its chain waits with an honest reason instead of firing on every
-    upload of every table.
+    `instance.get_run_records` returns the run storage's default order --
+    the `runs.id` column descending, an autoincrement integer, so newest
+    first on every storage this build runs on -- and this is the first
+    match. An empty `table` matches nothing: a pipeline whose source zone
+    is not `bronze` has no Bronze table to filter on, and fail-closed
+    here means its chain waits with an honest reason instead of firing on
+    every upload of every table.
     """
     if not table:
         return None
-    for run in runs:
-        if _run_config_value(run, FILE_INGEST_OP_CONFIG) == table:
-            return run
+    for record in records:
+        if _run_config_value(record.dagster_run, FILE_INGEST_OP_CONFIG) == table:
+            return record
     return None
 
 
@@ -905,11 +907,21 @@ the unfiltered rule above, byte for byte.
         # the latest run has not started yet) -- never "no comparison
         # point", which was the buggy "first-success fires the chain"
         # behaviour the old code shipped.
-        downstream_runs = context.instance.get_runs(
+        # Why RECORDS and not runs (`DATA-19` gate finding): in Dagster
+        # 1.13.20 a run's times live on the storage record
+        # (`RunRecord.start_time` / `.end_time`), NOT on the `DagsterRun`
+        # that `instance.get_runs` returns -- `DagsterRun.__new__` takes
+        # no `start_time` at all. Reading it off the run raised
+        # `AttributeError: 'DagsterRun' object has no attribute
+        # 'start_time'` on EVERY tick of a real chain, so the chain never
+        # fired; `ops/g9`'s step 10 is what caught it, from the sensor
+        # tick's own FAILURE. `R3 plan 2a`'s unit tests could not: their
+        # stub defined the attributes the storage no longer puts there.
+        downstream_records = context.instance.get_run_records(
             filters=RunsFilter(job_name=f"authored__{downstream_safe}"),
             limit=1,
         )
-        latest_downstream = downstream_runs[0] if downstream_runs else None
+        latest_downstream = downstream_records[0] if downstream_records else None
         # F1.3 (#57): "downstream has a queued run" is the
         # `latest_downstream is not None and latest_downstream.start_time
         # is None` branch -- the chain's previous launch is still in
@@ -917,7 +929,7 @@ the unfiltered rule above, byte for byte.
         # queued run actually starts (and beats its upstream checks).
         if latest_downstream is not None and latest_downstream.start_time is None:
             yield SkipReason(
-                f"downstream has a queued run ({latest_downstream.run_id}); "
+                f"downstream has a queued run ({latest_downstream.dagster_run.run_id}); "
                 "skip until it starts so we do not double-launch"
             )
             return
@@ -958,7 +970,7 @@ the unfiltered rule above, byte for byte.
             # enough -- the newest run THAT LOADED THIS PIPELINE'S TABLE
             # is. Everything else asks for one run exactly as before.
             filtered = upstream_id == FILE_INGEST_JOB
-            upstream_runs = context.instance.get_runs(
+            upstream_records = context.instance.get_run_records(
                 filters=RunsFilter(
                     job_name=upstream_job_name,
                     statuses=[DagsterRunStatus.SUCCESS],
@@ -966,9 +978,9 @@ the unfiltered rule above, byte for byte.
                 limit=FILE_INGEST_SCAN_LIMIT if filtered else 1,
             )
             latest = (
-                _latest_run_for_table(upstream_runs, bronze_table or "")
+                _latest_record_for_table(upstream_records, bronze_table or "")
                 if filtered
-                else (upstream_runs[0] if upstream_runs else None)
+                else (upstream_records[0] if upstream_records else None)
             )
             if latest is None or latest.end_time is None:
                 if filtered:
@@ -997,7 +1009,7 @@ the unfiltered rule above, byte for byte.
                     f"this upstream run ({upstream_run.run_id}) is stale"
                 )
                 return
-            latest_success_ids.append(latest.run_id)
+            latest_success_ids.append(latest.dagster_run.run_id)
         # ALL upstreams have a fresh SUCCESS run -> one RunRequest,
         # keyed on the SORTED tuple of those upstream run ids. The
         # `run_key` is a string the daemon dedups, so two ticks that
