@@ -296,6 +296,55 @@ report"); no test asserted the old text.
 - `connector_disabled` text says "paused after N failed runs", with N from the setting, not the streak.
 - `record_run_once` pauses at `streak >= threshold` (so a connector already above it when this ships is paused by its next failure) and raises the alert only when this run did the pausing.
 
+### Orchestrator side, tasks 5 and 6 (developer, 2026-10-14, branch `feat/phase-1-rest`)
+
+Only `dagster/` was touched. **Commits** (one per task):
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| 5 | `1260e2ac` | `SRC-11 feat(dagster): ingest retries on a 1, 5 and 15 minute schedule, one classification of failures` |
+| 6 | `e6c2a5ff` | `SRC-11 feat(dagster): run reports, the pause check, and left-out columns` |
+
+(The handoff commit that adds this entry follows them.)
+
+**Commands run (from `/home/hv/lakehouse-sec27`, venv `~/.cache/rantai-dagster-venv`).**
+
+- After task 5: `(cd dagster && python -m pytest dispar_orchestrate -q -m "not loader")`: 853 passed, 258 deselected.
+- After task 6: the same: 907 passed, 258 deselected.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK (both after each task).
+- `loader` group, once, detached, after the last code commit: `(cd dagster && python -m pytest dispar_orchestrate -q -m loader)` (detached, log in the scratchpad): 258 passed, 907 deselected, in 1030 s (17 min).
+- Not run: cargo, docker, TypeScript (not in scope). No gate (task 8).
+
+**What was built.**
+
+- `ingest_errors.py` (new): `classify(exc) -> Classified(error_class, retried)` is the one function (D2). Closed list as in the route handoff; retried: `unreachable`, `timeout`, `source_busy`, `api_unreachable`. By type and driver code (`pymysql` number, `pyodbc` SQLSTATE, `oracledb` code, `psycopg2` SQLSTATE, HTTP status, `kafka`/`paramiko`/`pymongo` class). `other` (nobody taught the module about it) is NOT retried, as the route handoff lists it. `RetrySettings.from_env()` reads `INGEST_RETRY_DELAYS_SECONDS` (default `60,300,900`; one to three whole numbers, 0 to 86400; anything else falls back to the default with one log line that does not echo the value). `UnknownAdapter` and `UnsupportedKafkaAuth` moved here from `ingest_factory.py` (re-imported there, same names). `is_authentication_refusal` replaces `_is_authentication_refusal` (alias kept in `ingest_factory`).
+- SRC-19: PostgreSQL refusal = SQLSTATE `28P01`/`28000` when `psycopg2` gives one, else the fixed wording `password authentication failed`, read for `psycopg2` errors only, only inside the process; never logged, stored or sent.
+- `ingest_factory.py`: `_decide` + `_fail_or_retry` (raises `RetryRequested(max_retries=len(delays), seconds_to_wait=...)`, or `Failure(allow_retries=False)`, or the exception itself for `other`); both ingest ops lost `retry_policy=DEFAULT_RETRY_POLICY` (other jobs keep it). Only the failing table retries because the mapped step is the retry unit (tested through a real in-process job run: `{"orders": 1, "customers": 3, "invoices": 1}` calls, only `customers` restarted). `run_ingest` retries the connector fetch (`api_unreachable`) and the Kafka path by the same rule.
+- `run_reports.py` (new): `RunReporter` (`start`, `attempt`, `log`, `end`), built on `schema_observer.ObserverConfig` and `schema_observer._post_json` (no second helper): service token, `timeout=10`, `raise_for_status()`. A report that fails returns `False`, logs a fixed warning (kind of failure, no URL, token or error text) and never raises; the next report that can be sent is preceded by a `report_gap` line (per reporter, i.e. per step; if the gap line itself cannot be sent, the report is not tried either).
+- Reports sent: `start` first thing in `run_ingest`; one `attempt` per attempt in `ingest_source_object` and for the Kafka micro-batch (rows on success; `errorClass` and `waitSeconds` when the failure will be retried); `schema_decision_pending` class on the attempt of a table that waits, plus its log line; `columns_left_out` (table, count) on the final attempt only (not repeated on a retried one); `end` for a paused run, a CDC run, and a Kafka micro-batch (`succeeded`/`completed`, or `failed`/`table_failed` when no retry is left).
+- D13: `run_ingest` ends `paused`/`connector_paused` and yields nothing when `connector["paused"] is True` (only an explicit `true`). Applies to scheduled, queued, single-table and orchestrator-screen runs alike.
+- D9: `excludedColumns` applied in the before-load gate (`_leave_out_columns`), after `post_observation` has seen the whole table, by subtracting from the API's column list (or all reflected columns). Covers the PostgreSQL path (`dlt_pipeline` gate) and the MySQL/MariaDB/SQL Server path through the same gate; Oracle can't carry the field (the API refuses it). A name the table lacks leaves nothing out and reports nothing; every column excluded raises `ObservationRefused` (class `setting_rejected`, not retried, nothing loaded). `keep_only` is the existing function; the new code only chooses the list.
+- `run_kafka_stream_batch` / `_run_stream_connector` now return the row count (were `None`).
+- `conftest.py` (new): an autouse fixture replaces `RunReporter.for_run` with a recorder for every unit test (no test can reach a network); its `attempt` has the real keyword signature.
+
+**Things you need to know (decisions I could not take from the plan).**
+
+1. **Trigger `user` is not detectable today.** The API's `POST .../ingest/run` and the orchestrator's own screen both launch a run with no `lakehouse/trigger` tag (checked in `lakehouse-dagster`: `launch_run_with_config` sends none), and an ordinary run's config is identical in both. `_trigger_of` therefore reports: `clear`/`refresh` from the config's action, `schedule` from the sensor's tag, any known value of the tag if one is ever present, else `other`. A run started by a person from the connector page is reported `other` until the Rust side tags that launch `lakehouse/trigger: user` (a one-line change in `launch_run_with_config`'s caller in `routes/connectors.rs`, which I was not to touch); the Python already honours the tag. Not a missing route, so I did not stop.
+2. **A batch run's end is not sent by the orchestrator.** The job graph has no step after the mapped steps (`.collect()` ends it), and adding one changes the graph the gate and several tests assert. The API's run sensors close a record still `running` from Dagster's confirmed final status (tasks 1-4), which covers success and failure; a run killed without either sensor still stays `running` (already noted in the Rust handoff). The orchestrator sends `end` where only it knows (paused, CDC, Kafka).
+3. **`schema_decision_pending` is reported as an attempt with that class** (rows 0) plus the log line, while the step and the run still succeed (SRC-8 D7). The sheets `unsupported` return (a step that succeeds without loading) is reported the same way, class `unsupported`.
+4. **`other` is not retried.** Unclassified failures that used to retry (any driver error nobody listed) now fail at once; the list of known transient errors is in `ingest_errors._classify_driver`/`_classify_one`. This is the main behavioural risk to look at in review and at the gate. The ClickHouse/Iceberg sink side is only covered where it surfaces as `requests`/`OSError`/`pyiceberg` `ServiceUnavailableError`.
+5. A connector that is no longer ingestible (`StopIteration` from the fetch) now fails at once (`setting_rejected`) instead of being retried.
+6. `INGEST_RETRY_DELAYS_SECONDS` is **not yet passed by `docker-compose.yml`** (not mine to edit, `ops/`/compose are task 8); the gate must add it to the `dagster-daemon`/code-location services to lower it.
+
+**Existing tests changed, and why.**
+
+- `test_ingest_factory.py::test_the_op_retries_an_unreachable_api_but_not_a_refusal` and `::test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driver_errors`: they asserted that a transient failure leaves the op as a retryable `Failure`/the raw exception for `DEFAULT_RETRY_POLICY`; it now leaves as `RetryRequested` (first wait 60 s). The assertions for refusals are unchanged.
+- `test_op_source_metadata.py::test_every_op_carries_the_default_retry_policy`: skips the two ingest ops (D1 replaces their policy); a new test in the same file pins that those two carry NO policy, so the default cannot also apply to them. Every other op is checked as before.
+
+**New tests** (`test_ingest_errors.py` 66, `test_ingest_retries.py` 12, `test_run_reports.py` 20, `test_ingest_run_reports.py` 34): one case per class and per driver; PostgreSQL refusal by SQLSTATE and by wording on a real `psycopg2.OperationalError`, and that the wording is not read for other exceptions; the delay setting (default, set, every bad shape, no echo); only the failing table retried; reports' payloads, `timeout=`, token, gap, never raising; trigger table; paused run; left-out columns (whole table observed first, subtraction from the API's list, unknown name, all excluded, count reported once).
+
+**Not verified.** Nothing against a real API, Dagster daemon, or databases (no gate, no docker): in particular that Dagster's executor in the real deployment honours `RetryRequested.seconds_to_wait` for the mapped step (it does in the in-process executor, tested), and the report routes' behaviour against the Rust code (written against the route handoff; the Rust tests are not run either). Real `psycopg2` refusal text was not produced by a server: the test uses a hand-built `OperationalError` with the server's wording.
+
 ### Console, task 7 (developer, 2026-10-14, branch `feat/phase-1-rest`)
 
 Only `src/` was touched. **Commit** (task 7): `0db25b17` `SRC-11 feat(frontend): run history and log, resume, and column choice on the connector page`.
