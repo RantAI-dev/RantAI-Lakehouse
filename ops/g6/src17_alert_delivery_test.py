@@ -419,8 +419,26 @@ def named(step: str, fn, *args) -> None:
         raise AlertGateFailure(f"{step}: {type(exc).__name__}: {exc}") from exc
 
 
+def wait_for_file_ingest_job() -> None:
+    """Wait until Dagster's code location lists `file_ingest_job`, the job the
+    upload step (step 3) launches. `matrix.step_wait_for_services` waits only
+    for `ingest_job`, which the connector step launches; the matrix module has
+    no wait for another job name, so this is the same `repositoriesOrError`
+    poll with the name as a parameter (F3 of the 2026-10-14 CI plan)."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
+
+    def loaded() -> bool:
+        resp = requests.post(matrix.DAGSTER_URL, json={"query": query}, timeout=5)
+        resp.raise_for_status()
+        nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+        return any(job.get("name") == "file_ingest_job" for node in nodes for job in node.get("jobs", []))
+
+    matrix._wait_for("Dagster code location (file_ingest_job loaded)", loaded, 120)
+
+
 def run() -> None:
     named("wait for the services", matrix.step_wait_for_services)
+    named("wait for file_ingest_job", wait_for_file_ingest_job)
     named("sign in", matrix.step_login)
     named("tenant", matrix.step_ensure_tenant)
     # Uploads belong to the active tenant (`tenant_scope::resolve`).

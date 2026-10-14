@@ -12,7 +12,8 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # F4: a push to main must finish its run; cancelling it made its ci-required read as failed.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -1035,9 +1036,13 @@ jobs:
         # `shell: bash` for pipefail and `-T` for no pseudo-terminal, as the
         # g6-ingest run step explains; the same `-f` pair as the "up" step.
         shell: bash
+        # `--no-deps`: the "up" step above already started every service the
+        # runner depends on; without it `compose run` re-reconciles them while
+        # the gate starts (F3, run #127 job 115336951020: the code server went
+        # UNAVAILABLE right after the gate's wait passed).
         run: |
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
-            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
+            --profile g6-sql --profile g6-alerts --profile dagster run --rm -T --no-deps g6-alerts-test-runner 2>&1 | tee "$RUNNER_TEMP/g6-alerts-run.log"
 
       - name: Add the measured seconds to the job summary
         # `always()`: a failed gate prints its lines too. Only the gate's own
