@@ -244,6 +244,38 @@ the filtered upstream is eligible changes. Pinned both ways by
 (fires with `authored-deps:ours,upstream-a-1`; with the authored
 upstream behind, the tick ends naming `pl-up-a` and asks for nothing).
 
+### T4 — D3 and D4 in the console (`d2241ef0`)
+
+`src/features/pipelines/pipeline-reupload-trigger.ts` (pure: the switch
+is shown for a Bronze source only, ON for a new pipeline, and ON/OFF
+touches ONLY `file_ingest_job`); `pipeline-create-page.tsx` renders it
+in the source step and sends the chain on every save, so switching it
+off clears a stored upstream. `dependsOn` is declared on
+`CreatePipelineInput`, `UpdatePipelineInput` and `PipelineDetail` — it
+was already on the wire (`authored_detail` returns the pipeline row);
+the clients post their input unchanged, so no client code changed.
+
+| Check | Result |
+| --- | --- |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 6 warnings (all pre-existing, none in the files this task touched) |
+| `bun test src/features/pipelines/` | 49 passed, 0 failed across 5 files |
+
+**Section 6, question 3 (answer).** `lakehouseService`, not the data
+catalog: `listNamespaces()` then `listTables(zone)` —
+`/api/lakehouse/namespaces` and `/api/lakehouse/tables?namespace=…`
+(`src/services/clients/lakehouse.ts`, WS2 §4). `/api/catalog` was the
+other candidate and is NOT usable for this: its Bronze rows carry a
+deployment-chosen namespace (`NAMESPACE_PRIMER`, `catalog.rs:1172`),
+and its Silver/Gold `name` is `prettify(name)` (a display title), not
+the table name. `listTables` answers for an Iceberg namespace, so
+today the suggestions cover `bronze` — which is the whole of DATA-19's
+"pick an uploaded table" case — and a ClickHouse zone has no
+suggestions and stays free text. No API route was added. The form
+checks the zone against the namespaces the same service lists before
+asking for tables, so a `silver` zone never fires a listing that would
+answer 404.
+
 ## 8. Review
 
 (Reviewer.)
