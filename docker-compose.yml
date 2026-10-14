@@ -2209,6 +2209,14 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # What the source step asserts (BLD-3 review BLOCKER 1): `required`
+      # (the default, and what a real deployment wants) makes the gate
+      # demand the op's real source text, which needs images carrying a
+      # real `GIT_SHA`; `unavailable` makes it assert the API's 409
+      # refusal instead, which is the CI shape — `ci.yml`'s `images` job
+      # builds both images WITHOUT `GIT_SHA` so the layer cache is shared
+      # across commits. See `ops/g7/g7_pipeline_test.py`'s module doc.
+      G7_SOURCE_PROVENANCE: ${G7_SOURCE_PROVENANCE:-required}
       # R1 (ADR 0011): same `clickhouse-reader` OAuth credential
       # `g3a-test-runner` passes — see `ops/g3a/g3a_test.py`'s
       # module-level comment on why the static `catalog_credential`

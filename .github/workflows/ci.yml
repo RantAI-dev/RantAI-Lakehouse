@@ -638,6 +638,19 @@ jobs:
           # value every other job that starts an authored pipeline uses
           # (this is that value's one existing shape in the file).
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # BLD-3 review BLOCKER 1: the G7 step's source assertion
+          # follows the BUILD, and this job's images have no commit. The
+          # `images` job deliberately passes no `GIT_SHA` to either build
+          # (its own comment above: `ARG GIT_SHA` sits near the top of
+          # `dagster/Dockerfile`, so a per-commit value would invalidate
+          # every layer below it and the cache would never hit), so both
+          # images carry `GIT_SHA=unknown` and `pipelines::source` refuses
+          # with 409 by design -- `pipeline_source::check_commit`'s
+          # `is_placeholder` short-circuit. With this set, g7 asserts that
+          # honest refusal instead of demanding source text no image here
+          # can prove; the source TEXT is proven by the local run with a
+          # real commit (`ops/g7/g7_pipeline_test.py`'s module doc).
+          G7_SOURCE_PROVENANCE=unavailable
           EOF
 
       # Fixture images are not shared artifacts: `oidc-mock` is a tiny

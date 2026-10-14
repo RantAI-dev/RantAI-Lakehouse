@@ -43,9 +43,11 @@ verified by reading `rust/crates/lakehouse-api/src/routes/mod.rs`'s
   `pipelines::detail`.
 - `GET /api/pipelines/{id}/source` (`step_verify_graph_and_source`) --
   `pipelines::source`. It answers only when the op's declared `commit`
-  matches the API image's own `GIT_SHA`
-  (`pipeline_source::check_commit`), which is why the CI job that runs
-  this gate builds both images with the same commit.
+  matches the API image's own `GIT_SHA`, and REFUSES with 409 when
+  either side is a placeholder (`pipeline_source::check_commit`'s
+  `is_placeholder` short-circuit). Which of the two this gate asserts is
+  decided by `G7_SOURCE_PROVENANCE`; read the section below before
+  changing either branch.
 - `GET /api/pipelines/{id}/runs/{runId}/steps`
   (`step_trigger_and_wait_for_real_row_materializations`) --
   `pipelines::run_steps`.
@@ -81,6 +83,38 @@ location: without it the code location builds zero authored jobs
 (`authored_factory._fetch_authored_pipelines`) and the trigger answers
 409. The CI job's `.env` therefore sets it, like every other job that
 starts an authored pipeline.
+
+# `G7_SOURCE_PROVENANCE`: what the source step asserts (BLD-3 review
+BLOCKER 1)
+
+The source step has two honest settings, and which one runs is a fact
+about the BUILD, not a preference:
+
+- `required` (the default; every local run and every real deployment)
+  -- the step is unchanged: `GET /api/pipelines/{id}/source` must
+  answer 200 with text containing the op's real function name. The
+  images must therefore carry a real `GIT_SHA` on both sides, which is
+  what the developer-facing `.local/build-images.sh` does.
+- `unavailable` -- the step instead asserts the refusal the API is
+  built to make: 409 with the body exactly `{"error": "source
+  provenance is unavailable for this build"}`, and it prints one line
+  saying the source text was NOT checked because this build carries no
+  `GIT_SHA`. Any other status or body fails the gate.
+
+`unavailable` is not a weakened gate. It is a real assertion about a
+real response -- it is the same principle 3 (fail closed) the Rust
+`is_placeholder` short-circuit implements, checked from the outside: a
+build that cannot prove which commit it ran must say so, and a gate that
+demanded the source text there would be demanding the API lie. It is
+what CI needs, because `ci.yml`'s `images` job deliberately builds both
+images WITHOUT `GIT_SHA` so the layer cache is shared across commits
+(`ARG GIT_SHA` sits near the top of `dagster/Dockerfile`), which is the
+same `GIT_SHA=unknown` shape those images always had. The source TEXT is
+proven by the local run with a real commit; CI proves the refusal.
+
+An unrecognised value is refused up front rather than silently treated
+as `required`: a typo in the CI `.env` must fail loudly, not quietly
+change what the gate checks.
 """
 
 from __future__ import annotations
@@ -98,6 +132,23 @@ BRONZE_TABLE_NAME = os.environ.get("BRONZE_TABLE_NAME", "g3a_orders")
 FIXTURE_JOB_NAME = os.environ.get("G7_FIXTURE_JOB_NAME", "bronze_maintenance_job")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 SILVER_TABLE_NAME = os.environ.get("G7_SILVER_TABLE_NAME", "g7_dedupe_select_out")
+
+# What the source step asserts (BLD-3 review BLOCKER 1): the real source
+# text (`required`, the default) or the API's honest refusal on a build
+# that carries no `GIT_SHA` (`unavailable`, the CI shape). See the module
+# doc's section of the same name for why both are real assertions and why
+# CI needs the second one.
+SOURCE_PROVENANCE = os.environ.get("G7_SOURCE_PROVENANCE", "required")
+SOURCE_PROVENANCE_MODES = ("required", "unavailable")
+
+# The one body `pipelines::source` answers with for
+# `pipeline_source::SourceError::UnverifiableProvenance`, quoted from the
+# `Display` impl (`rust/crates/lakehouse-api/src/pipeline_source.rs:80`)
+# the route serializes as `{"error": err.to_string()}`
+# (`routes/pipelines.rs:1202-1206`). Compared as parsed JSON so the
+# assertion is on the message and the whole body, not on the serializer's
+# key spacing.
+SOURCE_UNAVAILABLE_BODY = {"error": "source provenance is unavailable for this build"}
 
 # ClickHouse, for the row assertion: the Silver output and the Bronze
 # source are counted through the same client `ops/g3a/g3a_test.py` uses
@@ -417,11 +468,21 @@ def step_verify_graph_and_source() -> None:
     WS4 item E3, applies the whole `transforms` list inside one op's
     body), so the grand plan's `>= 3 ops` acceptance text is checked
     against this pre-existing, multi-op fixture job instead -- a real op
-    count is proven, just not on the pipeline this gate itself created."""
+    count is proven, just not on the pipeline this gate itself created.
+
+    The GRAPH half is asserted the same way in both
+    `G7_SOURCE_PROVENANCE` modes: it does not depend on the build's
+    commit. Only the SOURCE half branches, and it branches on what the
+    API actually does with a build that cannot name its commit (BLD-3
+    review BLOCKER 1; the module doc's section on the variable says why
+    the refusal is a real assertion and not a hole)."""
     fixture_detail = API.get(f"{API_URL}/api/pipelines/{FIXTURE_JOB_NAME}", timeout=30).json()
     if fixture_detail.get("graph") is None or len(fixture_detail["graph"]["ops"]) < 1:
         raise G7Failure(f"fixture job {FIXTURE_JOB_NAME!r} has no real graph: {fixture_detail}")
     op = fixture_detail["graph"]["ops"][0]
+    if SOURCE_PROVENANCE == "unavailable":
+        _assert_source_refused(op)
+        return
     source = API.get(
         f"{API_URL}/api/pipelines/{FIXTURE_JOB_NAME}/source",
         params={"op": op["sourceRef"]}, timeout=30,
@@ -434,8 +495,49 @@ def step_verify_graph_and_source() -> None:
     print(f"[g7] {FIXTURE_JOB_NAME!r} graph has {len(fixture_detail['graph']['ops'])} op(s); source contains {func_name!r}")
 
 
+def _assert_source_refused(op: dict) -> None:
+    """`G7_SOURCE_PROVENANCE=unavailable`: the source text cannot be
+    checked on this build, so the gate checks the refusal instead --
+    409 with EXACTLY `SOURCE_UNAVAILABLE_BODY`, nothing else. A 200 here
+    would mean the API served source it cannot prove; a different body
+    would mean the message changed and this gate stopped describing what
+    an operator would see. Both fail (BLD-3 review BLOCKER 1)."""
+    source = API.get(
+        f"{API_URL}/api/pipelines/{FIXTURE_JOB_NAME}/source",
+        params={"op": op["sourceRef"]}, timeout=30,
+    )
+    if source.status_code != 409:
+        raise G7Failure(
+            f"G7_SOURCE_PROVENANCE=unavailable: GET .../source answered "
+            f"{source.status_code} {source.text}; this build carries no GIT_SHA, "
+            f"so the API must refuse with 409, not serve source it cannot verify"
+        )
+    try:
+        body = source.json()
+    except ValueError:
+        raise G7Failure(f"the refusal body was not JSON: {source.text}") from None
+    if body != SOURCE_UNAVAILABLE_BODY:
+        raise G7Failure(
+            f"G7_SOURCE_PROVENANCE=unavailable: refusal body was {body}, "
+            f"expected {SOURCE_UNAVAILABLE_BODY}"
+        )
+    print(
+        f"[g7] {FIXTURE_JOB_NAME!r} graph checked; source text NOT checked because "
+        f"this build has no GIT_SHA -- the API refused with 409 "
+        f"'{SOURCE_UNAVAILABLE_BODY['error']}', which is the honest answer"
+    )
+
+
 def main() -> int:
     try:
+        # Fail closed on an unrecognised mode rather than defaulting it to
+        # `required`: a typo in a CI `.env` must be loud, not a quiet
+        # change of what the gate checks (BLD-3 review BLOCKER 1).
+        if SOURCE_PROVENANCE not in SOURCE_PROVENANCE_MODES:
+            raise G7Failure(
+                f"G7_SOURCE_PROVENANCE={SOURCE_PROVENANCE!r} is not one of "
+                f"{list(SOURCE_PROVENANCE_MODES)}"
+            )
         step_login()
         pipeline_id = step_create_and_activate_authored_pipeline()
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
