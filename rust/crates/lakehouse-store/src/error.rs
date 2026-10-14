@@ -82,6 +82,17 @@ pub enum StoreError {
     /// `sqlx::migrate!` failed to apply the migration set.
     #[error("migration failed")]
     Migration(#[source] sqlx::migrate::MigrateError),
+    /// `serde_json` failed to encode or decode a value this crate owns
+    /// (a `pipeline_definition_version.snapshot`, the row that every
+    /// `created`/`updated`/`restored`/`deleted` event captures). A
+    /// serialization failure is a programmer error — every type that
+    /// reaches `to_value` is one this crate can deserialize — so the
+    /// mapping is 500 (`Internal`). The `Display` is deliberately generic
+    /// for the same reason `Self::Database`'s is: the serde message can
+    /// embed the offending field name, which we treat as upstream text
+    /// and never forward.
+    #[error("database error")]
+    Serialization(#[source] serde_json::Error),
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -111,6 +122,17 @@ impl From<sqlx::migrate::MigrateError> for StoreError {
     }
 }
 
+impl From<serde_json::Error> for StoreError {
+    /// Every `serde_json::Error` produced inside this crate is either a
+    /// snapshot encode/decode against a known Rust type (a programmer
+    /// error if it fires at all — see [`StoreError::Serialization`]) or
+    /// a row-decode for a column this crate's own INSERTs write (same
+    /// argument, same status mapping).
+    fn from(err: serde_json::Error) -> Self {
+        Self::Serialization(err)
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         let message = err.to_string();
@@ -129,7 +151,9 @@ impl From<StoreError> for ApiError {
             }
             StoreError::NotFound => Self::NotFound(message),
             StoreError::Unavailable => Self::Unavailable(message),
-            StoreError::Database(_) | StoreError::Migration(_) => Self::Internal(message),
+            StoreError::Database(_) | StoreError::Migration(_) | StoreError::Serialization(_) => {
+                Self::Internal(message)
+            }
         }
     }
 }

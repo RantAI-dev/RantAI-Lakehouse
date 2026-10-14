@@ -41,6 +41,8 @@ jobs:
 
       - name: Setup staging .env
         working-directory: ${{ github.workspace }}
+        # bash, stated: the secret loop below uses indirect expansion.
+        shell: bash
         run: |
           cp .env.example .env
           cat .env.staging >> .env
@@ -59,7 +61,44 @@ jobs:
           # degrading to 503, never a broken deploy.
           sed -i '/^LLM_KEY=/d' .env
           printf '\nLLM_KEY=%s\n' "${{ secrets.LLM_KEY }}" >> .env
+          # SEC-13: the staging admin password, the six service tokens and
+          # the embed secret used to be committed in .env.staging, readable
+          # by anyone (this repo is public). They now come from repo secrets
+          # named STAGING_<NAME>, passed in through `env:` below rather than
+          # interpolated into this script, so a value with a quote or a `$`
+          # cannot change what the script does. Same rule as LLM_KEY: delete
+          # any existing line, then append exactly one, on its own line.
+          # Unlike LLM_KEY these are required: an empty token leaves the
+          # scheduled pipelines inert and /api/pipelines answering 401/503
+          # with nothing in the deploy log to say why, so a missing secret
+          # fails the deploy here, by name, instead (fail closed).
+          missing=""
+          for name in AUTH_BOOTSTRAP_PASSWORD AGENT_RUN_TOKEN GOLD_EXPORT_RUN_TOKEN \
+                      INGEST_SERVICE_TOKEN ALERTS_RUN_TOKEN PIPELINE_RUN_TOKEN \
+                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET; do
+            var="STAGING_${name}"
+            value="${!var}"
+            if [ -z "$value" ]; then
+              missing="$missing $var"
+              continue
+            fi
+            sed -i "/^${name}=/d" .env
+            printf '\n%s=%s\n' "$name" "$value" >> .env
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
           echo "=== staging .env ready ==="
+        env:
+          STAGING_AUTH_BOOTSTRAP_PASSWORD: ${{ secrets.STAGING_AUTH_BOOTSTRAP_PASSWORD }}
+          STAGING_AGENT_RUN_TOKEN: ${{ secrets.STAGING_AGENT_RUN_TOKEN }}
+          STAGING_GOLD_EXPORT_RUN_TOKEN: ${{ secrets.STAGING_GOLD_EXPORT_RUN_TOKEN }}
+          STAGING_INGEST_SERVICE_TOKEN: ${{ secrets.STAGING_INGEST_SERVICE_TOKEN }}
+          STAGING_ALERTS_RUN_TOKEN: ${{ secrets.STAGING_ALERTS_RUN_TOKEN }}
+          STAGING_PIPELINE_RUN_TOKEN: ${{ secrets.STAGING_PIPELINE_RUN_TOKEN }}
+          STAGING_LAKEHOUSE_MAINTENANCE_TOKEN: ${{ secrets.STAGING_LAKEHOUSE_MAINTENANCE_TOKEN }}
+          STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
         working-directory: ${{ github.workspace }}
