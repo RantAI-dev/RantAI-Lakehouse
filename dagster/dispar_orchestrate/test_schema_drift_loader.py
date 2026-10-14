@@ -56,6 +56,10 @@ import pytest
 from dlt.destinations import filesystem
 from pyiceberg.table import StaticTable
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 DISPOSITIONS = ["append", "replace"]
 TABLE = "drift"
 

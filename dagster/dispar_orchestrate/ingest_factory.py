@@ -154,6 +154,7 @@ from kafka.structs import OffsetAndMetadata
 from dispar_orchestrate import connector_catalog, dlt_pipeline, schema_observer, secret_resolver, ssrf_guard
 from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
 from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
+from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
@@ -395,25 +396,34 @@ def _register_in_catalog(connector_id: str, obj: dict) -> None:
         )
 
 
-def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
+def _load_plan(adapter_name: str, obj: dict, refresh: str | None = None) -> LoadPlan:
     """How this source object's rows meet its Bronze table
     (`adapters/sink.py`'s "Load modes"). A source object saved before load
     modes existed replaces: every run used to add the whole source again.
 
-    `incremental` is offered for the `sql` adapter only. dlt can filter any
+    `incremental` and `incremental_dedup` are offered for the `sql` adapter
+    only; `replace_dedup` runs on every batch adapter, through the same
+    deduplication on plain rows (SRC-10; `adapters/dedup.py`), and so does `history`
+    (`adapters/history.py`: it reads the whole source every run, so it needs no cursor
+    and no adapter that can filter by one). A Kafka
+    micro-batch never goes through here: it has no source-object load mode
+    and `load_via_sink` appends it, which suits new rows by construction. dlt can filter any
     resource by a cursor, but only the `sql_database` source's path (the
     filter pushed into the query, the cursor kept across runs) has been
     exercised; the others are refused rather than assumed to work.
+
+    `refresh` (`"keep"` or `"remove"`, SRC-10 decision 5) is set by a run of one
+    table started with a refresh action; see `LoadPlan`.
 
     # Errors
 
     Raises `UnsupportedLoadMode`, which `_run_one_object` records as a
     rejection.
     """
-    plan = LoadPlan.from_source_object(obj)
-    if plan.mode == "incremental" and adapter_name != "sql":
+    plan = LoadPlan.from_source_object(obj, refresh=refresh)
+    if plan.mode in sink_adapter.INCREMENTAL_MODES and adapter_name != "sql":
         raise UnsupportedLoadMode(
-            f"load mode 'incremental' is only available for SQL connectors, not adapter {adapter_name!r}"
+            f"load mode {plan.mode!r} is only available for SQL connectors, not adapter {adapter_name!r}"
         )
     return plan
 
@@ -583,7 +593,43 @@ def _build_observed(build, gate):
     return result
 
 
-def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> int | None:
+# SRC-10 decision 5: the actions a run of ONE table can carry (the run config's
+# `action`, beside `object`). A scheduled run and an old API send neither.
+ACTION_REFRESH_KEEP = "refresh_keep"
+ACTION_REFRESH_REMOVE = "refresh_remove"
+ACTION_CLEAR = "clear"
+ACTIONS = (ACTION_REFRESH_KEEP, ACTION_REFRESH_REMOVE, ACTION_CLEAR)
+_REFRESH_OF_ACTION = {ACTION_REFRESH_KEEP: "keep", ACTION_REFRESH_REMOVE: "remove"}
+
+
+def _single_table_request(connector_id: str, object_name: Any, action: Any) -> tuple[str, str] | None:
+    """The `(object, action)` a run was started with, or `None` for an ordinary run
+    of every table. Both or neither: an `object` without an `action` (or the reverse)
+    is a run the API would never send, so it fails closed instead of loading
+    something nobody asked for.
+
+    # Errors
+
+    Raises `Failure(allow_retries=False)` for one of the pair alone, an `action` that is
+    not one of `ACTIONS`, or a blank `object`."""
+    if object_name is None and action is None:
+        return None
+    if (
+        not isinstance(object_name, str)
+        or not object_name.strip()
+        or action not in ACTIONS
+    ):
+        raise Failure(
+            f"connector {connector_id!r}: a run of one table needs both an object and an action "
+            f"({', '.join(ACTIONS)})",
+            allow_retries=False,
+        )
+    return object_name, action
+
+
+def _run_one_object(
+    connector: dict, obj: dict, run_id: str | None = None, action: str | None = None
+) -> int | None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
     case -- a rejection (bad secret ref, SSRF-blocked host, an
@@ -603,6 +649,15 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
     function returns `None`.
 
     `run_id` is the Dagster run id sent with the schema observation.
+
+    `action` (SRC-10 decision 5) is set only for a run of one table started with an
+    action. `refresh_keep` and `refresh_remove` load as usual under a plan that
+    first forgets the table's cursor and deduplication marker (and, for `remove`,
+    empties the table: see `LoadPlan`). `clear` empties the table, forgets the same
+    state and loads NOTHING: it resolves no secret, dials no source, makes no
+    schema observation (so the table's baseline in `connector_source_schema` is not
+    touched; it describes the source, not the table) and records a run with status
+    `cleared` and rows 0.
     """
     connector_id, adapter_name, dial = connector["id"], connector["adapter"], connector["dial"]
     job_name = "ingest_job"
@@ -620,6 +675,18 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
             error=error,
         )
 
+    if action == ACTION_CLEAR:
+        try:
+            sink_adapter.clear_table(
+                obj["target"],
+                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+            )
+        except Exception as exc:  # noqa: BLE001 -- every failure still gets a row (never silently invisible)
+            _record(rows=None, status="failed", error=_classify_exception(exc))
+            raise
+        _record(rows=0, status="cleared")
+        return 0
+
     try:
         secrets = _resolve_object_secrets(connector, adapter_name, dial)
     except SecretRefRejected as exc:
@@ -628,7 +695,7 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
-        plan = _load_plan(adapter_name, obj)
+        plan = _load_plan(adapter_name, obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
         gate = _make_gate(connector, obj, run_id)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
@@ -751,6 +818,9 @@ def _run_one_object(connector: dict, obj: dict, run_id: str | None = None) -> in
         ssrf_guard.SsrfBlocked,
         UnsupportedColumnType,
         UnsupportedLoadMode,
+        # SRC-10: a deduplicating load that cannot be done as asked (a row with
+        # no key value, too many keys). Fixed message: counts and names only.
+        dedup_adapter.DedupRefused,
         schema_observer.ObservationRefused,
     ) as exc:
         _record(rows=None, status="rejected", error=str(exc))
@@ -965,7 +1035,21 @@ def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
 
 
 @op(
-    config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")},
+    config_schema={
+        "connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest."),
+        # SRC-10 decision 5, both OPTIONAL so a scheduled run and an API that
+        # predates them still validate: a run of ONE table with an action.
+        "object": Field(
+            str,
+            is_required=False,
+            description="Source object name (sourceObjects[].name) of the one table to run; needs `action`.",
+        ),
+        "action": Field(
+            str,
+            is_required=False,
+            description="refresh_keep | refresh_remove | clear, for the table named in `object`.",
+        ),
+    },
     out=DynamicOut(),
     retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
@@ -1018,10 +1102,23 @@ def run_ingest(context) -> Any:
     into one mapped step doing two objects' work, which Dagster's
     graph would refuse at build time and which this fan-out catches
     first with both names in the message.
+
+    SRC-10 decision 5: with `object` and `action` in the config the op fans out over
+    that ONE source object only, and the mapped step carries the action
+    (`refresh_keep`, `refresh_remove`, `clear`; see `_run_one_object`). New tables
+    are not discovered in such a run (it touches one table). A cdc or stream
+    connector, and an object the connector does not select, fail closed with
+    `Failure(allow_retries=False)`; the API refuses both before launching.
     """
     connector_id: str = context.op_config["connector_id"]
+    single = _single_table_request(connector_id, context.op_config.get("object"), context.op_config.get("action"))
     cfg = IngestFactoryConfig.from_env()
     connector = _fetch_one_connector(cfg, connector_id)
+    if single is not None and (connector["adapter"] == "cdc" or connector.get("ingestMode") == "stream"):
+        raise Failure(
+            f"connector {connector_id!r} streams its rows; a run of one table with an action is for batch connectors",
+            allow_retries=False,
+        )
     if connector["adapter"] == "cdc":
         context.log.info(
             f"connector {connector_id!r} is adapter=cdc -- no job body to run: Debezium's own "
@@ -1036,13 +1133,23 @@ def run_ingest(context) -> Any:
         # build_source() call per sourceObjects entry.
         _run_stream_connector(connector, run_id=context.run_id)
         return
-    if _discover_new_tables(connector, context.run_id):
+    if single is None and _discover_new_tables(connector, context.run_id):
         # Added in this run, loaded in this run: the API wrote them to the
         # connector's tables, so one more read of the connector (the same call
         # that started this run) fans out over the new list.
         connector = _fetch_one_connector(cfg, connector_id)
+    objects = connector.get("sourceObjects", [])
+    action = None
+    if single is not None:
+        object_name, action = single
+        objects = [obj for obj in objects if obj.get("name") == object_name]
+        if not objects:
+            raise Failure(
+                f"connector {connector_id!r} does not select the object {object_name!r}",
+                allow_retries=False,
+            )
     seen: dict[str, str] = {}
-    for obj in connector.get("sourceObjects", []):
+    for obj in objects:
         target = obj["target"]
         key = _sanitize_target(target)
         if key in seen:
@@ -1055,7 +1162,7 @@ def run_ingest(context) -> Any:
             )
         seen[key] = target
         yield DynamicOutput(
-            value={"connector": connector, "obj": obj},
+            value={"connector": connector, "obj": obj, "action": action},
             mapping_key=key,
         )
 
@@ -1095,7 +1202,10 @@ PART D: a config-shaped failure retries with the same input and
     says it says."""
     connector, obj = payload["connector"], payload["obj"]
     try:
-        rows = _run_one_object(connector, obj, run_id=context.run_id)
+        # `action` only when set: an ordinary run calls `_run_one_object` exactly as
+        # it did before SRC-10.
+        action = payload.get("action")
+        rows = _run_one_object(connector, obj, run_id=context.run_id, **({"action": action} if action else {}))
     except schema_observer.ObservationUnreachable as exc:
         # SRC-8, fail closed: the API could not be asked, so the table was
         # NOT loaded unchecked. Transient (a connection error or a 5xx), so

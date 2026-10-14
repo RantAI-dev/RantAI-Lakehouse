@@ -29,6 +29,10 @@ from pyiceberg.table import StaticTable
 
 from dispar_orchestrate import schema_observer
 
+# Runs a real dlt pipeline against a local Iceberg table (registered in pyproject.toml);
+# CI runs these in `dagster-loader-tests`, the rest in `dagster-unit-tests`.
+pytestmark = pytest.mark.loader
+
 TABLE = "src"
 # A camel-case name, one with a space, one already snake_case, one with a
 # leading digit and one with a symbol: the shapes `dlt` rewrites differently.
