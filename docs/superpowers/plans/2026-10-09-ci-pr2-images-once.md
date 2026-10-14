@@ -527,3 +527,99 @@ That was the right call.
   `main` writes the cache. It is measured on the first runs after merge.
 
 CI results are appended below once the PR has run.
+
+## Handoff 2 (main merged, 2026-10-14)
+
+Developer: Claude Sonnet 5.5. Branch `ci/pr2-images-once`. Merge commit
+`6d33290` (`merge: main into ci/pr2-images-once (07c7632)`), a merge, no rebase,
+no force-push. No PR opened or commented on. No workflow has run on this
+commit.
+
+### Conflicts and how they were resolved
+
+Five files conflicted; each was resolved hunk by hunk (rule 9).
+
+- `.github/workflows/ci.yml` (8 hunks): main's text kept, this branch's
+  consumer wiring re-applied. g4-cdc: main's `-f` override pair plus
+  `--no-build`. g6-ingest: main's name, 25-minute timeout and `g6-sql`
+  profile, plus `needs: [changes, images]`, the image `env:` and the fixture
+  build. g6-ingest-other: main's job, wired like the others; the link-local
+  project moved into it with its steps, so the branch's link-local
+  `oidc-mock` build step now sits in this job. `image-smoke` and
+  `g8-time-travel` both kept; `ci-required` `needs` and `env` list both.
+  `cancel-in-progress` is main's; the `--no-deps` on the `g6-alerts` run
+  step is untouched.
+- `docker-compose.yml` (1 hunk): `g6-test-runner` takes main's profiles
+  (`g6`, `g6-sql`, `g6-other`) and keeps the shared `image:` key.
+- `scripts/ci/required_gate.sh`, `scripts/ci/tests/test_required_gate.sh`:
+  main's variables and cases, plus `IMAGES_RESULT` / `IMAGE_SMOKE_RESULT`.
+  The two "consumers skipped" self-tests now list every consumer, new ones
+  included. `ci-required` needs `images` and `image-smoke`, as before.
+- `docs/CI.md`: main's acceptance-job list plus the `images` bullet; the
+  "Images" section names the new consumers.
+
+### New jobs wired to the shared images
+
+`g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g8-time-travel`
+(and `g6-ingest`, already wired, re-pointed at `--profile g6-sql`). Each:
+`needs: [changes, images]` with main's `if:` unchanged, job `env:` with the
+two `:ci` tags, both artifacts downloaded and loaded, the fixture images
+built with the same `-p`, `-f` and `--profile` flags as the `up`, and `up -d
+--no-build`.
+
+Fixture builds, from a walk of `depends_on` over `docker compose config` for
+each job's files and profiles (only `oidc-mock` and `rest-stub-g6` have a
+`build:` and no `image:` outside the shared two):
+
+| Job | Fixture builds |
+| --- | --- |
+| `g6-ingest` (g6-sql) | `oidc-mock` |
+| `g6-ingest-other` (g6-other) | `oidc-mock`, `rest-stub-g6`; link-local project: `oidc-mock` |
+| `g6-oracle` | `oidc-mock` (`oracle-g6` is a pinned upstream image) |
+| `g9-upload`, `g8-time-travel` | `oidc-mock` |
+| `g6-alerts` | `oidc-mock` (`mysql-g6` is upstream; `rest-stub-g6` is not in `g6-sql` or `g6-alerts`) |
+
+`g9-test-runner` and `g8-time-travel-test-runner` are `python:3.12-slim`, so
+they are pulled, not built.
+
+### A gap decision 3 did not foresee (mismatch, fixed in the merge)
+
+`g6-oracle-test-runner` and `g6-alerts-test-runner`
+(`ops/g6/docker-compose.g6-oracle.override.yml`,
+`ops/g6/docker-compose.g6.override.yml`) have a `build:` of `./dagster` with
+no `image:` key and no `GIT_SHA` arg. Under `--no-build` for the `up`, the
+`docker compose run` of the gate would still have built the whole Dagster
+image in those two jobs. Both now carry the shared `image:` key and the same
+`args:`, the decision 3 treatment. This extends decision 3 from five to seven
+services; it changes no decision. The planner should confirm.
+
+### Left alone
+
+`g1-rustfs`, `g2-seaweedfs` (decision 5; unchanged by main). `images` and
+`image-smoke` keep their scope condition, which equals every consumer's, so a
+docs-only PR skips them and `ci-required` passes (self-test case kept).
+
+### Checks run (foreground, in the worktree, at `6d33290` plus this entry)
+
+- `python3 -c "import yaml…"` on all five workflow files: all parse.
+- `bash scripts/ci/tests/test_required_gate.sh`: 44 passed, 0 failed.
+- `bash scripts/ci/tests/test_detect_change_scope.sh`: 33 passed, 0 failed.
+- `python3 ops/lint/check_compose_init_readiness.py`: exit 0.
+- `docker compose --env-file <temp env from .env.example> --profile '*' config
+  --quiet`: exit 0 (temp env deleted).
+- `docker compose config` with each override pair and `--profile '*'`
+  (temp env with the gate secrets added): `g6-alerts-test-runner`,
+  `g6-oracle-test-runner` and `g6-test-runner` resolve to
+  `rantai-lakehouse-dagster:local` with `GIT_SHA: unknown`.
+- A scripted check over the parsed `ci.yml`: all twelve consumers `needs`
+  `images`, set both image variables, and no `--build` remains.
+
+### Not verified
+
+CI itself: the `images` job, every consumer with `--no-build` (including
+the five newly wired), `download-artifact@v8` with `pattern` and
+`merge-multiple`, the read-only token, the cache behaviour and all timings.
+Neither the real `docker compose up` for the new stacks nor the override
+runners' `run` without a rebuild was run (rule 8): only `config`.
+`shellcheck` and `actionlint` are not installed here, so `run:` shell was not
+linted.
