@@ -128,18 +128,25 @@ function SettingsDisclosure({ column, draft, onChange, canHide }: { column: stri
 }
 
 /** Table: grouped summary or raw rows, with the columns, their order, the sort and each one's format. */
-export function TableSection({ draft, onChange, columns, groupedColumns }: {
+export function TableSection({ draft, onChange, columns, groupedColumns, part = "all" }: {
   readonly draft: TableDraft;
   readonly onChange: (d: TableDraft) => void;
   readonly columns: SourceColumns;
   /** The columns a grouped table shows (dimension and measure), whose formats can be set. */
   readonly groupedColumns: readonly string[];
+  /**
+   * Phase 2 QA R3: "shape" is what the table shows (its mode, and the columns and sort of raw rows);
+   * "format" is the formats of a grouped table's columns, which sit in the folded options.
+   */
+  readonly part?: "all" | "shape" | "format";
 }) {
   const rows = draft.mode === "rows";
+  const showShape = part !== "format";
+  const showFormat = part !== "shape";
   const sortItems: Record<string, string> = { [NO_SORT]: "Natural order", ...Object.fromEntries(draft.columns.map((c) => [c, c])) };
   return (
     <div className="grid gap-3">
-      <div className="grid gap-1.5">
+      {showShape ? <div className="grid gap-1.5">
         <Label>Rows</Label>
         <Select value={draft.mode} items={{ grouped: "Grouped summary", rows: "Raw rows" }} onValueChange={(v) => onChange({ ...draft, mode: v === "rows" ? "rows" : "grouped" })}>
           <SelectTrigger className="w-full" aria-label="Table mode"><SelectValue /></SelectTrigger>
@@ -148,8 +155,8 @@ export function TableSection({ draft, onChange, columns, groupedColumns }: {
             <SelectItem value="rows">Raw rows</SelectItem>
           </SelectContent>
         </Select>
-      </div>
-      {rows ? (
+      </div> : null}
+      {rows && showShape ? (
         <>
           <ColumnList
             label="Columns" required value={draft.columns} options={columns.all} max={PICK_LIMITS.columns}
@@ -179,7 +186,7 @@ export function TableSection({ draft, onChange, columns, groupedColumns }: {
             </div>
           </div>
         </>
-      ) : groupedColumns.length ? (
+      ) : !rows && showFormat && groupedColumns.length ? (
         <div className="grid gap-1">
           {groupedColumns.map((c) => (
             <div key={c} className="rounded-md border border-border px-2 py-1">

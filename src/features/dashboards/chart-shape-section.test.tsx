@@ -52,10 +52,29 @@ describe("MeasureRows", () => {
     expect(screen.queryByLabelText("Remove measure 1")).toBeNull()
   })
 
-  it("offers an aggregate of its own only to a kind that takes several measures", () => {
-    const { rerender } = render(<MeasureRows {...baseProps} rows={rows3} onChange={() => {}} />)
+  it("shows each measure's own aggregation, defaulting to the chart's, and stores none when the chart's is picked again", () => {
+    const onChange = mock<(rows: MeasureRow[]) => void>(() => {})
+    render(<MeasureRows {...baseProps} defaultAggregate="avg" rows={rows3} onChange={onChange} />)
+    // Phase 2 QA R4: no "Default (avg)" entry; the row reads the aggregate it is computed with.
+    expect(screen.getByLabelText("Aggregation of visitors").textContent).toContain("avg")
+    expect(screen.getByLabelText("Aggregation of stay").textContent).toContain("avg")
+    expect(screen.queryByText(/Default \(/)).toBeNull()
+  })
+
+  it("has one aggregation per measure for the kinds that take several, and one for the chart for the rest", () => {
+    const onDefault = mock<(a: string) => void>(() => {})
+    const { rerender } = render(<MeasureRows {...baseProps} own={false} max={1} rows={[rows3[0]]} onChange={() => {}} />)
+    // A kind without aggregates of its own and no chart-wide control: none shown.
+    expect(screen.queryByLabelText("Aggregation of visitors")).toBeNull()
+    rerender(<MeasureRows {...baseProps} own={false} max={1} onDefaultAggregate={onDefault} rows={[rows3[0]]} onChange={() => {}} />)
     expect(screen.getByLabelText("Aggregation of visitors")).toBeTruthy()
-    rerender(<MeasureRows {...baseProps} max={1} rows={[rows3[0]]} onChange={() => {}} />)
+    rerender(<MeasureRows {...baseProps} own={false} max={1} fixedNote="min, quartiles, max" rows={[rows3[0]]} onChange={() => {}} />)
+    expect(screen.queryByLabelText("Aggregation of visitors")).toBeNull()
+    expect(screen.getByText("min, quartiles, max")).toBeTruthy()
+  })
+
+  it("shows no aggregation for a metric or a calculated aggregate, which carry their own", () => {
+    render(<MeasureRows {...baseProps} wholeMeasure={new Set(["visitors"])} rows={[rows3[0]]} onChange={() => {}} />)
     expect(screen.queryByLabelText("Aggregation of visitors")).toBeNull()
   })
 })
@@ -206,6 +225,31 @@ describe("StepsEditor", () => {
     expect(screen.getAllByLabelText("Condition column").length).toBe(1)
     // (The names it offers are pinned in chart-shape.test.ts, `columnsAfterSteps`.)
     expect(screen.getByLabelText("Step 2")).toBeTruthy()
+  })
+})
+
+describe("StepsEditor wording (phase 2 QA R8)", () => {
+  const noop = () => {}
+  it("reads an earlier step's columns as plain labels, not stacked names", () => {
+    const base = { groups: [{ name: "kab", kind: "text" }], measures: ["avg_visitors"], labels: { avg_visitors: "avg of visitors" }, bases: { avg_visitors: "visitors" } }
+    render(
+      <StepsEditor
+        value={[
+          { summarise: { by: ["kab"], measures: [{ column: "avg_visitors", aggregate: "sum" }] } },
+          { filter: [{ column: "sum_avg_visitors", op: "gt", value: "5" }] },
+        ]}
+        onChange={noop} base={base} disabled={false}
+      />,
+    )
+    expect(screen.getByLabelText("Condition column").textContent).toContain("total visitors")
+    expect(screen.queryByText(/sum of avg of/)).toBeNull()
+  })
+
+  it("says once that there is nothing to keep when the chart has no groupings, and offers no list", () => {
+    const base = { groups: [], measures: ["visitors"], labels: {} }
+    render(<StepsEditor value={[{ summarise: { by: [], measures: [{ column: "visitors", aggregate: "sum" }] } }]} onChange={noop} base={base} disabled={false} />)
+    expect(screen.getByText("There is no grouping to keep: group the chart by a column first.")).toBeTruthy()
+    expect(screen.queryByText("Keep")).toBeNull()
   })
 })
 
