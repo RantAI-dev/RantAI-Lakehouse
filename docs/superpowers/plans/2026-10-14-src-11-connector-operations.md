@@ -296,6 +296,41 @@ report"); no test asserted the old text.
 - `connector_disabled` text says "paused after N failed runs", with N from the setting, not the streak.
 - `record_run_once` pauses at `streak >= threshold` (so a connector already above it when this ships is paused by its next failure) and raises the alert only when this run did the pausing.
 
+### Console, task 7 (developer, 2026-10-14, branch `feat/phase-1-rest`)
+
+Only `src/` was touched. **Commit** (task 7): `0db25b17` `SRC-11 feat(frontend): run history and log, resume, and column choice on the connector page`.
+
+**What was built** (files under `src/features/connectors/` unless noted):
+
+- Runs card (`connector-ingest-panel.tsx`): reads `GET /api/connectors/{id}/runs` (`listConnectorRuns`), one card per run with trigger, status, started, duration, rows, attempts and the end reason in words. A run recorded `running` for more than `STALE_RUN_MS` (6 hours, comment at the constant: a table holds a run open about 21 minutes of retry waits plus the load, and a killed run fires neither report) shows "No end reported", is not active, and does not disable Run now. A run launched by Run now is waited for until the record lists its id (the orchestrator's run id is the record's `runId`, as the handoff of tasks 5 and 6 should confirm).
+- Run log: "Show log" on a run reads `GET …/runs/{runId}/log` only when asked; attempts (table, attempt, rows, result, the error class in product words, the wait before the next attempt) then the lines (event in product words plus the API's `text`). "Download log" fetches `…/log?format=text` through the service and saves it with the existing download pattern (Blob and anchor, as `pipelines/run-log-console.tsx`) as `run-<runId>.log`.
+- Resume: in the Runs card where the paused note is, shown when the reason matches `Paused after <N> failed runs in a row` (`isAutoDisablePause`, mirrors `AUTO_DISABLE_REASON_HEAD`/`_TAIL` in `lakehouse-store/src/connectors.rs`); calls `POST …/resume`, shows the 409's text as it came, and calls the new `onResumed` prop (the detail page passes `state.reload`, so the pause pill goes). A schema-change pause shows no button.
+- Column choice: a "Columns" section per table for `sql` connectors on the postgres, mysql or mssql driver (`supportsColumnChoice`); columns come from this visit's discovery (a saved table not found yet says "Find this table above to list its columns."); unticked columns go to `excludedColumns`. Key columns of a key-using mode and the cursor are ticked, disabled, with the reason (`lockedColumns`), and `effectiveExcluded` never sends one as excluded (the API would answer 422). Other source types: "Column choice is not available for this source type." (once above the table list). Not offered for CDC.
+- Schema changes tab: new "Inactive columns" card (shown only when there are some) with the reason: "removed at the source", "left out by you" for `excluded`, plain "inactive" for any other string. `InactiveColumn.reason` is a required contract field; `SourceObject.excludedColumns?` is the contract field.
+- Overview: Last run tile and "Needs attention" read the run record (`recentProblems(probes, runs)`); a failed last run says "did not load every table" for `table_failed`, else "failed"; a running or no-end run is not judged, a paused run is not a failure.
+- Alerts page: the `connector_disabled` note is now "Raised once when a connector fails runs in a row (30 by default) and is paused. Resume it from its page." The test constant that pinned "Nothing raises this yet" is corrected to the new sentence (it was false once D3 landed).
+- Removed: `groupResultsByRun`, `RunGroupCard`, `RUN_TONE`, `RUN_STATUS_LABEL/TONE`, the `IngestRun` and `IngestJobRun` contract types, `listIngestRuns` (`/api/governance/ingest-runs?connectorId=`) and `listIngestJobRuns` (`/api/connectors/{id}/ingest/runs`) from the service and client. No console code calls either route now, so **the Rust route `GET /api/connectors/{id}/ingest/runs` can go** (D7); `/api/governance/ingest-runs` was used by the console for this card only (grep of `src/`), the governance route itself is not mine to judge.
+
+**Commands run** (all from `/home/hv/lakehouse-sec27`):
+
+- `bun run typecheck`: no errors.
+- `bun run lint`: 0 errors, 6 warnings, all in code I did not change (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx:692` the `rules` conditional, `open-format-card.test.tsx`, `use-data-table.ts`, `dashboard-specs.ts`).
+- `bun run test`: **could not complete as one process**. Three attempts were killed with SIGKILL (exit 137) by memory pressure on this shared machine: `src/features/catalog` alone peaks at 4.5 GB (measured with `/usr/bin/time -v`, 95 s, unchanged code of mine: I did not touch it) and the single `bun test src` process grows past what is free next to other developers' builds. So the same suite was run **per directory** (`bun test` on each of `src/features/*`, `src/components`, `src/hooks`, `src/lib`, `src/services`, `src/app`, `src/config`, `src/types`), twice in a row, summing the counts: run 1: 1194 pass, 0 fail; run 2: 1194 pass, 0 fail. `src/features/connectors`: 267 pass in both. `bun run test` as one process is *not verified*.
+
+**Not verified.** No browser check of the new Runs card, the log, the Columns section or the Resume button (component tests only, rendered in the test DOM; the details/summary layout, the "Download log" file save and the long-column-list scrolling were not seen in a browser). Resume against the real 409 was not run (stubbed with the handoff's text). The run-record `runId` equalling the Dagster run id (so a launched run is recognised) is read from the handoff, not run.
+
+**Existing tests changed, and why.**
+
+- `connector-ingest-panel.test.tsx`: `stubFetch` answers `GET …/runs`, the run log and `POST …/resume` instead of the removed routes; the "a run's row" fixture became a run record (summary "7 rows · 1 attempt", pill "Succeeded" instead of "1 of 1 tables · 7 rows" and "Completed"); the "is disabled while a run is going" fixture uses a run recorded now (an old `running` is "no end reported" by design); the `groupResultsByRun` tests were removed with the function; the test "names the table and the action in the run list" was removed: the run record has the trigger (`refresh`, `clear`) but **not the table**, so the Runs card no longer names it. **This drops a SRC-10 decision 5 line ("Clear · public.orders" in the run list); if the product owner wants the table back it needs a field on the run record.** The plan did not ask for it, so I did not add one.
+- `connector-overview.test.tsx`: fixtures are run records; `recentProblems` takes two arguments (the two probe-history tests changed only by dropping the third argument); the "Completed" assertions became "Succeeded"; "Could not ask the orchestrator" became "Run history could not be loaded" (the text no longer names the orchestrator).
+- `connector-detail-page.test.tsx`, `connector-create-page.test.tsx`: the stubs of the two removed routes became one stub of `GET …/runs`.
+- `connector-schema-changes-panel.test.tsx`: the one `inactiveColumns` fixture gained the now-required `reason`.
+- `alerts-page.test.tsx`: the `connector_disabled` note constant and test name (see above).
+
+**Added tests**: runs from the record (trigger, rows, attempts, duration; end reasons; empty; stale running; fresh running; load error), the log (open on request and not before, download via `?format=text`, empty log, error), Resume (recognition, success and `onResumed`, 409 text, schema pause has none, Run now disabled while paused), column choice (untick and save, tick again saves none, locked key and cursor, never sends a locked one, not-found-yet note, mysql and mssql, oracle/files/REST note, CDC none, `lockedColumns`), inactive columns (two reasons, none, unknown reason), overview (no-end tile, failed/paused/running problems).
+
+**Things the reviewer may want to look at.** (1) The Resume button sits in the Runs card, not in a banner above the tabs; the page's header pill still shows the pause. (2) Column choice needs discovery in the same visit to list columns; a saved table opened without "Find tables" shows only what is already left out. (3) The six-hour bound is mine; the plan named none.
+
 ## Review
 
 *(planner)*
