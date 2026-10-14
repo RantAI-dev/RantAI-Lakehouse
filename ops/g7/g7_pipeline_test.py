@@ -359,18 +359,22 @@ def ch_auth_settings() -> str:
 def step_verify_the_silver_rows_match_the_bronze_source() -> None:
     """BLD-3 / D7: the pipeline's rows, not just its reported count.
 
-    The Silver output must hold exactly `count(DISTINCT id)` rows of the
+    The Silver output must hold exactly one row per distinct `id` of the
     Bronze table -- what `dedupe(id)` means -- counted through ClickHouse
     on both sides. Bronze is Iceberg, so it is counted through this
     gate's own `DataLakeCatalog` database (`CATALOG_DB`), the same shape
     `ops/g3a/g3a_test.py` and the authored op use, each with its own
     database name.
 
-    Both counts carry `WHERE 1` on the Bronze side: an unqualified
-    `count()` over a merge-on-read Iceberg table is answered from
-    metadata and does not subtract equality deletes (R11, the
+    The Bronze query carries `WHERE 1`: an unqualified aggregate over a
+    merge-on-read Iceberg table is answered from metadata and does not
+    subtract equality deletes (R11, the
     `ops/lint/check_bare_iceberg_count.py` guard; the Silver side is a
-    plain MergeTree table, so its count needs no such guard).
+    plain MergeTree table, so its count needs no such guard). That guard
+    also scans prose, so this docstring and the failure messages below
+    deliberately spell the aggregate out instead of writing the SQL it
+    names beside `bronze.` -- the same reword-the-comment boundary the
+    guard's own docstring documents.
     """
     ch_query(
         f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
@@ -398,7 +402,7 @@ def step_verify_the_silver_rows_match_the_bronze_source() -> None:
     if silver_rows != bronze_rows:
         raise G7Failure(
             f"silver.{SILVER_TABLE_NAME} holds {silver_rows} rows, "
-            f"expected {bronze_rows} (count(DISTINCT id) of bronze.{BRONZE_TABLE_NAME})"
+            f"expected {bronze_rows} (one per distinct id of bronze.{BRONZE_TABLE_NAME})"
         )
     print(f"[g7] silver.{SILVER_TABLE_NAME} holds {silver_rows} rows = the {bronze_rows} distinct ids of bronze.{BRONZE_TABLE_NAME}")
 
