@@ -344,3 +344,12 @@ Stage 2 passed functionally: join with the suggested pair and a joined measure, 
 - `SHOULD-FIX` R16 — Legends with long series names ("max of mart_demo_province_capacity.rooms") use the same short label as R14 ("max of rooms") and truncate in the legend with the full name in the tooltip.
 
 After this round, the reviewer takes screenshots at the dialog's default size of: a bar with a joined measure chosen, a bar with a number dimension in bins, a line with a date dimension and a grain.
+
+### Chart builder, round 4 — owner's QA stages 3 and 4 (reviewer, 2026-10-15)
+
+Stages 3 and 4 passed functionally: parameters, reference line, column switch, one Save/Reset, a second question on the right axis; metrics page, a new metric (value 1177), a metric as a measure with its label, delete refused naming three charts and an alert rule, the metric choice in the alert rule form. Console only.
+
+- `BLOCKER` R17 — The chart-type menu opened from "Bar ▾" does not close on a click outside it or on Escape; the user must pick a type to close it. It must behave like every other menu (outside click and Escape close it, focus returns to the trigger). If the inline panel was chosen to avoid the dialog treating a portal click as an outside click, use the UI primitives' own popover inside the dialog (they handle nested layers) rather than a hand-made panel.
+- `BLOCKER` R18 — The owner asks whether the form/preview split can still be resized. The drag handle is drawn; confirm it drags in the reworked layout (pointer and keyboard), and that the form's new `minmax(0,1fr)` grids do not fight the panel sizes. If it does not work, fix it; either way say in the handoff what you verified.
+- `SHOULD-FIX` R19 — Remove the "Next" buttons from sections 1 and 2. Opening a section by its heading is enough; a filled section still folds when another opens.
+- `SHOULD-FIX` R20 — Small labels: the metric editor's Source select shows `mart:mart_demo_map_points` (show the source's name, with a small tag for SQL sources); a chart's default title uses the raw reference (`metric:coba_metrik by category`) instead of the label ("Coba metrik by category"); "Value now" prints 1177.0253164556962 (format with the console's number formatting); the dialog breadcrumb shows "New chart ›" with nothing after it (drop the chevron or show the kind).
