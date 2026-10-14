@@ -245,3 +245,16 @@ No per-item browser QA and no reviewer re-run of the suites (owner's instruction
 - Deviations 1 to 6 of the handoff: accepted as built.
 
 Not looked at by anyone: the steps editor, the rows panel, the builder as a whole.
+
+### Chart builder rework — product owner's QA of phase 2 (reviewer, 2026-10-14)
+
+The owner's first QA pass stopped at the builder: it shows every control of phase 2 at once and is hard to follow. The owner chose a layout of four ordered sections with the rarely used options folded away. The numbers the builder produced were right (two aggregations, top 5 with `Other` 1,106 as the average of the rest, a chart filter); what follows is layout and labelling. Console only; no change to a chart definition's shape or to any route.
+
+- `BLOCKER` R3 — Layout. Four sections in this order, each with a short heading: **1 Data** (source; "Join a table"; one "Custom fields (n)" menu button that lists the source's calculated fields, value groups and hierarchies and holds "New calculated field", "New value group", "New hierarchy" — no row of chips in the form), **2 What to show** (dimension or groupings, breakdown, measures), **3 Sort and filter** (sort, top N, the "Other" switch, filters), **4 More options**, folded by default (steps, reference lines, parameters, more questions, on click, table column settings). The fold opens by itself when the chart being edited uses anything inside it. Keep `previewKey` / `previewSpec` behaviour exactly.
+- `BLOCKER` R4 — One aggregation control per measure. Remove the chart-level "Aggregation (default)" select from the form; every measure row carries its own aggregation, a new row defaults to `sum` (or the column's natural default the code already uses). A chart saved with a chart-level aggregate opens with that aggregate shown on each of its measures and saves back equivalently.
+- `SHOULD-FIX` R5 — Show only what applies to the chosen kind and state: a section or control the kind cannot use is hidden, not shown with a warning (for example "More questions" with "Other" on: hide it and show the reason only as a one-line hint where the "Other" switch is). Where the server would refuse a combination, prevent it in the form.
+- `SHOULD-FIX` R6 — Switching the chart kind keeps what still fits: from a chart to a data table, the dimension (and breakdown) become the first groupings; from a table to a chart, the first grouping becomes the dimension.
+- `SHOULD-FIX` R7 — Measure labels always say what was computed: a measure whose effective aggregation is not the column's plain sum reads "avg of visitors" in the legend, axis, tooltip and table header, including when the aggregation came from a default (QA saw a second measure labelled "visitors" whose values were averages).
+- `SHOULD-FIX` R8 — Steps editor wording: columns of an earlier step read as plain labels ("total visitors", "average visitors"), not stacked names ("sum of avg of visitors"); a summarise step whose "Keep" list is empty because the chart has no groupings says so in one line and offers none.
+
+Verify with the headless browser on the dev console after rebuilding it (see the developer's brief): one screenshot of a new bar chart with nothing opened, one with "More options" open, one of a data table with two steps.
