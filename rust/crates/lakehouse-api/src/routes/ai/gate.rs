@@ -133,6 +133,11 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "delete_tab" => format!(
+            "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
+            s("tab"),
+            s("board")
+        ),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -288,6 +293,22 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("kind")
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "create_tab" => format!(
+            "Menambah tab \"{}\" pada dashboard {}.",
+            s("title"),
+            s("board")
+        ),
+        "rename_tab" => format!(
+            "Mengganti nama tab {} pada dashboard {} menjadi \"{}\".",
+            s("tab"),
+            s("board"),
+            s("title")
+        ),
+        "move_charts_to_tab" => format!(
+            "Memindahkan chart ke tab {} pada dashboard {}.",
+            s("tab"),
+            s("board")
+        ),
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),

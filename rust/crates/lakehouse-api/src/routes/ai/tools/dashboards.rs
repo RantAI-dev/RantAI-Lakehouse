@@ -98,7 +98,14 @@ pub(super) async fn list_boards(ch: &ChClient) -> Value {
     match store::list_boards(ch).await {
         Ok(boards) => {
             let mut out = vec![json!({ "id": "default", "name": "Main" })];
-            out.extend(boards.iter().map(|b| json!({ "id": b.id, "name": b.name })));
+            // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
+            out.extend(boards.iter().map(|b| {
+                let mut entry = json!({ "id": b.id, "name": b.name });
+                if let Some(tabs) = b.tabs.as_ref().filter(|t| !t.is_empty()) {
+                    entry["tabs"] = json!(tabs);
+                }
+                entry
+            }));
             json!({ "boards": out })
         }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),

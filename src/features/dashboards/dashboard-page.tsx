@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, SlidersHorizontal, Sparkles, Table2, Trash2 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -21,11 +21,14 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { summarizeFilters, summarizeParams, summarizeTiles } from "@/lib/page-context-summary";
+import { summarizeFilters, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
-import type { ChartClick, LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
+import {
+  TAB_PARAM, addTab, deleteTab, filtersOnTab, moveTab, moveTileToTab, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+} from "@/lib/dashboard-tabs";
+import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
@@ -44,6 +47,10 @@ import { ReportingProvider } from "./reporting-context";
 import { FilterBar } from "./filters/filter-bar";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
+import { LineDialog } from "./line-dialog";
+import { TabBar } from "./tab-bar";
+import { isSectionKind } from "./tile-card";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, type DrillTarget } from "./drill";
 import { DrillTrail, useTileDrills } from "./tile-drills";
@@ -64,6 +71,8 @@ type Payload = {
   filters: FilterDef[];
   /** The board's saved default, which `filters` is not while the address overrides it. */
   defaultFilters?: FilterDef[];
+  /** The tabs of the board and the phone layout; absent when it has none (BI-18 part C). */
+  tabs?: BoardTab[]; phoneLayout?: PhoneTile[];
   /** The board's saved auto-refresh in seconds; 0 when none (BI-18·B). */
   refreshSeconds?: number;
   /** The grain the board saved ("" when none), and the one this response used (BI-9). */
@@ -88,6 +97,8 @@ const NO_RESULTS: Record<string, Cell> = {};
 const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
 const NO_CONTROLS: ParamControl[] = [];
+const NO_TABS: BoardTab[] = [];
+const SECTION_TEXT_MAX = 120;
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
 function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
@@ -144,6 +155,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [error, setError] = React.useState<string | null>(null);
   const [edit, setEdit] = React.useState(false);
   const [layout, setLayout] = React.useState<LayoutMap>({});
+  // BI-18 part C: the phone layout as held here while an editor arranges it.
+  const [phone, setPhone] = React.useState<PhoneTile[] | undefined>(undefined);
+  const [phoneEdit, setPhoneEdit] = React.useState(false);
+  const [lineDialog, setLineDialog] = React.useState<
+    { mode: "add"; kind: "heading" | "section" } | { mode: "edit"; id: string; kind: string } | null
+  >(null);
   // Filters are temporary and live in the address (`?f=`); the board's saved
   // default applies while the address carries none. Nothing is written to the
   // board until an editor presses "Save as default".
@@ -191,7 +208,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // old board's response (slower: it runs the built-in tiles) used to land
   // last and paint its charts under the new dashboard's name.
   const loadSeq = React.useRef(0);
-  const load = React.useCallback(async () => {
+  const load = React.useCallback(async (): Promise<Payload | undefined> => {
     const seq = ++loadSeq.current;
     setLoading(true); setError(null);
     try {
@@ -205,13 +222,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (paramsAsked) q.set("params", paramsAsked);
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
-      if (seq !== loadSeq.current) return;
+      if (seq !== loadSeq.current) return undefined;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       // BI-11: a chart's parameter slots arrive as `{ param }` objects and are held as `{name}` text.
       setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
+      setPhone(json.phoneLayout);
+      return json;
     } catch (e) {
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
+      return undefined;
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
@@ -219,7 +239,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
-  React.useEffect(() => { setEdit(false); }, [board]);
+  React.useEffect(() => { setEdit(false); setPhoneEdit(false); }, [board]);
+  React.useEffect(() => { if (!edit) setPhoneEdit(false); }, [edit]);
   // `/dashboards` meneruskan ke board terakhir, jadi membukanya di sinilah
   // yang menentukan "terakhir" — bukan klik di daftar, karena kanvas juga
   // dicapai lewat switcher, tautan bersama dan Copilot.
@@ -232,7 +253,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Periodic refresh for presenting; pauses while the tab is hidden.
   const savedSec = listedInterval(data?.refreshSeconds);
   const autoSec = effectiveRefresh(data?.refreshSeconds, sessionSec);
-  useAutoRefresh(autoSec * 1000, load);
+  const reload = React.useCallback(async () => { await load(); }, [load]);
+  useAutoRefresh(autoSec * 1000, reload);
   // A different board starts from its own saved interval.
   React.useEffect(() => { setSessionSec(null); }, [board]);
   // Full screen: the page's own overlay is always applied; the browser's
@@ -433,10 +455,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Drill-down: the rows behind the clicked value (or behind a whole tile),
   // for the filters in force so the list agrees with the number clicked. A
   // built-in tile ignores dashboard filters, so its rows are not narrowed.
-  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean, extra: FilterDef[] = NO_FILTERS) => {
+  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean, extra: FilterDef[] = NO_FILTERS, tileId?: string) => {
     setDrill(null);
-    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...filters, ...extra], params: paramsQuery(data?.appliedParams ?? null) ?? undefined });
-  }, [filters, data?.appliedParams]);
+    // BI-18 part C: the list of a tile takes the filters the tile is given.
+    const given = tileId ? filtersOnTab(filters, tabOf(data?.tabs ?? NO_TABS, layout, tileId)) : filters;
+    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...given, ...extra], params: paramsQuery(data?.appliedParams ?? null) ?? undefined });
+  }, [filters, data?.appliedParams, data?.tabs, layout]);
 
   // No "jump to the newest user dashboard" from the built-in board here.
   // That effect dated from when `/dashboards` was this page; it now is the
@@ -518,6 +542,120 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const tileDrills = useTileDrills(charts, filters, !edit);
   const results = data?.results ?? NO_RESULTS;
 
+  // ── BI-18 part C: tabs, section tiles and the phone layout ────────────────
+  const tabs = data?.tabs ?? NO_TABS;
+  const selTab = selectedTab(tabs, searchParams.get(TAB_PARAM));
+  const chartIds = React.useMemo(() => charts.map((c) => c.id), [charts]);
+  const canWrite = hasPermission("dashboard:write");
+  const selectTab = React.useCallback((id: string) => {
+    const qs = withTabParam(window.location.search, tabs, id);
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname, tabs]);
+  async function putBoard(body: Record<string, unknown>) {
+    const res = await apiFetch("/api/dashboard/boards", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, ...body }),
+    });
+    if (!res.ok) {
+      const j = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(j?.error ?? "Could not save the dashboard");
+    }
+  }
+  // One write for the tabs, the tiles that name them and the ties of the saved
+  // filters, so the server never sees a tile on a tab that is gone.
+  const saveTabEdit = async (next: TabEdit) => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    try {
+      const body: Record<string, unknown> = { tabs: next.tabs, layout: next.layout };
+      if (JSON.stringify(next.filters) !== JSON.stringify(defaultFilters)) {
+        body.filters = normalizeFilters(next.filters);
+      }
+      await putBoard(body);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const currentEdit = (): TabEdit => ({ tabs, layout, filters: defaultFilters });
+  const tabEditing = canWrite && !isDefault && edit
+    ? {
+        onAdd: (title: string) => {
+          const next = addTab(currentEdit(), title);
+          if (!next) { notifyFailure("A dashboard has at most 20 tabs"); return; }
+          void saveTabEdit(next).then(() => selectTab(next.tabs[next.tabs.length - 1].id));
+        },
+        onRename: (id: string, title: string) => void saveTabEdit({ ...currentEdit(), tabs: renameTab(tabs, id, title) }),
+        onMove: (id: string, by: -1 | 1) => void saveTabEdit({ ...currentEdit(), tabs: moveTab(tabs, id, by) }),
+        onDelete: (id: string, moveTiles: boolean) => {
+          const next = deleteTab(currentEdit(), chartIds, id, moveTiles);
+          if ("error" in next) { notifyFailure(next.error); return; }
+          if (selTab === id && next.tabs.length > 0) selectTab(next.tabs[0].id);
+          void saveTabEdit(next);
+        },
+        tileCount: (id: string) => tilesOnTab(tabs, layout, chartIds, id).length,
+      }
+    : undefined;
+  // The phone layout: this tab's tiles replace their entries, other tabs' entries stay.
+  const phoneTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistPhone = (forTab: PhoneTile[]) => {
+    const mine = new Set(forTab.map((p) => p.id));
+    const onTab = new Set(tilesOnTab(tabs, layout, chartIds, selTab ?? "").concat(selTab ? [] : chartIds));
+    const next = [...forTab, ...(phone ?? []).filter((p) => !mine.has(p.id) && !onTab.has(p.id))];
+    setPhone(next);
+    if (phoneTimer.current) clearTimeout(phoneTimer.current);
+    phoneTimer.current = setTimeout(() => {
+      void putBoard({ phoneLayout: next }).catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    }, 600);
+  };
+  const resetPhone = async () => {
+    try { await putBoard({ phoneLayout: [] }); setPhone(undefined); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  // A heading, a rule or a section header, at the bottom of the tab being edited.
+  const addSectionTile = async (kind: "heading" | "divider" | "section", text: string) => {
+    try {
+      const res = await apiFetch("/api/dashboard/specs", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: kind === "divider" ? "Divider" : text, kind, board, span: 2, ...(kind === "divider" ? {} : { text }) }),
+      });
+      const j = (await res.json().catch(() => null)) as { chart?: { id: string }; error?: string } | null;
+      if (!res.ok || !j?.chart) throw new Error(j?.error ?? "Could not add the tile");
+      const onTab = tabs.length ? tilesOnTab(tabs, layout, chartIds, selTab ?? "") : chartIds;
+      const y = onTab.reduce((m, id) => Math.max(m, (layout[id]?.y ?? 0) + (layout[id]?.h ?? 0)), 0);
+      const box = { x: 0, y, w: 12, h: kind === "divider" ? 1 : 2, ...(selTab ? { tab: selTab } : {}) };
+      await putBoard({ layout: { ...layout, [j.chart.id]: box } });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const editSectionText = async (id: string, kind: string, text: string) => {
+    try {
+      const res = await apiFetch("/api/dashboard/specs", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, title: text, kind, text, board, span: 2 }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not change the text");
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  // A chart made while another tab is open lands on that tab, not on the first.
+  const loadAndPlace = async () => {
+    const known = new Set(chartIds);
+    const json = await load();
+    if (!json || !canWrite || tabs.length < 2 || !selTab || selTab === tabs[0].id) return;
+    const added = (json.charts ?? []).filter((c) => !known.has(c.id) && !(c.id in (json.layout ?? {})));
+    if (added.length === 0) return;
+    const onTab = tilesOnTab(tabs, json.layout ?? {}, (json.charts ?? []).map((c) => c.id), selTab);
+    let y = onTab.reduce((m, id) => Math.max(m, (json.layout?.[id]?.y ?? 0) + (json.layout?.[id]?.h ?? 0)), 0);
+    const next: LayoutMap = { ...(json.layout ?? {}) };
+    for (const c of added) { next[c.id] = { x: 0, y, w: c.span === 2 ? 12 : 6, h: 6, tab: selTab }; y += 6; }
+    try { await putBoard({ layout: next }); await load(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+
   // Tell Copilot what is on this dashboard — the built-in one included.
   const { setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded } = useCopilot();
   React.useEffect(() => {
@@ -543,12 +681,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
         `Active filters: ${summarizeFilters(filters)}. ` +
         `Parameters shown (a formula reads one as {name}; list_parameters has them all): ${summarizeParams(paramControls)}. ` +
+        `Tabs: ${summarizeTabs(tabs, (id) => tabOf(tabs, layout, id), chartIds, selTab)}. ` +
         `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, kpis, results, filters, paramControls, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, paramControls, tabs, layout, chartIds, selTab, setPageContext]);
 
   // Carry out a chart's saved click destination (BI-18·B) for the clicked
   // value. The server did not check that the target exists, so the console
@@ -632,7 +771,26 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   }
 
   // Build the tiles for the grid.
+  // "Move to <tab>" for a tile, in edit mode of a dashboard with several tabs.
+  const moveItems = (id: string): TileMenuItem[] => {
+    if (!edit || !canWrite || tabs.length < 2) return [];
+    const here = tabOf(tabs, layout, id);
+    return tabs.filter((t) => t.id !== here).map((t, i) => ({
+      label: `Move to ${t.title}`, icon: <ArrowRightLeft />, separatorBefore: i === 0,
+      onSelect: () => persistLayout(moveTileToTab(tabs, layout, chartIds, id, t.id)),
+    }));
+  };
   const items: GridItem[] = charts.map((spec) => {
+    if (isSectionKind(spec.kind)) {
+      return {
+        id: spec.id, kind: spec.kind, span: spec.span, title: spec.title, body: null,
+        menu: edit && canWrite ? [
+          ...(spec.kind !== "divider" ? [{ label: "Edit text", icon: <Pencil />, onSelect: () => setLineDialog({ mode: "edit", id: spec.id, kind: spec.kind }) }] : []),
+          ...moveItems(spec.id),
+          { label: "Delete", icon: <Trash2 />, destructive: true, separatorBefore: true, onSelect: () => setRemoving({ id: spec.id, title: spec.title }) },
+        ] : undefined,
+      };
+    }
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
     const drilled = tileDrills.drills[spec.id];
@@ -649,7 +807,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : []),
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
       ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
-        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin") }]
+        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin", NO_FILTERS, spec.id) }]
         : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
@@ -666,6 +824,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...(own && spec.def
         ? [{ label: "Edit chart", icon: <Pencil />, separatorBefore: true, onSelect: () => setEditing({ id: spec.id, def: spec.def as ChartDef }) }]
         : []),
+      ...moveItems(spec.id),
       ...(own
         ? [{ label: "Delete chart", icon: <Trash2 />, destructive: true, separatorBefore: !spec.def, onSelect: () => setRemoving({ id: spec.id, title: spec.title }) }]
         : []),
@@ -721,7 +880,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           </div>
         </div>
       ) : (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
+        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters: filtersOnTab(filters, tabOf(tabs, layout, spec.id)) }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };
@@ -812,6 +971,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             onChange={applyFilters}
             dirty={rowDirty}
             canSaveDefault={!isDefault && hasPermission("dashboard:write")}
+            tabs={tabs}
             saving={savingDefault}
             onSaveDefault={() => void saveRowDefault()}
             onReset={resetRow}
@@ -869,15 +1029,60 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : (
         <>
           {edit ? (
-            <div className="flex items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
               <Move className="size-3.5 text-primary" />
-              Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Saved automatically.
+              <span className="min-w-0 flex-1">
+                {phoneEdit
+                  ? <>Phone layout: <span className="font-medium text-foreground">move tiles up or down</span> and change their height. Saved automatically.</>
+                  : <>Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Saved automatically.</>}
+              </span>
+              {canWrite && !isDefault && !phoneEdit ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}><Plus className="size-3.5" /> Add</DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-40">
+                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "heading" })}><Heading className="size-4" /> Heading</DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "section" })}><Rows3 className="size-4" /> Section</DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => void addSectionTile("divider", "")}><Minus className="size-4" /> Divider</DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              ) : null}
+              {canWrite ? (
+                <Button variant={phoneEdit ? "default" : "outline"} size="sm" aria-pressed={phoneEdit} onClick={() => setPhoneEdit((v) => !v)}>
+                  <Smartphone className="size-3.5" /> {phoneEdit ? "Done with phone layout" : "Edit phone layout"}
+                </Button>
+              ) : null}
+              {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
             </div>
           ) : null}
-          <DashboardGrid items={items} layout={layout} editable={edit} onLayoutChange={persistLayout} />
+          <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
+          <DashboardGrid
+            items={items} layout={layout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
+            tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
+            foldKey={board}
+          />
+          {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
+            <p className="text-center text-sm text-muted-foreground">
+              {edit ? "No tiles on this tab. Use “Move to” in a tile's menu on another tab." : "No tiles on this tab."}
+            </p>
+          ) : null}
         </>
       )}
 
+      {lineDialog ? (
+        <LineDialog
+          title={lineDialog.mode === "add" ? (lineDialog.kind === "section" ? "New section" : "New heading") : "Edit text"}
+          initial={lineDialog.mode === "edit" ? (charts.find((c) => c.id === lineDialog.id)?.text ?? charts.find((c) => c.id === lineDialog.id)?.title ?? "") : ""}
+          confirm={lineDialog.mode === "add" ? "Add" : "Save"}
+          label="Heading text"
+          maxLength={SECTION_TEXT_MAX}
+          onClose={() => setLineDialog(null)}
+          onSave={(text) => {
+            const d = lineDialog;
+            setLineDialog(null);
+            if (d.mode === "add") void addSectionTile(d.kind, text); else void editSectionText(d.id, d.kind, text);
+          }}
+        />
+      ) : null}
       <ConfirmActionDialog
         open={removing !== null}
         onOpenChange={(o) => { if (!o) setRemoving(null); }}
@@ -907,7 +1112,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {newChartOpen ? (
         <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
           board={board} boards={boards} paramValues={data?.appliedParams}
-          onSaved={() => { setNewChartOpen(false); void load(); }} />
+          onSaved={() => { setNewChartOpen(false); void loadAndPlace(); }} />
       ) : null}
 
       {drill ? (
@@ -922,7 +1127,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
           drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}

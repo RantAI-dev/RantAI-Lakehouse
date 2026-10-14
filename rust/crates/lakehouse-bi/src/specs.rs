@@ -73,6 +73,29 @@ pub enum ChartKind {
     Pivot,
     /// Free-text markdown tile (no SQL).
     Text,
+    /// A one-line heading between tiles (`BI-18` part C; no SQL).
+    Heading,
+    /// A rule between tiles (`BI-18` part C; no SQL, no text).
+    Divider,
+    /// A heading that folds the tiles below it, up to the next section
+    /// header on the same tab (`BI-18` part C; no SQL).
+    Section,
+}
+
+impl ChartKind {
+    /// Whether the tile carries no data: it never has a statement, reads no
+    /// relation and takes no filter, so every path that builds or runs one
+    /// skips it. `text` was the only such kind before `BI-18` part C; the
+    /// section kinds (`heading`, `divider`, `section`) join it, and a check
+    /// on this method replaces the old `== ChartKind::Text` so a new static
+    /// kind cannot reach a statement builder by being left out of one.
+    #[must_use]
+    pub fn is_static(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Heading | Self::Divider | Self::Section
+        )
+    }
 }
 
 /// Numeric display format for a chart or KPI value.

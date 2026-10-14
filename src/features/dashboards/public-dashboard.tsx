@@ -8,13 +8,18 @@ import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import { selectedTab } from "@/lib/dashboard-tabs";
+import type { BoardTab, LayoutMap, PhoneTile } from "@/services/clients/bi-store";
+import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   board: { id: string; name: string };
   layout: LayoutMap;
+  /** BI-18 part C: only when the board has them. */
+  tabs?: BoardTab[];
+  phoneLayout?: PhoneTile[];
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
   /** The zone and first weekday the buckets were cut with (BI-9). */
@@ -33,6 +38,7 @@ export function PublicDashboard({ token }: { token: string }) {
   React.useEffect(() => setMounted(true), []);
   const dark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
+  const [tabId, setTabId] = React.useState<string | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
 
   React.useEffect(() => {
@@ -73,7 +79,9 @@ export function PublicDashboard({ token }: { token: string }) {
     );
   }
 
+  const tab = selectedTab(data?.tabs ?? [], tabId);
   const items: GridItem[] = (data?.charts ?? []).map((spec) => ({
+    kind: spec.kind,
     id: spec.id,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
@@ -114,7 +122,11 @@ export function PublicDashboard({ token }: { token: string }) {
         ) : items.length === 0 ? (
           <Centered><p className="text-sm text-muted-foreground">This dashboard has no charts yet.</p></Centered>
         ) : (
-          <DashboardGrid items={items} layout={data?.layout ?? {}} editable={false} onLayoutChange={() => {}} />
+          <>
+          <TabBar tabs={data?.tabs ?? []} selected={tab} onSelect={setTabId} />
+          <DashboardGrid items={items} layout={data?.layout ?? {}} editable={false} onLayoutChange={() => {}}
+            tabs={data?.tabs} tab={tab} phone={data?.phoneLayout} foldKey={data?.board.id} />
+        </>
         )}
       </main>
 

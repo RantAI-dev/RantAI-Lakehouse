@@ -429,16 +429,10 @@ fn embed_rendered(original: &StoredChartSpec, effective: &StoredChartSpec) -> Va
 
 /// The board's tile layout as the payload carries it.
 fn layout_json(board: &Board) -> Value {
-    board.layout.as_ref().map_or_else(
-        || json!({}),
-        |l| {
-            let mut m = serde_json::Map::new();
-            for (k, b) in l {
-                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-            }
-            Value::Object(m)
-        },
-    )
+    board
+        .layout
+        .as_ref()
+        .map_or_else(|| json!({}), crate::routes::dashboard::layout_to_json)
 }
 
 /// The calculated fields of every source.
@@ -498,6 +492,52 @@ async fn board_columns(
         });
     }
     Ok(std::collections::HashMap::new())
+}
+
+/// The filters the tile of `chart_id` is given (`BI-18` part C): the tabs and
+/// the layout choose, as on the dashboard. The locked embed `params` have no
+/// tie and so apply on every tab.
+fn tile_filters<'a>(
+    board: &Board,
+    filters: &'a [FilterDef],
+    chart_id: &str,
+) -> std::borrow::Cow<'a, [FilterDef]> {
+    let no_tiles = lakehouse_bi::store::LayoutMap::new();
+    lakehouse_bi::layout::filters_for_chart(
+        filters,
+        board.tabs.as_deref().unwrap_or_default(),
+        board.layout.as_ref().unwrap_or(&no_tiles),
+        chart_id,
+    )
+}
+
+/// The `{ board, layout, charts, results }` payload of an embed or a public
+/// link, with the board's tabs and phone layout when it has them (`BI-18` part
+/// C; left off otherwise so an older board's payload is unchanged).
+fn board_body(
+    board: &Board,
+    charts: &[Value],
+    results: &serde_json::Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Value {
+    let mut body = json!({
+        "board": { "id": board.id, "name": board.name },
+        "layout": layout_json(board),
+        "charts": charts,
+        "results": results,
+        // BI-9: the zone and first day the buckets were cut with, so the
+        // page labels them the same way.
+        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
+    });
+    if let Some(map) = body.as_object_mut() {
+        if let Some(tabs) = board.tabs.as_ref().filter(|t| !t.is_empty()) {
+            map.insert("tabs".to_owned(), json!(tabs));
+        }
+        if let Some(phone) = board.phone_layout.as_ref().filter(|p| !p.is_empty()) {
+            map.insert("phoneLayout".to_owned(), json!(phone));
+        }
+    }
+    body
 }
 
 /// Shared `{ board, layout, charts, results }` assembly for both
@@ -567,6 +607,7 @@ async fn render_board_payload(
         read: &read,
     };
     for original in &stored_for_board {
+        let tile_filters = tile_filters(board, filters, &original.spec.id);
         let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
         let c = match &effective {
             Ok(e) => &**e,
@@ -576,7 +617,7 @@ async fn render_board_payload(
                 continue;
             }
         };
-        match stored_chart_sql(c, &[], filters, &cols, &sources, &read) {
+        match stored_chart_sql(c, &[], &tile_filters, &cols, &sources, &read) {
             Ok(filtered) => {
                 let (id, mut val) = run_spec_sql(
                     ch,
@@ -598,7 +639,11 @@ async fn render_board_payload(
                     (&roles, &placeholders, obligations),
                 )
                 .await;
-                crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain)
+                let tile_ctx = crate::routes::layers::LayerContext {
+                    filters: &tile_filters,
+                    ..layer_ctx
+                };
+                crate::routes::layers::annotate_layers(&tile_ctx, &mut val, c, filtered.grain)
                     .await;
                 annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
                 results.insert(id, val);
@@ -611,17 +656,7 @@ async fn render_board_payload(
         charts_out.push(embed_rendered(original, c));
     }
 
-    let layout = layout_json(board);
-
-    Ok(json!({
-        "board": { "id": board.id, "name": board.name },
-        "layout": layout,
-        "charts": charts_out,
-        "results": results,
-        // BI-9: the zone and first day the buckets were cut with, so the
-        // page labels them the same way.
-        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
-    }))
+    Ok(board_body(board, &charts_out, &results, time))
 }
 
 #[cfg(test)]
@@ -741,6 +776,8 @@ mod typed_filters {
             refresh_seconds: None,
             grain: None,
             params: None,
+            tabs: None,
+            phone_layout: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -782,6 +819,136 @@ mod typed_filters {
         assert!(
             tile.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub') > 0"),
             "{tile}"
+        );
+    }
+
+    /// Two charts, `c1` on `mart_a` and `c2` on `mart_b`, both with `kab` and
+    /// `visitors`; every other statement succeeds with no rows.
+    async fn mount_two_marts(server: &MockServer) {
+        let row = |id: &str, mart: &str| {
+            let spec = json!({
+                "id": id, "title": id, "kind": "bar", "mart": mart,
+                "sql": "SELECT 1", "x": "kab", "y": "visitors"
+            });
+            let def = json!({
+                "title": id, "mart": mart, "kind": "bar",
+                "dimension": "kab", "measures": ["visitors"]
+            });
+            json!({
+                "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })
+        };
+        answer(
+            server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            vec![row("c1", "mart_a"), row("c2", "mart_b")],
+        )
+        .await;
+        let mut cols = Vec::new();
+        for table in ["mart_a", "mart_b"] {
+            cols.push(json!({ "table": table, "name": "kab", "type": "String" }));
+            cols.push(json!({ "table": table, "name": "visitors", "type": "UInt32" }));
+        }
+        answer(
+            server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// BI-18 part C: on an embed or a public link a filter tied to one tab is
+    /// not given to the tiles of the other, and the payload carries the tabs,
+    /// the tile tabs and the phone layout.
+    #[tokio::test]
+    async fn a_tied_filter_and_the_tabs_reach_a_public_link() {
+        let server = MockServer::start().await;
+        mount_two_marts(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let filters: Vec<FilterDef> = serde_json::from_str(
+            r#"[{"column":"kab","op":"contains","text":"ub","tabs":["t_a"]}]"#,
+        )
+        .unwrap();
+        let layout: lakehouse_bi::store::LayoutMap = serde_json::from_value(json!({
+            "c1": { "x": 0, "y": 0, "w": 6, "h": 4, "tab": "t_a" },
+            "c2": { "x": 0, "y": 0, "w": 6, "h": 4, "tab": "t_b" },
+        }))
+        .unwrap();
+        let tabs = vec![
+            lakehouse_bi::layout::Tab {
+                id: "t_a".to_owned(),
+                title: "A".to_owned(),
+            },
+            lakehouse_bi::layout::Tab {
+                id: "t_b".to_owned(),
+                title: "B".to_owned(),
+            },
+        ];
+        let board = Board {
+            id: "b1".to_owned(),
+            name: "B".to_owned(),
+            description: None,
+            created_by: None,
+            layout: Some(layout),
+            filters: Some(filters.clone()),
+            refresh_seconds: None,
+            grain: None,
+            params: None,
+            tabs: Some(tabs),
+            phone_layout: Some(vec![lakehouse_bi::layout::PhoneTile {
+                id: "c2".to_owned(),
+                h: 5,
+            }]),
+            created_at: None,
+            updated_at: None,
+            public_token: None,
+            embed_enabled: None,
+            folder_id: None,
+            embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
+        };
+        let body = render_board_payload(
+            &ch,
+            &PolicyEngineObligations::new(None, &ch),
+            &board,
+            "b1",
+            &filters,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["tabs"][1]["id"], "t_b");
+        assert_eq!(body["phoneLayout"][0], json!({ "id": "c2", "h": 5 }));
+        assert_eq!(body["layout"]["c2"]["tab"], "t_b");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let on_a = sent
+            .iter()
+            .find(|s| s.contains("FROM serving.mart_a WHERE"))
+            .unwrap();
+        assert!(
+            on_a.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub')"),
+            "{on_a}"
+        );
+        // c2 is on t_b: the filter tied to t_a is not given, so it runs its stored SQL.
+        assert!(
+            sent.iter()
+                .all(|s| !s.contains("FROM serving.mart_b WHERE")),
+            "{sent:?}"
         );
     }
 
@@ -838,6 +1005,8 @@ mod typed_filters {
             refresh_seconds: None,
             grain: None,
             params: None,
+            tabs: None,
+            phone_layout: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -930,6 +1099,8 @@ mod typed_filters {
             refresh_seconds: None,
             grain: Some("month".to_owned()),
             params: None,
+            tabs: None,
+            phone_layout: None,
             created_at: None,
             updated_at: None,
             public_token: None,

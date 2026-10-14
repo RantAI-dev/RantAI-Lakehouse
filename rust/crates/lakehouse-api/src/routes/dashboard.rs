@@ -236,6 +236,9 @@ async fn get_body(
         .find(|b| b.id == board)
         .or(default_row.as_ref());
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
+    // BI-18 part C: the tabs decide which filters each tile is given.
+    let tabs: Vec<lakehouse_bi::layout::Tab> =
+        board_obj.and_then(|b| b.tabs.clone()).unwrap_or_default();
     let filters = param_filters
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
@@ -348,7 +351,15 @@ async fn get_body(
             }
         };
         let c = &*c;
-        let filtered = match stored_chart_sql(c, &years, &filters, &cols, &sources, &read) {
+        // BI-18 part C: a filter tied to other tabs is not given to this tile,
+        // and so is not reported as skipped on it either.
+        let tile_filters =
+            lakehouse_bi::layout::filters_for_chart(&filters, &tabs, &layout, &c.spec.id);
+        let tile_layer_ctx = crate::routes::layers::LayerContext {
+            filters: &tile_filters,
+            ..layer_ctx
+        };
+        let filtered = match stored_chart_sql(c, &years, &tile_filters, &cols, &sources, &read) {
             Ok(filtered) => filtered,
             Err(msg) => {
                 results.insert(c.spec.id.clone(), json!({ "error": msg }));
@@ -374,7 +385,7 @@ async fn get_body(
             (roles, placeholders, obligations),
         )
         .await;
-        crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain).await;
+        crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain).await;
         crate::routes::support::annotate_metric_labels(
             &mut val,
             c,
@@ -454,7 +465,7 @@ async fn get_body(
         charts_out.push(rendered);
     }
 
-    Ok(json!({
+    let mut body = json!({
         "board": board,
         "years": years,
         "layout": layout_to_json(&layout),
@@ -487,7 +498,21 @@ async fn get_body(
         "charts": charts_out,
         "results": results,
         "storeError": store_error,
-    }))
+    });
+    // BI-18 part C: left off when there are none, so the payload of a board
+    // saved before tabs and phone layouts is the one it always was.
+    if let Some(map) = body.as_object_mut() {
+        if !tabs.is_empty() {
+            map.insert("tabs".to_owned(), json!(tabs));
+        }
+        if let Some(phone) = board_obj
+            .and_then(|b| b.phone_layout.as_ref())
+            .filter(|p| !p.is_empty())
+        {
+            map.insert("phoneLayout".to_owned(), json!(phone));
+        }
+    }
+    Ok(body)
 }
 
 /// Parse the `filters` query parameter. Absent or blank means "use the
@@ -521,7 +546,7 @@ fn filter_fields(
 ) -> Vec<Value> {
     let mut by_column: BTreeMap<String, (ColumnKind, usize)> = BTreeMap::new();
     for c in charts {
-        if c.spec.kind == ChartKind::Text {
+        if c.spec.kind.is_static() {
             continue;
         }
         let source_cols;
@@ -576,12 +601,11 @@ fn filter_fields(
         .collect()
 }
 
-fn layout_to_json(layout: &LayoutMap) -> Value {
-    let mut m = Map::new();
-    for (k, b) in layout {
-        m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-    }
-    Value::Object(m)
+/// The layout as the payload carries it: `{ chartId: { x, y, w, h, tab? } }`,
+/// `tab` only on a tile that names one (`BI-18` part C). Shared with the embed
+/// and public payloads so the three agree.
+pub(crate) fn layout_to_json(layout: &LayoutMap) -> Value {
+    serde_json::to_value(layout).unwrap_or_else(|_| json!({}))
 }
 
 // ── /api/dashboard/specs ────────────────────────────────────────────────
@@ -1018,6 +1042,15 @@ struct BoardEditBody {
     /// empty list shows none.
     #[serde(default)]
     params: Option<Vec<lakehouse_bi::params::BoardParam>>,
+    /// The tabs of the board (`BI-18` part C); an empty list removes them. The
+    /// tiles in `layout` and the ties in `filters` that the same save (or the
+    /// stored board) holds must name only tabs in this list.
+    #[serde(default)]
+    tabs: Option<Vec<lakehouse_bi::layout::Tab>>,
+    /// The order and heights of the tiles below 640 px (`BI-18` part C); an
+    /// empty list goes back to the computed stacking.
+    #[serde(default, rename = "phoneLayout")]
+    phone_layout: Option<Vec<lakehouse_bi::layout::PhoneTile>>,
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -1034,6 +1067,10 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 && body.embed_revoke_all.is_none()
                 && body.embed_origins.is_none()
                 && body.folder_id.is_none()
+                // BI-18 part C: the built-in board is one page; duplicate it
+                // for a copy that can have tabs. Its phone layout is a
+                // layout, so it is accepted.
+                && body.tabs.is_none()
         }
         Some(_) => true,
     }
@@ -1053,6 +1090,82 @@ fn checked_refresh(raw: Option<i64>) -> Result<Option<u32>, ApiError> {
     let seconds = u32::try_from(raw).unwrap_or(u32::MAX);
     lakehouse_bi::click::validate_refresh_seconds(seconds).map_err(ApiError::BadRequest)?;
     Ok(Some(seconds))
+}
+
+/// The tab rules of a board edit (`BI-18` part C), checked before the first
+/// write so a save that would leave a tile on a missing tab, or a filter tied
+/// to one, changes nothing. The tabs, tiles and filters it judges are the
+/// body's where it sends them and the stored board's where it does not, so a
+/// body that only deletes a tab is checked against the tiles and filters
+/// already saved.
+///
+/// # Errors
+///
+/// 400 with our sentence for tabs that are not valid, a tile on a tab that does
+/// not exist, or a filter tied to one; a classified error when the board
+/// cannot be read.
+async fn check_tab_rules(ch: &ChClient, id: &str, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        lakehouse_bi::layout::validate_tabs(tabs).map_err(ApiError::BadRequest)?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        lakehouse_bi::layout::validate_phone_layout(phone).map_err(ApiError::BadRequest)?;
+    }
+    let ties = |filters: &[FilterDef]| {
+        filters
+            .iter()
+            .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    };
+    let layout_names_tab = parsed
+        .layout
+        .as_ref()
+        .is_some_and(|l| l.values().any(|t| t.tab.is_some()));
+    let filters_tie = parsed.filters.as_deref().is_some_and(ties);
+    // A save that touches no tab, tile tab or tie needs no other row.
+    if parsed.tabs.is_none() && !layout_names_tab && !filters_tie {
+        return Ok(());
+    }
+    let stored = store::get_board(ch, id)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let tabs = match (&parsed.tabs, &stored) {
+        (Some(tabs), _) => tabs.clone(),
+        (None, Some(board)) => board.tabs.clone().unwrap_or_default(),
+        (None, None) => Vec::new(),
+    };
+    let stored_layout = stored.as_ref().and_then(|b| b.layout.as_ref());
+    let layout = parsed.layout.as_ref().or(stored_layout);
+    if let Some(layout) = layout {
+        lakehouse_bi::layout::check_layout_tabs(layout, &tabs).map_err(ApiError::BadRequest)?;
+    }
+    let stored_filters = stored.as_ref().and_then(|b| b.filters.as_deref());
+    let filters = parsed
+        .filters
+        .as_deref()
+        .or(stored_filters)
+        .unwrap_or_default();
+    lakehouse_bi::layout::check_filter_ties(filters, &tabs).map_err(ApiError::BadRequest)?;
+    Ok(())
+}
+
+/// The tabs and the phone layout of a board edit (`BI-18` part C), both
+/// already checked by [`check_tab_rules`].
+async fn save_tabs_and_phone_layout(
+    ch: &ChClient,
+    id: &str,
+    parsed: &BoardEditBody,
+) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        store::update_board_tabs(ch, id, tabs)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        store::update_board_phone_layout(ch, id, phone)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    Ok(())
 }
 
 /// The `SEC-12` part of [`boards_update`]: withdraw every embed token of the
@@ -1147,6 +1260,7 @@ pub async fn boards_update(
     if let Some(filters) = &parsed.filters {
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
+    check_tab_rules(ch, &id, &parsed).await?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
@@ -1182,6 +1296,7 @@ pub async fn boards_update(
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     save_grain_and_params(ch, &id, parsed.grain.as_deref(), checked_params.as_deref()).await?;
+    save_tabs_and_phone_layout(ch, &id, &parsed).await?;
     if let Some(filters) = &parsed.filters {
         // BI-18 review round 1: a save cleans the row of filters that filter
         // nothing. Not rejected (an older console still sends them) and not
@@ -1930,15 +2045,55 @@ async fn with_calculated_columns(
     })
 }
 
+/// `filters` narrowed to the ones the tile of `chart` is given (`BI-18` part
+/// C): a records list, an export or a drill of a tile on one tab must not take
+/// a filter tied to another, as the tile itself does not.
+///
+/// Nothing is read when no filter is tied to a tab. A board that cannot be
+/// read leaves every filter on: the result can only be narrower than the tile,
+/// never wider, and the failure is logged under a reference.
+pub(crate) async fn filters_for_chart_tab(
+    ch: &ChClient,
+    chart: &StoredChartSpec,
+    filters: Vec<FilterDef>,
+) -> Vec<FilterDef> {
+    if !filters
+        .iter()
+        .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    {
+        return filters;
+    }
+    let board = match store::get_board(ch, &chart.board).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return filters,
+        Err(err) => {
+            let _ = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            return filters;
+        }
+    };
+    lakehouse_bi::layout::filters_for_chart(
+        &filters,
+        board.tabs.as_deref().unwrap_or_default(),
+        &board.layout.unwrap_or_default(),
+        &chart.spec.id,
+    )
+    .into_owned()
+}
+
 /// The own filters of the tile `q.chart` names (`BI-6`), or none when it names
 /// no tile. The tile must read the relation the query names: its filters mean
 /// nothing over another one.
 async fn chart_own_filters(
     ch: &ChClient,
     q: &RecordsQuery,
-) -> Result<(Vec<FilterDef>, Vec<lakehouse_bi::joins::JoinSpec>), ApiError> {
+    dashboard_filters: Vec<FilterDef>,
+) -> Result<TileFilters, ApiError> {
     let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(TileFilters {
+            own: Vec::new(),
+            joins: Vec::new(),
+            dashboard: dashboard_filters,
+        });
     };
     let stored = store::list_stored_charts(ch)
         .await
@@ -1985,7 +2140,21 @@ async fn chart_own_filters(
     // BI-2: a segment in the tile's filters is its filters here too, so the
     // records behind a mark are the rows the mark was drawn from.
     let own = expand_tile_segments(ch, own, sql_source, mart).await?;
-    Ok((own, joins))
+    // BI-18 part C: only the dashboard filters the tile itself is given.
+    let dashboard = filters_for_chart_tab(ch, chart, dashboard_filters).await;
+    Ok(TileFilters {
+        own,
+        joins,
+        dashboard,
+    })
+}
+
+/// What [`chart_own_filters`] found for a tile: its own filters and joins, and
+/// the dashboard filters it is given.
+struct TileFilters {
+    own: Vec<FilterDef>,
+    joins: Vec<lakehouse_bi::joins::JoinSpec>,
+    dashboard: Vec<FilterDef>,
 }
 
 /// `filters` with each `{ "segment": … }` replaced by the segment's filters,
@@ -2160,7 +2329,11 @@ async fn records_for_roles(
     .clamp(1, RECORDS_PAGE_MAX);
     let offset = records_number(q.offset.as_deref(), "offset", 0)?;
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    let (own, joins) = chart_own_filters(ch, &q).await?;
+    let TileFilters {
+        own,
+        joins,
+        dashboard: dashboard_filters,
+    } = chart_own_filters(ch, &q, dashboard_filters).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -2554,6 +2727,8 @@ pub async fn table_export(
         .into());
     }
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    // BI-18 part C: a filter tied to another tab is not in this tile's file.
+    let dashboard_filters = filters_for_chart_tab(ch, chart, dashboard_filters).await;
     let time = crate::routes::settings::time_context(&state).await?;
     let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
     let time = time.with_params(loaded.values);
@@ -2769,7 +2944,7 @@ async fn board_value_selects(
     let on_board: Vec<&StoredChartSpec> = charts
         .iter()
         .filter(|c| board == "all" || c.board == board)
-        .filter(|c| c.spec.kind != ChartKind::Text)
+        .filter(|c| !c.spec.kind.is_static())
         .collect();
     let mart_cols = mart_columns(ch)
         .await
@@ -2954,6 +3129,17 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
             b.layout.as_ref(),
             b.params.as_deref(),
         ));
+        // BI-18 part C: a board's tabs, after its other keys.
+        if let Some(tabs) = b.tabs.as_deref().filter(|t| !t.is_empty()) {
+            let rendered = tabs
+                .iter()
+                .map(|t| serde_json::to_string(t).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str("    tabs: [");
+            out.push_str(&rendered);
+            out.push_str("]\n");
+        }
     }
     out.push('\n');
     out.push_str("charts:\n");
@@ -3025,8 +3211,14 @@ fn yaml_board(
     {
         lines.push("    layout:".to_owned());
         for (cid, bx) in layout {
+            // BI-18 part C: the tab only when the tile names one, so the
+            // line of a board saved before tabs is unchanged.
+            let tab = bx
+                .tab
+                .as_deref()
+                .map_or_else(String::new, |t| format!(", tab: {}", yaml_value(&json!(t))));
             lines.push(format!(
-                "      {cid}: {{ x: {}, y: {}, w: {}, h: {} }}",
+                "      {cid}: {{ x: {}, y: {}, w: {}, h: {}{tab} }}",
                 bx.x, bx.y, bx.w, bx.h
             ));
         }
@@ -3681,11 +3873,24 @@ mod tests {
                 y: 0,
                 w: 3,
                 h: 5,
+                tab: None,
+            },
+        );
+        layout.insert(
+            "c2".to_owned(),
+            store::TileBox {
+                x: 3,
+                y: 0,
+                w: 3,
+                h: 5,
+                tab: Some("t_maps".to_owned()),
             },
         );
         let out = yaml_board("b1", "Board 1", Some(&layout), None);
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+        // BI-18 part C: the tab only on a tile that names one.
+        assert!(out.contains("      c2: { x: 3, y: 0, w: 3, h: 5, tab: t_maps }"));
     }
 }
 
@@ -4258,7 +4463,12 @@ mod typed_filters {
     use crate::policy_engine::PolicyEngineObligations;
     use crate::sql_rewrite::PlaceholderValues;
 
-    async fn answer(server: &MockServer, statement_has: &str, meta: &[&str], data: Vec<Value>) {
+    pub(super) async fn answer(
+        server: &MockServer,
+        statement_has: &str,
+        meta: &[&str],
+        data: Vec<Value>,
+    ) {
         let meta: Vec<Value> = meta
             .iter()
             .map(|n| json!({ "name": n, "type": "String" }))
@@ -4275,7 +4485,7 @@ mod typed_filters {
     }
 
     /// Anything not matched above (DDL, tile queries): success, no rows.
-    async fn answer_rest(server: &MockServer) {
+    pub(super) async fn answer_rest(server: &MockServer) {
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4285,7 +4495,7 @@ mod typed_filters {
             .await;
     }
 
-    async fn statements(server: &MockServer) -> Vec<String> {
+    pub(super) async fn statements(server: &MockServer) -> Vec<String> {
         server
             .received_requests()
             .await
@@ -4295,7 +4505,7 @@ mod typed_filters {
             .collect()
     }
 
-    fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
+    pub(super) fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
         let mut spec = json!({
             "id": id, "title": id, "kind": "bar", "mart": mart,
             "sql": "SELECT 1", "x": "kab", "y": "visitors"
@@ -4314,13 +4524,13 @@ mod typed_filters {
         })
     }
 
-    fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
+    pub(super) fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
         cols.iter()
             .map(|(name, ty)| json!({ "table": table, "name": name, "type": ty }))
             .collect()
     }
 
-    fn client(server: &MockServer) -> ChClient {
+    pub(super) fn client(server: &MockServer) -> ChClient {
         ChClient::new(server.uri(), "default".to_owned(), String::new())
     }
 
@@ -6092,3 +6302,9 @@ mod bin_rewrite;
 #[cfg(test)]
 #[path = "param_rewrite.rs"]
 mod param_rewrite;
+
+// BI-18 part C: tabs, tab ties and section tiles on the dashboard routes; see
+// `chart_shapes_rewrite` above. It uses the helpers of `typed_filters`.
+#[cfg(test)]
+#[path = "layout_tabs.rs"]
+mod layout_tabs;

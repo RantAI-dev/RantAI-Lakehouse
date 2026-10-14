@@ -1,0 +1,145 @@
+import { strict as assert } from "node:assert"
+import { test } from "node:test"
+import type { BoardTab, FilterDef, LayoutMap } from "@/services/clients/bi-store"
+import {
+  addTab, appliesOnTab, collapseLayout, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab,
+  phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
+} from "./dashboard-tabs"
+import { decodeFilters, encodeFilters, normalizeFilters } from "./dashboard-filter-state"
+
+const A: BoardTab = { id: "t_a", title: "Overview" }
+const B: BoardTab = { id: "t_b", title: "Maps" }
+const f = (column: string, tabs?: string[]): FilterDef => ({ column, values: ["x"], ...(tabs ? { tabs } : {}) })
+
+test("a tile with no tab sits on the first tab and a board without tabs has none", () => {
+  const layout: LayoutMap = { a: { x: 0, y: 0, w: 6, h: 4 }, b: { x: 0, y: 0, w: 6, h: 4, tab: "t_b" }, s: { x: 0, y: 0, w: 6, h: 4, tab: "gone" } }
+  assert.equal(tabOf([A, B], layout, "a"), "t_a")
+  assert.equal(tabOf([A, B], layout, "b"), "t_b")
+  assert.equal(tabOf([A, B], layout, "s"), "t_a")
+  assert.equal(tabOf([A, B], layout, "unplaced"), "t_a")
+  assert.equal(tabOf([], layout, "b"), undefined)
+})
+
+test("a filter tied to a tab is given to that tab only, and ties on a board without tabs are ignored", () => {
+  assert.equal(appliesOnTab(f("c"), "t_a"), true)
+  assert.equal(appliesOnTab(f("c", []), "t_a"), true)
+  assert.equal(appliesOnTab(f("c", ["t_a"]), "t_b"), false)
+  assert.equal(appliesOnTab(f("c", ["t_a"]), undefined), true)
+  const filters = [f("u"), f("a", ["t_a"]), f("b", ["t_b"])]
+  assert.deepEqual(filtersOnTab(filters, "t_b").map((x) => x.column), ["u", "b"])
+  const untied = [f("u")]
+  assert.equal(filtersOnTab(untied, "t_b"), untied)
+})
+
+test("adding the first tab puts every existing tile in it, and later tabs start empty", () => {
+  const layout: LayoutMap = { a: { x: 0, y: 0, w: 6, h: 4 }, b: { x: 6, y: 0, w: 6, h: 4 } }
+  const first = addTab({ tabs: [], layout, filters: [] }, "Overview", "t_a")!
+  assert.deepEqual(first.tabs, [{ id: "t_a", title: "Overview" }])
+  assert.equal(first.layout.a.tab, "t_a")
+  assert.equal(first.layout.b.tab, "t_a")
+  const second = addTab(first, "  Maps  ", "t_b")!
+  assert.equal(second.tabs[1].title, "Maps")
+  assert.deepEqual(second.layout, first.layout)
+  const full = { tabs: Array.from({ length: 20 }, (_, i) => ({ id: `t${i}`, title: "x" })), layout: {}, filters: [] }
+  assert.equal(addTab(full, "one more"), null)
+})
+
+test("renaming trims, refuses a blank title, and moving a tab swaps it with its neighbour", () => {
+  assert.equal(renameTab([A, B], "t_a", "  New  ")[0].title, "New")
+  assert.deepEqual(renameTab([A, B], "t_a", "   "), [A, B])
+  assert.deepEqual(moveTab([A, B], "t_b", -1).map((t) => t.id), ["t_b", "t_a"])
+  assert.deepEqual(moveTab([A, B], "t_a", -1), [A, B])
+})
+
+test("a tab with tiles is deleted only when they move to the first tab, below what is there", () => {
+  const layout: LayoutMap = {
+    a: { x: 0, y: 0, w: 12, h: 5, tab: "t_a" },
+    b: { x: 0, y: 0, w: 6, h: 3, tab: "t_b" },
+    c: { x: 6, y: 0, w: 6, h: 4, tab: "t_b" },
+  }
+  const ids = ["a", "b", "c"]
+  const edit = { tabs: [A, B], layout, filters: [f("only_b", ["t_b"]), f("both", ["t_a", "t_b"]), f("free")] }
+  assert.ok("error" in (deleteTab(edit, ids, "t_b", false) as object))
+  const done = deleteTab(edit, ids, "t_b", true) as typeof edit
+  assert.deepEqual(done.tabs, [A])
+  assert.deepEqual([done.layout.b, done.layout.c].map((t) => [t.tab, t.x, t.y]), [["t_a", 0, 5], ["t_a", 0, 8]])
+  // The tie that named only the deleted tab follows the tiles; the other loses one id; untied stays untied.
+  assert.deepEqual(done.filters.map((x) => x.tabs), [["t_a"], ["t_a"], undefined])
+  // An empty tab goes without moving anything.
+  const empty = deleteTab({ ...edit, layout: { a: layout.a } }, ["a"], "t_b", false) as typeof edit
+  assert.deepEqual(empty.tabs, [A])
+})
+
+test("deleting the last tab leaves no tabs, no tile tabs and no ties", () => {
+  const edit = { tabs: [A], layout: { a: { x: 0, y: 0, w: 6, h: 4, tab: "t_a" } }, filters: [f("c", ["t_a"])] }
+  const out = deleteTab(edit, ["a"], "t_a", true) as typeof edit
+  assert.deepEqual(out.tabs, [])
+  assert.deepEqual(out.layout.a, { x: 0, y: 0, w: 6, h: 4 })
+  assert.equal(out.filters[0].tabs, undefined)
+})
+
+test("a tile moves to another tab below what is there", () => {
+  const layout: LayoutMap = { a: { x: 0, y: 0, w: 6, h: 4, tab: "t_a" }, b: { x: 3, y: 2, w: 6, h: 4, tab: "t_b" } }
+  const out = moveTileToTab([A, B], layout, ["a", "b"], "a", "t_b")
+  assert.deepEqual(out.a, { x: 0, y: 6, w: 6, h: 4, tab: "t_b" })
+  assert.deepEqual(tilesOnTab([A, B], out, ["a", "b"], "t_a"), [])
+})
+
+test("a tie to every tab, or to none, is no tie", () => {
+  assert.equal(withTies(f("c", ["t_a"]), [A, B], ["t_a", "t_b"]).tabs, undefined)
+  assert.equal(withTies(f("c", ["t_a"]), [A, B], []).tabs, undefined)
+  assert.deepEqual(withTies(f("c"), [A, B], ["t_b", "gone"]).tabs, ["t_b"])
+})
+
+test("ties survive the address: they are kept by normalise, encode and decode", () => {
+  const tied = [f("c", ["t_b", "t_a"])]
+  assert.deepEqual(normalizeFilters(tied)[0].tabs, ["t_a", "t_b"])
+  assert.deepEqual(decodeFilters(encodeFilters(tied))?.[0].tabs, ["t_a", "t_b"])
+  // A filter with no tie encodes exactly as before.
+  assert.equal(encodeFilters([f("c")]), '[{"column":"c","values":["x"]}]')
+})
+
+test("the selected tab is the one in the address when it exists, else the first", () => {
+  assert.equal(selectedTab([A, B], "t_b"), "t_b")
+  assert.equal(selectedTab([A, B], "nope"), "t_a")
+  assert.equal(selectedTab([A, B], null), "t_a")
+  assert.equal(selectedTab([], "t_b"), undefined)
+  assert.equal(withTabParam("f=1", [A, B], "t_b"), "f=1&tab=t_b")
+  assert.equal(withTabParam("f=1&tab=t_b", [A, B], "t_a"), "f=1")
+})
+
+test("static kinds are the text tile and the three section kinds", () => {
+  for (const k of ["text", "heading", "divider", "section"]) assert.equal(isStaticKind(k), true)
+  for (const k of ["bar", "kpi", "table"]) assert.equal(isStaticKind(k), false)
+})
+
+test("the reading order is row then column, and a phone layout replaces it for the tiles it names", () => {
+  const layout: LayoutMap = {
+    a: { x: 6, y: 0, w: 6, h: 4 }, b: { x: 0, y: 0, w: 6, h: 3 }, c: { x: 0, y: 4, w: 12, h: 5 }, d: { x: 0, y: 9, w: 12, h: 2 },
+  }
+  assert.deepEqual(readingOrder(["a", "b", "c", "d"], layout), ["b", "a", "c", "d"])
+  assert.deepEqual(phoneOrder(["a", "b", "c", "d"], layout, undefined), [{ id: "b", h: 3 }, { id: "a", h: 4 }, { id: "c", h: 5 }, { id: "d", h: 2 }])
+  const saved = [{ id: "c", h: 8 }, { id: "gone", h: 3 }, { id: "a", h: 2 }]
+  assert.deepEqual(phoneOrder(["a", "b", "c", "d"], layout, saved), [{ id: "c", h: 8 }, { id: "a", h: 2 }, { id: "b", h: 3 }, { id: "d", h: 2 }])
+  const moved = movePhoneTile(phoneOrder(["a", "b"], layout, undefined), "a", -1)
+  assert.deepEqual(moved.map((p) => p.id), ["a", "b"])
+  assert.equal(resizePhoneTile(moved, "a", 999)[0].h, 60)
+  assert.equal(resizePhoneTile(moved, "a", 0)[0].h, 1)
+})
+
+test("a section folds the tiles after it up to the next section, and the tiles below move up", () => {
+  const layout: LayoutMap = {
+    s1: { x: 0, y: 0, w: 12, h: 1 }, a: { x: 0, y: 1, w: 6, h: 4 }, b: { x: 6, y: 1, w: 6, h: 4 },
+    s2: { x: 0, y: 5, w: 12, h: 1 }, c: { x: 0, y: 6, w: 12, h: 3 },
+  }
+  const items = Object.keys(layout).map((id) => ({ id, kind: id.startsWith("s") ? "section" : "bar" }))
+  assert.deepEqual([...foldedTiles(items, layout, new Set())], [])
+  assert.deepEqual([...foldedTiles(items, layout, new Set(["s1"]))].sort(), ["a", "b"])
+  assert.deepEqual([...foldedTiles(items, layout, new Set(["s2"]))], ["c"])
+  const hidden = foldedTiles(items, layout, new Set(["s1"]))
+  const out = collapseLayout(layout, items, hidden)
+  assert.deepEqual(Object.keys(out).sort(), ["c", "s1", "s2"])
+  assert.equal(out.s2.y, 1)
+  assert.equal(out.c.y, 2)
+  assert.equal(out.s1.y, 0)
+})

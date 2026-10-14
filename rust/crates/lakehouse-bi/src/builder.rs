@@ -1246,7 +1246,7 @@ where
         table: None,
         bins: Vec::new(),
     };
-    if spec.spec.kind == crate::specs::ChartKind::Text {
+    if spec.spec.kind.is_static() {
         return FilteredSql {
             sql: String::new(),
             skipped: Vec::new(),
@@ -1500,7 +1500,7 @@ pub fn sql_for_sql_source_report<HCols>(
 where
     HCols: std::hash::BuildHasher,
 {
-    if spec.spec.kind == crate::specs::ChartKind::Text {
+    if spec.spec.kind.is_static() {
         return Some(FilteredSql {
             sql: String::new(),
             skipped: Vec::new(),
@@ -2815,6 +2815,24 @@ mod tests {
         let cols: HashMap<String, RelationColumns> = HashMap::new();
         let sql = sql_with_filters(&spec, &[2024], &[], &cols);
         assert_eq!(sql, "");
+    }
+
+    /// BI-18 part C: a tile that carries no data never has a statement, even
+    /// when its stored definition holds a mart, a dimension and SQL (a row
+    /// written by hand, or a text tile edited into a heading). The section
+    /// kinds are checked by the same `is_static` the text tile is.
+    #[test]
+    fn a_section_tile_produces_no_sql_whatever_its_stored_definition_holds() {
+        let cols = mart_cols(&[("mart_wisman", &["kawasan", "jumlah", "tahun"])]);
+        let filters = vec![FilterDef::in_values("kawasan", vec!["Asia".to_owned()])];
+        for kind in [ChartKind::Heading, ChartKind::Divider, ChartKind::Section] {
+            let mut spec = stored_spec(kind, "mart_wisman", "kawasan", &["jumlah"]);
+            spec.spec.sql = "SELECT secret FROM serving.mart_wisman".to_owned();
+            assert_eq!(sql_with_filters(&spec, &[2024], &filters, &cols), "");
+            let report = sql_with_filters_report(&spec, &[2024], &filters, &cols);
+            assert_eq!(report.sql, "", "{kind:?}");
+            assert!(report.skipped.is_empty(), "{kind:?}");
+        }
     }
 
     #[test]

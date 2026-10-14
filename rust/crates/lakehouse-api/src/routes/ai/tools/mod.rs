@@ -10,6 +10,7 @@
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
@@ -41,6 +42,7 @@ mod ops;
 mod pipelines;
 mod propose;
 mod queries;
+mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;

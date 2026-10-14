@@ -81,6 +81,9 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Table,
     ChartKind::Pivot,
     ChartKind::Text,
+    ChartKind::Heading,
+    ChartKind::Divider,
+    ChartKind::Section,
 ];
 
 /// Kinds allowed to carry a breakdown (2nd dimension). `heatmap`, `sankey`
@@ -455,6 +458,15 @@ pub struct Board {
     /// saved for each (`BI-11`). `None` when the board shows none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub params: Option<Vec<crate::params::BoardParam>>,
+    /// The tabs of the board, in order (`BI-18` part C). `None` when it has
+    /// none, which is one implicit tab and the board as it always was.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tabs: Option<Vec<crate::layout::Tab>>,
+    /// The order and heights of the tiles below 640 px, when an editor saved
+    /// a layout for the phone (`BI-18` part C). `None` stacks the tiles in
+    /// the reading order of [`Self::layout`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub phone_layout: Option<Vec<crate::layout::PhoneTile>>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -489,7 +501,7 @@ pub struct Board {
 }
 
 /// A tile's position on the 12-column grid canvas.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TileBox {
     /// Grid column.
     pub x: i32,
@@ -499,6 +511,12 @@ pub struct TileBox {
     pub w: i32,
     /// Height, in grid rows.
     pub h: i32,
+    /// The id of the tab this tile sits on (`BI-18` part C). Absent on a
+    /// board with no tabs, and on a tile saved before it had any: such a tile
+    /// sits on the first tab ([`crate::layout::tab_of`]). Left off the wire
+    /// when absent so a board saved before tabs serialises to the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
 }
 
 /// Layout, keyed by chart id.
@@ -623,6 +641,20 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
     // list; `[]` is "none", so a board saved before reads as showing none.
     ch.exec(
         "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS params_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    // BI-18 part C: the tabs of a dashboard and its phone layout, JSON lists;
+    // `[]` is "none" for both, so a board saved before reads as one tab and
+    // the computed stacking. Same `ALTER ... IF NOT EXISTS` idiom, no
+    // Postgres migration: boards live in ClickHouse.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS tabs_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS phone_layout_json String DEFAULT '[]'",
         None,
     )
     .await?;
@@ -803,7 +835,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -861,6 +893,15 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         params: serde_json::from_str::<Vec<crate::params::BoardParam>>(row_str(row, "params_json"))
             .ok()
             .filter(|p| !p.is_empty()),
+        tabs: serde_json::from_str::<Vec<crate::layout::Tab>>(row_str(row, "tabs_json"))
+            .ok()
+            .filter(|t| !t.is_empty()),
+        phone_layout: serde_json::from_str::<Vec<crate::layout::PhoneTile>>(row_str(
+            row,
+            "phone_layout_json",
+        ))
+        .ok()
+        .filter(|t| !t.is_empty()),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -951,6 +992,8 @@ pub async fn create_board(
         refresh_seconds: None,
         grain: None,
         params: None,
+        tabs: None,
+        phone_layout: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -976,6 +1019,7 @@ async fn upsert_board(
     embed_access: &EmbedAccess,
     refresh_seconds: u32,
     (grain, params): (&str, &[crate::params::BoardParam]),
+    (tabs, phone_layout): (&[crate::layout::Tab], &[crate::layout::PhoneTile]),
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -987,8 +1031,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -1008,6 +1052,10 @@ async fn upsert_board(
         SqlLiteral::from(grain),
         // And the shown parameters with their saved values (BI-11).
         SqlLiteral::from(serde_json::to_string(params).unwrap_or_else(|_| "[]".to_owned())),
+        // And the tabs and the phone layout (BI-18 part C), for the same
+        // reason: every save is a full-row INSERT.
+        SqlLiteral::from(serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned())),
+        SqlLiteral::from(serde_json::to_string(phone_layout).unwrap_or_else(|_| "[]".to_owned())),
     );
     ch.exec(&sql, None).await
 }
@@ -1058,6 +1106,11 @@ async fn save_board_patch(
         .unwrap_or_else(|| board.refresh_seconds.unwrap_or(0));
     let grain = patch.grain.or(board.grain.as_deref()).unwrap_or("");
     let params = patch.params.or(board.params.as_deref()).unwrap_or_default();
+    let tabs = patch.tabs.or(board.tabs.as_deref()).unwrap_or_default();
+    let phone_layout = patch
+        .phone_layout
+        .or(board.phone_layout.as_deref())
+        .unwrap_or_default();
     upsert_board(
         ch,
         &board.id,
@@ -1072,6 +1125,7 @@ async fn save_board_patch(
         embed_access,
         refresh_seconds,
         (grain, params),
+        (tabs, phone_layout),
     )
     .await
 }
@@ -1092,6 +1146,8 @@ struct BoardPatch<'a> {
     refresh_seconds: Option<u32>,
     grain: Option<&'a str>,
     params: Option<&'a [crate::params::BoardParam]>,
+    tabs: Option<&'a [crate::layout::Tab]>,
+    phone_layout: Option<&'a [crate::layout::PhoneTile]>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -1168,6 +1224,30 @@ pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// The bare board a write creates when the row it patches does not exist yet:
+/// the built-in board has no row until something about it is first saved.
+fn shell_board(id: &str) -> Board {
+    Board {
+        id: id.to_owned(),
+        name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
+        layout: None,
+        filters: None,
+        refresh_seconds: None,
+        grain: None,
+        params: None,
+        tabs: None,
+        phone_layout: None,
+        created_at: None,
+        updated_at: None,
+        public_token: None,
+        embed_enabled: None,
+        folder_id: None,
+        embed_access: EmbedAccess::default(),
+    }
+}
+
 /// Update a board's tile layout, creating a bare `Board { id, name:
 /// "Dashboard" }` shell if it does not exist yet. Ports `updateBoardLayout`.
 ///
@@ -1180,23 +1260,7 @@ pub async fn update_board_layout(
     layout: &LayoutMap,
 ) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        refresh_seconds: None,
-        grain: None,
-        params: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-        embed_access: EmbedAccess::default(),
-    });
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1220,23 +1284,7 @@ pub async fn update_board_filters(
     filters: &[FilterDef],
 ) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        refresh_seconds: None,
-        grain: None,
-        params: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-        embed_access: EmbedAccess::default(),
-    });
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1259,23 +1307,7 @@ pub async fn update_board_filters(
 pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Result<(), BiError> {
     crate::click::validate_refresh_seconds(seconds).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        refresh_seconds: None,
-        grain: None,
-        params: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-        embed_access: EmbedAccess::default(),
-    });
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1304,23 +1336,7 @@ pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<
         ));
     }
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        refresh_seconds: None,
-        grain: None,
-        params: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-        embed_access: EmbedAccess::default(),
-    });
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1347,28 +1363,71 @@ pub async fn update_board_params(
     params: &[crate::params::BoardParam],
 ) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        refresh_seconds: None,
-        grain: None,
-        params: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-        embed_access: EmbedAccess::default(),
-    });
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
         BoardPatch {
             params: Some(params),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save a board's tabs, or clear them with an empty list (`BI-18` part C).
+/// Same fallback as [`update_board_layout`] for the built-in board's row. The
+/// caller has checked that the tiles and the filters of the board only name
+/// tabs that remain ([`crate::layout::check_layout_tabs`],
+/// [`crate::layout::check_filter_ties`]); this checks the tabs themselves.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the tabs fail
+/// [`crate::layout::validate_tabs`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_tabs(
+    ch: &ChClient,
+    id: &str,
+    tabs: &[crate::layout::Tab],
+) -> Result<(), BiError> {
+    crate::layout::validate_tabs(tabs).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            tabs: Some(&crate::layout::clean_tabs(tabs)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save a board's phone layout, or clear it with an empty list (`BI-18` part
+/// C). Same fallback as [`update_board_layout`] for the built-in board's row.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the layout fails
+/// [`crate::layout::validate_phone_layout`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_phone_layout(
+    ch: &ChClient,
+    id: &str,
+    phone: &[crate::layout::PhoneTile],
+) -> Result<(), BiError> {
+    crate::layout::validate_phone_layout(phone).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            phone_layout: Some(phone),
             ..Default::default()
         },
     )
@@ -1579,8 +1638,160 @@ pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
     Ok(())
 }
 
-/// Duplicate a board along with its charts and layout (new ids). Ports
-/// `duplicateBoard`.
+/// The built-in board's fixed tiles as saved charts, so the built-in board
+/// can be duplicated (`BI-18` part C). The tiles are kept as the fixed
+/// statements they are: the stored definition has no mart, which is what
+/// makes the builder serve the statement as written
+/// ([`crate::builder::stored_chart_sql`]'s "unfiltered" branch), so a copy of
+/// a built-in tile shows the same numbers and, like the original, takes no
+/// dashboard filter and no year filter. Returns the saved charts with the
+/// built-in id each one came from.
+fn builtin_tiles_as_charts(board: &str, created_by: &str) -> Vec<(String, StoredChartSpec)> {
+    let mut out = Vec::new();
+    for k in crate::specs::kpis() {
+        let spec = ChartSpec {
+            id: k.id.clone(),
+            title: k.title.clone(),
+            subtitle: None,
+            kind: ChartKind::Kpi,
+            mart: k.mart.clone(),
+            sql_source: None,
+            sql: k.sql.clone(),
+            x: String::new(),
+            y: ChartY::Single("v".to_owned()),
+            series: None,
+            map: None,
+            lat: None,
+            lon: None,
+            format: Some(k.format),
+            span: Some(1),
+            text: None,
+            caption: k.caption.clone(),
+            target: None,
+            click: None,
+        };
+        out.push((k.id.clone(), builtin_as_chart(spec, board, created_by)));
+    }
+    for c in crate::specs::charts() {
+        let spec = ChartSpec {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            subtitle: c.subtitle.clone(),
+            kind: c.kind,
+            mart: c.mart.clone(),
+            sql_source: None,
+            sql: c.sql.clone(),
+            x: c.x.clone(),
+            y: c.y.clone(),
+            series: c.series.clone(),
+            map: None,
+            lat: None,
+            lon: None,
+            format: c.format,
+            span: c.span,
+            text: c.text.clone(),
+            caption: c.caption.clone(),
+            target: c.target,
+            click: None,
+        };
+        out.push((c.id.clone(), builtin_as_chart(spec, board, created_by)));
+    }
+    out
+}
+
+fn builtin_as_chart(spec: ChartSpec, board: &str, created_by: &str) -> StoredChartSpec {
+    let def = ChartInput {
+        title: spec.title.clone(),
+        subtitle: spec.subtitle.clone(),
+        kind: spec.kind,
+        span: spec.span,
+        board: Some(board.to_owned()),
+        caption: spec.caption.clone(),
+        ..empty_chart_input()
+    };
+    StoredChartSpec {
+        spec,
+        source: ChartSource::Ui,
+        board: board.to_owned(),
+        def,
+        has_year: false,
+        created_by: Some(created_by.to_owned()),
+        created_at: None,
+    }
+}
+
+/// What a duplicate writes besides the board row: the copied charts under new
+/// ids, and the layout and phone layout re-keyed to them.
+struct DuplicatePlan {
+    charts: Vec<StoredChartSpec>,
+    layout: LayoutMap,
+    phone_layout: Vec<crate::layout::PhoneTile>,
+}
+
+/// The pure part of [`duplicate_board`]: every chart of `src` (and the
+/// built-in tiles, when it is the built-in board) cloned under an id from
+/// `new_id` onto `new_board`, and the layout and phone layout of `src`
+/// re-keyed to them. A tile or phone entry whose chart is gone is dropped;
+/// tabs and each tile's tab carry over unchanged because tab ids belong to a
+/// board, not to a chart.
+fn plan_duplicate(
+    src: &Board,
+    charts: Vec<StoredChartSpec>,
+    builtin: Vec<(String, StoredChartSpec)>,
+    new_board: &str,
+    mut new_id: impl FnMut() -> String,
+) -> DuplicatePlan {
+    // Old chart id -> new chart id, for the layout and the phone layout.
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut copies = Vec::with_capacity(charts.len() + builtin.len());
+    for mut clone in charts {
+        let fresh = new_id();
+        id_map.insert(clone.spec.id.clone(), fresh.clone());
+        clone.spec.id = fresh;
+        new_board.clone_into(&mut clone.board);
+        // The definition names its board too; the editor prefills from it.
+        clone.def.board = Some(new_board.to_owned());
+        copies.push(clone);
+    }
+    for (old_id, mut chart) in builtin {
+        let fresh = new_id();
+        id_map.insert(old_id, fresh.clone());
+        chart.spec.id = fresh;
+        copies.push(chart);
+    }
+    let mut layout = LayoutMap::new();
+    for (old_id, tile) in src.layout.iter().flatten() {
+        if let Some(fresh) = id_map.get(old_id) {
+            layout.insert(fresh.clone(), tile.clone());
+        }
+    }
+    let phone_layout = src
+        .phone_layout
+        .iter()
+        .flatten()
+        .filter_map(|t| {
+            id_map.get(&t.id).map(|fresh| crate::layout::PhoneTile {
+                id: fresh.clone(),
+                h: t.h,
+            })
+        })
+        .collect();
+    DuplicatePlan {
+        charts: copies,
+        layout,
+        phone_layout,
+    }
+}
+
+/// Duplicate a board with everything that makes it that board (`BI-18` part
+/// C): its tiles (as new charts with the same definitions), tabs, filters
+/// with their tab ties, grain, parameter controls, refresh, layout and phone
+/// layout. The copy is named "Copy of <name>" and lands in the original's
+/// folder. The sharing state is not copied: the copy has no public link, no
+/// embed and no withdrawn tokens or framing sites of its own to inherit.
+///
+/// The built-in board can be duplicated too: its fixed tiles become saved
+/// charts ([`builtin_tiles_as_charts`]).
 ///
 /// # Errors
 ///
@@ -1588,46 +1799,64 @@ pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
-    let src = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let charts = list_stored_charts(ch).await?;
-    let charts: Vec<_> = charts.into_iter().filter(|c| c.board == id).collect();
+    // The built-in board has a row only once its layout was first saved.
+    let src = match get_board(ch, id).await? {
+        Some(board) => board,
+        None if id == DEFAULT_BOARD_ID => Board {
+            name: "Main".to_owned(),
+            ..shell_board(DEFAULT_BOARD_ID)
+        },
+        None => return Err(BiError::Validation("dashboard not found.".to_owned())),
+    };
+    let stored = list_stored_charts(ch).await?;
+    let charts: Vec<_> = stored.into_iter().filter(|c| c.board == id).collect();
     // The copy carries the original's description — it describes the same
     // thing — but is authored by whoever pressed Duplicate, not by the
     // person who made the original.
     let new_board = create_board(
         ch,
-        &format!("{} (salinan)", src.name),
+        &format!("Copy of {}", src.name),
         src.description.as_deref().unwrap_or(""),
         created_by,
     )
     .await?;
-    let mut id_map: HashMap<String, String> = HashMap::new();
-    for c in &charts {
-        let new_id = new_chart_id();
-        id_map.insert(c.spec.id.clone(), new_id.clone());
-        let mut clone = c.clone();
-        clone.spec.id = new_id;
-        clone.board = new_board.id.clone();
-        insert_chart(ch, &clone).await?;
+    let builtin = if id == DEFAULT_BOARD_ID {
+        builtin_tiles_as_charts(&new_board.id, created_by)
+    } else {
+        Vec::new()
+    };
+    let plan = plan_duplicate(&src, charts, builtin, &new_board.id, new_chart_id);
+    for chart in &plan.charts {
+        insert_chart(ch, chart).await?;
     }
-    let mut new_layout = LayoutMap::new();
-    if let Some(src_layout) = &src.layout {
-        for (old_id, tile) in src_layout {
-            if let Some(new_id) = id_map.get(old_id) {
-                new_layout.insert(new_id.clone(), *tile);
-            }
-        }
-    }
-    update_board_layout(ch, &new_board.id, &new_layout).await?;
+    let (new_layout, new_phone) = (plan.layout, plan.phone_layout);
     // The copy lands next to the original, not at the root.
     let folder_id = src.folder_id.clone().unwrap_or_default();
-    if !folder_id.is_empty() {
-        move_board(ch, &new_board.id, &folder_id).await?;
-    }
+    // One full-row write for everything the copy inherits.
+    save_board_patch(
+        ch,
+        &new_board,
+        BoardPatch {
+            layout: Some(&new_layout),
+            filters: Some(src.filters.as_deref().unwrap_or_default()),
+            refresh_seconds: src.refresh_seconds,
+            grain: src.grain.as_deref(),
+            params: src.params.as_deref(),
+            tabs: src.tabs.as_deref(),
+            phone_layout: Some(&new_phone),
+            folder_id: Some(&folder_id),
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(Board {
         layout: Some(new_layout),
+        filters: src.filters,
+        refresh_seconds: src.refresh_seconds,
+        grain: src.grain,
+        params: src.params,
+        tabs: src.tabs,
+        phone_layout: Some(new_phone).filter(|p| !p.is_empty()),
         folder_id: Some(folder_id),
         ..new_board
     })
@@ -2006,8 +2235,46 @@ struct TextCtx<'a> {
     created_by: &'a str,
 }
 
-/// Assemble the `text` branch of `specFromInput` (markdown content, no
-/// SQL/mart).
+/// Longest text of a `heading` or `section` tile, in characters.
+const SECTION_TEXT_MAX_CHARS: usize = 120;
+
+/// The text a no-data tile keeps (`BI-18` part C). `text` takes markdown and
+/// needs some; `heading` and `section` take one line of at most
+/// [`SECTION_TEXT_MAX_CHARS`] characters and need it; a `divider` has no
+/// text, and what a caller sent is dropped rather than stored. The text is
+/// only ever shown, never run: these tiles have no statement
+/// ([`ChartKind::is_static`]).
+fn static_tile_text(kind: ChartKind, raw: Option<&str>) -> Result<String, BiError> {
+    let text = raw.unwrap_or_default().trim().to_owned();
+    match kind {
+        ChartKind::Divider => Ok(String::new()),
+        ChartKind::Heading | ChartKind::Section => {
+            if text.is_empty() {
+                return Err(BiError::Validation("heading text is required.".to_owned()));
+            }
+            if text.chars().any(|c| c == '\n' || c == '\r') {
+                return Err(BiError::Validation(
+                    "a heading is one line of text.".to_owned(),
+                ));
+            }
+            if text.chars().count() > SECTION_TEXT_MAX_CHARS {
+                return Err(BiError::Validation(format!(
+                    "a heading is at most {SECTION_TEXT_MAX_CHARS} characters."
+                )));
+            }
+            Ok(text)
+        }
+        _ => {
+            if text.is_empty() {
+                return Err(BiError::Validation("text content is required.".to_owned()));
+            }
+            Ok(text)
+        }
+    }
+}
+
+/// Assemble the no-data branch of `specFromInput` (`text` markdown, and the
+/// `heading`, `divider` and `section` tiles of `BI-18` part C; no SQL/mart).
 fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredChartSpec, BiError> {
     let TextCtx {
         title,
@@ -2019,10 +2286,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         source,
         created_by,
     } = ctx;
-    let text = input.text.as_deref().unwrap_or_default().trim().to_owned();
-    if text.is_empty() {
-        return Err(BiError::Validation("text content is required.".to_owned()));
-    }
+    let text = static_tile_text(kind, input.text.as_deref())?;
     let def = ChartInput {
         title: title.clone(),
         subtitle: None,
@@ -2040,7 +2304,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         order: None,
         span: Some(span),
         board: Some(board.clone()),
-        text: Some(text.clone()),
+        text: Some(text.clone()).filter(|t| !t.is_empty()),
         caption: None,
         target: None,
         click: None,
@@ -2064,7 +2328,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         lon: None,
         format: Some(NumFmt::Int),
         span: Some(span),
-        text: Some(text),
+        text: Some(text).filter(|t| !t.is_empty()),
         caption: None,
         target: None,
         click: None,
@@ -2873,7 +3137,7 @@ fn spec_before_relation(
     )
     .map_err(BiError::Validation)?;
     // ── TEXT — no SQL/mart ────────────────────────────────────────────
-    if common.kind == ChartKind::Text {
+    if common.kind.is_static() {
         let CommonFields {
             title,
             kind,
@@ -3184,7 +3448,7 @@ fn validated_click(input: &ChartInput) -> Result<Option<ClickAction>, BiError> {
     let Some(click) = &input.click else {
         return Ok(None);
     };
-    if input.kind == ChartKind::Text {
+    if input.kind.is_static() {
         return Err(BiError::Validation(
             "a text tile has nothing to click.".to_owned(),
         ));
@@ -4106,10 +4370,11 @@ mod tests {
         // `console.bi_hierarchy` table. 22 = those 20 plus the BI-11
         // `bi_board.params_json` column and the `console.bi_param` table.
         // 24 = those 22 plus the BI-2 `console.bi_metric` and
-        // `console.bi_segment` tables.
+        // `console.bi_segment` tables. 26 = those 24 plus the BI-18 part C
+        // `bi_board.tabs_json` and `bi_board.phone_layout_json` columns.
         assert_eq!(
-            first_call_requests, 24,
-            "first call should issue all 24 DDL statements"
+            first_call_requests, 26,
+            "first call should issue all 26 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -4349,6 +4614,7 @@ mod tests {
                 y: 0,
                 w: 4,
                 h: 2,
+                tab: None,
             },
         );
         assert_eq!(parse_layout(r#"{"c1":{"x":0,"y":0,"w":4,"h":2}}"#), want);
@@ -4478,6 +4744,8 @@ mod tests {
             refresh_seconds: None,
             grain: None,
             params: None,
+            tabs: None,
+            phone_layout: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -5884,5 +6152,274 @@ mod tests {
             &ReadContext::new(&DEFAULT_TIME),
         );
         assert_eq!(report.sql, spec.spec.sql);
+    }
+
+    // ── BI-18 part C: tabs, section tiles, duplicate ───────────────────
+
+    fn static_input(kind: &str, text: Option<&str>) -> ChartInput {
+        let mut v = serde_json::json!({ "title": "t", "kind": kind, "board": "b1" });
+        if let Some(text) = text {
+            v["text"] = serde_json::json!(text);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn built(kind: &str, text: Option<&str>) -> Result<StoredChartSpec, BiError> {
+        spec_from_inline_sql_free(&static_input(kind, text))
+    }
+
+    /// The no-data branch is reached before any schema lookup, so it runs
+    /// without a `ClickHouse`; `Stage::Done` is what a section tile returns.
+    fn spec_from_inline_sql_free(input: &ChartInput) -> Result<StoredChartSpec, BiError> {
+        let common = derive_common_fields(input, Some("u_x".to_owned()))?;
+        spec_from_text_input(
+            input,
+            TextCtx {
+                title: common.title,
+                subtitle: common.subtitle,
+                kind: common.kind,
+                new_id: common.new_id,
+                span: common.span,
+                board: common.board,
+                source: ChartSource::Ui,
+                created_by: "",
+            },
+        )
+    }
+
+    #[test]
+    fn a_heading_and_a_section_take_one_line_and_a_divider_takes_none() {
+        for kind in ["heading", "section"] {
+            let ok = built(kind, Some("  Sales by region  ")).unwrap();
+            assert_eq!(ok.spec.text.as_deref(), Some("Sales by region"));
+            assert_eq!(ok.spec.sql, "", "a section tile has no statement");
+            assert!(ok.def.mart.is_empty());
+            for bad in [
+                None,
+                Some("   "),
+                Some("two\nlines"),
+                Some("cr\rhere"),
+                Some(&"x".repeat(121)[..]),
+            ] {
+                assert!(
+                    matches!(built(kind, bad), Err(BiError::Validation(_))),
+                    "{kind} {bad:?}"
+                );
+            }
+            assert!(built(kind, Some(&"x".repeat(120))).is_ok());
+        }
+        // A divider keeps no text, whatever was sent.
+        let divider = built("divider", Some("ignored")).unwrap();
+        assert_eq!(divider.spec.text, None);
+        assert_eq!(divider.def.text, None);
+        assert!(built("divider", None).is_ok());
+        // `text` still needs its markdown, and may be several lines.
+        assert!(built("text", None).is_err());
+        assert!(built("text", Some("a\nb")).is_ok());
+    }
+
+    #[test]
+    fn a_text_in_a_heading_is_stored_as_text_and_never_as_a_statement() {
+        let hostile = "x'; DROP TABLE console.bi_chart; --";
+        let heading = built("heading", Some(hostile)).unwrap();
+        assert_eq!(heading.spec.sql, "");
+        assert_eq!(heading.spec.text.as_deref(), Some(hostile));
+        assert!(heading.spec.kind.is_static());
+    }
+
+    #[test]
+    fn a_section_tile_refuses_a_click_filters_and_joins() {
+        for kind in ["heading", "divider", "section"] {
+            let mut input = static_input(kind, Some("A"));
+            input.click = Some(ClickAction::Url {
+                url: "/x".to_owned(),
+            });
+            assert!(validated_click(&input).is_err(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_layout_tile_without_a_tab_serialises_to_the_bytes_it_always_had() {
+        let tile = TileBox {
+            x: 0,
+            y: 1,
+            w: 6,
+            h: 4,
+            tab: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&tile).unwrap(),
+            r#"{"x":0,"y":1,"w":6,"h":4}"#
+        );
+        let tabbed = TileBox {
+            tab: Some("t_a".to_owned()),
+            ..tile
+        };
+        assert_eq!(
+            serde_json::to_string(&tabbed).unwrap(),
+            r#"{"x":0,"y":1,"w":6,"h":4,"tab":"t_a"}"#
+        );
+        let parsed = parse_layout(r#"{"c1":{"x":0,"y":0,"w":4,"h":2,"tab":"t_a"}}"#);
+        assert_eq!(parsed["c1"].tab.as_deref(), Some("t_a"));
+    }
+
+    #[test]
+    fn a_board_row_read_without_the_new_columns_has_no_tabs_and_no_phone_layout() {
+        let row = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        let old = row_to_board(&row(serde_json::json!({})));
+        assert!(old.tabs.is_none() && old.phone_layout.is_none());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("tabs").is_none() && json.get("phoneLayout").is_none());
+        let empty = row_to_board(&row(
+            serde_json::json!({ "tabs_json": "[]", "phone_layout_json": "[]" }),
+        ));
+        assert!(empty.tabs.is_none() && empty.phone_layout.is_none());
+        let new = row_to_board(&row(serde_json::json!({
+            "tabs_json": r#"[{"id":"t_a","title":"Overview"}]"#,
+            "phone_layout_json": r#"[{"id":"c1","h":5}]"#,
+        })));
+        assert_eq!(new.tabs.unwrap()[0].title, "Overview");
+        assert_eq!(new.phone_layout.unwrap()[0].h, 5);
+        // A damaged column reads as none, not as a failed board.
+        let bad = row_to_board(&row(serde_json::json!({ "tabs_json": "nope" })));
+        assert!(bad.tabs.is_none());
+    }
+
+    fn stored(id: &str, board: &str) -> StoredChartSpec {
+        let mut s = StoredChartSpec::for_test(ChartKind::Bar, "m", "d", &["v"], "SELECT 1".into());
+        s.spec.id = id.to_owned();
+        s.board = board.to_owned();
+        s.def.board = Some(board.to_owned());
+        s
+    }
+
+    fn tile(tab: Option<&str>) -> TileBox {
+        TileBox {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 4,
+            tab: tab.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_re_keys_the_layout_and_the_phone_layout_and_keeps_the_tabs() {
+        let mut layout = LayoutMap::new();
+        layout.insert("c1".to_owned(), tile(Some("t_a")));
+        layout.insert("c2".to_owned(), tile(Some("t_b")));
+        layout.insert("gone".to_owned(), tile(Some("t_a")));
+        let src = Board {
+            layout: Some(layout),
+            tabs: Some(vec![crate::layout::Tab {
+                id: "t_a".to_owned(),
+                title: "A".to_owned(),
+            }]),
+            phone_layout: Some(vec![
+                crate::layout::PhoneTile {
+                    id: "c2".to_owned(),
+                    h: 7,
+                },
+                crate::layout::PhoneTile {
+                    id: "gone".to_owned(),
+                    h: 3,
+                },
+                crate::layout::PhoneTile {
+                    id: "c1".to_owned(),
+                    h: 5,
+                },
+            ]),
+            ..shell_board("b_src")
+        };
+        let mut n = 0;
+        let plan = plan_duplicate(
+            &src,
+            vec![stored("c1", "b_src"), stored("c2", "b_src")],
+            Vec::new(),
+            "b_new",
+            || {
+                n += 1;
+                format!("u_{n}")
+            },
+        );
+        assert_eq!(plan.charts.len(), 2);
+        assert!(plan.charts.iter().all(|c| c.board == "b_new"));
+        assert!(
+            plan.charts
+                .iter()
+                .all(|c| c.def.board.as_deref() == Some("b_new"))
+        );
+        // c1 -> u_1, c2 -> u_2; the tile whose chart is gone is dropped.
+        assert_eq!(plan.layout.len(), 2);
+        assert_eq!(plan.layout["u_1"].tab.as_deref(), Some("t_a"));
+        assert_eq!(plan.layout["u_2"].tab.as_deref(), Some("t_b"));
+        // The reading order of the phone layout is kept.
+        let phone: Vec<(&str, i32)> = plan
+            .phone_layout
+            .iter()
+            .map(|t| (t.id.as_str(), t.h))
+            .collect();
+        assert_eq!(phone, [("u_2", 7), ("u_1", 5)]);
+    }
+
+    #[test]
+    fn the_built_in_tiles_become_saved_charts_that_run_their_fixed_statement() {
+        let spec = ChartSpec {
+            id: "kpi_total".to_owned(),
+            title: "Total".to_owned(),
+            subtitle: None,
+            kind: ChartKind::Kpi,
+            mart: "mart_x".to_owned(),
+            sql_source: None,
+            sql: "SELECT sum(v) AS v FROM serving.mart_x".to_owned(),
+            x: String::new(),
+            y: ChartY::Single("v".to_owned()),
+            series: None,
+            map: None,
+            lat: None,
+            lon: None,
+            format: Some(NumFmt::Int),
+            span: Some(1),
+            text: None,
+            caption: Some("visitors".to_owned()),
+            target: None,
+            click: None,
+        };
+        let chart = builtin_as_chart(spec, "b_new", "Ann");
+        assert_eq!(chart.board, "b_new");
+        assert_eq!(chart.created_by.as_deref(), Some("Ann"));
+        // No mart in the definition is what makes the builder serve the
+        // fixed statement as written.
+        assert!(chart.def.mart.is_empty());
+        let sql = crate::builder::sql_with_filters(
+            &chart,
+            &[],
+            &[FilterDef::in_values("kab", vec!["a".to_owned()])],
+            &HashMap::<String, crate::builder::RelationColumns>::new(),
+            &crate::builder::ReadContext::new(&DEFAULT_TIME),
+        );
+        assert_eq!(sql, "SELECT sum(v) AS v FROM serving.mart_x");
+        let mut n = 0;
+        let src = Board {
+            name: "Main".to_owned(),
+            ..shell_board(DEFAULT_BOARD_ID)
+        };
+        let plan = plan_duplicate(
+            &src,
+            Vec::new(),
+            vec![("kpi_total".to_owned(), chart)],
+            "b_new",
+            || {
+                n += 1;
+                format!("u_{n}")
+            },
+        );
+        assert_eq!(plan.charts[0].spec.id, "u_1");
     }
 }

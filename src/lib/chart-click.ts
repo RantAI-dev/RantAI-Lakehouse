@@ -97,7 +97,7 @@ export type DrillValue = {
  * gauge are one number or a list, not a mark per value: those offer the
  * rows behind the whole tile instead ({@link offersTileRecords}).
  */
-const NO_VALUE_KINDS: ReadonlySet<ChartKind> = new Set(["geoheat", "table", "pivot", "kpi", "gauge", "text"])
+const NO_VALUE_KINDS: ReadonlySet<ChartKind> = new Set(["geoheat", "table", "pivot", "kpi", "gauge", "text", "heading", "divider", "section"])
 
 /**
  * Whether a click on this chart can ever name a value. A built-in line or

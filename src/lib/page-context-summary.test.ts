@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { summarizeFilters, summarizeParams, summarizeQuery, summarizeRows, summarizeTiles } from "./page-context-summary"
+import { summarizeFilters, summarizeParams, summarizeTabs, summarizeQuery, summarizeRows, summarizeTiles } from "./page-context-summary"
 
 test("summarizeRows shows category=value pairs and counts the rest", () => {
   const rows = [1, 2, 3, 4, 5, 6, 7].map((i) => ({ region: `r${i}`, total: i * 10 }))
@@ -114,4 +114,15 @@ test("a chart's other questions are listed beside its own rows, with their reaso
   const text = summarizeTiles([tile], { c_1: cell })
   assert.match(text, /rows: 2026-01-01=5 \| also "Rooms" \(mart_rooms; line, right axis\): rows: 2026-01-01=9/)
   assert.match(text, /also "Occupancy" \(mart_occ; line, right axis\): error: This chart could not be loaded\./)
+})
+
+test("BI-18 part C: summarizeTabs names each tab with its id, the open one and the charts on it, or says none", () => {
+  assert.equal(summarizeTabs([], () => undefined, ["a"]), "none (the dashboard has no tabs)")
+  const tabs = [{ id: "t_1", title: "Overview" }, { id: "t_2", title: "Maps" }]
+  const on = (id: string) => (id === "m" ? "t_2" : "t_1")
+  assert.equal(
+    summarizeTabs(tabs, on, ["a", "m", "b"], "t_2"),
+    '"Overview" (id t_1; charts a, b); "Maps" (id t_2, open; charts m)',
+  )
+  assert.equal(summarizeTabs(tabs, () => "t_1", ["a"]), '"Overview" (id t_1; charts a); "Maps" (id t_2; no charts)')
 })

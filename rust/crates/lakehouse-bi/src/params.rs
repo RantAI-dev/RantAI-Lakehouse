@@ -877,6 +877,9 @@ fn takes_param_slots(def: &ChartInput) -> bool {
             | ChartKind::Geoheat
             | ChartKind::Boxplot
             | ChartKind::Text
+            | ChartKind::Heading
+            | ChartKind::Divider
+            | ChartKind::Section
     ) && def.shape.steps.is_none()
         && def.shape.groupings.is_none()
         && !def.tables.is_rows_mode(def.kind)

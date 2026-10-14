@@ -592,7 +592,10 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
         | ChartKind::Pointmap
         | ChartKind::Geoheat
         | ChartKind::Pivot
-        | ChartKind::Text => false,
+        | ChartKind::Text
+        | ChartKind::Heading
+        | ChartKind::Divider
+        | ChartKind::Section => false,
         _ => !def.tables.is_rows_mode(kind),
     }
 }

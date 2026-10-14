@@ -596,6 +596,9 @@ fn is_grouped_kind(kind: ChartKind) -> bool {
     !matches!(
         kind,
         ChartKind::Text
+            | ChartKind::Heading
+            | ChartKind::Divider
+            | ChartKind::Section
             | ChartKind::Kpi
             | ChartKind::Gauge
             | ChartKind::Boxplot
@@ -632,7 +635,7 @@ pub fn check_kind_fields(
         ));
     }
     if let Some(filters) = &shape.filters {
-        if kind == ChartKind::Text {
+        if kind.is_static() {
             return Err("a text tile has no data to filter.".to_owned());
         }
         validate_filters(filters).map_err(|m| format!("chart filter: {m}"))?;
@@ -755,7 +758,7 @@ fn check_joins_kind(shape: &ShapeFields, kind: ChartKind) -> Result<(), String> 
     let Some(joins) = &shape.joins else {
         return Ok(());
     };
-    if kind == ChartKind::Text {
+    if kind.is_static() {
         return Err("a text tile has no data to join.".to_owned());
     }
     if joins.len() > MAX_JOINS {

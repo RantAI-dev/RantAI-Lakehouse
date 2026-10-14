@@ -155,6 +155,8 @@ fn with_param_id(mut result: Value) -> Value {
 pub(super) fn handles(name: &str) -> bool {
     // BI-2: the metric tools ride the same single guard arm in `run_tool`.
     super::metrics::handles(name)
+        // BI-18 part C: the tab tools ride the same guard arm.
+        || super::tabs::handles(name)
         || matches!(
             name,
             "list_formula_functions"
@@ -184,6 +186,9 @@ pub(super) async fn run(
 ) -> Value {
     if super::metrics::handles(name) {
         return super::metrics::run(state, principal, name, args).await;
+    }
+    if super::tabs::handles(name) {
+        return super::tabs::run(state, name, args).await;
     }
     match name {
         "list_formula_functions" => list_formula_functions(),

@@ -2513,6 +2513,112 @@
   {
     "type": "function",
     "function": {
+      "name": "create_tab",
+      "description": "Add a tab to a dashboard (board). On a dashboard with no tabs the first tab holds every chart already on it, so to separate some charts create a second tab as well and then move_charts_to_tab. The built-in dashboard has no tabs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "dashboard id from list_boards"
+          },
+          "title": {
+            "type": "string",
+            "description": "1 to 60 characters"
+          }
+        },
+        "required": [
+          "board",
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "rename_tab",
+      "description": "Rename a tab of a dashboard. The tab keeps its id, so charts and filters stay on it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title, from list_boards"
+          },
+          "title": {
+            "type": "string",
+            "description": "the new title, 1 to 60 characters"
+          }
+        },
+        "required": [
+          "board",
+          "tab",
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "move_charts_to_tab",
+      "description": "Put charts of a dashboard on one of its tabs, below what is already there. Charts are picked by id (list_charts); every one must be on this dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title"
+          },
+          "chartIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "ids of the charts to move"
+          }
+        },
+        "required": [
+          "board",
+          "tab",
+          "chartIds"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_tab",
+      "description": "Delete a tab of a dashboard. Its charts move to the first remaining tab (none are deleted); a filter tied to it is tied to that tab instead. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title"
+          }
+        },
+        "required": [
+          "board",
+          "tab"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_formula_functions",
       "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
       "parameters": {

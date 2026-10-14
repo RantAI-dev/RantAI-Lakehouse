@@ -238,6 +238,8 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   sunburst: "Break each category into its parts, as rings",
   boxplot: "Compare the spread of a measure across categories",
   calendar: "Spot daily patterns on a calendar",
+  // BI-18 part C: added from the dashboard's "Add" menu, never picked here; present only to satisfy the record.
+  heading: "A heading between tiles", divider: "A rule between tiles", section: "A heading that folds the tiles below it",
 };
 /**
  * Extra words the type search matches, beyond label and description: the

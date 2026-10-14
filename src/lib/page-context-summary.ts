@@ -10,6 +10,7 @@
  * applies its own hard cap (`PAGE_CONTEXT_MAX_CHARS` in routes/ai/mod.rs).
  */
 
+import { isStaticKind } from "./dashboard-tabs"
 import type { FilterDef } from "@/services/clients/bi-store"
 import { type BinDef, type BinMeta, binLabel, binsOfTile } from "./chart-bins"
 import { filterLabel, isActiveFilter } from "./dashboard-filter-state"
@@ -81,7 +82,7 @@ export function summarizeTiles(
     const id = t.source && t.source !== "builtin" ? `, id ${t.id}` : ", built-in"
     const cell = results[t.id]
     let data: string
-    if (t.kind === "text") data = "note"
+    if (isStaticKind(t.kind)) data = "note"
     else if (!cell) data = "not loaded"
     else if ("error" in cell) data = `error: ${fmt(cell.error)}`
     else data = summarizeRows(cell.columns, cell.rows, maxRows)
@@ -116,6 +117,26 @@ export function summarizeFilters(filters: FilterLike[]): string {
 export function summarizeParams(controls: { param: { name: string; type: string }; value: string | number }[]): string {
   const parts = controls.map((c) => `${c.param.name} = ${fmt(c.value)} (${c.param.type})`)
   return parts.length ? parts.join("; ") : "none"
+}
+
+/**
+ * The dashboard's tabs for the assistant (BI-18 part C, AI-9): each with its
+ * id, whether it is the open one, and the chart ids on it, so "put the map
+ * charts in a separate tab" can be done with `move_charts_to_tab`.
+ */
+export function summarizeTabs(
+  tabs: readonly { id: string; title: string }[],
+  tabOfChart: (id: string) => string | undefined,
+  chartIds: readonly string[],
+  selected?: string,
+): string {
+  if (tabs.length === 0) return "none (the dashboard has no tabs)"
+  return tabs
+    .map((t) => {
+      const ids = chartIds.filter((id) => tabOfChart(id) === t.id)
+      return `"${t.title}" (id ${t.id}${t.id === selected ? ", open" : ""}; ${ids.length ? `charts ${ids.join(", ")}` : "no charts"})`
+    })
+    .join("; ")
 }
 
 /** The SQL in the editor plus the first rows of its last result. */
