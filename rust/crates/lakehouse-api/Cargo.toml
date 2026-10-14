@@ -117,7 +117,7 @@ object_store = { version = "0.14", features = ["aws"] }
 # versions `lakehouse-iceberg` pins, so an Arrow upgrade only ever needs to
 # happen in one place at a time.
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "60"
 # Reads `.parquet` for the file upload (`upload_parquet`, ADR 0014, amendment
 # of 2026-10-08). The same crate and the same default features
 # `lakehouse-iceberg` already uses (so the lockfile gains no crate and no
