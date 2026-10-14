@@ -199,6 +199,13 @@ pub struct UpstreamFailure {
 impl UpstreamFailure {
     /// The fixed message, without the reference.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "only the tests read it since the Dagster launch outcome became typed (main's F2.7); kept as the accessor for the message half of `to_string`"
+        )
+    )]
     pub const fn message(&self) -> &'static str {
         self.message
     }
