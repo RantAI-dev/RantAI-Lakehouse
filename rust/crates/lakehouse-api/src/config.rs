@@ -23,6 +23,21 @@ use lakehouse_core::ident::Ident;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Stack size of every thread of the API's tokio runtime (workers and
+/// `spawn_blocking` threads), set in `main`.
+///
+/// phase 2 catch-up with main (sqlparser 0.63): the SQL rewrite parses and
+/// visits the statements the chart builders produce, and `sqlparser`'s
+/// recursive descent costs stack in proportion to subquery nesting. A binned
+/// breakdown with "Other" needs about 0.5 MiB in a release build but about
+/// 2.1 MiB in a debug one (`cargo run`, the dev stack), which is more than
+/// tokio's default 2 MiB: whether it overflowed depended on where
+/// `sqlparser`'s own stack checks fell, not on a bound. 8 MiB (the size of a
+/// Linux main thread) leaves a margin of roughly 3x over the debug figure and
+/// 15x over release. Stack is reserved as address space and committed only as
+/// used, so the cost is nil for threads that never recurse deeply.
+pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///

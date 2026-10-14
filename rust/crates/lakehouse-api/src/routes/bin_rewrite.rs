@@ -326,8 +326,34 @@ fn the_dashboards_filters_and_the_charts_own_filters_stay_under_the_bin_and_gove
     governed("filters", &chart(&own), &dash, &only_jakarta());
 }
 
+/// Runs `body` on a thread with the stack the API's tokio workers have
+/// ([`crate::config::WORKER_STACK_BYTES`]), not the 2 MiB of a libtest thread.
+///
+/// phase 2 catch-up with main (sqlparser 0.63): the deepest statements
+/// the chart builders emit (a binned breakdown or "Other", whose bin range and
+/// membership subqueries nest the governed relation up to nine levels) need
+/// about 2.1 MiB of stack to *parse* in a debug build, with 0.62 and 0.63
+/// alike (measured: 2148 KiB and 2220 KiB), so a 2 MiB thread overflows or does
+/// not, by where `recursive`'s stack checks happen to fall. A release build needs
+/// about 0.5 MiB. The test now runs where production runs, so it fails if the
+/// runtime's stack ever shrinks below what these statements need.
+fn on_worker_stack(body: impl FnOnce() + Send + 'static) {
+    let handle = std::thread::Builder::new()
+        .name("worker-stack".to_owned())
+        .stack_size(crate::config::WORKER_STACK_BYTES)
+        .spawn(body)
+        .unwrap();
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn a_binned_breakdown_a_binned_grouping_a_pivot_and_other_stay_governed() {
+    on_worker_stack(binned_statements_stay_governed);
+}
+
+fn binned_statements_stay_governed() {
     let policy = only_jakarta();
     governed(
         "binned breakdown",
