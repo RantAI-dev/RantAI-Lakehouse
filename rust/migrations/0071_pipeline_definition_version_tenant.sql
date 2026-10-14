@@ -71,12 +71,12 @@
 --
 -- # Why `tenant_id` is nullable on this table too
 --
--- A row inserted between `0053` and `0057` (every existing
+-- A row inserted between `0053` and `0071` (every existing
 -- `pipeline_definition_version` row today) was never stamped, because
 -- the column did not exist when it was written. This migration backfills
 -- those rows from the still-live `pipeline_definition` (see below); the
 -- column is NULL only for the read paths that historically could not see one.
--- Post-`0057` writes always stamp `tenant_id` from the same transaction
+-- Post-`0071` writes always stamp `tenant_id` from the same transaction
 -- (the create/update/restore paths read it off the live row's
 -- `RETURNING`; the delete path reads it from the pre-delete `SELECT`
 -- inside the same tx). F2.3 keeps the column nullable rather than NOT

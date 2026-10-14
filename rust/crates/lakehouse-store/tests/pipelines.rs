@@ -1593,14 +1593,14 @@ async fn get_definition_version_returns_err_when_snapshot_does_not_decode(
     Ok(())
 }
 
-/// The baseline-backfill `INSERT` of migration `0060`, read out of the
+/// The baseline-backfill `INSERT` of migration `0071`, read out of the
 /// migration file itself and returned as executable SQL.
 ///
 /// The extraction, not a copy, is the point: the previous version of
 /// these tests pasted a hand-maintained duplicate of the statement into
 /// the test body and claimed the test would stop compiling if the
 /// migration changed shape, which was false — the test never read the
-/// file, so editing `rust/migrations/0060_pipeline_definition_version_
+/// file, so editing `rust/migrations/0071_pipeline_definition_version_
 /// tenant.sql` left every test green (measured). Here the statement is
 /// taken from `include_str!`, so editing the migration's semantics
 /// changes what these tests execute and makes them fail;
@@ -1619,9 +1619,9 @@ async fn get_definition_version_returns_err_when_snapshot_does_not_decode(
 /// `INSERT … WHERE NOT EXISTS`, or when that statement is not
 /// `;`-terminated — either is a shape change a human has to look at,
 /// not something to fall back from.
-fn migration_0057_backfill() -> &'static str {
+fn migration_0071_backfill() -> &'static str {
     const MIGRATION: &str =
-        include_str!("../../../migrations/0060_pipeline_definition_version_tenant.sql");
+        include_str!("../../../migrations/0071_pipeline_definition_version_tenant.sql");
     const PREFIX: &str = "INSERT INTO pipeline_definition_version";
     let mut found = MIGRATION
         .match_indices(PREFIX)
@@ -1637,7 +1637,7 @@ fn migration_0057_backfill() -> &'static str {
     assert_eq!(
         found.len(),
         1,
-        "migration 0060 must hold exactly one backfill INSERT … WHERE NOT EXISTS"
+        "migration 0071 must hold exactly one backfill INSERT … WHERE NOT EXISTS"
     );
     found.remove(0)
 }
@@ -1646,7 +1646,7 @@ fn migration_0057_backfill() -> &'static str {
 /// f2-tenant-scope-and-run-config.md`): every pre-`0053`
 /// `pipeline_definition` row had no version row at all — `0053` *made*
 /// the `pipeline_definition_version` table, so legacy rows were
-/// versionless until `0057`'s backfill ran. The backfill writes one
+/// versionless until `0071`'s backfill ran. The backfill writes one
 /// synthetic `event = 'baseline'` row per such pipeline: `version = 1`,
 /// `changed_by = NULL` (no recoverable principal for a synthetic
 /// backfill — attributing it to the migration runner would be a
@@ -1654,7 +1654,7 @@ fn migration_0057_backfill() -> &'static str {
 /// snapshot that round-trips through `PipelineDefinitionSnapshot`. This
 /// test inserts a legacy row, deletes any version rows it has, extracts
 /// and re-runs the migration file's own `INSERT INTO … SELECT … WHERE
-/// NOT EXISTS` statement (see [`migration_0057_backfill`]), and
+/// NOT EXISTS` statement (see [`migration_0071_backfill`]), and
 /// verifies the resulting row through the store's own read paths.
 #[sqlx::test(migrations = "../../migrations")]
 async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
@@ -1705,11 +1705,11 @@ async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
     );
 
     // Execute the migration's own `INSERT … SELECT … WHERE NOT EXISTS`
-    // backfill, read out of `rust/migrations/0060_pipeline_definition_
-    // tenant.sql` by `migration_0057_backfill`. Editing that statement's
+    // backfill, read out of `rust/migrations/0071_pipeline_definition_
+    // tenant.sql` by `migration_0071_backfill`. Editing that statement's
     // semantics in the migration file changes what runs here, so this
     // test fails on a mutated migration instead of drifting away from it.
-    sqlx::query(migration_0057_backfill())
+    sqlx::query(migration_0071_backfill())
         .execute(&pool)
         .await?;
 
@@ -1780,9 +1780,9 @@ async fn baseline_backfill_is_idempotent_under_rerun(pool: PgPool) -> sqlx::Resu
     // backfill's `WHERE NOT EXISTS` clause must skip this pipeline
     // because a version row exists, regardless of its `event`. The
     // statement is the migration file's own (same extraction as the
-    // synthesises test), so editing 0057's predicate changes what runs
+    // synthesises test), so editing 0071's predicate changes what runs
     // here and this assertion fails.
-    sqlx::query(migration_0057_backfill())
+    sqlx::query(migration_0071_backfill())
         .execute(&pool)
         .await?;
     let count: i64 = sqlx::query_scalar(

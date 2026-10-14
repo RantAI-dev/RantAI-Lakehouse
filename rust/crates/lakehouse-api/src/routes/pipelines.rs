@@ -10390,7 +10390,7 @@ mod tests {
         }
 
         /// A version row whose `tenant_id` was never stamped (the
-        /// `tenant_id IS NULL` branch of migration `0060`'s CHECK
+        /// `tenant_id IS NULL` branch of migration `0071`'s CHECK
         /// widening) is visible to the unrestricted caller only — a
         /// restricted caller gets the standard 404.
         #[sqlx::test(migrations = "../../migrations")]
@@ -10399,7 +10399,7 @@ mod tests {
             // Hand-insert a version row with `tenant_id = NULL` for
             // an id that has no live `pipeline_definition` row. This
             // models the post-migration shape: a historical version
-            // row whose live row was deleted before `0057` stamped
+            // row whose live row was deleted before `0071` stamped
             // the column on the version.
             let pl_id = "pl-null-version-orphan";
             insert_deleted_version(&pool, pl_id, 1, "deleted", None).await;
