@@ -581,7 +581,11 @@ jobs:
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # SRC-20: raised from 25 for the G7 step added below. The budget is
+    # the measured G7 wall time (30 s on a clean local stack, with the
+    # authored run itself at 5.6 s) plus 5 minutes of slack, which the
+    # plan allows rather than assuming.
+    timeout-minutes: 30
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
@@ -623,6 +627,30 @@ jobs:
           # `ops/g6/docker-compose.g6.override.yml`'s header comment
           # documents for its own fixtures.
           INGEST_ALLOW_INTERNAL_HOSTS=true
+          # SRC-20: the G7 step below authors a real pipeline, and the
+          # code location builds ZERO authored jobs when this is unset
+          # (`authored_factory._fetch_authored_pipelines` logs
+          # "PIPELINE_RUN_TOKEN is unset; loading with zero
+          # authored-pipeline jobs"), so the trigger answers 409
+          # instead of running. `lakehouse-api` needs the same value (it
+          # bootstraps the `authored-pipeline-scheduler` service identity
+          # from it), which compose passes to both. Same throwaway CI
+          # value every other job that starts an authored pipeline uses
+          # (this is that value's one existing shape in the file).
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # BLD-3 review BLOCKER 1: the G7 step's source assertion
+          # follows the BUILD, and this job's images have no commit. The
+          # `images` job deliberately passes no `GIT_SHA` to either build
+          # (its own comment above: `ARG GIT_SHA` sits near the top of
+          # `dagster/Dockerfile`, so a per-commit value would invalidate
+          # every layer below it and the cache would never hit), so both
+          # images carry `GIT_SHA=unknown` and `pipelines::source` refuses
+          # with 409 by design -- `pipeline_source::check_commit`'s
+          # `is_placeholder` short-circuit. With this set, g7 asserts that
+          # honest refusal instead of demanding source text no image here
+          # can prove; the source TEXT is proven by the local run with a
+          # real commit (`ops/g7/g7_pipeline_test.py`'s module doc).
+          G7_SOURCE_PROVENANCE=unavailable
           EOF
 
       # Fixture images are not shared artifacts: `oidc-mock` is a tiny
@@ -641,6 +669,15 @@ jobs:
 
       - name: Run the G3a end-to-end test inside the compose network
         run: docker compose -p g3aci --profile dagster run --rm g3a-test-runner
+
+      # SRC-20: G7 (`ops/g7/g7_pipeline_test.py`) authors a
+      # Bronze-to-Silver pipeline over the table G3a just loaded, runs it
+      # and asserts the rows it produced. It runs HERE, in this job, not
+      # in a new one: no second image download, no second stack boot, and
+      # no CI time of its own beyond the test itself (measured 30 s on a
+      # clean local stack -- see the `timeout-minutes` above).
+      - name: Run the G7 authored-pipeline test inside the compose network
+        run: docker compose -p g3aci --profile dagster run --rm g7-test-runner
 
       - name: Compose logs (on failure)
         if: failure()
