@@ -26,14 +26,26 @@ use time::OffsetDateTime;
 /// - `sloppy_ranges(true)`: 2.x read `5/10` as "from 5 to the maximum, every
 ///   10" and 4.x rejects it by default (OCPS strict steps). Stored schedules
 ///   and connector `scheduleCron` values written against 2.x keep parsing.
-///   The same flag also admits `/10` (2.x refused it); that only widens what
-///   a human typed, never what a stored 2.x value meant.
+///   The same flag would also admit a bare step such as `/10` (read as
+///   `*/10`), which 2.x refused. A schedule is user input and validation
+///   must not widen silently (fail closed), so a list element that starts
+///   with `/` is refused before `croner` sees it.
 ///
 /// # Errors
 ///
-/// [`CronError`] when `cron_expr` is not a valid five-field cron expression
-/// (or `@` nickname) under the settings above.
+/// [`CronError::InvalidPattern`] for a bare step; otherwise [`CronError`]
+/// when `cron_expr` is not a valid five-field cron expression (or `@`
+/// nickname) under the settings above.
 fn parse_cron(cron_expr: &str) -> Result<Cron, CronError> {
+    if cron_expr
+        .split_whitespace()
+        .flat_map(|field| field.split(','))
+        .any(|element| element.starts_with('/'))
+    {
+        return Err(CronError::InvalidPattern(
+            "a step needs a range or `*` before the `/`".to_owned(),
+        ));
+    }
     CronParser::builder()
         .seconds(Seconds::Disallowed)
         .year(Year::Disallowed)
@@ -118,6 +130,24 @@ mod tests {
         let next = next_run_at("5/10 * * * *", now).expect("2.x accepted the shorthand");
         assert_eq!((next.hour(), next.minute()), (10, 5));
         assert_eq!(ingest_cron_problem("0/15 * * * *"), None);
+    }
+
+    #[test]
+    fn a_bare_step_is_refused_as_croner_2_did() {
+        let now = time::macros::datetime!(2026 - 09 - 11 10:00:00 UTC);
+        for expr in [
+            "/10 * * * *",
+            "*/5 /10 * * *",
+            "1,/10 * * * *",
+            "* * * * /2",
+        ] {
+            assert!(next_run_at(expr, now).is_none(), "{expr}");
+            assert!(ingest_cron_problem(expr).is_some(), "{expr}");
+        }
+        assert!(matches!(
+            parse_cron("/10 * * * *"),
+            Err(CronError::InvalidPattern(_))
+        ));
     }
 
     #[test]
