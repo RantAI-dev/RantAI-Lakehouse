@@ -210,8 +210,10 @@ async fn ingest_run_unknown_connector_is_404() {
 }
 
 /// A `Dagster`-reported launch failure (`RunConfigValidationInvalid`, a
-/// `PythonError`, ...) is a 422 naming the failure — never a 200 claiming
-/// success, and never the raw transport-error branch (Z9's trap).
+/// `PythonError`, ...) is a 422 with the FIXED classified body
+/// `"Dagster did not accept the ingest run"` (F2.7 — never the raw
+/// upstream `message` text, never a 200 claiming success, never the
+/// raw transport-error branch (Z9's trap)).
 #[tokio::test]
 async fn ingest_run_dagster_launch_failure_is_422_not_200() {
     let server = MockServer::start().await;
@@ -248,16 +250,12 @@ async fn ingest_run_dagster_launch_failure_is_422_not_200() {
         .await
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    // SEC-11: this used to assert that Dagster's own message ("job not
-    // found") reached the body; that asserted the bug. The body now carries
-    // a fixed sentence and a reference, and the orchestrator's text is only
-    // in the log.
-    let message = body["error"].as_str().expect("an error message");
-    assert!(
-        message.starts_with("The request to a backing service failed. Reference: "),
-        "{message}"
-    );
-    assert!(!message.contains("job not found"), "{message}");
+    // SEC-11 + F2.7: this used to assert that Dagster's own message ("job not
+    // found") reached the body; that asserted the bug. The body is now the
+    // fixed sentence `LaunchFailure` allows, and the orchestrator's text is
+    // only in the log.
+    assert_eq!(body["error"], "Dagster did not accept the ingest run");
+    assert!(!body.to_string().contains("job not found"), "{body}");
 }
 
 /// Posts `ingest/run` for `connector_id` against a `Dagster` that answers the
@@ -340,8 +338,8 @@ async fn ingest_run_job_not_loaded_is_a_503_with_a_code_and_no_upstream_text() {
     }
 }
 
-/// Any other Dagster launch failure keeps the generic 422: a reference, no
-/// code, no upstream text. Words that merely look like "not loaded" in the
+/// Any other Dagster launch failure keeps the generic 422: a fixed sentence,
+/// no code, no upstream text. Words that merely look like "not loaded" in the
 /// message do not make it one; only the typed fields do.
 #[tokio::test]
 async fn ingest_run_other_launch_failures_stay_generic_without_a_code() {
@@ -354,11 +352,9 @@ async fn ingest_run_other_launch_failures_stay_generic_without_a_code() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(retry_after.is_none());
     assert!(body.get("code").is_none(), "{body}");
-    let message = body["error"].as_str().expect("an error message");
-    assert!(
-        message.starts_with("The request to a backing service failed. Reference: "),
-        "{message}"
-    );
+    // F2.7: the generic 422 body is the fixed sentence; the reference moved
+    // to the dagster crate's log line with the raw text.
+    assert_eq!(body["error"], "Dagster did not accept the ingest run");
     assert!(!body.to_string().contains("planted-marker"), "{body}");
 }
 

@@ -49,3 +49,28 @@ touched. If a task cannot be finished, push the others and report.
 - arrow/parquet 60;
 - TypeScript 7, eslint 10, TanStack Table 9;
 - the `pymongo` recreate.
+
+## Handoff (developer, summarised by the planner)
+
+| Commit | Task | Result |
+| --- | --- | --- |
+| `439b1fb` | 1 | `serde_json` 1.0.154, `sqlparser` 0.63, `motion` 14.1, `react-day-picker` 10.0.2, `lucide-react` 1.55 |
+| `ea4723a` | 2 | 18 of #131's 20 updates. `next` and `eslint-config-next` stay at 16.1.6: CI's build fails with a Bun error the developer could not reproduce locally (`REL-8`). The CodeMirror packages were re-added so the lockfile holds one `@codemirror/state`; a nested copy failed "QueryStudioPage Fix with AI" |
+| `d7bc7ee` | 3 | `croner` 4: one `parse_cron` helper (5 fields, no seconds or year, `sloppy_ranges` for `5/10`) |
+| `28db2b5` | review fix | A bare step (`/10`) is still refused, as under `croner` 2.x |
+
+Checks run by the developer:
+- `cargo fmt --check` and `cargo clippy -p lakehouse-api --all-targets -- -D warnings` passed.
+- `cargo test -p lakehouse-api`: lib 1595 passed and bin 1641 passed; 36 integration binaries, 323 passed.
+- `bun install --frozen-lockfile`, typecheck, lint, test (1165 pass) and build all passed.
+
+Not verified locally: `cargo deny`/`cargo audit` and the workspace-wide block; CI runs them.
+
+## Review (planner)
+
+- **`sqlparser` 0.63**: the changelog has no change to `SELECT`, identifier, `SETTINGS` or table-function parsing.
+  - The developer noted that `substitute_in_function` skips `FunctionArg::ExprNamed`.
+  - That is not a leak: `substitute_governed_tables`' post-pass backstop refuses a statement whose governed table was not reached (`UnprovableSubstitution`, `sql_rewrite.rs:484-492`). At worst such a query is refused. No ticket.
+- **`croner` 4**: same behaviour as 2.x, including refusing `/10` (review fix `28db2b5`, with a test).
+- **#131**: everything but `next` applied. `next` 16.4 is `REL-8`.
+- No `BLOCKER`.
