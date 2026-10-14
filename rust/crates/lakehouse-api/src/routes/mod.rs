@@ -21,7 +21,8 @@ mod dashboard;
 mod dashboard_folders;
 mod dashboard_sources;
 mod embed;
-pub mod gold;
+// DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
+mod gold;
 mod governance;
 mod home;
 mod identity;

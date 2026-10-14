@@ -340,6 +340,88 @@ pub async fn last_success_fingerprint(
         .filter(|s| !s.is_empty()))
 }
 
+/// DATA-10 review SHOULD-FIX 1: Whether `{schema}.{mart}` exists in `system.tables`.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the query fails.
+pub async fn mart_exists(ch: &ChClient, schema: &str, mart: &str) -> Result<bool, ChError> {
+    let sql = format!(
+        "SELECT toString(count()) AS n FROM system.tables \
+         WHERE database = {schema} AND name = {mart}",
+        schema = SqlLiteral::from(schema),
+        mart = SqlLiteral::from(mart),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("n"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| n != "0"))
+}
+
+/// DATA-10 review SHOULD-FIX 1: Read the content fingerprint of `mart` in `schema`.
+///
+/// Computes `count()`, `sum(cityHash64(*))`, and a hash of the column
+/// list from `system.columns`. Returns `Some("<count>:<sum>:<schemaHash>")`,
+/// or `None` if the mart does not exist in `system.tables`.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if a `ClickHouse` query fails.
+pub async fn mart_content_fingerprint(
+    ch: &ChClient,
+    schema: &str,
+    mart: &str,
+) -> Result<Option<String>, ChError> {
+    if !mart_exists(ch, schema, mart).await? {
+        return Ok(None);
+    }
+    let sql = content_fingerprint_sql(schema, mart);
+    let rows = ch.rows(&sql, None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(parse_content_fingerprint_row(row))
+}
+
+// DATA-10 review SHOULD-FIX 1 / Nit: use `\` line continuations like the other queries in the file.
+fn content_fingerprint_sql(schema: &str, mart: &str) -> String {
+    format!(
+        "SELECT \
+             toString(count()) AS row_count, \
+             toString(ifNull(sum(cityHash64(*)), toUInt64(0))) AS content_sum, \
+             ( \
+                 SELECT toString(cityHash64(groupArray(concat(name, \x27:\x27, type)))) \
+                 FROM ( \
+                     SELECT name, type \
+                     FROM system.columns \
+                     WHERE database = {schema_lit} AND table = {mart_lit} \
+                     ORDER BY position \
+                 ) \
+             ) AS schema_hash \
+         FROM `{clean_schema}`.`{clean_mart}` FORMAT JSON",
+        schema_lit = SqlLiteral::from(schema),
+        mart_lit = SqlLiteral::from(mart),
+        clean_schema = schema.replace('`', "``"),
+        clean_mart = mart.replace('`', "``"),
+    )
+}
+
+fn parse_content_fingerprint_row(row: &serde_json::Map<String, Value>) -> Option<String> {
+    let str_val = |key: &str| -> Option<String> {
+        row.get(key).and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    };
+    let row_count = str_val("row_count")?;
+    let content_sum = str_val("content_sum")?;
+    let schema_hash = str_val("schema_hash")?;
+    Some(format!("{row_count}:{content_sum}:{schema_hash}"))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -450,5 +532,53 @@ mod tests {
         assert_eq!(row.rows_exported, None);
         assert_eq!(row.format_version, None);
         assert_eq!(row.snapshot_id, None);
+    }
+    // ── content_fingerprint (DATA-10 T1 / SHOULD-FIX 1) ─────────────────
+
+    #[test]
+    fn content_fingerprint_sql_escapes_identifiers_and_queries_columns() {
+        let sql = content_fingerprint_sql("serving", "sales'; DROP TABLE x; --");
+        assert!(sql.contains("sum(cityHash64(*))"), "{sql}");
+        assert!(sql.contains("system.columns"), "{sql}");
+        assert!(sql.contains("groupArray(concat(name, ':', type))"), "{sql}");
+        assert!(sql.contains("ORDER BY position"), "{sql}");
+        assert!(sql.contains("'sales''; DROP TABLE x; --'"), "{sql}");
+        assert!(sql.contains("'serving'"), "{sql}");
+        assert!(
+            sql.contains("`serving`.`sales'; DROP TABLE x; --`"),
+            "{sql}"
+        );
+
+        let sql_backtick = content_fingerprint_sql("serv`ing", "sal`es");
+        assert!(
+            sql_backtick.contains("`serv``ing`.`sal``es`"),
+            "{sql_backtick}"
+        );
+    }
+
+    #[test]
+    fn parse_content_fingerprint_row_keeps_large_uint64_exact() {
+        // UInt64 sum above 2^53 (9_007_199_254_740_992) must not suffer
+        // float rounding.
+        let large_sum = "17600050468841063192";
+        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "row_count": "42",
+            "content_sum": large_sum,
+            "schema_hash": "987654321012345678"
+        }))
+        .unwrap();
+        let fp = parse_content_fingerprint_row(&row).expect("fingerprint parsed");
+        assert_eq!(fp, format!("42:{large_sum}:987654321012345678"));
+    }
+
+    #[test]
+    fn parse_content_fingerprint_row_returns_none_on_missing_field() {
+        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "row_count": "42",
+            "content_sum": null,
+            "schema_hash": "123"
+        }))
+        .unwrap();
+        assert!(parse_content_fingerprint_row(&row).is_none());
     }
 }

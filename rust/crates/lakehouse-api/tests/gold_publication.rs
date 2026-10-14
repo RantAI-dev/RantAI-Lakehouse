@@ -391,7 +391,8 @@ async fn publication_detail_reports_changed_since_export_accurately() {
 
     // 2. Exported with current fingerprint -> changedSinceExport is false (Up to date).
     let fp =
-        lakehouse_api::routes::gold::mart_content_fingerprint(&ch, "serving", "fp_status_mart")
+// DATA-10 review SHOULD-FIX 1: mart_content_fingerprint in gold_export_history
+        lakehouse_api::gold_export_history::mart_content_fingerprint(&ch, "serving", "fp_status_mart")
             .await
             .expect("fingerprint read")
             .expect("fingerprint present");
@@ -498,10 +499,12 @@ async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
 async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "quiet_mart").await;
-    let fp = lakehouse_api::routes::gold::mart_content_fingerprint(&ch, "serving", "quiet_mart")
-        .await
-        .expect("read fingerprint")
-        .expect("quiet_mart has a fingerprint");
+    // DATA-10 review SHOULD-FIX 1: mart_content_fingerprint in gold_export_history
+    let fp =
+        lakehouse_api::gold_export_history::mart_content_fingerprint(&ch, "serving", "quiet_mart")
+            .await
+            .expect("read fingerprint")
+            .expect("quiet_mart has a fingerprint");
     seed_success_run_with_fingerprint(&ch, "quiet_mart", unix_ms(-3_600), &fp).await;
     let sessions = Sessions { app };
     let cookie = sessions.with("gold:export").await;

@@ -52,12 +52,12 @@
 //!
 //! # Content Fingerprint & Cost (DATA-10, D5)
 //!
-//! `?ifChanged=true` skips export when the ClickHouse content fingerprint
+//! `?ifChanged=true` skips export when the `ClickHouse` content fingerprint
 //! (row count, wrapping 64-bit sum of `cityHash64(*)`, and schema hash)
 //! matches the last successful export. A full scan over a 5,000,000-row mart
-//! (`GOLD_EXPORT_MAX_ROWS`) with 4 realistic columns (UInt64, String, Float64,
-//! DateTime) measured 187 ms (0.187s) on ClickHouse 26.8 running on Linux
-//! x86_64 (7.9 GB RAM, 6 vCPUs).
+//! (`GOLD_EXPORT_MAX_ROWS`) with 4 realistic columns (`UInt64`, `String`, `Float64`,
+//! `DateTime`) measured 187 ms (0.187s) on `ClickHouse` 26.8 running on Linux
+//! `x86_64` (7.9 GB RAM, 6 vCPUs).
 
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
@@ -320,9 +320,9 @@ pub async fn export(
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
-    // DATA-10 D2: The fingerprint is computed before the export reads rows,
-    // and written on the history row of that export.
-    let current_fingerprint = mart_content_fingerprint(
+    // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
+    // the export reads rows, and written on the history row of that export.
+    let current_fingerprint = gold_export_history::mart_content_fingerprint(
         &state.clickhouse,
         &state.config.gold_source_schema,
         mart_ident.as_str(),
@@ -649,19 +649,9 @@ pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
 ///
 /// Returns [`ChError`] if the query fails (a dead `ClickHouse` surfaces
 /// as its classified [`ApiError`], never raw text).
+// DATA-10 review SHOULD-FIX 1: delegating to gold_export_history::mart_exists
 async fn mart_exists(ch: &ChClient, schema: &str, mart: &str) -> Result<bool, ChError> {
-    let sql = format!(
-        "SELECT toString(count()) AS n FROM system.tables \
-         WHERE database = {schema} AND name = {mart}",
-        schema = lakehouse_core::ident::SqlLiteral::from(schema),
-        mart = lakehouse_core::ident::SqlLiteral::from(mart),
-    );
-    let rows = ch.rows(&sql, None).await?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.get("n"))
-        .and_then(Value::as_str)
-        .is_some_and(|n| n != "0"))
+    gold_export_history::mart_exists(ch, schema, mart).await
 }
 
 /// Unix-millisecond `max(modification_time)` over the active parts of
@@ -706,58 +696,6 @@ async fn mart_last_changed_at(
         .map(|s| s * 1000))
 }
 
-/// DATA-10: Read the content fingerprint of `mart` in `schema`.
-///
-/// Computes `count()`, `sum(cityHash64(*))`, and a hash of the column
-/// list from `system.columns`. Returns `Some("<count>:<sum>:<schemaHash>")`,
-/// or `None` if the mart does not exist in `system.tables`.
-///
-/// DATA-10: Computes the content fingerprint for `mart` in `schema`.
-/// Returns `None` if the mart does not exist.
-///
-/// # Errors
-///
-/// Returns [`ChError`] if a `ClickHouse` query fails.
-pub async fn mart_content_fingerprint(
-    ch: &ChClient,
-    schema: &str,
-    mart: &str,
-) -> Result<Option<String>, ChError> {
-    if !mart_exists(ch, schema, mart).await? {
-        return Ok(None);
-    }
-    let sql = content_fingerprint_sql(schema, mart);
-    let rows = ch.rows(&sql, None).await?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    Ok(parse_content_fingerprint_row(row))
-}
-
-fn content_fingerprint_sql(schema: &str, mart: &str) -> String {
-    format!(
-        "SELECT             toString(count()) AS row_count,             toString(ifNull(sum(cityHash64(*)), toUInt64(0))) AS content_sum,             (                 SELECT toString(cityHash64(groupArray(concat(name, ':', type))))                 FROM (                     SELECT name, type                     FROM system.columns                     WHERE database = {schema_lit} AND table = {mart_lit}                     ORDER BY position                 )             ) AS schema_hash          FROM `{clean_schema}`.`{clean_mart}` FORMAT JSON",
-        schema_lit = lakehouse_core::ident::SqlLiteral::from(schema),
-        mart_lit = lakehouse_core::ident::SqlLiteral::from(mart),
-        clean_schema = schema.replace('`', "``"),
-        clean_mart = mart.replace('`', "``"),
-    )
-}
-
-fn parse_content_fingerprint_row(row: &serde_json::Map<String, Value>) -> Option<String> {
-    let str_val = |key: &str| -> Option<String> {
-        row.get(key).and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
-    };
-    let row_count = str_val("row_count")?;
-    let content_sum = str_val("content_sum")?;
-    let schema_hash = str_val("schema_hash")?;
-    Some(format!("{row_count}:{content_sum}:{schema_hash}"))
-}
-
 /// The response body shared by the publication detail `GET` and `PUT`:
 /// the stored switch plus the two measured freshness facts the console's
 /// "Up to date"/"Out of date" line compares.
@@ -797,10 +735,14 @@ async fn publication_body(
     let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
         .map_err(ApiError::from)?;
-    let current_fingerprint =
-        mart_content_fingerprint(&state.clickhouse, &state.config.gold_source_schema, mart)
-            .await
-            .map_err(ApiError::from)?;
+    // DATA-10 review SHOULD-FIX 1: mart_content_fingerprint moved to gold_export_history
+    let current_fingerprint = gold_export_history::mart_content_fingerprint(
+        &state.clickhouse,
+        &state.config.gold_source_schema,
+        mart,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let changed_since_export = compute_changed_since_export(
         current_fingerprint.as_deref(),
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
@@ -1254,54 +1196,5 @@ mod tests {
             matches!(result.unwrap_err(), ApiError::Unprocessable(_)),
             "ClickHouse read error is classified as Unprocessable"
         );
-    }
-
-    // ── content_fingerprint (DATA-10 T1) ────────────────────────────────
-
-    #[test]
-    fn content_fingerprint_sql_escapes_identifiers_and_queries_columns() {
-        let sql = content_fingerprint_sql("serving", "sales'; DROP TABLE x; --");
-        assert!(sql.contains("sum(cityHash64(*))"), "{sql}");
-        assert!(sql.contains("system.columns"), "{sql}");
-        assert!(sql.contains("groupArray(concat(name, ':', type))"), "{sql}");
-        assert!(sql.contains("ORDER BY position"), "{sql}");
-        assert!(sql.contains("'sales''; DROP TABLE x; --'"), "{sql}");
-        assert!(sql.contains("'serving'"), "{sql}");
-        assert!(
-            sql.contains("`serving`.`sales'; DROP TABLE x; --`"),
-            "{sql}"
-        );
-
-        let sql_backtick = content_fingerprint_sql("serv`ing", "sal`es");
-        assert!(
-            sql_backtick.contains("`serv``ing`.`sal``es`"),
-            "{sql_backtick}"
-        );
-    }
-
-    #[test]
-    fn parse_content_fingerprint_row_keeps_large_uint64_exact() {
-        // UInt64 sum above 2^53 (9_007_199_254_740_992) must not suffer
-        // float rounding.
-        let large_sum = "17600050468841063192";
-        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
-            "row_count": "42",
-            "content_sum": large_sum,
-            "schema_hash": "987654321012345678"
-        }))
-        .unwrap();
-        let fp = parse_content_fingerprint_row(&row).expect("fingerprint parsed");
-        assert_eq!(fp, format!("42:{large_sum}:987654321012345678"));
-    }
-
-    #[test]
-    fn parse_content_fingerprint_row_returns_none_on_missing_field() {
-        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
-            "row_count": "42",
-            "content_sum": null,
-            "schema_hash": "123"
-        }))
-        .unwrap();
-        assert!(parse_content_fingerprint_row(&row).is_none());
     }
 }
