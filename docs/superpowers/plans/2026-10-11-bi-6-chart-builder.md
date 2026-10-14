@@ -315,3 +315,13 @@ Stage 1 passed functionally (two aggregations with honest labels, top 5 with `Ot
 - `SHOULD-FIX` R13 — The preview's "Rows" panel labels columns with raw result names ("sum_visitors") while the table above says "total visitors"; use the same labels.
 
 Visual check after the console is rebuilt: a new bar chart with nothing done (type list collapsed after choosing, only section 1 open), the same chart with all three sections done (three summary lines), and an edited saved chart.
+
+### Chart builder, round 3 — owner's QA stage 2 (reviewer, 2026-10-14)
+
+Stage 2 passed functionally: join with the suggested pair and a joined measure, number bins, drill down a hierarchy with the trail, a value group. Seen on the round-1 builder (round 2 was not yet on the console). Console only.
+
+- `BLOCKER` R14 — Long column names break the form. In the measure picker, joined columns are cut off (`mart_demo_province_capacity.h…`); once one is chosen the select shows the raw result name `mart_demo_province_capacity__rooms` and the whole form scrolls sideways. Pickers must show the readable label everywhere (the list, the closed select, summaries, the legend), never the `__` form; long labels truncate with an ellipsis inside the control and show in full on hover (title) and in the list; the list may be wider than its trigger; nothing in the form may cause horizontal scrolling at the dialog's minimum width. Prefer showing a joined column as the column name with a small source tag (`rooms` · capacity) rather than the full `table.column` string.
+- `BLOCKER` R15 — Grid alignment. Controls that appear conditionally (the bin "Group in" under a number dimension, the grain "Group by" under a date) push one column down and leave the row misaligned (Dimension and Breakdown no longer line up). Lay out section 2 so conditional controls take their own row spanning the width, or sit under their parent without shifting the neighbour; check every kind's conditional controls (bin, grain, map region, lat/lon, KPI compare) at the dialog's minimum and default widths.
+- `SHOULD-FIX` R16 — Legends with long series names ("max of mart_demo_province_capacity.rooms") use the same short label as R14 ("max of rooms") and truncate in the legend with the full name in the tooltip.
+
+After this round, the reviewer takes screenshots at the dialog's default size of: a bar with a joined measure chosen, a bar with a number dimension in bins, a line with a date dimension and a grain.
