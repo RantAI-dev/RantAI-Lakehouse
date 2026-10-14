@@ -280,6 +280,29 @@ past `in_scope` at all, so both now seed a row and call as
                                                     #  Iceberg table found."
    ```
 
+4. **Dagster tests.**
+
+   The venv the earlier session was said to have made does not exist
+   (`/home/shiro/rantai/venv-bld3` and `dagster/.venv` are both absent,
+   and system `python3` has no `pytest`), so it was rebuilt the way
+   `.github/workflows/ci.yml` installs it, under `.heavy.lock`:
+   `uv venv --python 3.11 /home/shiro/rantai/venv-bld3` then
+   `uv pip install ./dagster pytest==8.3.4`.
+
+   ```
+   cd dagster && python -m pytest dispar_orchestrate -q
+   # 1039 passed, 0 failed, 585 warnings in 931.46s (0:15:31)
+   ```
+
+   One suite, no skips reported, no failures. (The suite the plan's
+   T2 check names, `test_authored_factory.py`, is inside it.)
+
+5. **Compose config.**
+
+   ```
+   docker compose --profile '*' config --quiet   # rc 0, no output
+   ```
+
 ### Section 6 answers
 
 (Appended after the run.)
