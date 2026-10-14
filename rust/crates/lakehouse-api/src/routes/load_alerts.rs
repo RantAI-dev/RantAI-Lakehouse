@@ -379,6 +379,8 @@ pub(super) async fn connector_run_event(
         outcome.event_kind(),
         outcome == Outcome::Success,
         run_end(info.end_time),
+        // `SRC-11` D3: the count that pauses the connector.
+        state.config.connector_auto_disable_after,
     )
     .await?;
     // `SRC-17` F2 (delivery review 2026-10-12): read the rules BEFORE the

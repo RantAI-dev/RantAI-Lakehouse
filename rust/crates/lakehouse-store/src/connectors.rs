@@ -1528,6 +1528,37 @@ pub async fn record_test_result(
 /// the store's health rule and the API's alert trigger, so they cannot drift.
 pub const REPEATED_FAILURE_STREAK: i32 = 3;
 
+/// Failed runs in a row at which a connector is paused (`SRC-11` decision D3,
+/// Airbyte's threshold). The API reads `CONNECTOR_AUTO_DISABLE_AFTER` and
+/// passes the value to [`record_run_once`]; this is the default.
+pub const DEFAULT_AUTO_DISABLE_AFTER: i32 = 30;
+
+/// The words of the pause an auto-disable sets, either side of the number
+/// (`SRC-11` decision D3: "Paused after 30 failed runs in a row"). The number
+/// comes from the setting, so [`is_auto_disable_pause_reason`] recognises the
+/// pause by its shape, not by one number: a pause set when the setting was 30
+/// is still resumable after the setting was changed.
+const AUTO_DISABLE_REASON_HEAD: &str = "Paused after ";
+const AUTO_DISABLE_REASON_TAIL: &str = " failed runs in a row";
+
+/// The `paused_reason` an auto-disable after `after` failed runs writes.
+#[must_use]
+pub fn auto_disable_pause_reason(after: i32) -> String {
+    format!("{AUTO_DISABLE_REASON_HEAD}{after}{AUTO_DISABLE_REASON_TAIL}")
+}
+
+/// Whether `reason` is a pause written by an auto-disable, and so the only
+/// pause [`resume_connector`] lifts (`SRC-11` decision D4). A pause set by
+/// the schema-change policy ([`crate::schema_change::SCHEMA_CHANGE_PAUSE_REASON`])
+/// or by anything else is not.
+#[must_use]
+pub fn is_auto_disable_pause_reason(reason: &str) -> bool {
+    reason
+        .strip_prefix(AUTO_DISABLE_REASON_HEAD)
+        .and_then(|rest| rest.strip_suffix(AUTO_DISABLE_REASON_TAIL))
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// What [`record_run_result`] leaves on the connector row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHealth {
@@ -1559,6 +1590,12 @@ pub struct RunRecord {
     /// value of the first report, also returned to its retries. `None` only
     /// for a run counted before `0069` kept it.
     pub failure_streak: Option<i32>,
+    /// `true` when THIS run's failure paused the connector (`SRC-11` D3): the
+    /// streak reached the auto-disable threshold and nothing had paused the
+    /// connector yet. Also `true` for a retry of that run's report, which is
+    /// what lets the retry deliver `connector_disabled` once after a rule-store
+    /// failure (the same reason the streak is kept per run).
+    pub auto_disabled: bool,
 }
 
 /// Count one real run on the connector exactly once, and remember the streak
@@ -1574,6 +1611,18 @@ pub struct RunRecord {
 /// `kind` is the dedupe kind of the outcome (`"failure"` or `"success"`,
 /// `routes::load_alerts::Outcome::event_kind`).
 ///
+/// # Auto-disable (`SRC-11` decision D3)
+///
+/// A failed run that brings the streak to `auto_disable_after` or more pauses
+/// the connector, in the same transaction as the count, with
+/// [`auto_disable_pause_reason`]. It pauses once: a connector that is already
+/// paused (by the schema-change policy, say) keeps its pause and its reason,
+/// and the run is not reported as having disabled it. When this run did pause
+/// it, a dedupe row `(run_id, "auto_disabled")` is written with it, so
+/// [`RunRecord::auto_disabled`] is the same answer for the run's retries and
+/// the caller raises `connector_disabled` exactly once. A success resets the
+/// streak, as before; it never lifts a pause.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] if `id` does not name a connector (the
@@ -1586,6 +1635,7 @@ pub async fn record_run_once(
     kind: &str,
     succeeded: bool,
     at: OffsetDateTime,
+    auto_disable_after: i32,
 ) -> Result<RunRecord, StoreError> {
     let mut tx = pool.begin().await?;
     let inserted: Option<(String,)> = sqlx::query_as(
@@ -1607,10 +1657,19 @@ pub async fn record_run_once(
         .bind(kind)
         .fetch_optional(&mut *tx)
         .await?;
+        let auto_disabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_run_event \
+             WHERE run_id = $1 AND kind = $2)",
+        )
+        .bind(run_id)
+        .bind(AUTO_DISABLED_KIND)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(RunRecord {
             first_seen: false,
             failure_streak: stored.and_then(|(streak,)| streak),
+            auto_disabled,
         });
     }
     let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
@@ -1632,11 +1691,97 @@ pub async fn record_run_once(
     .bind(failure_streak)
     .execute(&mut *tx)
     .await?;
+    // `SRC-11` D3: the pause and its dedupe row are part of counting the run.
+    // `paused_at IS NULL` makes it pause once, and leave another pause alone.
+    let mut auto_disabled = false;
+    if !succeeded && failure_streak >= auto_disable_after {
+        let paused: Option<(String,)> = sqlx::query_as(
+            "UPDATE connector SET paused_reason = $2, paused_at = $3 \
+             WHERE id = $1 AND paused_at IS NULL RETURNING id",
+        )
+        .bind(id)
+        .bind(auto_disable_pause_reason(auto_disable_after))
+        .bind(at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if paused.is_some() {
+            sqlx::query(
+                "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(run_id)
+            .bind(format!("connector:{id}"))
+            .bind(AUTO_DISABLED_KIND)
+            .execute(&mut *tx)
+            .await?;
+            auto_disabled = true;
+        }
+    }
     tx.commit().await?;
     Ok(RunRecord {
         first_seen: true,
         failure_streak: Some(failure_streak),
+        auto_disabled,
     })
+}
+
+/// The `pipeline_run_event.kind` of the row that records that a run's failure
+/// paused the connector (`SRC-11` decision D3). Not one of the outcome kinds
+/// (`failure`, `success`, `*_alerted`, `slow`, `volume_drop`).
+const AUTO_DISABLED_KIND: &str = "auto_disabled";
+
+/// What [`resume_connector`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The auto-disable pause was lifted and the failure streak is 0.
+    Resumed,
+    /// The connector is not paused; nothing changed.
+    NotPaused,
+    /// The connector is paused for another reason (the schema-change policy,
+    /// for one); nothing changed.
+    PausedForAnotherReason,
+}
+
+/// Resume a connector that an auto-disable paused (`SRC-11` decision D4): lift
+/// the pause, set the failure streak back to 0 (so it gets the full number of
+/// tries again) and its health to `unknown` until its next run says. Only a
+/// pause [`is_auto_disable_pause_reason`] recognises is lifted; a
+/// schema-change pause is lifted by approving the change (`SRC-8`).
+///
+/// The row is locked while the reason is read, so a pause set a moment later
+/// by something else is not lifted by mistake.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, Option<OffsetDateTime>)> =
+        sqlx::query_as("SELECT paused_reason, paused_at FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((reason, paused_at)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    if paused_at.is_none() {
+        return Ok(ResumeOutcome::NotPaused);
+    }
+    let Some(reason) = reason.filter(|r| is_auto_disable_pause_reason(r)) else {
+        return Ok(ResumeOutcome::PausedForAnotherReason);
+    };
+    sqlx::query(
+        "UPDATE connector SET paused_reason = NULL, paused_at = NULL, failure_streak = 0, \
+           health = 'unknown' \
+         WHERE id = $1 AND paused_reason = $2",
+    )
+    .bind(id)
+    .bind(&reason)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ResumeOutcome::Resumed)
 }
 
 /// Record the outcome of one real run (not a manual test) on the connector:

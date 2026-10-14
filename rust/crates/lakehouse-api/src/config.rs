@@ -751,6 +751,14 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Failed connector runs in a row at which the connector is paused and
+    /// `connector_disabled` is raised (`SRC-11` decision D3), from
+    /// `CONNECTOR_AUTO_DISABLE_AFTER`. Zero, negative, or unparseable values
+    /// fall back to the default (30,
+    /// `lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER`). The gate
+    /// lowers it for its own job and says so; it is not a per-connector
+    /// setting.
+    pub connector_auto_disable_after: i32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -941,6 +949,10 @@ impl std::fmt::Debug for Config {
             .field("login_failure_window_secs", &self.login_failure_window_secs)
             .field("login_lockout_secs", &self.login_lockout_secs)
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "connector_auto_disable_after",
+                &self.connector_auto_disable_after,
+            )
             .finish()
     }
 }
@@ -1260,6 +1272,12 @@ impl Config {
             ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
+                env,
+                "CONNECTOR_AUTO_DISABLE_AFTER",
+                30,
+            ))
+            .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
         })
     }
 
@@ -1582,6 +1600,26 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         assert_eq!(cfg.gold_export_max_rows, 5_000_000);
         assert_eq!(cfg.gold_export_batch_size, 20_000);
+    }
+
+    /// `SRC-11` decision D3: 30 failed runs in a row unless the gate (or an
+    /// operator) sets another positive number; garbage keeps the default.
+    #[test]
+    fn connector_auto_disable_after_defaults_to_thirty_and_ignores_garbage() {
+        let default = lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER;
+        assert_eq!(default, 30);
+        assert_eq!(
+            Config::from_map(&map(&[]))
+                .unwrap()
+                .connector_auto_disable_after,
+            default
+        );
+        for bad in ["0", "-3", "many", ""] {
+            let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", bad)])).unwrap();
+            assert_eq!(cfg.connector_auto_disable_after, default, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
+        assert_eq!(cfg.connector_auto_disable_after, 4);
     }
 
     /// The compose stack's documented opt-out — only the literal string
