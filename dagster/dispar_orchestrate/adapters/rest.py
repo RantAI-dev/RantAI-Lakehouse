@@ -63,7 +63,7 @@ token of the two OAuth kinds:
   and secret; `oauth2_authorization_code` asks it with the stored REFRESH
   token (`grant_type=refresh_token`; the person's sign-in happened in the API).
 - A token is fetched before the first request, fetched AGAIN when it has
-  expired (`expires_in`, with a margin) and once more when the source answers
+  expired (`expires_in`, less a margin of 30 seconds or a fifth of it) and once more when the source answers
   401 to a request (`_authed_get`). Access tokens live in memory only, never
   in a file, a log line or a report.
 - If the provider rotates the refresh token, the new one is sent to the API
@@ -104,8 +104,8 @@ logger = logging.getLogger(__name__)
 # words are never read into an exception, a log line or a report.
 SIGN_IN_AGAIN = "sign in again"
 
-# Seconds taken off a token's `expires_in` so it is replaced before the source
-# sees it expire, and the bound on one token request.
+# Seconds taken off a token's `expires_in` (at most a fifth of it) so it is
+# replaced before the source sees it expire, and the bound on one token request.
 _EXPIRY_MARGIN_SECONDS = 30
 _TOKEN_TIMEOUT_SECONDS = 10
 
@@ -270,7 +270,11 @@ class AuthSession:
     def _with_token(self, body: dict) -> dict:
         expires_in = body.get("expires_in")
         if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and expires_in > 0:
-            self._expires_at = self._clock() + max(expires_in - _EXPIRY_MARGIN_SECONDS, 0)
+            # A margin, so the token is replaced before the source sees it expire:
+            # 30 seconds, or a fifth of a shorter lifetime (a 5-second token is
+            # replaced after 4, not at once).
+            margin = min(_EXPIRY_MARGIN_SECONDS, expires_in * 0.2)
+            self._expires_at = self._clock() + (expires_in - margin)
         else:
             # No stated lifetime: replaced only after a 401.
             self._expires_at = None

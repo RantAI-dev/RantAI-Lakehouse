@@ -278,16 +278,29 @@ def test_another_error_status_is_not_a_reason_to_ask_for_a_new_token(provider):
 
 @pytest.mark.parametrize("auth,secrets", [(CODE_AUTH, CODE_SECRETS), (CC_AUTH, CC_SECRETS)])
 def test_an_expired_access_token_is_replaced_before_the_next_request(provider, auth, secrets):
-    fake = provider(_token("access-1", expires_in=5 + 30), _token("access-2", expires_in=3600))
+    # 100 seconds, less a margin of 30 or a fifth of it (20): replaced after 80.
+    fake = provider(_token("access-1", expires_in=100), _token("access-2", expires_in=3600))
     clock = _Clock()
     session = _session(auth, secrets, clock=clock)
     assert session.headers()["Authorization"] == "Bearer access-1"
-    clock.now += 4  # still inside the five seconds the margin leaves
+    clock.now += 79
     assert session.headers()["Authorization"] == "Bearer access-1"
     assert len(fake.calls) == 1
-    clock.now += 2  # past it
+    clock.now += 2
     assert session.headers()["Authorization"] == "Bearer access-2"
     assert len(fake.calls) == 2
+
+
+def test_a_short_lived_token_is_replaced_after_four_fifths_of_its_life_not_at_once(provider):
+    fake = provider(_token("access-1", expires_in=5), _token("access-2", expires_in=5))
+    clock = _Clock()
+    session = _session(clock=clock)
+    session.headers()
+    clock.now += 3.9
+    session.headers()
+    assert len(fake.calls) == 1
+    clock.now += 0.2
+    assert session.headers()["Authorization"] == "Bearer access-2"
 
 
 def test_client_credentials_ask_for_a_token_with_the_client_credentials_grant_and_get_the_401_rule(provider):

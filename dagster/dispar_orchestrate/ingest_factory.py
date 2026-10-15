@@ -729,6 +729,11 @@ def _run_one_object(
     except SecretRefRejected as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise
+    except rest_adapter.OAuthSignInRefused as exc:
+        # SRC-12 part C: nobody has signed in (no refresh token to read). A failure,
+        # not a rejected setting; the row names the type only, like every other.
+        _record(rows=None, status="failed", error=_classify_exception(exc))
+        raise
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
