@@ -51,6 +51,8 @@ import src11_connector_operations_test as ops
 GATE = "src12m"
 MANAGED_DIR = "/managed-secrets"
 SECRET_FIELD = "password"
+# Word for word `refs::OUTSIDE_PREFIXES_TEXT` (and `secret_manager.POLICY_TEXTS`).
+OUTSIDE_PREFIXES_TEXT = "That reference is outside the secrets this installation allows connectors to reference"
 
 # Words a manager uses in its own error bodies; none may reach the user.
 MANAGER_WORDS = ("ResourceNotFoundException", "Secrets Manager can", "permission denied", "no handler for route", "vault")
@@ -209,13 +211,21 @@ def run_phase(kind: str) -> None:
     # SRC-12 review B1 BLOCKER 1: the operator's prefixes (`.env`:
     # SECRET_MANAGER_ALLOWED_PREFIXES, `.../g12/`) are the only places a
     # reference may point, whatever the manager's identity could read.
-    for outside in (store.outside_ref(), store.ref(f"g12/../outside-g12/{sfx}")):
-        refused = set_reference(connector_id, outside)
-        if refused.status_code != 400 or "outside the secrets" not in refused.text:
-            raise ManagerGateFailure(
-                f"a reference outside the allowed prefixes should be refused with 400, got {refused.status_code} {refused.text[:200]}"
-            )
-    say("1b. a reference outside the operator's allowed prefixes (and one with '..') is refused (400)")
+    # `SRC-12 review B2 BLOCKER 3`: the first reference is VALID under the
+    # grammar and outside the prefixes, so the refusal must be the prefix
+    # rule's fixed text, exactly; the second is not valid at all ("..") and is
+    # refused by the grammar, which is a different sentence.
+    refused = set_reference(connector_id, store.outside_ref())
+    if refused.status_code != 400 or OUTSIDE_PREFIXES_TEXT not in refused.text:
+        raise ManagerGateFailure(
+            f"a valid reference outside the allowed prefixes should be refused by the prefix rule with 400 and {OUTSIDE_PREFIXES_TEXT!r}, got {refused.status_code} {refused.text[:200]}"
+        )
+    dotdot = set_reference(connector_id, store.ref(f"g12/../outside-g12/{sfx}"))
+    if dotdot.status_code != 400 or "not a valid" not in dotdot.text or OUTSIDE_PREFIXES_TEXT in dotdot.text:
+        raise ManagerGateFailure(
+            f"a reference with '..' should be refused by the grammar (400, 'not a valid ...'), got {dotdot.status_code} {dotdot.text[:200]}"
+        )
+    say("1b. a valid reference outside the operator's allowed prefixes is refused by the prefix rule; one with '..' by the grammar (400 each)")
 
     # 2. The reference is accepted: read once, connection tested.
     reference = store.ref(secret_name)
