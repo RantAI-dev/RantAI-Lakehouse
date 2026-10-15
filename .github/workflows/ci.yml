@@ -394,6 +394,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           EOF
 
@@ -431,6 +438,15 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          SEAWEEDFS_ACCESS_KEY=ci-only-seaweedfs-access
+          SEAWEEDFS_SECRET_KEY=ci-only-seaweedfs-secret-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           EOF
 
@@ -614,6 +630,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # dagster-code-location's `dlt` SSRF guard fail-closed refuses
@@ -740,6 +763,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's own .env above: `ops/g3/g3_test.py`
@@ -816,6 +846,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
@@ -943,6 +980,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1088,6 +1132,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1244,6 +1295,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           ORACLE_G6_PASSWORD=CiOracleSysNotReal123
           CONNECTOR_ORACLE_PASSWORD=CiOracleConnectorNotReal123
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
@@ -1342,18 +1400,29 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # lakehouse-api has no default upload credential (unset, every
           # upload answers 503 "Upload storage is not configured"). RustFS
           # 1.0.0-rc.4 has no non-root S3 identity (docker-compose.yml, the
           # CONNECTOR_S3_* note), so the gate hands the API RustFS's own root
-          # key, which this stack takes from the compose default
-          # (RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY unset here), the same
-          # value the Dagster services already default to. A throwaway CI
-          # stack, never a deployment value.
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          # key: same throwaway value as RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY.
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
+          # DATA-19 step 10: the gate authors a pipeline over an uploaded
+          # table, so the code location must build an authored job and its
+          # chain sensor. Unset, `authored_factory` loads zero of both
+          # (docker-compose.yml's `PIPELINE_RUN_TOKEN` note) and the gate
+          # would fail with "the orchestrator never built the job". Same
+          # single-.env-value reasoning as g6-ingest's copy of this token.
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
@@ -1448,8 +1517,15 @@ jobs:
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
@@ -1558,12 +1634,19 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          # DATA-2 review BLOCKER 2: credentials in CI-only .env matching g9-upload
-          CONNECTOR_S3_ACCESS_KEY=rustfsadmin
-          CONNECTOR_S3_SECRET_KEY=rustfsadmin
+          # DATA-2 review BLOCKER 2: credentials in CI-only .env matching the RustFS keys
+          CONNECTOR_S3_ACCESS_KEY=ci-only-rustfs-access
+          CONNECTOR_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           # DATA-2 review BLOCKER 1: CI runs with age 0 to allow immediate orphan cleanup in gate test (no other writer runs here)
           GOLD_ORPHAN_MIN_AGE_SECONDS=0
           EOF
@@ -1628,6 +1711,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
@@ -1749,6 +1839,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # PR #83 review round 2, BLOCKER 1: SEC-18 docker-compose.yml has no
+          # default credentials. CI-ONLY throwaway values for this job's own
+          # throwaway stack; they protect nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's .env: bronze_ingest_job dials this compose
