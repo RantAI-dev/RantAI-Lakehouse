@@ -6,7 +6,7 @@
 | Backlog | `DATA-15` |
 | Spec | `docs/core/specs/data-15.md` |
 | Kind | Feature |
-| Status | Drafting — **decisions not signed**. The product owner signs every row marked *(proposed)*; the plan is written after that |
+| Status | Decisions **signed by the product owner (2026-10-14, all six)** — plan is next |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -48,18 +48,19 @@ the AI team in `AI-16`.
 
 ## Decisions
 
-**Not signed.** Each row's Default is what the planner proposes; the product
-owner confirms or changes it. *(proposed)* numbers come from the planner, not
-from a competitor's documentation.
+**Signed 2026-10-14** — the product owner approved every row's Default as
+shown below (the *(proposed)* markers are removed; these numbers are now the
+decisions). The plan builds to them; a target that cannot be met is
+reported, not quietly lowered.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Preview size and paging. | Up to 1,000 rows per request; the page shows them 100 at a time *(proposed)*. Masking and row filters apply as today; a preview that cannot be masked still shows no rows. | |
-| 2 | Usage window and "frequent". | 30 days, from the query history the product already records; dashboards reads stay uncounted. "Frequent" lists the top 10 *(proposed)* users, queries and joined tables. Column popularity is built only from what query history already records per query; if columns are not recorded, the section says "not recorded" and is not faked — the plan verifies what exists before building. | |
-| 3 | Who may grant and revoke. | The holder of `access:approve` — the same permission that decides access requests today (`policy.rs:212`). A direct grant from the page creates the same 30-day permission a decided request creates *(proposed)*, is audited like one, and shows in the grantee's own Access view. Revoke removes it at once and is audited with actor and subject. | |
-| 4 | Who may restore, and what restore does. | `governance:write` *(proposed)*. Restore re-registers a dropped Iceberg table from its retained metadata, within 7 days of the drop *(proposed, the spec's number)*. The product must not purge a dropped table's metadata before the window ends; if the catalog has already purged it, the page says so with the reason instead of pretending. ClickHouse tables: not restorable, said in the UI. | |
-| 5 | Version history author. | The author shown is the principal recorded when the write was committed through this product's loader; versions committed by anything else say "unknown" rather than a guess. Writing the principal is a loader change owned by the orchestration team — coordinated at the end of this item (it touches the flow Phase 1's `SRC-11` is rebuilding). | |
-| 6 | Entity relationship diagram. | Dropped from this item (the spec proposed the drop); `BACKLOG.md` keeps an entry if the owner wants it later. | |
+| 1 | Preview size and paging. | Up to 1,000 rows per request; the page shows them 100 at a time. Masking and row filters apply as today; a preview that cannot be masked still shows no rows. | 2026-10-14 |
+| 2 | Usage window and "frequent". | 30 days, from the query history the product already records; dashboards reads stay uncounted. "Frequent" lists the top 10 users, queries and joined tables. Column popularity is built only from what query history already records per query; if columns are not recorded, the section says "not recorded" and is not faked — the plan verifies what exists before building. | 2026-10-14 |
+| 3 | Who may grant and revoke. | The holder of `access:approve` — the same permission that decides access requests today (`policy.rs:212`). A direct grant from the page creates the same 30-day permission a decided request creates, is audited like one, and shows in the grantee's own Access view. Revoke removes it at once and is audited with actor and subject. | 2026-10-14 |
+| 4 | Who may restore, and what restore does. | `governance:write`. Restore re-registers a dropped Iceberg table from its retained metadata, within 7 days of the drop (the spec's number). The product must not purge a dropped table's metadata before the window ends; if the catalog has already purged it, the page says so with the reason instead of pretending. ClickHouse tables: not restorable, said in the UI. | 2026-10-14 |
+| 5 | Version history author. | The author shown is the principal recorded when the write was committed through this product's loader; versions committed by anything else say "unknown" rather than a guess. Writing the principal is a loader change owned by the orchestration team — coordinated at the end of this item (it touches the flow Phase 1's `SRC-11` is rebuilding). | 2026-10-14 |
+| 6 | Entity relationship diagram. | Dropped from this item (the spec proposed the drop); `BACKLOG.md` keeps an entry if the owner wants it later. | 2026-10-14 |
 
 ## Limits to tell a customer
 
