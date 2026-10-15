@@ -868,7 +868,14 @@ async fn run_chat(
                     (approval_result, outcome, run_id, approval_id)
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    (refusal, outcome, None, None)
+                    if outcome == "needs_confirmation"
+                        && let Some(error) =
+                            tools::check_draft(state, &call.function.name, &args).await
+                    {
+                        (error, "failed", None, None)
+                    } else {
+                        (refusal, outcome, None, None)
+                    }
                 }
             } else if not_offered {
                 let error = not_offered_refusal(&call.function.name);
@@ -1193,7 +1200,13 @@ pub async fn tool_call(
             (approval_result, outcome, run_id, approval_id)
         } else {
             let outcome = gate::outcome_of(&refusal);
-            (refusal, outcome, None, None)
+            if outcome == "needs_confirmation"
+                && let Some(error) = tools::check_draft(&state, &parsed.tool, &parsed.args).await
+            {
+                (error, "failed", None, None)
+            } else {
+                (refusal, outcome, None, None)
+            }
         }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
