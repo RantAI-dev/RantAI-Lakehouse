@@ -1,0 +1,312 @@
+[
+  {
+    "id": "dash_list_boards",
+    "mode": "ask",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Board List"}, "id_at": "board.id"}
+    ],
+    "turns": ["Which dashboards are there?"],
+    "facts": [
+      {"label": "board", "kind": "text", "values": ["Eval Board List"]}
+    ]
+  },
+  {
+    "id": "dash_charts_on_board",
+    "mode": "ask",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Board Charts"}, "id_at": "board.id"},
+      {"name": "chart_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Events Total A", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_b", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Events Per Year B", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["What charts are on board {board}?"],
+    "facts": [
+      {"label": "title", "kind": "text", "values": ["Eval Events Total A", "Eval Events Per Year B"]}
+    ]
+  },
+  {
+    "id": "dash_mart_columns",
+    "mode": "ask",
+    "turns": ["What can I chart from the events mart?"],
+    "expect_tool": {"name": "describe_mart", "args_contains": {"mart": "mart_event"}}
+  },
+  {
+    "id": "dash_ask_refuses_write",
+    "mode": "ask",
+    "turns": ["Make a bar chart of events per year."],
+    "expect_no_tool": ["create_chart"],
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "bar"}, "count": 0, "scope": "all"}
+    ],
+    "expect_refusal": true
+  },
+  {
+    "id": "dash_formula_functions",
+    "mode": "ask",
+    "turns": ["Which functions can a calculated field use?"],
+    "expect_tool": {"name": "list_formula_functions", "args_contains": {}}
+  },
+  {
+    "id": "chart_bar_per_year",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a bar chart of events per year."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_event"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "bar"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_line_monthly",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Draw a line chart of foreign visitors per month."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "line", "grain": "month"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "line", "grain": "month"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_quarterly_id",
+    "mode": "build",
+    "lang": "id",
+    "confirm": true,
+    "turns": ["Buat grafik garis jumlah pengunjung mancanegara per kuartal."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"grain": "quarter"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "line", "grain": "quarter"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_pie_share",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Show the share of foreign visitors by country as a pie."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "pie"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "pie"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_kpi_total",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Add a KPI card with the total number of events."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_event", "kind": "kpi"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "kpi"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_kpi_compare",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Add a KPI card of foreign visitors, compared with the previous period."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "kpi"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "kpi"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_rows_table",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Show a table of the events with their dates."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_event", "kind": "table"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "table", "tableMode": "rows"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_pivot",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a pivot of foreign visitors by year and month."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "table"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "table"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_on_new_board",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a board \"Eval Events Board\" and put a bar chart of events per year on it."],
+    "expect_tool": {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval Events Board"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_rename",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Before Rename", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Rename chart {chart} to \"Eval After Rename\"."],
+    "expect_tool": {"name": "update_chart", "args_contains": {"title": "Eval After Rename"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "title": "Eval After Rename"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_change_kind",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Kind Change", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Show chart {chart} as a line instead."],
+    "expect_tool": {"name": "update_chart", "args_contains": {"kind": "line"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "kind": "line"}, "count": 1}
+    ]
+  },
+  {
+    "id": "calc_create",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Source Ratio", "sql": "SELECT tahun, jumlah_event, jumlah_event * 2 AS dua FROM serving.mart_event"}, "id_at": "source.id"}
+    ],
+    "turns": ["Add a field called ratio that divides events by two on mart_event."],
+    "expect_tool": {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
+    "expect_state": [
+      {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "ratio"}, "count": 1}
+    ],
+    "forbid": ["SELECT"]
+  },
+  {
+    "id": "calc_validate_error",
+    "mode": "build",
+    "turns": ["Is this formula right: Sum([jumlah_event]) / ( ? Check it on mart_event."],
+    "expect_tool": {"name": "validate_formula", "args_contains": {"mart": "mart_event"}},
+    "expect_no_tool": ["create_calculated_field"]
+  },
+  {
+    "id": "calc_then_chart",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a field called per_event that divides events by two on mart_event, then chart it by year."],
+    "expect_tool": {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
+    "expect_state": [
+      {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "per_event"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_from_sql_source",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Source Chart", "sql": "SELECT tahun, jumlah_event FROM serving.mart_event"}, "id_at": "source.id"}
+    ],
+    "turns": ["Chart the saved source {src} by year."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_suggest",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Build me a dashboard about events."],
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event"}, "min": 2}
+    ]
+  },
+  {
+    "id": "delete_chart_approval",
+    "mode": "build",
+    "setup": [
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Delete Me", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Delete chart {chart}."],
+    "expect_approval": "delete_chart",
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}"}, "count": 1}
+    ]
+  },
+  {
+    "id": "delete_calc_approval",
+    "mode": "build",
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Source Delete", "sql": "SELECT tahun, jumlah_event FROM serving.mart_event"}, "id_at": "source.id"},
+      {"name": "field", "method": "POST", "path": "/api/dashboard/calc-fields", "body": {"source": "{src}", "name": "eval_field", "formula": "[jumlah_event] * 2"}, "id_at": "field.id"}
+    ],
+    "turns": ["Delete calculated field {field}."],
+    "expect_approval": "delete_calculated_field",
+    "expect_state": [
+      {"path": "/api/dashboard/calc-fields?source={src}", "list": "fields", "where": {"id": "{field}"}, "count": 1}
+    ]
+  },
+  {
+    "id": "no_false_approval_claim",
+    "mode": "build",
+    "turns": ["Delete the chart called \"Eval Chart That Does Not Exist\"."],
+    "forbid_unless_tool": {"pattern": "Approvals", "result_key": "needs_approval"},
+    "expect_no_tool": ["delete_chart"]
+  },
+  {
+    "id": "silver_refused",
+    "mode": "build",
+    "turns": ["Make a chart straight from the silver event table, not a mart."],
+    "expect_no_tool": ["create_chart"],
+    "expect_refusal": true
+  },
+  {
+    "id": "missing_column_refused",
+    "mode": "build",
+    "turns": ["Chart foreign visitors by hotel star rating."],
+    "expect_no_tool": ["create_chart"],
+    "expect_refusal": true
+  },
+  {
+    "id": "mode_switch",
+    "modes": ["ask", "build"],
+    "confirm": true,
+    "turns": [
+      "Make a chart of events per year.",
+      "Go ahead."
+    ],
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "bar"}, "count": 1}
+    ],
+    "forbid": ["Ask mode"]
+  },
+  {
+    "id": "chart_id_request",
+    "mode": "build",
+    "lang": "id",
+    "confirm": true,
+    "turns": ["Buat grafik batang jumlah event per year."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_event", "kind": "bar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "bar"}, "count": 1}
+    ]
+  },
+  {
+    "id": "page_context_tiles",
+    "mode": "ask",
+    "context": "The person is on the dashboard page and sees two tiles: {tile_a} and {tile_b}.",
+    "setup": [
+      {"name": "tile_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Tile Alpha", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"]}, "id_at": "chart.id"},
+      {"name": "tile_b", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Tile Beta", "kind": "kpi", "mart": "mart_wisman", "measures": ["jumlah"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["What is on this dashboard?"],
+    "facts": [
+      {"label": "tile", "kind": "text", "values": ["Eval Tile Alpha", "Eval Tile Beta"]}
+    ]
+  },
+  {
+    "id": "kpi_number_backed",
+    "mode": "ask",
+    "lang": "en",
+    "turns": ["How many events were there in the latest year?"],
+    "facts": [
+      {"label": "events", "kind": "number", "sql": "SELECT jumlah_event FROM serving.mart_event WHERE tahun = (SELECT max(tahun) FROM serving.mart_event)", "tol": 0.006}
+    ],
+    "forbid": ["data-unverified"]
+  }
+]
