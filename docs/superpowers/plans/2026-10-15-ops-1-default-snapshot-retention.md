@@ -141,4 +141,35 @@ any Rust or console change.
 
 ## 8. Review
 
-(planner)
+Round 1, reviewed 2026-10-15 at `0e666b77`.
+
+T1 is right: no policy, or no `snapshotsToKeep`, runs
+`expire_snapshots(retention_threshold => '7d')` through Trino with the
+existing error mapping; a policy-fetch failure skips expiry instead of
+applying the default (correct: a policy might keep older snapshots, so
+expiring blind could delete what it protects). The ClickHouse probe's
+refusal is no longer the recorded reason when Trino runs; acceptable,
+since the verb run now records what happened. Mutation evidence quoted.
+
+The 13 failures in `test_history_write_measurement.py` reproduce on `main`
+(`8e2f6a19`, planner's run: 13 failed) with the local venv's Python
+3.14.6; CI uses 3.11. Not this PR's; noted for the environment.
+
+**BLOCKER 1. T2 (the measurement) is not done.** Both reported blockers
+have a way through that the plan allows:
+
+- 10 snapshots: create a measurement-only table through Trino
+  (`CREATE TABLE iceberg.<bronze namespace>.ops1_measure (id bigint)`) and
+  run 10 single-row `INSERT`s; each commit is one snapshot. Drop it at the
+  end. No seed change needed.
+- The 0s floor: an override file under `ops/` (for example
+  `ops/trino/docker-compose.ops1-measure.override.yml`) that redefines the
+  `trino` service's `command:` with the same heredoc plus
+  `iceberg.expire-snapshots.min-retention=0s`, used only as
+  `docker compose -f docker-compose.yml -f <that file> …` during the
+  measurement. That is a file under `ops/`, not an edit to
+  `docker-compose.yml`, which is what section 5 means. Its header says it is
+  for this measurement only and must never be used by a deployment.
+
+Then do T2 steps 1-4 as written (step 4 measures with that override;
+steps 2 and 3 with the plain file) and write `docs/plans/OPS-1-RESULT.md`.
