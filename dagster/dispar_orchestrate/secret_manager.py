@@ -234,6 +234,7 @@ _MODULES: dict[str, str] = {
     "vault": "dispar_orchestrate.secret_manager_vault",
     "aws": "dispar_orchestrate.secret_manager_aws",
     "gcp": "dispar_orchestrate.secret_manager_gcp",
+    "azure": "dispar_orchestrate.secret_manager_azure",
 }
 _READERS: dict[str, Callable[[Mapping[str, str | None], Mapping[str, str]], str]] = {}
 

@@ -42,6 +42,7 @@
 //! sign-in token on to another server.
 
 mod aws;
+mod azure;
 mod gcp;
 pub mod refs;
 mod vault;
@@ -314,7 +315,13 @@ impl ManagerResolver {
                     backend: Arc::new(backend),
                 })
             }
-            SecretManagerKind::Azure => None,
+            SecretManagerKind::Azure => {
+                let backend = azure::AzureBackend::from_settings(settings);
+                Some(Self {
+                    kind: SecretManagerKind::Azure,
+                    backend: Arc::new(backend),
+                })
+            }
         }
     }
 
