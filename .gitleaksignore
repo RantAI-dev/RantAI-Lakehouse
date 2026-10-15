@@ -45,3 +45,10 @@ c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rant
 # `password=matrix.CONNECTOR_MYSQL_PASSWORD` is a reference to a CI fixture
 # constant, not a value. The history scan reads every branch. SEC-1.
 4ae1bcdda704797129801f537899cf527035c6ba:ops/g6/src11_connector_operations_test.py:generic-api-key:576
+
+# Not a secret: a git commit hash. The BLD-3 plan's handoff (fix round 1)
+# quoted the full id of commit 367f304c ("BLD-3 review BLOCKER 1") as the
+# GIT_SHA an image was built with; `git cat-file -t 367f304c1db0…` prints
+# `commit`. The working-tree copy now quotes 12 characters; this entry
+# covers the one historical commit that still holds the full line.
+ee0d663df87af4fb1e3ebfa9a3a857489d340a8c:docs/superpowers/plans/2026-10-14-bld-3-bronze-pipeline-source.md:generic-api-key:623

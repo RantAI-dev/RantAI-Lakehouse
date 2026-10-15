@@ -234,3 +234,12 @@ spaces (a multi-line literal without `\` continuations); harmless to
 queries in the file.
 
 Cite `DATA-10 review SHOULD-FIX <n>` at each fix site.
+
+### Round 2 (planner/reviewer), at `2afe53e0`
+
+The three SHOULD-FIX and the nit are fixed. Reviewer re-ran the full block
+on the branch: Rust 97 suites, 4752 passed, 0 failed, 8 ignored; frontend
+per folder 1289 / 0 / 2; `pytest` 1032 passed; lints pass. CI passed every
+check except `cargo audit` / `cargo deny`, red on `main` from the `rustls`
+advisories (`SEC-30`). No open BLOCKER; merged as PR #156 (`caf5784b`).
+
