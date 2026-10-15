@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::{js_error, num_or_zero};
+use crate::routes::support::{num_or_zero, upstream_message};
 use crate::state::AppState;
 
 /// `GET /api/storage`.
@@ -59,7 +59,7 @@ pub async fn get(State(state): State<AppState>) -> Response {
         // status: 503 }); }` in `storage/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }

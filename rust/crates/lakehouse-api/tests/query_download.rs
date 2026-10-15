@@ -248,3 +248,172 @@ async fn an_unauthenticated_request_is_401_before_touching_clickhouse() {
             .is_empty()
     );
 }
+
+// ── The download applies the same policy rewrite as the run ──────────────
+
+use lakehouse_store::governance::{self, CreatePolicyInput};
+
+/// Answers the column lookup the rewrite makes, then any other statement with
+/// a small CSV.
+async fn mount_mart_columns_then_csv(ch: &MockServer) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [
+                {"name": "name", "type": "String"},
+                {"name": "type", "type": "String"},
+                {"name": "default_kind", "type": "String"},
+                {"name": "default_expression", "type": "String"},
+            ],
+            "data": [
+                {"name": "email", "type": "String", "default_kind": "", "default_expression": ""},
+                {"name": "region", "type": "String", "default_kind": "", "default_expression": ""},
+            ],
+            "rows": 2,
+        })))
+        .mount(ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("email\n***\n"))
+        .mount(ch)
+        .await;
+}
+
+async fn seed_mask_and_filter_policy(pool: &PgPool) {
+    governance::create_policy(
+        pool,
+        &CreatePolicyInput {
+            name: "download-rewrite-test".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "Analyst".to_owned(),
+            resources: "serving.mart_x".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .expect("seed the governing policy");
+}
+
+async fn sent_statements(ch: &MockServer) -> Vec<String> {
+    ch.received_requests()
+        .await
+        .expect("mock records requests")
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .filter(|b| !b.contains("system."))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_download_is_masked_for_the_callers_role() {
+    let ch = MockServer::start().await;
+    mount_mart_columns_then_csv(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    seed_mask_and_filter_policy(&pool).await;
+
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    insert_history_row(
+        &pool,
+        "q-10",
+        "SELECT email FROM serving.mart_x",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-10", "csv", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("replaceRegexpOne(toString(`email`)"),
+        "{}",
+        sent[0]
+    );
+    assert!(sent[0].contains("LIMIT 10000"), "{}", sent[0]);
+}
+
+#[tokio::test]
+async fn a_role_the_policy_does_not_govern_downloads_the_statement_unchanged() {
+    let ch = MockServer::start().await;
+    mount_mart_columns_then_csv(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    // The policy governs a different role than the caller's.
+    governance::create_policy(
+        &pool,
+        &CreatePolicyInput {
+            name: "download-rewrite-other-role".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "Auditor".to_owned(),
+            resources: "serving.mart_x".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                r#"{"roles":["Auditor"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .expect("seed a policy for another role");
+
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    insert_history_row(
+        &pool,
+        "q-11",
+        "SELECT email FROM serving.mart_x",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-11", "csv", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].contains("replaceRegexpOne"), "{}", sent[0]);
+    assert!(
+        sent[0].contains("SELECT * FROM (\nSELECT email FROM serving.mart_x\n) LIMIT 10000"),
+        "{}",
+        sent[0]
+    );
+}
+
+#[tokio::test]
+async fn a_statement_the_rewrite_refuses_is_refused_with_the_run_routes_status_and_never_sent() {
+    let ch = MockServer::start().await;
+    mount_mart_columns_then_csv(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+
+    let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    // A table function is one of the shapes the rewrite refuses outright.
+    insert_history_row(
+        &pool,
+        "q-12",
+        "SELECT * FROM numbers(5)",
+        Some(owner_id),
+        "clickhouse",
+    )
+    .await;
+
+    let resp = download_with_cookie(&router, "q-12", "csv", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        !body.contains("numbers"),
+        "no statement text in the refusal: {body}"
+    );
+    assert!(
+        sent_statements(&ch).await.is_empty(),
+        "a refused statement must not reach the engine"
+    );
+}

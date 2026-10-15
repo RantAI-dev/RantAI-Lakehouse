@@ -3,16 +3,21 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
+import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
+import type { TileFailure } from "@/services/contracts/dashboards";
+import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   board: { id: string; name: string };
   layout: LayoutMap;
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
+  /** The zone and first weekday the buckets were cut with (BI-9). */
+  reporting?: { timeZone: string; weekStart: string };
 };
 
 /**
@@ -27,6 +32,9 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   const dark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
+  // SEC-12: what a refused signed token reads. The public link keeps the
+  // plain line.
+  const [refusal, setRefusal] = React.useState(EMBED_UNAVAILABLE);
 
   // Data source: a public token (GET, read-only) OR a signed JWT embed (POST,
   // server-side locked filters). Public link: /embed/dashboard/<token>.
@@ -46,7 +54,16 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
             })
           : await fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}`, { cache: "no-store" });
         if (!alive) return;
-        if (res.status === 404 || res.status === 403 || res.status === 401) { setState("notfound"); return; }
+        if (res.status === 404 || res.status === 403 || res.status === 401) {
+          if (jwt) setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
+          setState("notfound");
+          return;
+        }
+        if (jwt && res.status === 503) {
+          setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
+          setState("error");
+          return;
+        }
         if (!res.ok) { setState("error"); return; }
         setData(await res.json());
         setState("ok");
@@ -56,7 +73,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   }, [token, jwt]);
 
   if (state === "notfound" || state === "error") {
-    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">Dashboard not available.</div>;
+    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">{refusal}</div>;
   }
 
   const charts = data?.charts ?? [];
@@ -68,6 +85,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
       return <div className="grid h-screen place-content-center text-sm text-muted-foreground">Chart not found.</div>;
     }
     return (
+      <ReportingProvider reporting={data?.reporting}>
       <div className="flex h-screen flex-col overflow-hidden bg-transparent p-2">
         <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card">
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
@@ -80,10 +98,11 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
             )}
           </div>
           <div className="min-h-0 flex-1 p-2">
-            {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} year="all" /> : null}
+            {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} /> : null}
           </div>
         </div>
       </div>
+      </ReportingProvider>
     );
   }
 
@@ -92,10 +111,11 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     id: spec.id,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} year="all" />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
   }));
 
   return (
+    <ReportingProvider reporting={data?.reporting}>
     <div className="min-h-screen bg-transparent p-2">
       {state === "loading" ? (
         <div className="grid gap-3 sm:grid-cols-2">
@@ -107,5 +127,6 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
         <DashboardGrid items={items} layout={data?.layout ?? {}} editable={false} onLayoutChange={() => {}} />
       )}
     </div>
+    </ReportingProvider>
   );
 }

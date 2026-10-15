@@ -6,10 +6,29 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
+import type { FilterSkip } from "@/services/clients/bi-store";
 import { TileBody } from "./tile-body";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
-export type Rows = { columns: string[]; rows: Record<string, unknown>[] };
-export type Cell = Rows | { error: string };
+export type Rows = {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  /** Active filters this tile's data could not honour (BI-18). */
+  filtersSkipped?: FilterSkip[];
+  /** The grain the rows were bucketed with, when the chart has one (BI-9). */
+  grain?: string;
+  /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */
+  grainColumn?: string;
+  /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
+  grainSkipped?: string;
+  /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
+  truncated?: boolean;
+  /** A raw table's first page: the rows its pages walk through, the page size and the offset. Absent when the count could not be read (BI-16). */
+  total?: number;
+  limit?: number;
+  offset?: number;
+};
+export type Cell = Rows | TileFailure;
 
 export function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
@@ -60,12 +79,11 @@ export function TileDataDialog({
 
 /** One chart at a readable size. */
 export function TileExpandDialog({
-  spec, cell, dark, year, onClose,
+  spec, cell, dark, onClose,
 }: {
   readonly spec: ChartRenderSpec & { text?: string; caption?: string };
   readonly cell: Cell | undefined;
   readonly dark: boolean;
-  readonly year: string;
   readonly onClose: () => void;
 }) {
   return (
@@ -76,7 +94,7 @@ export function TileExpandDialog({
           {spec.subtitle ? <p className="text-sm text-muted-foreground">{spec.subtitle}</p> : null}
         </DialogHeader>
         <div className="h-[65vh]">
-          <TileBody spec={spec} cell={cell} dark={dark} loading={false} year={year} />
+          <TileBody spec={spec} cell={cell} dark={dark} loading={false} />
         </div>
       </DialogContent>
     </Dialog>

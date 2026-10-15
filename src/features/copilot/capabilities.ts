@@ -31,7 +31,9 @@ export const CAPABILITIES: Capability[] = [
     desc: "Create & manage charts / boards",
     icon: BarChart3,
     write: true,
-    tools: ["describe_mart", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board"],
+    tools: ["describe_mart", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
+      // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.
+      "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field"],
   },
   {
     key: "pipeline",

@@ -118,6 +118,35 @@ async fn missing_permission_refuses_and_audits_with_permission_reason() {
     assert_eq!(ours[0].outcome, "refused");
 }
 
+/// SEC-9-AC2 through the real router: a principal without `query:read` is
+/// refused by both SQL tools, the permission is named, and the audited
+/// outcome is `refused`, not `failed`. The test app's `ClickHouse` upstream is
+/// deliberately dead, so a call that had reached an engine would have been
+/// audited `failed`; `refused` is the proof that nothing was sent.
+#[tokio::test]
+async fn the_sql_tools_are_refused_without_query_read_and_never_reach_an_engine() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = common::create_zero_permission_principal(&pool).await;
+    let cookie = common::session_cookie_for_user(&pool, user_id).await;
+
+    for (tool, args) in [
+        ("run_sql", json!({ "sql": "SELECT 1" })),
+        ("run_saved_query", json!({ "id": "q-planted" })),
+    ] {
+        let resp = post_tool(
+            &router,
+            Some(&cookie),
+            json!({ "tool": tool, "args": args, "mode": "build" }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{tool}");
+        let body = json_body(resp).await;
+        assert_eq!(body["outcome"], json!("refused"), "{tool}");
+        assert_eq!(body["result"]["reason"], json!("permission"), "{tool}");
+        assert_eq!(body["result"]["required"], json!("query:read"), "{tool}");
+    }
+}
+
 /// A `WriteLow` tool called in build mode WITHOUT `confirmed: true`
 /// returns `needs_confirmation` and executes nothing — proven here by the
 /// audited outcome, since the real `create_board` execution would hit the

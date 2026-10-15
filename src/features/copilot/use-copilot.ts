@@ -59,10 +59,15 @@ function newMsgId(): string {
     : `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** The message a failed chat request should show, from its JSON error body. */
-function chatErrorText(body: unknown): string {
-  const b = (body ?? {}) as { error?: string; detail?: string; hint?: string };
-  return b.detail ?? b.error ?? "Copilot couldn't answer. Try again.";
+/**
+ * The message a failed chat request should show, from its JSON error body.
+ * When the server logged the provider's error it says under which reference
+ * (`errorId`, SEC-11); the user can quote it to an administrator.
+ */
+export function chatErrorText(body: unknown): string {
+  const b = (body ?? {}) as { error?: string; detail?: string; hint?: string; errorId?: string };
+  const text = b.detail ?? b.error ?? "Copilot couldn't answer. Try again.";
+  return b.errorId ? `${text} Reference: ${b.errorId}` : text;
 }
 
 type ChatResult = {

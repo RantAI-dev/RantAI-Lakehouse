@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// `GET /api/alerts` — list the alert & digest rules the caller may see.
 ///
@@ -55,7 +56,13 @@ pub async fn list(
 ) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_alerts::list_rules(&state.clickhouse)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
     Ok(ApiJson(json!({ "rules": rules })))
 }
@@ -324,9 +331,13 @@ pub async fn create(
         input.connector.as_deref(),
     )
     .await?;
-    let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, None)
-        .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let rule =
+        lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), &input, None)
+            .await
+            .map_err(|err| {
+                upstream_error::alert(&upstream_error::DATABASE, &err)
+                    .into_api_error(upstream_error::FailedAs::BadRequest)
+            })?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -353,9 +364,17 @@ pub async fn update(
         &input,
     )
     .await?;
-    let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id))
-        .await
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let rule = lakehouse_alerts::save_rule(
+        &state.clickhouse,
+        &state.webhook_sender(),
+        &input,
+        Some(&id),
+    )
+    .await
+    .map_err(|err| {
+        upstream_error::alert(&upstream_error::DATABASE, &err)
+            .into_api_error(upstream_error::FailedAs::BadRequest)
+    })?;
     Ok(ApiJson(json!({ "ok": true, "rule": rule })))
 }
 
@@ -389,7 +408,13 @@ pub async fn delete(
     authorise_existing_rule(&state, principal.as_ref().map(|Extension(p)| p), &id).await?;
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -788,7 +813,8 @@ pub async fn run(
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
     // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
     // implementations when both dependencies are configured for this
@@ -819,7 +845,13 @@ pub async fn run(
         &gate,
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?;
 
     // Persist every fired, non-Digest result as an `alert_instance` row,
     // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
@@ -1039,7 +1071,7 @@ fn late_episode_key(pipeline_id: &str, last: Option<LastSuccess>) -> String {
 async fn evaluate_late_pass(
     pg: &PgPool,
     ch: &lakehouse_clickhouse::ChClient,
-    http: &reqwest::Client,
+    http: &lakehouse_notify::WebhookSender,
     email: &EmailSender,
     late_rule_pipelines: Vec<String>,
     last_success: &HashMap<String, Option<LastSuccess>>,
@@ -1076,7 +1108,7 @@ async fn evaluate_late_pass(
             Some(now),
         )
         .await
-        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        .map_err(|err| late_error(&err))?;
         if decision != Some(true) {
             continue;
         }
@@ -1112,7 +1144,7 @@ async fn evaluate_late_pass(
             Some(now),
         )
         .await
-        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        .map_err(|err| late_error(&err))?;
         delivered_pipelines += 1;
     }
     Ok(delivered_pipelines)
@@ -1124,6 +1156,21 @@ async fn evaluate_late_pass(
 // pass (a broken clock means we cannot make a "late" claim, and the
 // alternative — `Some(0.0)` "late since 1970" — is exactly the bug this
 // helper exists to prevent).
+
+/// A [`lakehouse_alerts::PipelineLateError`] as a `500`: the `ClickHouse`
+/// listing failure is reported (SEC-11); the `LateSource` message is already
+/// classified by the source before the alerts crate sees it (its doc comment),
+/// so it is ours.
+fn late_error(err: &lakehouse_alerts::PipelineLateError) -> ApiError {
+    match err {
+        lakehouse_alerts::PipelineLateError::ListRules(ch) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            ch,
+            upstream_error::FailedAs::Internal,
+        ),
+        lakehouse_alerts::PipelineLateError::Source(message) => ApiError::Internal(message.clone()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1391,6 +1438,96 @@ mod tests {
         }
     }
 
+    /// `SEC-10-AC1`: saving a rule whose webhook points at an address
+    /// webhooks may not reach is a 400 with the fixed message, through the
+    /// real route handlers (`create` and `update`), and nothing is written.
+    /// (`SEC-10-AC3`, the permission refusal, is in `tests/route_auth.rs`:
+    /// the policy layer answers before either handler runs.)
+    mod webhook_targets {
+        use std::collections::HashMap;
+
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn body(target: &str, id: Option<&str>) -> Bytes {
+            let mut rule = json!({
+                "name": "Spike",
+                "type": "alert",
+                "mart": "mart_wisman",
+                "measure": "jumlah",
+                "agg": "sum",
+                "op": ">",
+                "threshold": 1,
+                "channel": "webhook",
+                "target": target,
+            });
+            if let Some(id) = id {
+                rule["id"] = json!(id);
+            }
+            Bytes::from(serde_json::to_vec(&rule).expect("serialisable"))
+        }
+
+        #[tokio::test]
+        async fn saving_an_internal_webhook_is_a_400_with_the_fixed_message() {
+            let ch = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(""))
+                .mount(&ch)
+                .await;
+            let state = state_for(&ch.uri());
+            for target in [
+                "http://127.0.0.1:8080/x",
+                "http://10.1.2.3/x",
+                "http://169.254.169.254/latest/meta-data",
+                "http://[::1]/x",
+            ] {
+                for update in [false, true] {
+                    let bytes = body(target, update.then_some("al-1"));
+                    let result = if update {
+                        update_rule(&state, bytes).await
+                    } else {
+                        create(State(state.clone()), None, bytes).await
+                    };
+                    let Err(rejection) = result else {
+                        panic!("{target} must be refused");
+                    };
+                    assert_eq!(rejection.0.status(), 400, "{target}");
+                    assert_eq!(
+                        rejection.0.to_string(),
+                        "webhook address is not allowed",
+                        "{target}"
+                    );
+                }
+            }
+            let inserts = ch
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    String::from_utf8_lossy(&r.body).contains("INSERT INTO console.alert_rule")
+                })
+                .count();
+            assert_eq!(inserts, 0, "a refused rule must not be written");
+        }
+
+        async fn update_rule(state: &AppState, bytes: Bytes) -> ApiResult<ApiJson<Value>> {
+            update(State(state.clone()), None, bytes).await
+        }
+    }
+
     /// ADR 0015 — the tick records the schema versions of Silver and Gold
     /// tables beside the quality pass; a single-rule run (`?id=`), which is
     /// someone testing one alert and not the tick, does not.
@@ -1553,7 +1690,9 @@ mod tests {
         async fn late_pass_skips_entirely_when_the_clock_is_unset(pool: sqlx::PgPool) {
             let server = MockServer::start().await;
             let ch = ch_for(&server).await;
-            let http = reqwest::Client::new();
+            let http = crate::webhook_guard::sender(
+                &Config::from_map(&HashMap::new()).expect("a valid test Config"),
+            );
             let email = no_smtp_email_sender();
             // Threshold 60s, so under the old fallback the run at
             // epoch −3600 is 3600 seconds late.
@@ -1612,7 +1751,9 @@ mod tests {
         async fn a_second_late_pass_for_the_same_episode_does_not_re_deliver(pool: sqlx::PgPool) {
             let server = MockServer::start().await;
             let ch = ch_for(&server).await;
-            let http = reqwest::Client::new();
+            let http = crate::webhook_guard::sender(
+                &Config::from_map(&HashMap::new()).expect("a valid test Config"),
+            );
             let email = no_smtp_email_sender();
             // The pipeline is late: threshold 60s, last success an hour
             // before `now`.
@@ -1903,7 +2044,7 @@ mod rule_scope_authorisation {
         Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "id": id, "name": "Load failed", "type": kind, "connector": connector,
-                "channel": "webhook", "target": "https://hooks.example.com/x",
+                "channel": "webhook", "target": "https://93.184.216.34/x",
                 "pipeline": "pl-x",
             }))
             .unwrap(),
