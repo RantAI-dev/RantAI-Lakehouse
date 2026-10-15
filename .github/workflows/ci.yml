@@ -2304,7 +2304,8 @@ jobs:
       - name: Run container
         run: |
           # SEC-36: generated for this run; no key-shaped literal in the repository.
-          CONNECTOR_SECRETS_KEY="$(openssl rand -base64 32)"
+          # Exported: `docker run -e NAME` forwards only an exported variable.
+          export CONNECTOR_SECRETS_KEY="$(openssl rand -base64 32)"
           docker run -d --name lakehouse-api -p 8080:8080 \
             -e CONNECTOR_SECRETS_KEY \
             rantai-lakehouse-api:ci
