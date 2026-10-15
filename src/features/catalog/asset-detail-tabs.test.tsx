@@ -190,11 +190,25 @@ function stubApi({
   lineage = GRAPH,
   profile = PROFILE,
   sample = (limit) => Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })),
-}: { permissions?: string[]; lineage?: unknown; profile?: unknown; sample?: SampleAnswer } = {}) {
+  tagKeys = [],
+  annotationRefusal,
+}: {
+  permissions?: string[]
+  lineage?: unknown
+  profile?: unknown
+  sample?: SampleAnswer
+  /** The governed tag keys `GET /api/governance/tag-keys` answers. */
+  tagKeys?: unknown[]
+  /** When set, `PUT .../annotation` is refused with this sentence (400). */
+  annotationRefusal?: string
+} = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
-    if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
+    if (method === "PUT" && path.endsWith("/annotation")) {
+      return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
+    }
+    if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/quality/")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/sla/")) return json({ ok: true })
@@ -634,6 +648,104 @@ describe("About card", () => {
         { description: "One row per order.", owner: "Data Platform", steward: "Rina", tags: ["finance", "monthly-report"] },
       ],
     ])
+  })
+
+  const DOMAIN_KEY = {
+    key: "data_domain",
+    allowedValues: ["finance", "ops"],
+    createdBy: "Rina",
+    createdAt: "2026-10-14T10:00:00Z",
+    updatedAt: "2026-10-14T10:00:00Z",
+  }
+
+  it("shows governed tags beside the free tags as key: value", async () => {
+    stubApi()
+    renderTabs({ ...BRONZE, tags: ["finance"], governedTags: { data_domain: "finance" } })
+    expect(await screen.findByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("finance")).toBeTruthy()
+  })
+
+  it("offers one select per tag key with its allowed values and None, and saves the choice", async () => {
+    const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
+    const reloaded = mock(() => {})
+    renderTabs(
+      { ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } },
+      reloaded
+    )
+
+    fireEvent.click(await screen.findByText("Edit"))
+    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
+    expect([...select.options].map((o) => o.value)).toEqual(["", "finance", "ops"])
+    expect(select.value).toBe("")
+    fireEvent.change(select, { target: { value: "ops" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "PUT",
+        "/api/catalog/demo-orders/annotation",
+        { description: null, owner: null, steward: null, tags: [], governedTags: { data_domain: "ops" } },
+      ],
+    ])
+  })
+
+  it("starts from the stored value and takes the key off the table when None is chosen", async () => {
+    const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
+    renderTabs({
+      ...BRONZE,
+      governedTags: { data_domain: "finance" },
+      annotation: { owner: null, steward: null, tags: ["pii"], description: null, governedTags: { data_domain: "finance" } },
+    })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
+    expect(select.value).toBe("finance")
+    fireEvent.change(select, { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(writes(fetchSpy).length).toBe(1))
+    expect(writes(fetchSpy)[0][2]).toMatchObject({ tags: ["pii"], governedTags: {} })
+  })
+
+  it("shows the API's sentence when the allowed values changed under the editor", async () => {
+    stubApi({
+      tagKeys: [DOMAIN_KEY],
+      annotationRefusal:
+        'governedTags: "ops" is not an allowed value for "data_domain"; allowed values: finance',
+    })
+    renderTabs({ ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    fireEvent.change(await screen.findByLabelText("data_domain"), { target: { value: "ops" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    expect(await screen.findByText(/"ops" is not an allowed value for "data_domain"; allowed values: finance/)).toBeTruthy()
+  })
+
+  it("sends no governed tags when the keys cannot be read, so a save never wipes them", async () => {
+    const fetchSpy = stubApi()
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith("/api/governance/tag-keys")) return json({ error: "unavailable" }, 503)
+      if ((init?.method ?? "GET") === "PUT") return json({ ok: true })
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Writer", email: null, roles: [], permissions: ["*:*"], tenants: [] })
+      }
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    renderTabs({
+      ...BRONZE,
+      governedTags: { data_domain: "finance" },
+      annotation: { owner: null, steward: null, tags: [], description: null, governedTags: { data_domain: "finance" } },
+    })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    expect(await screen.findByText(/governed tag keys could not be loaded/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(writes(fetchSpy).length).toBe(1))
+    expect(writes(fetchSpy)[0][2]).not.toHaveProperty("governedTags")
   })
 
   it("refuses a tag the API would refuse, before sending anything", async () => {
