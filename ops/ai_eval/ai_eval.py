@@ -43,7 +43,8 @@ the saved answers for any case whose score moves.
 
 `--only id1,id2` runs a subset. Results go to `--out` (default: a JSON file
 in the system temp directory), with every answer and tool trace, so two
-runs can be compared case by case.
+runs can be compared case by case. A relative `--out` is also taken under the
+temp directory, so a run from the repository never writes results into it.
 
 # The dashboard set
 
@@ -259,6 +260,29 @@ def dig(value: Any, path: str) -> list[Any]:
     return current
 
 
+def where_matches(item: Any, where: dict[str, Any]) -> bool:
+    """Whether `item` satisfies every `where` key. A flat key reads the item's
+    own field; a dotted key reads into it (`def.grain` is the `grain` of the
+    item's `def`, as `GET /api/dashboard/specs` nests it). A key that is absent
+    does not match. A field that holds a list matches when the value is one of
+    its members (`def.measures` names a measure the chart uses)."""
+    if not isinstance(item, dict):
+        return False
+    for key, want in where.items():
+        found = dig(item, key)
+        if not found:
+            return False
+        if not any(_is_or_holds(got, want) for got in found):
+            return False
+    return True
+
+
+def _is_or_holds(got: Any, want: Any) -> bool:
+    if isinstance(got, list):
+        return want in got
+    return got == want
+
+
 def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -> list[Any]:
     """The expected values of one fact: every row's first column for `sql`,
     every value at `path` of an API GET for `api`, or `values` as given."""
@@ -267,7 +291,7 @@ def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -
     if "api" in fact:
         items = dig(api_get(cfg, session, fact["api"]), fact["path"])
         where = fact.get("where", {})
-        items = [i for i in items if all(isinstance(i, dict) and i.get(k) == v for k, v in where.items())]
+        items = [i for i in items if where_matches(i, where)]
         if "field" in fact:
             items = [i.get(fact["field"]) for i in items if isinstance(i, dict)]
         return items[: fact.get("limit", 50)]
@@ -419,6 +443,48 @@ def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
     return filled
 
 
+CREATED_RE = re.compile(r"\{created:(\w+)\}")
+
+
+def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
+    """Replace `{created:<kind>}` in a `where` value with the id of the first
+    object of that kind this run created (from the trace or a confirm). The
+    assistant makes such an object itself, so its id is not known when the case
+    is written. A kind this run did not create is left as written, so it
+    matches nothing."""
+    first: dict[str, str] = {}
+    for obj in created:
+        first.setdefault(obj["kind"], obj["id"])
+
+    def sub(value: Any) -> Any:
+        if isinstance(value, str):
+            return CREATED_RE.sub(lambda mt: first.get(mt.group(1), mt.group(0)), value)
+        if isinstance(value, dict):
+            return {k: sub(v) for k, v in value.items()}
+        return value
+
+    filled = dict(check)
+    filled["where"] = sub(check.get("where", {}))
+    return filled
+
+
+def formula_problems(trace: list[dict[str, Any]], forbidden: list[str]) -> list[str]:
+    """`formula_forbid`: the formula of every calculated field the run created
+    must not contain any of `forbidden`. The answer is scored as text; the
+    formula is a field of the tool's result and is checked here."""
+    problems: list[str] = []
+    for step in trace:
+        if step.get("tool") != "create_calculated_field":
+            continue
+        result = step.get("result") or {}
+        field = result.get("field") if isinstance(result, dict) else None
+        formula = str((field or {}).get("formula", ""))
+        for word in forbidden:
+            if re.search(word, formula, re.IGNORECASE):
+                problems.append(f"formula contains {word}")
+    return problems
+
+
 def pending_of(step: dict[str, Any]) -> dict[str, Any]:
     """The call a trace step asks the person to confirm (use-copilot.ts:380-382):
     the step's result when it holds one, else the step's own tool and args."""
@@ -502,7 +568,7 @@ def collect_created(
                 found.append({"kind": "chart", "id": str(result["id"])})
             elif tool == "create_board" and result.get("created"):
                 found.append({"kind": "board", "id": str(result["id"])})
-            elif tool == "create_calculated_field":
+            elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
     for confirm in confirms:
         tool = confirm.get("tool")
@@ -511,7 +577,7 @@ def collect_created(
             kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
             if kind:
                 found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and isinstance(result, dict) and result.get("id"):
+        if tool == "create_calculated_field" and isinstance(result, dict) and result.get("id") and result.get("ok") is True:
             found.append({"kind": "field", "id": str(result["id"])})
     return found
 
@@ -555,8 +621,7 @@ def expect_state_problems(
     matches = [
         i
         for i in items
-        if isinstance(i, dict)
-        and all(i.get(k) == v for k, v in where.items())
+        if where_matches(i, where)
         and (check.get("scope") == "all" or str(i.get("id")) in own_ids)
     ]
     if "min" in check:
@@ -690,10 +755,11 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
         scored = score_case(cfg, session, case, bodies)
         scored["confirms"] = confirms
         trace = [s for b in bodies for s in b.get("toolTrace", [])]
-        own_ids = {c["id"] for c in collect_created(setup_created, [trace], confirms)}
+        created = collect_created(setup_created, [trace], confirms)
+        own_ids = {c["id"] for c in created}
         for check in case.get("expect_state", []):
             try:
-                filled = fill_check(check, names)
+                filled = fill_created(fill_check(check, names), created)
                 scored["problems"].extend(expect_state_problems(cfg, session, filled, own_ids))
             except requests.RequestException as err:
                 scored["problems"].append(f"state check failed: {type(err).__name__}")
@@ -706,6 +772,8 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
             scored["problems"].extend(
                 forbid_unless_problems(scored["answer"], trace, spec["pattern"], spec["result_key"])
             )
+        if "formula_forbid" in case:
+            scored["problems"].extend(formula_problems(trace, case["formula_forbid"]))
     except BaseException as raised:  # noqa: BLE001 - a failed run is a result, not a crash
         _raised_run = raised
     finally:
@@ -878,6 +946,18 @@ def print_row(result: dict[str, Any]) -> None:
     )
 
 
+def resolve_out(out: str, label: str) -> Path:
+    """Where the results go. An absolute `--out` is kept as given; a relative
+    one, and the default when none is given, goes under the temp directory, so
+    a run from the repository never writes its results into it (S3)."""
+    if out and Path(out).is_absolute():
+        return Path(out)
+    tmp = Path(tempfile.gettempdir())
+    if not out:
+        return tmp / f"ai-eval-{label}-{int(time.time())}.json"
+    return tmp / out
+
+
 def load_baseline(path: str) -> dict[str, bool]:
     """Which cases passed in a saved run's verdict (a run with `passed`)."""
     doc = json.loads(Path(path).read_text())
@@ -964,7 +1044,7 @@ def main() -> int:
     verdict = set_verdict(verdict_cases, baseline=baseline) if verdict_cases else None
     if verdict:
         print(summary_line(verdict))
-    out = Path(args.out) if args.out else Path(tempfile.gettempdir()) / f"ai-eval-{args.label}-{int(time.time())}.json"
+    out = resolve_out(args.out, args.label)
     out.write_text(json.dumps(result_document(args.label, results, verdict) | {"summary": summary},
                               ensure_ascii=False, indent=2))
     print(f"saved {out}")

@@ -348,7 +348,7 @@ class CleanupPlanTests(unittest.TestCase):
     def test_created_objects_are_collected_from_setup_trace_and_confirm(self) -> None:
         setup_results = [{"kind": "board", "id": "b1"}]
         trace = [{"tool": "create_chart", "result": {"created": True, "id": "c1"}}, {"tool": "create_chart", "result": {"error": "no"}}]
-        confirms = [{"tool": "create_calculated_field", "result": {"id": "f1", "created": False}}]
+        confirms = [{"tool": "create_calculated_field", "result": {"ok": True, "id": "f1"}}]
         found = m.collect_created(setup_results, [trace], confirms)
         # The confirmed calculated field is collected too; the failed chart is not.
         self.assertEqual(
@@ -356,8 +356,24 @@ class CleanupPlanTests(unittest.TestCase):
             [{"kind": "board", "id": "b1"}, {"kind": "chart", "id": "c1"}, {"kind": "field", "id": "f1"}],
         )
 
+    def test_a_failed_calc_field_create_that_echoes_an_id_is_not_collected(self) -> None:
+        # S2: a failed create must not make the run delete an object it did not
+        # create. The real failure is {error} (ApiRejection); a stray id on it
+        # is refused, as a chart and a board are refused without `created`.
+        trace = [{"tool": "create_calculated_field", "ok": False, "result": {"error": "no", "id": "f-theirs"}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_a_calc_field_with_no_ok_marker_is_not_collected(self) -> None:
+        trace = [{"tool": "create_calculated_field", "result": {"id": "f-x", "field": {"id": "f-x"}}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_a_calc_field_confirm_that_failed_is_not_collected(self) -> None:
+        confirms = [{"tool": "create_calculated_field", "result": {"error": "bad", "id": "f-theirs"}}]
+        self.assertEqual(m.collect_created([], [], confirms), [])
+
     def test_a_calc_field_created_in_a_turn_is_collected_as_a_field(self) -> None:
-        trace = [{"tool": "create_calculated_field", "result": {"id": "f9", "field": {"id": "f9"}}}]
+        # The real success: `{ok: true, field: {id}}`, with `id` lifted to the top.
+        trace = [{"tool": "create_calculated_field", "ok": True, "result": {"ok": True, "id": "f9", "field": {"id": "f9"}}}]
         self.assertEqual(m.collect_created([], [trace], []), [{"kind": "field", "id": "f9"}])
 
     def test_a_board_created_in_a_turn_is_collected_as_a_board(self) -> None:
@@ -481,6 +497,88 @@ class ExpectStateTests(unittest.TestCase):
             {"id": "c1", "title": "T", "board": "b1"}]}})
         check = {"path": "/api/dashboard/specs", "list": "charts", "where": {"board": "b1"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c1"}), [])
+
+
+# ── `where` keys: flat, dotted into `def`, and list members (P1, P2) ──────
+
+
+# The shape `GET /api/dashboard/specs` returns for one chart: `render_stored_chart`
+# (dashboard.rs) puts the stored spec at the top, and `def` (a `ChartInput`)
+# carries `grain`, `tableMode`, `measures`, `dimension`, `compare`. The three
+# `def.*` keys below resolve against this, never against the top level.
+REAL_SPEC_ITEM = {
+    "id": "c-real",
+    "title": "Line per month",
+    "kind": "line",
+    "mart": "mart_wisman",
+    "x": "bulan",
+    "y": "jumlah",
+    "board": "b-1",
+    "hasYear": False,
+    "createdBy": "ai",
+    "createdAt": "2026-10-15 00:00:00",
+    "def": {
+        "title": "Line per month",
+        "mart": "mart_wisman",
+        "kind": "line",
+        "dimension": "bulan",
+        "measures": ["jumlah"],
+        "grain": "month",
+    },
+}
+
+
+class WhereMatchTests(unittest.TestCase):
+    def test_a_flat_key_still_matches_a_top_level_value(self) -> None:
+        self.assertTrue(m.where_matches({"kind": "line"}, {"kind": "line"}))
+        self.assertFalse(m.where_matches({"kind": "bar"}, {"kind": "line"}))
+
+    def test_a_dotted_key_matches_a_nested_value(self) -> None:
+        self.assertTrue(m.where_matches(REAL_SPEC_ITEM, {"def.grain": "month"}))
+        self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.grain": "quarter"}))
+
+    def test_a_dotted_key_that_is_absent_does_not_match(self) -> None:
+        # No `tableMode` in this chart's def: a dotted check must not match
+        # against None, nor against a missing parent.
+        self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.tableMode": "rows"}))
+        self.assertFalse(m.where_matches({"id": "x"}, {"def.grain": "month"}))
+        # A `where` value of null must not turn "absent" into "matches either":
+        # that would let a state check pass on a chart that lacks the field.
+        self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.tableMode": None}))
+        self.assertFalse(m.where_matches({"id": "x"}, {"def.grain": None}))
+
+    def test_a_flat_grain_never_matches_because_grain_lives_under_def(self) -> None:
+        # The bug this guards: the old flat matcher could never see `grain`.
+        self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"grain": "month"}))
+
+    def test_a_where_value_matches_a_member_of_a_list(self) -> None:
+        # `measures` is a list in def; a where value names one member.
+        self.assertTrue(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "jumlah"}))
+        self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "other"}))
+
+    def test_a_state_check_with_a_dotted_key_counts_matching_charts(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [REAL_SPEC_ITEM]}})
+        check = {"path": "/api/dashboard/specs", "list": "charts",
+                 "where": {"kind": "line", "def.grain": "month"}, "count": 1}
+        self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
+
+    def test_the_three_grain_and_table_keys_resolve_against_a_real_spec_item(self) -> None:
+        # The three cases that could never pass (P1) must now resolve against
+        # the shape the route returns, so a perfect assistant can match them.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        self.assertEqual(
+            cases["chart_line_monthly"]["expect_state"][0]["where"], {"mart": "mart_wisman", "kind": "line", "def.grain": "month"}
+        )
+        self.assertEqual(
+            cases["chart_quarterly_id"]["expect_state"][0]["where"], {"kind": "line", "def.grain": "quarter"}
+        )
+        table = {"id": "t", "kind": "table", "mart": "mart_event", "def": {"tableMode": "rows", "kind": "table"}}
+        self.assertEqual(
+            cases["chart_rows_table"]["expect_state"][0]["where"],
+            {"mart": "mart_event", "kind": "table", "def.tableMode": "rows"},
+        )
+        self.assertTrue(m.where_matches(table, cases["chart_rows_table"]["expect_state"][0]["where"]))
 
 
 # ── expect_approval, expect_no_tool, forbid_unless_tool ───────────────────
@@ -738,6 +836,122 @@ class ExitCodeTests(unittest.TestCase):
 
 
 # ── the dashboard case file ───────────────────────────────────────────────
+
+
+class OutPathTests(unittest.TestCase):
+    """S3: results never land in the repository. A relative `--out` is taken
+    under the temp directory, the same place the default goes."""
+
+    def test_a_relative_out_is_placed_in_the_temp_directory_not_the_cwd(self) -> None:
+        out = m.resolve_out("results.json", label="x")
+        self.assertEqual(out.parent, Path(tempfile.gettempdir()))
+        self.assertEqual(out.name, "results.json")
+
+    def test_a_relative_out_with_folders_stays_under_the_temp_directory(self) -> None:
+        out = m.resolve_out("sub/results.json", label="x")
+        self.assertTrue(str(out).startswith(tempfile.gettempdir()))
+
+    def test_an_absolute_out_is_kept_as_given(self) -> None:
+        target = Path(tempfile.gettempdir()) / "ai-eval-keep.json"
+        self.assertEqual(m.resolve_out(str(target), label="x"), target)
+
+    def test_the_default_is_a_timestamped_file_in_the_temp_directory(self) -> None:
+        out = m.resolve_out("", label="dashboard")
+        self.assertEqual(out.parent, Path(tempfile.gettempdir()))
+        self.assertTrue(out.name.startswith("ai-eval-dashboard-"))
+
+
+class DashboardRowsTests(unittest.TestCase):
+    """P2: each strengthened row asserts what its plan row says, against the
+    real field names (`ChartInput`: `compare`, `rows`, `columns`, `tableMode`,
+    `measures`; `kind: pivot`)."""
+
+    def cases(self) -> dict[str, dict[str, Any]]:
+        return {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+
+    def test_kpi_compare_asserts_the_compare_is_set(self) -> None:
+        # row 11: "KPI with `compare` set" -> def.compare.kind matches.
+        where = self.cases()["chart_kpi_compare"]["expect_state"][0]["where"]
+        self.assertEqual(where.get("def.compare.kind"), "previous")
+        kpi = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi", "compare": {"kind": "previous", "period": "month"}}}
+        self.assertTrue(m.where_matches(kpi, where))
+        plain = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi"}}
+        self.assertFalse(m.where_matches(plain, where))
+
+    def test_pivot_asserts_its_kind_and_its_rows_and_columns(self) -> None:
+        # row 13: "Pivot with `rows` and `columns`" -> kind pivot, rows and columns.
+        where = self.cases()["chart_pivot"]["expect_state"][0]["where"]
+        self.assertEqual(where["kind"], "pivot")
+        self.assertEqual(where.get("def.rows"), "tahun")
+        self.assertEqual(where.get("def.columns"), "bulan_no")
+        pivot = {"id": "p", "kind": "pivot", "mart": "mart_wisman",
+                 "def": {"kind": "pivot", "rows": ["tahun"], "columns": ["bulan_no"]}}
+        self.assertTrue(m.where_matches(pivot, where))
+        grouped = {"id": "g", "kind": "table", "mart": "mart_wisman", "def": {"kind": "table"}}
+        self.assertFalse(m.where_matches(grouped, where))
+
+    def test_chart_on_new_board_links_the_chart_to_the_board_it_created(self) -> None:
+        # row 14: the chart's `board` is the id of the board this run created.
+        case = self.cases()["chart_on_new_board"]
+        chart = [c for c in case["expect_state"] if c["path"] == "/api/dashboard/specs"]
+        self.assertEqual(chart[0]["where"].get("board"), "{created:board}")
+
+    def test_a_where_value_naming_a_created_board_is_filled_from_the_trace(self) -> None:
+        # The board is made by the assistant's create_board call; its id is
+        # not known when the case is written. `{created:board}` names it.
+        trace = [{"tool": "create_board", "ok": True, "result": {"created": True, "id": "b-new", "name": "X"}}]
+        names: dict[str, str] = {}
+        created = m.collect_created([], [trace], [])
+        filled = m.fill_created({"where": {"board": "{created:board}"}}, created)
+        self.assertEqual(filled["where"], {"board": "b-new"})
+
+    def test_a_created_placeholder_with_no_such_object_is_left_unfilled(self) -> None:
+        # No board was created: the placeholder stays, so nothing matches it.
+        filled = m.fill_created({"where": {"board": "{created:board}"}}, [])
+        self.assertEqual(filled["where"], {"board": "{created:board}"})
+
+    def test_calc_create_asserts_the_formula_has_no_sql(self) -> None:
+        # row 17: the formula, not only the answer, must not contain SQL.
+        case = self.cases()["calc_create"]
+        self.assertIn("formula_forbid", case)
+        self.assertIn("SELECT", case["formula_forbid"])
+
+    def test_a_formula_containing_sql_is_a_problem(self) -> None:
+        trace = [{"tool": "create_calculated_field", "ok": True,
+                  "result": {"id": "f1", "field": {"formula": "SELECT 1"}}}]
+        self.assertTrue(m.formula_problems(trace, ["SELECT"]))
+
+    def test_a_clean_formula_is_not_a_problem(self) -> None:
+        trace = [{"tool": "create_calculated_field", "ok": True,
+                  "result": {"id": "f1", "field": {"formula": "[jumlah_event] / 2"}}}]
+        self.assertEqual(m.formula_problems(trace, ["SELECT"]), [])
+
+    def test_calc_validate_error_names_the_offending_token(self) -> None:
+        # row 18: "the answer names the mistake". The formula's broken token is
+        # the `?` (lex.rs: "unexpected character '?'"), and a text fact must
+        # have the answer say it.
+        case = self.cases()["calc_validate_error"]
+        facts = [f for f in case.get("facts", []) if f.get("kind") == "text"]
+        self.assertTrue(facts, "a text fact must name the mistake")
+        self.assertIn("'?'", facts[0]["values"])
+
+    def test_calc_then_chart_asserts_the_chart_uses_the_field(self) -> None:
+        # row 19: a chart uses the calculated field by name (def.measures lists it).
+        case = self.cases()["calc_then_chart"]
+        chart_check = [c for c in case["expect_state"] if c["path"] == "/api/dashboard/specs"][0]
+        self.assertEqual(chart_check["where"].get("def.measures"), "per_event")
+
+    def test_silver_refused_asserts_the_answer_offers_a_mart(self) -> None:
+        # row 25: "the answer offers a mart" -> the answer names a serving mart.
+        case = self.cases()["silver_refused"]
+        facts = [f for f in case.get("facts", []) if f.get("kind") == "text"]
+        self.assertTrue(facts, "a text fact must name a mart the answer offers")
+        self.assertTrue(any(v.startswith("mart_") for v in facts[0]["values"]))
+
+    def test_kpi_number_backed_has_no_dead_forbid(self) -> None:
+        # P4: forbid scans plain text, which strips the attribute, so the
+        # `data-unverified` forbid can never match. It is removed.
+        self.assertNotIn("forbid", self.cases()["kpi_number_backed"])
 
 
 class DashboardCasesTests(unittest.TestCase):

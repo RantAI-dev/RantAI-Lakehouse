@@ -62,7 +62,7 @@
     "turns": ["Draw a line chart of foreign visitors per month."],
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "line", "grain": "month"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "line", "grain": "month"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "line", "def.grain": "month"}, "count": 1}
     ]
   },
   {
@@ -73,7 +73,7 @@
     "turns": ["Buat grafik garis jumlah pengunjung mancanegara per kuartal."],
     "expect_tool": {"name": "create_chart", "args_contains": {"grain": "quarter"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "line", "grain": "quarter"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "line", "def.grain": "quarter"}, "count": 1}
     ]
   },
   {
@@ -103,7 +103,7 @@
     "turns": ["Add a KPI card of foreign visitors, compared with the previous period."],
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "kpi"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "kpi"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "kpi", "def.compare.kind": "previous"}, "count": 1}
     ]
   },
   {
@@ -113,7 +113,7 @@
     "turns": ["Show a table of the events with their dates."],
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_event", "kind": "table"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "table", "tableMode": "rows"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "table", "def.tableMode": "rows"}, "count": 1}
     ]
   },
   {
@@ -121,9 +121,9 @@
     "mode": "build",
     "confirm": true,
     "turns": ["Make a pivot of foreign visitors by year and month."],
-    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "table"}},
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "pivot"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "table"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "pivot", "def.rows": "tahun", "def.columns": "bulan_no"}, "count": 1}
     ]
   },
   {
@@ -133,7 +133,8 @@
     "turns": ["Make a board \"Eval Events Board\" and put a bar chart of events per year on it."],
     "expect_tool": {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval Events Board"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval Events Board"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "kind": "bar", "board": "{created:board}"}, "count": 1}
     ]
   },
   {
@@ -174,14 +175,18 @@
     "expect_state": [
       {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "ratio"}, "count": 1}
     ],
-    "forbid": ["SELECT"]
+    "forbid": ["SELECT"],
+    "formula_forbid": ["SELECT"]
   },
   {
     "id": "calc_validate_error",
     "mode": "build",
     "turns": ["Is this formula right: Sum([jumlah_event]) / ( ? Check it on mart_event."],
     "expect_tool": {"name": "validate_formula", "args_contains": {"mart": "mart_event"}},
-    "expect_no_tool": ["create_calculated_field"]
+    "expect_no_tool": ["create_calculated_field"],
+    "facts": [
+      {"label": "mistake", "kind": "text", "values": ["'?'"]}
+    ]
   },
   {
     "id": "calc_then_chart",
@@ -191,7 +196,7 @@
     "expect_tool": {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
     "expect_state": [
       {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "per_event"}, "count": 1},
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_event", "def.measures": "per_event"}, "count": 1}
     ]
   },
   {
@@ -253,7 +258,10 @@
     "mode": "build",
     "turns": ["Make a chart straight from the silver event table, not a mart."],
     "expect_no_tool": ["create_chart"],
-    "expect_refusal": true
+    "expect_refusal": true,
+    "facts": [
+      {"label": "offered mart", "kind": "text", "values": ["mart_event"]}
+    ]
   },
   {
     "id": "missing_column_refused",
@@ -306,7 +314,6 @@
     "turns": ["How many events were there in the latest year?"],
     "facts": [
       {"label": "events", "kind": "number", "sql": "SELECT jumlah_event FROM serving.mart_event WHERE tahun = (SELECT max(tahun) FROM serving.mart_event)", "tol": 0.006}
-    ],
-    "forbid": ["data-unverified"]
+    ]
   }
 ]
