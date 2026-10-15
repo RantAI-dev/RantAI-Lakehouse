@@ -468,21 +468,39 @@ def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[s
     return filled
 
 
-def formula_problems(trace: list[dict[str, Any]], forbidden: list[str]) -> list[str]:
+def formula_problems(
+    trace: list[dict[str, Any]], confirms: list[dict[str, Any]], forbidden: list[str]
+) -> list[str]:
     """`formula_forbid`: the formula of every calculated field the run created
     must not contain any of `forbidden`. The answer is scored as text; the
-    formula is a field of the tool's result and is checked here."""
-    problems: list[str] = []
+    formula is a field of the tool's result and is checked here.
+
+    Both places a created field's result can arrive are read. A tool the
+    model called with `confirmed` itself answers in the trace. A tool the
+    person confirmed -- which is the flow every writing case in the set
+    uses -- returns the pending `{needs_confirmation, tool, args}` in the
+    trace and the executed `{ok, field}` only in `confirms`, so reading the
+    trace alone would find no formula and let the case pass unchecked."""
+    formulas: list[str] = []
     for step in trace:
-        if step.get("tool") != "create_calculated_field":
-            continue
-        result = step.get("result") or {}
-        field = result.get("field") if isinstance(result, dict) else None
-        formula = str((field or {}).get("formula", ""))
+        if step.get("tool") == "create_calculated_field":
+            formulas.append(_created_formula(step.get("result")))
+    for confirm in confirms:
+        if confirm.get("tool") == "create_calculated_field":
+            formulas.append(_created_formula(confirm.get("result")))
+    problems: list[str] = []
+    for formula in formulas:
         for word in forbidden:
             if re.search(word, formula, re.IGNORECASE):
                 problems.append(f"formula contains {word}")
     return problems
+
+
+def _created_formula(result: Any) -> str:
+    """The formula of a `create_calculated_field` result, or `""` when the
+    result is the pending confirmation rather than the executed call."""
+    field = result.get("field") if isinstance(result, dict) else None
+    return str((field or {}).get("formula", "")) if isinstance(field, dict) else ""
 
 
 def pending_of(step: dict[str, Any]) -> dict[str, Any]:
@@ -773,7 +791,7 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
                 forbid_unless_problems(scored["answer"], trace, spec["pattern"], spec["result_key"])
             )
         if "formula_forbid" in case:
-            scored["problems"].extend(formula_problems(trace, case["formula_forbid"]))
+            scored["problems"].extend(formula_problems(trace, confirms, case["formula_forbid"]))
     except BaseException as raised:  # noqa: BLE001 - a failed run is a result, not a crash
         _raised_run = raised
     finally:

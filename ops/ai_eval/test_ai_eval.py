@@ -917,14 +917,55 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertIn("SELECT", case["formula_forbid"])
 
     def test_a_formula_containing_sql_is_a_problem(self) -> None:
+        # The model called the tool with `confirmed` itself: the result is in
+        # the trace.
         trace = [{"tool": "create_calculated_field", "ok": True,
                   "result": {"id": "f1", "field": {"formula": "SELECT 1"}}}]
-        self.assertTrue(m.formula_problems(trace, ["SELECT"]))
+        self.assertTrue(m.formula_problems(trace, [], ["SELECT"]))
+        # Whatever case the model writes it in: `select 1` is the same mistake.
+        lower = [{"tool": "create_calculated_field", "ok": True,
+                  "result": {"id": "f1", "field": {"formula": "select 1"}}}]
+        self.assertTrue(m.formula_problems(lower, [], ["SELECT"]))
 
     def test_a_clean_formula_is_not_a_problem(self) -> None:
         trace = [{"tool": "create_calculated_field", "ok": True,
                   "result": {"id": "f1", "field": {"formula": "[jumlah_event] / 2"}}}]
-        self.assertEqual(m.formula_problems(trace, ["SELECT"]), [])
+        self.assertEqual(m.formula_problems(trace, [], ["SELECT"]), [])
+
+    def test_a_formula_confirmed_by_the_person_is_still_checked(self) -> None:
+        # The flow every writing case in the set runs: the trace step is only
+        # the pending confirmation, and the executed result arrives through the
+        # confirm. Reading the trace alone would find no formula here and let
+        # the case pass unchecked.
+        trace = [{"tool": "create_calculated_field",
+                  "result": {"needs_confirmation": True, "tool": "create_calculated_field",
+                             "args": {"formula": "SELECT 1"}}}]
+        confirms = [{"tool": "create_calculated_field",
+                     "result": {"ok": True, "field": {"formula": "SELECT 1"}}}]
+        self.assertTrue(m.formula_problems(trace, confirms, ["SELECT"]))
+
+    def test_a_clean_confirmed_formula_is_not_a_problem(self) -> None:
+        trace = [{"tool": "create_calculated_field",
+                  "result": {"needs_confirmation": True, "tool": "create_calculated_field",
+                             "args": {"formula": "[jumlah_event] / 2"}}}]
+        confirms = [{"tool": "create_calculated_field",
+                     "result": {"ok": True, "field": {"formula": "[jumlah_event] / 2"}}}]
+        self.assertEqual(m.formula_problems(trace, confirms, ["SELECT"]), [])
+
+    def test_a_pending_confirmation_alone_is_not_a_created_formula(self) -> None:
+        # Only a pending step, never confirmed: nothing was created, so there
+        # is no formula to judge and no problem to report.
+        trace = [{"tool": "create_calculated_field",
+                  "result": {"needs_confirmation": True, "tool": "create_calculated_field",
+                             "args": {"formula": "SELECT 1"}}}]
+        self.assertEqual(m.formula_problems(trace, [], ["SELECT"]), [])
+
+    def test_the_calc_create_case_confirms_so_its_formula_is_checked_in_confirms(self) -> None:
+        # Row 17 is only enforced because the case confirms; if it stopped, the
+        # shape of the result the checker reads would change with it.
+        case = self.cases()["calc_create"]
+        self.assertTrue(case.get("confirm"))
+        self.assertIn("SELECT", case["formula_forbid"])
 
     def test_calc_validate_error_names_the_offending_token(self) -> None:
         # row 18: "the answer names the mistake". The formula's broken token is
