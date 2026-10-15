@@ -335,11 +335,28 @@ fn matches_filter(asset: &Value, filter: &Filter) -> bool {
 /// nothing: a list has no order. An asset without the field is an empty
 /// list, so a negative filter keeps it, as it does for a missing scalar.
 fn matches_array_filter(asset: &Value, filter: &Filter) -> bool {
-    let entries: Vec<&str> = asset
+    let mut entries: Vec<String> = asset
         .get(filter.id.as_str())
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default();
+    // `DATA-12` part 2: the Tags filter reads the governed pairs too, as
+    // `key: value` entries, so `iLike finance` finds a table tagged
+    // `data_domain: finance` and `isEmpty` is true only for a table with
+    // neither kind. The same text the search indexes.
+    if filter.id == "tags" {
+        entries.extend(
+            super::catalog_search::governed_pairs(asset)
+                .into_iter()
+                .map(|(key, value)| format!("{key}: {value}")),
+        );
+    }
     let first = filter.values.first().map_or("", String::as_str);
     let any = |positive: &str| {
         entries.iter().any(|entry| match positive {
@@ -662,6 +679,30 @@ mod tests {
     fn tags_is_empty_and_is_not_empty_look_at_the_length_and_a_missing_key_is_empty() {
         assert_eq!(tag_hits("isEmpty", &[]), vec!["c", "d"]);
         assert_eq!(tag_hits("isNotEmpty", &[]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_tags_filter_reads_governed_pairs_as_key_colon_value() {
+        let assets = vec![
+            json!({ "id": "a", "governedTags": { "data_domain": "finance" } }),
+            json!({ "id": "b", "tags": ["pii"] }),
+            json!({ "id": "c" }),
+        ];
+        let hits = |operator: &str, values: &[&str]| -> Vec<String> {
+            apply_filters(
+                &assets,
+                &[filter("tags", operator, values)],
+                JoinOperator::And,
+            )
+            .iter()
+            .filter_map(|a| a["id"].as_str().map(str::to_owned))
+            .collect()
+        };
+        assert_eq!(hits("iLike", &["finance"]), vec!["a"]);
+        assert_eq!(hits("iLike", &["data_domain"]), vec!["a"]);
+        assert_eq!(hits("eq", &["data_domain: Finance"]), vec!["a"]);
+        assert_eq!(hits("isNotEmpty", &[]), vec!["a", "b"]);
+        assert_eq!(hits("notILike", &["finance"]), vec!["b", "c"]);
     }
 
     #[test]
