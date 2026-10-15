@@ -48,10 +48,12 @@ from dagster import (
 from dispar_orchestrate import gold_export
 from dispar_orchestrate.gold_export import (
     GoldExportConfig,
+    InvalidKeepCopiesError,
     _headers,
     evaluate_authored_success,
     gold_export_job,
     gold_export_schedule,
+    parse_gold_keep_copies,
 )
 
 
@@ -528,6 +530,75 @@ class GoldExportAfterAuthoredSensorTests(unittest.TestCase):
         run_requests = [r for r in results if isinstance(r, RunRequest)]
         self.assertEqual(run_requests, [])
 
+
+
+
+class GoldKeepCopiesParsingTests(unittest.TestCase):
+    """DATA-2 T2 (D4): parse GOLD_KEEP_COPIES setting as integer >= 1.
+    Values 7 and 1 parse successfully; 0, -1, x, empty, None fail with
+    fixed reason 'invalid GOLD_KEEP_COPIES'.
+    """
+
+    def test_parses_seven(self) -> None:
+        self.assertEqual(parse_gold_keep_copies("7"), 7)
+        self.assertEqual(parse_gold_keep_copies(7), 7)
+
+    def test_parses_one(self) -> None:
+        self.assertEqual(parse_gold_keep_copies("1"), 1)
+        self.assertEqual(parse_gold_keep_copies(1), 1)
+
+    def test_zero_rejected(self) -> None:
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies("0")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+        with self.assertRaises(InvalidKeepCopiesError):
+            parse_gold_keep_copies(0)
+
+    def test_negative_rejected(self) -> None:
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies("-1")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+        with self.assertRaises(InvalidKeepCopiesError):
+            parse_gold_keep_copies(-1)
+
+    def test_non_integer_rejected(self) -> None:
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies("x")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+
+    def test_empty_rejected(self) -> None:
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies("")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies("   ")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+
+        with self.assertRaises(InvalidKeepCopiesError) as ctx:
+            parse_gold_keep_copies(None)
+        self.assertEqual(str(ctx.exception), "invalid GOLD_KEEP_COPIES")
+
+    def test_config_from_env_defaults(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            cfg = GoldExportConfig.from_env()
+            self.assertEqual(cfg.gold_keep_copies, "7")
+            self.assertEqual(cfg.gold_export_token_file, "/tokens/gold-export.jwt")
+            self.assertEqual(parse_gold_keep_copies(cfg.gold_keep_copies), 7)
+
+    def test_config_from_env_custom(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "GOLD_KEEP_COPIES": "14",
+                "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE": "/custom/path/gold.jwt",
+            },
+            clear=True,
+        ):
+            cfg = GoldExportConfig.from_env()
+            self.assertEqual(cfg.gold_keep_copies, "14")
+            self.assertEqual(cfg.gold_export_token_file, "/custom/path/gold.jwt")
+            self.assertEqual(parse_gold_keep_copies(cfg.gold_keep_copies), 14)
 
 if __name__ == "__main__":
     unittest.main()

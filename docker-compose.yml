@@ -1732,6 +1732,13 @@ services:
         source: lakehouse_connector_secrets
         target: /run/secrets
         read_only: true
+      # DATA-2 (D2): read-only subpath mount for the gold-export principal token
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
@@ -1806,6 +1813,8 @@ services:
       # so there is no step to interpolate a file into an env var before
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
+      # DATA-2 (D2): the gold-export principal pre-minted token path
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
       # static-credential fallback path, used because dlt writes Parquet
@@ -1849,6 +1858,8 @@ services:
       LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
       GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # DATA-2 (D4): number of Gold export copies to keep per mart (default 7)
+      GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the

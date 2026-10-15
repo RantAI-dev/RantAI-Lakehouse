@@ -91,6 +91,34 @@ def _env(name: str, default: str) -> str:
     return value if value else default
 
 
+INVALID_KEEP_COPIES_REASON = "invalid GOLD_KEEP_COPIES"
+
+
+class InvalidKeepCopiesError(ValueError):
+    """Raised when GOLD_KEEP_COPIES cannot be parsed as an integer >= 1."""
+
+
+def parse_gold_keep_copies(raw: Any) -> int:
+    """Parse GOLD_KEEP_COPIES setting as an integer >= 1 (DATA-2 D4).
+
+    Anything else (0, negative, non-numeric, empty string, None) raises
+    InvalidKeepCopiesError("invalid GOLD_KEEP_COPIES").
+    """
+    if raw is None:
+        raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON)
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON)
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON) from None
+    if val < 1:
+        raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON)
+    return val
+
+
 def _marts_from_env() -> list[str]:
     """The operator's `GOLD_EXPORT_MARTS` override, default empty: the
     scheduled mart list is owned by the per-mart publication setting
@@ -120,6 +148,15 @@ class GoldExportConfig:
     # exists — the schedule then runs and fails loudly (`401`/`503`)
     # instead of silently, which is the honest state to ship.
     run_token: str
+    gold_keep_copies: str = "7"
+    gold_export_token_file: str = "/tokens/gold-export.jwt"
+    lakekeeper_catalog_uri: str = "http://lakekeeper:8181/catalog"
+    lakekeeper_warehouse: str = "default"
+    rustfs_endpoint: str = "http://rustfs:9000"
+    rustfs_access_key: str = "rustfsadmin"
+    rustfs_secret_key: str = "rustfsadmin"
+    ch_oauth_client_id: str = ""
+    ch_oauth_server_uri: str = ""
 
     @classmethod
     def from_env(cls) -> "GoldExportConfig":
@@ -128,6 +165,19 @@ class GoldExportConfig:
             api_url=_env("LAKEHOUSE_API_URL", "http://lakehouse-api:8080"),
             marts=_marts_from_env(),
             run_token=_env("GOLD_EXPORT_RUN_TOKEN", ""),
+            gold_keep_copies=_env("GOLD_KEEP_COPIES", "7"),
+            gold_export_token_file=_env(
+                "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE", "/tokens/gold-export.jwt"
+            ),
+            lakekeeper_catalog_uri=_env(
+                "LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog"
+            ),
+            lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
+            rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
+            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
+            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+            ch_oauth_client_id=_env("CH_OAUTH_CLIENT_ID", ""),
+            ch_oauth_server_uri=_env("CH_OAUTH_SERVER_URI", ""),
         )
 
 

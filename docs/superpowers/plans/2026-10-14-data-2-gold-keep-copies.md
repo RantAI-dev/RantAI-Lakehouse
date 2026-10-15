@@ -257,6 +257,17 @@ console's manual publish (D1), Silver (`DATA-4`).
   - Parquet files in object store after applied run: exactly 7 files remain.
   - The 2 orphaned files were successfully deleted from object storage.
 
+### Task T2: Compose and Config (D2 + D4)
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - D2: Mounted `gold-export.jwt` read-only (`subpath: gold-export.jwt` on `lakehouse_oidc_tokens`) into `dagster-code-location` at `/tokens/gold-export.jwt` and wired `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` in `docker-compose.yml`.
+  - D4: Added `GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}` to `dagster-code-location` in `docker-compose.yml`.
+  - Added `parse_gold_keep_copies` in `dagster/dispar_orchestrate/gold_export.py` requiring integer >= 1, raising `InvalidKeepCopiesError("invalid GOLD_KEEP_COPIES")` otherwise.
+  - Added fields to `GoldExportConfig` (`gold_keep_copies`, `gold_export_token_file`, `lakekeeper_catalog_uri`, `lakekeeper_warehouse`, `rustfs_endpoint`, `rustfs_access_key`, `rustfs_secret_key`, `ch_oauth_client_id`, `ch_oauth_server_uri`).
+  - Added unit test suite `GoldKeepCopiesParsingTests` in `dagster/dispar_orchestrate/test_gold_export.py` (tested `7`, `1`, `0`, `-1`, `x`, empty, and env loading). All 29 tests pass.
+  - Checked `docker compose --profile '*' config --quiet` (exit code 0).
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`
