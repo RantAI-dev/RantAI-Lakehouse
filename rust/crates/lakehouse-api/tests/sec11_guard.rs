@@ -198,7 +198,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors.rs",
-        "_ => ApiError::Unprocessable(err.to_string()) // SEC-11 allowlisted",
+        "_ => ApiError::Unprocessable(err.to_string()), // SEC-11 allowlisted",
         "SRC-11 D9-D11, the other InvalidExcludedColumns variants: fixed sentences (ingest_spec.rs) that name only the object and column the request itself sent",
     ),
     (
