@@ -966,6 +966,14 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         row.tenant_id,
     )
     .await?;
+    if input.target_lag.is_some()
+        && let Some(cycle) = find_target_lag_cycle_conn(&mut tx, &id).await?
+    {
+        return Err(StoreError::Validation(format!(
+            "target lag would create a cycle: {}",
+            cycle.join(" -> ")
+        )));
+    }
     tx.commit().await?;
     Ok(Pipeline::from(row))
 }
@@ -1847,6 +1855,7 @@ pub async fn set_target_lag(
     id: &str,
     target_lag: Option<TargetLag>,
 ) -> Result<Option<Pipeline>, StoreError> {
+    let mut tx = pool.begin().await?;
     let (seconds, downstream) = target_lag.map_or((None, false), TargetLag::columns);
     let sql = format!(
         "UPDATE pipeline_definition \
@@ -1857,9 +1866,275 @@ pub async fn set_target_lag(
         .bind(id)
         .bind(seconds)
         .bind(downstream)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    Ok(row.map(Pipeline::from))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if target_lag.is_some()
+        && let Some(cycle) = find_target_lag_cycle_conn(&mut tx, id).await?
+    {
+        return Err(StoreError::Validation(format!(
+            "target lag would create a cycle: {}",
+            cycle.join(" -> ")
+        )));
+    }
+    tx.commit().await?;
+    Ok(Some(Pipeline::from(row)))
+}
+
+/// BLD-2 plan D7: every pipeline with a target lag that reads one of
+/// `targets` (directly as its source, or through a `depends_on` pipeline's
+/// target) — the "downstream" of a table.
+///
+/// A pipeline whose kind is `downstream` is refreshed by the pipeline that
+/// reads it, so this is the list such a pipeline's own check has to walk
+/// to find out whether anybody needs it at all.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn lag_pipelines_reading(
+    pool: &PgPool,
+    targets: &[String],
+) -> Result<Vec<Pipeline>, StoreError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
+         WHERE (target_lag_seconds IS NOT NULL OR target_lag_downstream) \
+           AND (source = ANY($1) OR EXISTS ( \
+                  SELECT 1 FROM unnest(depends_on) AS up(id) \
+                  JOIN pipeline_definition u ON u.id = up.id \
+                  WHERE u.target = ANY($1))) \
+         ORDER BY id"
+    );
+    let rows: Vec<PipelineRow> = sqlx::query_as(&sql).bind(targets).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(Pipeline::from).collect())
+}
+
+/// How many pipelines with a target lag read `target` (other than `pipeline_id`
+/// itself) — plan D7's honest note ("Downstream: no pipeline with a target lag
+/// reads this table") needs this number, and the page must not have to infer it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn count_lag_pipelines_reading(
+    pool: &PgPool,
+    pipeline_id: &str,
+    target: &str,
+) -> Result<i64, StoreError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM pipeline_definition p \
+         WHERE p.id != $1 \
+           AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
+           AND (p.source = $2 OR EXISTS ( \
+                  SELECT 1 FROM unnest(p.depends_on) AS up(id) \
+                  JOIN pipeline_definition u ON u.id = up.id \
+                  WHERE u.target = $2))",
+    )
+    .bind(pipeline_id)
+    .bind(target)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Upstream pipelines whose target lag is `downstream`, and whose target is
+/// read by `pipeline` (directly as its source, or through `depends_on`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn upstream_downstream_pipelines(
+    pool: &PgPool,
+    pipeline: &Pipeline,
+) -> Result<Vec<Pipeline>, StoreError> {
+    let mut input_tables = vec![pipeline.source.clone()];
+    for target in pipelines_targets(pool, &pipeline.depends_on)
+        .await?
+        .into_values()
+    {
+        input_tables.push(target);
+    }
+    input_tables.sort();
+    input_tables.dedup();
+
+    let sql = format!(
+        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
+         WHERE target_lag_downstream = true \
+           AND id != $1 \
+           AND (target = ANY($2) OR id = ANY($3)) \
+         ORDER BY id"
+    );
+    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+        .bind(&pipeline.id)
+        .bind(&input_tables)
+        .bind(&pipeline.depends_on)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(Pipeline::from).collect())
+}
+
+/// The chain of upstream downstream pipelines, deepest first.
+///
+/// Walks up the downstream dependencies until reaching inputs that are not
+/// produced by downstream pipelines. Because [`find_target_lag_cycle`] refuses
+/// cycles among lag pipelines at write time, this walk is guaranteed to
+/// terminate.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if any query fails.
+pub async fn upstream_downstream_chain(
+    pool: &PgPool,
+    pipeline: &Pipeline,
+) -> Result<Vec<Pipeline>, StoreError> {
+    let mut chain = Vec::new();
+    let mut current = pipeline.clone();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(pipeline.id.clone());
+
+    loop {
+        let upstreams = upstream_downstream_pipelines(pool, &current).await?;
+        let Some(next) = upstreams.into_iter().find(|u| !seen.contains(&u.id)) else {
+            break;
+        };
+        seen.insert(next.id.clone());
+        chain.push(next.clone());
+        current = next;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// `id → target` for the named pipelines, skipping ids with no row (a
+/// `depends_on` entry may name a `Dagster`-native job).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn pipelines_targets(
+    pool: &PgPool,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, String>, StoreError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, target FROM pipeline_definition WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// BLD-2 plan D7's write-time rule: a pipeline with a target lag may not
+/// (transitively) read the table it writes. A lag pipeline whose input is
+/// another lag pipeline's output would otherwise ask for a run inside the
+/// run it is waiting for — forever, in the worst case.
+///
+/// `Ok(None)` means acyclic, which is every pipeline that is not its own
+/// upstream. `Ok(Some(path))` is the cycle, starting and ending at
+fn dfs_cycle(
+    current: &str,
+    target: &str,
+    upstream_of: &impl Fn(&str) -> Vec<String>,
+    path: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    for up in upstream_of(current) {
+        if up == target {
+            path.push(up);
+            return true;
+        }
+        if visited.insert(up.clone()) {
+            path.push(up.clone());
+            if dfs_cycle(&up, target, upstream_of, path, visited) {
+                return true;
+            }
+            path.pop();
+        }
+    }
+    false
+}
+
+/// BLD-2 plan D7's write-time rule: a pipeline with a target lag may not
+/// (transitively) read the table it writes. A lag pipeline whose input is
+/// another lag pipeline's output would otherwise ask for a run inside the
+/// run it is waiting for — forever, in the worst case.
+///
+/// `Ok(None)` means acyclic, which is every pipeline that is not its own
+/// upstream. `Ok(Some(path))` is the cycle, starting and ending at
+/// `pipeline_id`, for the refusal message.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if either query fails.
+pub async fn find_target_lag_cycle(
+    pool: &PgPool,
+    pipeline_id: &str,
+) -> Result<Option<Vec<String>>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    find_target_lag_cycle_conn(&mut conn, pipeline_id).await
+}
+
+/// In-transaction variant of [`find_target_lag_cycle`], so a write can check
+/// before committing.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if either query fails.
+pub async fn find_target_lag_cycle_conn(
+    conn: &mut sqlx::PgConnection,
+    pipeline_id: &str,
+) -> Result<Option<Vec<String>>, StoreError> {
+    let targets =
+        sqlx::query_as::<_, (String, String)>("SELECT id, target FROM pipeline_definition")
+            .fetch_all(&mut *conn)
+            .await?;
+    let target_of: std::collections::HashMap<String, String> = targets.into_iter().collect();
+
+    let lag_rows = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "SELECT id, source, depends_on FROM pipeline_definition \
+         WHERE target_lag_seconds IS NOT NULL OR target_lag_downstream",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let upstream_of = |id: &str| -> Vec<String> {
+        let Some((_, source, depends_on)) = lag_rows.iter().find(|(pid, ..)| pid == id) else {
+            return Vec::new();
+        };
+        let mut inputs = vec![source.clone()];
+        for up in depends_on {
+            if let Some(target) = target_of.get(up) {
+                inputs.push(target.clone());
+            }
+        }
+        inputs.sort();
+        inputs.dedup();
+        lag_rows
+            .iter()
+            .filter(|(pid, ..)| inputs.contains(&target_of.get(pid).cloned().unwrap_or_default()))
+            .map(|(pid, ..)| pid.clone())
+            .collect()
+    };
+
+    let mut path = vec![pipeline_id.to_owned()];
+    let mut visited = std::collections::HashSet::new();
+    if dfs_cycle(
+        pipeline_id,
+        pipeline_id,
+        &upstream_of,
+        &mut path,
+        &mut visited,
+    ) {
+        return Ok(Some(path));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
