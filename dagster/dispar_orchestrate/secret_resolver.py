@@ -27,6 +27,18 @@ this module reads it through the same `file:` branch as an
 operator-dropped `connector_<id>_<suffix>` file -- no managed-specific
 code path exists here, by design.
 
+Managed credentials are sealed at rest (`SRC-12` decision 4, ADR 0002
+addendum 5): a file named `connector_managed_*` holds `0x01 || 12-byte nonce
+|| AES-256-GCM ciphertext and tag`, with the file name as the associated
+data, sealed by the API with `CONNECTOR_SECRETS_KEY`. This module only
+OPENS them (the API is the only writer), with that key and, during a key
+change, the previous one (`CONNECTOR_SECRETS_KEY_PREVIOUS`). A managed file
+that is not a seal -- a plain one the API has not yet sealed at its start --
+is refused, never read as text (fail closed). Operator `file:` and `env:`
+credentials are not sealed and read as before. The shared test vector
+`rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json` is
+checked by this module's tests and by the API's, so the two cannot drift.
+
 Never log a resolved value -- only the ref NAME appears in any exception
 message here, matching `secret.rs`'s `SecretValue` guarantee that a
 resolved credential is never `Debug`-printed or logged.
@@ -34,8 +46,13 @@ resolved credential is never `Debug`-printed or logged.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 from pathlib import Path
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from dispar_orchestrate.secret_map import secret_field_names
 
@@ -57,6 +74,22 @@ CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: tuple[str, ...] = (
 
 _SECRETS_BASE_DIR = "/run/secrets"
 
+# `SRC-12` decision 4: the sealed-file format, as `secret_crypto.rs` writes it.
+_MANAGED_FILE_PREFIX = "connector_managed_"
+_FORMAT_VERSION = 1
+_NONCE_LEN = 12
+_TAG_LEN = 16
+_KEY_LEN = 32
+_KEY_ENV = "CONNECTOR_SECRETS_KEY"
+_PREVIOUS_KEY_ENV = "CONNECTOR_SECRETS_KEY_PREVIOUS"
+
+# Fixed texts (decision 12): they say what is wrong, never carry a key, a
+# value or a library's own message.
+_KEY_MISSING = f"{_KEY_ENV} is not set; connector credentials cannot be read without it"
+_KEY_INVALID = f"{_KEY_ENV} (or {_PREVIOUS_KEY_ENV}) is not 32 random bytes in base64"
+_WRONG_KEY = "the stored credential cannot be opened with the configured key"
+_NOT_SEALED = "the stored credential file is not in a format this build reads"
+
 
 class SecretRefRejected(Exception):
     """A connector's declared secretRef is missing, not allowlisted, or
@@ -71,6 +104,51 @@ def _pattern_matches(pattern: str, value: str) -> bool:
         return False
     prefix, suffix = pattern.split("*", 1)
     return len(value) >= len(prefix) + len(suffix) and value.startswith(prefix) and value.endswith(suffix)
+
+
+def _key_from_env(name: str, *, required: bool) -> AESGCM | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        if required:
+            raise SecretRefRejected(_KEY_MISSING)
+        return None
+    try:
+        key = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise SecretRefRejected(_KEY_INVALID) from None
+    if len(key) != _KEY_LEN:
+        raise SecretRefRejected(_KEY_INVALID)
+    return AESGCM(key)
+
+
+def open_managed_credential(file_name: str, sealed: bytes) -> str:
+    """Open the content of the managed file `file_name`.
+
+    Tries `CONNECTOR_SECRETS_KEY`, then `CONNECTOR_SECRETS_KEY_PREVIOUS`
+    (decision 5: until the key-change command has run the old key still
+    opens). The associated data is the file name, so a file copied under
+    another connector's name does not open.
+
+    Raises `SecretRefRejected` with a fixed text: key missing, key
+    malformed, bytes not a seal, or key wrong.
+    """
+    keys = [_key_from_env(_KEY_ENV, required=True), _key_from_env(_PREVIOUS_KEY_ENV, required=False)]
+    if len(sealed) < 1 + _NONCE_LEN + _TAG_LEN or sealed[0] != _FORMAT_VERSION:
+        raise SecretRefRejected(_NOT_SEALED)
+    nonce = sealed[1 : 1 + _NONCE_LEN]
+    ciphertext = sealed[1 + _NONCE_LEN :]
+    for key in keys:
+        if key is None:
+            continue
+        try:
+            plaintext = key.decrypt(nonce, ciphertext, file_name.encode())
+        except InvalidTag:
+            continue
+        try:
+            return plaintext.decode().strip()
+        except UnicodeDecodeError:
+            raise SecretRefRejected(_NOT_SEALED) from None
+    raise SecretRefRejected(_WRONG_KEY)
 
 
 def resolve_secret_ref(secret_ref: str | None) -> str:
@@ -100,6 +178,18 @@ def resolve_secret_ref(secret_ref: str | None) -> str:
             raise SecretRefRejected(f"secretRef {secret_ref!r} does not resolve to a real file: {exc}") from exc
         if target != base and base not in target.parents:
             raise SecretRefRejected(f"secretRef {secret_ref!r} escapes the secrets base directory")
+        # The seal is bound to the name the ref gives, not to a symlink's
+        # target; a managed file is never read as text (`SRC-12` decision 4).
+        ref_file_name = Path(raw_path).name
+        if ref_file_name.startswith(_MANAGED_FILE_PREFIX):
+            try:
+                sealed = target.read_bytes()
+            except OSError:
+                raise SecretRefRejected(f"secretRef {secret_ref!r} could not be read") from None
+            try:
+                return open_managed_credential(ref_file_name, sealed)
+            except SecretRefRejected as exc:
+                raise SecretRefRejected(f"secretRef {secret_ref!r}: {exc}") from None
         return target.read_text().strip()
     raise SecretRefRejected(f"secretRef {secret_ref!r} has an unsupported scheme")
 
