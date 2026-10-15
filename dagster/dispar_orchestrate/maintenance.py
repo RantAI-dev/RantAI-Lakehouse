@@ -272,19 +272,24 @@ def _ch_query(cfg: MaintenanceConfig, sql: str) -> str:
     return resp.text
 
 
-def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
-    """A dedicated `DataLakeCatalog` database for maintenance, separate
+def ensure_catalog_database(cfg: Any, db_name: str = CATALOG_DB) -> None:
+    """A dedicated `DataLakeCatalog` database for maintenance/export jobs, separate
     from any per-test catalog database (`icecat`/`icecat_g3a` in
-    `ops/g3a/g3a_test.py`) so a maintenance run never depends on test
+    `ops/g3a/g3a_test.py`) so a run never depends on test
     fixtures having created one first."""
+    auth = cfg.ch_auth_settings() if hasattr(cfg, "ch_auth_settings") else ""
     _ch_query(
         cfg,
-        f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
+        f"CREATE DATABASE IF NOT EXISTS {db_name} "
         f"ENGINE = DataLakeCatalog('{cfg.lakekeeper_catalog_uri}') "
         f"SETTINGS catalog_type = 'rest', warehouse = '{cfg.lakekeeper_warehouse}', "
-        f"storage_endpoint = '{cfg.rustfs_endpoint}'{cfg.ch_auth_settings()} "
+        f"storage_endpoint = '{cfg.rustfs_endpoint}'{auth} "
         "SETTINGS allow_database_iceberg = 1",
     )
+
+
+def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
+    ensure_catalog_database(cfg, CATALOG_DB)
 
 
 def discover_bronze_tables(cfg: MaintenanceConfig) -> list[str]:
@@ -356,19 +361,25 @@ def _parse_tsv_kv(text: str) -> dict[str, int]:
 
 
 def run_remove_orphan_files(
-    cfg: MaintenanceConfig, table_name: str, *, dry_run: bool
+    cfg: Any,
+    table_name: str,
+    *,
+    dry_run: bool,
+    catalog_db: str = CATALOG_DB,
+    older_than_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Run (or dry-run) `remove_orphan_files` against one catalog-registered
-    Bronze table — the working verb on ClickHouse 26.8 (did not exist on
+    Iceberg table — the working verb on ClickHouse 26.8 (did not exist on
     26.3). `table_name` is the catalog's own two-part name, e.g.
-    `bronze.g3a_orders` (already backtick-safe: no user input reaches this,
-    only names `discover_bronze_tables` returned, which is itself filtered
-    to the `bronze.` prefix)."""
+    `bronze.g3a_orders` or `gold.mart_name`."""
     dry_run_arg = "dry_run=1" if dry_run else "dry_run=0"
+    settings = _REMOVE_ORPHAN_FILES_SETTINGS
+    if older_than_seconds is not None:
+        settings = f"{settings}, iceberg_orphan_files_older_than_seconds={int(older_than_seconds)}"
     sql = (
-        f"ALTER TABLE {CATALOG_DB}.`{table_name}` "
+        f"ALTER TABLE {catalog_db}.`{table_name}` "
         f"EXECUTE remove_orphan_files({dry_run_arg}) "
-        f"SETTINGS {_REMOVE_ORPHAN_FILES_SETTINGS} FORMAT TabSeparated"
+        f"SETTINGS {settings} FORMAT TabSeparated"
     )
     text = _ch_query(cfg, sql)
     counts = _parse_tsv_kv(text)
