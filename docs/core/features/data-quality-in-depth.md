@@ -6,7 +6,7 @@
 | Backlog | `DATA-14` |
 | Spec | `docs/core/specs/data-14.md` |
 | Kind | Feature |
-| Status | Drafting — **decisions not signed**. The product owner signs every row marked *(proposed)*; the plan is written after that |
+| Status | Decisions **signed by the product owner (2026-10-15, all)** — plan is next |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -32,18 +32,19 @@ no list of what is wrong now. Editing a rule even deletes its past runs.
 
 ## Decisions
 
-**Not signed.** Each row's Default is what the planner proposes; the product
-owner confirms or changes it. *(proposed)* numbers come from the planner, not
-from a competitor's documentation.
+**Signed 2026-10-15** — the product owner approved every row's Default as
+shown below (the *(proposed)* markers are removed; these numbers are now the
+decisions). The plan builds to them; a target that cannot be met is
+reported, not quietly lowered.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | The check library in this item. | The spec's named set, all of it: null count and percent, duplicate count, row count, freshness, accepted values, min/max/average, unique count — the four existing checks fold in, no check is removed *(proposed: all eight in this item, not staged)*. | |
-| 2 | Threshold levels. | Two levels stay, as today: **warning** (recorded, feeds nothing) and **failure** (feeds the asset's health and opens an incident). A check configures each level separately *(proposed)*. | |
-| 3 | Incident lifecycle. | A failure opens an incident; it is **resolved by a person**, with actor and reason recorded; the next passing run marks it stale but does not auto-resolve it *(proposed)*. Editing a rule **keeps** its past runs — today's delete-on-edit goes away. | |
-| 4 | Schedules. | Per table: on every load, or on an interval of 1 hour to 1 day (the spec's range). On-load checks run **after** the load commits and never block or fail it; a schedule change takes effect at the next tick *(proposed: async after-commit, both schedule kinds)*. | |
-| 5 | Anomaly detection. | Volume and freshness anomalies are learned per table from at least **14 days** of history (the spec's proposed number). Before that, the page says "not learned yet — collecting history" and detects nothing, rather than guessing. A volume anomaly is a load far under the recent median *(proposed: under half, today's per-pipeline factor, generalized per table)*; a freshness anomaly is a load later than the learned interval allows *(proposed: twice the learned median interval)*. Alerts go through SRC-7's channels. | |
-| 6 | Permissions. | Unchanged from today's quality feature: viewing needs what the Data Quality page needs, defining rules and resolving incidents need `governance:write` *(proposed: no new permission)*. | |
+| 1 | The check library in this item. | The spec's named set, all of it: null count and percent, duplicate count, row count, freshness, accepted values, min/max/average, unique count — the four existing checks fold in, no check is removed. | 2026-10-15 |
+| 2 | Threshold levels. | Two levels stay, as today: **warning** (recorded, feeds nothing) and **failure** (feeds the asset's health and opens an incident). A check configures each level separately. | 2026-10-15 |
+| 3 | Incident lifecycle. | A failure opens an incident; it is **resolved by a person**, with actor and reason recorded; the next passing run marks it stale but does not auto-resolve it. Editing a rule **keeps** its past runs — today's delete-on-edit goes away. | 2026-10-15 |
+| 4 | Schedules. | Per table: on every load, or on an interval of 1 hour to 1 day (the spec's range). On-load checks run **after** the load commits and never block or fail it; a schedule change takes effect at the next tick. | 2026-10-15 |
+| 5 | Anomaly detection. | Volume and freshness anomalies are learned per table from at least **14 days** of history (the spec's proposed number). Before that, the page says "not learned yet — collecting history" and detects nothing, rather than guessing. A volume anomaly is a load far under the recent median; a freshness anomaly is a load later than the learned interval allows. Alerts go through SRC-7's channels. | 2026-10-15 |
+| 6 | Permissions. | Unchanged from today's quality feature: viewing needs what the Data Quality page needs, defining rules and resolving incidents need `governance:write`. | 2026-10-15 |
 
 ## Limits to tell a customer
 

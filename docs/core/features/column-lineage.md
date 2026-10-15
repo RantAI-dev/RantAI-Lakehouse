@@ -6,7 +6,7 @@
 | Backlog | `DATA-13` |
 | Spec | `docs/core/specs/data-13.md` |
 | Kind | Feature |
-| Status | Drafting — **decisions not signed**. The product owner signs every row marked *(proposed)*; the plan is written after that |
+| Status | Decisions **signed by the product owner (2026-10-15, all)** — plan is next |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -32,17 +32,18 @@ not which columns, and impact analysis stops at the table.
 
 ## Decisions
 
-**Not signed.** Each row's Default is what the planner proposes; the product
-owner confirms or changes it. *(proposed)* numbers come from the planner, not
-from a competitor's documentation.
+**Signed 2026-10-15** — the product owner approved every row's Default as
+shown below (the *(proposed)* markers are removed; these numbers are now the
+decisions). The plan builds to them; a target that cannot be met is
+reported, not quietly lowered.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | How mappings are recorded. | Column mappings are **persisted rows**, written by the same path that records a pipeline run's rename, cast and select steps, a Gold build, and a saved-SQL save; a failed run writes nothing. The Lineage tab reads rows — it never rebuilds the map on request *(proposed: persisted, not computed on read)*. | |
-| 2 | Saved SQL depth. | When a saved SQL is saved, its referenced source tables and columns are mapped for plain `SELECT` queries the parser understands. Anything else (CTEs that defeat the parser, functions returning sets, `SELECT *`) stores what was mapped and marks the mapping **partial**, naming the reason *(proposed: partial, honestly — principle 14)*. | |
-| 3 | Who may see column lineage. | The same permission the table-level Lineage tab requires today — no new permission *(proposed)*. | |
-| 4 | Retention. | 1 year of mappings, as both competitors document. Older mapping rows are dropped; the count of retained days is shown, not guessed. | |
-| 5 | The lineage gate. | The gate (`ops/g3a`) must accept the `build` link kind the API emits; the plan fixes `RECORDED_LINEAGE_EDGE_KINDS` and its test in the same item (spec, "Found while re-reading"). Not a user-visible decision — recorded here so it is not lost. | |
+| 1 | How mappings are recorded. | Column mappings are **persisted rows**, written by the same path that records a pipeline run's rename, cast and select steps, a Gold build, and a saved-SQL save; a failed run writes nothing. The Lineage tab reads rows — it never rebuilds the map on request. | 2026-10-15 |
+| 2 | Saved SQL depth. | When a saved SQL is saved, its referenced source tables and columns are mapped for plain `SELECT` queries the parser understands. Anything else (CTEs that defeat the parser, functions returning sets, `SELECT *`) stores what was mapped and marks the mapping **partial**, naming the reason. | 2026-10-15 |
+| 3 | Who may see column lineage. | The same permission the table-level Lineage tab requires today — no new permission. | 2026-10-15 |
+| 4 | Retention. | 1 year of mappings, as both competitors document. Older mapping rows are dropped; the count of retained days is shown, not guessed. | 2026-10-15 |
+| 5 | The lineage gate. | The gate (`ops/g3a`) must accept the `build` link kind the API emits; the plan fixes `RECORDED_LINEAGE_EDGE_KINDS` and its test in the same item (spec, "Found while re-reading"). Not a user-visible decision — recorded here so it is not lost. | 2026-10-15 |
 
 ## Limits to tell a customer
 
