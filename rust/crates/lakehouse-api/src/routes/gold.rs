@@ -740,6 +740,9 @@ async fn publication_body(
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
     );
     let last_exported_at = last_export.as_ref().and_then(|e| e.started_at_ms);
+    let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
+        .await
+        .map_err(ApiError::from)?;
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
@@ -748,6 +751,7 @@ async fn publication_body(
         "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
         "changedSinceExport": changed_since_export,
         "canEdit": can_edit,
+        "trim": last_trim,
     }))
 }
 

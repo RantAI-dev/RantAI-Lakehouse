@@ -268,26 +268,6 @@ console's manual publish (D1), Silver (`DATA-4`).
   - Added unit test suite `GoldKeepCopiesParsingTests` in `dagster/dispar_orchestrate/test_gold_export.py` (tested `7`, `1`, `0`, `-1`, `x`, empty, and env loading). All 29 tests pass.
   - Checked `docker compose --profile '*' config --quiet` (exit code 0).
 
-### Task T3: The Trim Op, PyIceberg Delete, Snapshot Expire and Orphan Cleanup (D1 + D3 + D5 + A1)
-
-- **Status**: SUCCEEDED.
-- **Changes**:
-  - D5 + A1: Added  and  to  recording , , , , , , and fixed  strings.
-  - D1 + D3 + A1: Added  and mapped op  wired in :
-    - Keeps the newest  distinct  copies via PyIceberg .
-    - Expires unneeded snapshots via .
-    - Reclaims orphaned files through ClickHouse  with  and .
-    - Catches failures cleanly with fixed reasons (, , , , , ), preserving the export result untouched.
-    - Preserves skipped exports without trimming.
-  - Updated  to allow reusable  and  across custom catalog databases and retention windows.
-  - Unit tests: Added  in  covering:
-    - 9 copies keep 7 (asserts PyIceberg delete filter, snapshot expiry, orphan cleanup, and record).
-    - 7 copies delete nothing and record .
-    - Delete failure records  with fixed reason and leaves export result untouched.
-    - Commit conflict () records .
-    - Skipped export does not trim.
-    - Invalid  records  with .
-  - All 35 tests in , 41 tests in , and 10 tests in  pass.
 
 ### Task T3: The Trim Op, PyIceberg Delete, Snapshot Expire and Orphan Cleanup (D1 + D3 + D5 + A1)
 
@@ -309,6 +289,16 @@ console's manual publish (D1), Silver (`DATA-4`).
     - Skipped export does not trim.
     - Invalid `GOLD_KEEP_COPIES` records `failed` with `"invalid GOLD_KEEP_COPIES"`.
   - All 35 tests in `test_gold_export.py`, 41 tests in `test_maintenance.py`, and 10 tests in `test_op_source_metadata.py` pass.
+
+### Task T4: Publication Detail Trim Field and Console Display (D6)
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - D6 (API): Added `ensure_gold_trim_run_table`, `last_trim`, and `GoldTrimSummary` in `rust/crates/lakehouse-api/src/gold_export_history.rs`.
+  - D6 (API): Wired `"trim": last_trim` into `publication_body` in `rust/crates/lakehouse-api/src/routes/gold.rs`, returning `{ status, copiesKept, oldestKeptExportedAt, finishedAt, reason } | null`.
+  - D6 (Tests): Added unit tests in `gold_export_history.rs` and 3 integration tests in `rust/crates/lakehouse-api/tests/gold_publication.rs` (`publication_detail_reports_trim_null_when_never_trimmed`, `publication_detail_reports_trim_success`, `publication_detail_reports_trim_failed`).
+  - D6 (Console): Added `GoldTrimSummary` to `src/services/contracts/gold.ts`. Updated `OpenFormatCard` in `src/features/catalog/open-format-card.tsx` to display `"Copies kept: N (oldest <time>)"` on success, and `"Trim failed: <reason>"` on failure. Never renders "trimmed" for failed or null rows.
+  - D6 (Console Tests): Added tests in `src/features/catalog/open-format-card.test.tsx` verifying success, failed, and null trim cases. All 12 tests pass. All tests in `src/features/gold/` pass. `bun x tsc --noEmit` clean with zero errors.
 
 ## 8. Review
 

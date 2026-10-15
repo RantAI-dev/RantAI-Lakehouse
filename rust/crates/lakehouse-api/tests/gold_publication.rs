@@ -605,3 +605,124 @@ async fn if_changed_exports_when_the_last_export_is_unknown() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.get("skipped").is_none(), "{body}");
 }
+
+
+async fn seed_trim_run(
+    ch: &ChClient,
+    mart: &str,
+    status: &str,
+    copies_kept: Option<u32>,
+    oldest_kept_ms: Option<i64>,
+    finished_ms: i64,
+    reason: Option<&str>,
+) {
+    gold_export_history::ensure_gold_trim_run_table(ch)
+        .await
+        .expect("ensure trim table");
+    let oldest_sql = oldest_kept_ms.map_or_else(
+        || "NULL".to_owned(),
+        |ms| format!("fromUnixTimestamp64Milli({ms})"),
+    );
+    let reason_sql = reason.map_or_else(
+        || "NULL".to_owned(),
+        |r| format!("'{r}'"),
+    );
+    let copies_sql = copies_kept.map_or_else(
+        || "NULL".to_owned(),
+        |cp| cp.to_string(),
+    );
+    ch.exec(
+        &format!(
+            "INSERT INTO console.gold_trim_run              (id, mart, status, copies_kept, oldest_kept_exported_at,               copies_removed, snapshots_expired, files_removed, reason,               started_at, finished_at) VALUES              ('{id}', '{mart}', '{status}', {copies_sql}, {oldest_sql},               0, 0, 0, {reason_sql}, fromUnixTimestamp64Milli({finished_ms}),               fromUnixTimestamp64Milli({finished_ms}))",
+            id = uuid::Uuid::new_v4(),
+        ),
+        None,
+    )
+    .await
+    .expect("seed trim run row");
+}
+
+#[tokio::test]
+async fn publication_detail_reports_trim_null_when_never_trimmed() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "untrimmed_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/untrimmed_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["trim"].is_null(), "expected trim to be null, got: {body}");
+}
+
+#[tokio::test]
+async fn publication_detail_reports_trim_success() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "trimmed_ok_mart").await;
+    seed_trim_run(
+        &ch,
+        "trimmed_ok_mart",
+        "success",
+        Some(7),
+        Some(1_700_000_000_000),
+        1_700_000_010_000,
+        None,
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/trimmed_ok_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["trim"]["status"], "success");
+    assert_eq!(body["trim"]["copiesKept"], 7);
+    assert!(body["trim"]["oldestKeptExportedAt"].is_string());
+    assert!(body["trim"]["finishedAt"].is_string());
+    assert!(body["trim"]["reason"].is_null());
+}
+
+#[tokio::test]
+async fn publication_detail_reports_trim_failed() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "trimmed_fail_mart").await;
+    seed_trim_run(
+        &ch,
+        "trimmed_fail_mart",
+        "failed",
+        None,
+        None,
+        1_700_000_010_000,
+        Some("delete_failed"),
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/trimmed_fail_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["trim"]["status"], "failed");
+    assert!(body["trim"]["copiesKept"].is_null());
+    assert!(body["trim"]["oldestKeptExportedAt"].is_null());
+    assert!(body["trim"]["finishedAt"].is_string());
+    assert_eq!(body["trim"]["reason"], "delete_failed");
+}
