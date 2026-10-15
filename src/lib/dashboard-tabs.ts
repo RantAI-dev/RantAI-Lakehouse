@@ -25,6 +25,18 @@ export function isStaticKind(kind: ChartKind | string): boolean {
   return STATIC_KINDS.has(kind)
 }
 
+/**
+ * The height, in grid rows, a new tile of `kind` is created at (BI-18 part C
+ * review fix (SHOULD-FIX) R6): a heading, a section header and a divider are one
+ * line of text or a rule, so they take one row (44 px, which fits the heading's
+ * 18 px text; the tile centres it) instead of the 6 a chart gets. An existing
+ * tile keeps the height it was saved with; the phone column uses the saved
+ * height of the tile, so a new one is one row there too.
+ */
+export function defaultTileHeight(kind: string | undefined, chartDefault = 6): number {
+  return kind === "heading" || kind === "section" || kind === "divider" ? 1 : chartDefault
+}
+
 /** The tab a tile sits on: the one it names, else the first; `undefined` on a board with no tabs. */
 export function tabOf(tabs: readonly BoardTab[], layout: LayoutMap, id: string): string | undefined {
   if (tabs.length === 0) return undefined
@@ -131,11 +143,32 @@ export function deleteTab(
   return { tabs: remaining, layout, filters }
 }
 
-/** Puts a tile on another tab, below what is already there. */
+/**
+ * Puts a tile on another tab, below what is already there, and closes the space
+ * it leaves on the tab it came from (BI-18 part C review fix (SHOULD-FIX) R4):
+ * the tiles below it, over any of its columns, move up to its top as far as the
+ * tiles above them let them. Only a move to another tab does this; a layout
+ * save still pulls nothing up (`settleLayout`), so a gap the user made stays.
+ * Mirrors `layout::move_to_tab` on the server.
+ */
 export function moveTileToTab(tabs: readonly BoardTab[], layout: LayoutMap, ids: string[], id: string, tab: string): LayoutMap {
+  const from = tabOf(tabs, layout, id)
   const others = tilesOnTab(tabs, layout, ids, tab).filter((x) => x !== id)
   const box = layout[id] ?? { x: 0, y: 0, w: 6, h: 6 }
-  return { ...layout, [id]: { ...box, tab, x: 0, y: bottomOf(layout, others) } }
+  const out: LayoutMap = { ...layout, [id]: { ...box, tab, x: 0, y: bottomOf(layout, others) } }
+  if (from === undefined || from === tab || !layout[id]) return out
+  const left = tilesOnTab(tabs, layout, ids, from).filter((x) => x !== id)
+  const below = left
+    .filter((x) => out[x].y >= box.y + box.h && out[x].x < box.x + box.w && out[x].x + out[x].w > box.x)
+    .sort((p, q) => out[p].y - out[q].y)
+  for (const x of below) {
+    const t = out[x]
+    const floor = left
+      .filter((o) => o !== x && out[o].y < t.y && out[o].x < t.x + t.w && out[o].x + out[o].w > t.x)
+      .reduce((m, o) => Math.max(m, out[o].y + out[o].h), box.y)
+    if (floor < t.y) out[x] = { ...t, y: floor }
+  }
+  return out
 }
 
 /** The filter with no tie. */

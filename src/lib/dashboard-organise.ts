@@ -46,6 +46,26 @@ export function daysLeftLabel(expiresAt: string, now: number): string {
   return `${n} ${n === 1 ? "day" : "days"} left`
 }
 
+/** Said for a chart deleted on its own whose dashboard is in the trash too (BI-18 part C review fix R10); the server refuses that restore with the same words. */
+export const DASHBOARD_IN_TRASH = "Its dashboard is in the trash too: restore the dashboard first."
+
+/** Whether a trash entry cannot be restored yet. */
+export function restoreBlocked(item: Pick<TrashItem, "kind" | "boardState">): boolean {
+  return item.kind === "chart" && item.boardState === "trash"
+}
+
+/** The words after a revert about the charts it took out of the trash and the ones that could not come back (BI-18 part C review fix R7). */
+export function revertNote(done: { chartsRemoved: number; chartsRestored: string[]; chartsGone: string[] }): string {
+  const plural = (n: number) => (n === 1 ? "chart" : "charts")
+  const parts: string[] = []
+  if (done.chartsRestored.length) parts.push(`${done.chartsRestored.length} ${plural(done.chartsRestored.length)} came back from the trash.`)
+  if (done.chartsRemoved) parts.push(`${done.chartsRemoved} ${plural(done.chartsRemoved)} added since went to the trash.`)
+  if (done.chartsGone.length) {
+    parts.push(`${done.chartsGone.length} ${plural(done.chartsGone.length)} could not come back: removed from the trash for good: ${done.chartsGone.join(", ")}.`)
+  }
+  return parts.join(" ")
+}
+
 /**
  * What restoring a chart will do, said once for the row: it goes back to its
  * dashboard, comes back with the dashboard when that is in the trash too, or
@@ -57,7 +77,7 @@ export function restoreNote(item: Pick<TrashItem, "kind" | "boardState" | "board
     case "live":
       return item.boardName ? `Back on ${item.boardName}` : "Back on its dashboard"
     case "trash":
-      return "Comes back with its dashboard"
+      return DASHBOARD_IN_TRASH
     default:
       return "Its dashboard is gone: on no dashboard"
   }
@@ -67,4 +87,9 @@ export function restoreNote(item: Pick<TrashItem, "kind" | "boardState" | "board
 export function itemHref(item: { kind: ItemKind; id: string; board?: string }): string {
   if (item.kind === "board") return `/dashboards/${encodeURIComponent(item.id)}`
   return `/dashboards/${encodeURIComponent(item.board || "default")}`
+}
+
+/** Whether `id` names a personal space among `folders` (the New dashboard dialog hints that it is private). */
+export function isPersonalFolder(folders: readonly FolderLike[], id: string): boolean {
+  return Boolean(folders.find((f) => f.id === id)?.ownerId)
 }

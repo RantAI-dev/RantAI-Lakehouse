@@ -200,3 +200,52 @@ describe("CommandPalette dashboards and charts", () => {
     expect(screen.queryByText("Dashboard search is unavailable")).toBeNull()
   })
 })
+
+describe("CommandPalette empty state and recents (BI-18 part C review fix R12)", () => {
+  function stubWith(handler: (url: string) => Promise<Response> | Response) {
+    global.fetch = mock(async (input: RequestInfo | URL) => handler(String(input))) as unknown as typeof fetch
+  }
+  const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
+
+  it("does not say No results above server hits", async () => {
+    stubWith((url) =>
+      url.includes("/api/dashboard/search")
+        ? ok({ hits: [{ kind: "chart", id: "u_1", name: "Choropleth of hotels", board: "b_1", boardName: "Map demo" }] })
+        : ok({ assets: [] }),
+    )
+    await search("choropleth")
+    expect(await screen.findByText("Choropleth of hotels")).toBeTruthy()
+    expect(screen.queryByText("No results.")).toBeNull()
+    expect(screen.queryByText("Searching…")).toBeNull()
+  })
+
+  it("says Searching… while the server answers, then No results. when nothing matched anywhere", async () => {
+    let release: (r: Response) => void = () => {}
+    let asked = false
+    stubWith((url) =>
+      url.includes("/api/dashboard/search") ? new Promise<Response>((resolve) => { asked = true; release = resolve }) : ok({ assets: [] }),
+    )
+    await search("zzzzqq")
+    expect(await screen.findByText("Searching…")).toBeTruthy()
+    expect(screen.queryByText("No results.")).toBeNull()
+    await waitFor(() => expect(asked).toBe(true))
+    release(ok({ hits: [] }))
+    expect(await screen.findByText("No results.")).toBeTruthy()
+    expect(screen.queryByText("Searching…")).toBeNull()
+  })
+
+  it("leaves a favourite out of Recent dashboards", async () => {
+    stubWith((url) =>
+      url.includes("/api/dashboard/shortcuts")
+        ? ok({
+            favourites: [{ kind: "board", id: "b_1", name: "Map demo" }],
+            recent: [{ kind: "board", id: "b_1", name: "Map demo" }, { kind: "board", id: "b_2", name: "Other board" }],
+          })
+        : ok({}),
+    )
+    render(<CommandPalette />)
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    expect(await screen.findByText("Other board")).toBeTruthy()
+    expect(screen.getAllByText("Map demo")).toHaveLength(1)
+  })
+})

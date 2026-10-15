@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Lock, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -22,11 +22,11 @@ import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval }
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
 import { summarizeFilters, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
-import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, deleteTab, filtersOnTab, moveTab, moveTileToTab, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -41,6 +41,8 @@ import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
 import { labelledFolders } from "@/lib/dashboard-organise";
 import { FavouriteButton } from "./favourite-button";
+import { FilterRow } from "./filter-row";
+import { PrivateBadge } from "./private-badge";
 import { VersionHistoryDialog } from "./version-history-dialog";
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { GrainMarkers } from "./grain-marker";
@@ -631,7 +633,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (!res.ok || !j?.chart) throw new Error(j?.error ?? "Could not add the tile");
       const onTab = tabs.length ? tilesOnTab(tabs, layout, chartIds, selTab ?? "") : chartIds;
       const y = onTab.reduce((m, id) => Math.max(m, (layout[id]?.y ?? 0) + (layout[id]?.h ?? 0)), 0);
-      const box = { x: 0, y, w: 12, h: kind === "divider" ? 1 : 2, ...(selTab ? { tab: selTab } : {}) };
+      const box = { x: 0, y, w: 12, h: defaultTileHeight(kind), ...(selTab ? { tab: selTab } : {}) };
       await putBoard({ layout: { ...layout, [j.chart.id]: box } });
       await load();
     } catch (e) {
@@ -911,14 +913,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", fullscreen && fsDark && "dark")}>
       <PageHeader
         title={
-          <BoardSwitcher
-            boards={boards}
-            activeId={board}
-            activeName={dashName}
-            onSelect={(id) => router.push(`/dashboards/${id}`)}
-            onCreate={() => void createDashboard()}
-            folders={folders}
-          />
+          <span className="flex min-w-0 items-center gap-2">
+            <BoardSwitcher
+              boards={boards}
+              activeId={board}
+              activeName={dashName}
+              onSelect={(id) => router.push(`/dashboards/${id}`)}
+              onCreate={() => void createDashboard()}
+              folders={folders}
+            />
+            {ownerId ? <PrivateBadge /> : null}
+          </span>
 
         }
         actions={
@@ -939,11 +944,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   void dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts).catch(() => undefined);
                 }}
               />
-            ) : null}
-            {ownerId ? (
-              <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Only you and administrators can see this dashboard.">
-                <Lock className="size-3.5" aria-hidden /> Private
-              </span>
             ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
@@ -981,7 +981,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
-        <div data-print-hide className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/50 px-3 py-2">
+        <FilterRow count={filters.filter(isActiveFilter).length + (pValues ? Object.keys(pValues).length : 0)}>
           {grainedCharts.length > 0 ? (
             <GrainSwitch
               choices={grainChoices}
@@ -1003,7 +1003,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             onSaveDefault={() => void saveRowDefault()}
             onReset={resetRow}
           />
-        </div>
+        </FilterRow>
       ) : null}
 
       {/* KPI row (builtin dashboard) */}
@@ -1056,9 +1056,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : (
         <>
           {edit ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs">
               <Move className="size-3.5 text-primary" />
-              <span className="min-w-0 flex-1">
+              {/* BI-18 part C review fix (SHOULD-FIX) R2: the muted colour is the hint's alone; on the bar it was inherited by the buttons and made them look disabled. */}
+              <span className="min-w-0 flex-1 text-muted-foreground">
                 {phoneEdit
                   ? <>Phone layout: <span className="font-medium text-foreground">move tiles up or down</span> and change their height. Saved automatically.</>
                   : <>Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Saved automatically.</>}
@@ -1088,9 +1089,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             foldKey={board}
           />
           {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
-            <p className="text-center text-sm text-muted-foreground">
-              {edit ? "No tiles on this tab. Use “Move to” in a tile's menu on another tab." : "No tiles on this tab."}
-            </p>
+            // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.
+            <Empty className="border border-dashed">
+              <EmptyHeader>
+                <EmptyTitle>No tiles on this tab</EmptyTitle>
+                {edit ? <EmptyDescription>Use “Move to” in a tile&apos;s menu on another tab.</EmptyDescription> : null}
+              </EmptyHeader>
+            </Empty>
           ) : null}
         </>
       )}

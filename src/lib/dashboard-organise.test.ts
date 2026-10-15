@@ -5,10 +5,13 @@ import {
   daysLeftLabel,
   folderChoices,
   folderLabel,
+  isPersonalFolder,
   itemHref,
   labelledFolders,
   manageableFolders,
+  restoreBlocked,
   restoreNote,
+  revertNote,
 } from "./dashboard-organise"
 
 const shared = { id: "f_1", name: "Sales", parentId: "" }
@@ -58,7 +61,7 @@ describe("trash entries", () => {
     expect(restoreNote({ kind: "board", boardState: "", boardName: "" })).toBe("With its charts")
     expect(restoreNote({ kind: "chart", boardState: "live", boardName: "Sales" })).toBe("Back on Sales")
     expect(restoreNote({ kind: "chart", boardState: "trash", boardName: "Sales" })).toBe(
-      "Comes back with its dashboard",
+      "Its dashboard is in the trash too: restore the dashboard first.",
     )
     expect(restoreNote({ kind: "chart", boardState: "gone", boardName: "" })).toBe(
       "Its dashboard is gone: on no dashboard",
@@ -72,4 +75,25 @@ describe("opening an item", () => {
     expect(itemHref({ kind: "chart", id: "u_1", board: "b_2" })).toBe("/dashboards/b_2")
     expect(itemHref({ kind: "chart", id: "u_1" })).toBe("/dashboards/default")
   })
+})
+
+describe("restoring after a dashboard (R10) and going back (R7)", () => {
+  test("blocks only a chart whose dashboard is in the trash", () => {
+    expect(restoreBlocked({ kind: "chart", boardState: "trash" })).toBe(true)
+    expect(restoreBlocked({ kind: "chart", boardState: "live" })).toBe(false)
+    expect(restoreBlocked({ kind: "board", boardState: "" })).toBe(false)
+  })
+
+  test("says what came back, what moved to the trash and what could not come back", () => {
+    expect(revertNote({ chartsRemoved: 0, chartsRestored: [], chartsGone: [] })).toBe("")
+    expect(revertNote({ chartsRemoved: 2, chartsRestored: ["A"], chartsGone: ["B"] })).toBe(
+      "1 chart came back from the trash. 2 charts added since went to the trash. 1 chart could not come back: removed from the trash for good: B.",
+    )
+  })
+})
+
+test("a folder is personal when it has an owner (the New dashboard hint)", () => {
+  expect(isPersonalFolder([shared, mine], "fp_me")).toBe(true)
+  expect(isPersonalFolder([shared, mine], "f_1")).toBe(false)
+  expect(isPersonalFolder([shared, mine], "missing")).toBe(false)
 })

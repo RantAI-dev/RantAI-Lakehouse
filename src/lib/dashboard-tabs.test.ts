@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import type { BoardTab, FilterDef, LayoutMap } from "@/services/clients/bi-store"
 import {
-  addTab, appliesOnTab, collapseLayout, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab,
+  addTab, appliesOnTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab,
   phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
 } from "./dashboard-tabs"
 import { decodeFilters, encodeFilters, normalizeFilters } from "./dashboard-filter-state"
@@ -85,6 +85,27 @@ test("a tile moves to another tab below what is there", () => {
   assert.deepEqual(tilesOnTab([A, B], out, ["a", "b"], "t_a"), [])
 })
 
+test("moving a tile to another tab closes the space it leaves, and only that (BI-18 part C review fix R4)", () => {
+  const layout: LayoutMap = {
+    map: { x: 0, y: 0, w: 12, h: 6, tab: "t_a" },
+    kpi: { x: 0, y: 6, w: 6, h: 4, tab: "t_a" },
+    bar: { x: 6, y: 6, w: 6, h: 4, tab: "t_a" },
+    low: { x: 0, y: 10, w: 6, h: 4, tab: "t_a" },
+    gap: { x: 6, y: 20, w: 6, h: 4, tab: "t_a" },
+  }
+  const ids = Object.keys(layout)
+  const out = moveTileToTab([A, B], layout, ids, "map", "t_b")
+  assert.equal(out.kpi.y, 0)
+  assert.equal(out.bar.y, 0)
+  assert.equal(out.low.y, 4, "it stays under the tile that moved up")
+  assert.equal(out.gap.y, 4, "a tile under the moved one closes up as far as the tiles above it allow")
+  // A gap the user made by hand, with nothing moved out from above it, is not touched.
+  const kept = moveTileToTab([A, B], { ...layout, gap: { x: 0, y: 30, w: 6, h: 4, tab: "t_a" } }, ids, "bar", "t_b")
+  assert.equal(kept.gap.y, 30)
+  // Moving onto the tab it is on closes nothing.
+  assert.deepEqual(moveTileToTab([A, B], layout, ids, "kpi", "t_a").low, layout.low)
+})
+
 test("a tie to every tab, or to none, is no tie", () => {
   assert.equal(withTies(f("c", ["t_a"]), [A, B], ["t_a", "t_b"]).tabs, undefined)
   assert.equal(withTies(f("c", ["t_a"]), [A, B], []).tabs, undefined)
@@ -142,4 +163,11 @@ test("a section folds the tiles after it up to the next section, and the tiles b
   assert.equal(out.s2.y, 1)
   assert.equal(out.c.y, 2)
   assert.equal(out.s1.y, 0)
+})
+
+test("a heading, a section and a divider are created one row tall and a chart keeps its size (BI-18 part C review fix R6)", () => {
+  for (const kind of ["heading", "section", "divider"]) assert.equal(defaultTileHeight(kind), 1)
+  assert.equal(defaultTileHeight("bar"), 6)
+  assert.equal(defaultTileHeight(undefined, 4), 4)
+  assert.equal(defaultTileHeight("kpi", 3), 3)
 })

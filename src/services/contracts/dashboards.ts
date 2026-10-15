@@ -136,8 +136,10 @@ export type RevertResult = {
   version: number | null
   /** Charts added since that moved to the trash. */
   chartsRemoved: number
-  /** Charts the version had that were deleted since: they come back from the trash only. */
-  chartsNotBrought: string[]
+  /** Titles of charts the version had that were in the trash: the revert took them out of it. */
+  chartsRestored: string[]
+  /** Titles of charts the version had that were removed from the trash for good: they could not come back. */
+  chartsGone: string[]
 }
 
 /** `lakehouse_bi::trash::TrashItem`. */

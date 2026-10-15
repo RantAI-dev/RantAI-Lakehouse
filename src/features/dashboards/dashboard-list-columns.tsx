@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Copy, FolderInput, Lock, MoreHorizontal, Pencil, Star, Trash2 } from "lucide-react"
+import { Copy, FolderInput, MoreHorizontal, Pencil, Star, Trash2 } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { Pill } from "@/components/patterns/status-badge"
@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
 import type { Board } from "@/services/clients/bi-store"
+import { PrivateBadge } from "./private-badge"
 
 export type BoardRowActions = {
   onRename: (board: Board) => void
@@ -97,11 +98,7 @@ export function ShareBadges({ board }: { readonly board: Board }) {
   if (!isPublic && !board.embedEnabled && !isPrivate) return null
   return (
     <span className="flex flex-wrap gap-1">
-      {isPrivate ? (
-        <Pill tone="neutral">
-          <Lock className="size-3" aria-hidden /> Private
-        </Pill>
-      ) : null}
+      {isPrivate ? <PrivateBadge /> : null}
       {isPublic ? <Pill tone="warning">Public</Pill> : null}
       {board.embedEnabled ? <Pill tone="neutral">Embed</Pill> : null}
     </span>

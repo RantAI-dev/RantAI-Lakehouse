@@ -17,6 +17,7 @@ const trash = {
   items: [
     { kind: "board", id: "b1", name: "Old board", board: "", boardName: "", boardState: "", deletedBy: "Ann", deletedAt: "t", expiresAt: inDays(12), personal: false },
     { kind: "chart", id: "u1", name: "Lost chart", board: "b9", boardName: "", boardState: "gone", deletedBy: "Bob", deletedAt: "t", expiresAt: inDays(3), personal: false },
+    { kind: "chart", id: "u2", name: "Held chart", board: "b1", boardName: "Old board", boardState: "trash", deletedBy: "Bob", deletedAt: "t", expiresAt: inDays(5), personal: false },
   ],
 }
 
@@ -38,6 +39,15 @@ describe("TrashDialog", () => {
     expect(await screen.findByText("Old board")).toBeTruthy()
     expect(screen.getByText(/With its charts · by Ann · /)).toBeTruthy()
     expect(screen.getByText(/Its dashboard is gone: on no dashboard · by Bob · 3 days left/)).toBeTruthy()
+  })
+
+  it("disables Restore for a chart whose dashboard is in the trash too and says why (R10)", async () => {
+    stub()
+    render(<TrashDialog canWrite onOpenChange={() => {}} onRestored={() => {}} />)
+    await screen.findByText("Held chart")
+    expect(screen.getByText(/Its dashboard is in the trash too: restore the dashboard first\. · by Bob/)).toBeTruthy()
+    const buttons = screen.getAllByText("Restore") as HTMLButtonElement[]
+    expect(buttons.filter((b) => (b.closest("button") as HTMLButtonElement).disabled)).toHaveLength(1)
   })
 
   it("shows a reader the list without the Restore buttons", async () => {

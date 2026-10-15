@@ -8,6 +8,7 @@ import {
   Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { useService, useServiceAction } from "@/hooks/use-service";
+import { revertNote } from "@/lib/dashboard-organise";
 import { formatRelativeTime } from "@/lib/format";
 import { notifySuccess } from "@/lib/notify";
 import { dashboardService } from "@/services";
@@ -41,15 +42,7 @@ export function VersionHistoryDialog({
   async function goBack(version: number) {
     const done = await revert.run(version);
     if (!done) return;
-    const gone = done.chartsRemoved;
-    const kept = done.chartsNotBrought.length;
-    notifySuccess(
-      `Went back to version ${version}`,
-      [
-        gone ? `${gone} chart${gone === 1 ? "" : "s"} added since went to the trash.` : "",
-        kept ? `${kept} deleted since: restore from the trash.` : "",
-      ].filter(Boolean).join(" ") || undefined,
-    );
+    notifySuccess(`Went back to version ${version}`, revertNote(done) || undefined);
     onOpenChange(false);
     onReverted();
   }

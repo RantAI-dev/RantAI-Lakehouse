@@ -57,7 +57,7 @@ describe("VersionHistoryDialog", () => {
   })
 
   it("asks before going back, then restores and reports it", async () => {
-    const calls = stub(new Response(JSON.stringify({ ok: true, restoredFrom: 2, version: 4, chartsRemoved: 0, chartsNotBrought: [] }), { status: 200 }))
+    const calls = stub(new Response(JSON.stringify({ ok: true, restoredFrom: 2, version: 4, chartsRemoved: 0, chartsRestored: [], chartsGone: [] }), { status: 200 }))
     const onReverted = mock(() => {})
     open(true, onReverted)
     fireEvent.click(await screen.findByText("Go back"))

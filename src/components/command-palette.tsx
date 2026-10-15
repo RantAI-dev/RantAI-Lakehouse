@@ -75,6 +75,11 @@ export function CommandPalette() {
   const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
   const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
   const [dashFailed, setDashFailed] = React.useState(false);
+  // BI-18 part C review fix (SHOULD-FIX) R12: the two server searches are
+  // answering. "No results." is only said once both have answered and every
+  // group, local and server, is empty; until then it says "Searching…".
+  const [assetsPending, setAssetsPending] = React.useState(false);
+  const [dashPending, setDashPending] = React.useState(false);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -93,8 +98,10 @@ export function CommandPalette() {
     if (!term) {
       setAssetResults([]);
       setSearchFailed(null);
+      setAssetsPending(false);
       return;
     }
+    setAssetsPending(true);
     let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -104,11 +111,13 @@ export function CommandPalette() {
           if (cancelled) return;
           setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
+          setAssetsPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
           setSearchFailed(failureLine(err));
+          setAssetsPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
@@ -127,6 +136,7 @@ export function CommandPalette() {
     const term = search.trim();
     let cancelled = false;
     const controller = new AbortController();
+    setDashPending(Boolean(term));
     const timer = setTimeout(() => {
       const work = term
         ? dashboardService.searchItems(term, controller.signal).then((hits) => ({ hits, favourites: [] as ShortcutItem[], recent: [] as ShortcutItem[] }))
@@ -137,7 +147,10 @@ export function CommandPalette() {
           setDashFailed(false);
           setDashHits(found.hits.slice(0, 8));
           setDashFavourites(found.favourites.slice(0, 5));
-          setDashRecent(found.recent.slice(0, 5));
+          // A favourite is not listed again under Recent (as on the dashboard list).
+          const starred = new Set(found.favourites.map((f) => `${f.kind}:${f.id}`));
+          setDashRecent(found.recent.filter((r) => !starred.has(`${r.kind}:${r.id}`)).slice(0, 5));
+          setDashPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
@@ -145,6 +158,7 @@ export function CommandPalette() {
           setDashFavourites([]);
           setDashRecent([]);
           setDashFailed(!(isServiceError(err) && err.code === "permission_denied"));
+          setDashPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
@@ -213,7 +227,10 @@ export function CommandPalette() {
       <Command.List className="max-h-[54vh] overflow-y-auto p-1.5">
         {/* Not while the server has results: they are force-mounted, so
             cmdk's own count would say "No results." under them. */}
-        {assetResults.length === 0 ? (
+        {search.trim() && (assetsPending || dashPending) ? (
+          <div className="px-3 py-2 text-sm text-muted-foreground">Searching…</div>
+        ) : null}
+        {assetResults.length === 0 && dashHits.length === 0 && !assetsPending && !dashPending ? (
           <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
             No results.
           </Command.Empty>

@@ -8,7 +8,7 @@ import {
   Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { useService, useServiceAction } from "@/hooks/use-service";
-import { daysLeftLabel, restoreNote } from "@/lib/dashboard-organise";
+import { daysLeftLabel, restoreBlocked, restoreNote } from "@/lib/dashboard-organise";
 import { notifySuccess } from "@/lib/notify";
 import { dashboardService } from "@/services";
 import type { TrashItem } from "@/services/contracts/dashboards";
@@ -63,7 +63,8 @@ export function TrashDialog({
                   : <BarChart3 className="size-4 shrink-0 text-muted-foreground" aria-label="Chart" />}
                 <span className="min-w-0 flex-1 truncate font-medium">{item.name}</span>
                 {canWrite ? (
-                  <Button size="xs" variant="outline" disabled={restore.status === "pending"} onClick={() => void bringBack(item)}>
+                  <Button size="xs" variant="outline" disabled={restore.status === "pending" || restoreBlocked(item)}
+                          title={restoreBlocked(item) ? restoreNote(item) : undefined} onClick={() => void bringBack(item)}>
                     Restore
                   </Button>
                 ) : null}

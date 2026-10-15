@@ -4,7 +4,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { settleLayout } from "@/lib/grid-layout";
 import {
-  PHONE_MAX_WIDTH, collapseLayout, foldedTiles, phoneOrder, tabOf,
+  PHONE_MAX_WIDTH, collapseLayout, defaultTileHeight, foldedTiles, phoneOrder, tabOf,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services/clients/bi-store";
 import { PhoneStack } from "./phone-stack";
@@ -57,10 +57,11 @@ function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   for (const it of items) {
     if (out[it.id]) continue;
     const w = it.span === 2 ? COLS : DEFAULT.w;
-    if (col + w > COLS) { col = 0; maxY += DEFAULT.h; }
-    out[it.id] = { x: col, y: maxY, w, h: DEFAULT.h };
+    if (col + w > COLS) { col = 0; maxY += defaultTileHeight(it.kind, DEFAULT.h); }
+    const h = defaultTileHeight(it.kind, DEFAULT.h);
+    out[it.id] = { x: col, y: maxY, w, h };
     col += w;
-    if (col >= COLS) { col = 0; maxY += DEFAULT.h; }
+    if (col >= COLS) { col = 0; maxY += h; }
   }
   return settleLayout(out);
 }

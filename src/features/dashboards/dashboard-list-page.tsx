@@ -38,6 +38,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { filterDataClientSide } from "@/lib/data-table"
 import {
   folderChoices,
+  isPersonalFolder,
   itemHref,
   labelledFolders,
   manageableFolders,
@@ -62,6 +63,7 @@ import {
   type BoardRowActions,
 } from "./dashboard-list-columns"
 import { FavouriteButton } from "./favourite-button"
+import { PRIVATE_HINT } from "./private-badge"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
@@ -163,6 +165,9 @@ function BoardFormDialog({
                   ))}
                 </SelectContent>
               </Select>
+              {isPersonalFolder(folders ?? [], folderId) ? (
+                <p className="text-xs text-muted-foreground">{PRIVATE_HINT}</p>
+              ) : null}
             </div>
           ) : null}
         </div>
