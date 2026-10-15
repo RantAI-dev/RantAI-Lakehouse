@@ -434,4 +434,42 @@ lint or threshold was changed to get there.
 
 ## 8. Review
 
-(Reviewer.)
+### Round 1 (planner/reviewer, Claude Opus), at `cd7dff1d`
+
+Read: the whole diff and the handoff. The design follows D1 to D6, the g9
+gate proves the whole loop on a real stack (pipeline runs after the
+re-upload of its own table, not after another table's upload; lineage shows
+`upload → bronze → silver`), and the full block is recorded (Rust 4775 / 0 /
+8, `pytest` 1051 passed). The pre-existing sensor bug found by the gate
+(`DagsterRun` has no `start_time` in Dagster 1.13.20, so no authored chain
+has fired since the upgrade) is a real find, fixed and pinned (`c273ba92`).
+
+**BLOCKER 1. Lineage shows every tenant's rows to a caller with no tenant.**
+`lineage::build` passes `tenant_scope::resolve(...)` straight into
+`add_tenant_owned`. `resolve` returns `None` for a principal with no tenant,
+and `None` reaches `ConnectorFilter { tenant_id: None }` and the new
+`list_claims(pool, None)`, both of which mean "no filter". `tenant_scope`'s
+own contract is the opposite: "a principal with no tenant at all resolves to
+`Ok(None)`, which every caller of this function must treat as return an
+empty list, never return every tenant's rows". The connector and pipeline
+half of this is already on `main`; this PR adds upload claims to it.
+Fix, in `add_tenant_owned` (the function this PR edits): when `tenant` is
+`None` and the caller is not unrestricted (`catalog::is_unrestricted`, the
+rule `authored_pipelines::resolve_caller_scope` uses), add no
+tenant-owned edges at all (connectors, pipelines, claims) and push one
+coverage note ("connectors, pipelines and uploads are not shown: you belong
+to no tenant"); an unrestricted caller keeps the unscoped read. Tests: a
+zero-tenant restricted caller sees none of the three; an unrestricted caller
+sees all; a tenant caller sees only its own. Cite `DATA-19 review BLOCKER 1`.
+The planner records the pre-existing half as its own backlog item.
+
+**BLOCKER 2. The branch must merge `main`.** It is based on `caf5784b`;
+`main` now has PR #159 (rustls), #161 and #162 (the gitleaks fix). Without
+the merge the gitleaks working-tree scan reports the finding #162 removed
+(`2026-10-14-bld-3-bronze-pipeline-source.md`, line 623). Merge `origin/main`
+(a merge commit), then run the gitleaks scan below and record "no leaks
+found".
+
+After both: re-run `cargo test -p lakehouse-api lineage` and the full Rust
+line on the final commit, and the gitleaks working-tree scan:
+`sg docker -c "docker run --rm -v /home/shiro/rantai/wt-data-19:/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact -v"`.
