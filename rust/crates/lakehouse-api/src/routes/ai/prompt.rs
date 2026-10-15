@@ -366,6 +366,18 @@ pub(super) const SYSTEM_ASK_SUFFIX: &str = "
 
 MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. If the user asks for a change, tell them to switch to Build mode.";
 
+/// The line added to the newest user message, naming the mode for that
+/// message. The history still holds the model's own earlier statements about
+/// the mode (for example "I am in ASK mode" after a switch to Build), and the
+/// model follows those, so the newest message says which mode applies now.
+pub(super) fn mode_note(is_build: bool) -> &'static str {
+    if is_build {
+        "[Mode for this message: BUILD. Earlier messages about the mode are out of date.]"
+    } else {
+        "[Mode for this message: ASK. Earlier messages about the mode are out of date.]"
+    }
+}
+
 /// Appended in build mode.
 pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
