@@ -336,3 +336,33 @@ Branch `feat/bi-phase-3`, from `ea3e034e`. Developer: Claude Sonnet. Nothing pus
 - `cargo test -p lakehouse-api --lib` at the filters above was run once more after the last Rust edit; the full lib suite was not run.
 
 ## 8. Review (planner appends)
+
+### Planner's review of slice 1 (T1 to T9), 2026-10-15
+
+Deviations in the handoff, accepted:
+
+1. `check_reference_lines` and `check_style` now run for every chart, not
+   only on the parameter path: the plan assumed `check_chart_shape` already
+   ran everywhere and it did not. Better than planned.
+2. **Owner question (record at QA):** the current default palette does not
+   pass 3:1 contrast (sky 2.77:1 on white; amber, lime, orange also short).
+   Kept so saved charts do not change colour; the four new palettes pass.
+   Feature decision 6 is corrected at QA either way: keep the default as it
+   is, or change it (every existing chart's colours change).
+3. No `AI-15` request file exists; `AI-8-AC1` is pinned as a Rust test.
+4. The light-theme selector added to `design-system/tokens/colors.css` (one
+   commented line): the folder is ours and has been edited before.
+5. A metric's free-text format word is read only for number, percent,
+   compact and scientific; anything else is ignored, not guessed.
+6. `format_chart` and `set_dashboard_theme` are WriteLow like
+   `update_chart`: they wait for the chat's confirmation, not an approval;
+   consistent with feature decision 15.
+7. to 10. Accepted as written (optional `ReferenceLine.value` with a
+   fixture of old JSON; tests moved with the editor; tooltip fields refused
+   on kinds without an axis tooltip; `colors` given replaces the whole
+   field).
+
+Not verified by anyone yet: every visual result (owner QA), `bun run build`
+under Turbopack in this worktree (the `node_modules` symlink; webpack build
+passes; CI builds from a real install), the full workspace run (CI). The
+reviewer's own re-run was skipped at the owner's request.
