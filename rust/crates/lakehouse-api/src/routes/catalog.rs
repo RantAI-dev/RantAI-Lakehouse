@@ -4368,6 +4368,7 @@ mod tests {
             let (status, _) = response_json(write.into_response()).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
 
         fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
             crate::catalog_search_cache::CatalogSearchSnapshot {
