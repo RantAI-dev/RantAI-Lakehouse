@@ -44,8 +44,9 @@ Downstream jobs execute according to scope:
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
+- **`g6-credentials`** (`SRC-12` part A, `ops/g6/src12_credentials_test.py`): checks that `docker compose config` refuses an empty `CONNECTOR_SECRETS_KEY` and names it; starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume the other g6 gates replace); types a MySQL credential through the API and checks the stored file is a seal (version byte, not the plain value, owner-only) and that the connector tests and loads; runs `lakehouse-api rotate-secrets-key` with a new key (old key as `CONNECTOR_SECRETS_KEY_PREVIOUS`), drops the old key, recreates the API and the code location, and checks the file changed and the connector still tests and loads. Its own job so the slowest connector gate stays under 20 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
@@ -66,7 +67,7 @@ jobs built the Dagster image as well. Now:
   `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
   compression by the artifact service. It prints each archive's size in the log.
 - Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`,
-  `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `gold-export`, `g8-governance`, `g8-time-travel`,
+  `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `gold-export`, `g8-governance`, `g8-time-travel`,
   `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
   uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
   `g8-governance` and `image-smoke` only use the API image and download only that one.
