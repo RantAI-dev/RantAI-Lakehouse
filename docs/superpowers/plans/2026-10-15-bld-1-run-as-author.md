@@ -140,18 +140,85 @@ assistant's tool schema.
 1. How does Query Studio name a Bronze table in the SQL it sends to
    `enforce`, and does `enforce` govern the same table when named
    `<ICEBERG_QUERY_DB>.\`bronze.t\``? Prove it with a test before T4.
+   **Answer:** Query Studio and Dagster queries name Bronze tables via
+   `icecat_api.\`bronze.<table_name>\``. In `lakehouse-api`, the `enforce`
+   route parses incoming SQL with `sqlparser`, extracts table identifiers,
+   and matches against `policy_engine`. Verified in `tests/pipeline_enforce.rs`
+   (`a_masked_column_is_rewritten_for_an_author_who_has_the_obligation`) using
+   `SELECT * FROM icecat_api.\`bronze.customer\` LIMIT 10`.
+
 2. Which existing function turns a user id into role names and placeholder
    values? Name it in the handoff.
+   **Answer:** `lakehouse_auth::repository::load_principal_for_user(&pool, user_id)`
+   reads the live user and tenant memberships from Postgres, resolving role names
+   (`principal.roles`). Masking and row filter obligations are evaluated dynamically
+   against those roles by `policy_engine::rewrite_sql_for_roles`.
+
 3. Does `CREATE TABLE ... AS <rewritten SELECT> LIMIT 0` still infer the
    right column types when masked columns are rewritten expressions? Quote a
    `DESCRIBE` of the output.
+   **Answer:** Yes. ClickHouse infers expression types identically. In the T6 gate
+   runner, `CREATE TABLE silver.customer_masked AS SELECT ... FROM icecat_api.\`bronze.customer\` LIMIT 0`
+   produces matching types for masked columns:
+   `DESCRIBE silver.customer_masked`:
+   `customer_id String`, `name String`, `created_at DateTime64(6)` (matching Bronze).
+
 4. How many pipelines in a fresh compose stack end up with `run_as = NULL`
    after the backfill (the g7 fixture, the seeds)? Every one of them stops
    running: list them and say whether a gate depends on one.
+   **Answer:** 0 user-authored pipelines exist in clean seeds prior to test runs.
+   The g7 test fixture creates `g7_pipeline` under the seeded admin user
+   (`33333333-3333-4333-8333-000000000001`), so its `run_as` is populated.
+   Pipelines without an author are explicitly tested by the `bld1` runner fixture
+   where `run_as` is set to NULL, verifying that `enforce` and Dagster fail closed
+   with D2's fixed message (`this pipeline has no author to read as; an administrator must assign one`).
 
 ## 7. Handoff
 
-(Developer appends here, task by task.)
+### Migration
+- **Number:** `0076_pipeline_run_as.sql`
+- **Rationale:** Renamed from 0075 because PR #144 and concurrent branches hold 0072-0075. All SQL files, migration references, and tests consistently use 0076.
+
+### Tasks Completed
+- **T1 (`c33b479e47f6`):** Added `pipeline_definition.run_as` column referencing `app_user (id) ON DELETE SET NULL`. Backfill derives author deterministically from lowest `created` version with valid human user.
+- **T2 (`deae1fd5859c`):** Added `PUT /api/pipelines/{id}/run-as` admin endpoint gated by `identity:write` to assign author. Gated to members of pipeline's tenant.
+- **T3 (`f587b40898da`):** Added `POST /api/pipelines/runnable/{id}/enforce` endpoint rewriting SELECT statements under author's live roles via `load_principal_for_user`. Fails closed (409) if author is missing, deactivated, or deleted.
+- **T4 (`db8656579664`):** Updated Dagster `authored_factory.py` to consult `enforce` endpoint prior to running SELECT against `icecat_api.\`bronze.<t>\``.
+- **T5 (`d57ddefb482d`):** Added UI in `src/features/pipelines/` displaying pipeline author, warning on deactivated/missing author, and providing admin assignment modal.
+- **T6 Follow-up (`20047c4b7d67`, `d5b0a503e0e7`):** Added `ops/g7/bld1_pipeline_author_test.py`, configured `bld1-test-runner` service in `docker-compose.yml`, and wired into `.github/workflows/ci.yml` (`g3a-dagster` job). Verified locally from clean compose project holding `/home/shiro/rantai/.heavy.lock`:
+  - `[bld-1] masked author wrote masked values only: ['***']`
+  - `[bld-1] unmasked author wrote clear values: ['customer_1', 'customer_2', 'customer_3']`
+  - `[bld-1] no author: API answered 409 'this pipeline has no author to read as; an administrator must assign one', run refused, and wrote nothing`
+- **T7 (`5f8c76cd994c`):** Customer-readable CHANGELOG.md entry under `[Unreleased]` describing author requirement for authored pipelines. Module documentation in `lakehouse-store`, `lakehouse-api`, and `dagster`.
+- **Merge & Test Fix (`1940ac2a73a2`, `602199653e5a`):** Merged `origin/main` (0 conflicts). Updated test fixture principal in `routes/pipelines.rs` to use seeded user `33333333-3333-4333-8333-000000000001` satisfying `app_user` FK.
+
+### Full Verification Results (Merged Head)
+- **Rust fmt:** `cargo fmt --check` -> clean (0 issues)
+- **Rust clippy:** `/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` -> clean (0 warnings)
+- **Rust tests:**
+  - `lakehouse-store`: 296 passed across all targets
+  - `lakehouse-api`: 1756 unit tests passed, 0 failed; integration tests `pipeline_enforce` (11 passed), `route_auth` (35 passed), `semantic_api` (17 passed), `sec11_guard` (4 passed), `security_regressions` (10 passed), `embed` (21 passed), `explain_rewrite` (6 passed)
+  - `lakehouse-core`: 47 passed
+  - `lakehouse-dagster`: 68 passed
+  - `lakehouse-auth`: 87 passed (1 doc-test ignored)
+  - `lakehouse-iceberg`: 32 passed (3 compose integration tests ignored)
+  - `lakehouse-llm`: 26 passed
+  - `lakehouse-notify`: 17 passed
+  - `lakehouse-trino`: 8 passed
+- **Frontend:**
+  - `flock /home/shiro/rantai/.heavy.lock bun run typecheck` -> clean (0 errors)
+  - `bun run lint` -> clean (0 errors, 6 pre-existing warnings)
+  - `flock /home/shiro/rantai/.heavy.lock bun test src/features/pipelines` -> 42 passed
+  - `flock /home/shiro/rantai/.heavy.lock bun test src/services` -> 77 passed
+- **Python Repo Lints:**
+  - `python3 ops/lint/check_intra_package_imports.py` -> OK
+  - `python3 ops/lint/check_bare_iceberg_count.py` -> OK
+- **Dagster Pytest:**
+  - `flock /home/shiro/rantai/.heavy.lock /home/shiro/rantai/venv-bld3/bin/python -m pytest dispar_orchestrate -q` -> 1069 passed, 0 failed (verified across batches: 503 + 226 + 340)
+- **Docker Compose:**
+  - `docker compose --profile '*' config --quiet` -> clean (exit code 0)
+- **Gitleaks:**
+  - `zricethezav/gitleaks:v8.30.1` -> clean (0 leaks found, ~24.27 MB scanned)
 
 ## 8. Review
 
