@@ -458,12 +458,10 @@ async fn a_re_point_with_credentials_is_probed_and_saved_together() {
         dial_of(&fx.app.pool, "conn-pg-lakehouse").await["host"],
         host.as_str()
     );
-    let stored = std::fs::read_to_string(
-        fx.secrets
-            .path()
-            .join("connector_managed_conn_pg_lakehouse_password"),
-    )
-    .unwrap();
+    let stored = common::stored_credential(
+        fx.secrets.path(),
+        "connector_managed_conn_pg_lakehouse_password",
+    );
     assert_eq!(stored, password);
 
     // Audited as a re-point: the slots and whether it was verified, no ref,

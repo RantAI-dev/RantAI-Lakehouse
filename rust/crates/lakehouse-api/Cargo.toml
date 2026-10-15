@@ -58,6 +58,7 @@ lakehouse-iceberg = { path = "../lakehouse-iceberg" }
 # which `lakehouse-iceberg` does not re-export.
 iceberg = "=0.10.1"
 rand = { workspace = true }
+aes-gcm = { workspace = true }
 axum = { workspace = true }
 # `sync` (Mutex/OnceCell/Barrier): explicit here, not left to incidental
 # workspace feature unification, because `gold_lock::MartLocks`

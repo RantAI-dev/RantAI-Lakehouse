@@ -917,7 +917,10 @@ fn secret_store_error(err: &crate::connector_secret_store::SecretStoreError) -> 
     match err {
         SecretStoreError::InvalidValue(_) => ApiError::BadRequest(err.to_string()),
         SecretStoreError::NotManaged => ApiError::Internal(err.to_string()),
-        SecretStoreError::Io(_) => ApiError::Unavailable(err.to_string()),
+        // SRC-12 decision 12: a fixed text naming the setting, never a key.
+        SecretStoreError::Io(_) | SecretStoreError::Key(_) => {
+            ApiError::Unavailable(err.to_string())
+        }
     }
 }
 

@@ -420,8 +420,21 @@ impl FileSecretResolver {
     }
 }
 
-impl SecretResolver for FileSecretResolver {
-    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+impl FileSecretResolver {
+    /// The raw bytes of the file `secret_ref` names, after the same
+    /// confinement checks [`SecretResolver::resolve`] applies (scheme,
+    /// canonical path under the base directory).
+    ///
+    /// Exists for `SRC-12` decision 4: a managed credential is stored
+    /// sealed (not text), so its resolver needs the bytes to open, and must
+    /// not grow a second copy of the confinement rule (AGENTS.md rule 4).
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::UnsupportedRef`] for a wrong scheme or a path outside
+    /// the base directory; [`SecretError::NotFound`] if the file cannot be
+    /// read.
+    pub fn read_confined(&self, secret_ref: &str) -> Result<Vec<u8>, SecretError> {
         let Some(path) = secret_ref.strip_prefix(FILE_SECRET_REF_PREFIX) else {
             return Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -444,11 +457,21 @@ impl SecretResolver for FileSecretResolver {
                 resolver: "file",
             });
         }
-        let contents =
-            std::fs::read_to_string(&canonical_path).map_err(|_| SecretError::NotFound {
-                secret_ref: secret_ref.to_owned(),
-                resolver: "file",
-            })?;
+        std::fs::read(&canonical_path).map_err(|_| SecretError::NotFound {
+            secret_ref: secret_ref.to_owned(),
+            resolver: "file",
+        })
+    }
+}
+
+impl SecretResolver for FileSecretResolver {
+    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+        let bytes = self.read_confined(secret_ref)?;
+        // Not UTF-8 is "nothing usable here", as `read_to_string` reported.
+        let contents = String::from_utf8(bytes).map_err(|_| SecretError::NotFound {
+            secret_ref: secret_ref.to_owned(),
+            resolver: "file",
+        })?;
         Ok(SecretValue::new(contents.trim().to_owned()))
     }
 }

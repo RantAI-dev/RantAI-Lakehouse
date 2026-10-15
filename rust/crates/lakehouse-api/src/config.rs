@@ -180,6 +180,16 @@ pub struct Config {
     /// them — e.g. when it runs outside Docker, where `/run/secrets` does
     /// not exist and every stored credential would fail with a 503.
     pub connector_secrets_dir: std::path::PathBuf,
+    /// The installation key managed connector credentials are sealed with
+    /// (`CONNECTOR_SECRETS_KEY`: 32 random bytes, base64; `SRC-12` decision
+    /// 4). `None` when unset: the config still resolves (many tests and
+    /// tools do not touch credentials), but `main` refuses to start without
+    /// it and the credential store refuses every write.
+    pub connector_secrets_key: Option<String>,
+    /// The key being retired during a key change
+    /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
+    /// never seals.
+    pub connector_secrets_key_previous: Option<String>,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -853,6 +863,17 @@ impl std::fmt::Debug for Config {
             )
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
+                "connector_secrets_key",
+                &self.connector_secrets_key.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "connector_secrets_key_previous",
+                &self
+                    .connector_secrets_key_previous
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
@@ -1144,6 +1165,8 @@ impl Config {
                 || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
                 std::path::PathBuf::from,
             ),
+            connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
+            connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
