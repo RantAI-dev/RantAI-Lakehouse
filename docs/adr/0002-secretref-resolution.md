@@ -522,3 +522,53 @@ decision 4).
 - Every installation, development ones included, must set the key once.
 - Gates set a CI-only key in their override files.
 - `connector_secret_store` and both resolvers change; no route changes.
+
+## Addendum 6: references to an external secret manager (`SRC-12` part B, 2026-10-15)
+
+### Context
+
+`SRC-12` asks that a connector can read its password from HashiCorp Vault,
+AWS Secrets Manager, Google Secret Manager or Azure Key Vault, with no copy
+on the product's file system (feature page
+`docs/core/features/credentials-done-properly.md`, decisions 1 to 3, signed
+2026-10-14). The `SecretResolver` seam of this ADR was built for it.
+
+### Decision
+
+- **One manager per installation**, chosen by the operator with
+  `SECRET_MANAGER`; its sign-in is the operator's, in the environment of the
+  API and the orchestrator, never in the console.
+- **A reference is a credential kind** (`vault:`, `aws-sm:`, `gcp-sm:`,
+  `azure-kv:`), stored instead of a value. The API and the orchestrator each
+  read it from the manager at every use, with no cache, through a small HTTP
+  client per manager (no cloud SDK).
+- **Which secrets may be referenced is the operator's choice, and closed by
+  default.** `SECRET_MANAGER_ALLOWED_PREFIXES` lists reference prefixes,
+  compared segment by segment; `{tenant}` in a prefix is the connector's
+  tenant. With a manager set and no prefixes, no reference is accepted. The
+  rule is checked when a reference is saved and again at every use, in the
+  API and in the orchestrator. Without it, anyone allowed to manage a
+  connector could point it at any secret the product's identity can read
+  and, with a host of their choosing, carry that secret off in a connection
+  test (found in the planner's review of part B).
+- **Fixed error texts** for every manager failure; never the manager's own
+  text.
+
+### Deliberate limits
+
+- At use, the resolvers do not know the connector, so `{tenant}` matches
+  any one segment there; the exact tenant is checked when the reference is
+  saved through the API.
+- Vault: KV version 2, no namespaces. Azure: the public cloud. Google: a
+  service-account key file or the platform's metadata identity.
+- Google Secret Manager and Azure Key Vault are proven by tests against
+  their documented interfaces, not against the services; Vault and AWS by
+  gates against local stand-ins (the Vault image is a CI fixture under
+  BUSL-1.1; OpenBao is the drop-in).
+
+### Consequences
+
+- An operator who sets `SECRET_MANAGER` must also set
+  `SECRET_MANAGER_ALLOWED_PREFIXES`, and should give the product's manager
+  identity a policy no wider than those prefixes.
+- Typed credentials stay available unless `CONNECTOR_TYPED_CREDENTIALS=false`.
