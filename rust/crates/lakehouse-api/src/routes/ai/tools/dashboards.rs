@@ -548,4 +548,272 @@ mod tests {
         assert_eq!(reply["error"], json!("dashboard not found."));
         assert!(writes(&sent(&server).await).is_empty());
     }
+
+    // ── BI-16 part B (AI-5): progress, histogram, bullet, image and web ─────
+
+    /// A mart with a text and three number columns, and a console that takes
+    /// every write.
+    async fn mart_server() -> MockServer {
+        let server = MockServer::start().await;
+        rows(&server, "FROM system.tables", vec![json!({ "n": "1" })]).await;
+        rows(
+            &server,
+            "FROM system.columns",
+            vec![
+                json!({ "name": "province", "type": "String" }),
+                json!({ "name": "visitors", "type": "UInt64" }),
+                json!({ "name": "target", "type": "UInt64" }),
+                json!({ "name": "price", "type": "Float64" }),
+            ],
+        )
+        .await;
+        rest(&server).await;
+        server
+    }
+
+    fn arguments(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(map) => map,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    fn sites(list: &[&str]) -> lakehouse_bi::grain::TimeContext {
+        lakehouse_bi::grain::TimeContext::default()
+            .with_content_sites(list.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// The statement the tool ran to check the chart it saved.
+    fn statements(all: &[String]) -> Vec<&String> {
+        all.iter()
+            .filter(|s| s.starts_with("SELECT") && s.contains("serving.mart_x"))
+            .collect()
+    }
+
+    /// AI-5: "Show a progress bar of visitors against a goal of 1,000,000".
+    #[tokio::test]
+    async fn the_request_for_a_progress_bar_against_a_goal_of_a_million_creates_one() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against 1,000,000", "kind": "progress", "mart": "mart_x",
+                "measures": ["visitors"], "aggregate": "sum", "goal": 1_000_000,
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["created"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("progress"));
+        let all = sent(&server).await;
+        assert_eq!(
+            statements(&all)
+                .first()
+                .map(|s| s.trim_end_matches("\nFORMAT JSON")),
+            Some("SELECT round(sum(visitors)) AS v FROM serving.mart_x")
+        );
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("goal")),
+            "the goal is stored"
+        );
+        // A goal that is a second value, and a goal that is missing.
+        let valued = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Against target", "kind": "progress", "mart": "mart_x",
+                "measures": ["visitors", "target"], "goal": { "measure": "target" },
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(valued["created"], json!(true), "{valued}");
+        let none = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "No goal", "kind": "progress", "mart": "mart_x", "measures": ["visitors"],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert!(
+            none["error"].as_str().unwrap().contains("needs a goal"),
+            "{none}"
+        );
+    }
+
+    /// AI-5: "Show how hotel prices are spread" is a histogram of the price
+    /// column; the same call with `histogram: {count: 10}` cuts it in ten.
+    #[tokio::test]
+    async fn the_request_to_show_how_prices_are_spread_creates_a_histogram() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let auto = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "How hotel prices are spread", "kind": "histogram", "mart": "mart_x",
+                "dimension": "price",
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(auto["created"], json!(true), "{auto}");
+        let ten = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "In ten ranges", "kind": "histogram", "mart": "mart_x",
+                "dimension": "price", "histogram": { "count": 10 },
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(ten["created"], json!(true), "{ten}");
+        let all = sent(&server).await;
+        let ran = statements(&all);
+        assert!(ran[0].contains("<= 20, 1 * p"), "{}", ran[0]);
+        assert!(ran[1].contains("<= 10, 1 * p"), "{}", ran[1]);
+        assert!(ran.iter().all(|s| s.contains("count() AS __count")));
+        // The same refusals as the console, in the same words.
+        for (extra, sentence) in [
+            (json!({ "histogram": { "count": 101 } }), "1 to 100 ranges"),
+            (
+                json!({ "histogram": { "count": 5, "width": 2 } }),
+                "not both",
+            ),
+            (json!({ "dimension": "province" }), "not a number column"),
+        ] {
+            let mut input = json!({
+                "title": "t", "kind": "histogram", "mart": "mart_x", "dimension": "price",
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let reply = create_chart(&ch, None, &arguments(input), None, &time).await;
+            assert!(
+                reply["error"].as_str().unwrap().contains(sentence),
+                "{reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bullet_graph_per_province_with_bands_is_created_and_a_goal_on_a_bar_chart_is_refused()
+     {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let bullet = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors", "target"],
+                "goal": { "measure": "target" }, "bands": [50, 80, 100],
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(bullet["created"], json!(true), "{bullet}");
+        let bar = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "dimension": "province",
+                "measures": ["visitors"], "goal": 5,
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(
+            bar["error"],
+            json!("goal is only for a progress bar and a bullet graph.")
+        );
+    }
+
+    /// The address of an image or a web page is checked against the
+    /// administrator's list on the assistant's path as on the console's, with
+    /// the console's sentence, and the address is not repeated.
+    #[tokio::test]
+    async fn an_image_on_a_site_that_is_not_allowed_is_refused_with_the_consoles_sentence() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let image = |url: &str| {
+            arguments(json!({ "title": "Logo", "kind": "image", "url": url, "alt": "The logo" }))
+        };
+        let allowed = sites(&["https://img.example"]);
+        let created = create_chart(
+            &ch,
+            None,
+            &image("https://img.example/logo.png"),
+            None,
+            &allowed,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        for url in [
+            "https://other.example/logo.png",
+            "http://img.example/logo.png",
+            "https://img.example@evil.example/logo.png",
+        ] {
+            let refused = create_chart(&ch, None, &image(url), None, &allowed).await;
+            assert_eq!(
+                refused["error"],
+                json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED),
+                "{url}"
+            );
+            assert!(!refused.to_string().contains(url));
+        }
+        // With no site listed nothing can be created; update_chart is checked too.
+        let none = create_chart(
+            &ch,
+            None,
+            &image("https://img.example/logo.png"),
+            None,
+            &sites(&[]),
+        )
+        .await;
+        assert_eq!(
+            none["error"],
+            json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
+        );
+        rows(
+            &server,
+            "FROM console.bi_chart",
+            vec![json!({ "board": "default", "owner_id": "", "is_deleted": 0 })],
+        )
+        .await;
+        let mut update = image("https://other.example/logo.png");
+        update.insert("id".to_owned(), json!("c_1"));
+        let refused = update_chart(&ch, None, &update, &allowed).await;
+        assert_eq!(
+            refused["error"],
+            json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
+        );
+        let web = create_chart(
+            &ch,
+            None,
+            &arguments(
+                json!({ "title": "Status", "kind": "web", "url": "https://img.example/status" }),
+            ),
+            None,
+            &allowed,
+        )
+        .await;
+        assert_eq!(web["created"], json!(true), "{web}");
+    }
 }

@@ -185,7 +185,12 @@
               "gauge",
               "table",
               "pivot",
-              "text"
+              "text",
+              "progress",
+              "histogram",
+              "bullet",
+              "image",
+              "web"
             ]
           },
           "sqlSource": {
@@ -1666,6 +1671,59 @@
               ]
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "goal": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "measure": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "measure"
+                ]
+              }
+            ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension"
+          },
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "number"
+            },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)"
+          },
+          "histogram": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "the width of each range"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "at most this many ranges"
+              }
+            },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order"
+          },
+          "url": {
+            "type": "string",
+            "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused"
+          },
+          "alt": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "image only (required): a short description of the picture for screen readers"
           }
         },
         "required": [
@@ -1724,7 +1782,12 @@
               "gauge",
               "table",
               "pivot",
-              "text"
+              "text",
+              "progress",
+              "histogram",
+              "bullet",
+              "image",
+              "web"
             ]
           },
           "sqlSource": {
@@ -3202,6 +3265,59 @@
               ]
             },
             "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "goal": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "measure": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "measure"
+                ]
+              }
+            ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension"
+          },
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "number"
+            },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)"
+          },
+          "histogram": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "the width of each range"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "at most this many ranges"
+              }
+            },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order"
+          },
+          "url": {
+            "type": "string",
+            "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused"
+          },
+          "alt": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "image only (required): a short description of the picture for screen readers"
           }
         },
         "required": [

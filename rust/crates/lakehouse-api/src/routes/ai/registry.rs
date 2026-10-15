@@ -120,8 +120,43 @@ fn chart_kind_enum() -> Value {
         "gauge",
         "table",
         "pivot",
-        "text"
+        "text",
+        "progress",
+        "histogram",
+        "bullet",
+        "image",
+        "web"
     ])
+}
+
+/// The properties `BI-16` part B adds to both chart tools (progress, histogram,
+/// bullet, image and web cards), inserted into the schema built by
+/// [`create_chart_schema`] and [`update_chart_schema`] so the two cannot drift.
+/// The limits are the ones `lakehouse_bi::types_b` enforces, and an address the
+/// administrator does not allow is refused with the console's own sentence.
+fn with_type_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "goal": { "oneOf": [
+            { "type": "number" },
+            { "type": "object", "properties": { "measure": { "type": "string" } }, "required": ["measure"] } ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension" },
+        "bands": { "type": "array", "minItems": 1, "maxItems": 3, "items": { "type": "number" },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)" },
+        "histogram": { "type": "object", "properties": {
+            "width": { "type": "number", "description": "the width of each range" },
+            "count": { "type": "integer", "minimum": 1, "maximum": 100, "description": "at most this many ranges" } },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order" },
+        "url": { "type": "string", "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused" },
+        "alt": { "type": "string", "maxLength": 200, "description": "image only (required): a short description of the picture for screen readers" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
 }
 
 /// The properties `BI-16` part A adds to both chart tools (raw tables, pivots,
@@ -503,8 +538,9 @@ fn set_dashboard_theme_schema() -> Value {
 }
 
 fn create_chart_schema() -> Value {
-    with_style_properties(with_shape_properties(with_table_properties(
-        json!({ "type": "function", "function": { "name": "create_chart",
+    with_type_properties(with_style_properties(with_shape_properties(
+        with_table_properties(
+            json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -523,12 +559,14 @@ fn create_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
+        ),
     )))
 }
 
 fn update_chart_schema() -> Value {
-    with_style_properties(with_shape_properties(with_table_properties(
-        json!({ "type": "function", "function": { "name": "update_chart",
+    with_type_properties(with_style_properties(with_shape_properties(
+        with_table_properties(
+            json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -547,6 +585,7 @@ fn update_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } }),
+        ),
     )))
 }
 
@@ -2328,6 +2367,42 @@ mod tests {
                 json!(["by", "dir"]),
                 "{tool}"
             );
+        }
+    }
+
+    /// `BI-16` part B (`AI-5`): both chart tools take the five new kinds and their
+    /// fields, and the tool count does not change (no new tool).
+    #[test]
+    fn the_chart_tools_take_the_progress_histogram_bullet_image_and_web_fields() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            let kinds = properties["kind"]["enum"].as_array().unwrap();
+            for kind in ["progress", "histogram", "bullet", "image", "web"] {
+                assert!(kinds.iter().any(|k| k == kind), "{tool} lacks kind {kind}");
+            }
+            for field in ["goal", "bands", "histogram", "url", "alt"] {
+                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
+            }
+            assert_eq!(
+                properties["histogram"]["properties"]["count"]["maximum"],
+                json!(100)
+            );
+            assert_eq!(properties["bands"]["maxItems"], json!(3));
+            assert_eq!(properties["alt"]["maxLength"], json!(200));
+            // The tool says where an address may come from, as the console does.
+            assert!(
+                properties["url"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Admin > Settings")
+            );
+        }
+        // `format_chart` changes only the look: it takes none of them.
+        let format = (find("format_chart").expect("registered tool").schema)();
+        let props = &format["function"]["parameters"]["properties"];
+        for field in ["goal", "bands", "histogram", "url", "alt"] {
+            assert!(props.get(field).is_none(), "format_chart took {field}");
         }
     }
 
