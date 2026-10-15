@@ -958,6 +958,29 @@ async fn authored_detail(
         );
         obj.insert("upstream".to_owned(), json!(upstream));
         obj.insert("downstream".to_owned(), json!(downstream));
+        // BLD-1 / D2: the author this pipeline reads as, by NAME. The
+        // console shows "Reads as: <name>", and it cannot get that from
+        // `GET /api/identity/users` -- that route is `identity:read`, which
+        // no ordinary role holds, and the people who operate pipelines are
+        // Data Engineers, not Platform Admins. Null when no author is
+        // recorded, which is the state in which the pipeline does not run.
+        obj.insert(
+            "runAsName".to_owned(),
+            match pipeline.run_as {
+                Some(run_as) => match lakehouse_store::identity::display_name(pool, run_as).await {
+                    Ok(name) => name.map_or(Value::Null, Value::String),
+                    Err(err) => {
+                        // The name is decoration on a response that is
+                        // otherwise complete: a failure here must not turn
+                        // a readable pipeline into a 500. The id is still
+                        // there, and the page degrades to it.
+                        tracing::warn!(%err, %run_as, "authored_detail: author name lookup failed");
+                        Value::Null
+                    }
+                },
+                None => Value::Null,
+            },
+        );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
 }

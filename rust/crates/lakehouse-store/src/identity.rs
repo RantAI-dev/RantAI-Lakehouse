@@ -383,6 +383,27 @@ pub async fn user_in_tenant(
     Ok(present.is_some_and(|(present,)| present))
 }
 
+/// The display name of `id`, or `None` when there is no such row.
+///
+/// Read from `app_user.name` — the same column
+/// [`lakehouse_auth::repository::load_principal_for_user`] puts in
+/// [`lakehouse_auth::Principal::display_name`], so a pipeline's page and its
+/// own enforcement agree on who the author is. Used by BLD-1's pipeline
+/// detail read: `GET /api/identity/users` needs `identity:read`, which no
+/// ordinary role holds, so the name has to travel with the pipeline or the
+/// people who operate pipelines cannot see whose permissions govern them.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn display_name(pool: &PgPool, id: Uuid) -> Result<Option<String>, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT name FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(name,)| name))
+}
+
 /// Delete a user; its membership rows cascade away with it.
 ///
 /// # Errors

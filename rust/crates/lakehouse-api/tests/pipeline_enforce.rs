@@ -108,8 +108,8 @@ async fn seed_mask(pool: &PgPool, role: &str) {
 }
 
 /// A pipeline authored by `run_as`, which may be `None` (the "created by a
-/// service identity" case).
-async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
+/// service identity" case), in `tenant_id` (also possibly `None`).
+async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
@@ -126,7 +126,7 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
             fbic_enabled: false,
             max_retries: None,
             owner: None,
-            tenant_id: None,
+            tenant_id,
             depends_on: Vec::new(),
             connector_id: None,
             id: None,
@@ -137,6 +137,22 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
     .await
     .unwrap();
     created.id
+}
+
+/// The tenant a caller resolves to when they send no `X-Tenant`: their
+/// first one (`tenant_scope::resolve`). `GET /api/pipelines/{id}` scopes
+/// against it, so a pipeline these tests READ back has to live in it --
+/// a tenant-NULL row is correctly invisible to a restricted caller.
+async fn first_tenant_of(pool: &PgPool, email: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT tenant_id FROM app_user_tenant \
+         WHERE user_id = (SELECT id FROM app_user WHERE email = $1) \
+         ORDER BY tenant_id LIMIT 1",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn enforce(router: &axum::Router, cookie: &str, id: &str, sql: &str) -> (StatusCode, Value) {
@@ -161,6 +177,79 @@ async fn enforce(router: &axum::Router, cookie: &str, id: &str, sql: &str) -> (S
     )
 }
 
+async fn detail(
+    router: &axum::Router,
+    cookie: &str,
+    id: &str,
+    tenant: Option<Uuid>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/pipelines/{id}"))
+        .header("cookie", cookie);
+    // The detail read is tenant-scoped, and with no `X-Tenant` the scope
+    // is `principal.tenant_ids.first()` -- which the auth query returns in
+    // whatever order the database feels like. Naming the tenant makes the
+    // test say what it means instead of depending on that.
+    if let Some(tenant) = tenant {
+        request = request.header("x-tenant", tenant.to_string());
+    }
+    let resp = router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The console's source for "Reads as: <name>" (BLD-1 / D2's console half).
+///
+/// It cannot get the name from `GET /api/identity/users` — that route is
+/// `identity:read`, which no ordinary role holds, and the people who
+/// operate pipelines are Data Engineers. So the detail read carries it,
+/// and this pins both halves: a named author arrives as `runAsName`, and a
+/// pipeline with no author carries `runAsName: null` rather than an
+/// invented one.
+#[tokio::test]
+async fn the_pipeline_detail_carries_the_author_name_for_the_console() {
+    let (router, pool, cookie) = app().await;
+    let tenant = first_tenant_of(&pool, "fajar@meridian.example").await;
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(tenant),
+    )
+    .await;
+
+    let (status, body) = detail(&router, &cookie, &id, Some(tenant)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runAsName"].as_str(), Some("Rina Wijaya"), "{body}");
+    assert!(
+        body["runAs"].is_string(),
+        "the author id must travel too: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_pipeline_detail_carries_no_author_name_when_there_is_no_author() {
+    let (router, pool, cookie) = app().await;
+    let tenant = first_tenant_of(&pool, "fajar@meridian.example").await;
+    let id = seed_pipeline(&pool, None, Some(tenant)).await;
+
+    let (status, body) = detail(&router, &cookie, &id, Some(tenant)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runAsName"], Value::Null, "{body}");
+    assert!(
+        body.get("runAs").is_none(),
+        "an absent author must be an absent key, not a null one: {body}"
+    );
+}
+
 async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
     sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
         .bind(email)
@@ -179,6 +268,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        None,
     )
     .await;
 
@@ -209,6 +299,7 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "yoga@meridian.example").await),
+        None,
     )
     .await;
 
@@ -223,7 +314,7 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
 async fn a_pipeline_with_no_author_is_refused_with_d2s_message() {
     let (router, pool, cookie) = app().await;
     seed_mask(&pool, "Analyst").await;
-    let id = seed_pipeline(&pool, None).await;
+    let id = seed_pipeline(&pool, None, None).await;
 
     let (status, body) = enforce(&router, &cookie, &id, SQL).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -241,7 +332,7 @@ async fn a_pipeline_authored_by_a_deactivated_user_is_refused_with_d2s_message()
     let (router, pool, cookie) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "rina@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), None).await;
     sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id = $1")
         .bind(author)
         .execute(&pool)
@@ -264,7 +355,7 @@ async fn a_pipeline_whose_author_was_deleted_is_refused_with_d2s_message() {
     let (router, pool, cookie) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "rina@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), None).await;
     sqlx::query("DELETE FROM app_user WHERE id = $1")
         .bind(author)
         .execute(&pool)
@@ -290,6 +381,7 @@ async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        None,
     )
     .await;
 
@@ -313,6 +405,7 @@ async fn a_caller_who_is_neither_service_nor_admin_is_refused() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        None,
     )
     .await;
     let data_engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
@@ -332,6 +425,7 @@ async fn an_unknown_pipeline_and_a_dagster_job_id_answer_the_same_404() {
     let id = seed_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        None,
     )
     .await;
 
@@ -364,7 +458,7 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
     let (router, pool, cookie) = app().await;
     seed_mask(&pool, "Analyst").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), None).await;
 
     let (status, body) = enforce(&router, &cookie, &id, SQL).await;
     assert_eq!(status, StatusCode::OK, "{body}");

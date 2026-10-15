@@ -31,6 +31,35 @@ export type Pipeline = {
   incrementalColumn?: string
   transforms?: string[]
   fbicEnabled?: boolean
+  /**
+   * BLD-1 / D1 (`pipeline_definition.run_as`): the id of the user this
+   * pipeline reads as. Every statement it runs is rewritten for that
+   * user's current permissions, so this is a governance fact, not a label.
+   *
+   * ABSENT rather than `null` when no author is recorded — the Rust side
+   * skips serializing the column when it is NULL. Absent means the pipeline
+   * does not run: an administrator must assign an author through
+   * `PUT /api/pipelines/{id}/run-as`.
+   *
+   * Only ever set on an authored pipeline, and never changed by editing
+   * the pipeline.
+   */
+  runAs?: string
+  /**
+   * The author's display name, on the DETAIL read only (the list does not
+   * join it). Present exactly when `runAs` is, and null when the row has
+   * since lost its user — so the console never has to resolve a name
+   * through `GET /api/identity/users`, which is `identity:read` and which
+   * no ordinary role holds.
+   */
+  runAsName?: string | null
+  /**
+   * The tenant this pipeline belongs to, absent when it has none
+   * (`tenant_id` is NULL until one is assigned). Decides whose membership
+   * counts when assigning a reader: the author must belong to the
+   * pipeline's own tenant.
+   */
+  tenantId?: string
 }
 
 /**
@@ -282,4 +311,17 @@ export interface PipelineService {
   deletePipeline(id: string, signal?: AbortSignal): Promise<void>
   /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
   getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
+  /**
+   * `PUT /api/pipelines/{id}/run-as` — assign the user this pipeline reads
+   * as (BLD-1 / D2). The only way `runAs` changes after create, and it is
+   * the way out of the "no author, so no run" state.
+   *
+   * Platform Admin only (`identity:write`): deciding whose permissions
+   * every future run of a row is governed by is a governance decision, not
+   * a pipeline-operation grant. Answers 204, so there is nothing to
+   * return; a 409 means the pipeline has no tenant yet (assign it one
+   * first) and a 422 that the user is not a member of the pipeline's
+   * tenant.
+   */
+  assignRunAs(id: string, userId: string, signal?: AbortSignal): Promise<void>
 }
