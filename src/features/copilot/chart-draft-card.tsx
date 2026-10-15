@@ -128,7 +128,6 @@ export function ChartDraftCard({
             cell={preview.result}
             dark={resolvedTheme === "dark"}
             loading={loading}
-            year="all"
           />
         ) : (
           <div className="h-full animate-pulse rounded-lg bg-muted/60" />

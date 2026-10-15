@@ -63,6 +63,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "serde error over the caller's own query parameter",
     ),
     (
+        "dashboard.rs",
+        "filters is invalid: {err}",
+        "serde error over the caller's own query parameter (BI-18, the dashboard `filters` list)",
+    ),
+    (
         "connectors.rs",
         "invalid JSON: {err}",
         "serde error over the caller's own request body",

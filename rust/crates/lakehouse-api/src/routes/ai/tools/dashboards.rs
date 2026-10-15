@@ -22,12 +22,13 @@ pub(super) async fn create_chart(
     ch: &ChClient,
     args: &Map<String, Value>,
     id: Option<String>,
+    time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
     let input = match parse_chart_input(args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
-    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id).await {
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => json!({
                 "created": true,
@@ -45,7 +46,11 @@ pub(super) async fn create_chart(
     }
 }
 
-pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn update_chart(
+    ch: &ChClient,
+    args: &Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
@@ -54,7 +59,7 @@ pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
-    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id)).await {
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => json!({
                 "updated": true,
@@ -179,10 +184,23 @@ pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
                         .columns
                         .iter()
                         .partition(|c| crate::routes::support::is_numeric_type(&c.ty));
+                    // BI-9: each column's kind, so the assistant can tell which
+                    // dimensions take a `grain` (date, datetime).
+                    let columns: Vec<Value> = s
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "name": c.name,
+                                "kind": lakehouse_bi::filters::ColumnKind::from_clickhouse_type(&c.ty),
+                            })
+                        })
+                        .collect();
                     json!({
                         "id": s.id, "title": s.title,
                         "dimensions": dimensions.iter().map(|c| &c.name).collect::<Vec<_>>(),
                         "measures": measures.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                        "columns": columns,
                     })
                 })
                 .collect();

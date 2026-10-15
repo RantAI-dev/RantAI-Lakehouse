@@ -4,6 +4,7 @@ import {
   buildRegionIndex,
   matchRegion,
   matchRegionRows,
+  rawNamesByFeature,
   normalizeJakartaArea,
   type RegionLevel,
 } from "./geo-regions"
@@ -106,4 +107,12 @@ test("rows that match no region are counted and named, not dropped silently", ()
 test("a matched row with no numeric value draws nothing and is not called unmatched", () => {
   const result = matchRegionRows([{ name: "Sleman", value: Number.NaN }], "regency", REGENCIES)
   assert.deepEqual(result, { data: [], unmatchedRows: 0, unmatchedNames: [] })
+})
+
+test("rawNamesByFeature lists each stored spelling once, under the feature it joins to", () => {
+  const raw = ["Kab. Bandung", "Kabupaten Bandung", "Kab. Bandung", "Kota Bandung", "Nowhere"]
+  const got = rawNamesByFeature(raw, "regency", REGENCIES)
+  assert.deepEqual(got.get("Bandung"), ["Kab. Bandung", "Kabupaten Bandung"])
+  assert.deepEqual(got.get("Kota Bandung"), ["Kota Bandung"])
+  assert.equal(got.has("Nowhere"), false)
 })

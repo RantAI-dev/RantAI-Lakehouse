@@ -317,6 +317,17 @@ pub async fn delete(
     sources::delete_source(ch, &id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // BI-8: the source's calculated fields go with it (no chart uses the
+    // source any more, so none can use them).
+    let orphans =
+        lakehouse_bi::fields::list_fields_for(ch, lakehouse_bi::fields::SourceKind::SqlSource, &id)
+            .await
+            .map_err(|err| classify_ch_error(&err))?;
+    for field in orphans {
+        lakehouse_bi::fields::delete_field(ch, &field.id)
+            .await
+            .map_err(|err| classify_ch_error(&err))?;
+    }
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -337,12 +348,14 @@ pub async fn preview(
 ) -> ApiResult<ApiJson<Value>> {
     let body: PreviewBody = parse(&body)?;
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let time = crate::routes::settings::time_context(&state).await?;
     let out = preview_for_roles(
         &state.clickhouse,
         &obligations,
         &principal.role_names,
         &placeholders_for(&principal),
         body,
+        &time,
     )
     .await?;
     Ok(ApiJson(out))
@@ -361,6 +374,7 @@ async fn preview_for_roles(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     body: PreviewBody,
+    time: &lakehouse_bi::grain::TimeContext,
 ) -> Result<Value, ApiError> {
     let (normalized, rewritten) =
         check_and_rewrite(&body.sql, roles, placeholders, obligations).await?;
@@ -375,6 +389,7 @@ async fn preview_for_roles(
                 },
                 ChartSource::Ui,
                 "ui",
+                time,
             )
             .map_err(|err| match err {
                 BiError::Validation(message) => ApiError::BadRequest(message),
@@ -396,12 +411,14 @@ async fn preview_for_roles(
     if let Some(chart) = chart {
         // The chart's own query embeds the normalized SQL and is rewritten
         // for the same roles again, exactly as a stored source's chart is.
-        let rows =
+        let mut rows =
             match try_run_spec_sql(ch, &chart.spec.sql, roles, placeholders, obligations).await {
                 Ok(rows) => rows,
                 Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
                 Err(SpecRunFailure::Clickhouse(err)) => return Err(classify_ch_error(&err)),
             };
+        crate::routes::support::annotate_saved_grain(&mut rows, &chart);
+        crate::routes::support::annotate_saved_table(&mut rows, &chart);
         out["chart"] = json!({
             "spec": render_stored_spec(&chart.spec, ChartSource::Ui),
             "result": rows,
@@ -483,7 +500,15 @@ mod preview_tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
         let body: PreviewBody = serde_json::from_value(body).unwrap();
-        preview_for_roles(&ch, &obligations, &[], &PlaceholderValues::none(), body).await
+        preview_for_roles(
+            &ch,
+            &obligations,
+            &[],
+            &PlaceholderValues::none(),
+            body,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
     }
 
     async fn sent(server: &MockServer) -> Vec<String> {

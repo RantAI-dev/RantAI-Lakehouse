@@ -121,6 +121,9 @@ pub fn resource_for(
     match tool_name {
         "create_chart" | "update_chart" | "delete_chart" => (Some("chart"), str_field("id")),
         "create_board" => (Some("board"), str_field("id")),
+        "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
+            (Some("calculated_field"), str_field("id"))
+        }
         "trigger_lakehouse_build" | "run_bronze_maintenance" => {
             (Some("pipeline"), str_field("runId"))
         }

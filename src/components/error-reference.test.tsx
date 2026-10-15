@@ -36,7 +36,6 @@ describe("TileBody on a failed tile", () => {
         cell={{ error: "This chart could not be loaded.", errorId: "ab12cd34ef" }}
         dark={false}
         loading={false}
-        year="all"
       />,
     )
     expect(container.textContent).toContain("This chart could not be loaded.")
@@ -50,7 +49,6 @@ describe("TileBody on a failed tile", () => {
         cell={{ error: "this chart's definition is invalid" }}
         dark={false}
         loading={false}
-        year="all"
       />,
     )
     expect(container.textContent).toBe("this chart's definition is invalid")

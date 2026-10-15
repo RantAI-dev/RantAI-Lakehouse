@@ -1197,6 +1197,17 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
     } else {
         Vec::new()
     };
+    // BI-8: a tile on a SQL source that names a calculated field is built
+    // over it, so the fields are read when a source tile exists. A mart tile
+    // uses the SQL stored with it, as before.
+    let fields = if sources.is_empty() {
+        lakehouse_bi::fields::FieldCatalog::default()
+    } else {
+        lakehouse_bi::fields::FieldCatalog::from_fields(
+            lakehouse_bi::fields::list_fields(ch).await?,
+        )
+    };
+    let time = lakehouse_bi::grain::TimeContext::default();
     let mut lines = vec![format!(
         "Dashboard: {} — {} tile",
         board.name,
@@ -1213,12 +1224,19 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         let sql = match chart.def.sql_source.as_deref() {
             None => Some(chart.spec.sql.clone()),
             Some(id) => sources.iter().find(|s| s.id == id).and_then(|s| {
+                // BI-9: a digest tile is a KPI or gauge with no dashboard
+                // filters, so no date expression, bucket or relative filter
+                // is built here and the default time context is never read.
                 lakehouse_bi::builder::sql_for_sql_source(
                     chart,
                     &s.sql,
-                    &s.column_names(),
+                    &s.column_kinds(),
                     &[],
                     &[],
+                    &lakehouse_bi::builder::ReadContext {
+                        fields: &fields,
+                        ..lakehouse_bi::builder::ReadContext::new(&time)
+                    },
                 )
             }),
         };
