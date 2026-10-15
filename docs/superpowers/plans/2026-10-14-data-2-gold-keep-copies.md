@@ -210,6 +210,53 @@ console's manual publish (D1), Silver (`DATA-4`).
 #### What was not verified
 - Tasks T2-T6 were deliberately not built/verified because the GATE condition failed (data files remain in the object store, violating `DATA-2-AC2` and the core premise of storage reclamation).
 
+### Task T1b: Spike & Gate Verification (ClickHouse remove_orphan_files)
+
+- **Status**: GATE T1b PASSED.
+- **Gate Evaluation**:
+  - ClickHouse catalog principal (`clickhouse-reader`) on `gold` namespace: **SUCCEEDED** (DataLakeCatalog database `icecat_gold_export` accessed `gold.gold_export_spike` without permission refusal).
+  - ClickHouse `remove_orphan_files` dry run: **SUCCEEDED** (`deleted_data_files_count: 2`).
+  - ClickHouse `remove_orphan_files` applied run: **SUCCEEDED** (`deleted_data_files_count: 2`, `deleted_manifest_files_count: 2`, `deleted_manifest_lists_count: 9`, `failed_deletions_count: 0`).
+  - **Removed copies data files in object store**: **SUCCEEDED / FREED FROM OBJECT STORE**.
+    - Before delete: 9 parquet data files in object store
+    - After PyIceberg delete & expire: 9 parquet data files
+    - After ClickHouse applied `remove_orphan_files`: exactly 7 parquet data files remain
+    - Exactly 2 removed copy data files were freed from the object store.
+  - **Gate Decision**: Gate T1b passed. Tasks T2 through T6 proceed with amendment A1, and `files_removed` added to the trim record (D5).
+
+#### Exact Spike Measurements (from compose execution task-158)
+- **Stack environment**:
+  - Compose project: `data2`
+  - Services: `lakehouse-api` (image `rantai-lakehouse-api:local`), `lakekeeper` (image `quay.io/lakekeeper/catalog:v0.13.3`), `clickhouse` (`26.8`), `postgres` (`16`), `rustfs` (`1.0.0-rc.4`), `oidc-mock`, `openfga` (`v1.8`).
+  - Runner environment: Dagster image `rantai-lakehouse-dagster:bld3` (PyIceberg 0.12.0, Python 3.12.15).
+  - Credentials: `gold-export` principal (`/tokens/gold-export.jwt`) for PyIceberg; `clickhouse-reader` OAuth principal for ClickHouse DataLakeCatalog.
+- **Seeded Mart**: `serving.gold_export_spike` with 7 rows, followed by 9 export cycles (`POST /api/gold/export/gold_export_spike`) with data changes between cycles.
+- **Measurements BEFORE delete**:
+  - Table format version: 2
+  - Snapshots count: 9
+  - Row count: 108
+  - Data files (.parquet): 9
+  - Cutoff timestamp (7th newest, keep 7): 7th newest `_exported_at`
+- **Measurements AFTER PyIceberg delete & expire**:
+  - `table.delete(LessThan("_exported_at", cutoff_time))` succeeded (rows reduced from 98 to 84).
+  - `table.maintenance.expire_snapshots().by_ids(older_ids).commit()` succeeded (snapshots reduced from 10 to 1).
+  - Data files (.parquet) in S3: 9 files remain (no data files freed by PyIceberg).
+- **ClickHouse `remove_orphan_files` findings**:
+  - Default retention: ClickHouse's default is `iceberg_orphan_files_older_than_seconds = 259200` (3 days). When called without age parameters, `dry_run=1` returns 0 deleted files for files younger than 3 days.
+  - Age parameter / setting: ClickHouse accepts setting `iceberg_orphan_files_older_than_seconds = 0` (or procedure parameter `older_than = '<timestamp>'` up to current time; future timestamps are rejected with `BAD_ARGUMENTS`).
+  - Dry run with `iceberg_orphan_files_older_than_seconds=0`:
+    - `deleted_data_files_count`: 2
+    - `deleted_manifest_files_count`: 2
+    - `deleted_manifest_lists_count`: 9
+    - `failed_deletions_count`: 0
+  - Applied run (`dry_run=0`) with `iceberg_orphan_files_older_than_seconds=0`:
+    - `deleted_data_files_count`: 2
+    - `deleted_manifest_files_count`: 2
+    - `deleted_manifest_lists_count`: 9
+    - `failed_deletions_count`: 0
+  - Parquet files in object store after applied run: exactly 7 files remain.
+  - The 2 orphaned files were successfully deleted from object storage.
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`
