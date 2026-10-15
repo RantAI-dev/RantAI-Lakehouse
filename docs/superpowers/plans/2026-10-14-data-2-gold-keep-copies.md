@@ -337,6 +337,22 @@ console's manual publish (D1), Silver (`DATA-4`).
     - Rust format & clippy: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets` clean with 0 warnings.
     - Rust unit & integration tests: `cargo test -p lakehouse-api` 86 upload routes + 13 gold publication tests passed.
 
+### Round 2 fixes after main moved (PR #105)
+
+- **Commits**:
+  - `437c276a1810`: Merge remote-tracking branch 'origin/main' into feat/data-2-gold-keep-copies (resolved CHANGELOG.md conflict keeping both sides).
+  - `a92d291d37ac`: fix(api): classify last_trim ClickHouse errors (main removed From<ChError>)
+- **Verification Commands & Counts**:
+  - `cargo fmt --check`: passed cleanly (0 errors).
+  - `flock /home/shiro/rantai/.heavy.lock cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed cleanly (0 warnings, 0 errors).
+  - `flock /home/shiro/rantai/.heavy.lock cargo test -p lakehouse-api --no-fail-fast gold`:
+    - `lakehouse_api` unit tests: 56 passed; 0 failed.
+    - `lakehouse_api` binary tests: 59 passed; 0 failed.
+    - `gold_publication` test: 1 passed; 0 failed.
+  - `flock /home/shiro/rantai/.heavy.lock cargo test -p lakehouse-api --test gold_publication --no-fail-fast`: 13 passed; 0 failed.
+- **Not Verified**:
+  - Full workspace test suite not run per AGENTS.md keep build time down rules; scoped to `lakehouse-api` crate as instructed.
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`
