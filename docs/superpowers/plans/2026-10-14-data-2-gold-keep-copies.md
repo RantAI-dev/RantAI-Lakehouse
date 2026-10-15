@@ -440,3 +440,38 @@ block, and record exact counts or *not verified* with the reason.
 
 Cite `DATA-2 review BLOCKER <n>` / `SHOULD-FIX <n>` at each fix site.
 
+
+### Round 2 (planner/reviewer, Claude Opus), at `2ee381d1f6c5`
+
+Read: the round 1 fixes and the two commits after `main` moved (#105
+removed `From<ChError> for ApiError`): the merge `437c276a1810` (CHANGELOG
+kept both sides) and `a92d291d37ac` (`last_trim` errors go through
+`upstream_error::ch_error`, cited at the site). Every round 1 finding is
+fixed and cited: BLOCKER 1 (`GOLD_ORPHAN_MIN_AGE_SECONDS`, default 3600,
+fails closed on a bad value, 0 only in the CI-only `.env` with the reason),
+BLOCKER 2 (no default credentials; the compose defaults left are URLs, a
+bucket name and numbers), BLOCKER 3 (bind-mount removed), SHOULD-FIX 1
+(spike script gone), SHOULD-FIX 2 (see below). No open finding.
+
+Reviewer's verification on `2ee381d1f6c5`, from a fresh build of this
+worktree's crates (`cargo-locked`):
+
+- `cargo fmt --check`: clean. `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast`: 105 suites, 5115 passed, 133
+  failed, 9 ignored. 132 of the failures were `sqlx::test` setups reset by
+  the test Postgres container, which the reviewer removed by mistake while
+  the run used it; the 133rd (`oidc_callback_writes_an_audit_event...`)
+  was in the same suite. Re-run of that suite alone,
+  `cargo test -p lakehouse-api --lib --no-fail-fast`: 1756 passed, 0
+  failed, 1 ignored. Every other suite passed in the full run.
+- `bun run typecheck`, `bun run lint`: clean. `bun test`, folder by folder
+  (the whole run does not fit this machine's memory): 1616 passed, 0
+  failed, 2 skipped.
+- Both `ops/lint` checks: pass. `pytest dispar_orchestrate`: 1061 passed.
+- `docker compose --profile '*' config --quiet`: pass. `gitleaks dir`: no
+  leaks.
+
+CI on the PR: 30 checks pass; "gitleaks (full git history)" fails with 18
+findings, all also in `main`'s re-run (20 findings, run 38682287828), all
+on `feat/phase-1-rest` (#144), none from this PR: `SEC-36`. Merged as #164.
