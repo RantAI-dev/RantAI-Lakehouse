@@ -52,6 +52,7 @@ use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::pipelines::record_pipeline_audit;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// Ticks read per request: enough to see a day of a 15-minute schedule.
 const MAX_TICKS: u32 = 50;
@@ -960,9 +961,13 @@ pub struct EnforceBody {
 /// probeable across tenants); 409 with [`NO_AUTHOR_REASON`] when the
 /// pipeline has no author or its author is deactivated; 422 with
 /// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
-/// refused; 400 for a malformed body; 503 if no pool is configured; 500 on
-/// any other database failure. No error body ever carries the rewriter's,
-/// the policy engine's or `ClickHouse`'s text (`AGENTS.md` rule 4).
+/// refused; 400 for a malformed body; 503 if no pool is configured or
+/// Postgres is unreachable; 500 on any other database failure. No error
+/// body ever carries the rewriter's, the policy engine's, `ClickHouse`'s or
+/// the database driver's text (`AGENTS.md` rule 4): an upstream failure
+/// answers the fixed `upstream_error` message and a reference id, and the
+/// driver's own text goes to the log under that reference (BLD-1 review
+/// BLOCKER 1).
 pub async fn enforce_pipeline_sql(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1007,7 +1012,23 @@ pub async fn enforce_pipeline_sql(
         // Raced with a delete between the two reads above. The same
         // refusal as "no author", because it now IS no author.
         lakehouse_auth::AuthError::NotFound => ApiError::Conflict(NO_AUTHOR_REASON.to_owned()),
-        other => ApiError::Internal(other.to_string()),
+        // BLD-1 review BLOCKER 1: a failure here is an upstream database
+        // error, so it goes through `upstream_error` -- a fixed message
+        // plus a reference to the caller, the driver's own text to the log
+        // only (AGENTS.md principle 4). The reported value is the `sqlx`
+        // source, NOT this enum: `AuthError::Database`'s `Display` is the
+        // fixed "database error" (`lakehouse_auth::error`'s module doc), so
+        // reporting the enum would log that string and throw the cause
+        // away, and `report_sqlx` is also what tells an unreachable pool
+        // (`503`, retryable) from a statement the database refused (`500`).
+        lakehouse_auth::AuthError::Database(source) => {
+            upstream_error::report_sqlx(&upstream_error::STORE, &source)
+                .into_api_error(upstream_error::FailedAs::Internal)
+        }
+        // Every other variant this loader can return is this code base's
+        // own text, but none of it is a reason to answer the caller with an
+        // error string built here: log it under a reference, answer fixed.
+        other => upstream_error::internal_error(&upstream_error::STORE, &other),
     })?;
 
     // The placeholders are the AUTHOR's, exactly as Query Studio builds

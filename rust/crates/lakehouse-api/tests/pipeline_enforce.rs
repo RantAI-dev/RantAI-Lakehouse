@@ -481,3 +481,103 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
         "the newly granted role did not take effect: {sql}"
     );
 }
+
+/// Seeds the orchestrator's service identity and credential the way
+/// `main::bootstrap_gold_export_service` and
+/// `security_regressions.rs::seed_agent_run_service_credential` do — the
+/// same production functions, because those bootstraps are private to the
+/// `bin` crate and this HTTP-level harness cannot call them. The scope is
+/// the `pipeline:read` floor `POLICY_TABLE` puts on this route.
+async fn seed_orchestrator_credential(pool: &PgPool, token: &str) {
+    let identity = lakehouse_store::identity::create_service_identity(
+        pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "pipeline-enforce-orchestrator".to_owned(),
+            scopes: vec!["pipeline:read".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let service_identity_id: Uuid = identity.id.parse().unwrap();
+    lakehouse_auth::service_token::ensure_service_credential(
+        pool,
+        service_identity_id,
+        &lakehouse_auth::Secret::new(token.to_owned()),
+    )
+    .await
+    .unwrap();
+}
+
+/// BLD-1 review BLOCKER 1: a failure loading the author's principal is an
+/// UPSTREAM error, and its text must never reach a response body
+/// (`AGENTS.md` principle 4). The body carries only the fixed
+/// `upstream_error` message and a reference id; the driver's own text goes
+/// to the log under that reference.
+#[tokio::test]
+async fn an_upstream_database_failure_loading_the_author_carries_no_upstream_text() {
+    const TOKEN: &str = "orch-pipeline-enforce-test-token";
+    let (router, pool, _cookie) = app().await;
+    let id = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        None,
+    )
+    .await;
+    // The caller is the orchestrator's service identity, so authenticating
+    // reads `service_credential` and `service_identity` and never
+    // `app_user_tenant` -- the table about to go away.
+    seed_orchestrator_credential(&pool, TOKEN).await;
+
+    // Take away the table `load_principal_for_user` reads the author's
+    // tenants and roles through, so the loader fails with the database's
+    // own "relation ... does not exist" text. `user_status` above it still
+    // reads `app_user`, so the request reaches the loader rather than
+    // failing earlier.
+    sqlx::query("DROP TABLE app_user_tenant CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/pipelines/runnable/{id}/enforce"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(json!({ "sql": SQL }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let message = body["error"].as_str().expect("an error string");
+    // Asserted against the helper's own context rather than a copied
+    // literal: the body has to be exactly what `upstream_error` renders,
+    // so a route that answered something else fails here instead of
+    // quietly passing on an unrelated fixed wording.
+    let prefix = format!(
+        "{} Reference: ",
+        lakehouse_api::upstream_error::STORE.failed
+    );
+    let Some(reference) = message.strip_prefix(&prefix) else {
+        panic!("the fixed message and a reference, got: {message}");
+    };
+    assert_eq!(
+        reference.len(),
+        10,
+        "a ten-character reference an operator can look up: {message}"
+    );
+    for upstream in ["relation", "app_user_tenant", "does not exist", "ERROR"] {
+        assert!(
+            !message.contains(upstream),
+            "the upstream text {upstream:?} reached the response: {message}"
+        );
+    }
+}
