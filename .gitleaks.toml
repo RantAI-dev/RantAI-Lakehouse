@@ -112,3 +112,19 @@ regexes = [
   '''KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=''',
   '''Y2ktY29ubmVjdG9yLWtleS1yb3RhdGVkLTAwMDAwMDA=''',
 ]
+
+# SRC-12 review B1 SHOULD-FIX 1: the CI-only token of the Vault development
+# server in the `g6-secret-managers` job (`.github/workflows/ci.yml`,
+# `ops/g6/docker-compose.src12-managers.override.yml`) and of the `wiremock`
+# stand-in in `rust/crates/lakehouse-api/tests/connector_secret_reference.rs`.
+# Their entropy (about 3.8 and 3.5 bits per character) is high enough for the
+# generic rule's threshold although they are words ("not-real"); the dev
+# server is in-memory and protects nothing. Exact literals, so any other token
+# is still scanned. The job's other values (`testing` for the AWS stand-in,
+# entropy 2.5) are below the threshold and need no entry.
+[[allowlists]]
+description = "SRC-12 CI-only Vault development-server token (not real)"
+regexes = [
+  '''ci-vault-token-not-real-123''',
+  '''ci-vault-token-not-real''',
+]
