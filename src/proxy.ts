@@ -23,6 +23,14 @@ const ASK_TIMEOUT_MS = 3_000
 async function allowedOrigins(token: EmbedPageToken): Promise<unknown> {
   // Same target the `/api` rewrite in next.config.ts proxies to.
   const base = process.env.RUST_API_URL ?? "http://localhost:8080"
+  // Not `apiFetch` (`PR #105 review SHOULD-FIX 2`): that is the browser-side
+  // choke point — it attaches `X-Tenant` from `localStorage` and turns a `401`
+  // into a redirect to `/login` — and neither exists in middleware, which runs
+  // on the server before any page code. The `/api` rewrite in next.config.ts
+  // applies to a browser navigation, not to a server-side fetch, so this asks
+  // the API origin directly. No cookie is forwarded on purpose: the endpoint
+  // is public and takes the embed token in the body, and a visitor with no
+  // session must get the same `frame-ancestors 'none'` answer.
   const res = await fetch(`${base}/api/embed/frame`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
