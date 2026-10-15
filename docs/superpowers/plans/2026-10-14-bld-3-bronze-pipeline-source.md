@@ -323,7 +323,7 @@ past `in_scope` at all, so both now seed a row and call as
    Run 1, from a clean project with the images built from scratch:
 
    ```
-   GIT_SHA=a01e34dba77e6a66b4b3887be1b32d2f3e2264ab
+   GIT_SHA=a01e34dba77e
    build rc=0 in 431s
    up rc=0 in 23s
    g3a rc=0 in 44s
@@ -619,9 +619,9 @@ Run B -- `GIT_SHA=$(git rev-parse HEAD)` at `367f304c`, and the compose
 DEFAULT (`required`, nothing in the `.env`):
 
 ```
-GIT_SHA=367f304c1db0c147d063e69d2853d63c1bc86ab0
-api image GIT_SHA      = 367f304c1db0c147d063e69d2853d63c1bc86ab0
-code-location GIT_SHA = 367f304c1db0c147d063e69d2853d63c1bc86ab0
+GIT_SHA=367f304c1db0
+api image GIT_SHA      = 367f304c1db0
+code-location GIT_SHA = 367f304c1db0
 build rc=0 in 193s
 up rc=0 in 22s
 g3a rc=0 in 37s
