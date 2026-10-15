@@ -181,6 +181,99 @@ planner (section 5).
 
 ### Slice B — developer (OpenCode MiniMax M3.1), 2026-10-15
 
+Base `e17a8281`, branch `fix/pr105-orchestrator-class`. Commits, one per task:
+
+- `66fc42f3` — `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` (B1, 5 files, +237/−34)
+- `ba8d63a2` — `docs(proxy): say why the embed frame check uses fetch (PR #105 review SHOULD-FIX 2)` (B2, `src/proxy.ts` only, +8)
+
+What B1 does: `DgError::Status(u16)` in `lakehouse-dagster` (built at all
+three non-2xx sites — `lib.rs` `list_runs_with_steps_for_job`, `run_logs`,
+`execute` — with the unchanged `Display` `"Dagster HTTP {n}"`);
+`orchestrator_unreachable` keeps `503` + `code: orchestrator_unreachable` +
+`Retry-After` for `Transport` and `Status(n) if n >= 500` only, and answers
+everything else through the same `report(...)` path as a `502` with
+`ORCHESTRATOR_UNREACHABLE`'s `failed` sentence, no `code`, raw text in the log
+only. Route docs in `routes::connectors` that named the old class are
+corrected at the same time.
+
+#### One file the plan does not name: `lakehouse-core`
+
+No `502` existed anywhere in the workspace (`ApiError::status()` covered
+400/401/403/404/409/422/429/500/503), and D2 asks for one, so
+`ApiError::BadGateway(String)` is added beside `Self::Unavailable` with the
+unreachable/unusable split documented at the variant, plus its
+`status()` → 502 arm and a test. `ApiError::status()` is the only exhaustive
+match on the enum in the workspace (checked by grep over `rust/crates`); the
+renderer `error.rs` picks `code` with an `if let` + `_ =>`, so nothing else
+moves. Per the task note this variant is accepted by the planner.
+
+#### Commands run, with the counts they printed
+
+Rust, from `rust/`, `CARGO_TARGET_DIR` as noted below:
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo clippy -p lakehouse-dagster -p lakehouse-api --all-targets -- -D warnings` | exit 0 (`Finished dev profile in 58.34s`) |
+| `cargo test -p lakehouse-dagster` | 69 passed, 0 failed |
+| `cargo test -p lakehouse-core` (extra: the crate I touched) | 48 passed, 0 failed |
+| `cargo test -p lakehouse-api --lib upstream_error` | 21 passed, 0 failed (17 pre-existing + the 4 the plan lists) |
+| `cargo test -p lakehouse-api --lib connectors` | 75 passed, 0 failed |
+| `cargo test -p lakehouse-api --lib pipelines` | 157 passed, 0 failed |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed |
+| `cargo test -p lakehouse-api --test ingest_run -- --test-threads=2` (extra) | 22 passed, 0 failed — includes `ingest_run_with_dagster_down_is_a_503_with_an_unreachable_code`, the end-to-end proof the `Transport` → `503` + code path is intact |
+| `cargo test -p lakehouse-api --test upstream_errors -- --test-threads=2` (extra) | 6 passed, 0 failed |
+
+TypeScript, from the worktree root: `bun run typecheck` exit 0;
+`bun run lint` exit 0 — `✖ 6 problems (0 errors, 6 warnings)`, all pre-existing
+and none in `src/proxy.ts`.
+
+#### Two environment facts the reviewer needs
+
+1. **No Rust toolchain was installed on this machine** when the slice
+   started (`cargo: command not found`, no `~/.cargo`, no `~/.rustup`). I
+   installed the pinned toolchain of `rust/rust-toolchain.toml`
+   (1.96.1 + rustfmt + clippy, minimal profile) with rustup to be able to run
+   anything at all. That is a machine change outside the repository, not a
+   repo change.
+2. **`/home/uaa/rantai/.cargo-target` is shared with the slice-A developer and
+   served this worktree artifacts built from THEIR source.** Observed
+   concretely: `cargo test -p lakehouse-api --lib upstream_error` there first
+   failed with five `E0599` errors (`no variant ... named Status`,
+   `... named BadGateway`) and then, on a rerun, reported
+   `17 passed` — 17 is the pre-change count, and the four new tests were
+   absent from the binary it ran. Every number quoted above therefore comes
+   from a private target dir, `CARGO_TARGET_DIR=/home/uaa/rantai/.cargo-target-orch-pr105`,
+   built from this worktree only. Nothing in the shared cache was cleaned or
+   deleted. Re-running the review's own verification in the shared dir can
+   produce a false green for the same reason; it is worth a re-run there after
+   slice A is done.
+
+#### Consequences worth a look
+
+- A `Dagster` answer that is not a transport failure or a `5xx` is now a
+  `502`, and `ops/g6/g6_ingest_matrix_test.py` raises at once on anything
+  that is not `503` + one of `RETRYABLE_ORCHESTRATOR_CODES` — that is the
+  gate's own rule, and D2's point, but it does mean such an answer no longer
+  consumes the gate's 120 s wait window. The transient in
+  `docs/superpowers/plans/2026-10-14-ci-green.md` (F3: a launch answering
+  `Dagster HTTP 500` while the code location reloads) is a `5xx`, so it
+  keeps the retry code; nothing in the acceptance gates needed a change.
+- `docs/core/features/no-raw-upstream-errors.md:52` still describes
+  `orchestrator_unreachable` as the answer for both classes; that is the
+  planner's SHOULD-FIX 6 (section 5), left untouched here.
+
+#### Not verified, and why
+
+- `cargo clippy --workspace --all-features -- -D warnings` and
+  `cargo test --workspace`: forbidden by section 4 of this plan (11 GB
+  machine); CI runs them.
+- `bun run test`, the `ops/g*` gates, and `docker compose config`: not run —
+  this slice touches neither TypeScript behaviour nor compose, and the gates
+  need the whole stack up.
+- The doc pages in section 5 and `no-raw-upstream-errors.md` are the
+  planner's, not verified here.
+
 Branch `fix/pr105-orchestrator-class`, base `e17a8281`. Commits:
 
 - `66fc42f3` `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` — B1.
