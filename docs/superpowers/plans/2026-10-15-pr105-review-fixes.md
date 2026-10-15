@@ -181,11 +181,12 @@ planner (section 5).
 
 ### Slice B — developer (OpenCode MiniMax M3.1), 2026-10-15
 
-Branch `fix/pr105-orchestrator-class`, base `e17a8281`. Commits, one per task:
+Branch `fix/pr105-orchestrator-class`, base `e17a8281`:
 
 - `66fc42f3` — `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` (B1; 5 files, +237/−34)
 - `ba8d63a2` — `docs(proxy): say why the embed frame check uses fetch (PR #105 review SHOULD-FIX 2)` (B2; `src/proxy.ts` only, +8)
-- the commit(s) carrying this section.
+- `29f31e98` — `docs(dagster): name Status in launch_run_with_config's Errors` (doc only, part of B1)
+- `89231890`, `1f4766fc`, `3e2eee8d` — the three commits carrying this section; the first was pushed by an interrupted run of this slice and the other two consolidate it into the single section below.
 
 **Plan vs code.** No scope mismatch. The anchors held at `e17a8281`
 (`DgError` 157, `Server(format!("Dagster HTTP …"))` 1157,
