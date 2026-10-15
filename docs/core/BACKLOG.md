@@ -69,7 +69,7 @@ estimate (S, M, L), which the base has no field for.
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
 | `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history. Decided 2026-10-14: no rewrite; the key and the staging values are rotated (product owner) and their history findings are baselined by exact fingerprint in `.gitleaksignore` | Administration & Security | P1 | Done | #153 | `SECURITY.md` |
 | `REL-1` | Task | Protect the main branch | Delivery | P1 | Todo |  | `docs/CI.md` |
-| `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Todo |  | PRODUCT §6 |
+| `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Done | #171 | PRODUCT §6 |
 | `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
 | `SEC-10` | Task | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver. The `SRC-17` gate (`ops/g6/src17_alert_delivery_test.py`) receives webhooks on its own network: this item gives that gate its documented opt-in | Administration & Security | P1 | Done | #105 | `lakehouse-notify` |
 | `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Done | #105 | `routes/support.rs` |
@@ -229,7 +229,7 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
-| `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/FEATURE_COVERAGE.md` |
+| `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
 | `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
 
@@ -331,6 +331,7 @@ set by the product owner and are left empty until they are.
 | `SRC-20` | 2026-10-14 | 2026-10-14 | |
 | `DATA-10` | 2026-10-14 | 2026-10-14 | |
 | `SEC-30` | 2026-10-14 | 2026-10-15 | |
+| `DOC-1` | 2026-10-15 | 2026-10-15 | |
 | `SEC-13` | 2026-10-13 | 2026-10-14 | |
 | `SEC-1` | 2026-10-14 | 2026-10-14 | |
 | `SEC-10` | 2026-10-10 | 2026-10-15 | |

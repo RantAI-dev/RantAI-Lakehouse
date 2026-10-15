@@ -1,5 +1,11 @@
 # Feature Coverage
 
+> **Archived 2026-10-15 (`DOC-1`).** This document predates the current build and
+> contradicts it in places. It is kept for history only and is not maintained.
+> What the product is and has: [`docs/core/PRODUCT.md`](../core/PRODUCT.md);
+> the work list: [`docs/core/BACKLOG.md`](../core/BACKLOG.md). Where any of
+> them differs from the code, trust the code.
+
 **Updated in P6.** This file predates the Rust backend cutover (P0–P6) and
 previously described every domain as a mock adapter. That was already false
 before P6 (10 of 12 `src/services/index.ts` domains were already real) and

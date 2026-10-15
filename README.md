@@ -66,7 +66,7 @@ flowchart LR
     Trino -. compacts Bronze via .-> Lakekeeper
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (13
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (14
 Rust crates), the request lifecycle (browser → rewrite → axum middleware →
 policy check → handler → store/client), and the Postgres-vs-ClickHouse data
 model.
@@ -172,7 +172,7 @@ bun start
 ### Test, lint, typecheck
 
 ```bash
-bun run test        # bun test (unit tests under src/lib)
+bun run test        # bun test src (every *.test.ts/tsx under src/)
 bun run lint         # eslint
 bun run typecheck    # tsc --noEmit
 ```
@@ -247,7 +247,7 @@ guessed.
 | `AUTH_RETENTION_DAYS` | How many days to keep expired sessions and revoked credentials before the background cleanup job purges them. Throttle rows are not gated by this — an unlocked row with a lapsed window is purged as soon as its window lapses | `30` | No |
 | `OIDC_ISSUER` | OIDC provider issuer URL | unset | No — OIDC requires both this and `OIDC_CLIENT_ID` |
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above |
-| `OIDC_CLIENT_SECRET` | Reserved for a future authorization-code exchange; not currently read by `OidcAuthenticator` | unset | No |
+| `OIDC_CLIENT_SECRET` | Client secret sent as `client_secret` in the authorization-code exchange at `OIDC_TOKEN_URL` (`routes/auth.rs`); leave unset for a public client | unset | No |
 | `OIDC_PROVIDER_NAME` | Short label combined with `oidc:` to form `Principal::provider` / `auth_identity.provider` | `default` | No |
 | `OIDC_JWKS_URL` | Explicit JWKS endpoint override | derived: `{OIDC_ISSUER}/.well-known/jwks.json` | No |
 | `OIDC_JIT_PROVISIONING` | `"true"` to auto-create an `app_user` for a validating token with no linked identity yet | `false` | No |
@@ -260,12 +260,31 @@ guessed.
 | `ORACLE_CDC_LOGMINER_ENABLED` | Names the extension point for Oracle CDC via Debezium LogMiner. This build ships no Oracle LogMiner template, so Oracle CDC connectors are refused either way; the flag changes only the explanation (`docs/adr/0008-initial-snapshot-backfill.md`) | `false` | No |
 | `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | `postgres://lakehouse:lakehouse@localhost:5432/lakehouse` | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
 
+These are also read by `lakehouse-api` (`config.rs`, and `routes/mod.rs` for
+the chat timeout); they were missing from the table above until 2026-10-15
+(`DOC-1`):
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `AGENT_RUN_TOKEN` | Shared token with which the orchestrator's digital-employee schedule runs an agent headlessly (`x-run-token`) | unset (only a principal holding `agent:manage` can run one) | Only for scheduled agent runs |
+| `AI_SQL_HELP` | Whether the assistant may explain a Query Studio statement and propose a corrected one; `false` only for the exact string `"false"` | `true` | No |
+| `AI_CHAT_TIMEOUT_SECS` | Request timeout of `/api/ai/chat` in whole seconds, clamped to 30–1800; raise it for a slow model served on CPU | `120` | No |
+| `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` | Lets connection tests dial internal addresses (the guard against using the console as a port scanner, `SEC-15`); `true` only for the exact string `"true"` | unset (refused) | Only to test connectors that point at internal hosts, such as the seeded ones |
+| `CONNECTOR_PROBE_ALLOWED_CIDRS` | Private networks a connector may dial although internal addresses are refused: the narrow alternative to the setting above | empty | No |
+| `WEBHOOK_ALLOWED_CIDRS` | Internal networks an alert webhook may call (`SEC-10`); never opens loopback, link-local or multicast | empty | No |
+| `CONNECTOR_SECRETS_DIR` | Where the API itself reads and writes connector credential files; refs keep saying `file:/run/secrets/...`, the orchestrator's path | `/run/secrets` | Only when the API runs outside Docker |
+| `ICEBERG_QUERY_DB` | The `ClickHouse` `DataLakeCatalog` database the API reads Iceberg tables through (compose creates `icecat_api`) | unset in the API (compose sets `icecat_api`); unset means Iceberg tables stay unreadable for policy checks and the catalog | Only when running the API outside compose |
+| `GIT_SHA` | The commit the image was built from; lets the pipeline source view say whether the code shown is the code that ran | `unknown` | No |
+
+`WEBHOOK_TEST_ALLOW_ALL` exists in `config.rs` but is read only in test
+builds; no deployment setting can open loopback for webhooks.
+
 Two additional variables live outside `config.rs`, on the frontend side —
 listed here because you need them to run the console at all:
 
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
-| `RUST_API_URL` | Target the Next.js `/api/*` rewrite proxies to (`next.config.ts`) | unset (rewrite disabled — no backend reachable) | Yes, to reach the Rust backend at all |
+| `RUST_API_URL` | Target the Next.js `/api/*` rewrite proxies to, read when `next build` runs (`next.config.ts`) | `http://localhost:8080` | Only when the API is not on `localhost:8080` |
 | `NEXT_PUBLIC_SSO_ENABLED` | Build-time flag that shows/hides the SSO login UI | unset (SSO UI hidden) | No — see "SSO configuration is split across two processes" below |
 
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
@@ -292,9 +311,6 @@ talks to it:
 | `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
 | `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store Lakekeeper's authorization model lives in | `lakekeeper` | No |
 | `OPENFGA_PG_DB` | Name of OpenFGA's own Postgres database on the existing `postgres` service | `openfga` | No |
-| `OPENFGA_HTTP_HOST_PORT` | Host port mapped to OpenFGA's HTTP API (container port 8080) | `8082` | No |
-| `OPENFGA_GRPC_HOST_PORT` | Host port mapped to OpenFGA's gRPC API (container port 8081) — this is the port Lakekeeper's `LAKEKEEPER__OPENFGA__ENDPOINT` actually talks to | `8083` | No |
-| `OIDC_MOCK_HOST_PORT` | Host port mapped to `ops/oidc-mock`'s discovery/JWKS/token endpoints (container port 8090) | `8090` | No |
 
 P1b (`lakehouse-iceberg`) adds the client-side counterparts below, read by
 `config.rs` — these are what a Rust process (not the container) uses to
@@ -346,7 +362,7 @@ their opt-in compose profiles:
 | `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
 | `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
 | `TRINO_PUBLISH_HOST_PORT` | SECURITY: `trino` has no authentication of its own, so its host port is NOT published by default — `trino-maintenance-cron` (the only real consumer) reaches it in-network as `http://trino:8080`. Set to the literal string `trino` (matching the Compose profile, not `true`/`1`) to opt in to host access; any other value leaves it disabled. See the `trino-host-port` service comment in `docker-compose.yml` for why the value must be that exact profile name | unset (disabled) | No, and CHANGE ME only on a trusted host if you do |
-| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile), only published when `TRINO_PUBLISH_HOST_PORT` is also set. Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
+| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile), only published when `TRINO_PUBLISH_HOST_PORT` is also set. | `8091` | No |
 | `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials and database for the compose `postgres` service. `POSTGRES_PASSWORD` is `lakehouse-api`'s OWN database password — no longer what the seeded `conn-pg-lakehouse` connector dials with (see `CONNECTOR_PG_PASSWORD` below) | `lakehouse` / `lakehouse` / `lakehouse` | No |
 | `CONNECTOR_PG_PASSWORD` | Password the seeded `conn-pg-lakehouse` connector's `secretRef` (`env:CONNECTOR_PG_PASSWORD`) resolves to for a real connectivity test. Deliberately a name distinct from `POSTGRES_PASSWORD` (the console's own database password) — this name matches the connector secret allowlist's fixed `env:CONNECTOR_*_PASSWORD` pattern (`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`), so the allowlist never has to name a process secret to let the seeded connector dial. A connector created through the console or the copilot does NOT name its own var (ADR 0002 Addendum 3, `docs/adr/0002-secretref-resolution.md`): it picks a source/kind, and the server derives an `env:CONNECTOR_CONN_<ID>_<PASSWORD\|SECRET_KEY\|ACCESS_KEY\|API_KEY\|TOKEN>` (or `file:/run/secrets/connector_conn_<id>_<suffix>`) name from the id it generates, returned once at creation — the six allowlist patterns are still fixed in code, not configurable, but the exact var name is per-connector and cannot be listed here. Defaults to the same value as `POSTGRES_PASSWORD` for the local stack; set to a least-privilege credential in a real deployment | `lakehouse` | No |
@@ -385,33 +401,36 @@ connector-registry (ADR 0007), not from top-level env vars.
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
-- **There is no streaming surface.** There is no Kafka/Redpanda/Pulsar/Flink
-  anywhere in this project. The console previously had a mocked
+- **There is no streaming surface.** There is no stream-processing engine
+  (Redpanda, Pulsar, Flink) in this project; Kafka appears only as a
+  connector source that the orchestrator reads in batches
+  (`dagster/dispar_orchestrate/adapters/kafka.py`). The console previously had a mocked
   `streaming` domain fabricating lag/throughput/checkpoint numbers; it has
   been removed rather than kept as a mock. **CDC (Debezium, P5) is not a
   streaming engine** and is not relabeled as one — it's a
   change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
   instead under Governance → "Ingestion (CDC)".
-- **Uploading a file is limited to delimited text, and every column is text.**
+- **Uploading a file: every column is loaded as text.**
   The console accepts a CSV or TSV (UTF-8 or UTF-16; comma, semicolon, tab or
-  pipe) of up to 50 MB and 2,000,000 data rows, and refuses a workbook, JSON or
-  Parquet file, or anything over a limit, with the reason, never cutting a file
-  short. The table it becomes stays in the raw layer: the pipeline builder
+  pipe), an `.xls`/`.xlsx` workbook, or a Parquet file, converted to text
+  columns on the way in (`routes/uploads.rs`, ADR 0014), of up to 50 MB and
+  2,000,000 data rows. It refuses any other format (JSON among them), or
+  anything over a limit, with the reason, never cutting a file short. The table it becomes stays in the raw layer: the pipeline builder
   cannot read raw tables yet and a dashboard reads Gold tables only. The
   original file is kept until someone deletes the upload, and uploading needs
   the object-storage settings and the orchestrator (see `docs/OPERATIONS.md`,
   "Uploaded files"). It has not been run end to end on a deployed stack.
-- **`knowledge.search` is mocked.** There is no vector store or embeddings
-  API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
-  Postgres (`lakehouse-store::knowledge`) — only the search-query path
-  itself is mocked.
-- **Connector "Test connection" genuinely dials only PostgreSQL and
-  S3-compatible object storage.** `POST /api/connectors/{id}/test`
-  (`lakehouse-api`'s `connector_probe` module) opens a real, 5s-bounded
-  connection and measures real latency for those two types, resolving the
-  connector's `secretRef` via `EnvSecretResolver` (ADR 0002). Every other
-  connector `type` (Kafka, MQTT, MongoDB, Oracle, SAP/ERP, SFTP, a vendor
-  REST API, ...) has no dial implementation in this build and returns
+- **There is no knowledge search.** The console's knowledge pages and the
+  mocked search behind them were removed; there is no vector store or
+  embeddings API. The API's knowledge source and vector-job records remain
+  (Postgres, `lakehouse-store::knowledge`) with no search route and no page.
+- **Connector "Test connection" dials PostgreSQL, MySQL/MariaDB, SQL Server,
+  S3-compatible object storage and REST APIs.** `POST /api/connectors/{id}/test`
+  (`lakehouse-api`'s `connector_probe` module) opens a real, bounded
+  connection to those and measures real latency, resolving the connector's
+  `secretRef` through the allowlisted resolver (ADR 0002). Oracle, MongoDB,
+  Kafka and SFTP connectors are read only by the orchestrator, so the
+  console reports them as not testable from here; any other type returns
   `{ supported: false }` with a message saying so — never a fabricated
   latency or success. The seed (`0022_prune_connector_seed.sql`) was
   shrunk to match: two connectors, `conn-pg-lakehouse` and
@@ -466,8 +485,8 @@ issue about any of the following — they're known, not bugs:
   test path, `debezium-server`, the dlt pipeline) authenticates as a
   granted principal — see `docs/adr/0011-lakekeeper-authorization.md` for
   the model, the grants, and the default-posture decision. **What is still
-  open:** ClickHouse's `CREATE TABLE`/`INSERT` through the catalog do not
-  work on this ClickHouse version at all (a ClickHouse defect, independent
+  open:** ClickHouse's `CREATE TABLE` through the catalog does not work on
+  this ClickHouse version (`INSERT` does on 26.8; a ClickHouse defect, independent
   of authorization — see above and `docs/plans/G1-RESULT.md`), so R1's
   original framing ("ClickHouse catalog-registered
   writes fail against Lakekeeper's authz on metadata updates") is still
@@ -475,9 +494,6 @@ issue about any of the following — they're known, not bugs:
   compaction escape hatch) is granted its own principal too — `EXECUTE
   optimize` measured working under enforcement (3 data files -> 1 on a
   live Bronze table; see ADR 0011 and `docs/plans/G3-RESULT.md`).
-- **`getWorkspaceSettings` returns a fixed response.** The contract has no
-  setter; workspace settings are not actually persisted or configurable
-  yet.
 - **Login throttling covers password login only.** Failed `POST
   /api/auth/login` attempts are throttled per email; after a configurable
   number of failures within a window, the email is locked out for a
@@ -488,13 +504,17 @@ issue about any of the following — they're known, not bugs:
   can't read the Rust process's environment variables directly, so whether
   the SSO login UI shows up is controlled by `NEXT_PUBLIC_SSO_ENABLED` at
   *build* time — it cannot react to whether `OIDC_ISSUER`/`OIDC_CLIENT_ID`
-  are actually set on the backend at runtime. A `GET /api/auth/providers`
-  endpoint (letting the frontend ask the backend what's configured) has
-  been proposed but is not built.
+  are actually set on the backend at runtime. `GET /api/auth/providers`
+  exists and the admin single sign-on page uses it to show what the backend
+  has configured; the login page's button still follows the build-time
+  flag. Single sign-on has not been tested against a real identity provider
+  (backlog `SEC-3`).
 - **The service does not refuse to boot when Postgres is down.**
   `lakehouse-store::connect_lazy` never does network I/O at startup;
   Postgres connectivity is only discovered lazily, at first use. Dependent
-  (Phase 2) routes return `503` instead of the process failing to start.
+  (Phase 2) routes answer `500` with a fixed "database error" (a
+  `DATABASE_URL` that does not parse gives `503`) instead of the process
+  failing to start; making this loud is backlog `OPS-4`.
   This is deliberate (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   but it means a misconfigured `DATABASE_URL` degrades quietly rather than
   loudly — watch logs and the 503 rate, not just process uptime.
@@ -558,14 +578,21 @@ blue/navy color tokens, Geist font, dark mode as the default theme.
 
 ```
 src/
-├── app/                 # App Router (layout, page, routes)
+├── app/                 # App Router: thin page files that render a feature
+├── features/            # One folder per console area (imports @/services only)
+├── services/            # contracts/ → clients/ (apiFetch) → index.ts
 ├── components/
 │   ├── ui/              # shadcn/ui components
-│   └── shared/          # Shared components (ThemeProvider, etc.)
-├── lib/                 # Utilities (utils, config)
+│   ├── patterns/        # Repo patterns (page headers, page states, ...)
+│   └── app-shell/       # Navigation and layout chrome
+├── config/              # Shared configuration (data-table settings)
+├── lib/                 # Pure logic and utilities (unit-tested)
 ├── hooks/               # Custom React hooks
-└── types/               # TypeScript types/interfaces
+├── types/               # TypeScript types
+└── proxy.ts             # Next.js proxy (embed frame policy headers)
 ```
+
+The layering rule is in `docs/CODE-STANDARD.md` section 4.1.
 
 ### Adding a shadcn component for the first time
 
@@ -606,5 +633,6 @@ src/
 
 The project uses `next-themes` via the design system's `ThemeProvider`
 (`@rantai/design-system/components/theme-provider`) in `src/app/layout.tsx`.
-Per the design system, dark mode is **forced**. To enable a light/dark
-toggle, remove the `forcedTheme` prop on that component.
+Dark is the default theme (`defaultTheme="dark"`, `enableSystem`); it is not
+forced, and `src/components/theme-toggle.tsx` switches between light and
+dark.

@@ -1,5 +1,11 @@
 # AI Project Insights
 
+> **Archived 2026-10-15 (`DOC-1`).** This document predates the current build and
+> contradicts it in places. It is kept for history only and is not maintained.
+> What the product is and has: [`docs/core/PRODUCT.md`](../core/PRODUCT.md);
+> the work list: [`docs/core/BACKLOG.md`](../core/BACKLOG.md). Where any of
+> them differs from the code, trust the code.
+
 Verified context for the **Rantai Lake** console after the lifecycle alignment pass, and after the P0-P6 Lakehouse Foundation build (Rust backend cutover + a real Bronze Iceberg/Lakekeeper/RustFS/CDC layer). Update only with facts that are true in the repository.
 
 **This section historically said "frontend preview only" and "no real
