@@ -1,5 +1,11 @@
 # RantAI Lake — New Frontend Repository Implementation Plan
 
+> **Archived 2026-10-15 (`DOC-1`).** This document predates the current build and
+> contradicts it in places. It is kept for history only and is not maintained.
+> What the product is and has: [`docs/core/PRODUCT.md`](../core/PRODUCT.md);
+> the work list: [`docs/core/BACKLOG.md`](../core/BACKLOG.md). Where any of
+> them differs from the code, trust the code.
+
 ## 1. Purpose
 
 Build a new frontend repository for **RantAI Lake** that:
