@@ -8,6 +8,7 @@ import {
   isAutoDisablePause,
   loadModeProblem,
   lockedColumns,
+  REST_OLD_OBJECT_NOTE,
   targetProblem,
 } from "./connector-ingest-panel"
 
@@ -34,13 +35,31 @@ const SPEC = {
 
 type Call = { url: string; method: string; body: unknown }
 
+type Found = { name: string; columns: { name: string; typeName: string }[]; primaryKey?: string[] }
+
+/** What the source holds: the tables a test passes as `discovered`, else two small ones. */
+function found(options: { discovered?: unknown[] }): Found[] {
+  return (
+    (options.discovered as Found[] | undefined) ?? [
+      { name: "public.orders", columns: [{ name: "order_id", typeName: "smallint" }] },
+      { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }] },
+    ]
+  )
+}
+
 function stubFetch(
   spec: typeof SPEC = SPEC,
   // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
   history: { runs: unknown[]; logs?: Record<string, unknown> } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
   // SRC-11: how Resume is answered (the default lifts the pause).
-  options: { discovered?: unknown[]; onRun?: (body: unknown) => Response; onResume?: () => Response } = {}
+  options: {
+    discovered?: unknown[]
+    /** SRC-13: a listing of objects that are not tables (topics, endpoints, collections); wins over `discovered` for the list. */
+    listing?: unknown[]
+    onRun?: (body: unknown) => Response
+    onResume?: () => Response
+  } = {}
 ): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -64,13 +83,27 @@ function stubFetch(
     if (url.includes("/debezium-properties")) {
       return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
     }
-    if (url.includes("/discover")) {
+    // SRC-13: names first (`/discovery/list`), the columns of one object when it is opened (`/discovery/preview`).
+    if (url.endsWith("/discovery/list") && method === "POST") {
       return json({
-        supported: true,
-        objects: options.discovered ?? [
-          { name: "public.orders", columns: [{ name: "order_id", typeName: "smallint" }] },
-          { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }] },
-        ],
+        kind: "list",
+        state: "done",
+        objects: options.listing ?? found(options).map((o) => ({ name: o.name, kind: "table" })),
+      })
+    }
+    if (url.endsWith("/discovery/preview") && method === "POST") {
+      // Only a table a test names in `discovered` has columns to read; the default listing's tables answer
+      // that the source cannot say, so a table saved or typed in a test keeps the typed key and cursor fields.
+      const object = ((options.discovered as Found[] | undefined) ?? []).find((o) => o.name === body.object)
+      if (!object) {
+        return json({ kind: "preview", state: "failed", object: body.object, errorClass: "failed", reason: "The source could not be read." })
+      }
+      return json({
+        kind: "preview",
+        state: "done",
+        object: object.name,
+        columns: object.columns.map((c) => ({ ...c, inferred: false })),
+        primaryKey: object.primaryKey ?? [],
       })
     }
     if (url.includes("/ingest/run")) return options.onRun ? options.onRun(body) : json({ runId: "0123456789abcdef" })
@@ -136,8 +169,11 @@ describe("ConnectorIngestPanel", () => {
     expect((screen.getByLabelText("Schema") as HTMLInputElement).value).toBe("public")
     fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
     await screen.findByText("public.orders")
-    const discover = calls.find((c) => c.url.includes("/discover"))
-    expect(discover?.url).toContain("/api/connectors/conn-northwind/discover?schema=public")
+    // SRC-13: the listing is the new route, asked for the schema in the field.
+    const discover = calls.find((c) => c.url.endsWith("/discovery/list"))
+    expect(discover?.url).toBe("/api/connectors/conn-northwind/discovery/list")
+    expect(discover?.method).toBe("POST")
+    expect(discover?.body).toEqual({ schema: "public" })
 
     fireEvent.click(screen.getByLabelText(/public\.orders/))
     const target = screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement
@@ -1157,7 +1193,9 @@ describe("ConnectorIngestPanel column choice", () => {
   async function openColumns() {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     await screen.findByText("1 tables found")
-    fireEvent.click(await screen.findByText(/^Columns/))
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
+    await screen.findAllByLabelText(/^Load column /)
   }
 
   it("lists the columns discovery found, ticked, and saves an unticked one as excluded", async () => {
@@ -1221,11 +1259,24 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(screen.getByText(/^Columns · 1 left out/)).toBeDefined()
   })
 
-  it("says to find the table first when its columns have not been listed", async () => {
+  // SRC-13 lifts SRC-11's limit that only a table found in this visit lists its columns: opening the section of a
+  // saved table reads them through the preview route.
+  it("reads the columns of a saved table when its section is opened, without finding it first", async () => {
+    const calls = stubFetch(saved({ excludedColumns: ["discount"] }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect(calls.some((c) => c.url.endsWith("/discovery/preview"))).toBe(false)
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    expect((await screen.findByLabelText("Load column region of public.orders")) as HTMLInputElement).toBeDefined()
+    expect(box("discount").checked).toBe(false)
+    const preview = calls.filter((c) => c.url.endsWith("/discovery/preview"))
+    expect(preview.map((c) => c.body)).toEqual([{ object: "public.orders" }])
+  })
+
+  it("says what failed when the columns of a saved table cannot be read, and keeps the left-out list", async () => {
     stubFetch(saved({ excludedColumns: ["discount"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    fireEvent.click(await screen.findByText(/^Columns/))
-    expect(screen.getByText(/Left out: discount\. Find this table above to list its columns\./)).toBeDefined()
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    expect(await screen.findByText(/Left out: discount\. Cannot read the columns · The source could not be read\./)).toBeDefined()
   })
 
   it.each(["mysql", "mssql"])("is offered for the %s driver too", async (driver) => {
@@ -1257,5 +1308,136 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(lockedColumns({ loadMode: "replace", primaryKey: ["id"], incrementalKey: "ts" }).size).toBe(0)
     expect([...lockedColumns({ loadMode: "history", primaryKey: ["id", "region"] }).keys()]).toEqual(["id", "region"])
     expect([...lockedColumns({ loadMode: "incremental", incrementalKey: " ts " }).keys()]).toEqual(["ts"])
+  })
+})
+
+/**
+ * SRC-13 in the panel: the Find flow for each type, Kafka's topic choice (D4), Oracle's add by name (D5), and the
+ * REST row note (D3).
+ */
+describe("ConnectorIngestPanel table discovery", () => {
+  const KAFKA = {
+    ...SPEC,
+    adapter: "kafka",
+    dial: {
+      bootstrapServers: ["k1.internal:9092"],
+      topic: "orders",
+      auth: { type: "none" },
+      groupId: "g",
+      microBatchSeconds: 30,
+    } as unknown as typeof SPEC.dial,
+    sourceObjects: [{ name: "orders", target: "kafka_orders" }],
+  }
+
+  it("lists a Kafka connector's topics, and picking one saves the dial's topic with no credential", async () => {
+    const calls = stubFetch(KAFKA, undefined, {
+      listing: [
+        { name: "orders", kind: "topic" },
+        { name: "payments", kind: "topic" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-kafka" connectorName="events" />)
+    expect((await screen.findByTestId("kafka-topic")).textContent).toBe("orders")
+    fireEvent.click(screen.getByRole("button", { name: "Find topics" }))
+    fireEvent.click(await screen.findByLabelText("payments"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")?.body as Record<string, unknown>
+    expect(put.dial).toEqual({ ...KAFKA.dial, topic: "payments" })
+    expect(put.sourceObjects).toEqual(KAFKA.sourceObjects)
+    // SEC-14: a topic is not a target, so nothing but the topic changes and no credential travels.
+    expect("credential" in put).toBe(false)
+    await waitFor(() => expect(screen.getByTestId("kafka-topic").textContent).toBe("payments"))
+  })
+
+  it("lists an Oracle connector's tables and also takes one added by name", async () => {
+    const calls = stubFetch(
+      { ...SPEC, dial: { ...SPEC.dial, driver: "oracle", user: "hr" } },
+      undefined,
+      { listing: [{ name: "HR.EMPLOYEES", kind: "table" }] }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-ora" connectorName="erp" />)
+    expect((await screen.findByLabelText<HTMLInputElement>("Schema")).value).toBe("HR")
+    fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
+    await screen.findByText("HR.EMPLOYEES")
+    expect(calls.find((c) => c.url.endsWith("/discovery/list"))?.body).toEqual({ schema: "HR" })
+
+    fireEvent.change(screen.getByLabelText("Add by name"), { target: { value: "SALES.ORDERS" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(screen.getByLabelText("Bronze table for SALES.ORDERS")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "SALES.ORDERS", target: "erp_orders", loadMode: "replace" },
+    ])
+  })
+
+  it("gives a SQL source no add-by-name field, since its list is the whole source", async () => {
+    stubFetch()
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    await screen.findByRole("button", { name: "Find tables" })
+    expect(screen.queryByLabelText("Add by name")).toBeNull()
+  })
+
+  it("loads the columns of a ticked SQL table once, to pick its key and cursor from", async () => {
+    const calls = stubFetch(SPEC, undefined, {
+      discovered: [{ name: "public.orders", columns: [{ name: "order_id", typeName: "integer" }], primaryKey: ["order_id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1))
+    fireEvent.change(await screen.findByLabelText("Load mode for public.orders"), { target: { value: "history" } })
+    await screen.findByLabelText("order_id is part of the key of public.orders")
+    expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1)
+  })
+
+  const REST = {
+    ...SPEC,
+    adapter: "rest",
+    dial: {
+      baseUrl: "https://api.example.com",
+      auth: { type: "bearer" },
+      pagination: { type: "none" },
+      endpoints: [{ path: "/orders" }, { path: "/users" }],
+    } as unknown as typeof SPEC.dial,
+  }
+
+  it("says a REST table saved before endpoints could be picked loads every endpoint, and not one that names an endpoint", async () => {
+    stubFetch({
+      ...REST,
+      sourceObjects: [
+        { name: "orders_table", target: "api_orders_table" },
+        { name: "/users", target: "api_users" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    await screen.findByLabelText("Bronze table for orders_table")
+    expect(screen.getAllByText(REST_OLD_OBJECT_NOTE).length).toBe(1)
+    expect(within(screen.getByLabelText("Bronze table for orders_table").closest("li") as HTMLElement).getByText(REST_OLD_OBJECT_NOTE)).toBeDefined()
+  })
+
+  it("picks a REST endpoint by its path from the list", async () => {
+    const calls = stubFetch(REST, undefined, {
+      listing: [
+        { name: "/orders", kind: "endpoint" },
+        { name: "/users", kind: "endpoint" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Find endpoints" }))
+    fireEvent.click(await screen.findByLabelText("/users"))
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "/users", target: "api_users", loadMode: "replace" },
+    ])
+  })
+
+  it("keeps the typed-name field and its explanation for a type that cannot list", async () => {
+    stubFetch({ ...SPEC, adapter: "sheets", dial: {} as unknown as typeof SPEC.dial })
+    render(<ConnectorIngestPanel connectorId="conn-sheets" connectorName="sheet" />)
+    expect(await screen.findByLabelText("Add by name")).toBeDefined()
+    expect(screen.getByText("This connector type cannot list its objects, so type each one as the source names it.")).toBeDefined()
+    expect(screen.queryByRole("button", { name: /^Find / })).toBeNull()
   })
 })

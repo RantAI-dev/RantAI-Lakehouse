@@ -498,10 +498,6 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/credential",
             axum::routing::put(connectors::set_credential),
         )
-        .route(
-            "/api/connectors/{id}/discover",
-            axum::routing::post(connectors::discover),
-        )
         // `SRC-13`: list and preview what a connector's source holds, for a
         // person with `connector:manage` on a connector of their own tenant (D11).
         // `{kind}` is `list` or `preview`; POST asks, GET reads the latest answer.

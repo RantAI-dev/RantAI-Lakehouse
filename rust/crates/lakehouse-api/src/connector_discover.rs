@@ -1,6 +1,11 @@
-//! `POST /api/connectors/{id}/discover` — list a connector's source
-//! objects (tables/columns) so a caller can pick what to ingest, without
-//! first hand-typing table names into an ingest spec.
+//! List a connector's source objects (tables/columns) so a caller can pick
+//! what to ingest, without first hand-typing table names into an ingest spec.
+//!
+//! `SRC-13`: the HTTP route `POST /api/connectors/{id}/discover` that served this
+//! was removed when the console moved to `discovery/{kind}`
+//! (`routes::connector_discovery`, `connector_listing`). What remains is used
+//! in-process by the assistant's `discover_source` tool through
+//! `routes::connectors::discover`; see that handler's doc comment.
 //!
 //! # The property this module exists to protect (WS3 item 14)
 //!
@@ -86,7 +91,7 @@ pub struct DiscoveredObject {
     pub primary_key: Vec<String>,
 }
 
-/// The response body for `POST /api/connectors/{id}/discover`. `reason`
+/// The response body of [`discover`]. `reason`
 /// is populated whenever `supported` is `false` — never left implicit.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
