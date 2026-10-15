@@ -113,8 +113,13 @@ merged; the planner checks this before writing its plan.
 Comments and commit messages are in English. Going around a choke point
 (`apiFetch`, `POLICY_TABLE`, `ApiJson`, `_assert_or_create_schema`, the
 allowlisted resolver) is allowed only with a comment at the site saying why.
-Known gap: `ApiError::Internal(err.to_string())` leaks upstream text in
-fourteen Phase-1 handlers — do not add another.
+Upstream error text never reaches a response (SEC-11, closed): the
+"fourteen Phase-1 handlers" gap is gone, and `lakehouse-clickhouse` has no
+`From<ChError> for ApiError` any more, so a `?` on a `ChError` in a route does
+not compile. Report an upstream error with `upstream_error` (the raw text to
+the log under a reference id, a fixed message and the id to the caller);
+`tests/sec11_guard.rs` fails when a route line puts an error's own text in a
+response, and an allowlist entry there needs a reason.
 
 ## Vocabulary you will see and must use correctly
 

@@ -11,6 +11,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 lettre = { workspace = true }
 
+[features]
+# `MappedResolver`, a permissive webhook resolver for other crates' tests.
+# Enabled only from `[dev-dependencies]`; never part of a service build.
+test-support = []
+
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true }

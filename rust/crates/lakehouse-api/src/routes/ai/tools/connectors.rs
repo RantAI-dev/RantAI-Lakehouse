@@ -76,6 +76,7 @@ pub(super) async fn create_connector(
     }
     let body = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
+        // Serialising our own `Value` (infallible in practice): not an upstream error.
         Err(err) => return json!({ "error": err.to_string() }),
     };
     let extension = principal.cloned().map(Extension);

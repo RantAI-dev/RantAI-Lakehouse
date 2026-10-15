@@ -75,12 +75,13 @@ use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
         match err {
-            GoldExportError::ClickHouse(e) => Self::from(e),
+            GoldExportError::ClickHouse(e) => upstream_error::ch_error(&upstream_error::DATABASE, &e),
             GoldExportError::UnsupportedColumn { .. }
             | GoldExportError::Batch(_)
             // The mart is over `GOLD_EXPORT_MAX_ROWS` — a well-formed
@@ -94,7 +95,11 @@ impl From<GoldExportError> for ApiError {
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
-            GoldExportError::Iceberg(e) => Self::Internal(e.to_string()),
+            // SEC-11: the Iceberg writer's text (catalog URLs, object keys)
+            // goes to the log under a reference, not into the body.
+            GoldExportError::Iceberg(e) => {
+                upstream_error::internal_error(&upstream_error::CATALOG, &e)
+            }
         }
     }
 }
@@ -157,7 +162,7 @@ async fn unchanged_since_last_export_reason(
 ) -> Result<Option<String>, ApiError> {
     let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let last_fp = last_export.as_ref().map(|e| e.content_fingerprint.as_str());
     let last_started_ms = last_export.as_ref().and_then(|e| e.started_at_ms);
     Ok(if_changed_skip_reason(
@@ -318,7 +323,7 @@ pub async fn export(
         mart_ident.as_str(),
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
 
     // DATA-10 / DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
     // skipped BEFORE the single-flight lock is taken (a skip holds
@@ -578,7 +583,7 @@ pub async fn exports(
 
     let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
 
     Ok(ApiJson(
         json!({ "mart": mart_ident.as_str(), "runs": runs }),
@@ -723,10 +728,10 @@ async fn publication_body(
     let last_changed_at =
         mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // DATA-10 review SHOULD-FIX 1: mart_content_fingerprint moved to gold_export_history
     let current_fingerprint = gold_export_history::mart_content_fingerprint(
         &state.clickhouse,
@@ -734,7 +739,7 @@ async fn publication_body(
         mart,
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let changed_since_export = compute_changed_since_export(
         current_fingerprint.as_deref(),
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
@@ -922,7 +927,7 @@ pub async fn set_publication(
         mart_ident.as_str(),
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     if !exists {
         return Err(ApiError::NotFound(format!(
             "mart {:?} does not exist in {}",
@@ -1185,8 +1190,10 @@ mod tests {
             "ClickHouse failure must surface as an error, never a silent skip"
         );
         assert!(
-            matches!(result.unwrap_err(), ApiError::Unprocessable(_)),
-            "ClickHouse read error is classified as Unprocessable"
+            // SEC-11: an unreachable engine is a 503 through `ch_error`, not
+            // the 422 the removed `From<ChError> for ApiError` produced.
+            matches!(result.unwrap_err(), ApiError::Unavailable(_)),
+            "an unreachable ClickHouse is classified as Unavailable"
         );
     }
 }

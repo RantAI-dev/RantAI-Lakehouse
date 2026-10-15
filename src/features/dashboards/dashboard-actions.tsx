@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Copy, Download, FileDown, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Share2, Trash2,
+  Check, Copy, Download, FileDown, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Save, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,20 +15,27 @@ import {
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { REFRESH_INTERVALS } from "./auto-refresh";
+import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, loading, fullscreen, autoSec,
-  onRefresh, onToggleFullscreen, onAutoSec, onRename, onShare, onExportPdf, onDuplicate, onDelete,
+  isDefault, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
 }: {
   readonly isDefault: boolean;
   readonly loading: boolean;
   readonly fullscreen: boolean;
+  /** The interval in force, in seconds ("0" = manual). */
   readonly autoSec: string;
+  /** The board's saved default, in seconds. */
+  readonly savedSec: string;
+  /** An editor whose choice differs from the saved default. */
+  readonly canSaveRefresh: boolean;
+  readonly savingRefresh: boolean;
   readonly onRefresh: () => void;
   readonly onToggleFullscreen: () => void;
   readonly onAutoSec: (value: string) => void;
+  readonly onSaveRefresh: () => void;
   readonly onRename: () => void;
   readonly onShare: () => void;
   readonly onExportPdf: () => void;
@@ -57,12 +64,23 @@ export function DashboardActionsMenu({
               the button carries a dot while an interval is on. */}
           <DropdownMenuGroup>
             <DropdownMenuGroupLabel>Auto-refresh</DropdownMenuGroupLabel>
-            {REFRESH_INTERVALS.map((opt) => (
-              <DropdownMenuItem key={opt.value} onClick={() => onAutoSec(opt.value)}>
-                <Check className={cn("size-4", autoSec === opt.value ? "opacity-100" : "opacity-0")} aria-hidden />
-                {opt.label}
+            {REFRESH_OPTIONS.map((opt) => {
+              const value = String(opt.seconds);
+              return (
+                // Stays open so the "Save as dashboard default" row that a
+                // new choice brings up is seen (product owner QA, BI-18·B).
+                <DropdownMenuItem key={value} closeOnClick={false} onClick={() => onAutoSec(value)}>
+                  <Check className={cn("size-4", autoSec === value ? "opacity-100" : "opacity-0")} aria-hidden />
+                  {opt.label}
+                  {savedSec === value && savedSec !== "0" ? <span className="ml-auto text-[11px] text-muted-foreground">default</span> : null}
+                </DropdownMenuItem>
+              );
+            })}
+            {canSaveRefresh ? (
+              <DropdownMenuItem onClick={onSaveRefresh} disabled={savingRefresh}>
+                <Save className="size-4" /> {savingRefresh ? "Saving…" : "Save as dashboard default"}
               </DropdownMenuItem>
-            ))}
+            ) : null}
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
