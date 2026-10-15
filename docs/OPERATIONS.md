@@ -272,9 +272,11 @@ partition synthetic load vs. a 1-file/partition control). This is a real
 operational requirement, not a nicety, for any deployment taking CDC-rate
 or dlt-batch writes into Bronze at meaningful volume — see ADR 0009. It
 does not affect `lakehouse-api`'s own boot or any of its existing routes;
-`dagster/dispar_orchestrate/maintenance.py`'s `expire_snapshots` chain is
-independent of Trino and keeps running either way (it does not compact
-data files, only aged snapshot/manifest metadata).
+`dagster/dispar_orchestrate/maintenance.py`'s snapshot expiry chain
+(default 7-day retention floor, OPS-1) requires Trino because ClickHouse 26.8
+refuses `expire_snapshots` on catalog-backed tables. If the `trino` profile is
+down or unconfigured, snapshot expiry logs a warning and skips cleanly, leaving
+snapshots unexpired without failing the maintenance job.
 
 ### Debezium Server (opt-in, `dagster` profile — P5, CDC)
 

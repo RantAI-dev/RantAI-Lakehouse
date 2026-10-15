@@ -112,7 +112,32 @@ any Rust or console change.
 
 ## 7. Handoff
 
-(developer)
+- **Branch**: `feat/ops-1-default-snapshot-retention`
+- **Base**: Merged `origin/main` (commit `0a97abfe`) via merge commit `146b1396`.
+- **Commits**:
+  - `2632cecb`: `feat(dagster): default snapshot retention to 7d (OPS-1)`
+- **T1 Implementation**:
+  - `dagster/dispar_orchestrate/maintenance.py`: Added `DEFAULT_SNAPSHOT_RETENTION = "7d"`. Updated `_expire_snapshots_result` so tables without a governance policy or with `snapshotsToKeep: None` call Trino:
+    `ALTER TABLE iceberg.{namespace}."{name}" EXECUTE expire_snapshots(retention_threshold => '7d')`
+  - Handled Trino error classifications: `TrinoUnavailableError` -> skip with logged warning; `TrinoQueryError` -> refusal; 5xx/unreachable policy fetch -> skip cleanly without attempting default expiry; 401/403 -> fail whole run.
+  - Tests in `test_maintenance.py`: Added 4 tests verifying default 7-day retention expiry, refusal recording, Trino unreachable skip, and explicit `snapshotsToKeep` retention.
+- **Verification Totals**:
+  - `dispar_orchestrate/test_maintenance.py`: **43 passed in 1.28s**.
+  - Mutation check: Mutated `DEFAULT_SNAPSHOT_RETENTION = "7d"` to `"8d"`. `test_table_without_policy_expires_snapshots_older_than_seven_days` failed with `AssertionError: 'default retention 8d ...' != 'default retention 7d ...'`. Restored to `"7d"`; test passed.
+  - Full suite `dispar_orchestrate -q`: **1054 passed, 13 failed**. All 13 failures are pre-existing on `main` in `test_history_write_measurement.py` due to Python 3.14 / SQLAlchemy / `pyiceberg.catalog.sql.SqlCatalog` typing compatibility.
+- **T2 Measurement Status**:
+  - Halted per instruction: *"If T2 cannot be done as written (no seed gives 10 snapshots, or the Trino override would need an edit to docker-compose.yml), commit and push T1, then stop and report exactly what blocked T2."*
+  - **Blocker 1 (No 10-snapshot seed)**: No existing seed in the repository produces 10 snapshots against a Bronze table. Existing seeds (`g3a-source-init`, `g4-source-init`, `g6-source-init`) write once and yield 1 snapshot.
+  - **Blocker 2 (Trino min-retention override requires compose change)**: `docker-compose.yml:trino` writes `/etc/trino/catalog/iceberg.properties` via an inline shell heredoc in `command:`. Injecting `iceberg.expire-snapshots.min-retention=0s` cannot be done via environment variables and would require modifying `docker-compose.yml` (forbidden per Section 5: *"Compose changes (the measurement override lives under ops/ and is not wired into docker-compose.yml)"*).
+- **T3 Documentation**:
+  - `README.md` lines 459-470 rewritten to reflect default 7-day snapshot retention floor via Trino.
+  - `docs/adr/0004-bronze-naming-partitioning-retention.md` updated with `## Addendum (2026-10-15, OPS-1)`.
+  - `docs/OPERATIONS.md` updated in the maintenance section.
+  - `CHANGELOG.md` updated under `## [Unreleased]` -> `### Added`.
+- **Pre-commit / Hygiene Checks**:
+  - `check_intra_package_imports.py`: OK.
+  - `check_bare_iceberg_count.py`: OK.
+  - Gitleaks scan: Clean (0 leaks found).
 
 ## 8. Review
 
