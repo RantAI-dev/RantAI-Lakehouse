@@ -27,7 +27,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
-use crate::embed_access::{self, EmbedAccess};
+use crate::embed_access::{self, EmbedAccess, WithdrawnToken};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
@@ -456,7 +456,14 @@ fn new_public_token() -> String {
 /// and `delete_board` on a 10-chart board issued ~96 DDL statements (~2s).
 /// Caching the *outcome* here (not just documenting the option) makes
 /// repeat calls free, matching the TS.
+#[cfg(not(test))]
 static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+#[cfg(test)]
+static BI_TABLE_ENSURED: tokio::sync::RwLock<bool> = tokio::sync::RwLock::const_new(false);
+
+#[cfg(test)]
+static TEST_DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Create the `console` database and `bi_chart`/`bi_board` tables if they do
 /// not already exist (idempotent). Ports `ensureBiTable` in `bi-store.ts`.
@@ -471,10 +478,25 @@ static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::cons
 ///
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_bi_table(ch: &ChClient) -> Result<(), ChError> {
-    BI_TABLE_ENSURED
-        .get_or_try_init(|| ensure_bi_table_uncached(ch))
-        .await
-        .map(drop)
+    #[cfg(not(test))]
+    {
+        BI_TABLE_ENSURED
+            .get_or_try_init(|| ensure_bi_table_uncached(ch))
+            .await
+            .map(drop)
+    }
+    #[cfg(test)]
+    {
+        let ensured = *BI_TABLE_ENSURED.read().await;
+        if !ensured {
+            let mut guard = BI_TABLE_ENSURED.write().await;
+            if !*guard {
+                ensure_bi_table_uncached(ch).await?;
+                *guard = true;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The actual DDL bootstrap, run at most once per process by
@@ -549,24 +571,23 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
-    // SEC-12: signed-embed access state kept with the board. `revoked_before`
-    // is a Unix-seconds instant ("withdraw all"), the two JSON columns hold
-    // the individually withdrawn tokens and the sites allowed to frame the
-    // embed (`crate::embed_access`). Constant defaults, like the columns
-    // above, so a row written before they existed reads as "nothing
-    // withdrawn, no site may frame".
+    // SEC-12 (PR #105 review SHOULD-FIX 1): embed access state is stored in
+    // an append-only event table instead of the `bi_board` row. Because
+    // dashboard saves (`save_board_patch`) perform full-row INSERTs into a
+    // ReplacingMergeTree, keeping embed state on the board row created a race
+    // where an unrelated edit could overwrite and bring back a withdrawn
+    // token. In this table, state is written only by INSERT and read by
+    // aggregation:
+    // - `revoked_before` = `max(revoked_before)` over `revoke_all` events;
+    // - withdrawn tokens = `jti` with `max(exp)` over unexpired `withdraw` events;
+    // - allowed origins = newest `origins` event (`argMax` on `at`).
     ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_before UInt64 DEFAULT 0",
-        None,
-    )
-    .await?;
-    ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_jti_json String DEFAULT '[]'",
-        None,
-    )
-    .await?;
-    ch.exec(
-        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_origins_json String DEFAULT '[]'",
+        "CREATE TABLE IF NOT EXISTS console.bi_board_embed_event (\n\
+           board_id String, kind LowCardinality(String),\n\
+           revoked_before UInt64 DEFAULT 0, jti String DEFAULT '',\n\
+           exp UInt64 DEFAULT 0, origins_json String DEFAULT '[]',\n\
+           at DateTime64(6) DEFAULT now64(6)\n\
+         ) ENGINE = MergeTree ORDER BY (board_id, at)",
         None,
     )
     .await?;
@@ -604,7 +625,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -659,11 +680,7 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
         folder_id: Some(row_str(row, "folder_id").to_owned()),
-        embed_access: EmbedAccess::from_stored(
-            row_u64(row, "embed_revoked_before"),
-            row_str(row, "embed_revoked_jti_json"),
-            row_str(row, "embed_origins_json"),
-        ),
+        embed_access: EmbedAccess::default(),
     }
 }
 
@@ -701,7 +718,11 @@ pub async fn get_board(ch: &ChClient, id: &str) -> Result<Option<Board>, ChError
         SqlLiteral::from(id)
     );
     let rows = ch.rows(&sql, None).await?;
-    Ok(rows.first().map(row_to_board))
+    let Some(mut board) = rows.first().map(row_to_board) else {
+        return Ok(None);
+    };
+    board.embed_access = get_board_embed_access(ch, &board.id).await?;
+    Ok(Some(board))
 }
 
 /// Create a new board. Ports `createBoard`.
@@ -763,20 +784,12 @@ async fn upsert_board(
     public_token: &str,
     embed_enabled: bool,
     folder_id: &str,
-    embed_access: &EmbedAccess,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
-    // Every save is a full-row INSERT, so the embed access state is written
-    // back on every save (carried forward from the board that was read), or
-    // an unrelated edit such as a rename would reset a withdrawal (SEC-12).
-    let withdrawn_json =
-        serde_json::to_string(&embed_access.withdrawn).unwrap_or_else(|_| "[]".to_owned());
-    let origins_json =
-        serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -786,9 +799,6 @@ async fn upsert_board(
         SqlLiteral::from(public_token),
         i32::from(embed_enabled),
         SqlLiteral::from(folder_id),
-        embed_access.revoked_before,
-        SqlLiteral::from(withdrawn_json),
-        SqlLiteral::from(origins_json),
     );
     ch.exec(&sql, None).await
 }
@@ -833,7 +843,6 @@ async fn save_board_patch(
     // folder must carry the current one forward or the board would fall
     // back to the root.
     let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
-    let embed_access = patch.embed_access.unwrap_or(&board.embed_access);
     upsert_board(
         ch,
         &board.id,
@@ -845,7 +854,6 @@ async fn save_board_patch(
         public_token,
         embed_enabled,
         folder_id,
-        embed_access,
     )
     .await
 }
@@ -862,7 +870,6 @@ struct BoardPatch<'a> {
     public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
-    embed_access: Option<&'a EmbedAccess>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -1072,6 +1079,123 @@ pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bo
     Ok(enable)
 }
 
+async fn board_exists(ch: &ChClient, id: &str) -> Result<bool, ChError> {
+    let sql = format!(
+        "SELECT 1 FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={} LIMIT 1",
+        SqlLiteral::from(id)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(!rows.is_empty())
+}
+
+const DEFAULT_CLOCK_TOLERANCE_SECS: u64 = 60;
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Map rows returned by the aggregate query on `console.bi_board_embed_event`
+/// into an [`EmbedAccess`].
+///
+/// Aggregation rules (PR #105 review SHOULD-FIX 1):
+/// - `revoked_before`: maximum across all `revoke_all` events;
+/// - `origins`: newest `origins` event;
+/// - `withdrawn`: union across distinct `jti` with maximum `exp`, dropping
+///   tokens that have expired (`exp + tolerance < now`) or are covered by
+///   `revoked_before` (`exp <= revoked_before`).
+pub(crate) fn embed_access_from_aggregate_rows(
+    rows: &[serde_json::Map<String, Value>],
+    now_unix_seconds: u64,
+    tolerance_secs: u64,
+) -> EmbedAccess {
+    let mut revoked_before: u64 = 0;
+    let mut origins = Vec::new();
+    let mut withdrawn_map: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let kind = row_str(row, "kind");
+        if kind == "revoke_all" {
+            let rb = row_u64(row, "revoked_before");
+            if rb > revoked_before {
+                revoked_before = rb;
+            }
+        } else if kind == "origins" {
+            let origins_json = row_str(row, "origins_json").trim();
+            if let Ok(list) = serde_json::from_str::<Vec<String>>(origins_json) {
+                origins = list;
+            }
+        } else if kind == "withdraw" {
+            let jti = row_str(row, "jti");
+            let exp = row_u64(row, "exp");
+            if !jti.is_empty() {
+                withdrawn_map
+                    .entry(jti.to_owned())
+                    .and_modify(|e| *e = (*e).max(exp))
+                    .or_insert(exp);
+            }
+        }
+    }
+
+    let withdrawn = withdrawn_map
+        .into_iter()
+        .filter(|(_, exp)| {
+            exp.saturating_add(tolerance_secs) >= now_unix_seconds && *exp > revoked_before
+        })
+        .map(|(jti, exp)| WithdrawnToken { jti, exp })
+        .collect();
+
+    EmbedAccess {
+        revoked_before,
+        withdrawn,
+        origins,
+    }
+}
+
+/// Read the current embed access state for a board by aggregating its
+/// append-only embed events (`SEC-12`, PR #105 review SHOULD-FIX 1).
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn get_board_embed_access(ch: &ChClient, board_id: &str) -> Result<EmbedAccess, ChError> {
+    get_board_embed_access_at(
+        ch,
+        board_id,
+        current_unix_timestamp(),
+        DEFAULT_CLOCK_TOLERANCE_SECS,
+    )
+    .await
+}
+
+/// Read the current embed access state for a board at a specific instant and tolerance.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn get_board_embed_access_at(
+    ch: &ChClient,
+    board_id: &str,
+    now_unix_seconds: u64,
+    tolerance_secs: u64,
+) -> Result<EmbedAccess, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT kind, max(revoked_before) AS revoked_before, jti, max(exp) AS exp, argMax(origins_json, at) AS origins_json \
+         FROM console.bi_board_embed_event WHERE board_id={} GROUP BY kind, jti",
+        SqlLiteral::from(board_id)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(embed_access_from_aggregate_rows(
+        &rows,
+        now_unix_seconds,
+        tolerance_secs,
+    ))
+}
+
 /// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
 /// Returns the normalised list that was stored.
 ///
@@ -1087,22 +1211,16 @@ pub async fn set_board_embed_origins(
 ) -> Result<Vec<String>, BiError> {
     let origins = embed_access::validate_origins(origins).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let access = EmbedAccess {
-        origins: origins.clone(),
-        ..board.embed_access.clone()
-    };
-    save_board_patch(
-        ch,
-        &board,
-        BoardPatch {
-            embed_access: Some(&access),
-            ..Default::default()
-        },
-    )
-    .await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let origins_json = serde_json::to_string(&origins).unwrap_or_else(|_| "[]".to_owned());
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json) VALUES ({}, 'origins', {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(origins_json),
+    );
+    ch.exec(&sql, None).await?;
     Ok(origins)
 }
 
@@ -1120,21 +1238,16 @@ pub async fn revoke_all_embed_tokens(
     now_unix_seconds: u64,
 ) -> Result<u64, BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let access = board.embed_access.clone().revoke_all(now_unix_seconds);
-    let revoked_before = access.revoked_before;
-    save_board_patch(
-        ch,
-        &board,
-        BoardPatch {
-            embed_access: Some(&access),
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok(revoked_before)
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, revoked_before) VALUES ({}, 'revoke_all', {})",
+        SqlLiteral::from(id),
+        now_unix_seconds,
+    );
+    ch.exec(&sql, None).await?;
+    Ok(now_unix_seconds)
 }
 
 /// "Withdraw one embed token" for a board (`SEC-12`): a token carrying
@@ -1155,23 +1268,29 @@ pub async fn withdraw_embed_token(
     tolerance_secs: u64,
 ) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let access = board
-        .embed_access
-        .clone()
-        .withdraw_token(jti, exp, now_unix_seconds, tolerance_secs)
-        .map_err(BiError::Validation)?;
-    save_board_patch(
-        ch,
-        &board,
-        BoardPatch {
-            embed_access: Some(&access),
-            ..Default::default()
-        },
-    )
-    .await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    // The cap MAX_WITHDRAWN_TOKENS is a size bound on unexpired distinct
+    // tokens, not a security property. Checking it before INSERT can be
+    // raced by two concurrent requests, which is acceptable since a small
+    // temporary overshoot does not compromise security.
+    let access = get_board_embed_access_at(ch, id, now_unix_seconds, tolerance_secs).await?;
+    if !access.withdrawn.iter().any(|w| w.jti == jti)
+        && access.withdrawn.len() >= embed_access::MAX_WITHDRAWN_TOKENS
+    {
+        return Err(BiError::Validation(
+            "too many tokens are withdrawn one by one for this dashboard; withdraw all of them instead."
+                .to_owned(),
+        ));
+    }
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, jti, exp) VALUES ({}, 'withdraw', {}, {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(jti),
+        exp,
+    );
+    ch.exec(&sql, None).await?;
     Ok(())
 }
 
@@ -1192,7 +1311,11 @@ pub async fn get_board_by_token(ch: &ChClient, token: &str) -> Result<Option<Boa
         SqlLiteral::from(t)
     );
     let rows = ch.rows(&sql, None).await?;
-    Ok(rows.first().map(row_to_board))
+    let Some(mut board) = rows.first().map(row_to_board) else {
+        return Ok(None);
+    };
+    board.embed_access = get_board_embed_access(ch, &board.id).await?;
+    Ok(Some(board))
 }
 
 /// Soft-delete a board (tombstone), then soft-delete every chart on it.
@@ -2562,6 +2685,9 @@ mod tests {
     /// execution order).
     #[tokio::test]
     async fn ensure_bi_table_runs_ddl_at_most_once_per_process() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+        *BI_TABLE_ENSURED.write().await = false;
+
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(""))
@@ -2575,12 +2701,11 @@ mod tests {
         // `ADD COLUMN` statements added for the dashboard list page, plus
         // dashboard SQL sources (`bi_source`) and folders (`bi_folder` +
         // `bi_board.folder_id`) joining the bootstrap; the property under
-        // test — every later call is free — is unchanged. 16 = those 13 plus
-        // the three SEC-12 `bi_board` columns (`embed_revoked_before`,
-        // `embed_revoked_jti_json`, `embed_origins_json`).
+        // test — every later call is free — is unchanged. 14 = those 13 plus
+        // the append-only SEC-12 event table (`console.bi_board_embed_event`).
         assert_eq!(
-            first_call_requests, 16,
-            "first call should issue all 16 DDL statements"
+            first_call_requests, 14,
+            "first call should issue all 14 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -2905,34 +3030,266 @@ mod tests {
         assert_eq!(parsed.has_year, Some(true));
     }
 
-    /// SEC-12: the three embed columns come back as the board's access state
-    /// (a `UInt64` arrives quoted), a row from before they existed reads as
-    /// "nothing withdrawn, no site may frame it", and none of it is
-    /// serialised into a dashboard listing.
-    #[test]
-    fn row_to_board_reads_the_embed_access_columns_and_does_not_serialise_them() {
-        let row = serde_json::json!({
-            "id": "b_1", "name": "Dash", "embed_enabled": "1",
-            "embed_revoked_before": "1700000000",
-            "embed_revoked_jti_json": "[{\"jti\":\"j1\",\"exp\":1700003600}]",
-            "embed_origins_json": "[\"https://app.customer.example\"]",
-        });
-        let board = row_to_board(row.as_object().unwrap());
-        assert_eq!(board.embed_access.revoked_before, 1_700_000_000);
-        assert_eq!(board.embed_access.withdrawn.len(), 1);
-        assert_eq!(
-            board.embed_access.origins,
-            vec!["https://app.customer.example"]
-        );
-        let json = serde_json::to_string(&board).unwrap();
-        assert!(
-            !json.contains("j1") && !json.contains("customer.example"),
-            "{json}"
-        );
+    fn sample_aggregate_event_rows() -> Vec<serde_json::Map<String, serde_json::Value>> {
+        vec![
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699990000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699995000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699992000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "origins",
+                "origins_json": "[\"https://old.customer.example\"]"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "origins",
+                "origins_json": "[\"https://new.customer.example\", \"https://app.customer.example\"]"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": "1700000500"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": "1700000800"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_2",
+                "exp": "1700001000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            // Expired token (exp + tolerance < now): must be dropped.
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_expired",
+                "exp": "1699999000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            // Token whose exp <= revoked_before: must be dropped.
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_covered",
+                "exp": "1699995000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ]
+    }
 
-        let old_row = serde_json::json!({ "id": "b_old", "name": "Old" });
-        let old = row_to_board(old_row.as_object().unwrap());
-        assert_eq!(old.embed_access, EmbedAccess::default());
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (b):
+    /// the aggregate read maps rows from `console.bi_board_embed_event` to
+    /// `EmbedAccess` (max `revoked_before`, union of `jti` with max `exp`,
+    /// newest `origins`, and expired `jti` dropped).
+    ///
+    /// Replaces the former `row_to_board_reads_the_embed_access_columns_and_does_not_serialise_them`
+    /// because embed access columns were removed from `console.bi_board`.
+    #[test]
+    fn aggregate_read_maps_rows_to_embed_access() {
+        let now = 1_700_000_000;
+        let tolerance = 60;
+
+        let rows = sample_aggregate_event_rows();
+
+        let access = embed_access_from_aggregate_rows(&rows, now, tolerance);
+        assert_eq!(access.revoked_before, 1_699_995_000, "max revoked_before");
+        assert_eq!(
+            access.origins,
+            vec![
+                "https://new.customer.example".to_owned(),
+                "https://app.customer.example".to_owned()
+            ],
+            "newest origins"
+        );
+        assert_eq!(access.withdrawn.len(), 2, "union of unexpired jtis");
+        assert_eq!(access.withdrawn[0].jti, "tok_1");
+        assert_eq!(access.withdrawn[0].exp, 1_700_000_800, "max exp for tok_1");
+        assert_eq!(access.withdrawn[1].jti, "tok_2");
+        assert_eq!(access.withdrawn[1].exp, 1_700_001_000);
+
+        // Empty rows aggregate to EmbedAccess::default()
+        let empty_access = embed_access_from_aggregate_rows(&[], now, tolerance);
+        assert_eq!(empty_access, EmbedAccess::default());
+
+        // row_to_board leaves embed_access as default, and does not serialize it
+        let board_row = serde_json::json!({
+            "id": "b_1", "name": "Dash", "embed_enabled": "1",
+            "folder_id": "f_1"
+        });
+        let board = row_to_board(board_row.as_object().unwrap());
+        assert_eq!(board.embed_access, EmbedAccess::default());
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(!json.contains("embed_access") && !json.contains("embedAccess"));
+    }
+
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (a):
+    /// a dashboard save's SQL contains none of the embed columns.
+    #[tokio::test]
+    async fn dashboard_save_sql_contains_none_of_the_embed_columns() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let layout = LayoutMap::new();
+        let filters = Vec::new();
+        upsert_board(
+            &ch, "b_test", "Title", "Desc", "User", &layout, &filters, "tok_pub", true, "f_root",
+        )
+        .await
+        .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let save_req = reqs
+            .iter()
+            .find(|r| {
+                let sql = String::from_utf8_lossy(&r.body);
+                sql.starts_with("INSERT INTO console.bi_board")
+            })
+            .expect("INSERT INTO console.bi_board issued");
+
+        let body = String::from_utf8_lossy(&save_req.body);
+        assert!(
+            !body.contains("embed_revoked_before"),
+            "must not contain embed_revoked_before: {body}"
+        );
+        assert!(
+            !body.contains("embed_revoked_jti_json"),
+            "must not contain embed_revoked_jti_json: {body}"
+        );
+        assert!(
+            !body.contains("embed_origins_json"),
+            "must not contain embed_origins_json: {body}"
+        );
+    }
+
+    struct MockBiCh;
+    impl wiremock::Respond for MockBiCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body);
+            if sql.contains("FROM console.bi_board FINAL") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [],
+                    "data": [{"1": 1}],
+                    "rows": 1
+                }));
+            }
+            if sql.contains("FROM console.bi_board_embed_event") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [],
+                    "data": [],
+                    "rows": 0
+                }));
+            }
+            ResponseTemplate::new(200).set_body_string("Ok.\n")
+        }
+    }
+
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (c):
+    /// each of the three writers issues an INSERT into the event table and
+    /// no INSERT into `bi_board`.
+    #[tokio::test]
+    async fn embed_writers_issue_insert_into_event_table_and_no_insert_into_bi_board() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MockBiCh)
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let origins = vec!["https://app.customer.example".to_owned()];
+        set_board_embed_origins(&ch, "b_1", &origins).await.unwrap();
+        revoke_all_embed_tokens(&ch, "b_1", 1_700_000_000)
+            .await
+            .unwrap();
+        withdraw_embed_token(&ch, "b_1", "jti_123", 1_700_003_600, 1_700_000_000, 60)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let insert_statements: Vec<String> = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT INTO"))
+            .collect();
+
+        assert_eq!(
+            insert_statements.len(),
+            3,
+            "expected 3 insert statements, got {insert_statements:?}"
+        );
+        for stmt in &insert_statements {
+            assert!(
+                stmt.starts_with("INSERT INTO console.bi_board_embed_event"),
+                "writer must insert into event table, not bi_board: {stmt}"
+            );
+            assert!(
+                !stmt.contains("INSERT INTO console.bi_board "),
+                "writer must not insert into bi_board: {stmt}"
+            );
+        }
+
+        // Verify specific writer events
+        assert!(
+            insert_statements[0].contains("'origins'")
+                && insert_statements[0].contains("https://app.customer.example"),
+            "origins insert: {}",
+            insert_statements[0]
+        );
+        assert!(
+            insert_statements[1].contains("'revoke_all'")
+                && insert_statements[1].contains("1700000000"),
+            "revoke_all insert: {}",
+            insert_statements[1]
+        );
+        assert!(
+            insert_statements[2].contains("'withdraw'")
+                && insert_statements[2].contains("'jti_123'")
+                && insert_statements[2].contains("1700003600"),
+            "withdraw insert: {}",
+            insert_statements[2]
+        );
     }
 
     /// `Board`'s JSON wire shape must match the TS `Board` type
