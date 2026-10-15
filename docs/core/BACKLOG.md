@@ -119,7 +119,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
 | `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Todo |  | `README.md` |
-| `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. **Waits for `DATA-10`** | Build | P2 | In Progress | #164 | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
+| `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. **Waits for `DATA-10`** | Build | P2 | Done | #164 | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
 | `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Done | #156 | Slice B review, gold-publish plan |
 | `DATA-6` | Feature | A "latest copy only" table for outside readers of published tables. **Waits for `DATA-2`** | Build | P2 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-6.md) |
 | `SEC-4` | Task | Human security review | Administration & Security | P2 | Todo |  | PRODUCT §4 blocker 3 |
@@ -260,6 +260,7 @@ set by the product owner and are left empty until they are.
 | `SEC-12` | 2026-10-10 | 2026-10-15 | |
 | `SEC-6` | | 2026-10-15 | |
 | `SEC-29` | | 2026-10-15 | |
+| `DATA-2` | 2026-10-14 | 2026-10-15 | |
 
 ## Decide
 
