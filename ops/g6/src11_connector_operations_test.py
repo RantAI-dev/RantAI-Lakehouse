@@ -362,6 +362,25 @@ def wait_dagster(run_id: str, want: str, what: str, timeout_s: int = RUN_TIMEOUT
     poll(f"{what}: run {run_id} {want}", check, timeout_s, interval_s=3.0)
 
 
+def wait_dagster_terminal(run_id: str, what: str, timeout_s: int = RUN_TIMEOUT_S) -> str:
+    """Poll Dagster until the run has any final status and return it.
+
+    SRC-11 review 3 SHOULD-FIX 1: a run record can end (`paused`) a moment
+    before Dagster itself marks the run finished, and the API's
+    one-run-at-a-time guard (correctly) refuses a launch while Dagster still
+    counts the run as running. A step that launches the next run waits for
+    this first; the product's guard is not touched."""
+    final = {"SUCCESS", "FAILURE", "CANCELED"}
+    seen: dict[str, str] = {}
+
+    def check() -> bool:
+        seen["status"] = dagster_status(run_id)
+        return seen["status"] in final
+
+    poll(f"{what}: Dagster run {run_id} to reach a final status", check, timeout_s, interval_s=3.0)
+    return seen["status"]
+
+
 def launch_through_dagster(connector_id: str) -> str:
     """Launch `ingest_job` for `connector_id` through Dagster's GraphQL
     `launchRun`, the way `lakehouse-dagster`'s `launch_run_with_config` does
@@ -646,6 +665,11 @@ def step_paused_does_not_load(state: dict, receiver: src17.Receiver) -> None:
         )
     if record["trigger"] != "other" or record["rowsLoaded"] != 0:
         raise OpsGateFailure(f"expected trigger 'other' and 0 rows for a run from Dagster's own screen, got {record!r}")
+    # SRC-11 review 3 SHOULD-FIX 1: the record ended `paused`, but Dagster may
+    # not have closed the run yet; step c's resume launches the next run and
+    # the API refuses it with a 409 while this one still counts as running.
+    final = wait_dagster_terminal(run_id, "d. the paused run")
+    say(f"d. Dagster run {run_id} is final ({final})")
     rows = bronze_rows(bronze)
     if rows != state["rows"]:
         raise OpsGateFailure(f"bronze.{bronze} has {rows} rows, it had {state['rows']} before the run: the paused connector loaded")
