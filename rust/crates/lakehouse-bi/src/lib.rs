@@ -28,6 +28,7 @@ pub mod shape;
 pub mod sources;
 pub mod specs;
 pub mod store;
+pub mod style;
 pub mod tables;
 pub mod trash;
 pub mod versions;

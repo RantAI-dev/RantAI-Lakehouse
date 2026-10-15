@@ -357,6 +357,11 @@ pub struct ChartInput {
     /// (`BI-6`), flat on the wire and all absent on a chart saved before.
     #[serde(flatten)]
     pub shape: ShapeFields,
+    /// Number and date formats, colours, axes, labels, notes, tooltip fields
+    /// and conditional colours (`BI-17` part A), flat on the wire and all
+    /// absent on a chart saved before they existed.
+    #[serde(flatten)]
+    pub style: crate::style::StyleFields,
 }
 
 impl ChartInput {
@@ -2426,6 +2431,7 @@ fn empty_chart_input() -> ChartInput {
         grain: None,
         tables: TableFields::default(),
         shape: ShapeFields::default(),
+        style: crate::style::StyleFields::default(),
     }
 }
 
@@ -2541,6 +2547,11 @@ fn kpi_measure(input: &ChartInput, column: &str) -> MeasureList {
 
 /// Assemble the `kpi`/`gauge` branch of `specFromInput` (single number, no
 /// dimension).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line assembly of the stored definition and the spec; the style \
+              copy of BI-17 part A pushed it one line over"
+)]
 fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChartSpec, BiError> {
     let KpiCtx {
         title,
@@ -2602,6 +2613,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
             ..TableFields::default()
         },
         shape: stored_shape(input),
+        style: input.style.clone(),
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
@@ -2734,6 +2746,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         grain: None,
         tables: TableFields::default(),
         shape: ShapeFields::default(),
+        style: crate::style::StyleFields::default(),
     };
     let spec = ChartSpec {
         id: new_id,
@@ -3195,6 +3208,11 @@ fn spec_from_chart_input(
     validate_chart_shape(kind, &dimension, &measures, &breakdown, &cols)?;
     validate_point_columns(&geo, &dimension, &measures, &cols)?;
     tables::check_settings(&input.tables, &cols).map_err(BiError::Validation)?;
+    // A chart whose columns a parameter switches names them as `{param}`, so
+    // only the shape of its style was checked (`spec_before_relation`).
+    if !input.uses_params() {
+        crate::style::check_style_names(input, &cols).map_err(BiError::Validation)?;
+    }
     if let Some(g) = grain {
         // BI-9: the dimension's column type decides whether the grain fits.
         g.validate(kind, kinds.get(&dimension).copied())
@@ -3234,6 +3252,7 @@ fn spec_from_chart_input(
             ..TableFields::default()
         },
         shape: stored_shape(input),
+        style: input.style.clone(),
     };
 
     let sql = if is_point_kind(kind) {
@@ -3552,6 +3571,10 @@ fn spec_before_relation(
     let common = derive_common_fields(input, id)?;
     let geo = geo_fields(common.kind, input)?;
     tables::check_kind_fields(&input.tables, common.kind).map_err(BiError::Validation)?;
+    // BI-17 part A: which style fields the kind takes and the shape of each;
+    // the names they use are checked once the relation's columns are known.
+    crate::style::check_style(input).map_err(BiError::Validation)?;
+    crate::params::check_reference_lines(input).map_err(BiError::Validation)?;
     shape::check_kind_fields(
         &input.measures,
         &input.shape,
@@ -3766,7 +3789,7 @@ fn spec_from_param_chart(
             .reference_lines
             .iter()
             .flatten()
-            .any(|l| matches!(&l.value, crate::params::LineValue::Param(p) if p.param == name));
+            .any(|l| l.params().any(|p| p.param == name));
         let as_limit =
             matches!(&input.limit, Some(crate::params::Limit::Param(p)) if p.param == name);
         if (in_lines || as_limit) && found.def.ty != ParamType::Number {
@@ -4361,6 +4384,7 @@ fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> C
         grain: grain.map(|g| g.as_str().to_owned()),
         tables: input.tables.clone(),
         shape: stored_shape(input),
+        style: input.style.clone(),
     }
 }
 
@@ -4441,6 +4465,7 @@ fn spec_from_groupings_input(
             ..TableFields::default()
         },
         shape: stored_shape(input),
+        style: input.style.clone(),
     };
     let y = ChartY::Multi(ctx.measures.clone());
     let (source, board, has_year, created_by) = (
@@ -4703,6 +4728,7 @@ impl StoredChartSpec {
                 grain: None,
                 tables: TableFields::default(),
                 shape: ShapeFields::default(),
+                style: crate::style::StyleFields::default(),
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -5866,6 +5892,45 @@ mod tests {
             spec.spec.sql.contains("GROUP BY place"),
             "{}",
             spec.spec.sql
+        );
+    }
+
+    /// `BI-17` part A (plan T2): the style is checked where the rest of the
+    /// definition is, kept in the stored definition, and a name it uses must
+    /// be one the chart returns.
+    #[test]
+    fn a_chart_keeps_its_style_and_a_style_naming_a_missing_column_is_refused() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "format": { "style": "compact", "decimals": 1 },
+            "valueFormats": { "visitors": { "style": "percent" } },
+            "referenceLines": [{ "kind": "average" }],
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.def.style.format.as_ref().map(|f| f.decimals),
+            Some(Some(1))
+        );
+        assert!(spec.def.style.value_formats.contains_key("visitors"));
+        let ghost = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "valueFormats": { "ghost": { "style": "number" } },
+        }));
+        assert!(matches!(&ghost, Err(BiError::Validation(m)) if m.contains("'ghost'")));
+        let wrong_kind = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "conditional": [{ "column": "visitors", "color": "#ff0000",
+                "rule": { "type": "contains", "text": "x" } }],
+        }));
+        assert!(
+            matches!(&wrong_kind, Err(BiError::Validation(m)) if m.contains("conditional colours"))
+        );
+        let currency = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "format": { "style": "currency", "currency": "ZZZ" },
+        }));
+        assert!(
+            matches!(&currency, Err(BiError::Validation(m)) if m.contains("not a currency code"))
         );
     }
 

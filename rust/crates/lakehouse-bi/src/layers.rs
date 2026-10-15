@@ -409,6 +409,7 @@ pub fn layer_input(
             layer_query: true,
             ..ShapeFields::default()
         },
+        style: crate::style::StyleFields::default(),
     }
 }
 

@@ -702,6 +702,7 @@ pub fn value_chart(q: &ValueQuery<'_>) -> crate::store::StoredChartSpec {
             layer_query: true,
             ..crate::shape::ShapeFields::default()
         },
+        style: crate::style::StyleFields::default(),
     };
     StoredChartSpec {
         spec: ChartSpec {
