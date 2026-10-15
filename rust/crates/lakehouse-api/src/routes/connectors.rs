@@ -944,7 +944,7 @@ fn secret_store_error(err: &crate::connector_secret_store::SecretStoreError) -> 
         SecretStoreError::NotManaged => ApiError::Internal(err.to_string()),
         // SRC-12 decision 12: a fixed text naming the setting, never a key.
         SecretStoreError::Io(_) | SecretStoreError::Key(_) => {
-            ApiError::Unavailable(err.to_string())
+            ApiError::Unavailable(err.to_string()) // SEC-11 allowlisted: fixed sentences (SecretStoreError::Io/Key)
         }
     }
 }
@@ -3295,9 +3295,9 @@ pub async fn ingest_spec_put(
     lakehouse_store::ingest_spec::validate_excluded_columns(&dial, &body.source_objects).map_err(
         |err| match err {
             lakehouse_store::ingest_spec::InvalidExcludedColumns::BadList { .. } => {
-                ApiError::BadRequest(err.to_string())
+                ApiError::BadRequest(err.to_string()) // SEC-11 allowlisted: InvalidExcludedColumns is fixed text
             }
-            _ => ApiError::Unprocessable(err.to_string()),
+            _ => ApiError::Unprocessable(err.to_string()), // SEC-11 allowlisted: InvalidExcludedColumns is fixed text
         },
     )?;
 

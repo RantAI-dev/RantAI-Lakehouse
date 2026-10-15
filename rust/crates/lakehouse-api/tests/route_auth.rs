@@ -797,6 +797,21 @@ async fn discovery_routes_need_connector_manage_and_the_result_route_needs_inges
     let TestApp { router, pool } = spin_up().await;
     let manage = create_principal_with_permissions(&pool, "connector:manage").await;
     let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    // SRC-13 review 3 BLOCKER 2: both principals join Meridian Group, the tenant of
+    // `conn-pg-lakehouse`. The per-connector routes answer 404 for a connector outside
+    // the caller's tenants (the route layer, before the handler), so without this the
+    // person's routes answered 404 instead of reaching the handler's 400, and the
+    // test's point (403 from the permission gate, not from the tenant gate) was lost.
+    for user_id in [manage, ingest] {
+        sqlx::query(
+            "INSERT INTO app_user_tenant (user_id, tenant_id) \
+             VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("join the connector's tenant");
+    }
     let base = "/api/connectors/conn-pg-lakehouse";
     // A preview with no object is a 400 before any dial; a poll with nothing
     // requested is a 404. Neither touches a source.
