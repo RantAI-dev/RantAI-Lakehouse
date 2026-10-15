@@ -897,13 +897,13 @@ async fn an_http_or_private_token_address_is_refused_at_save() {
     )
     .await;
     let good = json!({
-        "baseUrl": "https://93.184.216.34/api",
+        "baseUrl": "https://203.0.113.10/api",
         "auth": {
             "type": "oauth2_authorization_code",
             "clientId": "app-1",
             "authorizeUrl": "https://login.example.com/authorize",
-            "tokenUrl": "https://93.184.216.35/token",
-            "revocationUrl": "https://93.184.216.36/revoke",
+            "tokenUrl": "https://203.0.113.11/token",
+            "revocationUrl": "https://203.0.113.12/revoke",
             "scopes": ["read"],
         },
         "pagination": { "type": "none" },
@@ -920,8 +920,8 @@ async fn an_http_or_private_token_address_is_refused_at_save() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     for (field, value) in [
-        ("tokenUrl", "http://93.184.216.35/token"),
-        ("revocationUrl", "http://93.184.216.36/revoke"),
+        ("tokenUrl", "http://203.0.113.11/token"),
+        ("revocationUrl", "http://203.0.113.12/revoke"),
         ("authorizeUrl", "http://login.example.com/authorize"),
         ("tokenUrl", "https://127.0.0.1/token"),
         ("revocationUrl", "https://localhost/revoke"),

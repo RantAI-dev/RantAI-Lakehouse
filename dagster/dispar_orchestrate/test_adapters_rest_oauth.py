@@ -33,7 +33,7 @@ CC_SECRETS = {"clientId": "id-1", "clientSecret": "secret-1"}
 
 
 def _public(host: str, port: int) -> ResolvedAddress:
-    return ResolvedAddress(ip="93.184.216.34", port=port, family=2)
+    return ResolvedAddress(ip="203.0.113.10", port=port, family=2)
 
 
 class _Resp:

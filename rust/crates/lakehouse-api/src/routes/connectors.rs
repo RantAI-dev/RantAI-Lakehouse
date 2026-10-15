@@ -3314,6 +3314,59 @@ pub struct IngestCredentialBody {
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
+) -> Result<(), ApiError> {
+    let host_port: Option<(&str, u16)> = match dial {
+        Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
+        Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
+        Dial::Files(files) => files
+            .endpoint
+            .as_deref()
+            .and_then(connector_probe::parse_endpoint_host_port),
+        Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
+        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`): the authoritative
+        // SSRF check runs in Dagster (`ssrf_guard_mongo.py` /
+        // `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
+        // not in this save-time pre-check; this function only fails
+        // fast on the common case (a caller pastes an obviously-internal
+        // host for a `sql`/`cdc`/`files`/`rest` connector and finds out
+        // immediately, at save time). The Rust-side
+        // `routes/connectors::check_dial_ssrf` match returns `None` for
+        // these variants by construction -- the same shape `sheets`
+        // already has (its dial names a spreadsheet id, not a
+        // caller-chosen host). The authoritative check for these
+        // adapters stays in Dagster, not here.
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
+    };
+    let Some((host, port)) = host_port else {
+        return Ok(());
+    };
+    // The approved address is dropped on purpose: this is the advisory
+    // save-time check, and nothing is dialled here.
+    connector_probe::resolve_checked(host, port, internal_hosts)
+        .await
+        .map(|_approved| ())
+        .map_err(ApiError::BadRequest)
+}
+
+/// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will
+/// never dial. The addresses of an `OAuth2` dial receive the client secret and
+/// the refresh token, so they get the same two checks as `baseUrl`: `https` (or
+/// the gate-only `http` switch) and the private-address refusal; the sign-in
+/// address is only handed to the browser and gets the scheme check alone.
+///
+/// Run BEFORE the `SEC-14` re-point rule: an address that can never be valid
+/// is a 400 with a fixed text whether the connector is new or being changed,
+/// so the person is told the real problem and not that credentials are
+/// missing. The check resolves the host but sends nothing to it, so it does
+/// not weaken what the re-point rule protects (no credential reaches a new
+/// place).
+///
+/// # Errors
+///
+/// 400 with the fixed text of the scheme or address check.
+async fn check_oauth_addresses(
+    dial: &Dial,
+    internal_hosts: &crate::internal_hosts::InternalHosts,
     oauth: crate::connector_oauth::OAuthSettings,
 ) -> Result<(), ApiError> {
     // `SRC-12` part C: the addresses of an `OAuth2` dial receive the client
@@ -3348,37 +3401,7 @@ async fn check_dial_ssrf(
                 .map_err(ApiError::BadRequest)?;
         }
     }
-    let host_port: Option<(&str, u16)> = match dial {
-        Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
-        Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
-        Dial::Files(files) => files
-            .endpoint
-            .as_deref()
-            .and_then(connector_probe::parse_endpoint_host_port),
-        Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
-        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`): the authoritative
-        // SSRF check runs in Dagster (`ssrf_guard_mongo.py` /
-        // `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
-        // not in this save-time pre-check; this function only fails
-        // fast on the common case (a caller pastes an obviously-internal
-        // host for a `sql`/`cdc`/`files`/`rest` connector and finds out
-        // immediately, at save time). The Rust-side
-        // `routes/connectors::check_dial_ssrf` match returns `None` for
-        // these variants by construction -- the same shape `sheets`
-        // already has (its dial names a spreadsheet id, not a
-        // caller-chosen host). The authoritative check for these
-        // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
-    };
-    let Some((host, port)) = host_port else {
-        return Ok(());
-    };
-    // The approved address is dropped on purpose: this is the advisory
-    // save-time check, and nothing is dialled here.
-    connector_probe::resolve_checked(host, port, internal_hosts)
-        .await
-        .map(|_approved| ())
-        .map_err(ApiError::BadRequest)
+    Ok(())
 }
 
 /// Refuse a spec whose `sourceObjects` land in a raw table name that uploaded
@@ -3533,6 +3556,15 @@ pub async fn ingest_spec_put(
         },
     )?;
 
+    // `SRC-12 review C1 BLOCKER 1`: an OAuth address that can never be dialled
+    // is invalid whatever else the save does, so it is refused first.
+    check_oauth_addresses(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
+
     // SEC-14: decide whether this save re-points the connector BEFORE the
     // address check below, which resolves the new host. A re-point without
     // the credentials is refused here, so nothing is looked up or dialled.
@@ -3563,12 +3595,7 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     let Some(credential) = credential else {
-        check_dial_ssrf(
-            &dial,
-            &state.config.connector_internal_hosts(),
-            state.config.oauth_settings(),
-        )
-        .await?;
+        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
         return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
@@ -3640,12 +3667,7 @@ async fn save_with_credentials(
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
-    check_dial_ssrf(
-        dial,
-        &state.config.connector_internal_hosts(),
-        state.config.oauth_settings(),
-    )
-    .await?;
+    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
     // Only after the address is approved: a refused target makes no call to
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;
