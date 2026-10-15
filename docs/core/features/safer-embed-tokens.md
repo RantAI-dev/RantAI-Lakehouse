@@ -49,6 +49,7 @@ embeds.
 | 5 | A dashboard whose list of allowed sites is empty cannot be framed at all | — | Owner, 2026-10-10 |
 | 6 | "Withdraw all" needs to know when a token was issued, which is why `iat` is required (decision 1). "Withdraw one" needs a token id (`jti`), which stays optional: a token without one can only be withdrawn with all the others | Planner | Owner to confirm at QA |
 | 7 | A clock difference of up to 60 seconds between the customer's server and ours is tolerated | Planner | Owner to confirm at QA |
+| 8 | Withdrawals and the allowed-sites list are kept apart from the dashboard row, in an append-only table read by aggregation (latest "withdraw all" instant, union of withdrawn ids, newest list of sites). Kept on the dashboard row, a save of the dashboard that read it before a withdrawal wrote the old state back and the withdrawn token worked again (PR #105 review) | Planner | 2026-10-15 |
 
 ## Limits to tell a customer
 
