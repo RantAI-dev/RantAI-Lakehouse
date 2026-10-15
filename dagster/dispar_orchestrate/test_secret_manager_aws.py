@@ -44,14 +44,16 @@ def test_the_signer_matches_the_published_get_vanilla_vector() -> None:
 
 def test_the_signer_matches_what_botocore_signed_for_the_same_secrets_manager_request() -> None:
     # Produced once with `botocore.auth.SigV4Auth` for exactly these inputs
-    # (fixed clock, POST with a session token); botocore is not a dependency.
+    # (fixed clock, POST with a session token, COMPACT payload as the Rust
+    # client sends it: SRC-12 review B2 BLOCKER 1, the first constant had been
+    # made over a spaced payload); botocore is not a dependency.
     headers = sign(
         method="POST",
         host="secretsmanager.eu-west-1.amazonaws.com",
         path="/",
         query="",
         extra_headers={"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"},
-        payload=json.dumps({"SecretId": "prod/x"}).encode(),
+        payload=json.dumps({"SecretId": "prod/x"}, separators=(",", ":")).encode(),
         region="eu-west-1",
         service="secretsmanager",
         access_key="AKID",
@@ -60,7 +62,7 @@ def test_the_signer_matches_what_botocore_signed_for_the_same_secrets_manager_re
         now=datetime(2026, 10, 15, 10, 0, 0, tzinfo=UTC),
     )
     assert headers["Authorization"].endswith(
-        "Signature=61958663bab4354b5593a4b768239b0c320224a9fd102f4455863ec05cbf1e88"
+        "Signature=7e592597a21f89557ee9425eb46abc7d213f3270168424e38baf9df8f7865a6b"
     )
     assert headers["x-amz-security-token"] == "TOK"
 

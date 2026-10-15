@@ -442,7 +442,10 @@ mod tests {
     }
 
     /// Produced once with `botocore.auth.SigV4Auth` for exactly these inputs
-    /// (fixed clock, POST, session token); the Python signer asserts it too.
+    /// (fixed clock, POST, session token, the COMPACT payload `serde_json`
+    /// writes: `SRC-12 review B2 BLOCKER 1` found the first constant had been
+    /// made over `json.dumps`' spaced payload, which hashes differently); the
+    /// Python signer asserts it too.
     #[test]
     fn the_signer_matches_what_botocore_signed_for_the_same_secrets_manager_request() {
         let payload = json!({ "SecretId": "prod/x" }).to_string();
@@ -464,7 +467,7 @@ mod tests {
             now: datetime!(2026-10-15 10:00:00 UTC),
         });
         assert!(authorization(&headers).ends_with(
-            "Signature=61958663bab4354b5593a4b768239b0c320224a9fd102f4455863ec05cbf1e88"
+            "Signature=7e592597a21f89557ee9425eb46abc7d213f3270168424e38baf9df8f7865a6b"
         ));
     }
 

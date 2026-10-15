@@ -166,7 +166,8 @@ def read(parsed: Mapping[str, str | None], environ: Mapping[str, str]) -> str:
         raise ManagerFailure("manager_unreachable")
     host = endpoint.split("://", 1)[1]
     access_key, secret_key, session_token = _credentials(environ)
-    payload = json.dumps({"SecretId": parsed["secret_id"]}).encode()
+    # Compact, byte for byte what the Rust client sends (SRC-12 review B2 BLOCKER 1).
+    payload = json.dumps({"SecretId": parsed["secret_id"]}, separators=(",", ":")).encode()
     extra = {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"}
     headers = sign(
         method="POST",
