@@ -105,7 +105,8 @@ pub enum FormatStyle {
     Currency,
     /// `1.23E6`.
     Scientific,
-    /// `1.2 K`, `3.4 M`, `B`, `T`, in every locale (feature decision 3).
+    /// `1.2 K`, `3.4 M`, `B`, `T`, in every locale (feature decision 3); with
+    /// a [`ValueFormat::currency`] an amount, "Rp 1,2 M".
     Compact,
 }
 
@@ -141,7 +142,7 @@ pub struct ValueFormat {
     /// Group thousands (`1,234` or `1.234` by the deployment's locale).
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub thousands: bool,
-    /// An ISO 4217 code, upper case; only with the `currency` style.
+    /// An ISO 4217 code, upper case; with the `currency` or `compact` style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     /// Symbol or code.
@@ -466,7 +467,7 @@ impl ValueFormat {
             return Err(format!("decimals of {name} must be 0 to {MAX_DECIMALS}."));
         }
         match (&self.currency, self.style) {
-            (Some(code), FormatStyle::Currency) if !is_currency(code) => {
+            (Some(code), _) if !is_currency(code) => {
                 return Err(format!(
                     "'{code}' is not a currency code: use an ISO 4217 code such as IDR or USD."
                 ));
@@ -476,16 +477,16 @@ impl ValueFormat {
                     "the currency format of {name} needs a currency code such as IDR."
                 ));
             }
-            (Some(_), style) if style != FormatStyle::Currency => {
+            (Some(_), style) if !matches!(style, FormatStyle::Currency | FormatStyle::Compact) => {
                 return Err(format!(
-                    "a currency code is only for the currency format ({name})."
+                    "a currency code is only for the currency and compact formats ({name})."
                 ));
             }
             _ => {}
         }
-        if self.currency_display != CurrencyDisplay::Symbol && self.style != FormatStyle::Currency {
+        if self.currency_display != CurrencyDisplay::Symbol && self.currency.is_none() {
             return Err(format!(
-                "showing a currency as a code is only for the currency format ({name})."
+                "showing a currency as a code needs a currency code ({name})."
             ));
         }
         affix(self.prefix.as_ref(), &format!("the prefix of {name}"))?;
@@ -924,7 +925,14 @@ mod tests {
         let e = refused(&json!({"format": {"style": "currency"}}));
         assert!(e.contains("needs a currency code"), "{e}");
         let e = refused(&json!({"format": {"style": "number", "currency": "IDR"}}));
-        assert!(e.contains("only for the currency format"), "{e}");
+        assert!(
+            e.contains("only for the currency and compact formats"),
+            "{e}"
+        );
+        check_style(&chart(
+            &json!({"format": {"style": "compact", "currency": "IDR", "decimals": 2}}),
+        ))
+        .unwrap();
         let e = refused(&json!({"format": {"prefix": "12345678901234567"}}));
         assert!(e.contains("prefix"), "{e}");
         check_style(&chart(&json!({"format": {"suffix": "1234567890123456"}}))).unwrap();

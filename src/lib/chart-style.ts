@@ -16,7 +16,7 @@ export type ValueFormat = {
   decimals?: number
   /** Group thousands. Absent means yes. */
   thousands?: boolean
-  /** An ISO 4217 code, upper case; only with the `currency` style. */
+  /** An ISO 4217 code, upper case; with the `currency` or `compact` style. */
   currency?: string
   currencyDisplay?: "symbol" | "code"
   /** At most 16 characters. */
