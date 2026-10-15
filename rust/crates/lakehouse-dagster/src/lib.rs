@@ -1400,8 +1400,9 @@ impl DgClient {
     /// Same as [`DgClient::launch_run`]: a GraphQL-level launch failure
     /// (a bad job name, a `RunConfigValidationInvalid`) comes back as
     /// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`
-    /// — only a transport failure or a malformed GraphQL response is
-    /// [`DgError::Transport`]/[`DgError::Server`].
+    /// — only a transport failure, a non-2xx status or a malformed GraphQL
+    /// response is [`DgError::Transport`]/[`DgError::Status`]/
+    /// [`DgError::Server`].
     pub async fn launch_run_with_config(
         &self,
         job_name: &str,
