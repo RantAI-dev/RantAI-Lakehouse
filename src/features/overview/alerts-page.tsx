@@ -22,6 +22,7 @@ import { filterDataClientSide } from "@/lib/data-table"
 import { formatDateTime } from "@/lib/format"
 import { overviewService } from "@/services"
 import type { AlertItem } from "@/services/contracts/overview"
+import { AlertDelivery } from "./alert-delivery"
 import { getAlertColumns } from "./alerts-columns"
 
 type AlertResolutionProps = {
@@ -155,6 +156,8 @@ function AlertDetailDrawer(props: AlertDrawerProps) {
             ),
           },
           { label: "Opened", value: formatDateTime(selected.at) },
+          // SRC-17: whether the webhook or e-mail arrived.
+          { label: "Delivery", value: <AlertDelivery alert={selected} /> },
         ]}
       />
       {selected.resolutionNote ? (

@@ -211,6 +211,26 @@ impl UploadStore {
             .map_err(|err| user_error("get_range", key, &Failure::Store(&err)))
     }
 
+    /// Read the whole object at `key`. Only for what must be read whole: an
+    /// Excel workbook cannot be previewed or converted from a prefix. A text
+    /// upload is never read whole by the API ([`Self::head_bytes`]).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the object is missing (the
+    /// reason is `not found`) or the read fails.
+    pub async fn get_all(&self, key: &str) -> Result<Bytes, UploadStoreError> {
+        let result = self
+            .store
+            .get(&ObjectPath::from(key))
+            .await
+            .map_err(|err| user_error("get", key, &Failure::Store(&err)))?;
+        result
+            .bytes()
+            .await
+            .map_err(|err| user_error("get", key, &Failure::Store(&err)))
+    }
+
     /// Delete the object at `key`. An object that is already gone is
     /// success: the caller is deleting a registry row, and "the bytes are
     /// not there" is the state it wants.

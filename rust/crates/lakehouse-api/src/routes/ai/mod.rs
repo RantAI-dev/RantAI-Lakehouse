@@ -46,6 +46,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── POST /api/ai/build-status ───────────────────────────────────────────
 
@@ -89,7 +90,17 @@ pub async fn build_status(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": err.to_string(), "status": "unknown", "steps": [] })),
+            ApiJson({
+                let mut body = upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Unavailable,
+                    &err,
+                )
+                .to_json();
+                body["status"] = json!("unknown");
+                body["steps"] = json!([]);
+                body
+            }),
         )
             .into_response(),
     }
@@ -98,6 +109,17 @@ pub async fn build_status(
 // ── POST /api/ai/chat ───────────────────────────────────────────────────
 
 const MAX_ITER: u32 = 8;
+
+/// What a late `ask_user` gets back (plan 14). The model reads it on its
+/// next round, so it asks the model to answer with the reading it used.
+const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+
+/// What a call gets back when the console's allowlist did not offer the tool
+/// (plan 17). The model reads it on its next round, so it is told to answer
+/// without the tool.
+fn not_offered_refusal(name: &str) -> String {
+    format!("{name} is not available in this chat. Answer without it.")
+}
 
 /// A single incoming `{role, content}` chat turn (only `user`/`assistant`
 /// are kept, matching the `TypeScript`'s `.filter`).
@@ -188,6 +210,10 @@ struct PreparedChat {
     messages: Vec<LlmMessage>,
     tools: Vec<Value>,
     is_build: bool,
+    /// `true` when the request carried a non-empty `tools` list. Then a call
+    /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
+    /// with no allowlist dispatches as before.
+    allowlisted: bool,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -301,7 +327,9 @@ async fn users_terms(
 /// MAP is matched to (`AI_RELEVANT_TABLES`).
 ///
 /// With `AI_ASK_BACK` off the text is what it was before the switch
-/// existed.
+/// existed. `AI_SEMANTIC_LAYER` adds [`prompt::DISTINCT_COUNT_RULES`] after
+/// the mode text and the ask-back rules, in both modes; with it off that
+/// block is absent.
 async fn system_prompt(
     state: &AppState,
     principal: Option<&Principal>,
@@ -310,6 +338,7 @@ async fn system_prompt(
     context: &str,
     user_messages: &[&str],
     asking: bool,
+    sql_help: bool,
 ) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
     let withheld = withheld_by_policy(state).await;
@@ -350,11 +379,19 @@ async fn system_prompt(
     } else {
         format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
     };
-    let rules = if state.config.ai_ask_back && asking {
-        prompt::ASK_BACK_RULES
-    } else {
-        ""
-    };
+    let mut rules = String::new();
+    if state.config.ai_ask_back && asking {
+        rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
+    }
+    // Read from the switch alone, in both modes: a count that overlaps
+    // between rows is a fact about the data, not about asking back. With
+    // the switch off the text is what it was before the block existed.
+    if state.config.ai_semantic_layer {
+        rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
     let words = prompt::user_words_section(&terms);
     let ctx_line = page_context_line(context);
     (if schema.is_empty() {
@@ -366,6 +403,22 @@ async fn system_prompt(
     } + &words
         + &ctx_line
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
+}
+
+/// Plan 17: an Explain turn offers no tool. The console's Explain sends the
+/// statement with the sentence [`prompt::EXPLAIN_REQUEST`] first, and the
+/// model is told in the rules to call no tool. A Fix message keeps every tool
+/// it was offered, and so does a message that holds the sentence only inside
+/// the statement.
+fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<Value> {
+    let explain = newest_user.is_some_and(|m| m.trim_start().starts_with(prompt::EXPLAIN_REQUEST));
+    if !explain {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|t| t["function"]["name"].as_str() != Some(registry::PROPOSE_SQL))
+        .collect()
 }
 
 /// Validates the body and assembles the system prompt, history and the tool
@@ -428,6 +481,10 @@ async fn prepare_chat(
             if name == registry::ASK_USER && !state.config.ai_ask_back {
                 return false;
             }
+            // Same for the SQL help: the switch decides, whatever the list says.
+            if name == registry::PROPOSE_SQL && !state.config.ai_sql_help {
+                return false;
+            }
             if let Some(allow) = &allow {
                 // An explicit allowlist from the console's Tools menu is
                 // the user's own choice and wins over the per-turn
@@ -439,10 +496,17 @@ async fn prepare_chat(
         .collect();
 
     // The rules for asking are written only for a chat that can ask: one
-    // whose tool list holds `ask_user`.
+    // whose tool list holds `ask_user`. The SQL help rules follow the same
+    // rule for `propose_sql`.
     let asking = tools
         .iter()
         .any(|t| t["function"]["name"].as_str() == Some(registry::ASK_USER));
+    let sql_help = tools
+        .iter()
+        .any(|t| t["function"]["name"].as_str() == Some(registry::PROPOSE_SQL));
+    // plan 17: `sql_help` was read above, before this, so the SQL help rules
+    // stay in the prompt while the tool is taken out of an Explain turn.
+    let tools = without_tool_in_explain(tools, recent_user.last().copied());
     let sys = system_prompt(
         state,
         principal,
@@ -451,6 +515,7 @@ async fn prepare_chat(
         parsed.context.as_deref().unwrap_or_default(),
         &recent_user,
         asking,
+        sql_help,
     )
     .await;
 
@@ -462,10 +527,22 @@ async fn prepare_chat(
         name: None,
     }];
     messages.extend(history);
+    // The newest user message names the mode for this turn. `recent_user`
+    // above is read from the request, so the language line is unaffected.
+    if let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == LlmMessageRole::User)
+        && let Some(content) = last_user.content.as_mut()
+    {
+        content.push_str("\n\n");
+        content.push_str(prompt::mode_note(is_build));
+    }
     Ok(PreparedChat {
         messages,
         tools,
         is_build,
+        allowlisted: allow.is_some(),
     })
 }
 
@@ -608,6 +685,7 @@ async fn run_chat(
         mut messages,
         tools,
         is_build,
+        allowlisted,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
@@ -728,6 +806,14 @@ async fn run_chat(
             }
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // plan 14: an ask after any tool that ran in this turn is refused
+            // before the gate. The prompt asks the model to ask first; this
+            // is the check that holds when it does not.
+            let late_ask = call.function.name == registry::ASK_USER
+                && tool_trace.iter().any(|step| {
+                    step["tool"].as_str() != Some(registry::ASK_USER)
+                        && step["ok"].as_bool() == Some(true)
+                });
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
@@ -743,7 +829,18 @@ async fn run_chat(
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
-            let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
+            // plan 17: with an allowlist, the tools the console named are the
+            // only ones a call may reach. The check is against the offered
+            // list, not the request's strings, so a tool the switch removed,
+            // or that the Explain filter kept out, stays refused here too; a
+            // tool the permission removed never reaches this arm.
+            let not_offered = allowlisted
+                && !tools
+                    .iter()
+                    .any(|t| t["function"]["name"].as_str() == Some(call.function.name.as_str()));
+            let (result, outcome, run_id, approval_id) = if late_ask {
+                (json!({ "error": LATE_ASK_REFUSAL }), "failed", None, None)
+            } else if let Some(refusal) = gate_result {
                 if gate::is_write_high_pending(&refusal) {
                     let Some(spec) = registry::find(&call.function.name) else {
                         unreachable!("is_write_high_pending only set for a registered tool")
@@ -782,8 +879,18 @@ async fn run_chat(
                     (approval_result, outcome, run_id, approval_id)
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    (refusal, outcome, None, None)
+                    if outcome == "needs_confirmation"
+                        && let Some(error) =
+                            tools::check_draft(state, &call.function.name, &args).await
+                    {
+                        (error, "failed", None, None)
+                    } else {
+                        (refusal, outcome, None, None)
+                    }
                 }
+            } else if not_offered {
+                let error = not_offered_refusal(&call.function.name);
+                (json!({ "error": error }), "failed", None, None)
             } else {
                 let clean_args = gate::strip_confirmed(&args);
                 let result =
@@ -811,6 +918,37 @@ async fn run_chat(
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
             }));
+            // plan 14: an accepted ask ends the turn. The question is the
+            // reply, so the reader sees it above the option buttons; calls
+            // after it in this round are neither run nor recorded.
+            if call.function.name == registry::ASK_USER
+                && let Value::Object(m) = &result
+                && m.get("asked") == Some(&Value::Bool(true))
+            {
+                let question = m.get("question").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    question,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
+            // plan 15: an accepted proposal ends the turn the same way. The
+            // reason is the reply; the console shows the proposed statement.
+            if call.function.name == registry::PROPOSE_SQL
+                && let Value::Object(m) = &result
+                && m.get("proposed") == Some(&Value::Bool(true))
+            {
+                let reason = m.get("reason").and_then(Value::as_str).unwrap_or("");
+                return Ok(chat_response_body(
+                    reason,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                ));
+            }
             if let Value::Object(m) = &result
                 && let Some(Value::String(rid)) = m.get("runId")
             {
@@ -1073,7 +1211,13 @@ pub async fn tool_call(
             (approval_result, outcome, run_id, approval_id)
         } else {
             let outcome = gate::outcome_of(&refusal);
-            (refusal, outcome, None, None)
+            if outcome == "needs_confirmation"
+                && let Some(error) = tools::check_draft(&state, &parsed.tool, &parsed.args).await
+            {
+                (error, "failed", None, None)
+            } else {
+                (refusal, outcome, None, None)
+            }
         }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
@@ -1152,7 +1296,6 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
 fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
-    tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
@@ -1170,8 +1313,16 @@ fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
 
 /// The fixed 503 body for a Copilot LLM failure.
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    // SEC-11: the provider's text is logged under a reference the user can
+    // quote (`errorId`), not shown.
+    let class = match err {
+        lakehouse_llm::LlmError::Transport(_) => upstream_error::Class::Unavailable,
+        lakehouse_llm::LlmError::Api(_) => upstream_error::Class::Failed,
+    };
+    let failure = upstream_error::report(&upstream_error::MODEL, class, err);
     json!({
         "error": "AI Copilot is unavailable",
+        "errorId": failure.reference(),
         "detail": llm_error_detail(err),
         "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
     })
@@ -1350,10 +1501,19 @@ fn owner_key(principal: &Principal) -> String {
     principal.id.uuid().to_string()
 }
 
+/// A `500` for a failed chat-session read or write. The session store is
+/// `ClickHouse`; its text goes to the log under the reference (SEC-11).
 fn internal(err: &impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        ApiJson(json!({ "error": err.to_string() })),
+        ApiJson(
+            upstream_error::report(
+                &upstream_error::DATABASE,
+                upstream_error::Class::Failed,
+                err,
+            )
+            .to_json(),
+        ),
     )
         .into_response()
 }
@@ -1630,7 +1790,7 @@ pub async fn sessions_save(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
 
     let requested = parsed
         .id
@@ -1639,7 +1799,7 @@ pub async fn sessions_save(
         Some(id) => {
             let row = session_row(ch, &owner, id)
                 .await
-                .map_err(|err| ApiError::Internal(err.to_string()))?;
+                .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
             // Never overwrite someone else's session under its id.
             Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
         }
@@ -1689,7 +1849,7 @@ pub async fn sessions_save(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1729,10 +1889,10 @@ pub async fn sessions_rename(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     let row = session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
     let field = |k: &str| {
         row.get(k)
@@ -1753,7 +1913,7 @@ pub async fn sessions_rename(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1794,10 +1954,10 @@ pub async fn sessions_delete(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .is_none()
     {
         return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
@@ -1815,7 +1975,7 @@ pub async fn sessions_delete(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -1918,6 +2078,15 @@ mod tests {
         ])
     }
 
+    /// [`state_with_ask_back`] with `AI_SEMANTIC_LAYER` set too.
+    fn state_with_ask_back_and_layer(ask_back: &str, layer: &str) -> AppState {
+        state_with_env(&[
+            ("AI_ASK_BACK", ask_back),
+            ("AI_SEMANTIC_LAYER", layer),
+            ("DATABASE_URL", "not a postgres url"),
+        ])
+    }
+
     /// Length and FNV-1a fingerprint of `prompt::SYSTEM_BASE` as committed
     /// before this change, computed from the file's text and not from this
     /// code.
@@ -1946,11 +2115,22 @@ mod tests {
 
     #[tokio::test]
     async fn with_ask_back_off_the_prompt_is_the_text_it_was_before_the_switch() {
-        let state = state_with_ask_back("false");
+        // The layer is on by default and adds its own block; this test pins
+        // what the ask-back switch alone does.
+        let state = state_with_ask_back_and_layer("false", "false");
         let headers = axum::http::HeaderMap::new();
         for asking in [false, true] {
-            let ask =
-                system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], asking).await;
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 ask,
                 format!(
@@ -1959,8 +2139,17 @@ mod tests {
                     prompt::SYSTEM_ASK_SUFFIX
                 )
             );
-            let build =
-                system_prompt(&state, None, &headers, true, "", &[FIXED_QUESTION], asking).await;
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                asking,
+                false,
+            )
+            .await;
             assert_eq!(
                 build,
                 format!(
@@ -1974,9 +2163,19 @@ mod tests {
 
     #[tokio::test]
     async fn with_ask_back_on_the_rules_come_after_the_mode_text_and_before_the_data_map() {
-        let state = state_with_ask_back("true");
+        let state = state_with_ask_back_and_layer("true", "false");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert_eq!(
             text,
             format!(
@@ -1990,12 +2189,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_the_semantic_layer_off_the_prompt_is_the_text_it_was_before_the_count_rules() {
+        // Today's prompt for one fixed input, spelled out from the pieces
+        // that existed before `DISTINCT_COUNT_RULES`.
+        let headers = axum::http::HeaderMap::new();
+        for ask_back in ["false", "true"] {
+            let state = state_with_ask_back_and_layer(ask_back, "false");
+            let rules = if ask_back == "true" {
+                prompt::ASK_BACK_RULES
+            } else {
+                ""
+            };
+            let ask = system_prompt(
+                &state,
+                None,
+                &headers,
+                false,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(
+                ask,
+                format!(
+                    "{}{}{rules}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                    prompt::SYSTEM_BASE,
+                    prompt::SYSTEM_ASK_SUFFIX
+                )
+            );
+            let build = system_prompt(
+                &state,
+                None,
+                &headers,
+                true,
+                "",
+                &[FIXED_QUESTION],
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(
+                build,
+                format!(
+                    "{}{}{rules}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                    prompt::SYSTEM_BASE,
+                    prompt::SYSTEM_BUILD_SUFFIX
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_the_semantic_layer_on_the_count_rules_follow_the_mode_text_in_both_modes() {
+        // The layer is on when unset, so this is the default deployment.
+        let headers = axum::http::HeaderMap::new();
+        let state = state_with_env(&[
+            ("AI_ASK_BACK", "false"),
+            ("DATABASE_URL", "not a postgres url"),
+        ]);
+        let ask = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            ask,
+            format!(
+                "{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
+        let build = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            build,
+            format!(
+                "{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_BUILD_SUFFIX,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
+    }
+
+    #[test]
+    fn the_approval_sentence_in_build_mode_depends_on_a_needs_approval_result() {
+        let text = prompt::SYSTEM_BUILD_SUFFIX;
+        let line = text
+            .lines()
+            .find(|l| l.contains("delete_alert_rule"))
+            .expect("the build prompt lists the approval-gated tools");
+        assert!(
+            line.contains("needs_approval"),
+            "the approval line must name needs_approval as the condition, got: {line}"
+        );
+        assert!(
+            !text.contains("Tell the user the request is waiting in Approvals"),
+            "the approval line must not tell the user the request is waiting unconditionally"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
+        let state = state_with_ask_back_and_layer("true", "true");
+        let headers = axum::http::HeaderMap::new();
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            text,
+            format!(
+                "{}{}{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX,
+                prompt::ASK_BACK_RULES,
+                prompt::DISTINCT_COUNT_RULES
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn a_chat_that_cannot_ask_is_not_told_to() {
         // The rules name a tool; a chat whose tool list lacks it (Query
         // Studio's allowlist, for one) must not be told to call it.
         let state = state_with_ask_back("true");
         let headers = axum::http::HeaderMap::new();
-        let text = system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], false).await;
+        let text = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
         assert!(!text.contains("ask_user"), "{text}");
     }
 
@@ -2044,6 +2400,117 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// The message list the model receives after the system message: the
+    /// history `prepare_chat` built, with the request's own messages.
+    fn history_of(messages: &[(&str, &str)]) -> ChatBody {
+        ChatBody {
+            messages: messages
+                .iter()
+                .map(|(role, content)| IncomingMessage {
+                    role: (*role).to_owned(),
+                    content: (*content).to_owned(),
+                })
+                .collect(),
+            ..ChatBody::default()
+        }
+    }
+
+    /// The last user message the model is sent, and the assistant message
+    /// that came before it, as text.
+    async fn sent_to_model(state: &AppState, body: ChatBody, mode: Option<&str>) -> Vec<String> {
+        let who = analyst(1);
+        let body = ChatBody {
+            mode: mode.map(str::to_owned),
+            ..body
+        };
+        let prepared = prepare_chat(state, Some(&who), &axum::http::HeaderMap::new(), body)
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        prepared
+            .messages
+            .iter()
+            .skip(1)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect()
+    }
+
+    const ASK_MODE_REPLY: &str = "I am in ASK mode and cannot change anything.";
+
+    #[tokio::test]
+    async fn a_switch_to_build_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", ASK_MODE_REPLY),
+            ("user", "Yes, make it now."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        let note = prompt::mode_note(true);
+        assert_eq!(sent[0], "Make a chart.");
+        assert_eq!(
+            sent[1], ASK_MODE_REPLY,
+            "the assistant message is unchanged"
+        );
+        assert_eq!(sent[2], format!("Yes, make it now.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_ask_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", "Done."),
+            ("user", "Now only read."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("ask")).await;
+        let note = prompt::mode_note(false);
+        assert_eq!(sent[1], "Done.");
+        assert_eq!(sent[2], format!("Now only read.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn the_reply_language_does_not_move_with_the_mode_note() {
+        // The newest message is Indonesian. The language line is read from the
+        // request, so the note in the history must not change it.
+        let state = state_with_ask_back("false");
+        let who = analyst(1);
+        let headers = axum::http::HeaderMap::new();
+        let question = "Tolong buat grafik penjualan per wilayah sekarang.";
+        let body = |mode: &str| {
+            let mut b = history_of(&[("user", question)]);
+            b.mode = Some(mode.to_owned());
+            b
+        };
+        let build = prepare_chat(&state, Some(&who), &headers, body("build"))
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        let system = build.messages[0].content.clone().unwrap_or_default();
+        let lang = prompt::closing(question, None);
+        assert!(
+            system.ends_with(&lang),
+            "the language line is unchanged in build mode: {system}"
+        );
+        assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_message_gets_a_mode_note() {
+        // The console never sends a note back, but the input allows one in an
+        // earlier message: the new note goes on the newest message only.
+        let earlier = format!("Earlier question.\n\n{}", prompt::mode_note(false));
+        let body = history_of(&[
+            ("user", &earlier),
+            ("assistant", "Answer."),
+            ("user", "Newest question."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        assert_eq!(sent[0], earlier, "the earlier note is not added to again");
+        assert_eq!(
+            sent[2],
+            format!("Newest question.\n\n{}", prompt::mode_note(true))
+        );
     }
 
     #[tokio::test]
@@ -2149,6 +2616,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(
@@ -2163,12 +2631,22 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!his.contains("lodging"), "{his}");
         assert!(!his.contains(WORDS_HEADER), "{his}");
-        let nobody =
-            system_prompt(&state, None, &headers, false, "", &[FIXED_QUESTION], true).await;
+        let nobody = system_prompt(
+            &state,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            true,
+            false,
+        )
+        .await;
         assert!(!nobody.contains("lodging"), "{nobody}");
     }
 
@@ -2187,6 +2665,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let map = text.find("\n\nDATA MAP\n").expect("a data map section");
@@ -2208,6 +2687,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains("lodging"), "{text}");
@@ -2235,6 +2715,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         let words = text.split(WORDS_HEADER).nth(1).expect("a words section");
@@ -2287,6 +2768,7 @@ mod tests {
             "",
             &[FIXED_QUESTION],
             true,
+            false,
         )
         .await;
         assert!(!text.contains(WORDS_HEADER), "{text}");
@@ -2302,6 +2784,7 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("1016"), "{text}");
         assert!(!text.contains("upstream-secret-detail"), "{text}");
+        assert!(body["errorId"].is_string(), "{text}");
         assert_eq!(
             body["detail"],
             "The AI service returned an error (HTTP 530). Try again later."

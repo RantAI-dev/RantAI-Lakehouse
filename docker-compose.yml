@@ -78,6 +78,16 @@ services:
     restart: unless-stopped
 
   lakehouse-api:
+    # CI-SPEED-PLAN §4.2: a name for the image, so the `images` job in
+    # .github/workflows/ci.yml can build it ONCE per run, hand it to the
+    # acceptance jobs as a workflow artifact, and let them start the stack
+    # with `up -d --no-build`. CI sets LAKEHOUSE_API_IMAGE to
+    # `rantai-lakehouse-api:ci`; the default is what a local
+    # `docker compose up --build` builds and tags, so local use is unchanged
+    # apart from the image having a stable name instead of
+    # `<project>-lakehouse-api`. The `build:` block below stays: without
+    # `--no-build`, compose still builds this image from source.
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
     build:
       context: ./rust
       dockerfile: Dockerfile
@@ -180,6 +190,12 @@ services:
       # has answered before. `false` turns it off; `true`, empty or unset
       # leaves it on; any other value stops the API at start (see config.rs).
       AI_ASK_BACK: ${AI_ASK_BACK:-}
+      # SQL help: Query Studio can ask the assistant to explain a query in
+      # plain words and, for a failed ClickHouse query, propose a fix as a
+      # diff to accept or reject. `false` turns it off; `true`, empty or
+      # unset leaves it on; any other value stops the API at start (see
+      # config.rs).
+      AI_SQL_HELP: ${AI_SQL_HELP:-}
       # Relevant tables: the chat's data map writes in full only the tables
       # a question names and the others on one line. `false` turns it off;
       # `true`, empty or unset leaves it on; any other value stops the API
@@ -263,6 +279,10 @@ services:
       # per-request 503 rather than lakehouse-api refusing to boot.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
       EMBED_SECRET: ${EMBED_SECRET:-}
+      # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
+      # means 86400. A value that is not a positive whole number stops the
+      # API at start, on purpose (a typo must not silently keep 24 hours).
+      EMBED_TOKEN_MAX_LIFETIME_SECONDS: ${EMBED_TOKEN_MAX_LIFETIME_SECONDS:-}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
@@ -312,20 +332,34 @@ services:
       CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
-      # The connector connectivity probe blocks private/internal address
-      # ranges by DEFAULT (SSRF guard — otherwise a `connector:manage`
-      # principal gets an internal port scanner with output). This stack's own
-      # seeded connectors legitimately point at `postgres:5432` and
-      # `http://rustfs:9000`, which resolve inside those ranges, so the demo
-      # opts out EXPLICITLY. Keeping the safe posture as the default and making
-      # the exception visible here is the point — do NOT carry this into a
-      # deployment that accepts connector definitions from untrusted callers.
-      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
+      # The connector connection test, table discovery and the clean-up of
+      # a deleted change-capture connector block private/internal address
+      # ranges (SSRF guard — otherwise a `connector:manage` principal gets an
+      # internal port scanner with output). SEC-15: blocked BY DEFAULT here
+      # as in the code; this used to default to `true`. This stack's own
+      # seeded connectors point at `postgres:5432` and `http://rustfs:9000`,
+      # which resolve inside those ranges, so on a fresh install their tests
+      # are refused until the operator opts in — `true` here (every internal
+      # address; a trusted internal deployment only) or the narrower
+      # `CONNECTOR_PROBE_ALLOWED_CIDRS` below. Gates that need the compose
+      # network set it themselves, in their own override (`ops/g6/`).
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-}
       # The narrow alternative: only these networks (e.g. `192.168.18.0/24`,
       # comma-separated; a bare address is one host) pass the guard. Takes
       # effect when the flag above is not `true`. Never opens loopback,
-      # link-local or multicast (`lakehouse-api::internal_hosts`).
+      # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      # SEC-10: alert and digest webhooks refuse the same private/internal
+      # addresses as the connector tests above, never follow a redirect, and
+      # connect to the address that was checked. This lists the internal
+      # networks webhooks MAY reach (e.g. `10.1.0.0/16` for an on-premises
+      # chat or incident server; comma-separated, a bare address is one
+      # host). Empty by default: only public webhook targets work. It is
+      # separate from the connector setting on purpose, and there is no
+      # "allow every internal address" form for webhooks. Never opens
+      # loopback, link-local (cloud metadata), multicast or `0/8`. A
+      # malformed entry stops the API at start.
+      WEBHOOK_ALLOWED_CIDRS: ${WEBHOOK_ALLOWED_CIDRS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
@@ -1290,7 +1324,7 @@ services:
   #   docker compose -p <project> up -d --build lakehouse-api
   #   docker compose -p <project> --profile test run --rm gold-export-test-runner
   gold-export-test-runner:
-    profiles: ["test"]
+    profiles: ["dagster"]
     image: python:3.12-slim
     working_dir: /work
     volumes:
@@ -1312,6 +1346,8 @@ services:
     depends_on:
       lakehouse-api:
         condition: service_started
+      dagster-webserver:
+        condition: service_healthy
       lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
@@ -1319,6 +1355,12 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: ${DAGSTER_URL:-http://dagster-webserver:3000/graphql}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # DATA-2 review BLOCKER 2: no default credentials in compose (AGENTS rule 5)
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       LAKEKEEPER_BASE_URI: http://lakekeeper:8181
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEKEEPER_TOKENS_DIR: /tokens
@@ -1326,9 +1368,11 @@ services:
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
       GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "pip install -q requests && python gold_export_test.py"
+      - "pip install -q requests boto3 && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -1668,6 +1712,19 @@ services:
   # Lakekeeper catalog, the RustFS/SeaweedFS S3 endpoint, and ClickHouse.
   dagster-code-location:
     profiles: ["dagster"]
+    # One image for every service built from `./dagster` (this one,
+    # `dagster-webserver`, `dagster-daemon`, `backup-job`, `g6-test-runner`):
+    # they already shared a Dockerfile and build args, so they were the same
+    # image built up to five times. CI-SPEED-PLAN §4.2: the `images` job in
+    # .github/workflows/ci.yml builds it once and sets LAKEHOUSE_DAGSTER_IMAGE
+    # to `rantai-lakehouse-dagster:ci`; the default is what a local
+    # `up --build` tags. The two gate runners that `ops/g6/*.override.yml`
+    # define (`g6-oracle-test-runner`, `g6-alerts-test-runner`) share it too.
+    # All the `build:` blocks MUST stay identical (same
+    # `args:`): with one shared name, a build of any of them retags the image
+    # for all of them, so a block without `GIT_SHA` would bake `unknown`
+    # into the image the code location runs (see the `GIT_SHA` comment below).
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -1684,6 +1741,7 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
+      # DATA-2 review BLOCKER 3: no source bind-mount in deployment template (image carries code)
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
       - type: volume
@@ -1699,6 +1757,13 @@ services:
       - type: volume
         source: lakehouse_connector_secrets
         target: /run/secrets
+        read_only: true
+      # DATA-2 (D2): read-only subpath mount for the gold-export principal token
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
         read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
@@ -1774,6 +1839,8 @@ services:
       # so there is no step to interpolate a file into an env var before
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
+      # DATA-2 (D2): the gold-export principal pre-minted token path
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
       # static-credential fallback path, used because dlt writes Parquet
@@ -1817,6 +1884,10 @@ services:
       LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
       GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # DATA-2 (D4): number of Gold export copies to keep per mart (default 7)
+      GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}
+      # DATA-2 review BLOCKER 1: minimum orphan age in seconds before removal (default 3600)
+      GOLD_ORPHAN_MIN_AGE_SECONDS: ${GOLD_ORPHAN_MIN_AGE_SECONDS:-3600}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the
@@ -1919,9 +1990,18 @@ services:
   # an automatic in-process Dagster schedule.
   backup-job:
     profiles: ["backups"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` as `dagster-code-location`'s build: all five
+      # services built from `./dagster` share one image name, so this block
+      # must not differ from the others (see the `image:` comment on
+      # `dagster-code-location`).
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       postgres:
         condition: service_healthy
@@ -1947,6 +2027,9 @@ services:
   # the host.
   dagster-webserver:
     profiles: ["dagster"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -1985,6 +2068,9 @@ services:
   # change again in P4.
   dagster-daemon:
     profiles: ["dagster"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
@@ -2110,6 +2196,128 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3a_test.py"
+    restart: "no"
+
+  # WS4 item H1 (G7) — the authored-pipeline acceptance test
+  # (`ops/g7/g7_pipeline_test.py`): create a Bronze-to-Silver pipeline over
+  # the Bronze table G3a loads, activate it, trigger it and assert the run's
+  # real row materializations. SRC-20 runs it inside the existing
+  # `g3a-dagster` CI job, right after G3a, because it needs that job's
+  # `g3a_orders` Bronze table — no new job, no CI time of its own.
+  # `g3a-test-runner` shape (stock `python:3.12-slim`, script bind-mounted,
+  # runs INSIDE the compose network), `dagster` profile for the reason
+  # `g3a-source-init`'s comment gives, and `g3a-source-init` in
+  # `depends_on` so the Bronze table this gate reads is loaded before it
+  # starts. `./ops/g7` is mounted READ-ONLY: the script imports nothing
+  # local and only makes HTTP calls, so a write there would be a bug, and a
+  # read-only mount also removes the root-owned `__pycache__` failure mode
+  # `g3a-test-runner`'s `PYTHONDONTWRITEBYTECODE` comment describes.
+  # No credentials of its own: the bootstrap admin comes from the
+  # operator's `.env` exactly as `g3a-test-runner` takes it.
+  #
+  # Usage (from the clean stack G3a leaves behind):
+  #   docker compose -p <project> --profile dagster run --rm g7-test-runner
+  g7-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g7:/work:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      # The Silver-side row-count assertion reads the pipeline's output
+      # through ClickHouse, the same client `g3a-test-runner` uses.
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      # Bronze is Iceberg: reading it needs this gate's own
+      # `DataLakeCatalog` database (`icecat_g7`, created by the script
+      # itself), pointed at the same Lakekeeper warehouse and RustFS
+      # endpoint `g3a-test-runner` passes for its own `icecat_g3a`.
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # What the source step asserts (BLD-3 review BLOCKER 1): `required`
+      # (the default, and what a real deployment wants) makes the gate
+      # demand the op's real source text, which needs images carrying a
+      # real `GIT_SHA`; `unavailable` makes it assert the API's 409
+      # refusal instead, which is the CI shape — `ci.yml`'s `images` job
+      # builds both images WITHOUT `GIT_SHA` so the layer cache is shared
+      # across commits. See `ops/g7/g7_pipeline_test.py`'s module doc.
+      G7_SOURCE_PROVENANCE: ${G7_SOURCE_PROVENANCE:-required}
+      # R1 (ADR 0011): same `clickhouse-reader` OAuth credential
+      # `g3a-test-runner` passes — see `ops/g3a/g3a_test.py`'s
+      # module-level comment on why the static `catalog_credential`
+      # setting needs this pair.
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g7_pipeline_test.py"
+    restart: "no"
+
+  # DATA-9 (G9) — the file-upload acceptance test (`ops/g9/upload_test.py`):
+  # upload, preview, load with `replace` and `append`, delete, an Excel
+  # workbook and a Parquet file, end to end through the API, `file_ingest_job`
+  # and ClickHouse. SRC-9 plan task 7 puts it in CI (`g9-upload` job); until
+  # then nothing ran it. `dagster` profile, for the reason `g3a-source-init`'s
+  # comment gives (it depends on `dagster-webserver`).
+  #
+  # The stack it needs beyond the g3a set: `clickhouse-iceberg-init`, which
+  # creates the API's own `DataLakeCatalog` database (`ICEBERG_QUERY_DB`) that
+  # the gate reads the loaded table through (the API does not depend on it),
+  # and an upload credential for `lakehouse-api` (`UPLOAD_S3_ACCESS_KEY` /
+  # `UPLOAD_S3_SECRET_KEY`, which have no default: unset, every upload answers
+  # 503 "Upload storage is not configured."). The CI job writes both into its
+  # `.env`; see `.github/workflows/ci.yml`'s `g9-upload`.
+  #
+  # The gate reads its fixtures from `ops/fixtures/` beside `ops/g9/`, so the
+  # two directories are mounted side by side under /work, read-only: the
+  # runner writes nothing into the checkout, and a read-only mount also keeps
+  # root-owned `__pycache__/` out of it (the failure `g3a-test-runner`'s
+  # PYTHONDONTWRITEBYTECODE note describes).
+  #
+  # Usage (from a clean stack, `.env` as the CI job writes it):
+  #   docker compose -p <project> --profile dagster up -d --build
+  #     lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+  #     clickhouse-iceberg-init
+  #   docker compose -p <project> --profile dagster run --rm g9-test-runner
+  g9-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g9:/work/g9:ro
+      - ./ops/fixtures:/work/fixtures:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g9/upload_test.py"
     restart: "no"
 
   # P4 (G3) — functional acceptance test for the maintenance job + the
@@ -2678,6 +2886,12 @@ services:
       # verification) — mounting it at `/opt/...` instead avoids leaving
       # that stray artifact in the repo tree.
       - ./ops/debezium/deprovision_connector.sh:/opt/deprovision_connector.sh:ro
+      # SRC-9 plan task 6: `ops/gates/gate_summary.py` and `coverage.json`, the
+      # registry and result table every connector gate records into. At
+      # /opt/gates for the reason the deprovision script is at /opt: a bind
+      # mount nested under the bind-mounted /work would make Docker create
+      # the mount point on the host. Read-only, no secrets in it.
+      - ./ops/gates:/opt/gates:ro
     depends_on:
       debezium-server:
         condition: service_started
@@ -2703,6 +2917,12 @@ services:
         condition: service_healthy
     environment:
       DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
+      # SRC-9 plan task 6: where `import gate_summary` finds the module
+      # mounted above; no bytecode, because /work is a read-write bind of
+      # `ops/g4` and a root-owned `__pycache__` there breaks the next
+      # checkout's `git clean` (see `g3a-test-runner`'s note).
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
       CH_URL: http://clickhouse:8123
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
@@ -2851,6 +3071,58 @@ services:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_governance_test.py"
     restart: "no"
 
+  # DATA-16 (F2) — time-travel acceptance test:
+  # `ops/g8/g8_time_travel_test.py` loads a Bronze table twice through
+  # `bronze_ingest_job` and proves a masked, row-filtered Analyst still gets
+  # `***` and only the allowed rows when the OLDER version is pinned. It
+  # needs the Bronze-ingest stack, so it takes `g3a-test-runner`'s shape and
+  # dependencies (`dagster` profile, `g3a-source-init` for the demo source),
+  # plus `clickhouse-iceberg-init` (the `icecat_api` database the API reads
+  # Iceberg tables through) and direct Postgres access to seed an Analyst
+  # login and to change the demo source between the loads, as
+  # `g8-test-runner` does.
+  #
+  # Usage (from a clean stack, as the `g8-time-travel` CI job does):
+  #   docker compose -p <project> --profile dagster up -d --build \
+  #     lakehouse-api dagster-code-location dagster-webserver \
+  #     dagster-daemon g3a-source-init clickhouse-iceberg-init
+  #   docker compose -p <project> --profile dagster run --rm \
+  #     g8-time-travel-test-runner
+  g8-time-travel-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g8:/work
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      # `./ops/g8` is bound read-write as root (see `g3a-test-runner`):
+      # keep a root-owned `__pycache__/` from ever landing in the checkout.
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_time_travel_test.py"
+    restart: "no"
+
   # WS3 (G6) — Tier 1 ingestion matrix gate fixtures: one MySQL and one
   # SQL Server source the `sql` adapter (`dagster/dispar_orchestrate/
   # adapters/sql.py`) dials, plus a stdlib REST fixture server the `rest`
@@ -2876,7 +3148,7 @@ services:
   # still fails closed without real values.
   mysql-g6:
     image: mysql:8
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     environment:
       MYSQL_DATABASE: g6_ingest
@@ -2900,7 +3172,7 @@ services:
   # path is what gets exercised end-to-end, not a weakened one.
   mssql-g6-cert-init:
     image: alpine:3.20
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     volumes:
       - mssql_g6_tls:/out
@@ -2930,7 +3202,7 @@ services:
 
   mssql-g6:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql"]
     restart: "no"
     depends_on:
       mssql-g6-cert-init:
@@ -2960,7 +3232,7 @@ services:
     build:
       context: ./ops/g6
       dockerfile: Dockerfile.rest_stub
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
 
   # Tier 2 (G6) — the mongodb-adapter fixture
@@ -2978,7 +3250,7 @@ services:
   # network regardless.
   mongo-g6:
     image: mongo:7
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
       MONGO_INITDB_DATABASE: g6_ingest
@@ -3003,7 +3275,7 @@ services:
   # expected to survive a restart with existing data.
   kafka-g6:
     image: apache/kafka:3.8.0
-    profiles: ["g6"]
+    profiles: ["g6", "g6-other"]
     restart: "no"
     environment:
       KAFKA_NODE_ID: "1"
@@ -3069,26 +3341,46 @@ services:
   # unixodbc runtime `pyodbc` needs at import time (`dagster/Dockerfile`),
   # so this test runner needs no separate driver install of its own.
   g6-test-runner:
-    profiles: ["g6"]
+    profiles: ["g6", "g6-sql", "g6-other"]
+    # Shared image with the other `./dagster` services; see the comment on
+    # `dagster-code-location`.
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` as `dagster-code-location`'s build: all five
+      # services built from `./dagster` share one image name, so this block
+      # must not differ from the others (see the `image:` comment on
+      # `dagster-code-location`).
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     working_dir: /work
     volumes:
       - ./ops/g6:/work
+    # SRC-9 decision 9: the gate runs as two CI jobs, each with its own
+    # fixtures (`G6_GROUP`, see g6_ingest_matrix_test.py). `required: false`
+    # makes compose skip a fixture whose profile is not active, so
+    # `--profile g6-sql` starts the SQL fixtures only, `--profile g6-other`
+    # the others, and `--profile g6` (a developer's local run) all of them.
+    # A fixture whose profile IS active is still waited for until healthy.
     depends_on:
       dagster-code-location:
         condition: service_started
       mysql-g6:
         condition: service_healthy
+        required: false
       mssql-g6:
         condition: service_healthy
+        required: false
       rest-stub-g6:
         condition: service_started
+        required: false
       mongo-g6:
         condition: service_healthy
+        required: false
       kafka-g6:
         condition: service_healthy
+        required: false
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       DAGSTER_URL: http://dagster-webserver:3000/graphql

@@ -576,6 +576,252 @@ impl Dial {
             .or_else(|| self.kafka_auth_type())
             .or_else(|| self.sftp_auth_type())
     }
+
+    /// Where this dial sends the connector's credential, as a comparable
+    /// value (`SEC-14`, decision D1). Two dials with equal identities send
+    /// a stored credential to the same place; unequal identities mean the
+    /// connector is being re-pointed, and the credential must be supplied
+    /// again (see [`is_repoint`]).
+    ///
+    /// | Adapter | Compared |
+    /// | --- | --- |
+    /// | `sql`, `cdc` | `driver`, `host`, `port`, `database` |
+    /// | `files` | `protocol`, `endpoint`, `bucket` |
+    /// | `rest` | scheme, host and port of `baseUrl` |
+    /// | `mongodb` | `hosts` (as a set), `database` |
+    /// | `kafka` | `bootstrapServers` (as a set) |
+    /// | `sftp` | `host`, `port`, `hostKeyFingerprint` |
+    /// | `sheets` | nothing (fixed Google hosts) |
+    ///
+    /// The adapter name is part of the identity, so `sql` to `cdc` on the
+    /// same host is a re-point. A change of `user`, `sourceObjects`, the
+    /// schedule, pagination, `sslMode` or any other field is not.
+    ///
+    /// # Normalisation
+    ///
+    /// - Host names compare case-insensitively.
+    /// - Ports: the `sql`, `cdc`, `sftp`, `mongodb` and `kafka` shapes have
+    ///   no absent port ([`Dial::parse`] refuses a dial without one), so
+    ///   there is no default to apply and `5432` versus `5433` differ. In
+    ///   a URL (`rest` `baseUrl`, `files` `endpoint`) an absent port means
+    ///   the scheme's default, so `https://h` and `https://h:443` are the
+    ///   same target and `https://h:8443` is another.
+    /// - A URL's userinfo (`user@`) is not part of the host: only what
+    ///   follows the last `@` is compared, so `https://good@evil/` is
+    ///   `evil`.
+    /// - A `files` dial with no `endpoint` (the provider's own default)
+    ///   differs from one that names an endpoint.
+    #[must_use]
+    pub fn target_identity(&self) -> TargetIdentity {
+        match self {
+            Dial::Sql(sql) => TargetIdentity::new(
+                "sql",
+                vec![
+                    ("driver", driver_key(sql.driver).to_owned()),
+                    ("host", host_key(&sql.host)),
+                    ("port", sql.port.to_string()),
+                    ("database", sql.database.clone()),
+                ],
+            ),
+            Dial::Cdc(cdc) => TargetIdentity::new(
+                "cdc",
+                vec![
+                    ("driver", driver_key(cdc.driver).to_owned()),
+                    ("host", host_key(&cdc.host)),
+                    ("port", cdc.port.to_string()),
+                    ("database", cdc.database.clone()),
+                ],
+            ),
+            Dial::Files(files) => TargetIdentity::new(
+                "files",
+                vec![
+                    (
+                        "protocol",
+                        match files.protocol {
+                            FilesProtocol::S3 => "s3",
+                            FilesProtocol::Sftp => "sftp",
+                        }
+                        .to_owned(),
+                    ),
+                    (
+                        "endpoint",
+                        files
+                            .endpoint
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|endpoint| !endpoint.is_empty())
+                            .map(origin_key)
+                            .unwrap_or_default(),
+                    ),
+                    ("bucket", files.bucket.clone()),
+                ],
+            ),
+            Dial::Rest(rest) => {
+                TargetIdentity::new("rest", vec![("baseUrl", origin_key(&rest.base_url))])
+            }
+            Dial::Mongo(mongo) => TargetIdentity::new(
+                "mongodb",
+                vec![
+                    ("hosts", host_port_set_key(&mongo.hosts)),
+                    ("database", mongo.database.clone()),
+                ],
+            ),
+            Dial::Kafka(kafka) => TargetIdentity::new(
+                "kafka",
+                vec![(
+                    "bootstrapServers",
+                    host_port_set_key(&kafka.bootstrap_servers),
+                )],
+            ),
+            Dial::Sftp(sftp) => TargetIdentity::new(
+                "sftp",
+                vec![
+                    ("host", host_key(&sftp.host)),
+                    ("port", sftp.port.to_string()),
+                    (
+                        "hostKeyFingerprint",
+                        sftp.host_key_fingerprint.trim().to_owned(),
+                    ),
+                ],
+            ),
+            Dial::Sheets(_) => TargetIdentity::new("sheets", Vec::new()),
+        }
+    }
+}
+
+/// What a [`Dial`] points at: the adapter plus the fields that decide where
+/// the connector's credential is sent. Built only by
+/// [`Dial::target_identity`]; compared with `==`.
+///
+/// Holds host names and ports, never a credential (a `dial` cannot carry
+/// one: [`Dial::parse`] refuses unknown fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetIdentity {
+    adapter: &'static str,
+    parts: Vec<(&'static str, String)>,
+}
+
+impl TargetIdentity {
+    fn new(adapter: &'static str, parts: Vec<(&'static str, String)>) -> Self {
+        Self { adapter, parts }
+    }
+
+    /// The adapter this identity belongs to.
+    #[must_use]
+    pub fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+}
+
+/// Whether saving `new` over the stored `(stored_adapter, stored_dial)`
+/// re-points the connector (`SEC-14`): its stored credential would go to a
+/// target other than the one it was stored for.
+///
+/// # The first-configuration boundary
+///
+/// A connector created through `POST /api/connectors` has `adapter = NULL`
+/// and `dial = {}` until its first ingest spec is saved (`0033`'s column
+/// defaults). Saving that first dial is not a re-point: there is no stored
+/// target to move away from, and the console's create flow does exactly
+/// this. Anything else that cannot be compared fails closed and counts as a
+/// re-point: a stored `adapter` whose `dial` no longer parses for it, or an
+/// `adapter = NULL` row whose `dial` is not empty.
+///
+/// A pre-`0033` row (`adapter = NULL`) dials from its legacy `host` column
+/// until it has an ingest spec; that column is guarded separately, by
+/// `PATCH /api/connectors/{id}` refusing a `host` change for such a row.
+#[must_use]
+pub fn is_repoint(
+    stored_adapter: Option<&str>,
+    stored_dial: &serde_json::Value,
+    new: &Dial,
+) -> bool {
+    let Some(adapter) = stored_adapter else {
+        let empty = match stored_dial {
+            serde_json::Value::Null => true,
+            serde_json::Value::Object(map) => map.is_empty(),
+            _ => false,
+        };
+        return !empty;
+    };
+    match Dial::parse(adapter, stored_dial) {
+        Ok(stored) => stored.target_identity() != new.target_identity(),
+        Err(_) => true,
+    }
+}
+
+fn driver_key(driver: SqlDriver) -> &'static str {
+    match driver {
+        SqlDriver::Mysql => "mysql",
+        SqlDriver::Postgres => "postgres",
+        SqlDriver::Mssql => "mssql",
+        SqlDriver::Oracle => "oracle",
+    }
+}
+
+/// A host name as compared: trimmed and lower-cased.
+fn host_key(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
+}
+
+/// Split `authority` (no userinfo) into a lower-cased host and an optional
+/// numeric port. An IPv6 literal keeps its brackets. A port that is not a
+/// number leaves the whole text as the host, so it still takes part in the
+/// comparison.
+fn split_authority(authority: &str) -> (String, Option<u16>) {
+    let authority = authority.trim().to_ascii_lowercase();
+    let port_split = if authority.starts_with('[') {
+        authority
+            .rfind("]:")
+            .map(|index| (&authority[..=index], &authority[index + 2..]))
+    } else {
+        authority.rsplit_once(':')
+    };
+    match port_split.and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?))) {
+        Some((host, port)) => (host.to_owned(), Some(port)),
+        None => (authority, None),
+    }
+}
+
+/// `scheme://host:port` of a URL, with the scheme's default port filled in
+/// and userinfo, path, query and fragment dropped. Text that is not a
+/// `scheme://` URL is compared as it is (lower-cased), so it can only ever
+/// match itself.
+fn origin_key(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return format!("raw:{}", raw.to_ascii_lowercase());
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host_port)| host_port);
+    let (host, port) = split_authority(host_port);
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    match port.or(default_port) {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+/// The `host:port` entries of a `mongodb` or `kafka` dial as one comparable
+/// string: order and repeats do not matter, host case does not matter.
+fn host_port_set_key(entries: &[String]) -> String {
+    let mut keys: Vec<String> = entries
+        .iter()
+        .map(|entry| match split_authority(entry) {
+            (host, Some(port)) => format!("{host}:{port}"),
+            (host, None) => host,
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys.join(",")
 }
 
 /// Deserialize `raw` into `T`, wrapping a failure as
@@ -725,9 +971,10 @@ pub enum IngestSpecError {
 
 /// How one run's rows meet the Bronze table they land in. Mirrors
 /// `LOAD_MODES` in `dagster/dispar_orchestrate/adapters/sink.py`, which is
-/// what acts on it; the wire form is the lowercase name.
+/// what acts on it; the wire form is the snake-case name (`SRC-10`: the two
+/// deduplicating modes are `replace_dedup` and `incremental_dedup`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LoadMode {
     /// Overwrite the table with what the source returns now.
     Replace,
@@ -735,6 +982,40 @@ pub enum LoadMode {
     Append,
     /// Add only rows beyond the cursor column's last seen value.
     Incremental,
+    /// Overwrite the table with what the source returns now, keeping one
+    /// row per [`SourceObject::primary_key`] (`SRC-10`).
+    ReplaceDedup,
+    /// Merge the rows beyond the cursor column's last seen value into the
+    /// table on [`SourceObject::primary_key`] (`SRC-10`).
+    IncrementalDedup,
+    /// Keep every version of a row: a changed row is closed and a new
+    /// version added, each with the time of the load that saw it
+    /// (`SRC-10` decisions 1, 9 and 10). Reads the whole source on every
+    /// run, so it takes a key and no cursor.
+    History,
+}
+
+impl LoadMode {
+    /// Whether the mode keeps one row per key, and so needs a key.
+    #[must_use]
+    pub const fn is_dedup(self) -> bool {
+        matches!(self, Self::ReplaceDedup | Self::IncrementalDedup)
+    }
+
+    /// Whether the mode identifies rows by [`SourceObject::primary_key`]: the
+    /// deduplicating modes and `history`. A column of that key removed at the
+    /// source breaks the table under every one of them (`SRC-10` decision 6).
+    #[must_use]
+    pub const fn needs_key(self) -> bool {
+        self.is_dedup() || matches!(self, Self::History)
+    }
+
+    /// Whether the mode reads only rows beyond a cursor, and so needs a
+    /// cursor column and an adapter that can filter by one.
+    #[must_use]
+    pub const fn is_incremental(self) -> bool {
+        matches!(self, Self::Incremental | Self::IncrementalDedup)
+    }
 }
 
 /// One object (table, endpoint, sheet range) an ingest job targets.
@@ -750,6 +1031,11 @@ pub struct SourceObject {
     /// job then replaces.
     #[serde(default)]
     pub load_mode: Option<LoadMode>,
+    /// The columns that identify one row, for the deduplicating modes
+    /// (`SRC-10`). Kept on the object whatever the mode, so the console
+    /// can hold on to a detected key while the user switches modes.
+    #[serde(default)]
+    pub primary_key: Option<Vec<String>>,
     /// The Bronze target this object lands at.
     pub target: String,
 }
@@ -758,34 +1044,107 @@ pub struct SourceObject {
 /// identifier (`PostgreSQL` 63, `MySQL` 64, SQL Server 128).
 const MAX_INCREMENTAL_KEY_LEN: usize = 128;
 
+/// The most columns a `primaryKey` may name (`SRC-10`).
+const MAX_PRIMARY_KEY_COLUMNS: usize = 16;
+
+/// The longest column name in a `primaryKey`, as for the cursor column.
+const MAX_PRIMARY_KEY_COLUMN_LEN: usize = 128;
+
+/// The columns a `history` table adds (`SRC-10` decision 1). Mirrors
+/// `HISTORY_COLUMNS` in `dagster/dispar_orchestrate/adapters/history.py`.
+const HISTORY_COLUMNS: [&str; 4] = ["_valid_from", "_valid_to", "_is_current", "_row_hash"];
+
 /// Why a spec's `sourceObjects` cannot be ingested as written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidLoadMode {
     /// `loadMode` is not a [`LoadMode`].
-    #[error("source object {name:?} has loadMode {mode:?}; use replace, append or incremental")]
+    #[error(
+        "source object {name:?} has loadMode {mode:?}; use replace, append, incremental, \
+         replace_dedup, incremental_dedup or history"
+    )]
     Unknown {
         /// The source object's name.
         name: String,
         /// The offending value, as sent.
         mode: String,
     },
-    /// `incremental` for an adapter the ingest job does not run it for.
+    /// `incremental` or `incremental_dedup` for an adapter the ingest job
+    /// does not run it for.
     #[error(
-        "source object {name:?} asks for loadMode incremental, which only SQL connectors support"
+        "source object {name:?} asks for an incremental loadMode, which only SQL connectors support"
     )]
     NotForAdapter {
         /// The source object's name.
         name: String,
     },
-    /// `incremental` without a usable cursor column.
+    /// `incremental` or `incremental_dedup` without a usable cursor column.
     #[error(
-        "source object {name:?} asks for loadMode incremental, which needs incrementalKey: the \
+        "source object {name:?} asks for an incremental loadMode, which needs incrementalKey: the \
          column that marks new rows"
     )]
     NoCursor {
         /// The source object's name.
         name: String,
     },
+    /// `replace_dedup` or `incremental_dedup` without a key (`SRC-10`).
+    #[error(
+        "source object {name:?} asks for a deduplicating loadMode, which needs primaryKey: the \
+         columns that identify one row"
+    )]
+    NoKey {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with an `incrementalKey` (`SRC-10` decision 10): this version
+    /// reads the whole source on every run.
+    #[error(
+        "source object {name:?} asks for loadMode history, which reads the whole source on every \
+         run and takes no incrementalKey"
+    )]
+    HistoryHasCursor {
+        /// The source object's name.
+        name: String,
+    },
+    /// `history` with a key column named like one of the columns the mode adds
+    /// to the table (`SRC-10` decision 1).
+    #[error(
+        "source object {name:?} asks for loadMode history, whose primaryKey cannot name _valid_from, \
+         _valid_to, _is_current or _row_hash: the mode adds those columns"
+    )]
+    ReservedKeyColumn {
+        /// The source object's name.
+        name: String,
+    },
+    /// A `primaryKey` that is not a short list of plain, distinct column
+    /// names (`SRC-10`). Checked whatever the mode.
+    #[error(
+        "source object {name:?} has a primaryKey that is not a list of at most 16 distinct, \
+         non-blank column names of at most 128 characters without control characters"
+    )]
+    BadKey {
+        /// The source object's name.
+        name: String,
+    },
+}
+
+/// Whether `columns` is a key the loader can use: 1 to
+/// [`MAX_PRIMARY_KEY_COLUMNS`] distinct names, none blank, none longer than
+/// [`MAX_PRIMARY_KEY_COLUMN_LEN`], none with a control character. A name is
+/// compared and sent as written, so no trimming hides a difference between
+/// two columns.
+fn key_is_usable(columns: &[serde_json::Value]) -> bool {
+    if columns.is_empty() || columns.len() > MAX_PRIMARY_KEY_COLUMNS {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    columns.iter().all(|column| {
+        column.as_str().is_some_and(|name| {
+            !name.trim().is_empty()
+                && name.len() <= MAX_PRIMARY_KEY_COLUMN_LEN
+                && !name.chars().any(char::is_control)
+                && seen.insert(name)
+        })
+    })
 }
 
 /// Check each source object's load mode, the one part of `sourceObjects`
@@ -796,8 +1155,10 @@ pub enum InvalidLoadMode {
 /// # Errors
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
-/// `loadMode`, or with `incremental` on a non-`sql` adapter or without a
-/// cursor column that is a plain name of sensible length.
+/// `loadMode`, with an incremental mode on a non-`sql` adapter or without a
+/// cursor column that is a plain name of sensible length, with a
+/// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
+/// not a usable key.
 pub fn validate_load_modes(
     adapter: &str,
     source_objects: &serde_json::Value,
@@ -811,6 +1172,16 @@ pub fn validate_load_modes(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // SRC-10: a malformed `primaryKey` is refused whatever the mode, so a
+        // bad key cannot sit in a spec until the user switches to a mode that
+        // reads it. A well-formed one on a mode that does not use it is
+        // accepted and ignored: the console keeps the detected key on the
+        // table while the user switches modes.
+        let has_key = match object.get("primaryKey") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Array(columns)) if key_is_usable(columns) => true,
+            Some(_) => return Err(InvalidLoadMode::BadKey { name }),
+        };
         let mode = match object.get("loadMode") {
             None | Some(serde_json::Value::Null) => continue,
             Some(value) => match LoadMode::deserialize(value) {
@@ -825,7 +1196,32 @@ pub fn validate_load_modes(
                 }
             },
         };
-        if mode != LoadMode::Incremental {
+        if mode.needs_key() && !has_key {
+            return Err(InvalidLoadMode::NoKey { name });
+        }
+        if mode == LoadMode::History {
+            // `SRC-10` decision 10: no cursor in this version. A blank cursor
+            // is what the console sends when the field is empty, so only a
+            // value is refused.
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .map_or("", str::trim);
+            if !cursor.is_empty() {
+                return Err(InvalidLoadMode::HistoryHasCursor { name });
+            }
+            let names_reserved = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|column| HISTORY_COLUMNS.contains(&column));
+            if names_reserved {
+                return Err(InvalidLoadMode::ReservedKeyColumn { name });
+            }
+        }
+        if !mode.is_incremental() {
             continue;
         }
         if adapter != "sql" {
@@ -843,6 +1239,94 @@ pub fn validate_load_modes(
         }
     }
     Ok(())
+}
+
+/// The key columns of every object whose stored load mode has a key (the
+/// deduplicating modes and `history`, [`LoadMode::needs_key`]), by
+/// object name (`SRC-10` decision 6). Read by the schema-change code from the
+/// STORED spec, never from what the orchestrator reports, so a request cannot
+/// claim a table has no key. Lenient: an object [`validate_load_modes`] would
+/// refuse cannot be in a stored spec, and a malformed one simply has no entry
+/// (treated as non-deduplicating, as before `SRC-10`).
+#[must_use]
+pub fn dedup_keys(
+    source_objects: &serde_json::Value,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut keys = std::collections::HashMap::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let is_dedup = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(LoadMode::needs_key);
+        if !is_dedup {
+            continue;
+        }
+        let key: Vec<String> = object
+            .get("primaryKey")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|column| column.as_str().map(str::to_owned))
+            .collect();
+        keys.insert(name.to_owned(), key);
+    }
+    keys
+}
+
+/// `text` as a lower-case SQL-safe slug: every run of characters outside
+/// `[a-z0-9]` becomes one `_`, and leading and trailing `_` are dropped.
+fn bronze_slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut separator_pending = false;
+    for c in text.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if separator_pending && !out.is_empty() {
+                out.push('_');
+            }
+            separator_pending = false;
+            out.push(c);
+        } else {
+            separator_pending = true;
+        }
+    }
+    out
+}
+
+/// The Bronze table a source object lands in unless a person renames it:
+/// `<connector>_<table>` (`SRC-8` task 8, decision D2).
+///
+/// Every connector writes into the same flat `bronze` namespace, so two
+/// connectors that both have an `orders` table would otherwise append into
+/// one `bronze.orders`. `object_name` is `schema.table`; only its last
+/// dot-separated part is used.
+///
+/// THE SAME RULE AS THE CONSOLE'S TABLE PICKER: this is a port of
+/// `defaultTarget` in `src/features/connectors/connector-ingest-panel.tsx`.
+/// Keep both in step; each has a test that pins the same three examples
+/// (`northwind`/`public.orders`, `Northwind DB!`/`public.Order Details`,
+/// `2024 sales`/`t`).
+#[must_use]
+pub fn default_bronze_target(connector_name: &str, object_name: &str) -> String {
+    let table = bronze_slug(object_name.rsplit('.').next().unwrap_or(object_name));
+    let prefix = bronze_slug(connector_name);
+    let joined = [prefix, table]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let joined = if joined.is_empty() {
+        "table".to_owned()
+    } else {
+        joined
+    };
+    if joined.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("t_{joined}")
+    } else {
+        joined
+    }
 }
 
 /// This [`SourceObject`] failed application-level validation.
@@ -1100,6 +1584,35 @@ mod tests {
 
     use super::*;
 
+    /// The same examples `connector-ingest-panel.test.tsx` pins for
+    /// `defaultTarget` (the console's table picker): the two must agree.
+    #[test]
+    fn the_default_bronze_target_matches_the_console_pickers_examples() {
+        assert_eq!(
+            default_bronze_target("northwind", "public.orders"),
+            "northwind_orders"
+        );
+        assert_eq!(
+            default_bronze_target("Northwind DB!", "public.Order Details"),
+            "northwind_db_order_details"
+        );
+        assert_eq!(default_bronze_target("2024 sales", "t"), "t_2024_sales_t");
+    }
+
+    #[test]
+    fn the_default_bronze_target_falls_back_the_way_the_picker_does() {
+        // No usable connector name: the table alone.
+        assert_eq!(default_bronze_target("!!!", "dbo.Orders"), "orders");
+        // No usable table part: the connector alone.
+        assert_eq!(default_bronze_target("shop", "public."), "shop");
+        // Nothing usable at all.
+        assert_eq!(default_bronze_target("", "..."), "table");
+        // A name without a schema is its own table part.
+        assert_eq!(default_bronze_target("shop", "orders"), "shop_orders");
+        // Runs of separators collapse and edges are trimmed.
+        assert_eq!(default_bronze_target("  a--b  ", "s.__x__y__"), "a_b_x_y");
+    }
+
     #[test]
     fn sql_dial_parses_the_documented_shape() {
         let json = serde_json::json!({
@@ -1233,6 +1746,7 @@ mod tests {
             name: "public.orders".to_owned(),
             incremental_key: None,
             load_mode: None,
+            primary_key: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1245,6 +1759,7 @@ mod tests {
             name: "public.orders".to_owned(),
             incremental_key: Some("updated_at".to_owned()),
             load_mode: Some(LoadMode::Incremental),
+            primary_key: None,
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
@@ -1308,6 +1823,254 @@ mod tests {
             ),
             Err(InvalidLoadMode::NotForAdapter { .. })
         ));
+    }
+
+    /// `SRC-10` decision 6: only objects in a deduplicating mode have a key
+    /// entry; a key kept on a table in another mode is not one.
+    #[test]
+    fn dedup_keys_lists_only_the_deduplicating_objects() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+            {"name": "b", "target": "b", "loadMode": "incremental_dedup", "primaryKey": ["x", "y"],
+             "incrementalKey": "u"},
+            {"name": "c", "target": "c", "loadMode": "replace", "primaryKey": ["id"]},
+            {"name": "d", "target": "d", "primaryKey": ["id"]},
+            {"target": "e", "loadMode": "replace_dedup", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["a"], vec!["id".to_owned()]);
+        assert_eq!(keys["b"], vec!["x".to_owned(), "y".to_owned()]);
+        assert!(dedup_keys(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn source_object_reads_the_deduplicating_modes_and_a_primary_key() {
+        let object: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders", "loadMode": "incremental_dedup",
+            "incrementalKey": "updated_at", "primaryKey": ["id", "line"]
+        }))
+        .expect("valid");
+        assert_eq!(object.load_mode, Some(LoadMode::IncrementalDedup));
+        assert_eq!(
+            object.primary_key,
+            Some(vec!["id".to_owned(), "line".to_owned()])
+        );
+        let replace: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"]
+        }))
+        .expect("valid");
+        assert_eq!(replace.load_mode, Some(LoadMode::ReplaceDedup));
+        let none: SourceObject =
+            serde_json::from_value(serde_json::json!({ "name": "a", "target": "a" }))
+                .expect("valid");
+        assert_eq!(none.primary_key, None);
+    }
+
+    #[test]
+    fn validate_load_modes_accepts_a_deduplicating_mode_with_a_key() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"] },
+            { "name": "b", "target": "b", "loadMode": "incremental_dedup",
+              "incrementalKey": "updated_at", "primaryKey": ["id", "line"] },
+        ]);
+        assert_eq!(validate_load_modes("sql", &objects), Ok(()));
+        // `replace_dedup` runs on every batch adapter, `incremental_dedup` on `sql` only.
+        let replace = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "replace_dedup", "primaryKey": ["id"] },
+        ]);
+        assert_eq!(validate_load_modes("files", &replace), Ok(()));
+    }
+
+    #[test]
+    fn validate_load_modes_refuses_a_deduplicating_mode_without_a_key() {
+        for mode in ["replace_dedup", "incremental_dedup"] {
+            for object in [
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u" }),
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u", "primaryKey": [] }),
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": mode, "incrementalKey": "u", "primaryKey": null }),
+            ] {
+                assert!(
+                    matches!(
+                        validate_load_modes("sql", &serde_json::json!([object])),
+                        Err(InvalidLoadMode::NoKey { .. } | InvalidLoadMode::BadKey { .. })
+                    ),
+                    "{mode} without a key must be refused"
+                );
+            }
+        }
+        assert!(matches!(
+            validate_load_modes(
+                "sql",
+                &serde_json::json!([{ "name": "a", "target": "a", "loadMode": "replace_dedup" }])
+            ),
+            Err(InvalidLoadMode::NoKey { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_load_modes_requires_sql_and_a_cursor_for_incremental_dedup_as_for_incremental() {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        assert!(matches!(
+            check(
+                "rest",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "incrementalKey": "id", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                    "incrementalKey": " ", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::NoCursor { .. })
+        ));
+    }
+
+    /// `SRC-10` sixth pass, decisions 1 and 10: `history` needs a key, runs on every
+    /// batch adapter, takes no cursor and cannot key on a column it adds.
+    #[test]
+    fn validate_load_modes_for_history_needs_a_key_takes_no_cursor_and_keeps_its_own_columns_free()
+    {
+        let check = |adapter: &str, object: serde_json::Value| {
+            validate_load_modes(adapter, &serde_json::json!([object]))
+        };
+        let history = |extra: serde_json::Value| {
+            let mut object =
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" });
+            for (field, value) in extra.as_object().into_iter().flatten() {
+                object[field] = value.clone();
+            }
+            object
+        };
+        for adapter in ["sql", "files", "rest", "mongodb", "sftp"] {
+            assert_eq!(
+                check(
+                    adapter,
+                    history(serde_json::json!({ "primaryKey": ["id", "line"] }))
+                ),
+                Ok(()),
+                "history on {adapter}"
+            );
+        }
+        // A blank cursor is what an empty console field sends: not a cursor.
+        assert_eq!(
+            check(
+                "sql",
+                history(serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "  " }))
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            check("sql", history(serde_json::json!({}))),
+            Err(InvalidLoadMode::NoKey { .. })
+        ));
+        assert!(matches!(
+            check("sql", history(serde_json::json!({ "primaryKey": [] }))),
+            Err(InvalidLoadMode::BadKey { .. })
+        ));
+        assert!(matches!(
+            check(
+                "sql",
+                history(
+                    serde_json::json!({ "primaryKey": ["id"], "incrementalKey": "updated_at" })
+                )
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        for reserved in ["_valid_from", "_valid_to", "_is_current", "_row_hash"] {
+            assert!(
+                matches!(
+                    check(
+                        "sql",
+                        history(serde_json::json!({ "primaryKey": ["id", reserved] }))
+                    ),
+                    Err(InvalidLoadMode::ReservedKeyColumn { .. })
+                ),
+                "{reserved} in the key"
+            );
+        }
+        // Another mode may keep such a name in its key: only `history` adds the columns.
+        assert_eq!(
+            check(
+                "sql",
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "replace_dedup",
+                    "primaryKey": ["_valid_from"] })
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-10` decision 6 for `history`: its key is read like a dedup table's, so a
+    /// removed key column waits and cannot be approved (the same code path).
+    #[test]
+    fn dedup_keys_lists_a_history_object_with_its_key() {
+        let keys = dedup_keys(&serde_json::json!([
+            {"name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]},
+            {"name": "r", "target": "r", "loadMode": "replace", "primaryKey": ["id"]},
+        ]));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get("h"), Some(&vec!["id".to_owned()]));
+        let object = SourceObject::deserialize(&serde_json::json!({
+            "name": "h", "target": "h", "loadMode": "history", "primaryKey": ["id"]
+        }))
+        .expect("valid");
+        assert_eq!(object.load_mode, Some(LoadMode::History));
+        assert!(LoadMode::History.needs_key() && !LoadMode::History.is_dedup());
+        assert!(!LoadMode::History.is_incremental());
+    }
+
+    #[test]
+    fn validate_load_modes_refuses_a_primary_key_that_is_not_a_short_list_of_plain_distinct_names()
+    {
+        let too_many: Vec<String> = (0..17).map(|n| format!("c{n}")).collect();
+        let sixteen: Vec<String> = (0..16).map(|n| format!("c{n}")).collect();
+        let long = "x".repeat(129);
+        let longest = "x".repeat(128);
+        let bad = |key: serde_json::Value| {
+            matches!(
+                validate_load_modes(
+                    "sql",
+                    &serde_json::json!([{ "name": "a", "target": "a", "primaryKey": key }])
+                ),
+                Err(InvalidLoadMode::BadKey { .. })
+            )
+        };
+        assert!(bad(serde_json::json!(too_many)), "17 columns");
+        assert!(bad(serde_json::json!([])), "no column");
+        assert!(bad(serde_json::json!([long])), "129 characters");
+        assert!(bad(serde_json::json!([""])), "empty");
+        assert!(bad(serde_json::json!(["  "])), "blank");
+        assert!(bad(serde_json::json!(["a\nb"])), "control character");
+        assert!(bad(serde_json::json!(["id", "id"])), "repeated");
+        assert!(bad(serde_json::json!(["id", 7])), "not a string");
+        assert!(bad(serde_json::json!("id")), "not a list");
+        assert!(!bad(serde_json::json!(sixteen)), "16 columns are allowed");
+        assert!(
+            !bad(serde_json::json!([longest])),
+            "128 characters are allowed"
+        );
+    }
+
+    #[test]
+    fn validate_load_modes_accepts_and_ignores_a_primary_key_on_a_mode_that_does_not_use_it() {
+        // The console keeps the key it detected while the user switches modes.
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "append", "primaryKey": ["id"] },
+            { "name": "b", "target": "b", "primaryKey": ["id"] },
+        ]);
+        assert_eq!(validate_load_modes("sql", &objects), Ok(()));
     }
 
     #[test]
@@ -1683,5 +2446,445 @@ mod tests {
         let dial: SqlDial = serde_json::from_value(json).expect("mysql parses");
         assert!(dial.ssl_server_cert_dn.is_none());
         assert_eq!(dial.driver, SqlDriver::Mysql);
+    }
+}
+
+/// `SEC-14` task 1: [`Dial::target_identity`] and [`is_repoint`].
+#[cfg(test)]
+mod target_identity_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::{Value, json};
+
+    use super::{Dial, is_repoint};
+
+    fn parse(adapter: &str, dial: &Value) -> Dial {
+        Dial::parse(adapter, dial).expect("a valid dial")
+    }
+
+    /// `base` with `field` set to `value`, parsed for `adapter`.
+    fn with(adapter: &str, base: &Value, field: &str, value: Value) -> Dial {
+        let mut changed = base.clone();
+        changed[field] = value;
+        parse(adapter, &changed)
+    }
+
+    fn same(adapter: &str, base: &Value, field: &str, value: Value) -> bool {
+        parse(adapter, base).target_identity()
+            == with(adapter, base, field, value).target_identity()
+    }
+
+    fn sql() -> Value {
+        json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader"
+        })
+    }
+
+    #[test]
+    fn a_sql_dial_is_re_pointed_by_driver_host_port_or_database() {
+        let base = sql();
+        assert!(!same("sql", &base, "driver", json!("mysql")));
+        assert!(!same("sql", &base, "host", json!("other.internal")));
+        assert!(!same("sql", &base, "port", json!(5433)));
+        assert!(!same("sql", &base, "database", json!("billing")));
+    }
+
+    #[test]
+    fn a_sql_dial_keeps_its_target_when_user_or_ssl_settings_change() {
+        let base = sql();
+        assert!(same("sql", &base, "user", json!("someone_else")));
+        assert!(same("sql", &base, "sslMode", json!("require")));
+        assert!(same("sql", &base, "sslServerCertDn", json!("CN=db")));
+    }
+
+    #[test]
+    fn host_names_compare_case_insensitively() {
+        assert!(same("sql", &sql(), "host", json!("DB.Internal")));
+    }
+
+    #[test]
+    fn a_sql_port_is_always_explicit_so_a_different_port_is_a_different_target() {
+        // The shape has no absent port: there is no default to compare
+        // against, and the usual port is not treated as one.
+        assert!(!same("sql", &sql(), "port", json!(5433)));
+        let missing = json!({
+            "driver": "postgres", "host": "db.internal",
+            "database": "orders", "user": "reader"
+        });
+        assert!(Dial::parse("sql", &missing).is_err());
+    }
+
+    #[test]
+    fn a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only() {
+        let base = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "slot_a", "publicationName": "pub_a"
+        });
+        assert!(!same("cdc", &base, "driver", json!("mysql")));
+        assert!(!same("cdc", &base, "host", json!("other.internal")));
+        assert!(!same("cdc", &base, "port", json!(5433)));
+        assert!(!same("cdc", &base, "database", json!("billing")));
+        assert!(same("cdc", &base, "user", json!("someone_else")));
+        assert!(same("cdc", &base, "slotName", json!("slot_b")));
+        assert!(same("cdc", &base, "publicationName", json!("pub_b")));
+        assert!(same("cdc", &base, "serverId", json!(7)));
+    }
+
+    #[test]
+    fn changing_the_adapter_is_a_re_point_even_on_the_same_host() {
+        let cdc = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert_ne!(
+            parse("sql", &sql()).target_identity(),
+            parse("cdc", &cdc).target_identity()
+        );
+    }
+
+    fn files() -> Value {
+        json!({
+            "protocol": "s3", "endpoint": "https://store.internal:9000",
+            "bucket": "landing", "format": "csv"
+        })
+    }
+
+    #[test]
+    fn a_files_dial_is_re_pointed_by_protocol_endpoint_or_bucket() {
+        let base = files();
+        assert!(!same("files", &base, "protocol", json!("sftp")));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://other.internal:9000")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("http://store.internal:9000")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:9001")
+        ));
+        assert!(!same("files", &base, "bucket", json!("other")));
+    }
+
+    #[test]
+    fn a_files_dial_keeps_its_target_when_prefix_format_or_region_change() {
+        let base = files();
+        assert!(same("files", &base, "prefix", json!("2026/")));
+        assert!(same("files", &base, "format", json!("parquet")));
+        assert!(same("files", &base, "region", json!("eu-west-1")));
+    }
+
+    #[test]
+    fn a_files_endpoint_is_compared_by_origin_with_the_default_port_applied() {
+        let base = json!({
+            "protocol": "s3", "endpoint": "https://store.internal",
+            "bucket": "landing", "format": "csv"
+        });
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:443")
+        ));
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("HTTPS://Store.Internal/")
+        ));
+        assert!(same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal/some/path")
+        ));
+        assert!(!same(
+            "files",
+            &base,
+            "endpoint",
+            json!("https://store.internal:80")
+        ));
+    }
+
+    #[test]
+    fn a_files_dial_with_no_endpoint_differs_from_one_that_names_an_endpoint() {
+        let none = json!({ "protocol": "s3", "bucket": "landing", "format": "csv" });
+        assert!(!same(
+            "files",
+            &none,
+            "endpoint",
+            json!("https://store.internal")
+        ));
+        // An empty endpoint is the same as none.
+        assert!(same("files", &none, "endpoint", json!("  ")));
+    }
+
+    fn rest() -> Value {
+        json!({
+            "baseUrl": "https://api.example.com/v1",
+            "auth": { "type": "bearer" },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        })
+    }
+
+    #[test]
+    fn a_rest_dial_is_re_pointed_by_scheme_host_or_port_of_the_base_url() {
+        let base = rest();
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("http://api.example.com/v1")
+        ));
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.other.com/v1")
+        ));
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com:8443/v1")
+        ));
+    }
+
+    #[test]
+    fn a_rest_base_url_default_port_is_the_same_target_and_other_paths_too() {
+        let base = rest();
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com:443/v1")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://API.example.com")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com/v2/orders?x=1")
+        ));
+        let http = json!({
+            "baseUrl": "http://api.example.com",
+            "auth": { "type": "bearer" },
+            "pagination": { "type": "none" },
+            "endpoints": []
+        });
+        assert!(same(
+            "rest",
+            &http,
+            "baseUrl",
+            json!("http://api.example.com:80")
+        ));
+        assert!(!same(
+            "rest",
+            &http,
+            "baseUrl",
+            json!("http://api.example.com:443")
+        ));
+    }
+
+    #[test]
+    fn a_rest_base_url_userinfo_does_not_hide_the_host() {
+        let base = rest();
+        assert!(!same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://api.example.com@evil.example/")
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "baseUrl",
+            json!("https://someone@api.example.com/")
+        ));
+    }
+
+    #[test]
+    fn a_rest_dial_keeps_its_target_when_auth_pagination_or_endpoints_change() {
+        let base = rest();
+        assert!(same("rest", &base, "auth", json!({ "type": "basic" })));
+        assert!(same(
+            "rest",
+            &base,
+            "pagination",
+            json!({ "type": "page", "param": "p" })
+        ));
+        assert!(same(
+            "rest",
+            &base,
+            "endpoints",
+            json!([{ "path": "/orders", "recordsPath": null }])
+        ));
+    }
+
+    fn mongo() -> Value {
+        json!({
+            "hosts": ["m1.internal:27017", "m2.internal:27017"],
+            "database": "shop", "username": "reader", "directConnection": true
+        })
+    }
+
+    #[test]
+    fn a_mongodb_dial_is_re_pointed_by_its_host_set_or_database() {
+        let base = mongo();
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27017"])
+        ));
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27017", "m3.internal:27017"])
+        ));
+        assert!(!same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["m1.internal:27018", "m2.internal:27017"])
+        ));
+        assert!(!same("mongodb", &base, "database", json!("billing")));
+    }
+
+    #[test]
+    fn a_mongodb_dial_keeps_its_target_for_order_case_and_username() {
+        let base = mongo();
+        assert!(same(
+            "mongodb",
+            &base,
+            "hosts",
+            json!(["M2.internal:27017", "m1.internal:27017"])
+        ));
+        assert!(same("mongodb", &base, "username", json!("someone_else")));
+    }
+
+    fn kafka() -> Value {
+        json!({
+            "bootstrapServers": ["k1.internal:9092", "k2.internal:9092"],
+            "topic": "orders", "auth": { "type": "none" },
+            "groupId": "g", "microBatchSeconds": 30
+        })
+    }
+
+    #[test]
+    fn a_kafka_dial_is_re_pointed_by_its_bootstrap_servers_only() {
+        let base = kafka();
+        assert!(!same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["k1.internal:9092"])
+        ));
+        assert!(!same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["k1.internal:9093", "k2.internal:9092"])
+        ));
+        assert!(same(
+            "kafka",
+            &base,
+            "bootstrapServers",
+            json!(["K2.internal:9092", "k1.internal:9092"])
+        ));
+        assert!(same("kafka", &base, "topic", json!("other")));
+        assert!(same("kafka", &base, "groupId", json!("other")));
+        assert!(same("kafka", &base, "microBatchSeconds", json!(60)));
+        assert!(same(
+            "kafka",
+            &base,
+            "auth",
+            json!({ "type": "sasl_plain", "username": "u" })
+        ));
+    }
+
+    fn sftp() -> Value {
+        json!({
+            "host": "sftp.internal", "port": 22, "user": "reader",
+            "hostKeyFingerprint": "SHA256:abc", "path": "/inbox",
+            "fileFormat": "csv", "auth": { "type": "password" }
+        })
+    }
+
+    #[test]
+    fn an_sftp_dial_is_re_pointed_by_host_port_or_host_key() {
+        let base = sftp();
+        assert!(!same("sftp", &base, "host", json!("other.internal")));
+        assert!(!same("sftp", &base, "port", json!(2222)));
+        assert!(!same(
+            "sftp",
+            &base,
+            "hostKeyFingerprint",
+            json!("SHA256:xyz")
+        ));
+        assert!(same("sftp", &base, "host", json!("SFTP.internal")));
+        assert!(same("sftp", &base, "user", json!("someone_else")));
+        assert!(same("sftp", &base, "path", json!("/outbox")));
+        assert!(same("sftp", &base, "fileFormat", json!("json")));
+        assert!(same("sftp", &base, "auth", json!({ "type": "public_key" })));
+    }
+
+    #[test]
+    fn a_sheets_dial_has_no_target_to_change() {
+        let base = json!({ "spreadsheetId": "abc", "ranges": ["A1:B2"] });
+        assert!(same("sheets", &base, "spreadsheetId", json!("def")));
+        assert!(same("sheets", &base, "ranges", json!(["C1:D2"])));
+    }
+
+    #[test]
+    fn the_first_configuration_of_a_connector_is_not_a_re_point() {
+        let new = parse("sql", &sql());
+        assert!(!is_repoint(None, &json!({}), &new));
+        assert!(!is_repoint(None, &Value::Null, &new));
+    }
+
+    #[test]
+    fn a_stored_target_that_cannot_be_compared_counts_as_a_re_point() {
+        let new = parse("sql", &sql());
+        // No adapter, but a dial: unknown shape.
+        assert!(is_repoint(None, &sql(), &new));
+        // An adapter whose stored dial no longer parses for it.
+        assert!(is_repoint(Some("sql"), &json!({}), &new));
+        assert!(is_repoint(Some("rest"), &sql(), &new));
+    }
+
+    #[test]
+    fn a_stored_target_is_compared_with_the_new_one() {
+        let stored = sql();
+        assert!(!is_repoint(Some("sql"), &stored, &parse("sql", &stored)));
+        assert!(!is_repoint(
+            Some("sql"),
+            &stored,
+            &with("sql", &stored, "user", json!("someone_else"))
+        ));
+        assert!(is_repoint(
+            Some("sql"),
+            &stored,
+            &with("sql", &stored, "host", json!("other.internal"))
+        ));
+        assert!(is_repoint(Some("sql"), &stored, &parse("rest", &rest())));
     }
 }

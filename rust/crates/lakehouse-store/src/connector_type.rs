@@ -5,10 +5,12 @@
 //! A `supported = false` row is listed honestly rather than omitted or
 //! faked: the wizard can show a roadmap entry without claiming the type
 //! works (AGENTS.md rule 2 — unsupported is `supported: false` with an
-//! honest message, never a fabricated success). Every `supported = false`
-//! row has `adapter = NULL`, since there is no
+//! honest message, never a fabricated success). Most `supported = false`
+//! rows have `adapter = NULL`, since there is no
 //! [`crate::ingest_spec::Dial`] shape yet for a type this build cannot
-//! dial.
+//! dial. Google Sheets is the exception (`SRC-6` F5, migration `0062`): it
+//! keeps `adapter = 'sheets'` so connectors already created with it still
+//! open, and carries an `unsupported_reason` the wizard shows.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -31,6 +33,10 @@ pub struct ConnectorType {
     /// A documentation link, when one has actually been published. `None`
     /// rather than a fabricated URL (AGENTS.md rule 2).
     pub docs_url: Option<String>,
+    /// Why a `supported = false` type cannot be used, shown on its tile
+    /// (`SRC-6` F5). `None` for supported types and for roadmap rows that
+    /// have no specific reason.
+    pub unsupported_reason: Option<String>,
 }
 
 /// List every connector type, ordered by `name`.
@@ -40,7 +46,8 @@ pub struct ConnectorType {
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_connector_types(pool: &PgPool) -> Result<Vec<ConnectorType>, StoreError> {
     let rows = sqlx::query_as(
-        "SELECT name, adapter, supported, docs_url FROM connector_type ORDER BY name",
+        "SELECT name, adapter, supported, docs_url, unsupported_reason \
+         FROM connector_type ORDER BY name",
     )
     .fetch_all(pool)
     .await?;

@@ -55,6 +55,29 @@ export function tableNameProblem(name: string): string | null {
   return null
 }
 
+/**
+ * The specific reason `name` breaks the table-name rule, in a sentence, or
+ * `null` when it does not break it. For the hint under the field, which turns
+ * from the rule into this; `tableNameProblem` stays the judge (this returns
+ * `null` exactly when it does) and its rule sentence is the fallback for a
+ * break none of the checks below names.
+ */
+export function tableNameFault(name: string): string | null {
+  if (tableNameProblem(name) === null) return null
+  if (name.length > MAX_TABLE_NAME_CHARS) {
+    return `The name has ${name.length} characters; the most is ${MAX_TABLE_NAME_CHARS}.`
+  }
+  if (/^[0-9]/.test(name)) return "A name cannot start with a digit; it starts with a lower-case letter."
+  if (name.startsWith("_")) return "A name cannot start with an underscore; it starts with a lower-case letter."
+  if (/[A-Z]/.test(name)) return "Upper-case letters are not allowed: use lower case."
+  if (/\s/.test(name)) return "Spaces are not allowed: use an underscore."
+  const odd = [...name].find((ch) => !/[a-z0-9_]/.test(ch))
+  if (odd !== undefined) return `"${odd}" is not allowed: use lower-case letters, digits and underscores.`
+  if (name.endsWith("_")) return "A name cannot end with an underscore."
+  if (name.includes("__")) return "Underscores are single: a name cannot have two in a row."
+  return TABLE_NAME_RULE
+}
+
 /** What a table is called when a file's name leaves nothing to build one from. */
 const FALLBACK_TABLE_NAME = "uploaded_file"
 
@@ -186,10 +209,9 @@ export const REGISTRATION_FAILED_REASON = "The table was loaded but could not be
 /**
  * Why a chosen file cannot be sent, or `null`. Only the size is judged here
  * (it is what the browser knows before a byte leaves); an empty file, a
- * workbook or a file that is not delimited text is the API's to refuse, in
- * its own sentence, so a refusal the checklist expects (workbook: "save it as
- * CSV") comes from one place. The sentence names the limit and says what to
- * do next.
+ * workbook that does not open or a file that is not delimited text is the
+ * API's to refuse, in its own sentence. The sentence names the limit and says
+ * what to do next.
  */
 export function fileSizeProblem(name: string, sizeBytes: number): string | null {
   if (sizeBytes <= MAX_UPLOAD_BYTES) return null
@@ -200,17 +222,22 @@ export function fileSizeProblem(name: string, sizeBytes: number): string | null 
  * The sentence for a file a person must not send, and the extensions it is
  * for. The words follow the API's `WORKBOOK`, `PARQUET` and `OTHER_BINARY`
  * (`routes/uploads.rs`); the API still decides by content, so a file that
- * passes here can be refused there, and only a name that is clearly not
- * delimited text is refused here.
+ * passes here can be refused there (a `.parquet` with a binary column, say),
+ * and only a name that is clearly neither
+ * delimited text, nor an `.xls` / `.xlsx` workbook, nor a `.parquet` file is refused here. The
+ * workbook kinds the API does not open (`.xlsm`, `.xlsb`, `.ods`) and
+ * archives are refused with the workbook sentence.
  */
-const WORKBOOK_EXTENSIONS = ["xls", "xlsx", "xlsm", "xlsb", "ods"]
+const WORKBOOK_EXTENSIONS = ["xlsm", "xlsb", "ods"]
 const ARCHIVE_EXTENSIONS = ["zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar"]
 const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "avro", "orc", "db", "sqlite"]
 
 /**
- * Why a file cannot be sent judging by its NAME alone, or `null`. An Excel
- * workbook, archive, Parquet file or other binary is refused at once, before
- * any byte is sent, in words consistent with the API's. A name with no
+ * Why a file cannot be sent judging by its NAME alone, or `null`. A workbook
+ * the API does not read, an archive or another binary is
+ * refused at once, before any byte is sent, in words consistent with the
+ * API's. `.xls`, `.xlsx` and `.parquet` pass: the API opens them, and refuses
+ * one that does not open, in its own sentence. A name with no
  * extension or an unknown one (`.txt`, `.dat`, an extension-less export) is
  * never refused here: it may be delimited text, and the API judges content.
  * Case does not matter.
@@ -220,13 +247,10 @@ export function fileKindProblem(name: string): string | null {
   if (dot < 0) return null
   const extension = name.slice(dot + 1).toLowerCase()
   if (WORKBOOK_EXTENSIONS.includes(extension) || ARCHIVE_EXTENSIONS.includes(extension)) {
-    return `${name} looks like an Excel workbook or a zip archive. Only delimited text files (CSV, TSV) can be uploaded; save the sheet as CSV first.`
-  }
-  if (extension === "parquet") {
-    return `${name} looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.`
   }
   if (OTHER_BINARY_EXTENSIONS.includes(extension)) {
-    return `${name} is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
   }
   return null
 }
@@ -256,4 +280,47 @@ export function retryInput(upload: Upload): IngestUploadInput | null {
         ? "append"
         : "replace"
   return { ...parseOptions, bronzeTable, mode }
+}
+
+/**
+ * The name a raw table has in Data Explorer and in queries: the writer puts
+ * it in the `bronze` namespace (`Iceberg bronze.<table>` in
+ * `dagster/dispar_orchestrate/file_ingest.py`; `BRONZE_NAMESPACE` in
+ * `routes/catalog_source.rs`). Shown on the Table and Review steps so the
+ * person sees where the rows will land before pressing Load.
+ */
+export function rawTableFullName(table: string): string {
+  return `bronze.${table}`
+}
+
+/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, CSV or TSV text, or anything else. */
+export type UploadFileKind = "workbook" | "parquet" | "delimited" | "other"
+
+/** The extension of a file name, lower-cased, or `""` when there is none (`.csv` alone and `a.` have none). */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf(".")
+  return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase()
+}
+
+/**
+ * The kind of a file by its name only, for the mark beside it (presentation;
+ * the API still judges by content). `.txt`, an unknown extension and no
+ * extension are `other`. Case does not matter.
+ */
+export function uploadFileKind(name: string): UploadFileKind {
+  const extension = extensionOf(name)
+  if (extension === "xls" || extension === "xlsx") return "workbook"
+  if (extension === "parquet") return "parquet"
+  if (extension === "csv" || extension === "tsv") return "delimited"
+  return "other"
+}
+
+/** The longest extension shown as a label; a longer one would not fit the mark. */
+const MAX_LABEL_CHARS = 7
+
+/** The extension in capitals for the mark (`XLS`, `CSV`), or `null` when there is none or it is too long to fit. */
+export function uploadFileLabel(name: string): string | null {
+  const extension = extensionOf(name)
+  if (extension === "" || extension.length > MAX_LABEL_CHARS || !/^[a-z0-9]+$/.test(extension)) return null
+  return extension.toUpperCase()
 }

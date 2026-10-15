@@ -22,6 +22,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ErrorWithReference } from "@/components/error-reference";
 
 export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
 
@@ -173,7 +174,14 @@ function StepBody({ step }: { step: ToolStep }) {
   }
 
   if ("error" in res) {
-    return <p className="mt-1 text-[11px] text-destructive">{String(res.error)}</p>;
+    return (
+      <p className="mt-1 text-[11px] text-destructive">
+        <ErrorWithReference
+          message={String(res.error)}
+          errorId={typeof res.errorId === "string" ? res.errorId : undefined}
+        />
+      </p>
+    );
   }
 
   if (step.tool === "run_sql") {

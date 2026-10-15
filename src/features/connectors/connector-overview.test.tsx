@@ -24,6 +24,12 @@ const DETAIL: ConnectorDetail = {
   tenant: "Meridian Group",
   lastTestAt: "2026-09-30T05:00:00Z",
   lastActivityAt: null,
+  lastRunSuccessAt: null,
+  lastRunFailureAt: null,
+  failureStreak: 0,
+  schemaChangePolicy: "apply_non_breaking",
+  pausedReason: null,
+  pausedAt: null,
   capabilities: [],
   owner: "admin",
   discoveredAssets: 0,
@@ -51,7 +57,7 @@ const SPEC = {
 }
 
 function run(runId: string, status: IngestJobRun["status"], startedAt: string, endedAt: string | null): IngestJobRun {
-  return { runId, status, startedAt, endedAt }
+  return { runId, status, startedAt, endedAt, object: null, action: null }
 }
 
 function result(object: string, status: string, startedAt: string, error = ""): IngestRun {
@@ -259,5 +265,32 @@ describe("ConnectorOverview", () => {
     expect(pipeline.className).toContain("text-sm")
     // The old Ingest section is gone: the tiles say what it said.
     expect(screen.queryByText("Manage")).toBeNull()
+  })
+
+  it("shows the last success, the last failure and the streak, and says so when there are none", async () => {
+    stubFetch()
+    const { unmount } = render(<ConnectorOverview detail={DETAIL} onOpenTab={() => {}} />)
+    await screen.findByText("192.168.18.205:55432")
+    const card = screen.getByText("Run health", { selector: "[data-slot=card-title]" }).closest("[data-slot=card]")
+    expect(within(card as HTMLElement).getByText("No successful run yet")).toBeDefined()
+    expect(within(card as HTMLElement).getByText("No failed run yet")).toBeDefined()
+    expect(within(card as HTMLElement).getByText("None")).toBeDefined()
+    unmount()
+
+    render(
+      <ConnectorOverview
+        detail={{
+          ...DETAIL,
+          lastRunSuccessAt: "2026-09-29T05:00:00Z",
+          lastRunFailureAt: "2026-09-30T05:00:00Z",
+          failureStreak: 3,
+        }}
+        onOpenTab={() => {}}
+      />
+    )
+    await screen.findByText("192.168.18.205:55432")
+    const filled = screen.getByText("Run health", { selector: "[data-slot=card-title]" }).closest("[data-slot=card]")
+    expect(within(filled as HTMLElement).getByText("3 failed in a row")).toBeDefined()
+    expect(within(filled as HTMLElement).queryByText("No failed run yet")).toBeNull()
   })
 })

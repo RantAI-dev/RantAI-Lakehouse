@@ -10,8 +10,9 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import { TileBody } from "./tile-body";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
@@ -100,7 +101,7 @@ export function DashboardPreview({
                     {spec.title}
                   </Link>
                   <div className="min-h-0 flex-1">
-                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} year="all" hideLegend />
+                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} hideLegend />
                   </div>
                 </div>
               ))}

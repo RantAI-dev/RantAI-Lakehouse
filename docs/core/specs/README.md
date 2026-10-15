@@ -21,6 +21,7 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`SEC-19`](sec-19.md) | The query cost estimate runs only safe SQL | Next | S |
 | [`SEC-20`](sec-20.md) | Queries are scoped to the tenant | Next | M |
 | [`SEC-21`](sec-21.md) | Downloads and big results are safe | Next | S |
+| [`SEC-23`](sec-23.md) | Adding a governance rule needs the permission changing one needs | Now | S |
 
 ### Dashboards (BI)
 
@@ -89,6 +90,17 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`DATA-19`](data-19.md) | Uploaded tables feed pipelines and dashboards | Next | M |
 | [`SRC-4`](src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](src-3.md) | Connectors for business apps | Later | L |
+
+### Pipelines (Build)
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`BLD-1`](bld-1.md) | Joins, aggregations and a SQL step | Next | L, in two parts |
+| [`BLD-2`](bld-2.md) | Tables that refresh themselves within a target lag | Later | L |
+| [`DATA-2`](data-2.md) | Keep the last copies of a published Gold table | Next | M |
+| [`DATA-6`](data-6.md) | A latest-copy-only table for outside readers | Next | S |
+| [`DATA-4`](data-4.md) | Publish Silver in open format | Later | M |
+| [`DATA-3`](data-3.md) | Store Gold in open format first | Later | L |
 
 ### Query Studio
 

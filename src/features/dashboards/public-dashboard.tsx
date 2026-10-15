@@ -4,16 +4,20 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import Image from "next/image";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
+import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
-type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   board: { id: string; name: string };
   layout: LayoutMap;
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
+  /** The zone and first weekday the buckets were cut with (BI-9). */
+  reporting?: { timeZone: string; weekStart: string };
 };
 
 /**
@@ -72,10 +76,11 @@ export function PublicDashboard({ token }: { token: string }) {
     id: spec.id,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
-    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} year="all" />,
+    body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
   }));
 
   return (
+    <ReportingProvider reporting={data?.reporting}>
     <div className="min-h-screen bg-muted/25">
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
@@ -114,6 +119,7 @@ export function PublicDashboard({ token }: { token: string }) {
         Powered by Rantai Lake — Enterprise Lakehouse Console
       </footer>
     </div>
+    </ReportingProvider>
   );
 }
 

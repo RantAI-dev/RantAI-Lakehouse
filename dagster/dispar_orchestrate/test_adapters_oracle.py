@@ -127,3 +127,54 @@ def test_build_source_never_interpolates_the_password_into_a_dsn_string(monkeypa
         resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
     )
     assert captured["credentials"]["password"] == "p@ss/word:with?special&chars"
+
+
+def test_the_table_adapter_callback_reaches_sql_database_and_is_left_out_when_absent(monkeypatch):
+    captured = []
+    monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.append(kwargs) or "src")
+    spec = {"driver": "oracle", "host": "ora.invalid", "port": 1521, "database": "ORCLPDB1", "user": "reader"}
+
+    def callback(table):
+        return None
+
+    for cb in (callback, None):
+        build_source(
+            spec,
+            secrets={"password": "s3cret"},
+            source_objects=[{"name": "orders", "target": "orders"}],
+            resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
+            table_adapter_callback=cb,
+        )
+    assert captured[0]["table_adapter_callback"] is callback
+    assert "table_adapter_callback" not in captured[1]
+
+
+def test_build_source_sends_the_database_as_a_service_name_not_a_sid(monkeypatch):
+    # SRC-9 finding G3: the URL path becomes a SID in SQLAlchemy's oracle+oracledb
+    # dialect (DPY-6003 against a pluggable database); the dial's `database` is a
+    # service name, so it must travel as the `service_name` query parameter. Built
+    # through dlt's own credentials class and the real dialect, so the assertion is
+    # on the DSN oracledb receives, not on our dict.
+    from dlt.sources.credentials import ConnectionStringCredentials
+
+    captured = {}
+    monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.update(kwargs) or "src")
+    build_source(
+        {"driver": "oracle", "host": "ora.invalid", "port": 1521, "database": "FREEPDB1", "user": "reader"},
+        secrets={"password": "s3cret"},
+        source_objects=[],
+        resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
+    )
+    assert "database" not in captured["credentials"]
+    assert captured["credentials"]["query"] == {"service_name": "FREEPDB1"}
+
+    creds = ConnectionStringCredentials()
+    creds.update(captured["credentials"])
+    url = creds.to_url()
+    assert url.database is None and url.host == "10.0.0.9"
+    from sqlalchemy.dialects.oracle.oracledb import OracleDialect_oracledb
+
+    dialect = OracleDialect_oracledb(dbapi=__import__("oracledb"))
+    _args, kwargs = dialect.create_connect_args(url)
+    assert "SERVICE_NAME=FREEPDB1" in kwargs["dsn"] and "SID=" not in kwargs["dsn"]
+    assert "10.0.0.9" in kwargs["dsn"] and "ora.invalid" not in kwargs["dsn"]

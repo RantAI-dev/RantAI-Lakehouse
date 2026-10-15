@@ -55,6 +55,12 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
+    /// `WEBHOOK_ALLOWED_CIDRS` holds an entry that is not a network or an
+    /// address (`SEC-10`). Fails config resolution for the same reason
+    /// [`ConfigError::MalformedAllowedCidrs`] does: a dropped entry would
+    /// quietly keep refusing the internal webhook target the operator listed.
+    #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
+    MalformedWebhookAllowedCidrs(String),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -81,6 +87,13 @@ pub enum ConfigError {
     /// leave the chat asking questions for an operator who meant to stop it.
     #[error("AI_ASK_BACK must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}")]
     UnsupportedAiAskBack(String),
+    /// `AI_SQL_HELP` was set to something other than `"true"` or `"false"`.
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiAskBack`]: a typo such as `"no"` would leave the
+    /// assistant proposing SQL fixes for an operator who meant to stop it.
+    #[error("AI_SQL_HELP must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}")]
+    UnsupportedAiSqlHelp(String),
     /// `AI_RELEVANT_TABLES` was set to something other than `"true"` or
     /// `"false"`.
     ///
@@ -92,6 +105,17 @@ pub enum ConfigError {
         "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiRelevantTables(String),
+    /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` was set to something that is not a
+    /// positive whole number (`SEC-12`).
+    ///
+    /// Fails config resolution rather than falling back to the default: a
+    /// typo such as `"24h"` would quietly keep the 24-hour limit for an
+    /// operator who meant a shorter one, and `0` or a negative number would
+    /// refuse every token with nothing in the logs to explain it.
+    #[error(
+        "EMBED_TOKEN_MAX_LIFETIME_SECONDS must be a positive whole number of seconds (unset or empty means 86400), got {0:?}"
+    )]
+    InvalidEmbedTokenMaxLifetime(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -154,10 +178,11 @@ pub struct Config {
     /// the caller choose that `host`, so without this a `connector:manage`
     /// principal gets an internal port scanner with output. This
     /// deployment's own seeded connectors (`postgres:5432`,
-    /// `http://rustfs:9000`) ARE internal names, so the compose stack opts
-    /// out explicitly — an opt-out rather than a default, so the safe
-    /// posture is what a deployment gets unless it says otherwise. `true`
-    /// only when the env var is exactly `"true"`.
+    /// `http://rustfs:9000`) ARE internal names, so an install that wants
+    /// their tests to run opts in explicitly — an opt-in rather than a
+    /// default, in compose as here (`SEC-15`: compose used to default it to
+    /// `true`), so the safe posture is what a deployment gets unless it says
+    /// otherwise. `true` only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
     /// Private networks a connector may dial even though the SSRF guard
     /// refuses internal addresses (`CONNECTOR_PROBE_ALLOWED_CIDRS`, e.g.
@@ -165,6 +190,20 @@ pub struct Config {
     /// `connector_probe_allow_internal_hosts`. Empty by default. See
     /// [`crate::internal_hosts`] for what the list can never open.
     pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Internal networks alert webhooks may call (`WEBHOOK_ALLOWED_CIDRS`,
+    /// `SEC-10`), in the same format as `connector_probe_allowed_cidrs` and
+    /// with the same limits (the list never opens loopback, link-local,
+    /// multicast or `0/8`; see [`crate::internal_hosts`]). A separate
+    /// setting, not the connector one: what a connector may dial says
+    /// nothing about where an alert author may send data, and there is
+    /// deliberately no "allow every internal address" switch for webhooks.
+    /// Empty by default.
+    pub webhook_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Test-only: lets webhook tests reach a `wiremock` listener on
+    /// loopback, which no deployment setting can open. `WEBHOOK_TEST_ALLOW_ALL`
+    /// is read only when compiled for tests (`cfg!(test)`), so in a service
+    /// build this is always `false` whatever the environment says.
+    pub webhook_test_allow_all: bool,
     /// Where connector credential files physically live
     /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
     /// `file:/run/secrets/...`, the path Dagster reads inside its own
@@ -214,11 +253,17 @@ pub struct Config {
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
     /// here).
     pub llm_key: String,
-    /// Embed JWT signing secret. `None` when unset (mirrors the truthy
-    /// check `if (process.env.EMBED_SECRET)` at `embed-jwt.ts:37`; the
-    /// TypeScript then falls back to a generated, `ClickHouse`-persisted
-    /// secret, which is out of scope for this chassis).
+    /// Embed JWT signing secret. `None` when unset or empty (truthy check).
+    /// `SEC-12`: this is the ONLY source. No secret is generated or stored
+    /// any more (the TypeScript and the earlier Rust fell back to a
+    /// plain-text `console.app_kv` row); `None` means signed embedding is
+    /// unavailable and says so, while the API still starts.
     pub embed_secret: Option<String>,
+    /// The longest lifetime (`exp - iat`) a signed embed token may have, in
+    /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
+    /// 86400. A value that is not a positive integer fails start-up
+    /// ([`ConfigError::InvalidEmbedTokenMaxLifetime`]).
+    pub embed_token_max_lifetime_seconds: u64,
     /// Shared token required to call `/api/alerts/run`. `None` when unset,
     /// meaning the endpoint requires no auth (`alerts/run/route.ts:16-19`,
     /// truthy check).
@@ -694,9 +739,11 @@ pub struct Config {
     pub ai_default_reply_language: Option<ReplyLanguage>,
     /// Whether the semantic layer is on (`AI_SEMANTIC_LAYER`): the
     /// background pass that drafts a description of each table and column,
-    /// and the copilot's DATA MAP reading those descriptions. `true` when
-    /// unset or empty, and for `"true"`; `false` only for `"false"`. The
-    /// routes that read and correct the descriptions answer either way.
+    /// and the copilot's DATA MAP reading those descriptions. When on, the
+    /// chat's system prompt also gets the rules for counting in a table
+    /// grouped by several columns. `true` when unset or empty, and for
+    /// `"true"`; `false` only for `"false"`. The routes that read and correct
+    /// the descriptions answer either way.
     pub ai_semantic_layer: bool,
     /// Whether the chat may ask the user which reading of an unclear word
     /// they mean (`AI_ASK_BACK`): the `ask_user` tool, the rules that tell
@@ -704,6 +751,11 @@ pub struct Config {
     /// prompt. `true` when unset or empty, and for `"true"`; `false` only
     /// for `"false"`. The routes under `/api/ai/terms` answer either way.
     pub ai_ask_back: bool,
+    /// Whether the assistant may explain a Query Studio statement and propose
+    /// a corrected one (`AI_SQL_HELP`): the `propose_sql` tool and the rules
+    /// that tell the model when to call it. `true` when unset or empty, and
+    /// for `"true"`; `false` only for `"false"`.
+    pub ai_sql_help: bool,
     /// Whether the prompt carries only the tables a question names
     /// (`AI_RELEVANT_TABLES`), instead of every table in full. `true` when
     /// unset or empty, and for `"true"`; `false` only for `"false"`.
@@ -768,6 +820,10 @@ impl std::fmt::Debug for Config {
                 &self.embed_secret.as_ref().map(|_| REDACTED),
             )
             .field(
+                "embed_token_max_lifetime_seconds",
+                &self.embed_token_max_lifetime_seconds,
+            )
+            .field(
                 "alerts_run_token",
                 &self.alerts_run_token.as_ref().map(|_| REDACTED),
             )
@@ -828,6 +884,8 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allowed_cidrs",
                 &self.connector_probe_allowed_cidrs,
             )
+            .field("webhook_allowed_cidrs", &self.webhook_allowed_cidrs)
+            .field("webhook_test_allow_all", &self.webhook_test_allow_all)
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
                 "oracle_cdc_logminer_enabled",
@@ -919,6 +977,7 @@ impl std::fmt::Debug for Config {
             .field("ai_default_reply_language", &self.ai_default_reply_language)
             .field("ai_semantic_layer", &self.ai_semantic_layer)
             .field("ai_ask_back", &self.ai_ask_back)
+            .field("ai_sql_help", &self.ai_sql_help)
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
@@ -980,6 +1039,19 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .unwrap_or(default)
 }
 
+/// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` (`SEC-12`): unset or empty is the
+/// 24-hour default; anything else must be a positive whole number.
+fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, ConfigError> {
+    match truthy(env, "EMBED_TOKEN_MAX_LIFETIME_SECONDS") {
+        None => Ok(lakehouse_embed::DEFAULT_MAX_LIFETIME_SECONDS),
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or(ConfigError::InvalidEmbedTokenMaxLifetime(raw)),
+    }
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1019,6 +1091,8 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiSemanticLayer`], if `AI_SEMANTIC_LAYER`
     ///   is set and non-empty but is neither `true` nor `false`.
     /// - [`ConfigError::UnsupportedAiAskBack`], if `AI_ASK_BACK` is set and
+    ///   non-empty but is neither `true` nor `false`.
+    /// - [`ConfigError::UnsupportedAiSqlHelp`], if `AI_SQL_HELP` is set and
     ///   non-empty but is neither `true` nor `false`.
     /// - [`ConfigError::UnsupportedAiRelevantTables`], if
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
@@ -1077,6 +1151,7 @@ impl Config {
             llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
@@ -1110,6 +1185,14 @@ impl Config {
                     .map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedAllowedCidrs)?,
+            webhook_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("WEBHOOK_ALLOWED_CIDRS").map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedWebhookAllowedCidrs)?,
+            webhook_test_allow_all: cfg!(test)
+                && env
+                    .get("WEBHOOK_TEST_ALLOW_ALL")
+                    .is_some_and(|v| v == "true"),
             connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
                 || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
                 std::path::PathBuf::from,
@@ -1227,6 +1310,7 @@ impl Config {
                 ConfigError::UnsupportedAiSemanticLayer,
             )?,
             ai_ask_back: parse_switch(env, "AI_ASK_BACK", ConfigError::UnsupportedAiAskBack)?,
+            ai_sql_help: parse_switch(env, "AI_SQL_HELP", ConfigError::UnsupportedAiSqlHelp)?,
             ai_relevant_tables: parse_switch(
                 env,
                 "AI_RELEVANT_TABLES",
@@ -1262,6 +1346,17 @@ impl Config {
         crate::internal_hosts::InternalHosts {
             allow_all: self.connector_probe_allow_internal_hosts,
             allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
+
+    /// The internal addresses an alert webhook may call (`SEC-10`): only the
+    /// listed networks, never "all" (see
+    /// [`Config::webhook_allowed_cidrs`]).
+    #[must_use]
+    pub fn webhook_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.webhook_test_allow_all,
+            allowed: self.webhook_allowed_cidrs.clone(),
         }
     }
 }
@@ -1345,6 +1440,7 @@ mod tests {
         assert_eq!(cfg.llm_model, "MiniMax-M3");
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
         assert_eq!(cfg.smtp_port, 587);
@@ -1603,6 +1699,48 @@ mod tests {
 
         let err = Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOWED_CIDRS", "lan")])).unwrap_err();
         assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
+    }
+
+    /// `SEC-10`: the webhook allowlist is empty by default, parsed at start,
+    /// opens exactly the listed hosts and no other, never reaches loopback or
+    /// the metadata address, is independent of the connector list, and a
+    /// malformed entry refuses to boot rather than being ignored.
+    #[test]
+    fn webhook_allowed_cidrs_allow_exactly_the_listed_hosts_and_refuse_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert!(cfg.webhook_allowed_cidrs.is_empty());
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "WEBHOOK_ALLOWED_CIDRS",
+            "192.168.18.205, 10.1.0.0/16",
+        )]))
+        .unwrap();
+        let hosts = cfg.webhook_internal_hosts();
+        assert!(!hosts.allow_all);
+        assert!(hosts.permits(&"192.168.18.205".parse().unwrap()));
+        assert!(!hosts.permits(&"192.168.18.206".parse().unwrap()));
+        assert!(hosts.permits(&"10.1.7.7".parse().unwrap()));
+        assert!(!hosts.permits(&"10.2.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"127.0.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"169.254.169.254".parse().unwrap()));
+
+        // The connector setting does not leak into webhooks, or back.
+        let cfg = Config::from_map(&map(&[
+            ("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true"),
+            ("CONNECTOR_PROBE_ALLOWED_CIDRS", "192.168.18.0/24"),
+        ]))
+        .unwrap();
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("WEBHOOK_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
     /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
@@ -2104,6 +2242,63 @@ mod tests {
     fn ask_back_setting_false_means_off() {
         let cfg = Config::from_map(&env_with("AI_ASK_BACK", "false")).unwrap();
         assert!(!cfg.ai_ask_back);
+    }
+
+    #[test]
+    fn the_embed_token_lifetime_limit_defaults_to_24_hours_and_can_be_set() {
+        for unset in [None, Some("")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", v)
+            });
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
+        }
+        let cfg = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", "3600")).unwrap();
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 3600);
+    }
+
+    #[test]
+    fn an_embed_token_lifetime_limit_that_is_not_a_positive_integer_stops_the_api() {
+        // `SEC-12`: not a silent fallback to the default.
+        for bad in ["24h", "0", "-5", "1.5", " 60"] {
+            let err = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", bad))
+                .expect_err("only a positive whole number is accepted");
+            assert_eq!(
+                err,
+                ConfigError::InvalidEmbedTokenMaxLifetime(bad.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn sql_help_is_on_when_the_setting_is_absent_or_empty() {
+        assert!(Config::from_map(&HashMap::new()).unwrap().ai_sql_help);
+        assert!(
+            Config::from_map(&env_with("AI_SQL_HELP", ""))
+                .unwrap()
+                .ai_sql_help
+        );
+        assert!(
+            Config::from_map(&env_with("AI_SQL_HELP", "true"))
+                .unwrap()
+                .ai_sql_help
+        );
+    }
+
+    #[test]
+    fn sql_help_setting_false_means_off() {
+        let cfg = Config::from_map(&env_with("AI_SQL_HELP", "false")).unwrap();
+        assert!(!cfg.ai_sql_help);
+    }
+
+    #[test]
+    fn an_unknown_sql_help_setting_is_refused_with_the_accepted_values_named() {
+        let err = Config::from_map(&env_with("AI_SQL_HELP", "maybe"))
+            .expect_err("only true and false are accepted, a typo must not leave the help on");
+        assert_eq!(err, ConfigError::UnsupportedAiSqlHelp("maybe".to_owned()));
+        let message = err.to_string();
+        assert!(message.contains("\"true\""), "{message}");
+        assert!(message.contains("\"false\""), "{message}");
     }
 
     #[test]

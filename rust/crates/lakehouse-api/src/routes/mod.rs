@@ -10,16 +10,19 @@ pub(crate) mod ai;
 mod alerts;
 pub mod auth;
 mod authored_pipelines;
+mod calc_fields;
 mod catalog;
 mod catalog_governance;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_search;
 mod catalog_source;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
 mod dashboard_sources;
 mod embed;
+// DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
 mod home;
@@ -27,13 +30,16 @@ mod identity;
 mod knowledge;
 mod lakehouse;
 mod lineage;
+mod load_alerts;
 mod notifications;
 mod ops;
 mod overview;
 mod pipelines;
 mod quality;
 mod query;
+mod schema_changes;
 pub(crate) mod schema_versions;
+mod settings;
 mod storage;
 pub(crate) mod support;
 mod uploads;
@@ -494,11 +500,21 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/connectors/{id}/ingest/run",
-            axum::routing::post(connectors::ingest_run),
+            axum::routing::post(connectors::ingest_run_request),
         )
         .route(
             "/api/connectors/{id}/ingest/runs",
             get(connectors::ingest_run_history),
+        )
+        // `SRC-8` decision D6: a person with `connector:manage` on a
+        // connector of their own tenant reads and approves schema changes.
+        .route(
+            "/api/connectors/{id}/schema-changes",
+            get(schema_changes::list),
+        )
+        .route(
+            "/api/connectors/{id}/schema-changes/approve",
+            axum::routing::post(schema_changes::approve),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -534,6 +550,17 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/tenant",
             axum::routing::put(connectors::assign_connector_tenant),
+        )
+        // `SRC-8`: the orchestrator's observation. Outside the tenant gate on
+        // purpose: its only caller is a service identity, which belongs to no
+        // tenant (see `schema_changes`' module doc).
+        .route(
+            "/api/connectors/{id}/schema-observations",
+            axum::routing::post(schema_changes::observe),
+        )
+        .route(
+            "/api/connectors/{id}/schema-observations/tables",
+            axum::routing::post(schema_changes::new_tables),
         )
         .merge(per_connector)
 }
@@ -740,6 +767,7 @@ pub fn router(state: AppState) -> Router {
                 .put(alerts::update)
                 .delete(alerts::delete),
         )
+        .route("/api/alerts/status", get(alerts::status))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",
@@ -802,12 +830,36 @@ pub fn router(state: AppState) -> Router {
             "/api/dashboard/sources/preview",
             axum::routing::post(dashboard_sources::preview),
         )
+        .route(
+            "/api/dashboard/calc-fields",
+            get(calc_fields::list)
+                .post(calc_fields::create)
+                .put(calc_fields::update)
+                .delete(calc_fields::delete),
+        )
+        .route(
+            "/api/dashboard/calc-fields/validate",
+            axum::routing::post(calc_fields::validate),
+        )
+        .route(
+            "/api/dashboard/calc-fields/functions",
+            get(calc_fields::functions),
+        )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
+        .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
+        .route(
+            "/api/embed/frame",
+            axum::routing::post(embed::frame_origins),
+        )
+        .route(
+            "/api/dashboard/embed-revoke",
+            axum::routing::post(embed::revoke_token),
+        )
         .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
@@ -839,6 +891,12 @@ pub fn router(state: AppState) -> Router {
             get(home::get_layout)
                 .put(home::put_layout)
                 .delete(home::delete_layout),
+        )
+        // Deployment-wide report time zone and first day of the week
+        // (`BI-9`); see `routes::settings`.
+        .route(
+            "/api/settings/reporting",
+            get(settings::get_reporting).put(settings::put_reporting),
         )
         // Phase 2 identity domain.
         .merge(identity_router())
