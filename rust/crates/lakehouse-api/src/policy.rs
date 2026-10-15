@@ -654,10 +654,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `schema_changes::require_orchestrator`, as the run reports above do.
     ("POST", "/api/connectors/{id}/discovery-results", Policy::RequiresPermission("ingest:read")),
     // `SRC-12` part C: signing a REST connector in with `OAuth2`. A person
-    // reads the sign-in status and starts a sign-in; the tenant gate is the
-    // route layer.
+    // reads the sign-in status, starts a sign-in and signs out; the tenant gate
+    // is the route layer.
     ("GET",  "/api/connectors/{id}/oauth", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/oauth/start", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/oauth/sign-out", Policy::RequiresPermission("connector:manage")),
     // The provider's redirect carries the person's session cookie and nothing
     // else, so it needs a signed-in user and no more here: it names no connector.
     // The handler consumes the one-time `state`, then requires that user to be

@@ -341,6 +341,35 @@ pub async fn token_request(
     })
 }
 
+/// Tell the provider to forget `token` (RFC 7009), a refresh token.
+///
+/// # Errors
+///
+/// As [`token_request`]. A provider answers 200 for a token it does not
+/// know, so a `Refused` here means the client credentials were refused.
+pub async fn revoke_request(
+    url: &str,
+    token: &SecretValue,
+    client_id: &str,
+    client_secret: &SecretValue,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<(), TokenFailure> {
+    post_form(
+        url,
+        &[
+            ("token", token.expose_secret()),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", client_id),
+            ("client_secret", client_secret.expose_secret()),
+        ],
+        internal_hosts,
+        settings,
+    )
+    .await
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -538,5 +567,49 @@ mod tests {
             // A redirect is never followed: the one request is all there is.
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn revocation_sends_the_token_and_the_client_and_succeeds_on_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(body_string_contains("token=refresh-1"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .and(body_string_contains("client_id=app"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        revoke_request(
+            &format!("{}/revoke", server.uri()),
+            &SecretValue::new("refresh-1"),
+            "app",
+            &SecretValue::new("s3cret"),
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_revocation_is_a_fixed_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("PROVIDER-WORDS"))
+            .mount(&server)
+            .await;
+        let err = revoke_request(
+            &format!("{}/revoke", server.uri()),
+            &SecretValue::new("refresh-1"),
+            "app",
+            &SecretValue::new("s3cret"),
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, TokenFailure::Unavailable);
     }
 }

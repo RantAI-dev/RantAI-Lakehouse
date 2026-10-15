@@ -1025,12 +1025,19 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
-    let outcome = crate::connector_probe::probe(
-        &dial_info,
-        state.connector_secret_resolver.as_ref(),
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
+    // `SRC-12` part C: a provider that rotates refresh tokens retired the one
+    // the test just used; keep the new one or the test would sign the
+    // connector out.
+    if let Some(rotated) = outcome.rotated_refresh_token.take() {
+        store_refresh_token(
+            &state,
+            &id,
+            dial_info.secret_ref_secondary.as_deref(),
+            rotated,
+        )
+        .await?;
+    }
     match connectors::record_test_result(
         pool(&state)?,
         &id,
@@ -1272,12 +1279,8 @@ pub async fn rotate_secret(
         }
     }
 
-    let outcome = crate::connector_probe::probe(
-        &candidate,
-        state.connector_secret_resolver.as_ref(),
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    let mut outcome = run_probe(&state, &candidate, state.connector_secret_resolver.as_ref()).await;
+    let rotated = outcome.rotated_refresh_token.take();
 
     if !outcome.supported {
         // 422, not 409: nothing about this connector's STATE conflicts
@@ -1296,11 +1299,16 @@ pub async fn rotate_secret(
         .into());
     }
     if !outcome.ok {
-        // 422: the candidate credential itself does not work — the
-        // probe's own classified message is already safe to surface
-        // (see `connector_probe`'s module doc comment: never raw
-        // upstream `Display` text).
-        return Err(ApiError::Unprocessable(outcome.message).into());
+        return Err(refused_rotation(
+            &state,
+            &id,
+            body.slot,
+            dial_info.secret_ref_secondary.as_deref(),
+            rotated,
+            outcome.message,
+        )
+        .await
+        .into());
     }
 
     match connectors::swap_secret_ref(
@@ -1324,6 +1332,14 @@ pub async fn rotate_secret(
         }
         Err(err) => return Err(ApiError::from(err).into()),
     }
+    // `SRC-12` part C: the probe used the stored refresh token; if the
+    // provider rotated it, the new one is stored now (the slot may have just
+    // been swapped).
+    let secondary_now = match body.slot {
+        connectors::SecretSlot::Secondary => Some(new_secret_ref.as_str()),
+        connectors::SecretSlot::Primary => dial_info.secret_ref_secondary.as_deref(),
+    };
+    keep_rotated(&state, &id, rotated, secondary_now).await?;
     // Rotating away from a credential lakehouse stored (e.g. to an
     // operator's `env:` one) leaves its file unused; a password must not
     // outlive the only reference to it.
@@ -1931,8 +1947,8 @@ async fn replace_credentials(
 
 /// Seal `token` as this connector's refresh-token credential (`SRC-12` part C):
 /// the managed `…_token` file of the secondary slot, replacing whatever the slot
-/// held. The one place a refresh token is written, for the sign-in callback and
-/// the orchestrator's rotation report.
+/// held. The one place a refresh token is written, for the sign-in callback, the
+/// orchestrator's rotation report and a connection test that was rotated.
 /// `current_secondary_ref` is what the slot names now (the swap's expected old
 /// value); the slot is moved to the managed name when it named something else.
 ///
@@ -1957,6 +1973,77 @@ pub(super) async fn store_refresh_token(
         old_ref: current_secondary_ref.map(str::to_owned),
     };
     replace_credentials(state, id, std::slice::from_ref(&change)).await
+}
+
+/// Probe `info` with the installation's address and `OAuth2` settings. The one
+/// call the three routes that test a connector share.
+async fn run_probe(
+    state: &AppState,
+    info: &ConnectorDialInfo,
+    resolver: &dyn lakehouse_core::secret::DynSecretResolver,
+) -> crate::connector_probe::Outcome {
+    crate::connector_probe::probe_with(
+        info,
+        resolver,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await
+}
+
+/// Store the refresh token a provider rotated during a probe, if it did
+/// (`SRC-12` part C). The rotated token replaces one the provider has already
+/// retired, so dropping it would sign the connector out; a failure here is an
+/// error, not a log line.
+///
+/// # Errors
+///
+/// As [`store_refresh_token`].
+async fn keep_rotated(
+    state: &AppState,
+    id: &str,
+    rotated: Option<SecretValue>,
+    current_secondary_ref: Option<&str>,
+) -> Result<(), ApiError> {
+    match rotated {
+        Some(token) => store_refresh_token(state, id, current_secondary_ref, token).await,
+        None => Ok(()),
+    }
+}
+
+/// The 422 for a rotation whose candidate credential the source rejected.
+///
+/// `SRC-12` part C: the token request may have succeeded (and rotated the
+/// refresh token) before the source rejected the candidate. The stored token is
+/// retired either way, so the new one is kept, unless it came from the
+/// candidate's own, unsaved, refresh token (a `Secondary` rotation). If keeping
+/// it fails, that failure is returned instead: the connector is signed out and
+/// the person must hear it.
+async fn refused_rotation(
+    state: &AppState,
+    id: &str,
+    slot: connectors::SecretSlot,
+    current_secondary_ref: Option<&str>,
+    rotated: Option<SecretValue>,
+    message: String,
+) -> ApiError {
+    if slot == connectors::SecretSlot::Primary
+        && let Err(err) = keep_rotated(state, id, rotated, current_secondary_ref).await
+    {
+        return err;
+    }
+    // The probe's own classified message is already safe to surface (see
+    // `connector_probe`'s module doc comment: never raw upstream `Display`
+    // text). 422: the candidate credential itself does not work.
+    ApiError::Unprocessable(message)
+}
+
+/// Delete the managed refresh-token file named by `secondary_ref` (sign out).
+/// An operator's or a secret manager's reference is left where it is. Holds the
+/// store's change lock, like every other change to a credential file.
+pub(super) async fn remove_refresh_token(state: &AppState, id: &str, secondary_ref: Option<&str>) {
+    let _serialized = state.connector_secret_store.lock().await;
+    remove_managed_credentials(state, id, secondary_ref, None).await;
 }
 
 /// The part of [`replace_credentials`] every credential change shares
@@ -2094,13 +2181,24 @@ pub async fn set_credential(
     // secret manager (SEC-14): "refused before any lookup or connection".
     resolve_references(&state, &mut changes, "the credential was NOT saved").await?;
     let resolver = candidate_resolver(&state, &changes);
-    let outcome = crate::connector_probe::probe(
-        &candidate,
-        &resolver,
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    let mut outcome = run_probe(&state, &candidate, &resolver).await;
     if outcome.supported && !outcome.ok {
+        // `SRC-12` part C: as in `rotate_secret`, a refresh token the provider
+        // rotated during a rejected test is kept, unless it came from a
+        // refresh token this request was only proposing.
+        let proposes_a_refresh_token = changes
+            .iter()
+            .any(|c| c.slot == connectors::SecretSlot::Secondary);
+        if !proposes_a_refresh_token {
+            let rotated = outcome.rotated_refresh_token.take();
+            keep_rotated(
+                &state,
+                &id,
+                rotated,
+                dial_info.secret_ref_secondary.as_deref(),
+            )
+            .await?;
+        }
         return Err(ApiError::Unprocessable(format!(
             "the credential was NOT saved: {}",
             outcome.message
@@ -2109,6 +2207,20 @@ pub async fn set_credential(
     }
 
     replace_credentials(&state, &id, &changes).await?;
+    // `SRC-12` part C: the probe used a refresh token; a provider that rotates
+    // them retired it, so the new one replaces it, in the slot as it is now.
+    let secondary_now = changes
+        .iter()
+        .find(|c| c.slot == connectors::SecretSlot::Secondary)
+        .map(|c| c.new_ref.as_str())
+        .or(dial_info.secret_ref_secondary.as_deref());
+    keep_rotated(
+        &state,
+        &id,
+        outcome.rotated_refresh_token.take(),
+        secondary_now,
+    )
+    .await?;
 
     let slots: Vec<connectors::SecretSlot> = changes.iter().map(|c| c.slot).collect();
     // Same audit convention as `rotate_secret`: successful mutations only,
@@ -2996,6 +3108,11 @@ pub async fn delete(
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     }
+    // `SRC-12` part C, decision 8: an OAuth connector's refresh token is told
+    // to the provider before the file goes. Best effort: the connector is gone
+    // either way, and the audit event records what happened. The console says
+    // beforehand whether the provider can be told (`GET .../oauth`).
+    let revocation = super::connector_oauth::revoke_stored_token(&state, &dial_info).await;
     // ADR 0002 Addendum 4: a managed credential belongs to this connector
     // alone, so it goes with it. An operator's env/file credential is left
     // exactly where the operator put it.
@@ -3018,7 +3135,18 @@ pub async fn delete(
     // WS5 item D3: best-effort, after the row is already gone — a failed
     // audit write here must never resurrect the 404/409 branches above or
     // undo a delete that already succeeded.
-    let event = connector_audit_event(&principal, "connector.delete", &id, json!({}), "executed");
+    let delete_details = if revocation == super::connector_oauth::Revocation::NotApplicable {
+        json!({})
+    } else {
+        json!({ "oauthRevocation": revocation })
+    };
+    let event = connector_audit_event(
+        &principal,
+        "connector.delete",
+        &id,
+        delete_details,
+        "executed",
+    );
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
         tracing::warn!(%err, connector_id = %id, "failed to record connector.delete audit event");
     }

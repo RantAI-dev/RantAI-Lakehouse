@@ -539,6 +539,10 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/oauth/start",
             axum::routing::post(connector_oauth::start),
         )
+        .route(
+            "/api/connectors/{id}/oauth/sign-out",
+            axum::routing::post(connector_oauth::sign_out),
+        )
         // `SRC-8` decision D6: a person with `connector:manage` on a
         // connector of their own tenant reads and approves schema changes.
         .route(

@@ -1,6 +1,6 @@
 //! Sign in to a REST connector with `OAuth2` (`SRC-12` part C, decisions 6 to
 //! 8, 11 and 12): the sign-in, the provider's callback, the orchestrator's
-//! report of a rotated refresh token.
+//! report of a rotated refresh token, and sign-out.
 //!
 //! # The routes
 //!
@@ -12,6 +12,8 @@
 //!   address is set;
 //! - `POST /api/connectors/{id}/oauth/start` -- the provider's sign-in address
 //!   with a `state` bound to this connector and this user;
+//! - `POST /api/connectors/{id}/oauth/sign-out` -- tell the provider to forget
+//!   the refresh token (when it has a revocation address) and delete it.
 //!
 //! The provider's redirect, `GET /api/connectors/oauth/callback?code&state`,
 //! needs a signed-in user and nothing more at the route layer (it has no
@@ -55,7 +57,9 @@ use lakehouse_store::ingest_spec::{Dial, RestAuth};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::connectors::{connector_audit_event, parse_body, pool, store_refresh_token};
+use super::connectors::{
+    connector_audit_event, parse_body, pool, remove_refresh_token, store_refresh_token,
+};
 use super::schema_changes::require_orchestrator;
 use crate::connector_oauth::{self, TokenFailure};
 use crate::error::ApiResult;
@@ -529,6 +533,129 @@ pub async fn update_refresh_token(
     )
     .await;
     Ok(ApiJson(StoredResponse { stored: true }))
+}
+
+// ── sign out and delete ────────────────────────────────────────────────────
+
+/// What happened to the provider's copy of the token when a connector let it
+/// go (`SRC-12` decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum Revocation {
+    /// Not an `OAuth2` authorization-code connector.
+    NotApplicable,
+    /// The dial names no revocation address: the provider cannot be told, and
+    /// the token stays valid there until it expires.
+    NotConfigured,
+    /// There was no refresh token to revoke.
+    NoToken,
+    /// The provider accepted the revocation.
+    Done,
+    /// The provider could not be told (refused, unreachable, or the address was
+    /// not allowed); the token may stay valid there until it expires.
+    Failed,
+}
+
+impl Revocation {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "",
+            Self::NotConfigured => {
+                "The provider was not told: this connector has no revocation address, so the token stays valid at the provider until it expires."
+            }
+            Self::NoToken => "There was no token to revoke.",
+            Self::Done => "The provider was told to revoke the token.",
+            Self::Failed => {
+                "The provider could not be told to revoke the token; it may stay valid there until it expires."
+            }
+        }
+    }
+}
+
+/// Tell the provider to revoke the connector's refresh token, if the dial has a
+/// revocation address and a token is stored. Best effort: the caller removes the
+/// local copy whatever this returns. Used by sign-out and by deleting the
+/// connector, before the credential files go.
+pub(super) async fn revoke_stored_token(state: &AppState, info: &ConnectorDialInfo) -> Revocation {
+    let Some(app) = app_of(info) else {
+        return Revocation::NotApplicable;
+    };
+    let Some(url) = app.revocation_url.as_deref() else {
+        return Revocation::NotConfigured;
+    };
+    let Some(token) = refresh_token_of(state, info).await else {
+        return Revocation::NoToken;
+    };
+    let Ok(client_secret) = state
+        .connector_secret_resolver
+        .resolve_dyn(&info.secret_ref)
+        .await
+    else {
+        return Revocation::Failed;
+    };
+    match connector_oauth::revoke_request(
+        url,
+        &token,
+        &app.client_id,
+        &client_secret,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await
+    {
+        Ok(()) => Revocation::Done,
+        Err(failure) => {
+            tracing::warn!(?failure, "OAuth revocation failed");
+            Revocation::Failed
+        }
+    }
+}
+
+/// `POST /api/connectors/{id}/oauth/sign-out` response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignOutResponse {
+    /// Always `true`: the local token is gone.
+    signed_out: bool,
+    /// What happened at the provider.
+    revocation: Revocation,
+    /// Says it in words, for the page.
+    message: &'static str,
+}
+
+/// `POST /api/connectors/{id}/oauth/sign-out` -- revoke the token at the
+/// provider when the dial has a revocation address, then delete the stored
+/// refresh token. The local token is deleted even when the provider could not
+/// be told, and the response says which it was (decision 8).
+///
+/// # Errors
+///
+/// 404 for an unknown connector; 409 for a connector that does not use
+/// `OAuth2` authorization code; 503/500 as the store reports.
+pub async fn sign_out(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<SignOutResponse>> {
+    let info = dial_info_of(&state, &id).await?;
+    if app_of(&info).is_none() {
+        return Err(ApiError::Conflict(NOT_AN_OAUTH_CONNECTOR.to_owned()).into());
+    }
+    let revocation = revoke_stored_token(&state, &info).await;
+    remove_refresh_token(&state, &id, info.secret_ref_secondary.as_deref()).await;
+    audit(
+        &state,
+        &principal,
+        "connector.oauth_signed_out",
+        &id,
+        json!({ "revocation": revocation }),
+    )
+    .await;
+    Ok(ApiJson(SignOutResponse {
+        signed_out: true,
+        revocation,
+        message: revocation.message(),
+    }))
 }
 
 /// Best-effort audit, as every route of the connector module writes it:

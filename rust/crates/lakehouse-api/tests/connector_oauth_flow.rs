@@ -75,6 +75,7 @@ struct Provider {
     current_refresh: Option<String>,
     issued: u32,
     token_calls: u32,
+    revoked: Vec<String>,
     last_access: String,
 }
 
@@ -156,6 +157,20 @@ async fn provider_server(provider: &Arc<Mutex<Provider>>) -> MockServer {
         .mount(&server)
         .await;
     let state = Arc::clone(provider);
+    Mock::given(method("POST"))
+        .and(path("/revoke"))
+        .respond_with(move |request: &WireRequest| {
+            let form = form(request);
+            state
+                .lock()
+                .unwrap()
+                .revoked
+                .push(form.get("token").cloned().unwrap_or_default());
+            ResponseTemplate::new(200)
+        })
+        .mount(&server)
+        .await;
+    let state = Arc::clone(provider);
     Mock::given(method("GET"))
         .and(path("/api"))
         .respond_with(move |request: &WireRequest| {
@@ -203,6 +218,7 @@ async fn fixture_with(extra: &[(&str, &str)], with_revocation: bool) -> Fixture 
         current_refresh: None,
         issued: 0,
         token_calls: 0,
+        revoked: Vec::new(),
         last_access: String::new(),
     }));
     let server = provider_server(&provider).await;
@@ -632,6 +648,62 @@ async fn a_provider_that_issues_no_refresh_token_stores_nothing() {
     assert_eq!(stored_files(&fx), before);
 }
 
+#[tokio::test]
+async fn the_test_refreshes_and_keeps_a_refresh_token_the_provider_rotated() {
+    let fx = fixture().await;
+    save_client_secret(&fx).await;
+
+    // Before any sign-in: honest, nothing dialled.
+    let (status, body) = send(&fx, "POST", &url_of("test"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["supported"], false);
+    assert_eq!(token_calls(&fx), 0);
+
+    sign_in(&fx).await;
+    assert_eq!(
+        stored_credential(fx.secrets.path(), &token_file()),
+        "refresh-1"
+    );
+
+    // The test refreshes (the provider rotates to refresh-2) and calls the API
+    // with the new access token.
+    let (status, body) = send(&fx, "POST", &url_of("test"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(
+        stored_credential(fx.secrets.path(), &token_file()),
+        "refresh-2",
+        "the rotated refresh token must be kept"
+    );
+    // A second test only works because the new token was kept.
+    let (_, body) = send(&fx, "POST", &url_of("test"), None).await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(
+        stored_credential(fx.secrets.path(), &token_file()),
+        "refresh-3"
+    );
+    assert!(!body.to_string().contains("refresh-"), "{body}");
+}
+
+#[tokio::test]
+async fn a_refused_refresh_fails_the_test_with_a_fixed_text() {
+    let fx = fixture().await;
+    save_client_secret(&fx).await;
+    sign_in(&fx).await;
+    fx.provider.lock().unwrap().mode = Mode::Refuse;
+    let (status, body) = send(&fx, "POST", &url_of("test"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false);
+    let text = body.to_string();
+    assert!(text.contains("sign in again"), "{text}");
+    assert!(!text.contains(PROVIDER_WORDS));
+    // Nothing was thrown away: the stored token is still there to retry.
+    assert_eq!(
+        stored_credential(fx.secrets.path(), &token_file()),
+        "refresh-1"
+    );
+}
+
 async fn ingest_service_bearer(pool: &sqlx::PgPool) -> String {
     const TOKEN: &str = "ingest-service-fixture-token";
     let identity = lakehouse_store::identity::create_service_identity(
@@ -739,6 +811,71 @@ async fn the_orchestrator_replaces_the_refresh_token_and_only_it_and_only_for_oa
         stored_credential(fx.secrets.path(), &token_file()),
         "rotated-by-run"
     );
+}
+
+#[tokio::test]
+async fn signing_out_revokes_at_the_provider_and_removes_the_token() {
+    let fx = fixture().await;
+    save_client_secret(&fx).await;
+    sign_in(&fx).await;
+
+    let (status, body) = send(&fx, "POST", &url_of("oauth/sign-out"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["signedOut"], true);
+    assert_eq!(body["revocation"], "done");
+    assert_eq!(
+        fx.provider.lock().unwrap().revoked,
+        vec!["refresh-1".to_owned()]
+    );
+    assert!(!stored_files(&fx).contains(&token_file()));
+    let (_, status_body) = send(&fx, "GET", &url_of("oauth"), None).await;
+    assert_eq!(status_body["signedIn"], false);
+
+    // Nothing left to revoke the second time.
+    let (_, body) = send(&fx, "POST", &url_of("oauth/sign-out"), None).await;
+    assert_eq!(body["revocation"], "noToken");
+}
+
+#[tokio::test]
+async fn without_a_revocation_address_signing_out_says_the_provider_was_not_told() {
+    let fx = fixture_with(&[], false).await;
+    save_client_secret(&fx).await;
+    sign_in(&fx).await;
+    let (status, body) = send(&fx, "POST", &url_of("oauth/sign-out"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revocation"], "notConfigured");
+    assert!(body["message"].as_str().unwrap().contains("stays valid"));
+    assert!(fx.provider.lock().unwrap().revoked.is_empty());
+    assert!(!stored_files(&fx).contains(&token_file()));
+}
+
+#[tokio::test]
+async fn deleting_the_connector_revokes_and_removes_every_credential_file() {
+    let fx = fixture().await;
+    save_client_secret(&fx).await;
+    sign_in(&fx).await;
+    let (status, _) = raw(
+        &fx.app,
+        &fx.cookie,
+        "DELETE",
+        &format!("/api/connectors/{ID}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        fx.provider.lock().unwrap().revoked,
+        vec!["refresh-1".to_owned()]
+    );
+    assert!(stored_files(&fx).is_empty(), "{:?}", stored_files(&fx));
+    let (details,): (Value,) = sqlx::query_as(
+        "SELECT args FROM audit_event WHERE action = 'connector.delete' AND resource_id = $1",
+    )
+    .bind(ID)
+    .fetch_one(&fx.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(details["oauthRevocation"], "done");
 }
 
 fn spec_body(dial: &Value) -> Value {

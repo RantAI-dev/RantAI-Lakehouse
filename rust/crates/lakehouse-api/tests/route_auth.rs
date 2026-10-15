@@ -893,6 +893,7 @@ async fn oauth_routes_need_connector_manage_the_report_needs_ingest_read_and_the
     let person_routes = [
         ("GET", format!("{base}/oauth")),
         ("POST", format!("{base}/oauth/start")),
+        ("POST", format!("{base}/oauth/sign-out")),
     ];
     for (method, path) in &person_routes {
         let cookie = session_cookie_for_user(&pool, manage).await;
