@@ -432,6 +432,41 @@ lint or threshold was changed to get there.
   unit tests and observed in the gate's tick history; no console page
   renders them yet.
 
+### Round 2 fixes after main moved (PR #105, PR #164)
+
+Following the merges of `origin/main` (PR #105 and PR #164 / `4df7e6b4d1a3`), this round addresses reviewer blockers, merge conflicts, and environment schema constraints:
+
+- `16d341ac9b01`: DATA-19 review BLOCKER 1: caller with no tenant sees no tenant-owned edges unless unrestricted.
+- `6507efca5134`: DATA-19 review BLOCKER 2: merge origin/main (initial merge).
+- `196062b86e8d`: Merge remote-tracking branch 'origin/main' into feat/data-19-uploads-feed-pipelines (after PR #105).
+- `b49ffb2ac0d1`: fix(api): eliminate expect/unwrap in lineage tests (`expect_used` and `unwrap_used` clippy lints).
+- `e566a3932dc2`: fix(api): seed tenant rows before inserting tenant-owned rows in lineage tests (resolves FK constraint 23503 on `connector.tenant_id`).
+- `79127eaf9040`: Merge remote-tracking branch 'origin/main' into feat/data-19-uploads-feed-pipelines (after PR #164 / DATA-2, resolving merge conflict in `CHANGELOG.md` keeping both sides).
+
+#### Verification Block & Exact Counts
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Formatting | `cargo fmt --check` | clean (exit 0) |
+| Clippy | `/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` | clean across all targets and features (dev profile in 2m 04s, exit 0) |
+| Rust Store tests | `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-store --no-fail-fast` | 25 suites, 576 passed, 0 failed, 0 ignored |
+| Rust API tests | `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --no-fail-fast` | 45 suites, 3961 passed, 0 failed, 4 ignored (lib ignored=1, bin ignored=1, parity=2) |
+| Dagster tests | `pytest dispar_orchestrate --basetemp=/tmp/pytest-data19 -q` | 1073 passed, 585 warnings in 909.48s (15m 09s, exit 0) |
+| Gitleaks | `zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact -v` | scanned ~24.11 MB, no leaks found |
+
+#### Environment Findings & Resolutions
+
+1. **Foreign key constraint 23503 in lineage tests**: `origin/main` enforced foreign key constraint `connector_tenant_id_fkey` requiring tenant IDs referenced by `connector`, `pipeline_definition`, and `upload_table_claim` to exist in `tenant`. In `seed_test_tenant_owned`, `tenant_1` and `tenant_2` were inserted into `tenant` before inserting connectors, ensuring all 9 lineage tests pass.
+2. **Clippy warnings eliminated**: Removed `.expect()` and `.unwrap()` in test assertions in favor of `assert!(..., ...)` and `let Some(...) = ... else { panic!(...); }`, satisfying `-D clippy::unwrap_used` and `-D clippy::expect_used`.
+3. **Pytest temporary directory persistence**: Pytest runs under the antigravity harness defaulted `TMPDIR` to an ephemeral directory cleaned up between tool steps, causing `FileNotFoundError` in `tmp_path` fixtures during long runs. Specifying `--basetemp=/tmp/pytest-data19` resolved this, yielding 1073/1073 passing tests.
+4. **Target directory locking**: All cargo invocations were run via `/home/shiro/rantai/bin/cargo-locked` inside worktree `wt-data-19`, enforcing crate rebuilding when target directory was touched by other worktrees without deadlocking `flock`.
+5. **Dangling container cleanup**: Dangling testcontainers spawned during tests were terminated and pruned, leaving non-test containers (`moco-*`) untouched.
+
+#### Unverified Items
+
+- As documented in Section 7, `ingest_job` coarse firing remains untouched (backlog item).
+- Console UI is tested via unit/component tests (`pipeline-create-page.test.tsx`), with no live browser CI gate.
+
 ## 8. Review
 
 ### Round 1 (planner/reviewer, Claude Opus), at `cd7dff1d`
