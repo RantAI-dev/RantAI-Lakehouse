@@ -199,7 +199,8 @@ def test_a_schema_qualified_object_is_read_from_that_schema(monkeypatch):
     captured = _capture(monkeypatch)
     build_source(_SPEC, {"password": "x"}, [{"name": "HR.EMPLOYEES", "target": "employees"}], resolve_checked=_resolve)
     assert captured[0]["schema"] == "HR"
-    assert captured[0]["table_names"] == ["EMPLOYEES"]
+    # Oracle's own spelling, as the listing shows it, is mapped to the one SQLAlchemy reflects by (lower case).
+    assert captured[0]["table_names"] == ["employees"]
 
 
 def test_a_bare_table_name_keeps_the_logins_own_schema(monkeypatch):
@@ -216,3 +217,16 @@ def test_objects_of_two_schemas_in_one_call_are_refused_not_half_loaded(monkeypa
             [{"name": "HR.A", "target": "a"}, {"name": "SALES.B", "target": "b"}],
             resolve_checked=_resolve,
         )
+
+
+def test_a_listed_upper_case_table_name_is_spelled_the_way_sqlalchemy_reflects_it(monkeypatch):
+    # `MetaData.reflect(only=...)` compares against `Inspector.get_table_names`, which reports Oracle's
+    # all-upper-case names in lower case; a name given as listed would be "not available". A mixed-case name
+    # (created quoted in Oracle) is reported as it is and so is passed as it is.
+    captured = _capture(monkeypatch)
+    build_source(
+        _SPEC, {"password": "x"},
+        [{"name": "HR.EMPLOYEES", "target": "e"}, {"name": "HR.MixedCase", "target": "m"}, {"name": "HR.orders", "target": "o"}],
+        resolve_checked=_resolve,
+    )
+    assert captured[0]["table_names"] == ["employees", "MixedCase", "orders"]
