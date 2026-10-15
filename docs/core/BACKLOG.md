@@ -173,7 +173,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-5` | Task | Move to eslint 10 and its flat-config changes; dependabot #143 fails lint. Dependabot ignores eslint majors until this is planned | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
 | `REL-6` | Task | Move the data grids to TanStack Table 9; dependabot #133 fails typecheck. Dependabot ignores its majors until this is planned | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
 | `REL-7` | Task | arrow and parquet 60 with a newer `iceberg` crate: `iceberg = "=0.10.1"` still uses arrow 58, so #139, #140 and #142 fail to compile. **Blocked by** an `iceberg` release on arrow 60 (outside the repo); dependabot now groups the three | Delivery | P3 | Todo |  | `superpowers/plans/2026-10-14-deps-triage.md` |
-| `REL-8` | Task | `next` and `eslint-config-next` 16.1.6 → 16.4.0: CI's `bun run build` fails with "Failed to load external module next/dist/compiled/next-server/app-page-turbo.runtime.prod.js: TypeError: Expected CommonJS module to have a function wrapper ... this is a bug in Bun"; the same lockfile builds locally on Bun 1.3.12 and 1.3.14. Try a newer Bun in CI, or report it to Bun | Delivery | P3 | Todo |  | dependabot #131; `superpowers/plans/2026-10-14-deps-triage.md` |
+| `REL-8` | Task | `next` and `eslint-config-next` 16.1.6 → 16.4.0: CI's `bun run build` fails with "Failed to load external module next/dist/compiled/next-server/app-page-turbo.runtime.prod.js: TypeError: Expected CommonJS module to have a function wrapper ... this is a bug in Bun"; the same lockfile builds locally on Bun 1.3.12 and 1.3.14. Try a newer Bun in CI, or report it to Bun | Delivery | P3 | Done | #170 | dependabot #131; `superpowers/plans/2026-10-14-deps-triage.md` |
 | `SEC-6` | Task | Stop older API handlers from returning internal error text. Closed by `SEC-11`'s change: no handler builds a response from an error's text, and `tests/sec11_guard.rs` fails the build if one does | Administration & Security | P2 | Done | #105 | `AGENTS.md` |
 | `SEC-16` | Task | Cross-tenant leaks in the Data module: the ingestible-connectors route, one shared upload namespace, a message naming another tenant's upload table, annotation edits without the tenant gate | Administration & Security | P2 | In Progress | #87 | Data module code audit |
 | `SEC-17` | Task | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Administration & Security | P2 | In Progress | #86 | Data module code audit |
@@ -329,6 +329,7 @@ set by the product owner and are left empty until they are.
 | `SRC-20` | 2026-10-14 | 2026-10-14 | |
 | `DATA-10` | 2026-10-14 | 2026-10-14 | |
 | `SEC-30` | 2026-10-14 | 2026-10-15 | |
+| `REL-8` | 2026-10-15 | 2026-10-15 | |
 | `SEC-16` | 2026-10-08 | | |
 | `SEC-17` | 2026-10-08 | | |
 | `SEC-18` | 2026-10-08 | | |
