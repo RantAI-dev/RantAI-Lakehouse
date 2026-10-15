@@ -2910,6 +2910,22 @@ pub struct CreatePipelineBody {
     connector_id: Option<String>,
 }
 
+/// BLD-1 / D1: the `app_user` id a principal may author a pipeline as, or
+/// `None` when the principal is not a person.
+///
+/// `pipeline_definition.run_as` (migration `0075`) references `app_user`,
+/// and a service identity has no row there — `PrincipalId::uuid()` hands
+/// back its `service_identity.id` just the same, so binding the uuid
+/// blindly would fail the foreign key for every service-created pipeline.
+/// Returning `None` instead stores "no author", which D2 refuses to run,
+/// and an admin can assign through `PUT /api/pipelines/{id}/run-as`.
+fn author_id(principal: &Principal) -> Option<uuid::Uuid> {
+    match principal.id {
+        PrincipalId::User(id) => Some(id),
+        PrincipalId::Service(_) => None,
+    }
+}
+
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
 ///
 /// Every entry of `body.transforms` is validated through
@@ -3014,6 +3030,14 @@ pub async fn create(
         depends_on: body.depends_on,
         connector_id,
         id: Some(id),
+        // BLD-1 / D1: the creator is the author, so a pipeline reads as
+        // the person who made it. Only a HUMAN principal gets an author:
+        // `PrincipalId::Service` has no `app_user` row for the foreign
+        // key to point at, and "the service account reads everything" is
+        // exactly what this column exists to stop. Such a row stays
+        // `run_as = NULL` and does not run until an admin assigns an
+        // author (D2).
+        run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -3206,6 +3230,9 @@ pub async fn generate(
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
         id: None,
+        // BLD-1 / D1: the LLM proposes the SHAPE, never the identity. The
+        // author is the human who asked, exactly as in `create`.
+        run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -5770,6 +5797,8 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: None,
+                    run_as: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
                 },
                 None,
             )
@@ -8342,6 +8371,8 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: Some(id.clone()),
+                    run_as: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
                 },
                 None,
             )
@@ -9276,6 +9307,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -10343,6 +10376,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 

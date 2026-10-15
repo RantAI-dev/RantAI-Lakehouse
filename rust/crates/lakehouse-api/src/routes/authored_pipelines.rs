@@ -2032,6 +2032,8 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -2424,6 +2426,8 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -2582,6 +2586,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -2741,6 +2747,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -2931,6 +2939,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
@@ -3063,6 +3073,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
             }
         }
 
