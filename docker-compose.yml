@@ -1867,6 +1867,10 @@ services:
       # (see the block there), read by `secret_manager.py` when a run starts.
       SECRET_MANAGER: ${SECRET_MANAGER:-}
       SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
+      # SRC-12 part C, GATE ONLY: the same switch as `lakehouse-api`'s, read by
+      # `adapters/rest.py` before a token request. Empty (off) on a real
+      # installation: a client secret and a refresh token go to that address.
+      CONNECTOR_OAUTH_ALLOW_HTTP: ${CONNECTOR_OAUTH_ALLOW_HTTP:-}
       VAULT_ADDR: ${VAULT_ADDR:-}
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}

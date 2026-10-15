@@ -732,14 +732,16 @@ _REST = {
 def test_a_rest_preview_goes_through_the_adapters_first_page_reader() -> None:
     seen = {}
 
-    def first_page(dial, secrets, path, *, limit, resolve_checked):
-        seen.update(path=path, limit=limit)
+    def first_page(dial, secrets, path, *, limit, resolve_checked, connector_id):
+        # SRC-12 part C: the reader is also told the connector, so a rotated
+        # refresh token can be reported.
+        seen.update(path=path, limit=limit, connector_id=connector_id)
         return [{"id": 1, "total": 1.5}, {"id": 2}]
 
     result = discover.discover(
         _REST, _request("preview", object="/orders"), backends=_backends(rest_first_page=first_page)
     )
-    assert seen == {"path": "/orders", "limit": 100}
+    assert seen == {"path": "/orders", "limit": 100, "connector_id": "conn-1"}
     assert [(c["name"], c["typeName"]) for c in result["columns"]] == [("id", "integer"), ("total", "number")]
 
 

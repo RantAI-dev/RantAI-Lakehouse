@@ -343,7 +343,17 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
         return {}
     values = [secret_resolver.resolve_secret_ref(connector.get("secretRef"))]
     if len(fields) == 2:
-        values.append(secret_resolver.resolve_secret_ref(connector.get("secretRefSecondary")))
+        try:
+            values.append(secret_resolver.resolve_secret_ref(connector.get("secretRefSecondary")))
+        except secret_resolver.SecretRefRejected:
+            if auth_type != "oauth2_authorization_code":
+                raise
+            # SRC-12 part C: the second credential of an authorization-code
+            # connector is the refresh token, written by the person's sign-in.
+            # One that is missing or cannot be opened is a connector nobody has
+            # signed in to (or whose token was removed): "sign in again", not a
+            # rejected setting. The reason is not carried (decision 12).
+            raise rest_adapter.OAuthSignInRefused() from None
     return dict(zip(fields, values))
 
 
@@ -819,6 +829,11 @@ def _run_one_object(
             if result is None:
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
                 return None
+            source, resolved = result.source, result.resolved
+        elif adapter_name == "rest":
+            # SRC-12 part C: the connector's id lets a REST load report a refresh
+            # token the provider rotated (`adapters/rest.py`, OAUTH).
+            result = adapter.build_source(dial, secrets, [obj], connector_id=connector_id)
             source, resolved = result.source, result.resolved
         else:
             result = adapter.build_source(dial, secrets, [obj])

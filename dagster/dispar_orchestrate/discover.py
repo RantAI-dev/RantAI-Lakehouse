@@ -690,6 +690,9 @@ def _rest(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> d
         request.object,
         limit=MAX_SAMPLE_DOCUMENTS,
         resolve_checked=b.resolve_checked,
+        # SRC-12 part C: a preview that signs in with a refresh token may be
+        # handed a new one, which must reach the API (the old one is retired).
+        connector_id=request.connector_id,
     )
     return preview(columns_from_records(records))
 
