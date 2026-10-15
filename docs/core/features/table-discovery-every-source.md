@@ -6,8 +6,8 @@
 | Backlog | `SRC-13` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-13.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 9 |
-| Status | Planned. Decisions signed 2026-10-14 |
-| Plan | Not written; it waits for the signatures below |
+| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gates on 2026-10-15 |
+| Plan | `docs/superpowers/plans/2026-10-15-src-13-table-discovery.md` |
 
 ## Problem
 

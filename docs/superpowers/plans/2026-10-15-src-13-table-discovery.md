@@ -238,4 +238,38 @@ Branch fast-forwarded to `origin/feat/phase-1-rest` (84a2f212) first.
 
 ## Review
 
-*(planner)*
+### Reviews, 2026-10-15 (planner)
+
+**Review 1, tasks 1 to 4.** Accepted: the error classes `address_refused`
+and `failed` beyond the six of decision 10; an empty preview is `columns:
+[]`; a MongoDB sign-in refusal (code 18) is not retried; the adapter
+refactors that let listings share the loaders' connection code.
+`SHOULD-FIX 1`: the Oracle loader kept only the table part of a listed
+`SCHEMA.TABLE`, so a listed table from another schema would not load —
+fixed in task 5, plus a second Oracle defect the developer found (upper-case
+names against the dialect's lower-case reflection).
+
+**Review 2, tasks 5 to 8.** Accepted: the old `/discover` route is unmounted
+but its handler stays, because the assistant's `discover_source` tool calls
+it in-process; moving that tool is assistant work outside dashboards, filed
+as `SRC-22` for the AI team. Search runs on the server above 500 names
+(decision 9's "more than a page"). `BLOCKER 1` (CI): a store test assumed an
+empty `public` schema — fixed with a schema of its own.
+
+**Review 3, after CI on `84a2f212`.** `BLOCKER 1`: Kafka listing passed a
+setting kafka-python 3.0.11 does not know, so the consumer was never built;
+fixed, and an unclassified listing failure now logs its type name.
+`BLOCKER 2`: a route-permission test's principals had no tenant, so the
+tenant gate answered first; fixed without weakening the policy check. Then
+`main`'s `SEC-11` guard flagged three of this phase's lines as returning an
+error's text; each is the repository's own fixed sentence (checked by the
+reviewer for the credential store's I/O error, which carries only the error
+kind) and is allowlisted with its reason.
+
+CI on #144 at `f2632d21` (run 38692942055): every gate passes, including the
+real discover step of all eleven types and the 10,000-table job (listing in
+0.06 s, `docs/plans/SRC-13-RESULT.md`); the only red check was the `SEC-11`
+guard, fixed in `9aff013d`, whose CI is running. No open `BLOCKER`. Open for
+the product owner: the browser check of the Find flow at the end of the
+phase.
+
