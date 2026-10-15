@@ -44,6 +44,35 @@ the saved answers for any case whose score moves.
 `--only id1,id2` runs a subset. Results go to `--out` (default: a JSON file
 in the system temp directory), with every answer and tool trace, so two
 runs can be compared case by case.
+
+# The dashboard set
+
+`dashboard_cases.json` is the standard set of dashboard requests. One command
+brings up a throwaway stack, seeds it, runs the set and takes the stack away
+again:
+
+    LLM_KEY=… ops/ai_eval/run_dashboard_eval.sh --out /tmp/baseline.json
+
+The set passes at 90% of its cases or more. `--repeat N --need K` runs each
+case N times and needs K of them to pass, so one flaky answer does not decide
+a case; the run above uses `--repeat 3 --need 2`. `--baseline <results.json>`
+adds a second rule: a case that passed in the baseline and fails now fails the
+set however good the percentage is. A case the baseline never saw is a new
+case, not a regression.
+
+Every case sets up the objects it needs, confirms what the assistant drafts
+the way the console does, checks the state it created, and deletes it again,
+so the set does not depend on what the stack happens to hold and does not
+leave anything behind. A run that could not finish is a failed case, not a
+crash, and a delete that fails is a problem of that case.
+
+Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
+start (no stack, no login, a port already in use).
+
+This run belongs to a person, not to CI: it needs a model key, it builds an
+image, and it answers are read by whoever runs it. Put the numbers in the
+review of the PR that changed the tool or prompt. Results are never kept in
+the repository.
 """
 
 from __future__ import annotations
