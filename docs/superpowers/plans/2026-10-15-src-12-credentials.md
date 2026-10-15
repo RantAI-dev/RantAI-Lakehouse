@@ -7,8 +7,9 @@ by the planner (Claude Opus) for developer agents, under the role split in
 review before the next starts.
 
 **Base and branch:** the Phase 1 branch `feat/phase-1-rest` (draft PR #144).
-Built in its own worktree on a sub-branch cut from the phase branch and
-merged back into it, so it can run beside `SRC-13`. Migration numbers
+Built on the phase branch itself, in its worktree
+`/home/hv/lakehouse-sec27`, now that `SRC-11` is done there; `SRC-13` is
+built beside it on a sub-branch in another worktree. Migration numbers
 `0080` onward (`SRC-13` takes `0075`–`0079`).
 **Spec:** `docs/core/specs/src-12.md`. **Feature page:**
 `docs/core/features/credentials-done-properly.md`; D1 to D13 below are its
