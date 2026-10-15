@@ -534,5 +534,5 @@ df32fbdc41f6 docs(plan): SEC-18 round 2 review: 1 BLOCKER, 1 SHOULD-FIX
 
 ```
 git ls-remote --heads origin fix/sec-18-no-default-credentials:
-cdbf7c6a0a74136dc698f1f516a5a04eb41f7e0d	refs/heads/fix/sec-18-no-default-credentials
+cdbf7c6a0a74	refs/heads/fix/sec-18-no-default-credentials
 ```
