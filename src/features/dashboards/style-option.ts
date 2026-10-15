@@ -163,9 +163,10 @@ function applyByValue(series: Obj[], stops: string[]): void {
   });
 }
 
-function applySeriesColours(series: Obj[], byName: Record<string, string>): void {
-  series.forEach((s) => {
-    const own = typeof s.name === "string" ? byName[s.name] : undefined;
+function applySeriesColours(series: Obj[], cols: (string | undefined)[], byName: Record<string, string>): void {
+  series.forEach((s, i) => {
+    // By the series' name, else by the result column it draws (the builder lists result names).
+    const own = (typeof s.name === "string" ? byName[s.name] : undefined) ?? (cols[i] ? byName[cols[i]!] : undefined);
     if (own) {
       s.itemStyle = { ...asObj(s.itemStyle), color: own };
       if (s.type === "line") s.lineStyle = { ...asObj(s.lineStyle), color: own };
@@ -270,7 +271,7 @@ export function styleOption(base: EChartsOption, input: StyleInput): Styled {
   const message = applyAxes(option, series, cols, input);
   if (message) return { option: base, message, hiddenNotes: 0 };
   if (style.colors?.byValue) applyByValue(series, style.colors.byValue);
-  if (style.colors?.series) applySeriesColours(series, style.colors.series);
+  if (style.colors?.series) applySeriesColours(series, cols, style.colors.series);
   // A per-value format reaches the tooltip of its own series.
   series.forEach((s, i) => {
     const f = style.valueFormats?.[cols[i] ?? ""];

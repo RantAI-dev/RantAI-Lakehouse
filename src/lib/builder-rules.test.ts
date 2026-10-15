@@ -117,9 +117,10 @@ test("questions lock the breakdown and the bins", () => {
 })
 
 test("the fold opens for anything the edited chart uses inside it", () => {
-  const none = { steps: 0, layers: 0, referenceLines: 0, click: false, columnSettings: 0, compare: false }
+  // BI-17: reference lines moved to the Format section, which opens on `formatUsed` (style-draft.test.ts).
+  const none = { steps: 0, layers: 0, click: false, columnSettings: 0, compare: false }
   assert.equal(moreOptionsUsed(none), false)
-  for (const key of ["steps", "layers", "referenceLines", "columnSettings"] as const) assert.equal(moreOptionsUsed({ ...none, [key]: 1 }), true, key)
+  for (const key of ["steps", "layers", "columnSettings"] as const) assert.equal(moreOptionsUsed({ ...none, [key]: 1 }), true, key)
   assert.equal(moreOptionsUsed({ ...none, click: true }), true)
   assert.equal(moreOptionsUsed({ ...none, compare: true }), true)
 })

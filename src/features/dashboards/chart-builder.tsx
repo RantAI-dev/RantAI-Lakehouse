@@ -75,6 +75,9 @@ import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/sect
 import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
+import type { StyleFields } from "@/lib/chart-style";
+import { formatRules, formatUsed, styleFromDef, stylePayload } from "@/lib/style-draft";
+import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
 import type { Hierarchy } from "@/services/contracts/hierarchies";
@@ -110,6 +113,7 @@ export type ChartDef = {
   /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
   grain?: string;
 } & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
+  & StyleFields // number and date formats, colours, axes, labels, notes, tooltip, conditional colours (BI-17 part A)
   & ShapeDefFields; // measures with their own aggregate, the chart's own filters, sort, "Other", groupings (BI-6)
 type BoardOpt = { id: string; name: string };
 /** The rows of the chart's last result beside the chart (BI-6 part 2). */
@@ -379,6 +383,9 @@ export function ChartBuilder({
   const [paramDefs, setParamDefs] = React.useState<ParamDef[]>([]);
   const [limitParamName, setLimitParamName] = React.useState("");
   const [refLines, setRefLines] = React.useState<RefLineDraft[]>([]);
+  // BI-17 part A: the chart's formats, colours, axes, labels, notes, tooltip and conditional colours (section 5).
+  const [style, setStyle] = React.useState<StyleFields>({});
+  const [formatOpen, setFormatOpen] = React.useState(false);
   // BI-13: the chart's other questions, and how its own series is drawn when it has them ("" = the kind's default).
   const [layers, setLayers] = React.useState<LayerDraft[]>([]);
   const [ownDraw, setOwnDraw] = React.useState("");
@@ -388,7 +395,7 @@ export function ChartBuilder({
   const [moreOpen, setMoreOpen] = React.useState(false);
   // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
   const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
-  const panelRefs = React.useRef<Partial<Record<SectionNumber, HTMLElement | null>>>({});
+  const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
   const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
   // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
   const [listOpen, setListOpen] = React.useState(true);
@@ -751,12 +758,14 @@ export function ChartBuilder({
       setLimitParamName(limitParam(initial.limit) ?? "");
       setLimit(typeof initial.limit === "number" ? initial.limit : 20);
       setRefLines(refLinesFromDef(initial.referenceLines));
+      setStyle(styleFromDef(initial));
+      setFormatOpen(formatUsed(styleFromDef(initial), initial.referenceLines?.length ?? 0));
       setLayers(layerDraftsFromDef(initial.layers));
       setOwnDraw(initial.draw ?? "");
       setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
       setMoreOpen(moreOptionsUsed({
-        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0, referenceLines: initial.referenceLines?.length ?? 0,
+        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0,
         click: !!initial.click,
         columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
         compare: initial.kind === "kpi" && !!initial.compare,
@@ -785,7 +794,7 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setLayers([]); setOwnDraw(""); setOwnAxis("");
+    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setStyle({}); setFormatOpen(false); setLayers([]); setOwnDraw(""); setOwnAxis("");
     setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
     joinsSeen.current = "[]";
@@ -819,6 +828,11 @@ export function ChartBuilder({
   // which its column settings are kept for.
   const resultNames = measureRows.filter((r) => r.column).map((r) => resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure));
   const shownColumns = [...new Set([...groupingNames, ...resultNames])];
+  // BI-17 part A: which groups of section 5 this chart takes, and the names its formats, second axis,
+  // tooltip and conditional colours can refer to (a table's columns, a pivot's value columns, else the values).
+  const fmtRules = formatRules({ kind, breakdown: canBreakdown && !!breakdown, measures: resultNames.length });
+  const formatValueNames = kind === "table" || kind === "pivot" ? (kind === "pivot" ? tableDraft.pivotValues.map((v) => v.column).filter(Boolean) : shownColumns) : resultNames;
+
   const shapeContext = { kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: !!(canBreakdown && breakdown) };
   // BI-2: saved metrics of the source are offered where an aggregate field is (not maps, box plots, pivots or raw rows).
   const takesMetrics = !ownColumns && !isPoints && kind !== "boxplot" && kind !== "text";
@@ -948,6 +962,8 @@ export function ChartBuilder({
         ...shapeOut(),
       };
     }
+    // BI-17 part A: only the groups this kind takes, with empty ones left out.
+    if (!isText) Object.assign(payload, stylePayload(style, fmtRules));
     // A chart without marks to click (text, KPI, gauge, table, density map)
     // has no click setting; one left over from another kind is dropped.
     const clickable = kindHasClickValue(kind);
@@ -971,6 +987,8 @@ export function ChartBuilder({
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
     // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
     params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
+    // BI-17: formats and colours change how the preview is drawn, and the rules of a kind change what is sent.
+    style: JSON.stringify(stylePayload(style, fmtRules)),
     // BI-13: each question, and how the chart's own series is drawn, reaches the statements and the drawing.
     layers: JSON.stringify(layersApply ? { layers, ownDraw, ownAxis } : null),
   });
@@ -1452,7 +1470,6 @@ export function ChartBuilder({
               />
             ) : null}
 
-            {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} /> : null}
             {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
             {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
             {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
@@ -1464,6 +1481,13 @@ export function ChartBuilder({
               </div>
             ) : null}
             {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
+          </FoldSection>
+
+          {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
+          <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
+            <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames}>
+              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} /> : null}
+            </FormatSection>
           </FoldSection>
         </>
       )}

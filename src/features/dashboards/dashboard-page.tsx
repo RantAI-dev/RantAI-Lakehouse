@@ -41,6 +41,7 @@ import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
 import { ThemeFontDialog } from "./theme-font-dialog";
 import { dashboardLook, type DashboardTheme } from "@/lib/dashboard-look";
+import { NOTE_KINDS, withNote } from "@/lib/style-draft";
 import { SHIPPED_FONT_IDS } from "@/lib/formatting-settings";
 import { labelledFolders } from "@/lib/dashboard-organise";
 import { FavouriteButton } from "./favourite-button";
@@ -60,7 +61,7 @@ import { TabBar } from "./tab-bar";
 import { isSectionKind } from "./tile-card";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
-import { DrillMenu, RecordsDialog, type DrillTarget } from "./drill";
+import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill";
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
@@ -191,6 +192,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [themeOpen, setThemeOpen] = React.useState(false);
+  // BI-17: a note being pinned on a clicked point (edit mode), and the sentence when the save was refused.
+  const [noteFor, setNoteFor] = React.useState<{ tileId: string; point: string } | null>(null);
+  const [savingNote, setSavingNote] = React.useState(false);
+  const [noteError, setNoteError] = React.useState<string | null>(null);
   const [savingTheme, setSavingTheme] = React.useState(false);
   const [themeError, setThemeError] = React.useState<string | null>(null);
   // Folders only group the title switcher here. Managing them and filing
@@ -478,6 +483,31 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setSavingTheme(false);
     }
   }, [board]);
+
+  // BI-17: pin a note on a point. The chart is written whole through its own write route
+  // (`dashboard:write`), with the note added to the stored definition.
+  const saveNote = React.useCallback(async (text: string) => {
+    const target = noteFor && data?.charts.find((c) => c.id === noteFor.tileId);
+    if (!noteFor || !target?.def) return;
+    setSavingNote(true);
+    setNoteError(null);
+    try {
+      const res = await apiFetch("/api/dashboard/specs", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...withNote(target.def as { annotations?: never[] }, noteFor.point, text), id: noteFor.tileId, board }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not save the note");
+      }
+      setNoteFor(null);
+      await load();
+    } catch (e) {
+      setNoteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingNote(false);
+    }
+  }, [noteFor, data?.charts, board, load]);
 
   // Cross-filter: toggle a value in a column → filters EVERY tile with that column.
   const crossFilter = React.useCallback((column: string, value: string) => {
@@ -1194,11 +1224,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
+          onAddNote={edit && canWrite && !drill.builtin && drill.tileId && drillChart && NOTE_KINDS.includes(drillChart.kind) && drill.layer === undefined
+            ? () => { setNoteError(null); setNoteFor({ tileId: drill.tileId as string, point: drill.label ?? drill.name }); setDrill(null); }
+            : undefined}
           onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
           drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}
       <RecordsDialog request={records} onClose={() => setRecords(null)} />
+      {noteFor ? <NoteDialog point={noteFor.point} saving={savingNote} error={noteError} onSave={(t) => void saveNote(t)} onClose={() => setNoteFor(null)} /> : null}
 
       {tileDialog?.kind === "data" && dialogSpec ? (
         <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />

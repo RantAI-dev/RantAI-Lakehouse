@@ -95,7 +95,7 @@ function sortSummary(i: SummaryInput): string {
 
 /**
  * The builder's sections, by number: 1 Data, 2 What to show, 3 Sort and filter,
- * 4 More options.
+ * 4 More options. (Section 5, Format, holds nothing a save needs, so no missing field points to it.)
  */
 export type SectionNumber = 1 | 2 | 3 | 4
 

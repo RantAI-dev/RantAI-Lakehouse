@@ -62,6 +62,12 @@ describe("colours", () => {
     expect((series(named)[1]!.itemStyle as { color: string }).color).not.toBe("#00aa00")
   })
 
+  test("a colour keyed by the result column reaches the series that draws it", () => {
+    const { option } = draw("bar", { colors: { series: { w: "#00aa00" } } }, ["v", "w"], { measureLabels: { v: "Total", w: "Other" } })
+    expect((series(option)[1]!.itemStyle as { color: string }).color).toBe("#00aa00")
+    expect((series(option)[0]!.itemStyle as { color?: string }).color).toBeUndefined()
+  })
+
   test("colour by value ranges from the first to the last colour over the shown minimum and maximum", () => {
     const { option } = draw("bar", { colors: { byValue: ["#000000", "#ffffff"] } })
     const data = series(option)[0]!.data as { value: number; itemStyle: { color: string } }[]

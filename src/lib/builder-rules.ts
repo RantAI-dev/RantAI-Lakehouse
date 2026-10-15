@@ -97,7 +97,6 @@ export function builderRules(s: BuilderState): BuilderRules {
 export type MoreOptionsUse = {
   steps: number
   layers: number
-  referenceLines: number
   /** A click that replaces the drill menu. */
   click: boolean
   /** Column formats of a grouped table. */
@@ -107,7 +106,7 @@ export type MoreOptionsUse = {
 }
 
 export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.referenceLines > 0 || u.click || u.columnSettings > 0 || u.compare
+  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare
 }
 
 /**
