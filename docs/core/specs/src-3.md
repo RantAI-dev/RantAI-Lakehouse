@@ -5,7 +5,7 @@
 | Backlog | `SRC-3` in [BACKLOG.md](../BACKLOG.md) |
 | Module | Data |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Waits for | `DEC-9` (decision) |
+| Blocked by | `DEC-9`, `SRC-12` (OAuth sign-in) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why

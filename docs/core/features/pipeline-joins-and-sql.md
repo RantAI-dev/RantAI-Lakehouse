@@ -10,7 +10,7 @@
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `BLD-3`**. |
+| Plan | Slice 1: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md`; slices 2 and 3 not written yet. Nothing open blocks it (`BLD-3` shipped). |
 | Started | |
 | Shipped | |
 | Evidence | |

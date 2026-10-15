@@ -10,7 +10,7 @@
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `DATA-10`, `DATA-2`**. |
+| Plan | Not written yet. Nothing open blocks it (`DATA-10`, `DATA-2` shipped). |
 | Started | |
 | Shipped | |
 | Evidence | |
