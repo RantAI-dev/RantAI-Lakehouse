@@ -2215,6 +2215,8 @@ services:
         condition: service_healthy
       g3a-source-init:
         condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
@@ -2251,6 +2253,61 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g7_pipeline_test.py"
+    restart: "no"
+
+  # BLD-1 acceptance — `ops/g7/bld1_pipeline_author_test.py`: an authored
+  # pipeline reads as its author, proven on the ROWS it writes. Its own
+  # service rather than a second command on `g7-test-runner`, because that
+  # one's `command` is fixed to the G7 script and `docker compose run`
+  # REPLACES a command -- running this through it would drop the
+  # `pip install requests` its `entrypoint` relies on, and the script would
+  # exit on `import requests` having proved nothing. Same image, same
+  # read-only `./ops/g7` mount, same bootstrap-admin credential from the
+  # operator's `.env`.
+  #
+  # `BLD1_NO_AUTHOR_PIPELINE_ID` is the third case's fixture (a pipeline
+  # whose `run_as` was cleared, which is what a service identity's create
+  # and the migration's backfill both leave). Unset in a normal run, and
+  # the script then prints an explicit SKIP line naming where that case is
+  # covered; CI sets it — see `ci.yml`'s `g3a-dagster` job for the `psql`
+  # step that clears the column.
+  #
+  # Usage (from the clean stack G3a leaves behind):
+  #   docker compose -p <project> --profile dagster run --rm bld1-test-runner
+  bld1-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g7:/work:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      # The Silver-side assertions read the pipeline's output through
+      # ClickHouse, the same client `g7-test-runner` uses.
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      BLD1_NO_AUTHOR_PIPELINE_ID: ${BLD1_NO_AUTHOR_PIPELINE_ID:-}
+      BLD1_NO_AUTHOR_FIXTURE: ${BLD1_NO_AUTHOR_FIXTURE:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python bld1_pipeline_author_test.py"
     restart: "no"
 
   # DATA-9 (G9) — the file-upload acceptance test (`ops/g9/upload_test.py`):
