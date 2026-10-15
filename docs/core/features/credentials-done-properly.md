@@ -6,8 +6,8 @@
 | Backlog | `SRC-12` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-12.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 4 |
-| Status | Planned. Decisions signed 2026-10-14 |
-| Plan | Not written; it waits for the signatures below. Size L: the plan builds it in three parts (decision 13) |
+| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; all three parts built and proven by their gates on 2026-10-15 |
+| Plan | `docs/superpowers/plans/2026-10-15-src-12-credentials.md` (three parts) |
 
 ## Problem
 
@@ -95,6 +95,17 @@ beyond the spec. The planner's recommendation is the Default.
 - An operator's environment variable is read at start-up only.
 - Changing a password at the source is the customer's step; the product
   only stops using the old one.
+- Every installation must set `CONNECTOR_SECRETS_KEY`; losing it means
+  entering every typed credential again.
+- Secret-manager references work only inside the paths the operator allows
+  (`SECRET_MANAGER_ALLOWED_PREFIXES`); with none set, no reference is
+  accepted.
+- Vault: KV version 2, no namespaces. Azure: the public cloud. Google: a
+  service-account key file or the platform identity.
+- OAuth: REST connectors only; client authentication by `client_secret_post`
+  only; a signed-in connector cannot be moved to another provider (create a
+  new one); two runs of one connector at once can race on a provider that
+  rotates refresh tokens.
 
 ## Acceptance checklist
 

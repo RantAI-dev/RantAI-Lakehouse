@@ -407,4 +407,48 @@ Delete (existing route) revokes before the files go and records `oauthRevocation
 
 ## Review
 
-*(planner)*
+### Reviews, 2026-10-15 (planner)
+
+**Part A.** Accepted as built. `SHOULD-FIX 1`: a credential that cannot be
+opened with the key answered the generic "resolved to nothing" — fixed in
+part B's B0 with its own fixed text. `BLOCKER` (CI): the image smoke test
+started the API without a key — fixed.
+
+**Part B.** `BLOCKER 1` (security): any user with `connector:manage` could
+reference any secret the product's manager identity can read and, with a
+host of their choosing, carry it off in a connection test. Fixed fail-closed
+with `SECRET_MANAGER_ALLOWED_PREFIXES` (segment-wise, `{tenant}`, checked on
+save and at every use in the API and the orchestrator; no prefixes, no
+references). A stated limit: at use, `{tenant}` matches any one segment
+because the resolvers do not know the connector; the exact tenant is checked
+at save. CI rounds: a SigV4 test vector recorded over the wrong payload
+form; "nobody answers" tests that a pooled mock server answered with 404;
+a gate reference invalid by grammar; integration tests that never set the
+prefixes; an audit test pinned to the old args. Accepted: the AWS
+credential order; references on the re-point route after the `SEC-14`
+refusal; create-then-reference in the console; the Vault image is a CI
+fixture under BUSL-1.1 (OpenBao is the drop-in).
+
+**Part C.** Accepted, and written as limits: a signed-in connector cannot be
+re-pointed; `client_secret_post` only; concurrent runs can race on rotating
+providers; the PKCE verifier is kept in clear for at most 10 minutes. CI
+rounds: an invalid token address was answered with the re-point refusal
+instead of a 400 (order of checks fixed; a real public IP in a test replaced
+by a documentation address, rule 12); the gate expected rows to double under
+the replace mode.
+
+**`SEC-36`.** This branch's CI-only keys made the full-history `gitleaks`
+scan red on `main` and on every PR. Fixed: no key-shaped literal is committed
+(CI generates its keys at run time; the test vector describes its key); the
+22 historical findings are baselined by exact fingerprint with proof, per
+`SEC-1`; `.gitleaks.toml` is back to `main`'s. Both scans pass on #144. The
+planner should have caught this in part A's review.
+
+CI on #144 at `daaec3c9` (run 38719076389): all three `SRC-12` gates, every
+other gate and both `gitleaks` jobs pass; the last two failures (an
+unexported key in the smoke test, a test expecting the settings body without
+part C's `oauthCallbackUrl`) are fixed in `bf7a39ad`, whose CI is running.
+No open `BLOCKER`. Open for the product owner: the browser check of the
+credential form, "Reference a secret" and "Sign in" at the end of the phase,
+and the staging secret `STAGING_CONNECTOR_SECRETS_KEY` before the merge.
+
