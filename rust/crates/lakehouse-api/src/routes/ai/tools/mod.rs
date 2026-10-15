@@ -220,6 +220,9 @@ pub(in crate::routes) async fn run_tool(
 ///
 /// When the reporting settings cannot be read, this returns the same error
 /// the dispatch arm returns, instead of skipping the check.
+///
+/// `confirmed` is dropped during parse because `ChartInput` and its flattened `TableFields` lack
+/// `deny_unknown_fields` (`Compare` has it; adding it here would refuse drafts the Confirm path accepts).
 pub(crate) async fn check_draft(
     state: &AppState,
     name: &str,
