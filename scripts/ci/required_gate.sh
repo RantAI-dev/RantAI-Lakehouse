@@ -36,6 +36,7 @@
 #   G6_ALERTS_RESULT      result of `g6-alerts` job (SRC-17 alert delivery)
 #   G6_OPS_RESULT         result of `g6-ops` job (SRC-11 connector operations)
 #   G6_CREDENTIALS_RESULT result of `g6-credentials` job (SRC-12 credentials at rest)
+#   G6_SECRET_MANAGERS_RESULT result of `g6-secret-managers` job (SRC-12 part B, Vault and AWS)
 #   G6_DISCOVERY_SCALE_RESULT result of `g6-discovery-scale` job (SRC-13, 10,000 tables listed and searched)
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
@@ -149,6 +150,7 @@ run_gate() {
   check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
