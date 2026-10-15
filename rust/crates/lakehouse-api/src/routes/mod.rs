@@ -18,6 +18,7 @@ mod catalog_query;
 mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
+mod connector_oauth;
 mod connector_runs;
 mod connectors;
 mod dashboard;
@@ -531,6 +532,13 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/resume",
             axum::routing::post(connector_runs::resume),
         )
+        // `SRC-12` part C: signing a REST connector in with `OAuth2`, for a
+        // person with `connector:manage` on a connector of their own tenant.
+        .route("/api/connectors/{id}/oauth", get(connector_oauth::status))
+        .route(
+            "/api/connectors/{id}/oauth/start",
+            axum::routing::post(connector_oauth::start),
+        )
         // `SRC-8` decision D6: a person with `connector:manage` on a
         // connector of their own tenant reads and approves schema changes.
         .route(
@@ -623,6 +631,21 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/run-reports/{runId}/end",
             axum::routing::post(connector_runs::report_end),
+        )
+        // `SRC-12` part C: the provider sends the person's browser back here. It
+        // has no connector in its path, so it sits outside the tenant gate; the
+        // handler checks the user, the tenant and `connector:manage` itself.
+        // Static, so matched ahead of `/api/connectors/{id}` like `/types`.
+        .route(
+            "/api/connectors/oauth/callback",
+            get(connector_oauth::callback),
+        )
+        // `SRC-12` part C: the orchestrator reports a refresh token the provider
+        // rotated. Outside the tenant gate (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/oauth/refresh-token",
+            axum::routing::post(connector_oauth::update_refresh_token),
         )
         // `SRC-13`: the orchestrator's answer to a discovery request. Outside the
         // tenant gate for the same reason (a service identity belongs to no

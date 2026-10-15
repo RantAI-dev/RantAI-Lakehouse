@@ -859,6 +859,94 @@ async fn discovery_routes_need_connector_manage_and_the_result_route_needs_inges
     );
 }
 
+/// `SRC-12` part C: the OAuth sign-in routes of a connector are a person's
+/// (`connector:manage`), the rotated-token report is the orchestrator's
+/// (`ingest:read`, then the handler's service-identity check), and the
+/// provider's callback needs a signed-in user and nothing more at the gate.
+/// Each direction: a `connector:manage`-only principal passes the gate of the
+/// person's routes (the handler answers 409, the seeded Postgres connector is
+/// not an OAuth one) and is refused by the gate on the report; an
+/// `ingest:read`-only principal is refused by the gate on the person's routes
+/// and passes the gate on the report to be refused by the handler (a user, not
+/// the service identity). The callback refuses nobody at the gate who is signed
+/// in (a principal with no permission at all gets the fixed "not valid" page)
+/// and answers 401 to nobody signed in.
+#[tokio::test]
+async fn oauth_routes_need_connector_manage_the_report_needs_ingest_read_and_the_callback_a_user() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let nobody = create_zero_permission_principal(&pool).await;
+    // Both join the connector's tenant, as in the discovery test above, so the
+    // person's routes reach the handler and the 403 is the permission gate's.
+    for user_id in [manage, ingest] {
+        sqlx::query(
+            "INSERT INTO app_user_tenant (user_id, tenant_id) \
+             VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("join the connector's tenant");
+    }
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let person_routes = [
+        ("GET", format!("{base}/oauth")),
+        ("POST", format!("{base}/oauth/start")),
+    ];
+    for (method, path) in &person_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    let report = format!("{base}/oauth/refresh-token");
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, "POST", &report, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, "POST", &report, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
+
+    // The callback: signed in, with no permission at all, passes the gate and
+    // gets the fixed page (no `state`); not signed in, 401.
+    let callback = "/api/connectors/oauth/callback";
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let resp = request_with_cookie(&router, "GET", callback, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(text.contains("Sign-in not completed"), "{text}");
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(callback)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// The six upload routes (ADR 0014, decision 6) are gated by the existing
 /// `connector:manage`, with no new permission: a seeded Data Engineer
 /// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst

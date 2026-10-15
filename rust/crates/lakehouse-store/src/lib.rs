@@ -38,6 +38,7 @@ pub mod audit;
 pub mod cdc;
 pub mod chat_term;
 pub mod connector_discovery;
+pub mod connector_oauth;
 pub mod connector_probe_result;
 pub mod connector_run;
 pub mod connector_type;

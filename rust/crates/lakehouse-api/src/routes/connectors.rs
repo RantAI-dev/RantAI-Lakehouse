@@ -38,7 +38,7 @@ use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use lakehouse_store::ingest_spec::{Dial, SqlDriver};
+use lakehouse_store::ingest_spec::{Dial, RestAuth, SqlDriver};
 use lakehouse_store::schema_change::{self, SchemaChangePolicy};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
@@ -555,7 +555,7 @@ impl std::fmt::Debug for SecretInput {
 }
 
 impl SecretInput {
-    fn into_secret(self) -> SecretValue {
+    pub(super) fn into_secret(self) -> SecretValue {
         SecretValue::new(self.0)
     }
 }
@@ -1535,6 +1535,10 @@ pub struct CredentialSettingsResponse {
     secret_manager: Option<&'static str>,
     /// `false` when the operator turned typing a credential off.
     typed_credentials: bool,
+    /// This product's OAuth callback address, to enter in the provider's app
+    /// settings (`CONNECTOR_OAUTH_REDIRECT_URI`); `null` when the operator has
+    /// not set it, in which case signing in is refused (`SRC-12` part C).
+    oauth_callback_url: Option<String>,
 }
 
 /// `GET /api/connectors/credential-settings` — what this installation offers
@@ -1555,6 +1559,7 @@ pub async fn credential_settings(
             .kind
             .map(SecretManagerKind::as_str),
         typed_credentials: state.config.connector_typed_credentials,
+        oauth_callback_url: state.config.connector_oauth_redirect_uri.clone(),
     }))
 }
 
@@ -1922,6 +1927,36 @@ async fn replace_credentials(
             .map_err(|err| swap_error(id, err))
     })
     .await
+}
+
+/// Seal `token` as this connector's refresh-token credential (`SRC-12` part C):
+/// the managed `…_token` file of the secondary slot, replacing whatever the slot
+/// held. The one place a refresh token is written, for the sign-in callback and
+/// the orchestrator's rotation report.
+/// `current_secondary_ref` is what the slot names now (the swap's expected old
+/// value); the slot is moved to the managed name when it named something else.
+///
+/// # Errors
+///
+/// As [`replace_credentials`]: a store failure (400/503, fixed texts) or a
+/// 404/409 from the swap; nothing changed.
+pub(super) async fn store_refresh_token(
+    state: &AppState,
+    id: &str,
+    current_secondary_ref: Option<&str>,
+    token: SecretValue,
+) -> Result<(), ApiError> {
+    let change = SlotChange {
+        slot: connectors::SecretSlot::Secondary,
+        new_ref: connectors::derive_secret_ref(
+            id,
+            connectors::CredentialSource::Managed,
+            connectors::CredentialKind::Token,
+        ),
+        provided: Provided::Typed(token),
+        old_ref: current_secondary_ref.map(str::to_owned),
+    };
+    replace_credentials(state, id, std::slice::from_ref(&change)).await
 }
 
 /// The part of [`replace_credentials`] every credential change shares
@@ -3151,7 +3186,40 @@ pub struct IngestCredentialBody {
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
+    oauth: crate::connector_oauth::OAuthSettings,
 ) -> Result<(), ApiError> {
+    // `SRC-12` part C: the addresses of an `OAuth2` dial receive the client
+    // secret and the refresh token, so they get the same two checks as
+    // `baseUrl`: `https` (or the gate-only `http` switch) and the private
+    // address refusal. The sign-in address is only handed to the browser, so it
+    // gets the scheme check alone.
+    if let Dial::Rest(rest) = dial {
+        let (sign_in, dialled): (Option<&str>, Vec<&str>) = match &rest.auth {
+            RestAuth::Oauth2ClientCredentials { token_url } => (None, vec![token_url.as_str()]),
+            RestAuth::Oauth2AuthorizationCode {
+                authorize_url,
+                token_url,
+                revocation_url,
+                ..
+            } => (
+                Some(authorize_url.as_str()),
+                std::iter::once(token_url.as_str())
+                    .chain(revocation_url.as_deref())
+                    .collect(),
+            ),
+            RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => (None, Vec::new()),
+        };
+        if sign_in.is_some_and(|url| !crate::connector_oauth::scheme_allowed(url, oauth)) {
+            return Err(ApiError::BadRequest(
+                "auth.authorizeUrl must start with https://".to_owned(),
+            ));
+        }
+        for url in dialled {
+            crate::connector_oauth::check_address(url, internal_hosts, oauth)
+                .await
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     let host_port: Option<(&str, u16)> = match dial {
         Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
         Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
@@ -3367,7 +3435,12 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     let Some(credential) = credential else {
-        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        check_dial_ssrf(
+            &dial,
+            &state.config.connector_internal_hosts(),
+            state.config.oauth_settings(),
+        )
+        .await?;
         return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
@@ -3439,7 +3512,12 @@ async fn save_with_credentials(
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
-    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    check_dial_ssrf(
+        dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
     // Only after the address is approved: a refused target makes no call to
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;

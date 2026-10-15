@@ -689,7 +689,7 @@ async fn probe_rest(
             };
             request.basic_auth(username.expose_secret(), Some(password.expose_secret()))
         }
-        RestAuth::Oauth2ClientCredentials { .. } => {
+        RestAuth::Oauth2ClientCredentials { .. } | RestAuth::Oauth2AuthorizationCode { .. } => {
             // Never fabricated: an OAuth2 client-credentials exchange is a
             // second network call this build's probe does not implement
             // (mirrors probe_sheets's own "unsupported, honestly" posture
@@ -701,10 +701,10 @@ async fn probe_rest(
                 ok: false,
                 supported: false,
                 latency_ms: None,
-                message: "This build cannot test REST OAuth2 client-credentials auth: the probe \
-                          does not perform the token exchange. Ingest runs still use the stored \
-                          client id and secret."
-                    .to_owned(),
+                message:
+                    "This build cannot yet test REST OAuth2 auth: the probe does not perform the \
+                          token request. Ingest runs still use the stored credentials."
+                        .to_owned(),
             };
         }
     };
@@ -769,7 +769,7 @@ pub(crate) fn url_names_target(url: &str, host: &str, port: u16) -> bool {
 ///
 /// A fixed message when `url` does not name the checked host and port, or the
 /// client cannot be built.
-fn pinned_http_client(
+pub(crate) fn pinned_http_client(
     url: &str,
     host: &str,
     port: u16,
