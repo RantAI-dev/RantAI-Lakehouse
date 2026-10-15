@@ -232,6 +232,10 @@ Branch fast-forwarded to `origin/feat/phase-1-rest` (84a2f212) first.
 
 **BLOCKER 2, route_auth 404 (cause).** The tenant gate, not a missing connector and not the body: `require_connector_in_tenants` is the route layer of every `/api/connectors/{id}/*` route and answers 404 for a connector outside the caller's tenants; `create_principal_with_permissions` makes a user with no tenant, so the gate answered 404 before the handler could answer 400 for the missing `object`. Fixed in the test: both principals join Meridian Group (`conn-pg-lakehouse`'s tenant), as `ingest_spec_put_rejects_a_dial_whose_host_resolves_internal` does. The policy assertions are unchanged (403 for `ingest:read` on the person's routes, 403 on the result route for both); with the tenant joined the 403 now provably comes from the permission gate. The route is unchanged.
 
+### SEC-11 guard fix (developer)
+
+`no_route_builds_a_response_from_an_upstream_errors_text` flagged three lines of `routes/connectors.rs`. Read from the `Display` implementations: (1) `secret_store_error`'s `Io | Key` arm (SRC-12 A1): `SecretStoreError::Io` prints a fixed sentence plus only the `std::io::ErrorKind` variant name (`{0:?}` of an enum, not the OS message); `Key` prints a `CryptoError`, every variant a fixed sentence naming the setting. No upstream text, so it is allowlisted, not rerouted through `upstream_error`. (2) and (3) `InvalidExcludedColumns` (SRC-11 D9 to D11), 400 for `BadList` and 422 for the rest: every variant is a fixed sentence in `ingest_spec.rs` that echoes only the object and column the request itself sent. Three `ALLOWED` entries with those reasons (the old `Io(_) => ...` entry matched no line any more and is replaced); each site carries a `// SEC-11 allowlisted` comment, which also makes the entry's substring unique to the line. The guard is otherwise unchanged. Clippy for `lakehouse-api` all targets is the check; the guard test itself was not run (`cargo test` forbidden).
+
 ## Review
 
 *(planner)*
