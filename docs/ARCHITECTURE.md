@@ -10,9 +10,8 @@ For environment variables and a running-system quickstart, see
 
 ## Module map
 
-The Rust backend (`rust/crates/`) is 13 crates (`lakehouse-iceberg` was
-added in P1; the table below already listed it, but the prose above it had
-not been updated until P6). `lakehouse-api` is the only binary; everything
+The Rust backend (`rust/crates/`) is 14 crates (counted 2026-10-15; the
+newest are `lakehouse-trino` and `lakehouse-test-support`). `lakehouse-api` is the only binary; everything
 else is a library crate it depends on.
 
 | Crate | Owns |
@@ -28,6 +27,8 @@ else is a library crate it depends on.
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
 | `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append, and (ADR 0010) Gold export create/append/read-back. **`lakehouse-api` depends on it as of the Gold export work**: `routes::gold` (`POST`/`GET /api/gold/export/{mart}`, glued together by `gold_export.rs`) is its first real caller — Bronze itself is still surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, never through this crate. It is also exercised by the G1/G3a/G4/Gold-export gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients. See its crate doc comment and `docs/adr/0002`–`0004`, `0010`. |
+| `lakehouse-trino` | A thin client for `Trino`'s `/v1/statement` REST protocol (no vendor SDK exists): submit SQL, follow `nextUri`. Used by `lakehouse-api`. |
+| `lakehouse-test-support` | Test-only: one shared, labelled `testcontainers` Postgres for the integration tests of `lakehouse-store` and `lakehouse-auth`. Not linked into the API. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
 
 ## Request lifecycle
